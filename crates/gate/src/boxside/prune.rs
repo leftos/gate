@@ -23,6 +23,12 @@
 //! sharing no deletion, and held while git deletes its refs, so no one can rename it and swap a link in where it was. A
 //! link where the root, `work`, `pruned` or a work folder goes is refused; a link named as a bare repository, or a
 //! `.git` folder without `HEAD`, `objects` and `refs`, is skipped; and a link inside a folder is removed as itself.
+//! Both modes first read the builder's drain barrier, read only ([`drain::barrier_stands`]), and the keyed prune reads
+//! it again before each key: while it stands, the age prune touches nothing and the keyed prune keeps each key left. A
+//! barrier that cannot be read fails the prune. Once its sweep is done, the age prune runs `git gc --auto` in each bare
+//! repository, one at a time in name order, since the bares' pushes run no gc of their own: only in a root
+//! [`gate_win32::check_work_root`] passes, and each only while the barrier, read again before it, does not stand. A gc
+//! that fails is said and the next goes on.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -31,6 +37,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use gate_args::BoxSeams;
 use gate_router::escaped;
 use gate_win32::{Make, Share};
 use gate_wire::{is_drive_path, is_key};
@@ -40,7 +47,7 @@ use crate::answer::{FAILED_STATUS, USAGE_STATUS};
 use crate::boxside::forward::{ClientGone, OutputLock};
 use crate::boxside::preflight::{Git, GitClass, GitFailure, GitOutput, GitStep, Pipe, Shared, Streams, is_folder_itself, written_beneath};
 use crate::boxside::run::{FILE_FLAG_OPEN_REPARSE_POINT, LAYOUT_CHANGING, LOCK_VIOLATION, SHARING_VIOLATION};
-use crate::boxside::stamping;
+use crate::boxside::{drain, stamping};
 use crate::console::Console;
 
 /// How long a work folder goes unused before a sweep removes it.
@@ -67,14 +74,17 @@ const LOCK_ACCESS: u32 = FILE_GENERIC_READ | DELETE;
 const REF_KINDS: [&str; 3] = ["gate", "gate-bridge", "gate-back"];
 /// The git step that deletes a key's refs in one bare repository, as its lines and `--test-box-git-limit` name it.
 const REFS_STEP: &str = "update-ref";
+/// The git step that collects one bare repository after the age prune's sweep, as `--test-box-git-limit` names it.
+const GC_STEP: &str = "gc";
 
 /// Prunes the root `root`, after what an earlier sweep left in `<root>\pruned`: without `keys`, the work folders no
 /// run has used for over [`IDLE_AGE`] before `now` ([`aged`]); with them, those keys alone ([`named`]). The exit
 /// status: [`USAGE_STATUS`] for a root that is not an absolute path on a drive or a key that is no key, before anything
 /// is opened; [`FAILED_STATUS`] when the root, the work folders or the `pruned` folder could not be opened or listed,
-/// or one of them is not a plain folder; else each mode's own. The keyed prune's check of the root walks the folders
-/// above it up to `walk_stop`, the suite's seam, when given.
-pub(crate) fn prune(root: &Path, keys: &[String], walk_stop: Option<&Path>, now: SystemTime, console: &mut Console) -> u32 {
+/// or one of them is not a plain folder, or the drain barrier could not be read; else each mode's own. The barrier is
+/// judged at the time `seams` give, and the keyed prune's check of the root walks the folders above it up to the
+/// suite's walk stop, when `seams` give one.
+pub(crate) fn prune(root: &Path, keys: &[String], seams: &BoxSeams, now: SystemTime, console: &mut Console) -> u32 {
     // The parse takes keys alone; this guards the names the sweep opens beneath `work` all the same.
     if let Some(word) = keys.iter().find(|key| !is_key(key)) {
         stamping::err(console, &format!("gate: box prune --keys holds a word that is not a key: {word:?}"));
@@ -89,9 +99,9 @@ pub(crate) fn prune(root: &Path, keys: &[String], walk_stop: Option<&Path>, now:
     };
     let root = text.trim_end_matches(['\\', '/']);
     let swept = if keys.is_empty() {
-        aged(root, now, console)
+        aged(root, now, seams, console)
     } else {
-        named(root, keys, walk_stop, now, console)
+        named(root, keys, seams, now, console)
     };
     match swept {
         Ok(status) => status,
@@ -104,33 +114,182 @@ pub(crate) fn prune(root: &Path, keys: &[String], walk_stop: Option<&Path>, now:
 
 /// The age prune of the root `root`, given without a trailing separator: removes the work folders idle at `now`, and
 /// the records of a key whose folder is gone; says each folder removed and how many, with a line on stderr for each
-/// key kept for a failure, and gives 0. Else the line saying why the sweep ended. A root or work folder that is not
-/// there holds nothing to remove.
-fn aged(root: &str, now: SystemTime, console: &mut Console) -> Result<u32, String> {
-    let (removed, folders) = match Sweep::opened(root, now, false, console)? {
-        Some(sweep) => {
-            let listed = listed(&sweep.work).map_err(|error| cannot_list(Path::new(&sweep.work_path), &error))?;
-            let removed = listed.keys.iter().filter(|key| sweep.aged_key(key, console)).count();
-            (removed, listed.folders)
-        }
-        None => (0, 0),
+/// key kept for a failure, then runs gc in each bare repository ([`Gc::bares_collected`]), and gives 0. Under a
+/// standing drain barrier, judged at the time `seams` give, it says so and touches nothing. Else the line saying why
+/// the sweep ended, or the barrier could not be read. A root or work folder that is not there holds nothing to remove.
+fn aged(root: &str, now: SystemTime, seams: &BoxSeams, console: &mut Console) -> Result<u32, String> {
+    if drained(root, seams)? {
+        stamping::out(console, "gate: remote prune skipped: the builder is drained");
+        return Ok(0);
+    }
+    let Some(sweep) = Sweep::opened(root, now, false, console)? else {
+        stamping::out(console, "gate: remote prune removed 0 of 0 work folders");
+        return Ok(0);
     };
-    stamping::out(console, &format!("gate: remote prune removed {removed} of {folders} work folders"));
+    let listed = listed(&sweep.work).map_err(|error| cannot_list(Path::new(&sweep.work_path), &error))?;
+    let removed = listed.keys.iter().filter(|key| sweep.aged_key(key, console)).count();
+    stamping::out(
+        console,
+        &format!("gate: remote prune removed {removed} of {} work folders", listed.folders),
+    );
+    // The gc holds only the root: `work` and `pruned` are let go once the sweep is done.
+    let Sweep {
+        root: swept,
+        root_folder,
+        work,
+        pruned,
+        git,
+        ..
+    } = sweep;
+    drop((work, pruned));
+    let gc = Gc {
+        root: &swept,
+        root_folder: &root_folder,
+        git: &git,
+        seams,
+    };
+    gc.bares_collected(console)?;
     Ok(0)
+}
+
+/// The age prune's gc of the bare repositories of a root, once its sweep is done: the root, without a trailing
+/// separator, and its handle, held for the whole gc; git; and the seams the drain barrier and the root's check take.
+struct Gc<'a> {
+    root: &'a str,
+    root_folder: &'a File,
+    git: &'a Git,
+    seams: &'a BoxSeams,
+}
+
+/// How one bare repository's gc ended.
+enum Collected {
+    /// It ran to its end with status 0, or the bare was skipped.
+    Done,
+    /// It failed, for this reason.
+    Failed(String),
+    /// The client is gone: no further gc starts.
+    ClientGone,
+}
+
+impl Gc<'_> {
+    /// Runs `git gc --auto` in each bare repository of the root ([`held_bare`]), one at a time in name order, each held
+    /// while its gc runs ([`Gc::collected`]), once the root passes [`gate_win32::check_work_root`], whose hold lasts the
+    /// whole gc, and each only while the drain barrier does not stand. A gc that fails, a bare that cannot be opened, a
+    /// root that cannot be listed and a root the check refuses are each a line on stdout, and the next bare goes on; a
+    /// standing barrier is a line that ends the gc, and so is a gone client, with none. Whether a standing barrier ended
+    /// it; else the line saying the barrier could not be read.
+    fn bares_collected(&self, console: &mut Console) -> Result<bool, String> {
+        let names = match self.bare_names() {
+            Ok(names) if names.is_empty() => return Ok(false),
+            Ok(names) => names,
+            Err(error) => {
+                stamping::out(console, &gc_failed(self.root, &error.to_string()));
+                return Ok(false);
+            }
+        };
+        let checked = gate_win32::check_work_root(Path::new(&root_name(self.root)), self.seams.root_walk_stop.as_deref());
+        if let Err(why) = &checked {
+            stamping::out(console, &gc_failed(self.root, &why.to_string()));
+            return Ok(false);
+        }
+        for name in names {
+            if drained(self.root, self.seams)? {
+                stamping::out(console, "gate: remote prune gc stopped: the builder is drained");
+                return Ok(true);
+            }
+            match self.collected(&name, console) {
+                Collected::Done => {}
+                Collected::Failed(why) => stamping::out(console, &gc_failed(&name, &why)),
+                Collected::ClientGone => break,
+            }
+        }
+        drop(checked);
+        Ok(false)
+    }
+
+    /// The names in the root that name a bare repository ([`is_bare_name`]), in name order; else why the root cannot be
+    /// listed.
+    fn bare_names(&self) -> io::Result<Vec<String>> {
+        let mut names: Vec<String> = gate_win32::names_beneath(self.root_folder)?
+            .into_iter()
+            .filter_map(|name| name.into_string().ok())
+            .filter(|name| is_bare_name(name))
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
+    /// Runs `git gc --auto` in the bare repository `<root>\<name>` when it is a whole one, held while it runs, and never
+    /// detached, as a long write of the shared bare repository a gone client does not cut short
+    /// ([`GitClass::LongBare`]). A failure names git's last line on stderr, which names its failure, or why it did not
+    /// run to its end.
+    fn collected(&self, name: &str, console: &mut Console) -> Collected {
+        let held = match held_bare(self.root_folder, name) {
+            Ok(Some(held)) => held,
+            Ok(None) => return Collected::Done,
+            Err(error) => return Collected::Failed(error.to_string()),
+        };
+        let git_dir = format!(r"--git-dir={}\{name}", self.root);
+        let streams = Streams {
+            stdout: Pipe::Discard,
+            stderr: Pipe::Read,
+            feed: None,
+        };
+        let step = GitStep {
+            name: GC_STEP,
+            class: GitClass::LongBare,
+        };
+        let (lock, gone) = (OutputLock::default(), ClientGone::default());
+        let args = [git_dir.as_str(), "-c", "gc.autoDetach=false", "gc", "--auto"];
+        let ran = self.git.run(&args, step, &streams, Shared::alone(&lock, &gone), console);
+        drop(held);
+        match ran {
+            Ok(GitOutput { code: 0, .. }) => Collected::Done,
+            Ok(ran) => {
+                let stderr = String::from_utf8_lossy(&ran.stderr);
+                let said = stderr.lines().map(str::trim).rfind(|line| !line.is_empty()).unwrap_or_default();
+                Collected::Failed(if said.is_empty() {
+                    format!("git exited with status {}", ran.code)
+                } else {
+                    said.to_owned()
+                })
+            }
+            Err(GitFailure::NotStarted(why) | GitFailure::Failed(why)) => Collected::Failed(why),
+            Err(GitFailure::ClientGone) => Collected::ClientGone,
+        }
+    }
+}
+
+/// Whether the drain barrier stands under the root `root`, given without a trailing separator, at the time `seams`
+/// give ([`drain::barrier_stands`]); else the line saying the prune failed for why it could not be read.
+fn drained(root: &str, seams: &BoxSeams) -> Result<bool, String> {
+    drain::barrier_stands(Path::new(&root_name(root)), seams).map_err(|why| format!("gate: remote prune failed: {why}"))
+}
+
+/// Says each key of `keys` kept, the builder being drained.
+fn kept_drained(keys: &[String], console: &mut Console) {
+    for key in keys {
+        stamping::out(console, &format!("gate: remote kept {}: the builder is drained", escaped(key)));
+    }
 }
 
 /// The keyed prune of the root `root`, given without a trailing separator: removes each key of `keys` whatever its
 /// last use, and no other, saying for each that it was pruned, kept as in use, or could not be pruned. Gives
 /// [`FAILED_STATUS`] when a key could not be pruned, else 0; else the line saying why the sweep ended. A root that is
 /// not there holds nothing of any key, unless its drive is not there either, which says nothing of them. A root
-/// [`gate_win32::check_work_root`] refuses, with its walk above ending at `walk_stop`, has its keys' folders and records
-/// removed, but no git runs in it, so each key keeps its refs and could not be pruned.
-fn named(root: &str, keys: &[String], walk_stop: Option<&Path>, now: SystemTime, console: &mut Console) -> Result<u32, String> {
+/// [`gate_win32::check_work_root`] refuses, with its walk above ending at the walk stop `seams` give, has its keys'
+/// folders and records removed, but no git runs in it, so each key keeps its refs and could not be pruned. Under a
+/// standing drain barrier, read before the sweep and before each key, each key left is kept.
+fn named(root: &str, keys: &[String], seams: &BoxSeams, now: SystemTime, console: &mut Console) -> Result<u32, String> {
     if !drive_is_there(root) {
         for key in keys {
             stamping::err(console, &could_not_prune(key, "the root's drive is not there"));
         }
         return Ok(u32::from(FAILED_STATUS));
+    }
+    if drained(root, seams)? {
+        kept_drained(keys, console);
+        return Ok(0);
     }
     let Some(mut sweep) = Sweep::opened(root, now, true, console)? else {
         for key in keys {
@@ -139,18 +298,9 @@ fn named(root: &str, keys: &[String], walk_stop: Option<&Path>, now: SystemTime,
         return Ok(0);
     };
     // Held, when it passes, until every key is done, as the preflight holds the root it checked.
-    let checked = gate_win32::check_work_root(Path::new(&root_name(root)), walk_stop);
+    let checked = gate_win32::check_work_root(Path::new(&root_name(root)), seams.root_walk_stop.as_deref());
     sweep.refused = checked.as_ref().err().map(ToString::to_string);
-    let mut failed = false;
-    for key in keys {
-        match sweep.pruned_key(key, console) {
-            Pruned::Removed(_) => stamping::out(console, &gone_line(key)),
-            Pruned::Held => stamping::out(console, &format!("gate: remote kept {}: in use", escaped(key))),
-            // The keyed prune judges no age, so it keeps a key only for a held lock or a failure.
-            Pruned::Kept => {}
-            Pruned::Failed => failed = true,
-        }
-    }
+    let failed = sweep.named_keys(keys, seams, console)?;
     drop(checked);
     Ok(if failed { u32::from(FAILED_STATUS) } else { 0 })
 }
@@ -328,6 +478,27 @@ impl Sweep {
         let hours = idle.as_secs() / HOUR_SECONDS;
         stamping::out(console, &format!("gate: remote pruned {}: idle {hours} h", escaped(key)));
         true
+    }
+
+    /// The keyed prune of each key of `keys` in turn ([`Sweep::pruned_key`]), each said as it ends, the drain barrier
+    /// read before each at the time `seams` give: once it stands, each key left is kept. Whether a key could not be
+    /// pruned; else the line saying the barrier could not be read.
+    fn named_keys(&self, keys: &[String], seams: &BoxSeams, console: &mut Console) -> Result<bool, String> {
+        let mut failed = false;
+        for (at, key) in keys.iter().enumerate() {
+            if drained(&self.root, seams)? {
+                kept_drained(keys.get(at..).unwrap_or_default(), console);
+                break;
+            }
+            match self.pruned_key(key, console) {
+                Pruned::Removed(_) => stamping::out(console, &gone_line(key)),
+                Pruned::Held => stamping::out(console, &format!("gate: remote kept {}: in use", escaped(key))),
+                // The keyed prune judges no age, so it keeps a key only for a held lock or a failure.
+                Pruned::Kept => {}
+                Pruned::Failed => failed = true,
+            }
+        }
+        Ok(failed)
     }
 
     /// Prunes the key `key` when no run holds its lock and, in the age prune, its work folder is idle: its folder
@@ -713,6 +884,11 @@ fn could_not_prune(key: &str, why: &str) -> String {
     format!("gate: remote could not prune {}: {}", escaped(key), escaped(why))
 }
 
+/// The line saying `git gc --auto` failed in the bare repository `name`, or could not run in the root `name`, for `why`.
+fn gc_failed(name: &str, why: &str) -> String {
+    format!("gate: remote prune gc failed: {}: {}", escaped(name), escaped(why))
+}
+
 /// The line saying the folder `path`, renamed aside, could not be removed, for `error`.
 fn could_not_remove_pruned(path: &Path, error: &io::Error) -> String {
     format!(
@@ -736,7 +912,52 @@ mod tests {
     use std::fs;
     use std::time::{Duration, SystemTime};
 
-    use super::{IDLE_AGE, held_bare, idle_for, opened_root, prune, root_name};
+    use gate_args::BoxSeams;
+
+    use super::{Gc, IDLE_AGE, held_bare, idle_for, opened_root, prune, root_name};
+    use crate::boxside::preflight::Git;
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test that cannot make or remove its root must fail loudly")]
+    fn the_gc_reads_the_barrier_before_each_bare_and_stops_under_a_standing_one() {
+        let root = crate::test_support::temp_dir().join(format!("gate-prune-gc-drained-{}", std::process::id()));
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("an earlier root can be removed");
+        }
+        let bare = root.join("a.git");
+        fs::create_dir_all(bare.join("objects")).expect("the objects folder can be made");
+        fs::create_dir_all(bare.join("refs")).expect("the refs folder can be made");
+        // No repository git can read: a gc that started would fail, and say so.
+        fs::write(bare.join("HEAD"), "not a ref\n").expect("HEAD can be written");
+        fs::create_dir_all(root.join("drain")).expect("the drain folder can be made");
+        fs::write(root.join(r"drain\barrier"), r#"{"Raised":1000,"Lapses":2800,"Generation":1}"#).expect("the barrier can be written");
+        let text = root.to_str().expect("the root is Unicode").to_owned();
+        let root_folder = opened_root(&text).expect("the root opens").expect("the root is there");
+        let (git, walk_stop) = (Git::find(), crate::test_support::temp_dir().to_path_buf());
+        let at = |now| BoxSeams {
+            now: Some(now),
+            root_walk_stop: Some(walk_stop.clone()),
+            ..BoxSeams::default()
+        };
+        let (standing, lapsed) = (at(2000), at(2800));
+        let gc = |seams| {
+            Gc {
+                root: &text,
+                root_folder: &root_folder,
+                git: &git,
+                seams,
+            }
+            .bares_collected(&mut Console::new())
+        };
+
+        let under_barrier = gc(&standing);
+        let after_lapse = gc(&lapsed);
+
+        drop(root_folder);
+        fs::remove_dir_all(&root).expect("the root can be removed");
+        assert_eq!(under_barrier, Ok(true), "a standing barrier stops the gc before the bare");
+        assert_eq!(after_lapse, Ok(false), "a lapsed one lets it run");
+    }
 
     #[test]
     fn a_drive_s_own_root_is_named_with_its_separator_and_any_other_root_as_given() {
@@ -777,7 +998,7 @@ mod tests {
         fs::create_dir_all(&root).expect("the root can be made");
         let keys = ["k".to_owned(), r"..\x".to_owned()];
 
-        let status = prune(&root, &keys, None, SystemTime::now(), &mut Console::new());
+        let status = prune(&root, &keys, &BoxSeams::default(), SystemTime::now(), &mut Console::new());
 
         let made = root.join("pruned").exists() || root.join("work").exists();
         fs::remove_dir(&root).expect("the root is left empty and can be removed");

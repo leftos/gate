@@ -70,7 +70,7 @@ pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
         BoxVerb::RegisterDesktop => register::register(seams, console),
         BoxVerb::Prune => {
             if let Some(root) = request.root.as_deref() {
-                prune::prune(root, &request.keys, seams.root_walk_stop.as_deref(), SystemTime::now(), console)
+                prune::prune(root, &request.keys, seams, SystemTime::now(), console)
             } else {
                 // The parse gives `prune` its root always; a request without one is the box's usage error.
                 stamping::err(console, &Problem::BoxUsage.to_string());

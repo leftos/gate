@@ -302,6 +302,28 @@ fn barrier_of(text: &str, written_s: u64, clock: Clock) -> Barrier {
     }
 }
 
+/// Whether a barrier stands under the root `root` at the time `seams` give ([`Clock::of`]), read only: no lock is
+/// taken and nothing is written, so a process that may not write `drain\`, the prune, can ask. A root that is not a
+/// folder of its own, or has no `drain\` folder of its own or no `barrier` in it, has none standing; a barrier that
+/// does not read as one stands until its last write and a lapse ([`barrier_of`]). Else why it could not be read.
+pub(crate) fn barrier_stands(root: &Path, seams: &BoxSeams) -> Result<bool, String> {
+    if !preflight::is_real_folder(root) {
+        return Ok(false);
+    }
+    let Some(held_root) = preflight::held_folder_at(root).map_err(|error| cannot("open", root, &error))? else {
+        return Ok(false);
+    };
+    let drain_path = root.join(DRAIN);
+    let Some(drain) = existing(&held_root, DRAIN).map_err(|error| cannot("read", &drain_path, &error))? else {
+        return Ok(false);
+    };
+    if !preflight::is_folder_itself(&drain).map_err(|error| cannot("read", &drain_path, &error))? {
+        return Ok(false);
+    }
+    let read = read_text(&drain, BARRIER).map_err(|error| cannot("read", &drain_path.join(BARRIER), &error))?;
+    Ok(read.is_some_and(|(text, written)| matches!(barrier_of(&text, written, Clock::of(seams)), Barrier::Standing(_))))
+}
+
 /// The `At` of a `lapsed` or `lifted` record `text`; `written_s`, its last write, when it does not read as one.
 fn at_of(text: &str, written_s: u64) -> u64 {
     serde_json::from_str::<Value>(text)
@@ -1331,8 +1353,8 @@ mod tests {
     use crate::console::Console;
 
     use super::{
-        Barrier, Clock, Kind, Raising, Refused, Ticket, barrier_of, counted_processes, decided, names_prune, names_root, older_live, root_text,
-        ticket_live, ticket_name, ticket_of_name, ticket_seq,
+        Barrier, Clock, Kind, Raising, Refused, Ticket, barrier_of, barrier_stands, counted_processes, decided, names_prune, names_root, older_live,
+        root_text, ticket_live, ticket_name, ticket_of_name, ticket_seq,
     };
 
     const LEASE_MS: u64 = 120_000;
@@ -1921,5 +1943,94 @@ mod tests {
                 (61, Kind::Git)
             ]
         );
+    }
+
+    /// The seams of a box at the Unix second `now_s`, with the default lapse.
+    fn seams_at(now_s: u64) -> BoxSeams {
+        BoxSeams {
+            now: Some(now_s),
+            ..BoxSeams::default()
+        }
+    }
+
+    /// A scratch root `gate-drain-stands-{name}-{pid}` under the temp folder, made empty.
+    fn stands_root(name: &str) -> std::path::PathBuf {
+        let root = crate::test_support::temp_dir().join(format!("gate-drain-stands-{name}-{}", std::process::id()));
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("an earlier scratch root can be removed");
+        }
+        fs::create_dir_all(&root).expect("the scratch root can be made");
+        root
+    }
+
+    #[test]
+    fn no_barrier_stands_under_a_missing_root_a_root_without_drain_or_a_drain_without_a_barrier() {
+        let root = stands_root("none");
+        let missing = root.join("missing");
+        let without_drain = barrier_stands(&root, &seams_at(1000));
+        fs::create_dir(root.join("drain")).expect("the drain folder can be made");
+        let without_barrier = barrier_stands(&root, &seams_at(1000));
+        let at_missing = barrier_stands(&missing, &seams_at(1000));
+        fs::remove_dir_all(&root).expect("the scratch root can be removed");
+
+        assert_eq!(at_missing, Ok(false), "a root that is not there");
+        assert_eq!(without_drain, Ok(false), "a root without drain");
+        assert_eq!(without_barrier, Ok(false), "a drain without a barrier");
+    }
+
+    #[test]
+    fn a_drain_that_is_a_junction_or_a_file_holds_no_barrier() {
+        let root = stands_root("not-a-folder");
+        let elsewhere = stands_root("not-a-folder-target");
+        fs::write(elsewhere.join("barrier"), r#"{"Raised":1000,"Lapses":2800,"Generation":1}"#).expect("the barrier can be written");
+        crate::test_support::junction(&root.join("drain"), &elsewhere);
+        let through_junction = barrier_stands(&root, &seams_at(2000));
+        fs::remove_dir(root.join("drain")).expect("the junction can be removed");
+        fs::write(root.join("drain"), r#"{"Raised":1000,"Lapses":2800,"Generation":1}"#).expect("a drain file can be written");
+        let as_file = barrier_stands(&root, &seams_at(2000));
+        fs::remove_dir_all(&root).expect("the scratch root can be removed");
+        fs::remove_dir_all(&elsewhere).expect("the junction's target can be removed");
+
+        assert_eq!(through_junction, Ok(false), "a junction at drain is never followed");
+        assert_eq!(as_file, Ok(false), "a file at drain holds no barrier");
+    }
+
+    #[test]
+    fn a_barrier_stands_until_its_lapse_read_only() {
+        let root = stands_root("standing");
+        fs::create_dir(root.join("drain")).expect("the drain folder can be made");
+        let barrier = root.join(r"drain\barrier");
+        let text = r#"{"Raised":1000,"Lapses":2800,"Generation":1}"#;
+        fs::write(&barrier, text).expect("the barrier can be written");
+
+        let standing = barrier_stands(&root, &seams_at(2799));
+        let lapsed = barrier_stands(&root, &seams_at(2800));
+        let left = fs::read_to_string(&barrier);
+        let lapsed_record = root.join(r"drain\lapsed").exists();
+        fs::remove_dir_all(&root).expect("the scratch root can be removed");
+
+        assert_eq!(standing, Ok(true), "it stands before its lapse");
+        assert_eq!(lapsed, Ok(false), "it no longer stands at its lapse");
+        assert_eq!(left.ok().as_deref(), Some(text), "the read changes nothing");
+        assert!(!lapsed_record, "the read writes no lapsed record");
+    }
+
+    #[test]
+    fn an_unreadable_barrier_file_stands_for_the_reader_until_its_last_write_plus_the_lapse() {
+        let root = stands_root("unreadable");
+        fs::create_dir(root.join("drain")).expect("the drain folder can be made");
+        let barrier = root.join(r"drain\barrier");
+        fs::write(&barrier, "{not json").expect("the barrier can be written");
+        let written = fs::metadata(&barrier)
+            .and_then(|metadata| metadata.modified())
+            .expect("the barrier's last write can be read");
+        let written_s = written.duration_since(std::time::UNIX_EPOCH).expect("after 1970").as_secs();
+
+        let within = barrier_stands(&root, &seams_at(written_s + LAPSE_MS / 1000 - 1));
+        let past = barrier_stands(&root, &seams_at(written_s + LAPSE_MS / 1000));
+        fs::remove_dir_all(&root).expect("the scratch root can be removed");
+
+        assert_eq!(within, Ok(true), "it stands within a lapse of its last write");
+        assert_eq!(past, Ok(false), "it no longer stands a lapse after its last write");
     }
 }

@@ -10,9 +10,10 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use serde_json::json;
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
-use super::{bare_box_command, hold_lock, icacls};
+use super::{bare_box_command, box_call, hold_lock, icacls, payload};
 use crate::support::{Case, Outcome, finish, git, junction, shown};
 
 /// How long ago an idle work folder and its records were last written: two days, well past the sweep's one.
@@ -1021,6 +1022,225 @@ fn a_keyed_prune_of_a_root_without_a_work_folder_still_deletes_the_refs() {
     assert_eq!(outcome.stderr, "", "{outcome:?}");
     assert_eq!(refs_of(&case, &bare), Vec::<String>::new(), "{outcome:?}");
     assert!(!root.join(r"work\k.lock").exists(), "no lock is left behind: {outcome:?}");
+}
+
+/// The fixed time a case's drain barrier is raised at, in Unix seconds; it stands for the default 30 minutes.
+const T: u64 = 1_800_000_000;
+/// The line of an age prune that found the barrier standing.
+const SKIPPED: &str = "gate: remote prune skipped: the builder is drained\n";
+/// Two blob contents whose ids start with `17`: `git gc --auto` counts the loose objects in `objects\17` alone.
+const LOOSE_IN_17: [&str; 2] = ["loose 134", "loose 331"];
+
+/// Raises the drain barrier under `root` at [`T`], as `gate box drain` does.
+fn raise(case: &Case, root: &Path) {
+    let now = T.to_string();
+    let args = ["box", "--test-box-now", &now, "--test-box-drain-readable-only", "true", "drain"];
+    let raised = box_call(case, &args, &payload(&json!({ "Root": shown(root), "Action": "raise" }))).finish();
+    assert_eq!(raised.code, Some(0), "the barrier is raised: {raised:?}");
+}
+
+/// `gate box prune --root <root>` with the drain judged at the Unix second `now`, run to its end.
+fn prune_at(case: &Case, root: &Path, now: u64) -> Outcome {
+    let now = now.to_string();
+    finish(bare_box_command(case, &["box", "--test-box-now", &now, "prune", "--root", &shown(root)]))
+}
+
+/// The bare repository at `bare`, made with real git, with `gc.auto` 1 and the two loose objects of [`LOOSE_IN_17`],
+/// each reachable from a tag, so `git gc --auto` packs them.
+fn bare_due_gc(case: &Case, bare: &Path) {
+    let shown_bare = shown(bare);
+    git(case, &["init", "--bare", "--quiet", &shown_bare]);
+    let git_dir = format!("--git-dir={shown_bare}");
+    git(case, &[&git_dir, "config", "gc.auto", "1"]);
+    for (number, content) in LOOSE_IN_17.iter().enumerate() {
+        let file = case.folder().join(format!("blob-{number}"));
+        fs::write(&file, content).expect("the blob's content can be written");
+        let id = git(case, &[&git_dir, "hash-object", "-w", "--no-filters", &shown(&file)]);
+        git(case, &[&git_dir, "update-ref", &format!("refs/tags/t{number}"), &id]);
+    }
+}
+
+/// The loose objects of the bare repository at `bare`, as `git count-objects` counts them.
+fn loose_objects(case: &Case, bare: &Path) -> String {
+    let git_dir = format!("--git-dir={}", shown(bare));
+    git(case, &[&git_dir, "count-objects", "-v"])
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[test]
+fn an_age_prune_under_a_standing_barrier_prunes_nothing() {
+    let case = Case::new("prune_drained");
+    let root = root_with_k(&case);
+    age_k(&root);
+    let bare = root.join("a.git");
+    bare_due_gc(&case, &bare);
+    raise(&case, &root);
+
+    let outcome = prune_at(&case, &root, T + 10);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, SKIPPED, "{outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_k_kept(&root, &outcome);
+    assert!(!root.join("pruned").exists(), "nothing is made: {outcome:?}");
+    assert_eq!(loose_objects(&case, &bare), "count: 2", "no gc runs: {outcome:?}");
+}
+
+#[test]
+fn a_keyed_prune_under_a_standing_barrier_keeps_every_key() {
+    let case = Case::new("prune_keys_drained");
+    let root = root_with_k(&case);
+    fs::create_dir_all(root.join(r"work\j")).expect("a second work folder can be made");
+    let bare = root.join("a.git");
+    bare_with(&case, &bare, &refs_of_keys(&["k", "j"]));
+    raise(&case, &root);
+    let (shown_root, stop, now) = (shown(&root), shown(&case.folder()), (T + 10).to_string());
+    let words = [
+        "box",
+        "--test-box-now",
+        &now,
+        "--test-box-root-walk-stop",
+        &stop,
+        "prune",
+        "--root",
+        &shown_root,
+        "--keys",
+        "k",
+        "j",
+    ];
+
+    let outcome = finish(bare_box_command(&case, &words));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout, "gate: remote kept k: the builder is drained\ngate: remote kept j: the builder is drained\n",
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_k_kept(&root, &outcome);
+    assert!(root.join(r"work\j").is_dir(), "{outcome:?}");
+    assert!(!root.join("pruned").exists(), "nothing is made: {outcome:?}");
+    assert_eq!(refs_of(&case, &bare), refs_of_keys(&["j", "k"]), "every ref stays: {outcome:?}");
+}
+
+#[test]
+fn an_age_prune_after_the_barrier_lapsed_sweeps() {
+    let case = Case::new("prune_lapsed");
+    let root = root_with_k(&case);
+    age_k(&root);
+    raise(&case, &root);
+
+    let outcome = prune_at(&case, &root, T + 1800);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout, "gate: remote pruned k: idle 48 h\ngate: remote prune removed 1 of 1 work folders\n",
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_k_gone(&root, &outcome);
+}
+
+#[test]
+fn an_age_prune_runs_gc_in_each_bare_repository() {
+    let case = Case::new("prune_gc");
+    let root = case.folder().join("remote");
+    fs::create_dir_all(root.join("work")).expect("the work folder can be made");
+    let (a, b) = (root.join("a.git"), root.join("b.git"));
+    for bare in [&a, &b] {
+        bare_due_gc(&case, bare);
+    }
+
+    let outcome = prune_judged(&case, &root);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, NOTHING, "a passing gc says nothing: {outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    for bare in [&a, &b] {
+        assert_eq!(loose_objects(&case, bare), "count: 0", "{}: {outcome:?}", bare.display());
+    }
+}
+
+#[test]
+fn a_bare_repository_whose_gc_fails_is_named_and_the_next_is_collected() {
+    let case = Case::new("prune_gc_fails");
+    let root = case.folder().join("remote");
+    fs::create_dir_all(root.join("work")).expect("the work folder can be made");
+    let (a, b) = (root.join("a.git"), root.join("b.git"));
+    git(&case, &["init", "--bare", "--quiet", &shown(&a)]);
+    // git refuses to read a `gc.auto` that is no number, so its gc exits 128.
+    git(&case, &[&format!("--git-dir={}", shown(&a)), "config", "gc.auto", "bogus"]);
+    bare_due_gc(&case, &b);
+
+    let outcome = prune_judged(&case, &root);
+
+    assert_eq!(outcome.code, Some(0), "a failed gc fails no prune: {outcome:?}");
+    let failed = outcome.stdout.strip_prefix(NOTHING).unwrap_or_default();
+    assert!(
+        failed.starts_with("gate: remote prune gc failed: a.git: fatal: bad numeric config value 'bogus' for 'gc.auto'")
+            && failed.lines().count() == 1,
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_eq!(loose_objects(&case, &b), "count: 0", "the next bare is collected: {outcome:?}");
+}
+
+/// `gate box prune --root <root>`, run to its end, its root's check walking above it only up to the case folder, as
+/// the keyed cases' does.
+fn prune_judged(case: &Case, root: &Path) -> Outcome {
+    let (root, stop) = (shown(root), shown(&case.folder()));
+    finish(bare_box_command(
+        case,
+        &["box", "--test-box-root-walk-stop", &stop, "prune", "--root", &root],
+    ))
+}
+
+/// The NULL SID, which has no members, stands for another account, as the keyed prune's own case of it.
+#[test]
+fn a_root_another_account_may_write_in_gets_no_gc() {
+    let case = Case::new("prune_gc_unsafe_root");
+    let root = case.folder().join("remote");
+    fs::create_dir_all(root.join("work")).expect("the work folder can be made");
+    let bare = root.join("a.git");
+    bare_due_gc(&case, &bare);
+    icacls(&case.folder(), &["/grant", "*S-1-0-0:(OI)(CI)M", "/q"]);
+
+    let outcome = prune_judged(&case, &root);
+
+    assert_eq!(outcome.code, Some(0), "a refused gc fails no prune: {outcome:?}");
+    let failed = outcome.stdout.strip_prefix(NOTHING).unwrap_or_default();
+    assert!(
+        failed.starts_with(&format!("gate: remote prune gc failed: {}: ", shown(&root)))
+            && failed.ends_with(" lets S-1-0-0 add files to it\n")
+            && failed.lines().count() == 1,
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_eq!(loose_objects(&case, &bare), "count: 2", "no gc runs: {outcome:?}");
+}
+
+#[test]
+fn a_junction_named_as_a_bare_repository_gets_no_gc() {
+    let case = Case::new("prune_gc_junction");
+    let root = case.folder().join("remote");
+    fs::create_dir_all(root.join("work")).expect("the work folder can be made");
+    let real = case.folder().join(r"elsewhere\real.git");
+    bare_due_gc(&case, &real);
+    junction(&root.join("c.git"), &real);
+
+    let outcome = prune_judged(&case, &root);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, NOTHING, "a skipped bare says nothing: {outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_eq!(
+        loose_objects(&case, &real),
+        "count: 2",
+        "the junction's target is not collected: {outcome:?}"
+    );
 }
 
 #[test]

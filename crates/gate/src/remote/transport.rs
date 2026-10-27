@@ -18,7 +18,10 @@ use gate_wire::PathForm;
 use crate::remote::payload::{self, BOX_EXE};
 
 /// The pack commands a Windows builder's git is served through: pwsh reads the single-quoted path git sends through cmd.
-const RECEIVE_PACK: &str = "pwsh -NoProfile -NonInteractive -Command git-receive-pack";
+/// A push runs with `receive.autogc` off, so no gc it starts detaches past a drain; the scheduled age prune collects the
+/// bare repositories instead.
+const RECEIVE_PACK: &str = "pwsh -NoProfile -NonInteractive -Command $env:GIT_CONFIG_COUNT='1'; $env:GIT_CONFIG_KEY_0='receive.autogc'; \
+                            $env:GIT_CONFIG_VALUE_0='false'; git-receive-pack";
 const UPLOAD_PACK: &str = "pwsh -NoProfile -NonInteractive -Command git-upload-pack";
 /// The box a macOS builder runs, below its root.
 const UNIX_BOX: &str = "/bin/gate-box";
@@ -655,7 +658,10 @@ mod tests {
         assert_eq!(profile.push_url("app"), "builder:D:/gate-remote/app.git");
         assert_eq!(
             profile.receive_pack().as_deref(),
-            Some("pwsh -NoProfile -NonInteractive -Command git-receive-pack")
+            Some(
+                "pwsh -NoProfile -NonInteractive -Command $env:GIT_CONFIG_COUNT='1'; $env:GIT_CONFIG_KEY_0='receive.autogc'; \
+                 $env:GIT_CONFIG_VALUE_0='false'; git-receive-pack"
+            )
         );
         assert_eq!(
             profile.upload_pack().as_deref(),
@@ -1010,7 +1016,11 @@ mod tests {
             ssh.push_target(&windows(&ssh), "app"),
             Ok(PushTarget {
                 url: "builder:D:/gate-remote/app.git".to_owned(),
-                receive_pack: Some("pwsh -NoProfile -NonInteractive -Command git-receive-pack".to_owned()),
+                receive_pack: Some(
+                    "pwsh -NoProfile -NonInteractive -Command $env:GIT_CONFIG_COUNT='1'; $env:GIT_CONFIG_KEY_0='receive.autogc'; \
+                     $env:GIT_CONFIG_VALUE_0='false'; git-receive-pack"
+                        .to_owned()
+                ),
                 ssh_command: Some(git_ssh_command(&ssh.program)),
             })
         );
