@@ -35,6 +35,8 @@ The builders' setup is the session's own work, with the owner's standing permiss
 
 The primary goal is remote gates working for every caller repo under `X:\dev` as soon as possible. When ordering, splitting or merging work, prefer whatever routes the next repo soonest, and say the choice in one line.
 
+Functional work comes before edge cases and hardening. The owner is the gate's only user, so new behaviour and routing more of the callers' work outrank security hardening and fixes for edge cases no caller's run hits today. Such an item, and such a finding from a review or an invariant pass, is **add**ed with no priority (in its project, else `Backlog`) and never raised to Urgent or High. A defect that breaks or blocks a caller's routed run is not an edge case, and a flaky or timing-out test stays Urgent.
+
 Merging is the agents' call too. Once every item under a feature marker has landed and its gates are green, the session runs `ship` on the branch and merges the feature PR without asking.
 
 ## Agents
