@@ -3,6 +3,7 @@
 //! that needs it: a light or critical gate, `--local` or a covering parent read no routing file, and a machine with no
 //! routing file costs no git call.
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -65,6 +66,27 @@ const TEST_VERB: &str = "test";
 const PROJECT_OPTION: &str = "--project";
 /// The file extensions of a project file, compared ignoring letter case.
 pub const PROJECT_EXTENSIONS: [&str; 3] = [".csproj", ".fsproj", ".vbproj"];
+
+/// The file extension of an `MSBuild` project file that is not a language's own ([`PROJECT_EXTENSIONS`]).
+const MSBUILD_PROJECT_EXTENSIONS: [&str; 1] = [".proj"];
+/// The extensions of the files a build reads as its input beside its project and solution files.
+const BUILD_INPUT_EXTENSIONS: [&str; 4] = [".targets", ".props", ".rsp", ".runsettings"];
+
+/// Whether `name` ends in a project or solution file's extension ([`PROJECT_EXTENSIONS`], `.proj`,
+/// [`SOLUTION_EXTENSIONS`]), in any letter case: a folder directly holding such files is a dotnet build's input
+/// ([`Facts::gitignored_inputs`]).
+#[must_use]
+pub fn is_project_or_solution(name: &str) -> bool {
+    has_extension(name, &PROJECT_EXTENSIONS) || has_extension(name, &MSBUILD_PROJECT_EXTENSIONS) || has_extension(name, &SOLUTION_EXTENSIONS)
+}
+
+/// Whether `name` ends in the extension of a file a build reads as its input, in any letter case: a project or solution
+/// file's ([`is_project_or_solution`]), or `.targets`, `.props`, `.rsp` or `.runsettings` ([`Facts::gitignored_inputs`]).
+#[must_use]
+pub fn is_input_file(name: &str) -> bool {
+    is_project_or_solution(name) || has_extension(name, &BUILD_INPUT_EXTENSIONS)
+}
+
 /// The file extensions of a solution file, compared ignoring letter case.
 const SOLUTION_EXTENSIONS: [&str; 3] = [".sln", ".slnx", ".slnf"];
 /// The start of a dotnet word that names a response file, whose words the gate cannot see.
@@ -253,6 +275,15 @@ pub trait Facts {
     /// Asked once, with every candidate, only of a macOS pick whose words hold a relative path written with `\`.
     fn snapshot_carries(&self, place: &Place, paths: &[String]) -> Vec<String>;
 
+    /// Which of `paths`, each `/`-separated and relative to the worktree root of `place`, name a project input the
+    /// snapshot leaves out. A path with an input file's extension ([`is_input_file`]) counts only when it is a file on
+    /// this PC that none of the repo's input globs `inputs` matches and git reports ignored. Any other path counts only
+    /// when it is a folder on this PC directly holding a project or solution file ([`is_project_or_solution`]), each
+    /// of which no input glob matches and git reports ignored. A path whose answer cannot be told is left out, so the
+    /// command routes. Asked once, with every candidate ([`gitignored_reason`]), of every matched command that
+    /// would otherwise route.
+    fn gitignored_inputs(&self, place: &Place, paths: &[String], inputs: &[String]) -> Vec<String>;
+
     /// What the drive `letter` (upper case) stands for, as `QueryDosDevice` gives it (`\??\X:\dev` for a subst drive);
     /// `None` when there is no such device.
     fn subst_target(&self, letter: char) -> Option<String>;
@@ -439,6 +470,9 @@ pub enum LocalReason {
     /// The local file `file` ([`Facts::declaration_said`]) declares `pattern`, the first of its patterns the command
     /// matches.
     DeclaredLocal { file: String, pattern: String },
+    /// A matched command's word names `path`, as the word wrote it, a project input that is gitignored, which the
+    /// snapshot leaves out ([`Facts::gitignored_inputs`]).
+    GitignoredInput { path: String },
 }
 
 impl LocalReason {
@@ -470,6 +504,7 @@ impl LocalReason {
                 format!("{file}: {problem}")
             }
             Self::DeclaredLocal { file, pattern } => format!("{file} keeps it here ({})", escaped(pattern)),
+            Self::GitignoredInput { path } => format!("{} is gitignored, so the snapshot leaves it out", escaped(path)),
             Self::SiblingMissing { name } => format!("sibling {name} not found beside the worktree"),
             Self::SiblingRefused { name, reason } => format!("sibling {name} {reason}"),
             Self::SiblingsNotAllowed { names, problem } => not_allowed_reason(names, problem.as_deref()),
@@ -1158,9 +1193,9 @@ fn built(config: &Config, opened: Opened, sent: Rewritten, kept: Kept, facts: &d
 }
 
 /// The routed run of the `matched` command, as the decision ends: here, saying why, when a word names a path outside
-/// the worktree ([`outside_reason`]), or when the gate's folder below the root holds nothing the snapshot sends; else
-/// the run on its builder ([`remote_run`]), for the command as `given`. What [`route`] and [`later_run`] both end
-/// with.
+/// the worktree ([`outside_reason`]), when the gate's folder below the root holds nothing the snapshot sends, or when a
+/// word names a gitignored project input the snapshot leaves out ([`gitignored_reason`]); else the run on its builder
+/// ([`remote_run`]), for the command as `given`. What [`route`] and [`later_run`] both end with.
 fn ended(config: &Config, matched: Matched, given: &[String], facts: &dyn Facts) -> Result<RemoteRun, Here> {
     if let Some(word) = matched.outside.clone() {
         return Err(Some(outside_reason(config, word, &matched, facts)));
@@ -1170,7 +1205,139 @@ fn ended(config: &Config, matched: Matched, given: &[String], facts: &dyn Facts)
     if !place.prefix.is_empty() && !facts.folder_has_files(place).map_err(|reason| Some(failed(&reason)))? {
         return Err(Some(LocalReason::NothingSent { subfolder }));
     }
+    if let Some(reason) = gitignored_reason(&matched, facts) {
+        return Err(Some(reason));
+    }
     Ok(remote_run(config, matched, subfolder, given, facts))
+}
+
+/// Why the `matched` command runs here when one of its words before a script's text ([`script_start`]) names a
+/// project input the snapshot leaves out: each value of each word ([`input_values`]) that names a path below the root
+/// ([`input_path`]) is a candidate when it has an input file's extension ([`is_input_file`]), or, as a folder, when it
+/// comes after a dotnet command's verb ([`folders_from`]). No word after the first `--` is read, nor, in a dotnet
+/// command, an output option's value ([`output_values`]). The facts are asked once, with every candidate and the repo's
+/// input globs ([`Facts::gitignored_inputs`]), and the first candidate in word order they give back decides, shown as
+/// the word wrote it. `None` when there is no candidate or none is given back.
+fn gitignored_reason(matched: &Matched, facts: &dyn Facts) -> Option<LocalReason> {
+    let place = &matched.target.place;
+    let words = &matched.words[..script_start(&matched.words)];
+    let words = &words[..words.iter().position(|word| word == SEPARATOR).unwrap_or(words.len())];
+    let folders = folders_from(words);
+    let outputs = if folders.is_some() {
+        output_values(words)
+    } else {
+        vec![false; words.len()]
+    };
+    let candidates: Vec<(&str, String)> = words
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !outputs[*index])
+        .flat_map(|(index, word)| input_values(word).into_iter().map(move |value| (index, value)))
+        .filter(|(index, value)| is_input_file(value) || folders.is_some_and(|from| *index >= from))
+        .filter_map(|(_, value)| input_path(&place.prefix, value).map(|path| (value, path)))
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    let asked: Vec<String> = candidates
+        .iter()
+        .filter(|(_, path)| seen.insert(path.as_str()))
+        .map(|(_, path)| path.clone())
+        .collect();
+    let ignored = facts.gitignored_inputs(place, &asked, &matched.target.inputs);
+    candidates
+        .into_iter()
+        .find(|(_, path)| ignored.contains(path))
+        .map(|(shown, _)| LocalReason::GitignoredInput { path: shown.to_owned() })
+}
+
+/// The options of a dotnet command whose value names something the command writes, matched in any letter case.
+const WRITTEN_OPTIONS: [&str; 11] = [
+    "-o",
+    "--output",
+    "--results-directory",
+    "--diag",
+    "-d",
+    "--artifacts-path",
+    "-bl",
+    "--binaryLogger",
+    "-fl",
+    "-flp",
+    "--fileLoggerParameters",
+];
+
+/// For each of a dotnet command's `words`, whether it holds an output option's value ([`WRITTEN_OPTIONS`]): the option
+/// word itself when its value is joined to it by `=` or `:` (`--output=x`, `-bl:x`), else the word after it.
+fn output_values(words: &[String]) -> Vec<bool> {
+    let mut outputs = vec![false; words.len()];
+    for (index, word) in words.iter().enumerate() {
+        let name = word.split_once(['=', ':']).map_or(word.as_str(), |(name, _)| name);
+        if !WRITTEN_OPTIONS.iter().any(|option| eq_ignoring_case(name, option)) {
+            continue;
+        }
+        let at = if name.len() < word.len() { index } else { index + 1 };
+        if let Some(output) = outputs.get_mut(at) {
+            *output = true;
+        }
+    }
+    outputs
+}
+
+/// The index of the first of `words` a folder candidate may come from: the word after the verb of a command whose
+/// program word, the first non-empty one, names `dotnet` ([`names_program`]); `None` for any other command.
+fn folders_from(words: &[String]) -> Option<usize> {
+    let (first, program) = first_word(words)?;
+    if !names_program(program, "dotnet") {
+        return None;
+    }
+    let verb = words[first + 1..].iter().position(|word| !word.is_empty());
+    Some(verb.map_or(words.len(), |at| first + 1 + at + 1))
+}
+
+/// The values of `word` that may name a build's input: the path after a response file's `@`, alone; else the whole
+/// word, then each piece of its value, split on `;` and `,` as an `MSBuild` list is, a piece holding `=` taken after its
+/// first `=`. The value is the text after the word's first `=`, or, for a switch (a word starting with `-` or `/`)
+/// holding no `=`, after its first `:` (`-p:`, `/p:`).
+fn input_values(word: &str) -> Vec<&str> {
+    if let Some(file) = word.strip_prefix(RESPONSE_FILE) {
+        return vec![file];
+    }
+    let switch = word.starts_with(['-', '/']);
+    let value = word
+        .split_once('=')
+        .or_else(|| word.split_once(':').filter(|_| switch))
+        .map(|(_, value)| value);
+    let pieces = value
+        .into_iter()
+        .flat_map(|value| value.split([';', ',']))
+        .map(|piece| piece.split_once('=').map_or(piece, |(_, after)| after));
+    std::iter::once(word).chain(pieces).collect()
+}
+
+/// The characters no relative path a candidate names holds: a drive's or a switch's `:`, a glob's wildcards and those
+/// Windows refuses in a name.
+const NOT_IN_INPUT_PATH: [char; 8] = [':', '*', '?', '[', '"', '<', '>', '|'];
+
+/// The path `value`, written with `/` or `\`, names below the gate's folder `prefix` (`sub/dir/`, empty at the root),
+/// `/`-separated from the worktree root with its `.` segments dropped and each `..` taking off the segment before it.
+/// `None` for a value that is empty, starts with a separator or `-`, holds any of [`NOT_IN_INPUT_PATH`], climbs above
+/// the root, or names the root itself.
+fn input_path(prefix: &str, value: &str) -> Option<String> {
+    if value.is_empty() || value.starts_with(['-', '/', '\\']) || value.contains(NOT_IN_INPUT_PATH) {
+        return None;
+    }
+    let mut segments: Vec<&str> = prefix.split('/').filter(|segment| !segment.is_empty()).collect();
+    for segment in value.split(['/', '\\']) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            _ => segments.push(segment),
+        }
+    }
+    (!segments.is_empty()).then(|| segments.join("/"))
 }
 
 /// What a pick of `builder` runs as far as a macOS builder's rewrite goes: for a macOS builder, the opened worktree's

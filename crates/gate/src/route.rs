@@ -16,7 +16,7 @@ use gate_router::warm::FileRead;
 use gate_router::windows::{self, WindowsChange};
 use gate_router::{
     Config, ConfigProblem, Facts, FolderId, Inputs, LaterCandidate, LocalReason, Pattern, PinRefusal, Place, RemoteRun, Route, SiblingFolder,
-    SiblingRoot, Target, decide, dropped_env, dropped_env_line, escaped, repo_name,
+    SiblingRoot, Target, decide, dropped_env, dropped_env_line, escaped, is_input_file, is_project_or_solution, repo_name,
 };
 use gate_win32::Share;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -27,6 +27,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use crate::console::Console;
 use crate::dotnet_projects;
 use crate::no_build;
+use crate::outputs::glob::Globs;
 use crate::remote::{self, git, siblings};
 use crate::resolve::Environment;
 use crate::warm;
@@ -37,6 +38,8 @@ const LOCAL_FLAG: &str = "--local";
 const ANOTHER_WORKTREE: &str = "another worktree";
 /// The `notRouted` value of a matched command its repo's `.gate/local.toml` keeps here.
 const DECLARED_LOCAL: &str = "declared local";
+/// The `notRouted` value of a matched command kept here because a word names a gitignored project input.
+const GITIGNORED_INPUT: &str = "gitignored input";
 /// The declaration file of the prefixes of the caller's variables a repo's commands read.
 const ENV_NAME: &str = "env.toml";
 /// The largest file of `.gate` the gate reads: 64 KiB.
@@ -342,7 +345,8 @@ fn consented_hash(remote: &RemoteRun, machine: &Machine<'_>) -> Option<String> {
 
 /// The queue line's `notRouted`: `--local` for a heavy gate its caller kept here with `--local`, `another worktree`
 /// for a matched command whose outside path lies in another git worktree, `declared local` for one its repo's
-/// `.gate/local.toml` keeps here, by a pattern or by a problem, else none.
+/// `.gate/local.toml` keeps here, by a pattern or by a problem, `gitignored input` for one whose word names a gitignored
+/// project input, else none.
 pub(crate) fn not_routed(route: &Route) -> Option<String> {
     match route {
         Route::Local {
@@ -354,8 +358,45 @@ pub(crate) fn not_routed(route: &Route) -> Option<String> {
         Route::Local {
             reason: Some(LocalReason::DeclaredLocal { .. } | LocalReason::LocalFile { .. }),
         } => Some(DECLARED_LOCAL.to_owned()),
+        Route::Local {
+            reason: Some(LocalReason::GitignoredInput { .. }),
+        } => Some(GITIGNORED_INPUT.to_owned()),
         _ => None,
     }
+}
+
+/// The exclusions of the input globs a word's project input is matched against ([`Machine::uncovered`]): none, a
+/// regex no path matches. The inputs' own exclusions hold only for paths no project input has.
+const NOTHING_EXCLUDED: &str = r"[^\s\S]";
+
+/// The files the candidate `path`, `/`-separated below `root`, names as a build's input: itself when it has an input
+/// file's extension ([`is_input_file`]) and is a file; else, when it is a folder, each file directly in it that is a
+/// project or solution file ([`is_project_or_solution`]), in the order the folder lists them; else none.
+///
+/// # Errors
+///
+/// Why the folder `path` names cannot be listed.
+fn input_files(root: &Path, path: &str) -> Result<Vec<String>, String> {
+    let on_disk = root.join(path);
+    if is_input_file(path) {
+        return Ok(if on_disk.is_file() { vec![path.to_owned()] } else { Vec::new() });
+    }
+    if !on_disk.is_dir() {
+        return Ok(Vec::new());
+    }
+    let cannot = |error: io::Error| format!("cannot list {}: {error}", escaped(path));
+    let mut files = Vec::new();
+    for entry in fs::read_dir(&on_disk).map_err(cannot)? {
+        let entry = entry.map_err(cannot)?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if is_project_or_solution(name) && entry.file_type().map_err(cannot)?.is_file() {
+            files.push(format!("{path}/{name}"));
+        }
+    }
+    Ok(files)
 }
 
 fn slot(slot: Slot) -> gate_router::Slot {
@@ -406,8 +447,9 @@ pub(crate) struct Machine<'a> {
     /// ([`Facts::windows_change`]): [`CHANGE_DEADLINE`], or the `--test-git-limit-ms` seam when it is given; the hint's
     /// decision's own git limit for the hint's ([`would_route_on_heavy`]).
     change_deadline: Duration,
-    /// Whether a read of the change could not tell it ([`Facts::windows_change`]): the hint's decision then gives no
-    /// hint ([`would_route_on_heavy`]).
+    /// Whether a read of the change could not tell it ([`Facts::windows_change`]), or which words are gitignored could
+    /// not be told for every candidate ([`Facts::gitignored_inputs`]): the hint's decision then gives no hint
+    /// ([`would_route_on_heavy`]).
     change_unknown: Cell<bool>,
     /// Whether a placement call's readers get as long as git itself may take once it exits by itself
     /// ([`git::placing_drain`]): true for the decision, false for the hint's, which keeps the ordinary drain while the
@@ -532,6 +574,57 @@ impl<'a> Machine<'a> {
             .filter(|path| listed.iter().any(|file| lists_path(file, path.as_bytes())))
             .cloned()
             .collect())
+    }
+
+    /// Each of `paths`, relative to `root`, that names files ([`input_files`]) none of `globs` matches, with those files:
+    /// a path naming no file, or a file an input glob carries, is left out, and so is one whose folder cannot be
+    /// listed, saying why ([`Machine::cannot_tell`]).
+    fn uncovered<'p>(&self, root: &Path, paths: &'p [String], globs: &Globs) -> Vec<(&'p String, Vec<String>)> {
+        let mut judged = Vec::new();
+        for path in paths {
+            match input_files(root, path) {
+                Ok(files) if !files.is_empty() && !files.iter().any(|file| globs.matches(file)) => judged.push((path, files)),
+                Ok(_) => {}
+                Err(why) => self.cannot_tell(&why),
+            }
+        }
+        judged
+    }
+
+    /// Which of `files`, relative to `root`, one `git check-ignore -z --stdin` in the root reports ignored; a tracked
+    /// file is never reported.
+    ///
+    /// # Errors
+    ///
+    /// Why git cannot be started, failed, with its status and last error lines ([`git::git_failure`]), or wrote what
+    /// cannot be read.
+    fn check_ignore(&self, root: &Path, files: &[&String]) -> Result<Vec<String>, String> {
+        let input: Vec<u8> = files.iter().flat_map(|file| file.bytes().chain([0])).collect();
+        let args = ["check-ignore", "-z", "--stdin"];
+        let call = git::Call {
+            stdin: Some(&input),
+            ..self.git_call(root, &args)
+        };
+        let (mut ran, errors) = git::Git::find(root)?.run_kept(&call)?;
+        // 1 says no path is ignored; anything but 0 and 1 is git's own failure.
+        if !matches!(ran.status.code(), Some(0 | 1)) {
+            return Err(format!("git check-ignore failed: {}", git::git_failure(ran.status.code(), &errors)));
+        }
+        let mut listing = Vec::new();
+        ran.stdout
+            .read_to_end(&mut listing)
+            .map_err(|error| format!("cannot read git check-ignore's output: {error}"))?;
+        let listing = String::from_utf8(listing).map_err(|_| "git check-ignore's output is not valid UTF-8".to_owned())?;
+        Ok(listing.split('\0').filter(|file| !file.is_empty()).map(str::to_owned).collect())
+    }
+
+    /// Says in the log why which words are gitignored cannot be told, and marks the decision as one that gives no
+    /// route hint ([`Machine::change_unknown`]).
+    fn cannot_tell(&self, why: &str) {
+        self.notes
+            .borrow_mut()
+            .push(format!("gate: cannot tell which words are gitignored: {why}"));
+        self.change_unknown.set(true);
     }
 
     /// What the change of the worktree at `place`, and of each of `siblings` an entry names, is to the paths its
@@ -848,6 +941,47 @@ impl Facts for Machine<'_> {
                 .push(format!("gate: cannot tell what the snapshot carries: {why}"));
             Vec::new()
         })
+    }
+
+    /// The files each path names that no input glob of `inputs` matches, as the inputs' own matcher matches them
+    /// ([`Machine::uncovered`]), are asked of one `git check-ignore` ([`Machine::check_ignore`]), made only when there is
+    /// such a file; a path is given back when git reports every one of its files ignored. When that call fails, each
+    /// path's files are asked alone, and each path whose call fails too is left out, saying why
+    /// ([`Machine::cannot_tell`]): one path git refuses (one in a submodule) hides no other.
+    fn gitignored_inputs(&self, place: &Place, paths: &[String], inputs: &[String]) -> Vec<String> {
+        let root = Path::new(&place.root);
+        let globs = match Globs::inputs(inputs, NOTHING_EXCLUDED) {
+            Ok(globs) => globs,
+            Err(why) => {
+                self.cannot_tell(&why);
+                return Vec::new();
+            }
+        };
+        let judged = self.uncovered(root, paths, &globs);
+        if judged.is_empty() {
+            return Vec::new();
+        }
+        let all_ignored = |files: &[String], ignored: &[String]| files.iter().all(|file| ignored.contains(file));
+        let every: Vec<&String> = judged.iter().flat_map(|(_, files)| files).collect();
+        let kept: Vec<&String> = match self.check_ignore(root, &every) {
+            Ok(ignored) => judged
+                .iter()
+                .filter(|(_, files)| all_ignored(files, &ignored))
+                .map(|(path, _)| *path)
+                .collect(),
+            Err(_) => judged
+                .iter()
+                .filter(|(_, files)| match self.check_ignore(root, &files.iter().collect::<Vec<_>>()) {
+                    Ok(ignored) => all_ignored(files, &ignored),
+                    Err(why) => {
+                        self.cannot_tell(&why);
+                        false
+                    }
+                })
+                .map(|(path, _)| *path)
+                .collect(),
+        };
+        kept.into_iter().cloned().collect()
     }
 
     fn subst_target(&self, letter: char) -> Option<String> {

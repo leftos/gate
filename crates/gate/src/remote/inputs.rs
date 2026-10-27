@@ -21,7 +21,7 @@ use gate_win32::Interrupt;
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_DELETE_ON_CLOSE, FILE_SHARE_READ};
 
 use super::client::{Attempt, Called, End, RawSink, Watch};
-use super::git::{Call, Git, GitBounds, GitError, failure_text};
+use super::git::{Call, Git, GitBounds, GitError, git_failure};
 use super::outputs::{Archive, DELETE, GENERIC_WRITE, Unbuilt, sha256_for};
 use super::payload::{self, InputsStep, Location};
 use super::watchdog::{self, Cut};
@@ -264,19 +264,6 @@ fn ignored(asked: &Asked<'_>, found: &[Found]) -> Result<HashSet<String>, Unbuil
         .map_err(|error| failed(error.to_string()))?;
     let listed = String::from_utf8(listed).map_err(|_| failed("its output is not UTF-8".to_owned()))?;
     Ok(listed.split('\0').filter(|path| !path.is_empty()).map(str::to_owned).collect())
-}
-
-/// Why git failed with the exit `code`, `None` when it had none, having written `errors` on standard error: `status
-/// <n>`, then its last error lines when it wrote any.
-fn git_failure(code: Option<i32>, errors: &[u8]) -> String {
-    let status = code.map_or_else(|| "unknown".to_owned(), |code| code.to_string());
-    let errors = String::from_utf8_lossy(errors);
-    let lines: Vec<&str> = errors.lines().filter(|line| !line.trim().is_empty()).collect();
-    if lines.is_empty() {
-        format!("status {status}")
-    } else {
-        format!("status {status}: {}", failure_text(&lines))
-    }
 }
 
 /// The most bytes one put unpacks on the box, decompressed: 4 GiB, unless `--test-remote-inputs-budget-bytes` says

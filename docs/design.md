@@ -684,6 +684,10 @@ The lines of a run that starts its command:
 
   A word outside the worktree whose path lies in another git worktree of a repo `remote.json` lists says instead `gate: not routed: the command works in <tree>; run it with --cd <tree>` ([Routing](#routing), the decision). `<tree>` is the worktree's absolute path written with `\`, escaped like the sibling lines, and in double quotes when it holds a space or any of `; & ' ( ) , = $` or the backtick.
 
+  A matched command with a word that names an existing project input the snapshot leaves out, because git ignores it, says `gate: not routed: <path> is gitignored, so the snapshot leaves it out`, `<path>` as the word wrote it and escaped ([Routing](#routing), the decision). A light run kept here gets no route hint.
+
+  A failed `git check-ignore` that leaves a word unjudged says `gate: cannot tell which words are gitignored: <why>` in the log, and the run routes.
+
   It is also said for a word of the command that is not valid Unicode (`gate: not routed: a word of the command is not valid Unicode`), or a fact that could not be read (`gate: not routed: cannot run git: <error>`, or the working directory or git's output).
 
   These lines keep a matched command here for siblings: a problem with the repo's `.gate/siblings.toml` (`gate: not routed: .gate/siblings.toml: <problem>`, control characters and reordering marks escaped), a declared sibling with no worktree beside the root (`gate: not routed: sibling <name> not found beside the worktree`), a root folder name the builder cannot lay out (`gate: not routed: the worktree folder name <leaf> cannot be laid out on the builder`).
@@ -1134,7 +1138,7 @@ The event's own fields:
 
 | Event | Fields after the common ones |
 |---|---|
-| `queue` | `log` (the log's full path), `notRouted` (written right after `log`, only when a heavy gate was kept local with `--local`, with the value `--local`, or when a matched command's outside path lies in another worktree of a listed repo and the run says to `--cd` it, with the value `another worktree`, or when a matched command's repo `.gate/local.toml` keeps it here, by a pattern or by a problem, with the value `declared local`; every other reason for a local run, the plain outside line included, writes none), `reason` (the free text the run gave `--reason`, written after `notRouted`, when it gave one; absent otherwise), `pinned` (`true`, written after `reason`, only when the run was given `--builder`; absent otherwise) |
+| `queue` | `log` (the log's full path), `notRouted` (written right after `log`, only when a heavy gate was kept local with `--local`, with the value `--local`, or when a matched command's outside path lies in another worktree of a listed repo and the run says to `--cd` it, with the value `another worktree`, or when a matched command's repo `.gate/local.toml` keeps it here, by a pattern or by a problem, with the value `declared local`, or when a matched command's word names a gitignored project input, with the value `gitignored input`; every other reason for a local run, the plain outside line included, writes none), `reason` (the free text the run gave `--reason`, written after `notRouted`, when it gave one; absent otherwise), `pinned` (`true`, written after `reason`, only when the run was given `--builder`; absent otherwise) |
 | `take` | `slots` (the slot names taken; a critical gate lists every heavy and light slot it holds; a `none` run lists none, `[]`, with `waitedSeconds` 0.0), `waitedSeconds`, optionally `parentPid` (also on the late take of a covered gate), and for a critical gate `counts`, `otherHeld`, then `otherClaims` or `snapshotError` |
 | `release` | `slots` (the same list), `heldSeconds`, `status` (null when the gate failed before its command had one), `wallSeconds`, `adjustedSeconds`, optionally `avgCores`, `peakCores`, `freeCores`, `verdict`, the [run trace](GLOSSARY.md#run-trace) (`cpuSeconds`, `processes`, `peakProcesses`, `priority`, `loadFreeShare`, `children`, `phases`), and `cold` for a cold routed run |
 | `abandon` | `waitedSeconds`: the gate ended while still queued (Ctrl+C while waiting for a slot, or, for a routed run, while its client waited to start or while it waited for its work folder's key, remote-tagged) |
@@ -1890,7 +1894,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A paths entry that names a sibling not in `.gate/siblings.toml` is a file problem, so that change counts as unknown. Format: [remote.json](#remotejson) (the `.gate` readers).
 
-  A matched command still runs here, saying why, when a word names a path outside the worktree (a drive-relative, root-relative, share, device or climbing form included, see [the path rewrite](#routing)) or the gate's folder holds nothing the snapshot sends. The one exception is a first word naming a program by an absolute path, which the path rewrite sends as the program's name unless it refuses the name.
+  A matched command still runs here, saying why, when a word names a path outside the worktree (a drive-relative, root-relative, share, device or climbing form included, see [the path rewrite](#routing)) the gate's folder holds nothing the snapshot sends, or a word names a gitignored project input the snapshot leaves out ([Routing](#routing), the decision). The one exception is a first word naming a program by an absolute path, which the path rewrite sends as the program's name unless it refuses the name.
 
   `--no-build` is dropped from the builder's words of a dotnet `test` or `run` command, saying so (T4); `build`, `msbuild`, `pack` and `publish` keep it everywhere. A fallback here decides `--no-build` again for the run here, as a Local route does (below), whatever the refusal: the word stays when the worktree has no nothing-back record and every project the command builds has `obj\project.assets.json`, so the run tests the PC's own build, else it drops. The record is what an earlier routed step (a repo's test-all build) leaves when it built only on the builder, where a `dotnet test --no-build` here would find no build output.
 
@@ -2050,6 +2054,14 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A root whose id cannot be read keeps the run here with `gate: not routed: cannot read the id of the worktree folder <root>: <error>`, since the worktree lock of every routed run is named by it, and the client checks the folder it opens against it.
 
+  A matched command that would otherwise route stays local when a word names a project input the snapshot leaves out (`gitignored_reason`, after the nothing-sent check), saying `gate: not routed: <path> is gitignored, so the snapshot leaves it out` and journalling `notRouted: "gitignored input"`. The local run is a stopgap: carrying the files to the builder is GATE-806.
+
+  A candidate is an existing file with an extension of `.csproj .fsproj .vbproj .proj .sln .slnx .slnf .targets .props .rsp .runsettings`, or, in a `dotnet` command after the verb, a folder in which every project or solution file directly inside is gitignored; a candidate an `inputs` glob covers is not one, since `inputs` puts it back ([remote.json](#remotejson)).
+
+  Candidates come from whole words, switch values after `=` or a colon, MSBuild lists split on `;` and `,`, and `@file`. Never read: script text, words after a bare `--`, and the values of the dotnet output options (`-o`, `--output`, `--results-directory`, `--diag`, `-d`, `--artifacts-path`, `-bl`, `--binaryLogger`, `-fl`, `-flp`, `--fileLoggerParameters`).
+
+  One `git check-ignore -z --stdin` call judges every candidate. When it fails, each candidate is asked alone; one git refuses (in a submodule, say) gets the log note `gate: cannot tell which words are gitignored: <why>`, and the run routes with the light-run hint withheld.
+
   A command the repo keeps on this PC is declared in its `.gate/local.toml`, `patterns = [...]` of at most 32 `-like` patterns matched against the rewritten words joined by single spaces, like the `repos` and `desktop` patterns. The check runs right after the `repos` patterns match and before the siblings and desktop checks, on the file read as `desktop.toml` is (guarded, at most 64 KiB, else from the declarations folder), and needs no consent in `remote.json`, since it only narrows routing.
 
   The first pattern the words match keeps the run here with `gate: not routed: .gate/local.toml keeps it here (<pattern>)` (escaped). A file that cannot be used keeps every routed command of the repo here with `gate: not routed: .gate/local.toml: <problem>`, the first problem, on one line and escaped. Both journal `notRouted: "declared local"`, a copy from the declarations folder is named by its full path, a light run so kept gets no route hint, and `gate check` does not report the file.
@@ -2076,7 +2088,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   It reads (root, prefix below the root and common git folder), and a folder below the root asks `git ls-files` whether the snapshot would send anything there (tracked or untracked and not ignored, and still on disk). A `subst` drive is followed through `gate_win32::device_target`. A word that is not valid Unicode keeps a command that would route here, saying so.
 
-  The queue line carries `notRouted` `--local` for a heavy `--local` gate, `another worktree` or `declared local` for the runs those reasons keep here, the run's `--reason` text after it, and the remote tag for a routed one.
+  The queue line carries `notRouted` `--local` for a heavy `--local` gate, `another worktree`, `declared local` or `gitignored input` for the runs those reasons keep here, the run's `--reason` text after it, and the remote tag for a routed one.
 
   When the remote client has a part missing, the routed run falls back before it takes a remote slot: the `fallback` line has reason `client`, the gate says `gate: remote <host> client could not start: ...; running here`, and the later `take` and `release` carry no remote fields.
 - **The routing file's text** is JSON with `//` and `/* */` comments and trailing commas allowed outside strings, and a leading byte order mark skipped, as the PowerShell gate's reader allows. Keys match in any letter case, and unknown keys are ignored.

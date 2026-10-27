@@ -125,6 +125,10 @@ pub struct FakeFacts {
     pub windows_change: WindowsChange,
     /// How many times that was asked, kept apart from [`FakeFacts::asked`].
     pub windows_change_asked: Cell<u32>,
+    /// The paths, `/`-separated from the root, that name a gitignored project input the snapshot leaves out.
+    pub gitignored: Vec<String>,
+    /// Each gitignored-inputs question, its paths then `|` and the input globs, kept apart from [`FakeFacts::asked`].
+    pub gitignored_asked: RefCell<Vec<String>>,
 }
 
 impl FakeFacts {
@@ -165,6 +169,8 @@ impl FakeFacts {
             windows_only_asked: Cell::new(0),
             windows_change: WindowsChange::Untouched,
             windows_change_asked: Cell::new(0),
+            gitignored: Vec::new(),
+            gitignored_asked: RefCell::new(Vec::new()),
         }
     }
 
@@ -271,6 +277,14 @@ impl Facts for FakeFacts {
                 .any(|file| file == path || file.strip_prefix(path).is_some_and(|rest| rest.starts_with('/')))
         };
         paths.iter().filter(|path| carried(path)).cloned().collect()
+    }
+
+    /// Each path asked that is in [`FakeFacts::gitignored`].
+    fn gitignored_inputs(&self, _place: &Place, paths: &[String], inputs: &[String]) -> Vec<String> {
+        self.gitignored_asked
+            .borrow_mut()
+            .push(format!("{} | {}", paths.join(" "), inputs.join(" ")));
+        paths.iter().filter(|path| self.gitignored.contains(path)).cloned().collect()
     }
 
     fn subst_target(&self, letter: char) -> Option<String> {

@@ -421,6 +421,23 @@ fn a_long_light_pass_whose_command_would_route_on_heavy_says_so() {
 }
 
 #[test]
+fn a_long_light_pass_whose_command_names_a_gitignored_project_says_nothing() {
+    let case = routed_case("a_long_light_pass_whose_command_names_a_gitignored_project_says_nothing");
+    let probe = case.folder().join(".tmp").join("probe");
+    fs::write(case.folder().join(".gitignore"), ".tmp/\n").expect("the ignore file can be written");
+    fs::create_dir_all(&probe).expect("the probe folder can be made");
+    fs::write(probe.join("Probe.csproj"), "<Project />\n").expect("the probe can be written");
+    let mut extra = HINT_FLOOR.to_vec();
+    extra.extend(GIT_HANG_GUARDS);
+
+    let command = [r".\tool.exe", "sleep", "2000", "out", ".tmp/probe/Probe.csproj"];
+    let outcome = case.run(&run_words("out.log", &extra, &command));
+
+    assert_eq!((outcome.code, outcome.stderr.as_str()), (Some(0), ""), "{outcome:?}");
+    assert_no_route_hint(&outcome);
+}
+
+#[test]
 fn a_long_light_pass_whose_hint_git_call_cannot_answer_says_nothing() {
     let case = routed_case("a_long_light_pass_whose_hint_git_call_cannot_answer_says_nothing");
     let mut extra = HINT_FLOOR.to_vec();

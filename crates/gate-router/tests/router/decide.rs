@@ -3858,3 +3858,216 @@ fn a_file_without_builders_gives_the_target_it_always_gave() {
         })
     );
 }
+
+/// The line of a command kept here because its word names the gitignored project input `path`.
+fn gitignored_line(path: &str) -> String {
+    format!("gate: not routed: {path} is gitignored, so the snapshot leaves it out")
+}
+
+/// A gate at `prefix` below the root, under a routing file routing every command of `yaat`, whose facts report the
+/// paths `ignored` as gitignored project inputs.
+fn ignoring(prefix: &str, ignored: &[&str]) -> FakeFacts {
+    FakeFacts {
+        config: Ok(Some(routing_all())),
+        gitignored: words(ignored),
+        ..FakeFacts::at(prefix)
+    }
+}
+
+#[test]
+fn a_word_naming_a_gitignored_project_input_keeps_the_command_here_saying_so() {
+    let cases: [(&[&str], &str, &str, &str); 11] = [
+        (
+            &[
+                "dotnet",
+                "build",
+                "-p:Configuration=Release;CustomAfterMicrosoftCommonTargets=.tmp/probe/probe.targets",
+            ],
+            "",
+            ".tmp/probe/probe.targets",
+            ".tmp/probe/probe.targets",
+        ),
+        (
+            &["dotnet", "build", "-p:CustomAfterMicrosoftCommonTargets=.tmp/a.targets;.tmp/b.targets"],
+            "",
+            ".tmp/b.targets",
+            ".tmp/b.targets",
+        ),
+        (
+            &["dotnet", "test", ".tmp/probe/Probe.csproj"],
+            "",
+            ".tmp/probe/Probe.csproj",
+            ".tmp/probe/Probe.csproj",
+        ),
+        (&["dotnet", "test", r".tmp\probe"], "", ".tmp/probe", r".tmp\probe"),
+        (
+            &[
+                "dotnet",
+                "test",
+                "tests/A.Tests",
+                "-p:CustomAfterMicrosoftCommonTargets=.tmp/probe/probe.targets",
+            ],
+            "",
+            ".tmp/probe/probe.targets",
+            ".tmp/probe/probe.targets",
+        ),
+        (&["dotnet", "build", r"/p:Extra=.tmp\x.props"], "", ".tmp/x.props", r".tmp\x.props"),
+        (&["dotnet", "build", r"-p:.tmp\x.props"], "", ".tmp/x.props", r".tmp\x.props"),
+        (
+            &["dotnet", "test", "--settings", ".tmp/x.runsettings"],
+            "",
+            ".tmp/x.runsettings",
+            ".tmp/x.runsettings",
+        ),
+        (&["dotnet", "build", "@.tmp/args.rsp"], "", ".tmp/args.rsp", ".tmp/args.rsp"),
+        (
+            &["dotnet", "test", r"X:\dev\yaat.wt\a\.tmp\probe\P.csproj"],
+            "",
+            ".tmp/probe/P.csproj",
+            r".tmp\probe\P.csproj",
+        ),
+        (&["dotnet", "test", "./.tmp/P.CSPROJ"], "src/", "src/.tmp/P.CSPROJ", "./.tmp/P.CSPROJ"),
+    ];
+    for (command, prefix, ignored, shown) in cases {
+        let command = words(command);
+        let facts = ignoring(prefix, &[ignored]);
+        let route = decide(&heavy(&command), &facts);
+        assert_eq!(local_line(&route), Some(gitignored_line(shown)), "{command:?}");
+        let asked = facts.gitignored_asked.borrow();
+        assert_eq!(asked.len(), 1, "asked once: {asked:?}");
+        assert!(asked[0].split(' ').any(|path| path == ignored), "{asked:?}");
+        assert_eq!(head_asks(&facts), 0, "a command kept here asks no HEAD");
+    }
+}
+
+#[test]
+fn a_word_the_facts_do_not_call_gitignored_routes_as_before() {
+    let cases: [(&[&str], &str); 5] = [
+        (&["dotnet", "build", "-p:LogFile=.tmp/build.log"], ".tmp/build.log"),
+        (&["dotnet", "test", ".tmp/probe/Probe.csproj"], ".tmp/probe/Probe.csproj"),
+        (&["dotnet", "test", "src/A.csproj"], "src/A.csproj"),
+        (&["dotnet", "test", "-c", "Release"], "Release"),
+        (&["dotnet", "test", r"src\A\..\..\B.csproj"], "B.csproj"),
+    ];
+    for (command, judged) in cases {
+        let command = words(command);
+        let facts = ignoring("", &[]);
+        routed(decide(&heavy(&command), &facts));
+        let asked = facts.gitignored_asked.borrow();
+        assert_eq!(asked.len(), 1, "asked once: {asked:?}");
+        assert!(asked[0].split(' ').any(|path| path == judged), "the facts judge {judged}: {asked:?}");
+    }
+}
+
+#[test]
+fn a_gitignored_input_s_question_carries_the_repo_s_input_globs() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["*"]}, "inputs": {"yaat": [".tmp/**"]}}"#).expect("usable");
+    let command = words(&["dotnet", "test", ".tmp/x.csproj"]);
+    let facts = FakeFacts {
+        config: Ok(Some(config)),
+        ..FakeFacts::at_root()
+    };
+    routed(decide(&heavy(&command), &facts));
+    assert_eq!(*facts.gitignored_asked.borrow(), [".tmp/x.csproj | .tmp/**"]);
+}
+
+#[test]
+fn script_text_and_lone_switches_are_never_asked_about() {
+    let command = words(&["pwsh", "-Command", "dotnet test .tmp/p.csproj"]);
+    let facts = ignoring("", &[".tmp/p.csproj", "dotnet test .tmp/p.csproj"]);
+    routed(decide(&heavy(&command), &facts));
+    assert!(
+        facts.gitignored_asked.borrow().is_empty(),
+        "the script's text is not read: {:?}",
+        facts.gitignored_asked
+    );
+
+    let command = words(&["dotnet", "test", "-c", "Release"]);
+    let facts = ignoring("", &[]);
+    routed(decide(&heavy(&command), &facts));
+    assert_eq!(*facts.gitignored_asked.borrow(), ["Release | "], "a switch alone names no path");
+}
+
+#[test]
+fn a_dotnet_output_option_s_value_is_never_a_candidate() {
+    for command in [
+        &["dotnet", "test", "App.Tests.csproj", "--results-directory", ".tmp"][..],
+        &["dotnet", "test", "tests/A.Tests", "-o", ".tmp"],
+        &["dotnet", "test", "--OUTPUT=.tmp"],
+        &["dotnet", "build", "-bl:.tmp/x.props"],
+        &["dotnet", "build", "-flp:LogFile=.tmp"],
+        &["dotnet", "test", "--diag", ".tmp/x.props"],
+    ] {
+        let command = words(command);
+        let facts = ignoring("", &[".tmp", ".tmp/x.props"]);
+        routed(decide(&heavy(&command), &facts));
+        let asked = facts.gitignored_asked.borrow();
+        assert!(
+            asked.iter().all(|question| !question.contains(".tmp")),
+            "{command:?}: an output's value is not asked about: {asked:?}"
+        );
+    }
+}
+
+#[test]
+fn no_word_after_a_separator_is_a_candidate() {
+    for command in [
+        &["dotnet", "run", "--project", "tools/gen", "--", ".tmp/All.sln"][..],
+        &["cargo", "test", "--", ".tmp/All.sln"],
+    ] {
+        let command = words(command);
+        let facts = ignoring("", &[".tmp/All.sln"]);
+        routed(decide(&heavy(&command), &facts));
+        let asked = facts.gitignored_asked.borrow();
+        assert!(asked.iter().all(|question| !question.contains(".tmp")), "{command:?}: {asked:?}");
+    }
+}
+
+#[test]
+fn a_folder_is_a_candidate_only_after_a_dotnet_command_s_verb() {
+    for command in [
+        &["dotnet", "build"][..],
+        &[r"C:\Program Files\dotnet\DOTNET.EXE", "build"],
+        &["cargo", "build"],
+        &["cargo", "build", "--target-dir", "build"],
+        &["tool", "build", "x"],
+    ] {
+        let command = words(command);
+        let facts = ignoring("", &["build", "dotnet", "x"]);
+        let route = decide(&heavy(&command), &facts);
+        assert!(
+            !matches!(
+                route,
+                Route::Local {
+                    reason: Some(LocalReason::GitignoredInput { .. })
+                }
+            ),
+            "{command:?}: {route:?}"
+        );
+        let asked = facts.gitignored_asked.borrow();
+        assert!(
+            asked
+                .iter()
+                .all(|question| !question.split(' ').any(|path| path == "build" || path == "x")),
+            "{command:?}: {asked:?}"
+        );
+    }
+    let command = words(&["cargo", "build", "--manifest-path", ".tmp/p.props"]);
+    let facts = ignoring("", &[".tmp/p.props"]);
+    assert_eq!(
+        local_line(&decide(&heavy(&command), &facts)),
+        Some(gitignored_line(".tmp/p.props")),
+        "a file candidate is taken from any command"
+    );
+}
+
+#[test]
+fn a_word_outside_the_worktree_wins_over_a_gitignored_input() {
+    let command = words(&["dotnet", "test", ".tmp/p.csproj", r"..\other\x.csproj"]);
+    let facts = ignoring("", &[".tmp/p.csproj"]);
+    assert_eq!(
+        local_line(&decide(&heavy(&command), &facts)).as_deref(),
+        Some(r"gate: not routed: ..\other\x.csproj is outside the worktree")
+    );
+    assert!(facts.gitignored_asked.borrow().is_empty(), "{:?}", facts.gitignored_asked);
+}

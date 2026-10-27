@@ -980,6 +980,19 @@ pub(crate) fn first_bytes(text: &str, most: usize) -> &str {
     text.get(..end).unwrap_or_default()
 }
 
+/// Why git failed with the exit `code`, `None` when it had none, having written `errors` on standard error: `status
+/// <n>`, then its last error lines when it wrote any ([`failure_text`]).
+pub(crate) fn git_failure(code: Option<i32>, errors: &[u8]) -> String {
+    let status = code.map_or_else(|| "unknown".to_owned(), |code| code.to_string());
+    let errors = String::from_utf8_lossy(errors);
+    let lines: Vec<&str> = errors.lines().filter(|line| !line.trim().is_empty()).collect();
+    if lines.is_empty() {
+        format!("status {status}")
+    } else {
+        format!("status {status}: {}", failure_text(&lines))
+    }
+}
+
 /// The last [`FAILURE_LINES`] of a failed call's `lines`, each as its last carriage-return update leaves it, joined by
 /// ` | `, escaped and cut to their last [`FAILURE_BYTES`]: what a failure line carries of them. The characters are
 /// counted from the end by the width of their escapes and only those that fit are escaped, so the escaped text stays

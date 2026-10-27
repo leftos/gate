@@ -24,6 +24,8 @@ Every `--local` run must give `--reason "<why>"` (the gate refuses it otherwise)
 
 A command run from one worktree that names a path in another worktree of a listed repo stays local, saying `gate: not routed: the command works in <tree>; run it with --cd <tree>`. Run it again with `--cd <tree>` to route it from that worktree ([design.md, Routing](design.md#routing)). A path in an unlisted repo, on a network drive or in no worktree keeps the plain `is outside the worktree` line.
 
+A command whose word names an existing gitignored project input (a project, solution, `.targets`, `.props`, `.rsp` or `.runsettings` file, or a dotnet folder whose project files are all ignored) that no `inputs` glob covers stays local, saying `gate: not routed: <path> is gitignored, so the snapshot leaves it out`, and is journalled `notRouted: gitignored input`. List the file in `inputs` to route it ([design.md, Routing](design.md#routing)).
+
 ## Adding a repo
 
 1. Read the repo's own gate commands (its CLAUDE.md, nextup profile, justfile or package scripts) and the tools each needs: toolchains and their pins (`.gate/toolchain.toml`, `rust-toolchain.toml`, `global.json`), shells and utilities, package managers.

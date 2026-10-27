@@ -1757,6 +1757,160 @@ fn a_command_its_repo_declares_local_runs_here_saying_so_and_journals_declared_l
     assert_local(&events(&case), Some("declared local"));
 }
 
+/// Writes `text` as the case's `.gitignore` and an empty file at the `/`-separated `path`, with the folders above it.
+fn ignore_and_write(case: &Case, text: &str, path: &str) {
+    let folder = case.folder();
+    fs::write(folder.join(".gitignore"), text).expect("the ignore file can be written");
+    let file = folder.join(path);
+    fs::create_dir_all(file.parent().expect("the file has a folder")).expect("the file's folder can be made");
+    fs::write(&file, "<Project />\n").expect("the file can be written");
+}
+
+/// Runs `.\tool.exe out <path>` as a routed heavy gate of `case`, recording the client's call; the outcome and whether
+/// the client ran.
+fn run_routed_naming(case: &Case, path: &str) -> (Outcome, bool) {
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "out", path])));
+    (outcome, call.exists())
+}
+
+#[test]
+fn a_command_naming_a_gitignored_project_runs_here_and_says_why() {
+    let case = routed_case("routing-gitignored-project");
+    ignore_and_write(&case, ".tmp/\n", ".tmp/probe/Probe.csproj");
+
+    let (outcome, called) = run_routed_naming(&case, ".tmp/probe/Probe.csproj");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!called, "the client never ran: {outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: not routed: .tmp/probe/Probe.csproj is gitignored, so the snapshot leaves it out\n"),
+        "{outcome:?}"
+    );
+    assert!(outcome.stdout.contains(".tmp/probe/Probe.csproj"), "the command ran here: {outcome:?}");
+    assert_local(&events(&case), Some("gitignored input"));
+}
+
+#[test]
+fn a_command_naming_a_gitignored_project_an_inputs_glob_covers_still_routes() {
+    let case = routed_case("routing-gitignored-project-input");
+    let routing = json!({ "host": HOST, "repos": { repo(&case): ["*tool*"] }, "inputs": { repo(&case): [".tmp/**"] } });
+    write_remote_json(&case, &routing.to_string());
+    ignore_and_write(&case, ".tmp/\n", ".tmp/probe/Probe.csproj");
+
+    let (outcome, called) = run_routed_naming(&case, ".tmp/probe/Probe.csproj");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(called, "the run routed: {outcome:?}");
+    assert!(!outcome.stderr.contains("gitignored"), "{outcome:?}");
+}
+
+#[test]
+fn a_command_naming_a_tracked_project_still_routes() {
+    let case = routed_case("routing-tracked-project");
+    ignore_and_write(&case, "*.csproj\n", "src/A.csproj");
+    git(&case, &["add", "-f", "src/A.csproj"]);
+
+    let (outcome, called) = run_routed_naming(&case, "src/A.csproj");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(called, "a tracked file is in the snapshot, ignored or not: {outcome:?}");
+    assert!(!outcome.stderr.contains("gitignored"), "{outcome:?}");
+}
+
+#[test]
+fn a_dotnet_command_naming_a_gitignored_project_folder_runs_here_and_says_why() {
+    let case = routed_case("routing-gitignored-folder");
+    copy_tool(&case, "dotnet.exe");
+    ignore_and_write(&case, ".tmp/\n", ".tmp/probe/Probe.csproj");
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\dotnet.exe", "test", r".tmp\probe"])));
+
+    assert!(!call.exists(), "the client never ran: {outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: not routed: .tmp\\probe is gitignored, so the snapshot leaves it out\n"),
+        "{outcome:?}"
+    );
+    assert_local(&events(&case), Some("gitignored input"));
+}
+
+#[test]
+fn a_dotnet_command_naming_a_folder_with_a_tracked_project_still_routes() {
+    let case = routed_case("routing-gitignored-folder-mixed");
+    copy_tool(&case, "dotnet.exe");
+    ignore_and_write(&case, "*.Ignored.csproj\n", "proj/A.csproj");
+    git(&case, &["add", "proj/A.csproj"]);
+    fs::write(case.folder().join("proj").join("B.Ignored.csproj"), "<Project />\n").expect("the file can be written");
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\dotnet.exe", "test", "proj"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(call.exists(), "the builder has the tracked project, so the run routed: {outcome:?}");
+    assert!(!outcome.stderr.contains("gitignored"), "{outcome:?}");
+}
+
+/// Makes the case's folder `sub` a repository of its own holding a committed `A.csproj`, added to the case's index as
+/// a submodule's entry, which `git check-ignore` refuses to judge a path in.
+fn with_submodule(case: &Case) {
+    let sub = case.folder().join("sub");
+    git(case, &["init", "--quiet", "sub"]);
+    fs::write(sub.join("A.csproj"), "<Project />\n").expect("the file can be written");
+    commit_all(case, &sub, "sub");
+    git(case, &["add", "sub"]);
+}
+
+#[test]
+fn a_command_whose_gitignored_check_fails_routes_and_says_why_in_the_log() {
+    let case = routed_case("routing-gitignored-check-fails");
+    with_submodule(&case);
+
+    let (outcome, called) = run_routed_naming(&case, "sub/A.csproj");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(called, "a check that cannot be told routes: {outcome:?}");
+    let log = log_texts(&case.folder().join("out.log"));
+    assert!(
+        log.contains("gate: cannot tell which words are gitignored: git check-ignore failed: status "),
+        "{log}"
+    );
+}
+
+#[test]
+fn a_path_git_refuses_hides_no_gitignored_project_beside_it() {
+    let case = routed_case("routing-gitignored-beside-submodule");
+    with_submodule(&case);
+    ignore_and_write(&case, ".tmp/\n", ".tmp/probe/Probe.csproj");
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let command = [r".\tool.exe", "out", "sub/A.csproj", "out", ".tmp/probe/Probe.csproj"];
+
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &command)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!call.exists(), "the client never ran: {outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: not routed: .tmp/probe/Probe.csproj is gitignored, so the snapshot leaves it out\n"),
+        "{outcome:?}"
+    );
+    let log = log_texts(&case.folder().join("out.log"));
+    assert_eq!(
+        log.matches("gate: cannot tell which words are gitignored: ").count(),
+        1,
+        "one note, for sub/A.csproj alone: {log}"
+    );
+}
+
 #[test]
 fn a_command_its_repo_does_not_declare_local_routes() {
     let case = routed_case("routing-declared-local-other");
