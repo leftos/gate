@@ -31,6 +31,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::answer::USAGE_STATUS;
+use crate::boxside::drain;
 use crate::boxside::inputs::{
     Leftover, SCRATCH_SUFFIX_DIGITS, STAGED_ACCESS, Stage, StageNamed, WorkLock, locked, made_stage_named, not_the_box_s, plain_copy,
     protected_folder, protected_security, removed_stage, same_stage, staged_files,
@@ -136,9 +137,10 @@ struct Wanted {
     size: u64,
 }
 
-/// Answers `gate box lfs`: the request read, an unelevated box refused, then the manifest read from stdin before any
-/// lock is taken, so a client that stalls holds nothing; then the step. A payload refused is a usage error (2); any
-/// other failure is refused `lfs` and fails the step (1).
+/// Answers `gate box lfs`: the request read, the call passed through the drain ([`drain::passed`]) or refused `drain`
+/// (75), an unelevated box refused, then the manifest read from stdin before any lock is taken, so a client that
+/// stalls holds nothing; then the step. A payload refused is a usage error (2); any other failure is refused `lfs` and
+/// fails the step (1).
 pub(super) fn lfs(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
     let asked = match Asked::read(payload) {
         Ok(asked) => asked,
@@ -146,6 +148,11 @@ pub(super) fn lfs(payload: &Payload, seams: &BoxSeams, console: &mut Console) ->
             stamping::err(console, &line);
             return u32::from(USAGE_STATUS);
         }
+    };
+    // Refused `drain`, never `lfs`, so the PC waits on the drain; held until the step returns.
+    let _admitted = match drain::passed(asked.work, payload, None, seams, console) {
+        Ok(admitted) => admitted,
+        Err(status) => return status,
     };
     if let Err(why) = elevation() {
         return refused(&asked, &why, console);

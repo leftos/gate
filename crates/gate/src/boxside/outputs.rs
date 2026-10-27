@@ -2,9 +2,10 @@
 //! removes the outputs archives older than a day, lists the files under the globs before the command, and after a
 //! passing command and its back commit packs the files the PC lacks or holds otherwise into `<key>-<nonce>.tar.zst` in
 //! the output folder, as the PowerShell wrapper's `Publish-RunOutput` does. The `outputs` verb sends one such archive
-//! raw on stdout, then removes it; it takes no work folder lock, so it never waits on a run. A pack that pushes the
-//! folder past its size budget removes the archives last written before its own, oldest first, never one written with
-//! or after it, and removes its own when that alone is over the budget, ending the run's outputs as not brought back.
+//! raw on stdout, then removes it unless a barrier stands and the run's session is not live; it takes no work folder
+//! lock, so it never waits on a run. A pack that pushes the folder past its size budget removes the archives last
+//! written before its own, oldest first, never one written with or after it, and removes its own when that alone is
+//! over the budget, ending the run's outputs as not brought back.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufWriter, Write};
@@ -18,6 +19,7 @@ use gate_wire::{Payload, archive_file_name, archive_key};
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
+use crate::boxside::drain;
 use crate::boxside::run::FILE_FLAG_OPEN_REPARSE_POINT;
 use crate::boxside::stamping;
 use crate::console::Console;
@@ -424,9 +426,16 @@ pub(super) fn not_brought_back(reason: &str) -> String {
 /// a `Name` given that is not an outputs archive of the work folder, an archive that does not exist or one that cannot
 /// be read or sent ends with status 1, and a sent archive that cannot be removed is said and left for a later run's
 /// [`prune`], status 0; one already gone says nothing.
-pub(super) fn outputs(payload: &Payload, console: &mut Console) -> u32 {
-    let folder = match payload.work_folder().and_then(|(_, work)| payload.output_folder(work)) {
-        Ok(folder) => folder,
+///
+/// Before it sends, the call renews the payload's drain session ([`drain::renewed_at`]) and holds it until it returns.
+/// It is never refused: an archive of a session the drain found dead while a barrier stands is sent and kept, said
+/// with [`KEPT_DRAINED`], as is one sent when the drain could not be read, said `gate: drain failed: {why}`.
+pub(super) fn outputs(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
+    let read = payload
+        .work_folder()
+        .and_then(|(_, work)| Ok((work, payload.output_folder(work)?, payload.session()?)));
+    let (work, folder, session) = match read {
+        Ok(read) => read,
         Err(line) => {
             stamping::err(console, &line);
             return u32::from(USAGE_STATUS);
@@ -441,11 +450,41 @@ pub(super) fn outputs(payload: &Payload, console: &mut Console) -> u32 {
         }
     };
     let path = Path::new(folder).join(name);
+    let (_held, removal) = match drain::renewed_at(work, session, seams, console) {
+        Ok(renewal) if renewal.may_delete => (renewal.held, Removal::Remove),
+        Ok(renewal) => (renewal.held, Removal::KeepDrained),
+        Err(why) => {
+            stamping::err(console, &format!("gate: drain failed: {why}"));
+            (None, Removal::Keep)
+        }
+    };
     if let Err(unsent) = send(&path, &mut io::stdout().lock()) {
         stamping::err(console, &unsent.line(name));
         return u32::from(FAILED_STATUS);
     }
-    if let Err(error) = remove_archive(&path) {
+    match removal {
+        Removal::Remove => removed_after_send(&path, name, console),
+        Removal::KeepDrained => stamping::err(console, KEPT_DRAINED),
+        Removal::Keep => {}
+    }
+    0
+}
+
+/// The line an `outputs` call says when it keeps the archive it sent, its session dead under a standing barrier.
+const KEPT_DRAINED: &str = "gate: remote outputs kept: the builder is drained";
+
+/// What an `outputs` call does with the archive it sent.
+enum Removal {
+    Remove,
+    /// Kept, its session dead under a standing barrier.
+    KeepDrained,
+    /// Kept, the drain unread.
+    Keep,
+}
+
+/// Removes the sent archive `name` at `path`, saying a removal that failed.
+fn removed_after_send(path: &Path, name: &str, console: &mut Console) {
+    if let Err(error) = remove_archive(path) {
         stamping::err(
             console,
             &format!(
@@ -454,7 +493,6 @@ pub(super) fn outputs(payload: &Payload, console: &mut Console) -> u32 {
             ),
         );
     }
-    0
 }
 
 /// Why an archive was not sent.

@@ -38,6 +38,7 @@ use gate_wire::{PairSibling, PathForm, Payload, bare_stem, ordinal_upper, trees}
 use crate::answer::USAGE_STATUS;
 use crate::boxside::boot;
 use crate::boxside::ceiling::{Ceiling, KILLED, Spec};
+use crate::boxside::drain;
 use crate::boxside::forward::{ClientGone, DRAIN, Forwarders, OutputLock};
 use crate::boxside::heartbeat;
 use crate::boxside::inputs;
@@ -590,6 +591,17 @@ pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) ->
         Err(line) => {
             stamping::err(console, &line);
             return u32::from(USAGE_STATUS);
+        }
+    };
+    // Held until the run returns, its command and back commit done, so a drain counts the run as going.
+    let _admitted = match admitted(payload, &request, seams, console) {
+        Ok(admitted) => admitted,
+        Err(status) => {
+            // A drain that could not be read or written fails the run as a lock that could not be taken does.
+            if status == FAILED_STATUS {
+                no_back_commits(&request, console);
+            }
+            return status;
         }
     };
     // Held until the run returns; the command does not inherit it, so no process it leaves running keeps the work
@@ -1626,6 +1638,14 @@ impl Drop for HeldWorkLock {
             drop(self.file.set_modified(SystemTime::now()));
         }
     }
+}
+
+/// The run of `request`, from `payload`, passed through the drain ([`drain::passed`]) as the session `payload` names,
+/// its command text each command's words joined by spaces and a warm-up's commands by ` && `, its job the run's: the
+/// guard to hold until the run returns, or the status to exit with, its lines said.
+fn admitted(payload: &Payload, request: &Request<'_>, seams: &BoxSeams, console: &mut Console) -> Result<drain::Admitted, u32> {
+    let command = request.commands.iter().map(|words| words.join(" ")).collect::<Vec<_>>().join(" && ");
+    drain::passed(request.work, payload, Some((&command, request.job)), seams, console)
 }
 
 /// A lock file, the work folder's or a bare repository's: `path` opened for reading and writing, created when missing,

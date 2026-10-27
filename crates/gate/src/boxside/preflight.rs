@@ -28,6 +28,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use crate::answer::USAGE_STATUS;
 use crate::boxside::boot;
+use crate::boxside::drain::{self, HeldRoot};
 use crate::boxside::forward::{ClientGone, DRAIN, Forwarders, OutputLock};
 use crate::boxside::heartbeat;
 use crate::boxside::helper_trusted;
@@ -104,9 +105,12 @@ pub(crate) fn git_failed(step: &str, code: i32) -> Failed {
 /// version line comes first, so a PC client of another version falls back on the version rather than a bare status 1.
 /// Then, once the payload is read and before any record is read or folder readied, it makes the work root locked when
 /// it is missing and refuses one another account may write in, after its version line, with the root line and
-/// [`ROOT_STATUS`] ([`held_work_root`]), holding it until the folders are readied. It readies the bare repositories,
-/// then takes the key's work-folder lock `Lock` around its reads of the key's records and its writes in the work
-/// folder ([`ready`]), and lets it go before its version line, so the run right after it is never refused busy by it.
+/// [`ROOT_STATUS`] ([`held_work_root`]), holding it until the folders are readied. Under that hold it passes the drain
+/// ([`drain::admit`]), the payload's `NoTicket` saying whether a refusal takes a place in line, and holds its session
+/// until it returns; a refusal or a drain that fails says the version line, then the drain's
+/// ([`drain::admission_said`]). It readies the bare repositories, then takes the key's work-folder lock `Lock` around
+/// its reads of the key's records and its writes in the work folder ([`ready`]), and lets it go before its version
+/// line, so the run right after it is never refused busy by it.
 pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
     if crate::boxside::judges_trust()
         && let Err(why) = gate_desktop::helper_path()
@@ -121,16 +125,33 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
         let work = payload.work_folder()?.1;
         Ok((bare, work, payload.beside_work("Lock", work, "lock")?, payload.pair()?))
     });
-    let (bare, work, lock, pair) = match read {
-        Ok(folders) => folders,
+    let drain_read = drain::session_of(payload, "", "").and_then(|session| Ok((session, payload.no_ticket()?)));
+    let ((bare, work, lock, pair), (session, no_ticket)) = match read.and_then(|folders| Ok((folders, drain_read?))) {
+        Ok(read) => read,
         Err(line) => {
             stamping::err(console, &line);
             return u32::from(USAGE_STATUS);
         }
     };
     // Held until the folders are readied, so no one can rename or remove the root meanwhile.
-    let held_root = match held_work_root(work, bare, pair.is_some(), seams, console) {
+    let (held_root, root) = match held_work_root(work, bare, pair.is_some(), seams, console) {
         Ok(held) => held,
+        Err(status) => return status,
+    };
+    // Held until the preflight returns, so a drain counts it as going.
+    let admission = drain::admit(
+        &HeldRoot {
+            held: &held_root,
+            path: Path::new(&root),
+        },
+        session.as_ref(),
+        no_ticket,
+        seams,
+        console,
+    );
+    let version = format!("gate: remote version {}", build_version());
+    let _admitted = match drain::admission_said(admission, payload, Some(&version), console) {
+        Ok(admitted) => admitted,
         Err(status) => return status,
     };
     let readied = ready(bare, work, lock, pair.as_ref(), console);
@@ -142,7 +163,7 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
             return failed.status;
         }
     };
-    stamping::out(console, &format!("gate: remote version {}", build_version()));
+    stamping::out(console, &version);
     stamping::out(console, &format!("gate: remote warm {}", warm.as_deref().unwrap_or("none")));
     if made || cleared {
         stamping::out(console, NEW_WORK_TREE);
@@ -161,11 +182,12 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
 
 /// The builder's work root, `<root>` of the work folder `work` (`<root>\work\<key>`), made locked when it is missing,
 /// judged and held by [`gate_win32::check_work_root`], its walk above ending at `--test-box-root-walk-stop` when
-/// `seams` gives it. Else the status to exit with, said first: the usage line and [`USAGE_STATUS`] for a `work` laid
-/// out otherwise, or, unless `paired`, a bare repository `bare` that is not `<root>\<name>.git`; or the version line
-/// and [`ROOT_STATUS`] with the refusal ([`root_unsafe_line`]) for a root another account may write in, or the busy
-/// line ([`root_busy_line`]) for one another process holds open with delete access, or without sharing reading.
-fn held_work_root(work: &str, bare: &str, paired: bool, seams: &BoxSeams, console: &mut Console) -> Result<File, u32> {
+/// `seams` gives it, beside the root's path. Else the status to exit with, said first: the usage line and
+/// [`USAGE_STATUS`] for a `work` laid out otherwise, or, unless `paired`, a bare repository `bare` that is not
+/// `<root>\<name>.git`; or the version line and [`ROOT_STATUS`] with the refusal ([`root_unsafe_line`]) for a root
+/// another account may write in, or the busy line ([`root_busy_line`]) for one another process holds open with delete
+/// access, or without sharing reading.
+fn held_work_root(work: &str, bare: &str, paired: bool, seams: &BoxSeams, console: &mut Console) -> Result<(File, String), u32> {
     let Some(root) = work_root(work, PathForm::Windows) else {
         stamping::err(
             console,
@@ -188,7 +210,7 @@ fn held_work_root(work: &str, bare: &str, paired: bool, seams: &BoxSeams, consol
         );
         return Err(u32::from(USAGE_STATUS));
     }
-    gate_win32::check_work_root(Path::new(&root), seams.root_walk_stop.as_deref()).map_err(|why| {
+    let held = gate_win32::check_work_root(Path::new(&root), seams.root_walk_stop.as_deref()).map_err(|why| {
         stamping::out(console, &format!("gate: remote version {}", build_version()));
         let line = if why.is_busy() {
             root_busy_line(&why.to_string())
@@ -197,7 +219,8 @@ fn held_work_root(work: &str, bare: &str, paired: bool, seams: &BoxSeams, consol
         };
         stamping::err(console, &line);
         u32::from(ROOT_STATUS)
-    })
+    })?;
+    Ok((held, root))
 }
 
 /// Says the SDK line, the list read within `--test-dotnet-limit-ms` when `seams` gives it, else

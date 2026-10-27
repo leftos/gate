@@ -81,7 +81,7 @@ pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
         BoxVerb::Boot => with_request(console, |_, console| boot_status(boot::say(console))),
         BoxVerb::Run => with_request(console, |payload, console| run::run(payload, seams, console)),
         BoxVerb::Stop => with_request(console, stop::stop),
-        BoxVerb::Outputs => with_request(console, outputs::outputs),
+        BoxVerb::Outputs => with_request(console, |payload, console| outputs::outputs(payload, seams, console)),
         BoxVerb::Inflight => with_request(console, inflight::inflight),
         BoxVerb::Inputs => with_request(console, |payload, console| inputs::inputs(payload, seams, console)),
         BoxVerb::Lfs => with_request(console, |payload, console| lfs::lfs(payload, seams, console)),

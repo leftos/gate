@@ -38,6 +38,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::answer::USAGE_STATUS;
+use crate::boxside::drain;
 use crate::boxside::preflight::{self, is_folder_itself};
 use crate::boxside::run::{self, FAILED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, REFUSED_STATUS, SHARING_VIOLATION};
 use crate::boxside::stamping;
@@ -348,9 +349,10 @@ fn read_manifest(input: impl BufRead) -> Result<Sent, String> {
     Ok(Sent { manifest, digest })
 }
 
-/// Answers `gate box inputs`: the request read, then the manifest from stdin, before any lock is taken, so a client
-/// that stalls holds nothing; then the step. A payload refused is a usage error (2), a manifest that cannot be read
-/// fails the step (1).
+/// Answers `gate box inputs`: the request read, the call passed through the drain ([`drain::passed`]), refused `drain`
+/// (75) before anything more is read, then the manifest from stdin, before any lock is taken, so a client that stalls
+/// holds nothing; then the step. A payload refused is a usage error (2), a manifest that cannot be read fails the step
+/// (1).
 pub(super) fn inputs(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
     let asked = match Asked::read(payload) {
         Ok(asked) => asked,
@@ -358,6 +360,11 @@ pub(super) fn inputs(payload: &Payload, seams: &BoxSeams, console: &mut Console)
             stamping::err(console, &line);
             return u32::from(USAGE_STATUS);
         }
+    };
+    // Before the manifest is read, so a refused call reads nothing more; held until the step returns.
+    let _admitted = match drain::passed(asked.work, payload, None, seams, console) {
+        Ok(admitted) => admitted,
+        Err(status) => return status,
     };
     let sent = match read_manifest(io::stdin().lock()) {
         Ok(sent) => sent,

@@ -396,6 +396,27 @@ impl Payload {
         }
     }
 
+    /// The PC's host name, `Pc`, which the drain's session record keeps; `None` when the key is absent or null, as a PC
+    /// older than the drain sends it. Else the usage line saying it is not a text.
+    pub fn pc(&self) -> Result<Option<&str>, String> {
+        self.text_or_none("Pc")
+    }
+
+    /// The run's repository, `Repo`, which the drain's session record keeps; `None` when the key is absent or null, as
+    /// a PC older than the drain sends it. Else the usage line saying it is not a text.
+    pub fn repo(&self) -> Result<Option<&str>, String> {
+        self.text_or_none("Repo")
+    }
+
+    /// The text of `key`; `None` when the key is absent or null. Else the usage line saying it is not a text.
+    fn text_or_none(&self, key: &str) -> Result<Option<&str>, String> {
+        match self.object.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(text)) => Ok(Some(text)),
+            Some(_) => Err(format!("gate: box payload {key} is not a text")),
+        }
+    }
+
     /// Whether a refused call takes no place in the drain's line, `NoTicket`: true or false, false when the key is
     /// absent or null; else the usage line saying it is not true or false.
     pub fn no_ticket(&self) -> Result<bool, String> {
@@ -1511,6 +1532,23 @@ mod tests {
                 payload(&json!({ "Session": 7 })).session(),
                 Err("gate: box payload Session is not a text".to_owned())
             );
+        }
+
+        #[test]
+        fn the_pc_and_the_repo_are_optional_texts() {
+            let both = payload(&json!({ "Pc": "desk", "Repo": "gate" }));
+            assert_eq!(both.pc(), Ok(Some("desk")));
+            assert_eq!(both.repo(), Ok(Some("gate")));
+            for absent in [json!({}), json!({ "Pc": null, "Repo": null })] {
+                let asked = payload(&absent);
+                assert_eq!(asked.pc(), Ok(None), "an older PC sends no Pc: {absent}");
+                assert_eq!(asked.repo(), Ok(None), "an older PC sends no Repo: {absent}");
+            }
+            for bad in [json!(7), json!(true), json!(["desk"]), json!({ "Name": "desk" })] {
+                let asked = payload(&json!({ "Pc": bad, "Repo": bad }));
+                assert_eq!(asked.pc(), Err("gate: box payload Pc is not a text".to_owned()), "{bad}");
+                assert_eq!(asked.repo(), Err("gate: box payload Repo is not a text".to_owned()), "{bad}");
+            }
         }
 
         #[test]
