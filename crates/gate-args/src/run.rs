@@ -53,6 +53,8 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     PollMs,
     #[cfg(feature = "test-seams")]
+    DrainPollMs,
+    #[cfg(feature = "test-seams")]
     StallMs,
     #[cfg(feature = "test-seams")]
     DiagnosticsBudgetMs,
@@ -328,6 +330,8 @@ impl RunBuilder {
             ValueOption::HeartbeatMs => self.test_seams.heartbeat_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::PollMs => self.test_seams.poll_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
+            ValueOption::DrainPollMs => self.test_seams.drain_poll_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::StallMs => self.test_seams.stall_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]

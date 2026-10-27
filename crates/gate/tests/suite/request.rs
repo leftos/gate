@@ -27,6 +27,7 @@ fn print_request_shows_the_new_cli_request() {
         "sampleMs": null,
         "heartbeatMs": null,
         "pollMs": null,
+        "drainPollMs": null,
         "stallMs": null,
         "stallFromOutput": false,
         "loadWindowMs": null,

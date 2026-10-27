@@ -64,7 +64,7 @@ fn with_input(case: &Case) {
 }
 
 /// A client case whose repo declares the one ignored input [`INPUT`].
-fn inputs_case(name: &str) -> Case {
+pub(super) fn inputs_case(name: &str) -> Case {
     let case = client_case(name);
     with_input(&case);
     routed(&case, None);

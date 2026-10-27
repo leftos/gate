@@ -29,6 +29,8 @@ fn seam_flags_parse_with_the_feature() {
             "--test-remote-wait-ms=90",
             "--test-git-limit-ms",
             "95",
+            "--test-drain-poll-ms",
+            "85",
             "--test-print-request",
             "--",
             "cmd",
@@ -49,6 +51,7 @@ fn seam_flags_parse_with_the_feature() {
             remote_client: Some(std::path::PathBuf::from(r"steps\client.txt")),
             remote_wait_ms: Some(90),
             git_limit_ms: Some(95),
+            drain_poll_ms: Some(85),
             ..TestSeams::default()
         }
     );

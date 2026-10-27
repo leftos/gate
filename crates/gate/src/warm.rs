@@ -56,9 +56,11 @@ const KEY_BUSY: &str = "another routed run held the work folder past the wait";
 const CAP_BUSY: &str = "another warm-up held the warm-up cap past the wait";
 /// Why a warm-up the client ended without saying how it ended, and why it could not start, failed.
 const NOT_STARTED: &str = "the client did not start the warm-up";
+/// What a warm-up the builder's drain refused says as it ends, with status 1 and no record.
+const DRAINED: &str = "gate: warm: the builder is drained; this warm-up ends without warming";
 
 /// Warms the worktree of `request`'s folder, saying its lines through `console`, and returns the exit status: 0 warm;
-/// 2 a usage or precondition problem; 1 a warm-up that failed, was refused or is already running;
+/// 2 a usage or precondition problem; 1 a warm-up that failed, was refused, met the builder's drain or is already running;
 /// [`CONTROL_C_EXIT`] on Ctrl+C. With `--background`, no consent, no file and a warm-up already running say nothing
 /// and exit 0.
 pub(crate) fn warm(request: &WarmRequest, environment: &Environment, console: &mut Console) -> u32 {
@@ -116,6 +118,8 @@ struct Prepared<'e> {
     machine: Machine<'e>,
     target: Target,
     first: Warmup,
+    /// The warm-up's drain session, made once for every call it makes.
+    session: String,
 }
 
 /// A read of the warm-up file: what it declares, the hash of its bytes and its commands worded for the builder.
@@ -144,6 +148,7 @@ fn prepare<'e>(request: &WarmRequest, environment: &'e Environment) -> Result<Pr
         machine,
         target,
         first,
+        session: remote::payload::run_nonce(),
     })
 }
 
@@ -451,6 +456,8 @@ enum Ending {
     Failed { hash: String, failure: WarmFailure, reason: String },
     /// Ctrl+C ended it: the record is deleted.
     Deleted,
+    /// The builder is drained and refused it: the record is deleted, and the end says so.
+    Drained,
     /// The late recheck found no consent, no file, a file problem or another builder: the record is deleted, and the
     /// end says why.
     Withdrawn(End),
@@ -670,6 +677,7 @@ fn call_of<'a>(
     Ok(RemoteCall {
         builder: &target.builder,
         key: &target.key,
+        session: &prepared.session,
         root: &target.place.root,
         root_id: target.root_id,
         leaf: &target.leaf,
@@ -699,8 +707,12 @@ fn call_of<'a>(
 }
 
 /// How the warm-up of the file of `hash` ended, from how the client said it ended alone, never from its status: a call
-/// that said nothing of it did not start, and is refused for the client's detail.
+/// that said nothing of it did not start, and is refused for the client's detail. A call the builder's drain refused
+/// is drained, whatever else it said.
 fn ending_of(outcome: &RemoteOutcome, hash: &str) -> Ending {
+    if outcome.draining.is_some() {
+        return Ending::Drained;
+    }
     let hash = hash.to_owned();
     match &outcome.warm {
         Some(WarmEnd::Warm) => Ending::Warm { hash },
@@ -734,6 +746,7 @@ fn conclude(ending: Ending, record: &Recorder<'_>, background: bool, console: &m
             u32::from(FAILED_STATUS)
         }),
         Ending::Deleted => record.delete().map(|()| CONTROL_C_EXIT),
+        Ending::Drained => record.delete().map(|()| End::Failed(DRAINED.to_owned()).say(background, console)),
         Ending::Withdrawn(end) => record.delete().map(|()| end.say(background, console)),
     };
     match written {

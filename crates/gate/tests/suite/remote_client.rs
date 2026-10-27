@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
 use crate::durations::seed;
+use crate::remote_inputs::inputs_case;
 use crate::support::{
     ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, GIT_REDIRECTS, Go, Junction, NetfxKey, Outcome, PREFLIGHT_SEAMS_VARIABLE, Running,
     STEPS_VARIABLE, allow_breakaway, assert_in_order, beside, build_version, calls, copy_tool, events, finish, git, git_init, heavy_words, log_texts,
@@ -9710,4 +9711,338 @@ fn a_busy_fallback_of_a_send_with_a_record_drops_no_build_and_says_the_local_lin
         nothing_back(&case).is_some(),
         "the run here builds one project, which clears no record: {second:?}"
     );
+}
+
+/// The drain poll of the drain cases, short so a wait of a few polls ends soon.
+const DRAIN_POLL: [&str; 2] = ["--test-drain-poll-ms", "50"];
+/// The start of the line a routed run says once as it starts to wait behind the builder drain.
+const DRAIN_WAITING: &str = "gate: waiting behind the builder drain (raised ";
+/// The line a routed run says once the builder admits it under a barrier that still stood.
+const DRAIN_LIFTED: &str = "gate: the builder drain lifted; starting the routed run";
+/// The box seams of a run, inputs or LFS call that finds every session past its lease, so a run admitted at its
+/// preflight is no live session by then.
+const LEASE_PASSED: &str = "--test-box-drain-lease-ms 1";
+/// The steps a drain case's stand-in answers its polls with: more than any wait of the case polls.
+static POLLS: [&str; 2000] = ["ok"; 2000];
+
+/// `gate box drain` of `action` on the case's builder root, from the clock, to its end, which passes.
+pub(super) fn builder_drain(case: &Case, action: &str) {
+    let root = case.folder().join("builder");
+    fs::create_dir_all(&root).expect("the builder root can be made");
+    let request = STANDARD.encode(json!({ "Root": shown(&root), "Action": action }).to_string());
+    let stop = shown(&case.folder());
+    // The box under test reads no command line of the elevated gates around it, which the drain would count.
+    let mut child = Command::new(GATE)
+        .args([
+            "box",
+            "--test-box-root-walk-stop",
+            &stop,
+            "--test-box-drain-readable-only",
+            "true",
+            "drain",
+            "--stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the box's drain can be started");
+    let mut stdin = child.stdin.take().expect("the drain's stdin is piped");
+    writeln!(stdin, "{request}").expect("the drain's request can be written");
+    drop(stdin);
+    let output = child.wait_with_output().expect("the box's drain ends");
+    assert!(output.status.success(), "drain {action}: {output:?}");
+}
+
+/// The gate of a routed run logging to `log` through the steps file `steps`, polling the drain every [`DRAIN_POLL`].
+fn drain_gate(case: &Case, log: &str, steps: &Path) -> Command {
+    let tuned = Tuned {
+        extra: &DRAIN_POLL,
+        ..Tuned::default()
+    };
+    client_gate_tuned(case, log, steps, &tuned, &[r".\tool.exe", "out", "ran there"])
+}
+
+/// The names in the builder root's drain folder `name`, sorted; none when it is missing.
+pub(super) fn drain_entries(case: &Case, name: &str) -> Vec<String> {
+    let folder = case.folder().join("builder").join("drain").join(name);
+    let mut names: Vec<String> = fs::read_dir(folder).map_or_else(
+        |_| Vec::new(),
+        |entries| {
+            entries
+                .map(|entry| entry.expect("a drain entry can be read").file_name().to_string_lossy().into_owned())
+                .collect()
+        },
+    );
+    names.sort();
+    names
+}
+
+/// Asserts the run that ended `outcome` waited behind the drain once, was admitted after the lift and ran its command
+/// on the builder, its calls through `steps` ending in a run call after the preflight of its admitted attempt, with no
+/// fallback.
+fn assert_waited_then_ran(case: &Case, outcome: &Outcome, steps: &Path) {
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
+    let waiting = outcome.stderr.lines().filter(|line| line.starts_with(DRAIN_WAITING)).count();
+    assert_eq!(waiting, 1, "the waiting line is said once: {outcome:?}");
+    assert_in_order(&outcome.stderr, &[DRAIN_WAITING, DRAIN_LIFTED]);
+    let called = calls(steps);
+    assert_eq!(called.last().map(String::as_str), Some("run"), "{called:?}");
+    // The admitted attempt starts from its preflight, and only its sends come between that and its run call.
+    let admitted = called.iter().rposition(|verb| verb == "preflight").map_or(called.len(), |at| at + 1);
+    assert!(
+        admitted < called.len() && called[admitted..].iter().all(|verb| ["inputs", "lfs", "run"].contains(&verb.as_str())),
+        "the admitted attempt starts from its preflight: {called:?}"
+    );
+    assert_eq!(fallbacks(&events(case)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_drained_builder_refuses_the_preflight_and_the_run_waits_for_the_lift_then_runs_there() {
+    let case = client_case("client-drain-lift");
+    builder_drain(&case, "raise");
+    let steps = ssh_steps(&case, "ssh", &POLLS);
+    let running = start(drain_gate(&case, "out.log", &steps));
+
+    running.wait_for_stderr(DRAIN_WAITING);
+    builder_drain(&case, "lift");
+    let outcome = running.finish();
+
+    assert_waited_then_ran(&case, &outcome, &steps);
+    let called = calls(&steps);
+    assert!(
+        called[..called.len() - 1].iter().all(|verb| verb == "preflight"),
+        "only polls before the run: {called:?}"
+    );
+}
+
+#[test]
+fn a_drain_wait_polls_with_one_session_id_across_the_attempts() {
+    let case = client_case("client-drain-session");
+    builder_drain(&case, "raise");
+    let steps = ssh_steps(&case, "ssh", &POLLS);
+    let running = start(drain_gate(&case, "out.log", &steps));
+
+    // The refused attempt's preflight and two polls: every one of them renewed the one ticket.
+    running.wait_until("two drain polls", || calls(&steps).len() >= 3);
+    let tickets = drain_entries(&case, "tickets");
+    builder_drain(&case, "lift");
+    let outcome = running.finish();
+
+    assert_eq!(tickets.len(), 1, "one ticket for every poll: {tickets:?}");
+    let ticket = &tickets[0];
+    let session = ticket.strip_prefix("00000001-").expect("the first ticket in line");
+    assert_eq!(session.len(), 32, "{ticket}");
+    assert_waited_then_ran(&case, &outcome, &steps);
+    assert_eq!(
+        drain_entries(&case, "tickets"),
+        Vec::<String>::new(),
+        "the admitted session gave up its own ticket"
+    );
+    assert_eq!(drain_entries(&case, "sessions"), [session.to_owned()], "the run's session alone");
+}
+
+/// Runs a drain case through `steps`, whose call `held` is held until the barrier is raised under it and the run's
+/// session has passed its lease: the drain refuses that call, and the run waits until the case lifts the barrier.
+fn refused_after_admission(case: &Case, held: usize, steps: &Path) -> Outcome {
+    refused_after(case, held, steps, drain_gate(case, "out.log", steps))
+}
+
+/// [`refused_after_admission`] of the routed run `gate`.
+fn refused_after(case: &Case, held: usize, steps: &Path, mut gate: Command) -> Outcome {
+    gate.env(BOX_SEAMS_VARIABLE, LEASE_PASSED);
+    let running = start(gate);
+    running.wait_until("the held call", || calls(steps).len() >= held);
+    builder_drain(case, "raise");
+    fs::write(case.folder().join("go"), "").expect("the go file can be made");
+    running.wait_for_stderr(DRAIN_WAITING);
+    builder_drain(case, "lift");
+    running.finish()
+}
+
+/// The steps of a drain case whose calls before `held` pass, `held` waits for the case's go file, and every later one
+/// passes.
+fn held_steps(case: &Case, held: usize) -> PathBuf {
+    let hold = format!("hold {}", shown(&case.folder().join("go")));
+    let mut steps = vec!["ok"; held - 1];
+    steps.push(hold.as_str());
+    steps.extend(POLLS);
+    ssh_steps(case, "ssh", &steps)
+}
+
+#[test]
+fn a_run_call_refused_drain_after_its_session_died_restarts_from_the_preflight() {
+    let case = client_case("client-drain-run-refused");
+    let steps = held_steps(&case, 2);
+
+    let outcome = refused_after_admission(&case, 2, &steps);
+
+    assert_waited_then_ran(&case, &outcome, &steps);
+    let called = calls(&steps);
+    assert_eq!(
+        called[..3],
+        ["preflight", "run", "preflight"],
+        "the refused run polls the preflight: {called:?}"
+    );
+}
+
+#[test]
+fn an_inputs_call_refused_drain_restarts_from_the_preflight() {
+    let case = inputs_case("client-drain-inputs-refused");
+    let steps = held_steps(&case, 2);
+
+    let outcome = refused_after_admission(&case, 2, &steps);
+
+    assert_waited_then_ran(&case, &outcome, &steps);
+    let called = calls(&steps);
+    assert_eq!(
+        called[..3],
+        ["preflight", "inputs", "preflight"],
+        "the refused inputs poll the preflight: {called:?}"
+    );
+    assert!(
+        called.iter().filter(|verb| *verb == "inputs").count() >= 2,
+        "the admitted attempt sends its inputs: {called:?}"
+    );
+}
+
+/// The poll the builder admits is the call that lays out a new work folder, which the admitted attempt's own preflight
+/// then finds there: that attempt still gets the raised ceiling and says the cold note, as a first run of the worktree
+/// does.
+#[test]
+fn a_drain_poll_that_lays_out_the_work_folder_leaves_the_admitted_attempt_its_raised_ceiling() {
+    let case = client_case("client-drain-cold");
+    builder_drain(&case, "raise");
+    let steps = ssh_steps(&case, "ssh", &POLLS);
+    let tuned = Tuned {
+        timeout: "60",
+        extra: &DRAIN_POLL,
+        ..Tuned::default()
+    };
+    let running = start(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]));
+
+    running.wait_for_stderr(DRAIN_WAITING);
+    builder_drain(&case, "lift");
+    let outcome = running.finish();
+
+    assert_waited_then_ran(&case, &outcome, &steps);
+    assert_eq!(
+        outcome.stderr.lines().filter(|line| *line == COLD_NOTE).count(),
+        1,
+        "the cold note is said once: {outcome:?}"
+    );
+    assert!(
+        outcome.stdout.contains(", ceiling 120 s; command "),
+        "the admitted attempt ran under the raised ceiling: {outcome:?}"
+    );
+}
+
+/// A drain poll that cannot reach the builder while its barrier stands is still waiting: the client's unreachable line
+/// goes to the log alone, and the console holds the drain's lines only.
+#[test]
+fn an_unreachable_drain_poll_under_a_standing_barrier_says_its_line_in_the_log_alone() {
+    let case = client_case("client-drain-unreachable");
+    builder_drain(&case, "raise");
+    let mut answers = vec!["ok", "fail-other", "fail-other"];
+    answers.extend(POLLS);
+    let steps = ssh_steps(&case, "ssh", &answers);
+    let running = start(drain_gate(&case, "out.log", &steps));
+
+    // The refused attempt's preflight, the unreachable polls, and a poll the drain refuses again.
+    running.wait_until("a poll after the unreachable ones", || calls(&steps).len() >= 4);
+    builder_drain(&case, "lift");
+    let outcome = running.finish();
+
+    assert_waited_then_ran(&case, &outcome, &steps);
+    assert!(!outcome.stderr.contains("unreachable"), "no unreachable line on the console: {outcome:?}");
+    let log = log_texts(&case.folder().join("out.log"));
+    assert!(
+        log.lines()
+            .any(|line| line.starts_with("gate: remote ") && line.contains(" unreachable: ssh: connect to host builder port 22")),
+        "the log keeps the poll's line: {log}"
+    );
+}
+
+/// The send of the PC's build is refused by the drain, the run's session past its lease: the run waits behind the drain
+/// rather than dropping `--no-build`, and its admitted attempt sends the build again and keeps the word.
+#[test]
+fn a_drained_build_send_waits_instead_of_dropping_no_build() {
+    let case = sent_build_case("client-drain-sent-build", None);
+    let steps = held_steps(&case, 2);
+    let extra: Vec<&str> = PC_SDKS_ANSWERING.iter().chain(&DRAIN_POLL).copied().collect();
+    let tuned = Tuned {
+        extra: &extra,
+        ..Tuned::default()
+    };
+    let gate = client_gate_tuned(&case, "out.log", &steps, &tuned, &SENT_TEST);
+
+    let outcome = refused_after(&case, 2, &steps, gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains(DROPPED_NO_BUILD_LINE), "{outcome:?}");
+    assert_in_order(&outcome.stderr, &[DRAIN_WAITING, DRAIN_LIFTED]);
+    assert!(
+        outcome.stdout.lines().any(|line| line == "--no-build"),
+        "the admitted attempt kept it: {outcome:?}"
+    );
+    let called = calls(&steps);
+    assert_eq!(
+        called[..3],
+        ["preflight", "inputs", "preflight"],
+        "the refused send polls the preflight: {called:?}"
+    );
+    assert_eq!(called.last().map(String::as_str), Some("run"), "{called:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+/// The first attempt's preflight lays out the work folder, and the drain refuses its inputs call: the admitted attempt,
+/// whose own preflight finds the folder laid out, still gets the raised ceiling and says the cold note once.
+#[test]
+fn a_new_work_tree_survives_an_attempt_drained_again_before_its_run_call() {
+    let case = inputs_case("client-drain-cold-inputs");
+    let steps = held_steps(&case, 2);
+    let tuned = Tuned {
+        timeout: "60",
+        extra: &DRAIN_POLL,
+        ..Tuned::default()
+    };
+    let gate = client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]);
+
+    let outcome = refused_after(&case, 2, &steps, gate);
+
+    assert_waited_then_ran(&case, &outcome, &steps);
+    assert_eq!(calls(&steps)[..3], ["preflight", "inputs", "preflight"]);
+    assert_eq!(
+        outcome.stderr.lines().filter(|line| *line == COLD_NOTE).count(),
+        1,
+        "the cold note is said once: {outcome:?}"
+    );
+    assert!(
+        outcome.stdout.contains(", ceiling 120 s; command "),
+        "the admitted attempt ran under the raised ceiling: {outcome:?}"
+    );
+}
+
+/// The first poll after the lift is refused for the box's version: no admission, so no lifted line; the run's attempt
+/// then meets the same refusal and falls back for it.
+#[test]
+fn a_poll_refused_for_its_version_says_no_lifted_line() {
+    let case = client_case("client-drain-poll-version");
+    builder_drain(&case, "raise");
+    let mut answers = vec!["ok"];
+    answers.extend(std::iter::repeat_n("version 0.0.0-other", 2000));
+    let steps = ssh_steps(&case, "ssh", &answers);
+    let running = start(drain_gate(&case, "out.log", &steps));
+
+    running.wait_for_stderr(DRAIN_WAITING);
+    builder_drain(&case, "lift");
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains(DRAIN_LIFTED), "no admission, no lifted line: {outcome:?}");
+    let line = format!("gate: not routed: builder runs gate 0.0.0-other, this PC {}", build_version(&case));
+    assert!(outcome.stderr.contains(&line), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here") || outcome.stdout.contains("ran there"), "{outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), ["version"]);
 }

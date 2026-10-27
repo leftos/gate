@@ -131,6 +131,25 @@ pub fn builder_cache_dir(root: &Path, id: Option<&str>) -> PathBuf {
     }
 }
 
+/// The folder of the drain markers, `<root>\remote\drain`: one folder a builder ([`drain_marker_dir`]).
+#[must_use]
+pub fn drain_dir(root: &Path) -> PathBuf {
+    remote_dir(root).join("drain")
+}
+
+/// The folder of the drain markers of the builder whose id is `id`, `<root>\remote\drain\<id>`, or
+/// `<root>\remote\drain\host` for `host`, which has none. A routed run waiting behind that builder's drain holds one
+/// file of it, `<pid>-<session>`, open sharing nothing for the whole wait, so a file another open finds held is a live
+/// wait and one that opens is dead.
+#[must_use]
+pub fn drain_marker_dir(root: &Path, id: Option<&str>) -> PathBuf {
+    debug_assert!(
+        id.is_none_or(|id| id.len() == 8 && id.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))),
+        "a builder's id is 8 lower-case hex digits: {id:?}"
+    );
+    drain_dir(root).join(id.unwrap_or("host"))
+}
+
 /// The pending marker of the work folder `key`, `<root>\remote\<key>.outputs-pending`, whichever builder the run went
 /// to, since it says the PC's outputs may be wrong: written before a routed run with output globs makes its run call
 /// and removed once its outputs step completes, so the next routed run of that worktree, on any builder, asks for every

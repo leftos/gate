@@ -2189,6 +2189,7 @@ mod tests {
         let call = RemoteCall {
             builder: &crate::test_support::HOST,
             key: "app-1a2b3c4d",
+            session: "0123456789abcdef0123456789abcdef",
             root: &root,
             root_id: crate::route::root_id(&root).expect("the test's folder's id is read"),
             leaf: "app",
@@ -3002,6 +3003,7 @@ mod tests {
         RemoteCall {
             builder: &crate::test_support::HOST,
             key: KEY,
+            session: "0123456789abcdef0123456789abcdef",
             root,
             root_id: crate::route::root_id(root).expect("the wiring test's repository's id is read"),
             leaf: "app",

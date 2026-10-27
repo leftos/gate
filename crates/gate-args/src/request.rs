@@ -298,6 +298,8 @@ pub struct TestSeams {
     pub sample_ms: Option<u64>,
     pub heartbeat_ms: Option<u64>,
     pub poll_ms: Option<u64>,
+    /// The poll of a routed run's wait behind the builder drain (`--test-drain-poll-ms`).
+    pub drain_poll_ms: Option<u64>,
     pub stall_ms: Option<u64>,
     /// Whether the local watchdog's stall window runs only from the command's first output byte, so a quiet start is no
     /// stall.

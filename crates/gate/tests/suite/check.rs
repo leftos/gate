@@ -13,7 +13,7 @@ use gate_router::work_folder_key;
 use gate_state::v1::{self, WarmRecord, WarmState};
 use jiff::Timestamp;
 
-use crate::remote_client::{fake_unreal_install, open_to_another_account};
+use crate::remote_client::{builder_drain, drain_entries, fake_unreal_install, open_to_another_account};
 use crate::support::{
     ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, Go, NetfxKey, Outcome, PREFLIGHT_SEAMS_VARIABLE, STEPS_VARIABLE, build_version, calls,
     finish, git, ssh_steps, wait_until_closed, write_remote_json,
@@ -1491,6 +1491,26 @@ fn check_builder_lists_every_item_and_exits_0_when_nothing_is_missing() {
     assert_eq!(outcome.stderr, "", "{outcome:?}");
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(calls(&steps), ["preflight"], "one call reached the builder");
+}
+
+#[test]
+fn gate_check_builder_reports_the_drain_and_takes_no_place_in_line() {
+    let case = builder_case("check_builder_drained");
+    builder_drain(&case, "raise");
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+
+    let outcome = check_builder(&case, "builder-1", &[], &steps);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let drained = regex::Regex::new(
+        r"^gate: check: the builder is drained \(raised \d\d:\d\d UTC, lapses \d\d:\d\d UTC\); nothing was checked; check again after gate drain --lift$",
+    )
+    .expect("the pattern is valid");
+    assert!(drained.is_match(outcome.stderr.trim_end()), "one drained line: {outcome:?}");
+    assert_eq!(outcome.stdout, "", "nothing was checked: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"], "one call reached the builder");
+    assert_eq!(drain_entries(&case, "tickets"), Vec::<String>::new(), "the check took no ticket");
+    assert_eq!(drain_entries(&case, "sessions"), Vec::<String>::new(), "the check sent no session");
 }
 
 /// The stub of a git-lfs that answers as 3.8.0 does.

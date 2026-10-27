@@ -62,6 +62,7 @@ use crate::nesting::{Nesting, Parent, covers, enclosing_of};
 use crate::no_build::{self, NothingBack, Unfound, Worktree};
 use crate::orphan::{self, Orphan};
 use crate::outputs::{stale, walk::walk};
+use crate::remote::drain::{self, Drain, utc_clock};
 use crate::remote::{self, KEY_WAIT_SLICE, KeyWait, RemoteCall, RemoteClient, RemoteOutcome, Split, git};
 use crate::resolve::{Environment, ResolvedRoot};
 use crate::restore::{self, NotRestoring, RestorePlan};
@@ -895,6 +896,264 @@ struct CallParts<'r> {
     warmth: remote::Warmth<'r>,
     /// The variables the call sends the builder ([`routed_env`]).
     env: &'r [(String, String)],
+    /// The run's drain session, made once before its first attempt.
+    session: &'r str,
+}
+
+/// The outcome a routed run of `request` goes on with once `first`, the outcome of its `call`, ended: `first` itself,
+/// unless the builder's drain refused it. Then the run waits behind the drain, its key and remote slot kept: it says
+/// the waiting line and the still-waiting line every heartbeat, and polls the builder ([`RemoteClient::poll_drain`])
+/// every drain poll, each poll's barrier the last one seen. An unreachable poll is still waiting, said in the log only,
+/// until that barrier lapses, and is the outcome after. Any other poll the drain does not refuse starts a fresh attempt,
+/// whose outcome it is, unless the drain refused that attempt too, which says the waiting line again and waits again
+/// from the poll; a poll whose preflight passed is the builder's admission, and says the run's admitted line first.
+/// While it waits it holds its drain marker ([`drain::Marker`]), let go once the wait ends. `None` for a Ctrl+C during
+/// the wait.
+fn behind_drain(
+    client: &mut dyn RemoteClient,
+    call: &RemoteCall<'_>,
+    first: RemoteOutcome,
+    request: &RunRequest,
+    console: &mut Console,
+) -> Option<Behind> {
+    let Some(mut drain) = first.draining else {
+        return Some(Behind {
+            outcome: first,
+            admitted: None,
+        });
+    };
+    let poll = request.test_seams.drain_poll_ms.map_or(wait::DRAIN_POLL, Duration::from_millis);
+    let mut beat = Beat::new(request.test_seams.heartbeat_ms.map_or(wait::HEARTBEAT, Duration::from_millis));
+    loop {
+        console.err(&drain_waiting_line(drain));
+        let marker = held_marker(call, console);
+        let waited = waited_out(client, call, drain, (poll, &mut beat), console);
+        end_marker(marker, console);
+        let passed = match waited? {
+            WaitEnd::Polled { last, passed } => {
+                drain = last;
+                passed
+            }
+            WaitEnd::Ended(outcome) => {
+                return Some(Behind {
+                    outcome: *outcome,
+                    admitted: None,
+                });
+            }
+        };
+        if call.interrupt.is_some_and(Interrupt::is_raised) {
+            return None;
+        }
+        if passed {
+            console.err(&drain_admitted_line(drain, Timestamp::now().as_second()));
+        }
+        let admitted = Instant::now();
+        let ran = client.run(call);
+        match ran.draining {
+            Some(again) => drain = again,
+            None => {
+                return Some(Behind {
+                    outcome: ran,
+                    admitted: Some(admitted),
+                });
+            }
+        }
+    }
+}
+
+/// How a routed run goes on after its call: the outcome of its last attempt, and when the builder admitted that
+/// attempt after a wait behind its drain, `None` for a run that never waited and for one that fell back from its wait.
+struct Behind {
+    outcome: RemoteOutcome,
+    admitted: Option<Instant>,
+}
+
+/// How one stretch of a wait behind the builder drain ended, when no Ctrl+C ended it.
+enum WaitEnd {
+    /// A poll the drain did not refuse ended the wait, the last drain seen being `last`: the builder admitted the run
+    /// when the poll's preflight `passed`, and the run's attempt meets whatever else ended the poll on its own.
+    Polled { last: Drain, passed: bool },
+    /// The builder could not be reached after the last barrier lapsed: the run falls back with this outcome.
+    Ended(Box<RemoteOutcome>),
+}
+
+/// Waits behind the builder drain from `drain`, the last one seen, until a poll admits the run of `call` or ends its
+/// wait: polls the builder every `poll` and says the still-waiting line whenever `beat` says it is due; `None` once a
+/// Ctrl+C ends the wait.
+fn waited_out(
+    client: &mut dyn RemoteClient,
+    call: &RemoteCall<'_>,
+    mut drain: Drain,
+    (poll, beat): (Duration, &mut Beat),
+    console: &mut Console,
+) -> Option<WaitEnd> {
+    loop {
+        if !slept(poll, call.interrupt) {
+            return None;
+        }
+        if let Some(waited) = beat.due() {
+            console.err(&drain_still_waiting_line(waited, drain.place));
+        }
+        match poll_answer(client.poll_drain(call), drain, console) {
+            Answer::Waiting(standing) => drain = standing,
+            Answer::Ended(outcome) => return Some(WaitEnd::Ended(outcome)),
+            Answer::Polled { passed } => return Some(WaitEnd::Polled { last: drain, passed }),
+        }
+    }
+}
+
+/// The drain marker of the wait of `call` behind its builder's drain, held; `None`, said, when it cannot be, and the
+/// run waits without one.
+fn held_marker(call: &RemoteCall<'_>, console: &mut Console) -> Option<drain::Marker> {
+    match drain::Marker::hold(call.state_dir, call.builder.id.as_deref(), call.session) {
+        Ok(marker) => Some(marker),
+        Err(error) => {
+            let folder = v1::drain_marker_dir(call.state_dir, call.builder.id.as_deref());
+            console.err(&format!(
+                "gate: cannot hold a drain marker in {}: {}; the run waits without one",
+                gate_router::escaped(&folder.to_string_lossy()),
+                gate_router::escaped(&error.to_string())
+            ));
+            None
+        }
+    }
+}
+
+/// Lets the drain marker `marker` go, saying why its file could not be removed.
+fn end_marker(marker: Option<drain::Marker>, console: &mut Console) {
+    let Some(marker) = marker else {
+        return;
+    };
+    let path = marker.path().to_owned();
+    if let Err(error) = marker.end() {
+        console.err(&format!(
+            "gate: cannot remove the drain marker {}: {}",
+            gate_router::escaped(&path.to_string_lossy()),
+            gate_router::escaped(&error.to_string())
+        ));
+    }
+}
+
+/// What one drain poll answered a run waiting behind the drain that last said `drain`.
+enum Answer {
+    /// The drain still holds the run back, as this says.
+    Waiting(Drain),
+    /// The builder could not be reached after the last barrier lapsed: the run falls back with this outcome.
+    Ended(Box<RemoteOutcome>),
+    /// The drain no longer refused the poll, whose preflight `passed` when the builder admitted the run.
+    Polled { passed: bool },
+}
+
+/// What the poll that ended `polled` answered a run whose last drain seen is `drain`: an unreachable builder, or a poll
+/// the client killed, is still waiting while that drain's barrier stands, noted in the log alone.
+fn poll_answer(polled: RemoteOutcome, drain: Drain, console: &mut Console) -> Answer {
+    if let Some(standing) = polled.draining {
+        return Answer::Waiting(standing);
+    }
+    let fallback = polled.fallback();
+    if fallback != Some(FallbackReason::Unreachable) {
+        return Answer::Polled {
+            passed: polled.status == 0 && fallback.is_none(),
+        };
+    }
+    if Timestamp::now().as_second() < drain.lapses {
+        console.note(&format!(
+            "gate: the builder is unreachable while its drain stands (it lapses at {} UTC); still waiting",
+            utc_clock(drain.lapses)
+        ));
+        return Answer::Waiting(drain);
+    }
+    Answer::Ended(Box::new(polled))
+}
+
+/// When a wait's still-waiting lines are due: every period from the wait's start.
+struct Beat {
+    begun: Instant,
+    period: Duration,
+    next: Duration,
+}
+
+impl Beat {
+    fn new(period: Duration) -> Beat {
+        Beat {
+            begun: Instant::now(),
+            period,
+            next: period,
+        }
+    }
+
+    /// The time waited so far when a still-waiting line is due now, which moves the next one to the first period
+    /// after it, skipping any missed; else `None`.
+    fn due(&mut self) -> Option<Duration> {
+        let waited = self.begun.elapsed();
+        if waited < self.next {
+            return None;
+        }
+        while self.next <= waited {
+            self.next += self.period;
+        }
+        Some(waited)
+    }
+}
+
+/// Sleeps `period` in slices of [`KEY_WAIT_SLICE`], the console `interrupt` looked at before each; whether it slept
+/// the whole period, `false` once the interrupt is raised.
+fn slept(period: Duration, interrupt: Option<Interrupt>) -> bool {
+    let begun = Instant::now();
+    loop {
+        if interrupt.is_some_and(Interrupt::is_raised) {
+            return false;
+        }
+        let left = period.saturating_sub(begun.elapsed());
+        if left.is_zero() {
+            return true;
+        }
+        thread::sleep(left.min(KEY_WAIT_SLICE));
+    }
+}
+
+/// What a wait for the worktree's key says once its bound passed and a live drain marker holds that bound off.
+const KEY_HELD_OFF_LINE: &str = "gate: still waiting for the worktree's key past its bound: a routed run waits behind a builder drain";
+
+/// Says `line` unless `said` says it was, and marks it said.
+fn say_once(console: &mut Console, said: &mut bool, line: &str) {
+    if !std::mem::replace(said, true) {
+        console.err(line);
+    }
+}
+
+/// The line a routed run says once as it starts to wait behind the builder's `drain`, the barrier's times left out when
+/// the box said none stands, and its place when the box gave it none.
+fn drain_waiting_line(drain: Drain) -> String {
+    let head = match drain.times() {
+        Some(times) => format!("gate: waiting behind the builder drain ({times})"),
+        None => "gate: waiting behind the builder drain".to_owned(),
+    };
+    match drain.place {
+        Some(place) => format!("{head}; place {place} in line"),
+        None => head,
+    }
+}
+
+/// The line a routed run says every heartbeat of its wait behind the builder drain, `waited` into it, at `place`.
+fn drain_still_waiting_line(waited: Duration, place: Option<u32>) -> String {
+    let seconds = waited.as_secs();
+    match place {
+        Some(place) => format!("gate: still waiting behind the builder drain ({seconds} s; place {place})"),
+        None => format!("gate: still waiting behind the builder drain ({seconds} s)"),
+    }
+}
+
+/// The line a routed run says as the builder admits it at the Unix second `now`, the last drain seen being `drain`:
+/// the lapse line once that drain's barrier had lapsed by then, else the lift line.
+fn drain_admitted_line(drain: Drain, now: i64) -> String {
+    if drain.lapses > 0 && now >= drain.lapses {
+        return format!(
+            "gate: the builder drain lapsed at {} UTC without a lift; starting the routed run",
+            utc_clock(drain.lapses)
+        );
+    }
+    "gate: the builder drain lifted; starting the routed run".to_owned()
 }
 
 /// The variables a routed run sends the builder: the caller's pairs, then `SourceRevisionId` set to the worktree's
@@ -947,10 +1206,12 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         root,
         warmth,
         env,
+        session,
     } = parts;
     Ok(RemoteCall {
         builder: &remote.builder,
         key: &remote.key,
+        session,
         root: &remote.root,
         root_id: remote.root_id,
         leaf: &remote.leaf,
@@ -1581,12 +1842,14 @@ impl Run<'_> {
         };
         // Under the key lock, once a run: the key is the same for every builder the run tries.
         self.leave_worktree_record(remote, console);
+        // One drain session for every attempt and poll of the run.
+        let session = remote::payload::run_nonce();
         let mut waited = Duration::ZERO;
         let mut looked = 0;
         let mut later: Option<Box<RemoteRun>> = None;
         loop {
             let current = later.as_deref().unwrap_or(remote);
-            let refusal = match self.attempt(current, hold, &mut waited, console) {
+            let refusal = match self.attempt(current, hold, (&mut waited, &session), console) {
                 Attempt::Done(remotely) => return (remotely, None),
                 Attempt::Refused(refusal) => refusal,
             };
@@ -1703,7 +1966,7 @@ impl Run<'_> {
     /// only for what is left of the run's remote budget ([`wait::remote_budget`]) after the `waited` of its earlier
     /// attempts, which this wait adds to, then calls the client ([`Run::call_builder`]). A full pool is a refusal. A
     /// Ctrl+C ends the run here, with the remote slot released: one raised before the call, or during it over a refusal.
-    fn attempt(&mut self, remote: &RemoteRun, hold: &mut Hold, waited: &mut Duration, console: &mut Console) -> Attempt {
+    fn attempt(&mut self, remote: &RemoteRun, hold: &mut Hold, (waited, session): (&mut Duration, &str), console: &mut Console) -> Attempt {
         // A light run a critical request sent here never waits for a remote slot.
         let left = if self.rerouted_for.is_some() {
             Duration::ZERO
@@ -1736,16 +1999,18 @@ impl Run<'_> {
         if self.host.interrupt.is_some_and(Interrupt::is_raised) {
             return Attempt::Done(Remotely::Ended(self.interrupted_before_start(console)));
         }
-        self.call_builder(remote, hold, figures, console)
+        self.call_builder(remote, hold, (figures, session), console)
     }
 
     /// Calls the client for the routed run `remote` under `figures`, the remote slot held in `hold`, and ends the run as
     /// the client ended it. A refusal or a client that cannot start is a refusal, with the slot still held. A Ctrl+C
-    /// during the call over a refusal ends the run here, with the remote slot released. A client that ended on its own
+    /// during the call over a refusal ends the run here, with the remote slot released. A call the builder's drain refused
+    /// waits behind the drain ([`behind_drain`]) with the slot still held, and a Ctrl+C during that wait ends the run here
+    /// as one before the command started. A client that ended on its own
     /// keeps its own status, and the run writes or clears the worktree's nothing-back record
     /// ([`Run::leave_nothing_back`]).
-    fn call_builder(&mut self, remote: &RemoteRun, hold: &mut Hold, figures: Figures, console: &mut Console) -> Attempt {
-        let started = Instant::now();
+    fn call_builder(&mut self, remote: &RemoteRun, hold: &mut Hold, (figures, session): (Figures, &str), console: &mut Console) -> Attempt {
+        let mut started = Instant::now();
         let env = routed_env(&self.request.env, remote.source_revision.as_deref());
         let parts = CallParts {
             request: self.request,
@@ -1755,12 +2020,23 @@ impl Run<'_> {
             root: self.root,
             warmth: warmth_of(self.warm_hash.as_deref()),
             env: &env,
+            session,
         };
         let call = match call_of(parts, remote) {
             Ok(call) => call,
             Err(why) => return Attempt::refused(FallbackReason::Client, RemoteOutcome::not_started(why), hold.taken.take()),
         };
-        let outcome = self.client.run(&call);
+        let first = self.client.run(&call);
+        // A drain's refusal is no fallback: the run waits behind it, and goes on with the outcome of its admitted attempt.
+        let Some(Behind { outcome, admitted }) = behind_drain(self.client.as_mut(), &call, first, self.request, console) else {
+            return Attempt::Done(Remotely::Ended(self.interrupted_before_start(console)));
+        };
+        // The wait behind the drain is no part of the run's time: its slot's hold and its wall time count from the
+        // admission.
+        if let Some(admitted) = admitted {
+            started = admitted;
+            hold.took = Some(admitted);
+        }
         let fallback = outcome.fallback();
         // A Ctrl+C during the call wins over a refusal: the command never runs here.
         if fallback.is_some() && self.host.interrupt.is_some_and(Interrupt::is_raised) {
@@ -1998,6 +2274,8 @@ impl Run<'_> {
             root: self.root,
             warmth: warmth_of(self.warm_hash.as_deref()),
             env: &env,
+            // The key lock sends nothing, so it names no session.
+            session: "",
         };
         let call = match call_of(parts, remote) {
             Ok(call) => call,
@@ -2030,6 +2308,8 @@ impl Run<'_> {
             return Err(busy(self, console));
         }
         let mut probe_said = false;
+        let mut marker_said = drain::ProbeSaid::default();
+        let mut past_bound_said = false;
         if warm_up_holds(&self.root.path, &remote.key, console, &mut probe_said) {
             return Err(busy(self, console));
         }
@@ -2060,8 +2340,13 @@ impl Run<'_> {
                 return Err(self.interrupted_key_wait(remote, begun.elapsed(), console));
             }
             let waited = begun.elapsed();
+            // A run of the worktree waiting behind a builder's drain may hold the key, which is the worktree's on every
+            // builder: a live marker of any of them holds the bound off.
             if waited >= bound {
-                return Err(busy(self, console));
+                if !drain::any_marker_stood(&self.root.path, console, &mut marker_said) {
+                    return Err(busy(self, console));
+                }
+                say_once(console, &mut past_bound_said, KEY_HELD_OFF_LINE);
             }
             if waited >= next {
                 // A warm-up that took the key during the wait is not waited for either.
@@ -2360,7 +2645,7 @@ impl Run<'_> {
             Some(RecordChange::Add { path, folder, project }) => {
                 // The key lock a routed run writes the record under, so a fresh record it writes meanwhile is kept.
                 let added = self
-                    .hold_folder_key(&folder)
+                    .hold_folder_key(&folder, console)
                     .map_err(|reason| format!("gate: cannot add to {}: {reason}", path.display()))
                     .and_then(|_held| no_build::add_built(&path, &project, &settings));
                 if let Err(line) = added {
@@ -2373,16 +2658,19 @@ impl Run<'_> {
 
     /// Holds the lock of the work-folder key `folder`, the one a routed run of the worktree holds while it writes the
     /// worktree's nothing-back record ([`Run::take_key`]), waiting for another holder up to the run's key-wait bound in
-    /// slices, between which a Ctrl+C ends the wait.
+    /// slices, between which a Ctrl+C ends the wait. A live drain marker of any builder holds the bound off, said once;
+    /// an entry the marker probe skips is noted in the log once through `console`.
     ///
     /// # Errors
     ///
     /// Why the lock is not held: it cannot be opened or taken, another run held it for the whole bound, or a Ctrl+C
     /// ended the wait.
-    fn hold_folder_key(&self, folder: &str) -> Result<OwnedMutexGuard, String> {
+    fn hold_folder_key(&self, folder: &str, console: &mut Console) -> Result<OwnedMutexGuard, String> {
         let name = self.root.root.object_name(KernelObject::Routed { hash: key_hash(folder) });
         let bound = self.request.test_seams.key_wait_ms.map_or(KEY_WAIT, Duration::from_millis);
         let begun = Instant::now();
+        let mut said = drain::ProbeSaid::default();
+        let mut past_bound_said = false;
         loop {
             // A wait that times out gives its handle up, so each slice waits on one of its own.
             let mutex = NamedMutex::open(&name).map_err(|error| format!("cannot open the mutex {name}: {error}"))?;
@@ -2394,11 +2682,25 @@ impl Run<'_> {
             if self.host.interrupt.is_some_and(Interrupt::is_raised) {
                 return Err("Ctrl+C ended the wait for the work folder's key".to_owned());
             }
-            if begun.elapsed() >= bound {
-                return Err(format!(
-                    "another run of the worktree held the work folder's key for {} ms",
-                    bound.as_millis()
-                ));
+            if begun.elapsed() < bound {
+                continue;
+            }
+            // The key is the worktree's on every builder: a live drain marker of any of them holds the bound off.
+            let probed = drain::any_marker_stands(&self.root.path, &mut |path, error| said.skipped(console, path, error));
+            match probed {
+                Ok(true) => say_once(console, &mut past_bound_said, KEY_HELD_OFF_LINE),
+                Ok(false) => {
+                    return Err(format!(
+                        "another run of the worktree held the work folder's key for {} ms",
+                        bound.as_millis()
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "another run of the worktree held the work folder's key for {} ms, and the drain markers cannot be probed: {error}",
+                        bound.as_millis()
+                    ));
+                }
             }
         }
     }
@@ -4240,18 +4542,41 @@ mod tests {
     use gate_watchdog::{Cores, Hint};
 
     use super::{
-        Ends, Judged, Pass, ROUTE_HINT_MIN_WALL, RouteJudged, Stopper, Timing, brought_everything_back, cores_hint_for, cores_line, dropped_line,
-        earlier, holder_claim, interrupted, key_wait_left, key_wait_line, kill, log_in_state_root, passed_line, records_after, route_hint_for,
-        route_hint_line, routed_env, stop, takes_own_slot,
+        Ends, Judged, Pass, ROUTE_HINT_MIN_WALL, RouteJudged, Stopper, Timing, brought_everything_back, cores_hint_for, cores_line,
+        drain_waiting_line, dropped_line, earlier, holder_claim, interrupted, key_wait_left, key_wait_line, kill, log_in_state_root, passed_line,
+        records_after, route_hint_for, route_hint_line, routed_env, stop, takes_own_slot,
     };
     use crate::console::Console;
     use crate::escaped::{Found, Look, Reached, Recorded};
     use crate::nesting::{Nesting, Parent};
+    use crate::remote::drain::Drain;
     use crate::remote::{RemoteOutcome, Split};
     use crate::watch::Watched;
     use gate_state::v1::{Claim, ClaimKind};
     use jiff::Timestamp;
     use serde_json::{Map, Value};
+
+    #[test]
+    fn a_drain_with_no_barrier_says_its_waiting_line_without_the_times() {
+        let none = Drain {
+            place: Some(3),
+            raised: 0,
+            lapses: 0,
+        };
+        assert_eq!(drain_waiting_line(none), "gate: waiting behind the builder drain; place 3 in line");
+        assert_eq!(
+            drain_waiting_line(Drain { place: None, ..none }),
+            "gate: waiting behind the builder drain"
+        );
+        assert_eq!(
+            drain_waiting_line(Drain {
+                raised: 100,
+                lapses: 1900,
+                ..none
+            }),
+            "gate: waiting behind the builder drain (raised 00:01 UTC, lapses 00:31 UTC); place 3 in line"
+        );
+    }
 
     /// `count` caller pairs of distinct names.
     fn caller_pairs(count: usize) -> Vec<(String, String)> {

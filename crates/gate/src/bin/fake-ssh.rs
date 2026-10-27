@@ -39,7 +39,7 @@
 //! `/usr/bin/perl` looking for a path that does not exist; `no-cargo` runs it with no `cargo` stand-in and a login `PATH`
 //! of `tools`, `/usr/bin` and the first folder holding a `git.exe` along `PATH` alone.
 //!
-//! `ok` runs `<gate> box <verb> --stdin` with the gate the variable `GATE_FAKE_SSH_GATE` names, a `run` or `lfs` call
+//! `ok` runs `<gate> box <verb> --stdin` with the gate the variable `GATE_FAKE_SSH_GATE` names, a `run`, `lfs` or `inputs` call
 //! given the words of the variable `GATE_FAKE_SSH_BOX_SEAMS`, when set, before its verb as box seams, and a `preflight` call
 //! those of `GATE_FAKE_SSH_PREFLIGHT_SEAMS` the same way, then `--test-box-root-walk-stop <folder>` when the variable
 //! `GATE_FAKE_SSH_ROOT_WALK_STOP` names the folder, one path never split, or `git
@@ -379,7 +379,7 @@ fn variable(name: &str) -> Result<String, String> {
 }
 
 /// The box seams a call's gate is given before its verb: the words of the variable `name`, `GATE_FAKE_SSH_BOX_SEAMS`
-/// for a `run` or `lfs` call and `GATE_FAKE_SSH_PREFLIGHT_SEAMS` for a preflight, none when it is unset.
+/// for a `run`, `lfs` or `inputs` call and `GATE_FAKE_SSH_PREFLIGHT_SEAMS` for a preflight, none when it is unset.
 fn seams_of(name: &str) -> Result<String, String> {
     match std::env::var(name) {
         Err(std::env::VarError::NotPresent) => Ok(String::new()),
@@ -676,7 +676,7 @@ impl<'a> BoxCall<'a> {
         let mut command = Command::new(variable("GATE_FAKE_SSH_GATE")?);
         command.arg("box");
         let seams = match self.verb {
-            "run" | "lfs" => Some("GATE_FAKE_SSH_BOX_SEAMS"),
+            "run" | "lfs" | "inputs" => Some("GATE_FAKE_SSH_BOX_SEAMS"),
             "preflight" => Some("GATE_FAKE_SSH_PREFLIGHT_SEAMS"),
             _ => None,
         };

@@ -20,6 +20,7 @@ use serde_json::{Map, Value};
 use crate::console::Console;
 use crate::durations::span_text;
 use crate::pause::Pause;
+use crate::remote::drain;
 use crate::resolve::ResolvedRoot;
 use crate::slots::{self, BesideTry, Pool, Survey, Taken, ThisGate};
 
@@ -27,6 +28,8 @@ use crate::slots::{self, BesideTry, Pool, Survey, Taken, ThisGate};
 const POLL: Duration = Duration::from_secs(2);
 /// How often a waiter says it still waits, a routed run's wait for its work folder's key among them.
 pub(crate) const HEARTBEAT: Duration = Duration::from_secs(30);
+/// How often a routed run waiting behind the builder drain polls the builder's preflight.
+pub(crate) const DRAIN_POLL: Duration = Duration::from_secs(5);
 /// The longest a waiter sleeps after a pass that found the beside mutex held by another gate: that gate wakes the
 /// waiters only once it took or lent something, so a pass that found no room for this reason alone looks again soon.
 const BUSY_RETRY: Duration = Duration::from_millis(100);
@@ -235,6 +238,11 @@ pub(crate) struct Wait<'a> {
     may_route: bool,
     /// Whether a remote wait takes a slot only when another stays free after it ([`Wait::keep_spare`]).
     spare: bool,
+    /// Whether the last pass past the limit found a live drain marker of the pool's builder ([`drain::marker_stands`]),
+    /// which holds the limit off: the wait goes on without it until a pass finds none.
+    held_off: bool,
+    /// What the drain-marker probes of this wait have said.
+    said_marker: drain::ProbeSaid,
 }
 
 /// The earliest critical request ahead of a waiting gate, which holds it back: its gate's pid, and whether it holds the
@@ -338,6 +346,8 @@ impl<'a> Wait<'a> {
             said_ignored: false,
             may_route: false,
             spare: false,
+            held_off: false,
+            said_marker: drain::ProbeSaid::default(),
         }
     }
 
@@ -369,7 +379,7 @@ impl<'a> Wait<'a> {
             if let Some(waited) = self.pass(survey, console) {
                 return waited;
             }
-            self.waiter.sleep(self.limit, console);
+            self.waiter.sleep(self.limit.filter(|_| !self.held_off), console);
             if self.waiter.interrupted() {
                 return Waited::Interrupted;
             }
@@ -417,7 +427,7 @@ impl<'a> Wait<'a> {
         if !self.said_waiting && self.limit != Some(Duration::ZERO) {
             self.say_waiting(probe, range, survey, console);
         }
-        self.pass_ended()
+        self.pass_ended(console)
     }
 
     /// The fallback poll of this wait: the longest a waiter goes between two passes (`--test-poll-ms`, else 2 s).
@@ -426,14 +436,19 @@ impl<'a> Wait<'a> {
     }
 
     /// Whether this pass ended the wait, and how. The console is read first, so a Ctrl+C raised by this pass's own
-    /// still-waiting line is the interrupt, and never a remote pool read as full at the wait's limit.
-    fn pass_ended(&self) -> Option<Waited> {
+    /// still-waiting line is the interrupt, and never a remote pool read as full at the wait's limit. A pass past a
+    /// limit above zero that finds a live drain marker of the pool's builder ([`drain::marker_stands`]) ends nothing: a
+    /// run waiting behind that builder's drain holds a slot, and this wait goes on without its limit while the marker
+    /// stands. A wait whose limit is zero never waits, marker or not.
+    fn pass_ended(&mut self, console: &mut Console) -> Option<Waited> {
         if self.waiter.interrupted() {
             return Some(Waited::Interrupted);
         }
-        self.limit
-            .is_some_and(|limit| self.waiter.queued.elapsed() >= limit)
-            .then_some(Waited::TimedOut)
+        let limit = self.limit.filter(|limit| self.waiter.queued.elapsed() >= *limit)?;
+        let builder = self.pool.remote_id().map(|id| id.to_string());
+        self.held_off =
+            !limit.is_zero() && self.pool.is_remote() && drain::marker_stood(&self.root.path, builder.as_deref(), console, &mut self.said_marker);
+        (!self.held_off).then_some(Waited::TimedOut)
     }
 
     /// Deletes the gate's ticket, the first step of its take, and its pause marker, whichever way the wait ended.

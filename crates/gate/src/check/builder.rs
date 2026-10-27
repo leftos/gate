@@ -19,6 +19,7 @@ use crate::check::local::{self, Declarations, Declared, SiblingsFile, WarmSource
 use crate::check::report::{self, At, Checked, Problem, Tool, Warmup};
 use crate::console::Console;
 use crate::environment::Variables;
+use crate::remote::drain::{self, Drain};
 use crate::remote::git::{self, GitError, ProgramCall, ProgramOutput, ProgramPlace};
 use crate::remote::launch;
 use crate::remote::lfs;
@@ -37,6 +38,14 @@ use gate_wire::build_version;
 const BOUND: Duration = Duration::from_secs(120);
 /// What a failure to end a call that outlived its bound says after the late line, before why.
 const NOT_STOPPED: &str = "could not be stopped: ";
+/// The status of a preflight the box refused, its drain's among them ([`crate::remote::REFUSED`]).
+const DRAIN_REFUSED: i32 = 75;
+
+/// The one line of a check the builder's `drain` refused: the barrier's times, left out when the box said none stands.
+fn drained_line(drain: Drain) -> String {
+    let times = drain.times().map(|times| format!(" ({times})")).unwrap_or_default();
+    format!("gate: check: the builder is drained{times}; nothing was checked; check again after gate drain --lift")
+}
 
 /// Checks the builder `host` for the repo the working folder is in and says what it found through `console`; returns
 /// the exit status: 0 when nothing is missing, 1 when something is or the check could not run, 2 for a host
@@ -141,8 +150,12 @@ fn asked(transport: &dyn Transport, builder: &Builder, place: &Place, bound: Dur
     }
     let needs = toolchain::needs_of(&declared.manifest);
     let key = work_folder_key(&place.root);
-    let location = Location::under(&profile, &repo, &key, &payload::job_nonce());
-    let input = payload::input(&payload::preflight_word(&location, &needs), None);
+    // A check takes no place in the drain's line: it sends no session and asks for no ticket.
+    let location = Location {
+        no_ticket: true,
+        ..Location::under(&profile, &repo, &key, &payload::job_nonce())
+    };
+    let input = payload::input(&payload::preflight_word(&location, &needs, &payload::run_nonce()), None);
     let sent: Vec<String> = needs.into_iter().map(|(name, _)| name).collect();
     let program = transport.call(host, &profile.line(BoxVerb::Preflight), Wire::Plain);
     let heard = called(&program, bound, drain, input.as_bytes()).map_err(|failure| failure.line(host))?;
@@ -291,7 +304,8 @@ fn heard(output: &ProgramOutput) -> Heard {
 }
 
 /// The one line of a builder `host`, whose root is `root`, that cannot be checked, as its call `heard` ended: ssh's
-/// failure, a builder with no `gate box` that takes the call, a preflight that failed, or a builder that runs another
+/// failure, a builder whose drain refused the check ([`drained_line`]), a builder with no `gate box` that takes the
+/// call, a preflight that failed, or a builder that runs another
 /// gate build than this PC's; `None` for one that answered, and for one whose box refused its work root, which the
 /// report says as an item ([`root_problem`]).
 fn refusal(host: &str, root: &str, heard: &Heard) -> Option<String> {
@@ -305,6 +319,11 @@ fn refusal(host: &str, root: &str, heard: &Heard) -> Option<String> {
     }
     if root_problem(heard).is_some() {
         return None;
+    }
+    if heard.status == Some(DRAIN_REFUSED)
+        && let Some(drain) = drain::said_in(heard.errors.iter().map(String::as_str))
+    {
+        return Some(drained_line(drain));
     }
     match heard.status {
         Some(0) => {}
@@ -782,6 +801,35 @@ mod tests {
             errors: last_error.iter().map(|line| (*line).to_owned()).collect(),
             last_error: last_error.map(str::to_owned),
         }
+    }
+
+    /// A 75 whose stderr carries the drain's place and barrier lines is the drain, said as one line; the same lines
+    /// with another status are a failed preparation, and a drain with no barrier leaves the times out.
+    #[test]
+    fn a_drained_box_is_reported_not_failed() {
+        let root = r"D:\gate-remote";
+        let drained = |status: i32, barrier: &str| Heard {
+            status: Some(status),
+            lines: Vec::new(),
+            errors: lines(&["gate-remote-refused: n drain", "gate: drain place none", barrier]),
+            last_error: Some(barrier.to_owned()),
+        };
+        assert_eq!(
+            refusal(HOST, root, &drained(75, "gate: drain barrier 100 1900")),
+            Some(
+                "gate: check: the builder is drained (raised 00:01 UTC, lapses 00:31 UTC); nothing was checked; check again after gate drain --lift"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            refusal(HOST, root, &drained(75, "gate: drain barrier none")),
+            Some("gate: check: the builder is drained; nothing was checked; check again after gate drain --lift".to_owned())
+        );
+        assert_eq!(
+            refusal(HOST, root, &drained(3, "gate: drain barrier 100 1900")),
+            Some(r"check: builder-1: preparing D:\gate-remote failed (status 3): gate: drain barrier 100 1900".to_owned()),
+            "another status is no drain"
+        );
     }
 
     #[test]

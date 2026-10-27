@@ -707,6 +707,8 @@ pub(super) fn send(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &s
         Err(Unsent::Ended(End::Failed(why)) | Unsent::Refused(why)) => Err(refused(attempt, &why)),
         // The box refused for its install, its line said: the run falls back for that, not for its LFS content.
         Err(Unsent::Ended(End::Refused(FallbackReason::Install))) => Err(End::Refused(FallbackReason::Install)),
+        // The builder's drain refused a session no longer live: the run waits behind it, then starts again.
+        Err(Unsent::Ended(End::Draining(drain))) => Err(End::Draining(drain)),
         Err(Unsent::Ended(End::Refused(reason))) => Err(refused(attempt, &format!("the LFS call ended {}", reason.as_str()))),
         Err(Unsent::Ended(other)) => Err(End::Failed(format!("the LFS call ended {}, which no LFS call does", unexpected(&other)))),
     }
@@ -743,7 +745,7 @@ fn sent_to(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, send
     let path = folder.join(format!("{}-{nonce}.lfs.tar.zst", attempt.call.key));
     let archive = tmp_file(root, &path, "the LFS archive").map_err(Unsent::Refused)?;
     let compressed = packed(&archive, &objects, &needed, &|| attempt.go_on().is_ok()).map_err(unsent)?;
-    put(attempt, location, nonce, sending, (&archive, compressed, needed.len()))?;
+    put(attempt, location, sending, (&archive, compressed, needed.len()))?;
     drop(archive);
     drop(held);
     attempt.say(sent_line(needed.len(), bytes, started.elapsed()));
@@ -773,7 +775,10 @@ fn sent_line(count: usize, bytes: u64, took: Duration) -> String {
 /// answer is written raw into a file of the held `.tmp` and read back through the same handle; the call is watched by
 /// its own output and a transfer ceiling counted from its own start, as a fetch is.
 fn diffed<'s>(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, sending: &'s Sending) -> Result<Vec<&'s Object>, Unsent> {
-    let head = payload::input(&payload::inputs_word(location, nonce, InputsStep::Diff, None), Some(&sending.line));
+    // Each call's word carries a nonce new to it, which the box's refusal tags for the call name; the PC's own files
+    // keep the run's.
+    let call_nonce = payload::run_nonce();
+    let head = payload::input(&payload::inputs_word(location, &call_nonce, InputsStep::Diff, None), Some(&sending.line));
     let root = Path::new(attempt.call.root);
     let path = root.join(TMP).join(format!("{}-{nonce}.lfs-diff", attempt.call.key));
     let answer = tmp_file(root, &path, "the LFS diff answer").map_err(Unsent::Refused)?;
@@ -792,7 +797,7 @@ fn diffed<'s>(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, s
         })
     };
     let watch = Watch::Fetch(attempt.limits_for("lfs-diff"), None);
-    let called = attempt.lfs_call(&head, None, Some(&make), watch).map_err(Unsent::Ended)?;
+    let called = attempt.lfs_call((&head, &call_nonce), None, Some(&make), watch).map_err(Unsent::Ended)?;
     judged(attempt, &called, Step::LfsDiff)?;
     let mut text = Vec::new();
     (&answer)
@@ -805,11 +810,15 @@ fn diffed<'s>(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, s
 /// The put call of the `sent` objects packed into the open archive, its compressed length and their count: the
 /// request, the manifest and then the archive, watched as a put; else why not, a builder that installed another count
 /// than was sent included.
-fn put(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, sending: &Sending, sent: (&File, u64, usize)) -> Result<(), Unsent> {
+fn put(attempt: &mut Attempt<'_, '_>, location: &Location, sending: &Sending, sent: (&File, u64, usize)) -> Result<(), Unsent> {
     let (archive, length, count) = sent;
-    let head = payload::input(&payload::inputs_word(location, nonce, InputsStep::Put, None), Some(&sending.line));
+    // Each call's word carries a nonce new to it, which the box's refusal tags for the call name.
+    let call_nonce = payload::run_nonce();
+    let head = payload::input(&payload::inputs_word(location, &call_nonce, InputsStep::Put, None), Some(&sending.line));
     let watch = Watch::Put(attempt.limits_for("lfs"));
-    let called = attempt.lfs_call(&head, Some((archive, length)), None, watch).map_err(Unsent::Ended)?;
+    let called = attempt
+        .lfs_call((&head, &call_nonce), Some((archive, length)), None, watch)
+        .map_err(Unsent::Ended)?;
     judged(attempt, &called, Step::LfsPut)?;
     installed_all(&called.lines, count).map_err(Unsent::Refused)
 }

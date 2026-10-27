@@ -4407,3 +4407,605 @@ fn a_ctrl_c_on_the_first_builder_tries_no_other() {
     assert_eq!(names(&own), ["queue", "take", "release"], "{own:#?}");
     assert_eq!(hosts(&own), [Some(MAC); 3], "{own:#?}");
 }
+
+/// The drain poll of the drain cases, short so a wait of a few polls ends soon.
+const DRAIN_POLL: [&str; 2] = ["--test-drain-poll-ms", "20"];
+/// The line a routed run says once the builder admits it under a barrier that still stood.
+const DRAIN_LIFTED: &str = "gate: the builder drain lifted; starting the routed run";
+
+/// The Unix second now, from the clock the gate reads.
+fn unix_now() -> i64 {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is past 1970");
+    i64::try_from(since.as_secs()).expect("the seconds fit")
+}
+
+/// The Unix second `seconds` as the drain's lines say a time: `hh:mm`, in UTC.
+fn utc_clock(seconds: i64) -> String {
+    let day = seconds.rem_euclid(86_400);
+    format!("{:02}:{:02}", day / 3_600, day % 3_600 / 60)
+}
+
+/// The scripted client's step answering its first `calls` calls as the drain's refusal at `place`, under a barrier
+/// raised at `raised` that lapses at `lapses`.
+fn draining(calls: u32, place: &str, raised: i64, lapses: i64) -> String {
+    format!("draining {calls} {place} {raised} {lapses}")
+}
+
+/// The line a routed run says once as it starts to wait behind the drain of a barrier raised at `raised` that lapses
+/// at `lapses`, at `place` when it has one.
+fn drain_waiting(raised: i64, lapses: i64, place: Option<u32>) -> String {
+    let head = format!(
+        "gate: waiting behind the builder drain (raised {} UTC, lapses {} UTC)",
+        utc_clock(raised),
+        utc_clock(lapses)
+    );
+    place.map_or_else(|| head.clone(), |place| format!("{head}; place {place} in line"))
+}
+
+#[test]
+fn a_routed_run_behind_the_builder_drain_waits_then_runs_there_and_never_falls_back() {
+    let case = routed_case("routing-drain-wait");
+    let now = unix_now();
+    let (raised, lapses) = (now - 60, now + 1800);
+    let call = case.folder().join("call.json");
+    let record = format!("record {}", shown(&call));
+    let steps = shown(&stub(&case, &[&draining(3, "2", raised, lapses), &record, "out ran there", "status 0"]));
+    let running = case.start(&routed_words("out.log", &steps, &DRAIN_POLL, &[r".\tool.exe", "out", "ran here"]));
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let waiting = drain_waiting(raised, lapses, Some(2));
+    assert!(has_line_once(&outcome.stderr, &waiting), "the waiting line is said once: {outcome:?}");
+    assert_in_order(&outcome.stderr, &[&waiting, DRAIN_LIFTED]);
+    assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
+    assert!(!outcome.stdout.contains("ran here"), "nothing ran here: {outcome:?}");
+    let session = recorded(&call)["session"].as_str().map(str::to_owned).unwrap_or_default();
+    assert!(
+        session.len() == 32 && session.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+        "the run names its session: {session}"
+    );
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "take", "release"], "no fallback: {own:#?}");
+    assert!(own.iter().all(has_remote_tag), "{own:#?}");
+}
+
+#[test]
+fn a_drain_wait_says_still_waiting_every_heartbeat() {
+    let case = routed_case("routing-drain-heartbeat");
+    let now = unix_now();
+    let (raised, lapses) = (now - 60, now + 1800);
+    let steps = shown(&stub(&case, &[&draining(20, "none", raised, lapses), "status 0"]));
+    let mut extra = DRAIN_POLL.to_vec();
+    extra.extend(["--test-heartbeat-ms", "100"]);
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &extra, &[r".\tool.exe", "out", "hi"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    // Twenty polls a drain poll apart wait past the heartbeat at least once; a place of none drops the place.
+    assert!(has_line_once(&outcome.stderr, &drain_waiting(raised, lapses, None)), "{outcome:?}");
+    let still: Vec<&str> = outcome
+        .stderr
+        .lines()
+        .filter(|line| line.starts_with("gate: still waiting behind the builder drain ("))
+        .collect();
+    assert!(!still.is_empty(), "{outcome:?}");
+    for line in &still {
+        let seconds = line
+            .strip_prefix("gate: still waiting behind the builder drain (")
+            .and_then(|rest| rest.strip_suffix(" s)"));
+        assert!(seconds.is_some_and(|seconds| seconds.parse::<u64>().is_ok()), "{line}");
+    }
+    assert_in_order(&outcome.stderr, &[still[0], DRAIN_LIFTED]);
+}
+
+#[test]
+fn a_run_admitted_after_a_lapse_says_the_lapse_line() {
+    let case = routed_case("routing-drain-lapsed");
+    let now = unix_now();
+    let (raised, lapses) = (now - 1860, now - 60);
+    let steps = shown(&stub(&case, &[&draining(2, "1", raised, lapses), "status 0"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &DRAIN_POLL, &[r".\tool.exe", "out", "hi"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let lapsed = format!(
+        "gate: the builder drain lapsed at {} UTC without a lift; starting the routed run",
+        utc_clock(lapses)
+    );
+    assert_in_order(&outcome.stderr, &[&drain_waiting(raised, lapses, Some(1)), &lapsed]);
+    assert!(!outcome.stderr.contains(DRAIN_LIFTED), "{outcome:?}");
+}
+
+#[test]
+fn a_ctrl_c_in_the_drain_wait_frees_the_remote_slot_and_the_key() {
+    let case = routed_case("routing-drain-ctrl-c");
+    let now = unix_now();
+    // The poll after the refused call raises the interrupt, which the wait reads before it starts the run.
+    let steps = shown(&stub(
+        &case,
+        &[&draining(1, "1", now - 60, now + 1800), "interrupt", "out ran there", "status 0"],
+    ));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &DRAIN_POLL, &[r".\tool.exe", "out", "ran here"])));
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    assert!(
+        !outcome.stdout.contains("ran here") && !outcome.stdout.contains("ran there"),
+        "the command ran nowhere: {outcome:?}"
+    );
+    assert!(!outcome.stderr.contains(DRAIN_LIFTED), "{outcome:?}");
+    let events = events(&case);
+    assert_eq!(names(&events), ["queue", "take", "release"], "{events:#?}");
+    assert!(events.iter().all(has_remote_tag), "{events:#?}");
+    assert!(!remote_claim(&case).exists(), "the remote claim is gone");
+    let next = shown(&stub(&case, &["status 0"]));
+    let after = finish(case.gate(&routed_words("next.log", &next, &[], &[r".\tool.exe", "out", "hi"])));
+    assert_eq!(after.code, Some(0), "the next run takes the key and the slot: {after:?}");
+    assert!(!after.stderr.contains("still waiting for this worktree's work folder"), "{after:?}");
+}
+
+#[test]
+fn a_pinned_run_waits_for_the_drain_instead_of_ending_not_here() {
+    let case = two_builder_case("routing-drain-pinned");
+    let now = unix_now();
+    let (raised, lapses) = (now - 60, now + 1800);
+    let call = case.folder().join("call.json");
+    let record = format!("record {}", shown(&call));
+    let drained = draining(2, "1", raised, lapses);
+    let steps = shown(&stub(&case, &["on mac-1", &drained, &record, "status 0", "on builder", "refuse busy"]));
+    let mut extra = vec!["--builder", MAC];
+    extra.extend(DRAIN_POLL);
+    let running = case.start(&routed_words("out.log", &steps, &extra, &[r".\tool.exe", "out", "ran here"]));
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_in_order(&outcome.stderr, &[&drain_waiting(raised, lapses, Some(1)), DRAIN_LIFTED]);
+    assert!(!outcome.stderr.contains("--builder given"), "the pin never ends the run: {outcome:?}");
+    assert_eq!(recorded(&call)["host"], MAC, "the pinned builder ran it");
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "take", "release"], "{own:#?}");
+    assert_eq!(hosts(&own), [Some(MAC); 3], "{own:#?}");
+}
+
+#[test]
+fn an_unreachable_builder_while_a_barrier_stands_counts_as_waiting_and_after_its_lapse_falls_back() {
+    let case = routed_case("routing-drain-unreachable");
+    let now = unix_now();
+    // Under a standing barrier the unreachable poll waits on, noted in the log alone; the interrupt the same poll
+    // raised ends the wait.
+    let standing = now + 3600;
+    let steps = shown(&stub(&case, &[&draining(1, "1", now - 60, standing), "refuse unreachable", "interrupt"]));
+    let waited = finish(case.gate(&routed_words("waited.log", &steps, &DRAIN_POLL, &[r".\tool.exe", "out", "ran here"])));
+
+    assert_eq!(waited.code, Some(CONTROL_C_EXIT), "{waited:?}");
+    let note = format!(
+        "gate: the builder is unreachable while its drain stands (it lapses at {} UTC); still waiting",
+        utc_clock(standing)
+    );
+    assert!(!waited.stderr.contains(&note), "the note is the log's alone: {waited:?}");
+    assert!(log_text(&case, "waited.log").contains(&note), "the log notes the wait");
+    assert!(!waited.stderr.contains("unreachable; running here"), "{waited:?}");
+
+    // Past the barrier's lapse the same poll falls back.
+    let lapsed = now - 60;
+    let steps = shown(&stub(&case, &[&draining(1, "1", now - 1860, lapsed), "refuse unreachable"]));
+    let running = case.start(&routed_words("fell.log", &steps, &DRAIN_POLL, &[r".\tool.exe", "out", "ran here"]));
+    let pid = running.id();
+    let fell = running.finish();
+
+    assert_eq!(fell.code, Some(0), "{fell:?}");
+    assert!(fell.stdout.contains("ran here"), "{fell:?}");
+    assert!(fell.stderr.contains("gate: remote builder unreachable; running here"), "{fell:?}");
+    assert_refused(&own(&case, pid), "unreachable");
+}
+
+/// The text of the case's log `name`.
+fn log_text(case: &Case, name: &str) -> String {
+    fs::read_to_string(case.folder().join(name)).expect("the log can be read")
+}
+
+/// The case's drain marker folder of the builder whose id is `id`, `host` for none.
+fn marker_folder(case: &Case, id: Option<&str>) -> PathBuf {
+    case.root().join("remote").join("drain").join(id.unwrap_or("host"))
+}
+
+/// Holds a drain marker in the case's marker folder of the builder `id`, as a run waiting behind that builder's drain
+/// holds one: a file open sharing nothing, held until it is dropped.
+fn hold_marker(case: &Case, id: Option<&str>) -> fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let folder = marker_folder(case, id);
+    fs::create_dir_all(&folder).expect("the marker folder can be made");
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(folder.join("1-0123456789abcdef0123456789abcdef"))
+        .expect("the marker can be held")
+}
+
+/// The names in the marker folder `folder`, sorted, with whether another open finds each held; none when it is missing.
+fn markers(folder: &Path) -> Vec<(String, bool)> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let Ok(entries) = fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(String, bool)> = entries
+        .map(|entry| {
+            let path = entry.expect("a marker entry can be read").path();
+            // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE: only a holder sharing nothing refuses it.
+            let held = fs::OpenOptions::new().read(true).share_mode(7).open(&path).is_err();
+            (path.file_name().expect("a marker has a name").to_string_lossy().into_owned(), held)
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+#[test]
+fn a_drain_wait_keeps_a_live_marker_and_removes_it_when_the_wait_ends() {
+    let case = routed_case("routing-drain-marker");
+    let now = unix_now();
+    let go = case.folder().join("go");
+    // The poll after the refused call waits on the go file, so the run stays behind the drain until the case lets it go.
+    let wait_go = format!("wait {}", shown(&go));
+    let steps = shown(&stub(&case, &[&draining(1, "1", now - 60, now + 1800), &wait_go, "status 0"]));
+    let running = case.start(&routed_words("out.log", &steps, &DRAIN_POLL, &[r".\tool.exe", "out", "hi"]));
+    let pid = running.id();
+    let folder = marker_folder(&case, None);
+
+    running.wait_until("the run's drain marker", || markers(&folder).iter().any(|(_, held)| *held));
+    let held = markers(&folder);
+    let_go(&go);
+    let outcome = running.finish();
+
+    assert_eq!(held.len(), 1, "{held:?}");
+    let (name, _) = &held[0];
+    let session = name.strip_prefix(&format!("{pid}-")).expect("the marker is named by the run's pid");
+    assert_eq!(session.len(), 32, "and its session: {name}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(markers(&folder), Vec::new(), "the wait's end removed its marker");
+}
+
+#[test]
+fn a_second_run_waiting_for_the_remote_slot_does_not_fall_back_full_while_the_marker_stands() {
+    let case = routed_case("routing-drain-marker-full");
+    let go = case.folder().join("go");
+    let holder = remote_holder(&case, "holder.log", &go);
+    let marker = hold_marker(&case, None);
+    let steps = shown(&stub(&case, &["out ran there", "status 0"]));
+    let seams = ["--test-remote-wait-ms", "1", "--test-heartbeat-ms", "50", "--test-poll-ms", "20"];
+    let waiter = case.start(&routed_words("waiter.log", &steps, &seams, &[r".\tool.exe", "out", "ran here"]));
+    let pid = waiter.id();
+
+    // The still-waiting line comes past the wait's 1 ms limit: the marker held the limit off.
+    waiter.wait_for_stderr("gate: still waiting for a remote slot on builder (");
+    let_go(&go);
+    assert_eq!(holder.finish().code, Some(0));
+    let outcome = waiter.finish();
+    drop(marker);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains(FULL_LINE), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "take", "release"], "no fallback: {own:#?}");
+}
+
+#[test]
+fn a_marker_for_one_builder_does_not_hold_back_a_run_for_another() {
+    let case = routed_case("routing-drain-marker-other");
+    let go = case.folder().join("go");
+    let holder = remote_holder(&case, "holder.log", &go);
+    // Another builder's marker: `host`'s pool keeps its limit.
+    let marker = hold_marker(&case, Some("1f0efc62"));
+    let steps = shown(&stub(&case, &["status 0"]));
+    let waiter = case.start(&routed_words(
+        "waiter.log",
+        &steps,
+        &["--test-remote-wait-ms", "1"],
+        &[r".\tool.exe", "out", "ran here"],
+    ));
+    let pid = waiter.id();
+    let outcome = waiter.finish();
+    drop(marker);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_in_order(&outcome.stderr, &[REMOTE_WAITING, FULL_LINE]);
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "fallback", "take", "release"], "{own:#?}");
+    assert_eq!(own[1]["reason"], "full");
+    let_go(&go);
+    assert_eq!(holder.finish().code, Some(0));
+}
+
+#[test]
+fn a_second_run_of_the_worktree_waiting_for_the_key_does_not_fall_back_busy_while_the_marker_stands() {
+    let case = client_case("routing-drain-marker-key");
+    let go = Go(case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
+    let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    let marker = hold_marker(&case, None);
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+    // The heartbeat comes after the key wait's bound.
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "100", "--test-heartbeat-ms", "300"],
+        ..Tuned::default()
+    };
+    let second = start(client_gate_tuned(
+        &case,
+        "second.log",
+        &second_steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran there"],
+    ));
+
+    second.wait_for_stderr("gate: still waiting for this worktree's work folder on builder (");
+    fs::write(go.path(), "").expect("the go file can be made");
+    assert_eq!(first.finish().code, Some(0));
+    let outcome = second.finish();
+    drop(marker);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!has_line(&outcome.stderr, BUSY_LINE), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
+    assert_eq!(
+        calls(&second_steps),
+        ["preflight", "run"],
+        "the second run ran there once the key was free"
+    );
+}
+
+/// The seconds the passed line of `outcome` says, on either stream.
+fn passed_seconds(outcome: &Outcome) -> u32 {
+    let line = outcome
+        .stdout
+        .lines()
+        .chain(outcome.stderr.lines())
+        .find_map(|line| line.strip_prefix("gate: passed in "))
+        .expect("the run says its passed line");
+    line.split_once(" s")
+        .and_then(|(seconds, _)| seconds.parse().ok())
+        .expect("the passed line says whole seconds")
+}
+
+#[test]
+fn a_drain_wait_is_left_out_of_the_release_s_held_and_wall_seconds_and_the_durations_store() {
+    let case = routed_case("routing-drain-durations");
+    let now = unix_now();
+    // Ten refused calls, each followed by a sleep of a 200 ms drain poll: the wait alone lasts 2 s at least.
+    let wait_least = 2.0;
+    let steps = shown(&stub(&case, &[&draining(10, "1", now - 60, now + 1800), "status 0"]));
+    let begun = std::time::Instant::now();
+    let running = case.start(&routed_words(
+        "out.log",
+        &steps,
+        &["--test-drain-poll-ms", "200"],
+        &[r".\tool.exe", "out", "hi"],
+    ));
+    let pid = running.id();
+    let outcome = running.finish();
+    // Whatever the load, the run's own time fits in what the whole run took past its wait.
+    let left = begun.elapsed().as_secs_f64() - wait_least;
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let release = own(&case, pid)
+        .into_iter()
+        .find(|event| event["event"] == "release")
+        .expect("the run journals its release");
+    let held = release["heldSeconds"].as_f64().expect("the release says how long it held");
+    assert!(held <= left, "the slot's hold counts from the admission: {held} s of {left} s: {release}");
+    let passed = passed_seconds(&outcome);
+    assert!(
+        f64::from(passed) <= left.ceil(),
+        "the passed line counts from the admission: {passed} s of {left} s: {outcome:?}"
+    );
+    let store: Value =
+        serde_json::from_str(&fs::read_to_string(case.root().join("durations.json")).expect("the store was written")).expect("the store is JSON");
+    let walls: Vec<f64> = store["keys"]
+        .as_object()
+        .expect("the store holds its keys")
+        .values()
+        .flat_map(|history| history["samples"].as_array().expect("a history holds its samples").clone())
+        .map(|sample| sample["wall"].as_f64().expect("a sample has its wall"))
+        .collect();
+    assert_eq!(walls.len(), 1, "{store:#}");
+    assert!(walls[0] <= left, "the stored wall counts from the admission: {} s of {left} s", walls[0]);
+}
+
+/// What a run whose key wait passed its bound says once a drain marker holds that bound off.
+const KEY_HELD_OFF: &str = "gate: still waiting for the worktree's key past its bound: a routed run waits behind a builder drain";
+
+/// The Mac's pool is full past the run's whole remote budget, so `host`'s attempt has none left: a live marker of
+/// `host` does not hold that wait off, and the run falls back full at once instead of waiting on `host`'s pool.
+#[test]
+fn a_wait_with_no_remote_budget_is_not_held_off_by_a_drain_marker() {
+    let case = two_builder_case("routing-drain-no-budget");
+    let (host_go, mac_go) = (case.folder().join("host-go"), case.folder().join("mac-go"));
+    let mac_holder = remote_holder(&case, "mac.log", &mac_go);
+    let host_steps = shown(&stub(&case, &[&format!("wait {}", shown(&host_go))]));
+    let host_holder = case.start(&routed_words("host.log", &host_steps, &[], &[r".\host.exe", "out", "hi"]));
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, host_holder.id()));
+    let marker = hold_marker(&case, None);
+    let steps = shown(&stub(&case, &["status 0"]));
+    let seams = ["--test-remote-wait-ms", "1", "--test-heartbeat-ms", "50", "--test-poll-ms", "20"];
+    let waiter = case.start(&routed_words("waiter.log", &steps, &seams, &[r".\tool.exe", "out", "ran here"]));
+    let pid = waiter.id();
+
+    let said = waiter.wait_for_stderr_where("the fallback or a still-waiting line", |said| {
+        said.contains(FULL_LINE) || said.contains("gate: still waiting for a remote slot on builder (")
+    });
+    // Let go before the run's end, so a run held off ends too and fails on what it said.
+    drop(marker);
+    let_go(&mac_go);
+    let_go(&host_go);
+    let outcome = waiter.finish();
+    assert_eq!((mac_holder.finish().code, host_holder.finish().code), (Some(0), Some(0)));
+
+    assert!(said.contains(FULL_LINE), "the run left the remote queue at once: {said}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    let own = own(&case, pid);
+    assert_eq!(hosts(&own).last(), Some(&None), "the run ran here: {own:#?}");
+    assert!(
+        own.iter()
+            .any(|event| event["event"] == "fallback" && event["host"] == HOST && event["reason"] == "full"),
+        "host's pool fell back full: {own:#?}"
+    );
+}
+
+#[test]
+fn a_held_off_remote_wait_takes_its_limit_again_once_the_marker_is_gone() {
+    let case = routed_case("routing-drain-marker-gone");
+    let go = case.folder().join("go");
+    let holder = remote_holder(&case, "holder.log", &go);
+    let marker = hold_marker(&case, None);
+    let steps = shown(&stub(&case, &["out ran there", "status 0"]));
+    let seams = ["--test-remote-wait-ms", "1", "--test-heartbeat-ms", "50", "--test-poll-ms", "20"];
+    let waiter = case.start(&routed_words("waiter.log", &steps, &seams, &[r".\tool.exe", "out", "ran here"]));
+    let pid = waiter.id();
+
+    // Past the 1 ms limit the marker holds the wait off; once it is gone, the next pass ends the wait full.
+    waiter.wait_for_stderr("gate: still waiting for a remote slot on builder (");
+    drop(marker);
+    let outcome = waiter.finish();
+    let_go(&go);
+    assert_eq!(holder.finish().code, Some(0));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(FULL_LINE), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "fallback", "take", "release"], "{own:#?}");
+    assert_eq!(own[1]["reason"], "full", "{own:#?}");
+}
+
+#[test]
+fn a_key_wait_is_held_off_by_a_marker_of_another_builder() {
+    let case = client_case("routing-drain-marker-key-other");
+    let go = Go(case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
+    let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    // A run waiting behind another builder's drain: the key is the worktree's on every builder.
+    let marker = hold_marker(&case, Some("1f0efc62"));
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "100", "--test-heartbeat-ms", "300"],
+        ..Tuned::default()
+    };
+    let mut second = start(client_gate_tuned(
+        &case,
+        "second.log",
+        &second_steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran there"],
+    ));
+
+    second.wait_for_stderr_while_running("the key wait past its bound", |said| said.contains(KEY_HELD_OFF));
+    fs::write(go.path(), "").expect("the go file can be made");
+    assert_eq!(first.finish().code, Some(0));
+    let outcome = second.finish();
+    drop(marker);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!has_line(&outcome.stderr, BUSY_LINE), "{outcome:?}");
+    assert!(has_line_once(&outcome.stderr, KEY_HELD_OFF), "said once: {outcome:?}");
+    assert_eq!(
+        calls(&second_steps),
+        ["preflight", "run"],
+        "the second run ran there once the key was free"
+    );
+}
+
+#[test]
+fn a_finished_run_s_key_wait_held_by_a_marker_says_so() {
+    let case = project_case("routing-nothing-back-key-marker");
+    let path = record_path(&case).expect("the case has a record");
+    let key = path.file_stem().expect("the record has a name").to_string_lossy().into_owned();
+    let name = StateRoot::new(&shown(&case.root()), None).object_name(KernelObject::Routed { hash: key_hash(&key) });
+    let mutex = NamedMutex::open(&name).expect("the key's mutex opens");
+    let held = mutex.acquire(Duration::from_secs(5)).expect("the key's mutex is free");
+    let marker = hold_marker(&case, None);
+
+    let mut build = case.start(&run_words(
+        "build.log",
+        &["--test-key-wait-ms", "200"],
+        &[r".\dotnet.cmd", "build", "One", "-c", "Release"],
+    ));
+    build.wait_for_stderr_while_running("the record's key wait past its bound", |said| said.contains(KEY_HELD_OFF));
+    drop(held);
+    let build = build.finish();
+    drop(marker);
+
+    assert_eq!(build.code, Some(0), "{build:?}");
+    assert!(has_line_once(&build.stderr, KEY_HELD_OFF), "said once: {build:?}");
+    assert!(!build.stderr.contains("gate: cannot add to "), "{build:?}");
+    assert_ne!(nothing_back(&case).as_deref(), Some(RELEASE_RECORD), "the build was added: {build:?}");
+}
+
+#[test]
+fn a_run_drained_again_after_its_admission_waits_again_and_holds_its_marker() {
+    let case = routed_case("routing-drain-again");
+    let now = unix_now();
+    let (raised, lapses) = (now - 60, now + 1800);
+    let go = case.folder().join("go");
+    // The run's call is refused, the poll after it admits the run, whose call is refused again; the poll after that,
+    // the fourth call, waits on the go file, so the run stays in its second wait until the case lets it go.
+    let steps = shown(&stub(
+        &case,
+        &[
+            &draining(1, "1", raised, lapses),
+            &format!("draining-at 3 2 {raised} {lapses}"),
+            &format!("wait-at 4 {}", shown(&go)),
+            "out ran there",
+            "status 0",
+        ],
+    ));
+    let running = case.start(&routed_words("out.log", &steps, &DRAIN_POLL, &[r".\tool.exe", "out", "ran here"]));
+    let pid = running.id();
+    let folder = marker_folder(&case, None);
+
+    // The first wait's marker is let go before the lifted line: a marker held after it is the second wait's.
+    running.wait_for_stderr(DRAIN_LIFTED);
+    running.wait_until("the second wait's drain marker", || markers(&folder).iter().any(|(_, held)| *held));
+    let_go(&go);
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let (first, again) = (drain_waiting(raised, lapses, Some(1)), drain_waiting(raised, lapses, Some(2)));
+    assert_in_order(&outcome.stderr, &[&first, DRAIN_LIFTED, &again, DRAIN_LIFTED]);
+    assert!(has_line_once(&outcome.stderr, &again), "the waiting line again, once: {outcome:?}");
+    assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
+    assert_eq!(markers(&folder), Vec::new(), "the second wait's end removed its marker");
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "take", "release"], "no fallback: {own:#?}");
+}
+
+#[test]
+fn each_routed_run_has_its_own_session() {
+    let case = routed_case("routing-drain-sessions");
+    let sessions: Vec<String> = ["one", "two"]
+        .into_iter()
+        .map(|name| {
+            let call = case.folder().join(format!("{name}.json"));
+            let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+            let outcome = finish(case.gate(&routed_words(&format!("{name}.log"), &steps, &[], &[r".\tool.exe", "out", "hi"])));
+            assert_eq!(outcome.code, Some(0), "{outcome:?}");
+            recorded(&call)["session"].as_str().map(str::to_owned).unwrap_or_default()
+        })
+        .collect();
+
+    for session in &sessions {
+        assert!(
+            session.len() == 32 && session.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+            "{session}"
+        );
+    }
+    assert_ne!(sessions[0], sessions[1], "each run makes its own session");
+}

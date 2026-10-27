@@ -18,7 +18,9 @@ use gate_router::warm::warmup_hash;
 use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 
-use crate::remote_client::{Tuned, client_case, client_gate, client_gate_tuned, fallbacks, godot_csproj, godot_root, no_pin_warning};
+use crate::remote_client::{
+    Tuned, builder_drain, client_case, client_gate, client_gate_tuned, drain_entries, fallbacks, godot_csproj, godot_root, no_pin_warning,
+};
 use crate::routing::{CONTROL_C_EXIT, HOST, path_map, repo, routed_case};
 use crate::support::{
     ANSWERING, Case, FAKE_SSH, GATE, GATE_VARIABLE, Go, LOCAL_REASON, Outcome, PREFLIGHT_SEAMS_VARIABLE, Running, STEPS_VARIABLE, build_version,
@@ -1133,6 +1135,65 @@ fn a_real_client_warm_up_interrupted_at_its_run_call_is_deleted() {
     let next = ssh_steps(&case, "next", &["ok", "ok"]);
     let again = finish(warm_client(&case, &next, &[]));
     assert_eq!(again.code, Some(0), "a following warm-up takes the locks: {again:?}");
+}
+
+/// What a warm-up the builder's drain refused says as it ends.
+const DRAINED: &str = "gate: warm: the builder is drained; this warm-up ends without warming";
+
+/// A warm-up of the case's worktree run while a barrier stands on its builder root: its steps file and outcome.
+fn drained_warm_up(case: &Case) -> (PathBuf, Outcome) {
+    builder_drain(case, "raise");
+    let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
+    let outcome = finish(warm_client(case, &steps, &[]));
+    assert_eq!(
+        drain_entries(case, "tickets"),
+        Vec::<String>::new(),
+        "the warm-up took no place in line: {outcome:?}"
+    );
+    (steps, outcome)
+}
+
+#[test]
+fn a_warm_up_that_meets_the_drain_ends_at_once_with_its_line_and_gives_back_the_key() {
+    let case = warm_client_case("warm-real-drained");
+
+    let (steps, outcome) = drained_warm_up(&case);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stderr.trim_end(), DRAINED, "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"], "the refused preflight alone, and no poll: {outcome:?}");
+    let lock = warm_entry(&case, "lock").expect("the warm-up made its lock");
+    assert!(free(&lock), "the per-key lock is released");
+    builder_drain(&case, "lift");
+    // Consent taken out, as for `held_run`, so a work folder that is not warm does not keep the run here.
+    routing_with(&case, &json!(null));
+    let run = ssh_steps(&case, "run", &["ok", "ok"]);
+    let routed = finish(client_gate(&case, "run.log", &run, &[r".\tool.exe", "out", "ran there"]));
+    assert_eq!(routed.code, Some(0), "{routed:?}");
+    assert_eq!(
+        calls(&run),
+        ["preflight", "run"],
+        "the next run of the worktree takes the key and routes: {routed:?}"
+    );
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no busy fallback");
+}
+
+#[test]
+fn a_drained_warm_up_leaves_no_failed_record_and_no_backoff() {
+    let case = warm_client_case("warm-real-drained-record");
+
+    let (_, outcome) = drained_warm_up(&case);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(!outcome.stderr.contains("failed"), "{outcome:?}");
+    assert_eq!(records(&case), Vec::<Value>::new(), "the warming record is deleted and none replaces it");
+    builder_drain(&case, "lift");
+    let next = ssh_steps(&case, "next", &["ok", "ok"]);
+    let again = finish(warm_client(&case, &next, &[]));
+    assert_eq!(again.code, Some(0), "no backoff holds the next warm-up back: {again:?}");
+    assert_eq!(calls(&next), ["preflight", "run"], "{again:?}");
+    let record = record(&case).expect("the next warm-up's record");
+    assert_eq!(record["state"], "warm", "{record}");
 }
 
 #[test]

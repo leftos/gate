@@ -45,6 +45,7 @@ use regex::Regex;
 use gate_router::{Config, DROPPED_NO_BUILD_LINE, SendPlan, escaped, repo_name};
 use gate_wire::{PairRefused, Payload, SHA256_DIGITS, is_lower_hex};
 
+use super::drain::{self, Drain, DrainLine};
 use super::git::{self, Git, GitBounds, GitError, NO_CURRENT_FOLDER, last_update};
 use super::held::{Held, sibling_who};
 use super::inputs;
@@ -202,6 +203,44 @@ pub(crate) struct RustClient {
     /// `--test-remote-tamper`: the change the client makes to its own folders at one point of the run.
     #[cfg(feature = "test-seams")]
     tamper: Option<String>,
+    /// What the drain polls and the drained attempts since the last attempt that was not drained learned of the work
+    /// folder, which the next attempt's preflight then cannot ([`Carried`]).
+    carried: Carried,
+}
+
+/// What a drain poll, or an attempt the builder's drain refused, learned of the work folder of one builder that the
+/// next attempt's own preflight cannot, the box having made it by then: whether the box laid out the work tree new,
+/// which counts the next attempt's tree as new ([`Attempt::cold_ceiling`]), and the bare repositories it created, which
+/// the next attempt pushes as created ([`Attempt::pushes`]). Carried to each attempt until one is not drained.
+#[derive(Default)]
+struct Carried {
+    /// The builder whose work folder this is.
+    host: String,
+    new_tree: bool,
+    created: Vec<String>,
+}
+
+impl Carried {
+    /// Takes in what the preflight of an attempt or poll to `host` found: a `new_tree`, and the `created` bares.
+    fn add(&mut self, host: &str, new_tree: bool, created: &[String]) {
+        if self.host != host {
+            *self = Carried {
+                host: host.to_owned(),
+                ..Carried::default()
+            };
+        }
+        self.new_tree |= new_tree;
+        for bare in created {
+            if !self.created.contains(bare) {
+                self.created.push(bare.clone());
+            }
+        }
+    }
+
+    /// What this carries to an attempt to `host`: all of it for the builder it was learned of, nothing for another.
+    fn taken_for(self, host: &str) -> Carried {
+        if self.host == host { self } else { Carried::default() }
+    }
 }
 
 impl RustClient {
@@ -246,6 +285,7 @@ impl RustClient {
             outputs_progress: seams.outputs_progress_ms.map_or(OUTPUTS_PROGRESS, Duration::from_millis),
             #[cfg(feature = "test-seams")]
             tamper: seams.remote_tamper.clone(),
+            carried: Carried::default(),
         }
     }
 }
@@ -356,6 +396,25 @@ impl RemoteClient for RustClient {
     }
 
     fn run(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome {
+        self.attempted(call, Phases::All)
+    }
+
+    fn poll_drain(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome {
+        self.attempted(call, Phases::DrainPoll)
+    }
+}
+
+/// What one attempt of the client makes: every phase of the run, or the preflight alone of a drain poll.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phases {
+    All,
+    DrainPoll,
+}
+
+impl RustClient {
+    /// One attempt of `call` with fresh limits, making `phases`, and its outcome. A drain poll says neither the raised
+    /// stall line nor the missing handler's, which the run's own attempts say.
+    fn attempted(&mut self, call: &RemoteCall<'_>, phases: Phases) -> RemoteOutcome {
         let transport = match found(&mut self.transport) {
             Ok(transport) => transport,
             Err(why) => return RemoteOutcome::not_started(why),
@@ -429,7 +488,19 @@ impl RemoteClient for RustClient {
             marker_seen: false,
             raised: None,
             backstop_seam: self.backstop_ms.map(Duration::from_millis),
+            carried: match phases {
+                Phases::All => std::mem::take(&mut self.carried).taken_for(call.host()),
+                Phases::DrainPoll => Carried::default(),
+            },
+            log_only: phases == Phases::DrainPoll,
         };
+        if phases == Phases::DrainPoll {
+            let (end, polled) = attempt.drain_polled();
+            if let Some(prepared) = polled {
+                self.carried.add(call.host(), prepared.new_tree, &prepared.created);
+            }
+            return attempt.outcome(end);
+        }
         if let Some(line) = raised {
             attempt.say(line);
         }
@@ -439,6 +510,11 @@ impl RemoteClient for RustClient {
         let end = match attempt.phases() {
             Ok(end) | Err(end) => end,
         };
+        // An attempt the drain refused, before its run call or at it, never used the work folder its preflight found:
+        // the next attempt takes it on.
+        if matches!(end, End::Draining(_)) {
+            self.carried = std::mem::take(&mut attempt.carried);
+        }
         attempt.outcome(end)
     }
 }
@@ -592,6 +668,9 @@ pub(super) enum End {
     /// A transfer after the command, the sync-back's or the outputs call, failed as a connection fails on every attempt,
     /// for this reason: [`Attempt::transferred`] turns it into the TRANSFER FAILED line and the run's status.
     TransferFailed(String),
+    /// The builder's drain refused a preflight, inputs, LFS or run call with its `drain` tag, which no fallback
+    /// answers: status 75 with no reason, and the run waits behind the drain.
+    Draining(Drain),
 }
 
 /// What the preflight found: the bare repositories it created just now, as its `gate: remote created {bare}` lines name
@@ -1152,6 +1231,8 @@ pub(super) struct Called {
     started: bool,
     /// What the box's refusal tag for the run named on standard error, the first when it said more than one.
     refused: Option<Tagged>,
+    /// What the box's `drain` refusal and the place and barrier lines after it said, once its tag was heard.
+    drain: Option<Drain>,
     /// The kill the box's kill tag for the run named on standard error, the last when it said more than one.
     box_killed: Option<BoxKill>,
     /// The load-adjusted seconds the box's last adjusted line on standard error said.
@@ -1224,8 +1305,14 @@ impl Called {
     fn refusal(&self) -> Option<FallbackReason> {
         match self.refused.filter(|_| !self.started) {
             Some(Tagged::Fallback(reason)) => Some(reason),
-            Some(Tagged::Sent) | None => None,
+            Some(Tagged::Sent | Tagged::Drain) | None => None,
         }
+    }
+
+    /// What the box's drain said when it refused the call by its `drain` tag, read as [`Called::refusal`] reads a tag;
+    /// `None` for any other call.
+    fn draining(&self) -> Option<Drain> {
+        self.drain.filter(|_| self.refused == Some(Tagged::Drain) && !self.started)
     }
 
     /// Whether the box refused the run for the PC's build its `SentDigest` names, by its `sent` tag, read as
@@ -1236,11 +1323,13 @@ impl Called {
 }
 
 /// What a box's refusal tag names: the fallback reason of the run's refusal, or `sent`, the PC's build the run's
-/// `SentDigest` names, which no fallback answers ([`End::SentRefused`]).
+/// `SentDigest` names, which no fallback answers ([`End::SentRefused`]), or `drain`, the builder's drain, which no
+/// fallback answers either ([`End::Draining`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tagged {
     Fallback(FallbackReason),
     Sent,
+    Drain,
 }
 
 /// One run of the client: the call, the way to the builder, the limits, every line the attempt wrote to the log, and
@@ -1350,6 +1439,12 @@ pub(super) struct Attempt<'c, 'a> {
     /// `--test-remote-backstop-ms`: the run call's backstop, which a raised ceiling leaves as it is; `None` without the
     /// seam.
     backstop_seam: Option<Duration>,
+    /// What the drain polls and drained attempts before this attempt learned of the work folder, with what this
+    /// attempt's own preflight found taken in ([`Carried`]).
+    carried: Carried,
+    /// Whether the attempt is a drain poll, whose own lines go to the log alone ([`Attempt::say`]): the console of a
+    /// run waiting behind the drain gets only the drain's lines.
+    log_only: bool,
 }
 
 /// A send of the PC's build that landed ([`Attempt::sent_build`]): the digest of its manifest line, the run call's
@@ -1376,6 +1471,18 @@ impl Attempt<'_, '_> {
     /// The profile of the call's builder over the transport ([`super::transport::Transport::profile`]).
     pub(super) fn profile(&self) -> Profile {
         self.transport.profile(self.call.builder)
+    }
+
+    /// The drain poll's one phase, the preflight with no needs at the run's place, which makes the same word the run's
+    /// own preflight does: its end, [`End::Status`] 0 once the builder admits the run, and what the preflight found,
+    /// the work tree new and the bares created, which the box makes only for a poll it admits.
+    fn drain_polled(&mut self) -> (End, Option<Prepared>) {
+        let mut repos = self.repos();
+        let polled = self.location(&mut repos).and_then(|location| self.preflight(&location, &[]));
+        match polled {
+            Ok(prepared) => (End::Status(0), Some(prepared)),
+            Err(end) => (end, None),
+        }
     }
 
     /// The phases in order; `Err` for an end before the run call.
@@ -1408,9 +1515,11 @@ impl Attempt<'_, '_> {
             .unwrap_or_default();
         let git_lfs = self.git_lfs_needed(lfs.is_some(), &repos, &trees, &mut needs)?;
         let prepared = self.preflight(&location, &needs)?;
+        self.carried.add(self.call.host(), prepared.new_tree, &prepared.created);
         let chosen = self.parity(&repos, &snapshots, &trees, &prepared, git_lfs)?;
-        let raised = self.cold_ceiling(prepared.new_tree);
-        self.pushes(&repos, &snapshots, &prepared.created)?;
+        let raised = self.cold_ceiling(self.carried.new_tree);
+        let created = self.carried.created.clone();
+        self.pushes(&repos, &snapshots, &created)?;
         // The pair's folders are let go before the run call, which never runs while they are held.
         self.release_run()?;
         // After the push, so a route refused before it sends no input, and before the marker, so one the inputs refuse
@@ -1897,7 +2006,9 @@ impl Attempt<'_, '_> {
     /// reader before anything is sent, which names each sibling's bare repository; each of `repos` is given its bare. A
     /// pair the box would refuse keeps the run here naming the sibling.
     fn location(&mut self, repos: &mut [Repo]) -> Result<Location, End> {
-        let location = Location::under(&self.profile(), self.call.repo, self.call.key, &payload::job_nonce());
+        let warm_up = matches!(self.call.warmth, Warmth::WarmUp { .. });
+        let location =
+            Location::under(&self.profile(), self.call.repo, self.call.key, &payload::job_nonce()).with_session(self.call.session, warm_up);
         let Some((main, siblings)) = repos.split_first_mut() else {
             return Ok(location);
         };
@@ -2062,14 +2173,18 @@ impl Attempt<'_, '_> {
     /// version is not.
     fn preflight(&mut self, location: &Location, needs: &[(String, String)]) -> Result<Prepared, End> {
         self.go_on()?;
-        let input = payload::input(&payload::preflight_word(location, needs), None);
+        let nonce: Arc<str> = Arc::from(payload::run_nonce());
+        let input = payload::input(&payload::preflight_word(location, needs, &nonce), None);
         let sent: Vec<String> = needs.iter().map(|(name, _)| name.clone()).collect();
         let watch = Watch::Setup(self.limits_for("preflight"));
         let raise = self.raises_at("preflight");
         let (mut called, _) = self.with_retry(SSH_FAILED, |attempt| {
-            attempt.ssh(BoxVerb::Preflight, Echo::LogOnly, watch, raise, CallOnly::plain(Arc::clone(&input)))
+            let only = CallOnly {
+                tag_nonce: Some(Arc::clone(&nonce)),
+                ..CallOnly::plain(Arc::clone(&input))
+            };
+            attempt.ssh(BoxVerb::Preflight, Echo::LogOnly, watch, raise, only)
         })?;
-        let theirs = their_version(&called.lines).map(str::to_owned);
         let new_tree = new_work_tree(&called.lines);
         let created = called
             .lines
@@ -2080,38 +2195,14 @@ impl Attempt<'_, '_> {
         let boot = boot_time(&called.lines).map(str::to_owned);
         let sdks = sdks_of(&called.lines);
         let tools = toolchain::reported(&called.lines, &sent);
-        let host = self.call.host();
-        let refused = preflight_refusal(host, &called);
-        let box_missing = no_box(called.status, &called.lines, called.last_error.as_deref());
+        let ended = preflight_ended(self.call.host(), self.profile().root(), &called);
         self.lines.append(&mut called.lines);
         self.not_started_if_killed("the preflight", &called)?;
-        if let Some((line, reason)) = refused {
-            self.say(line);
-            return Err(End::Refused(reason));
-        }
-        match called.status {
-            0 => {}
-            SSH_FAILED => {
-                let last = git::failure_text(&[called.last_error.as_deref().unwrap_or_default()]);
-                self.say(format!("gate: remote {host} unreachable: {last}"));
-                return Err(End::Refused(FallbackReason::Unreachable));
+        if let Err((line, end)) = ended {
+            if let Some(line) = line {
+                self.say(line);
             }
-            status if box_missing => {
-                let said = shell_said(status, called.last_error.as_deref());
-                self.say(format!(
-                    "gate: not routed: {host} has no gate box that takes this run (preflight status {status}){said}"
-                ));
-                return Err(End::Refused(FallbackReason::Version));
-            }
-            status => {
-                self.say(format!("gate: preparing {} on {host} failed (status {status})", self.profile().root()));
-                return Err(End::Status(i64::from(status)));
-            }
-        }
-        // The builder's whole text must be this build's, so another build of the same package version is refused too.
-        if let Some(line) = version_refusal(host, theirs.as_deref(), &build_version()) {
-            self.say(line);
-            return Err(End::Refused(FallbackReason::Version));
+            return Err(end);
         }
         Ok(Prepared {
             created,
@@ -2709,6 +2800,7 @@ impl Attempt<'_, '_> {
             let run = CallOnly {
                 input: Input::Text(Arc::clone(input)),
                 nonce: Some(Arc::clone(&nonce)),
+                tag_nonce: None,
                 sink: None,
                 wire: Wire::Compressed,
             };
@@ -3013,6 +3105,7 @@ impl Attempt<'_, '_> {
             raise,
             input: Some(Fed { verb, input: only.input }),
             nonce: only.nonce,
+            tag_nonce: only.tag_nonce,
             sink: only.sink,
         };
         self.started(&command, echo, watch, starts)
@@ -3063,38 +3156,40 @@ impl Attempt<'_, '_> {
     /// archive, the sink or the call could not be made, or the interrupt.
     pub(super) fn inputs_call(
         &mut self,
-        head: &Arc<str>,
+        (head, nonce): (&Arc<str>, &str),
         archive: Option<(&File, u64)>,
         sink: Option<&dyn Fn() -> Result<RawSink, String>>,
         watch: Watch,
     ) -> Result<Called, End> {
         let raise = self.raises_at("inputs");
-        self.archive_call(BoxVerb::Inputs, raise, (head, archive), sink, watch)
+        self.archive_call(BoxVerb::Inputs, raise, (head, nonce, archive), sink, watch)
     }
 
     /// One LFS call, `gate box lfs`, made as [`Attempt::inputs_call`] makes an inputs call, but for the console
     /// interrupt, which `--test-remote-interrupt-at lfs` raises at the LFS phase's start instead.
     pub(super) fn lfs_call(
         &mut self,
-        head: &Arc<str>,
+        (head, nonce): (&Arc<str>, &str),
         archive: Option<(&File, u64)>,
         sink: Option<&dyn Fn() -> Result<RawSink, String>>,
         watch: Watch,
     ) -> Result<Called, End> {
-        self.archive_call(BoxVerb::Lfs, false, (head, archive), sink, watch)
+        self.archive_call(BoxVerb::Lfs, false, (head, nonce, archive), sink, watch)
     }
 
-    /// One call of `gate box <verb>` fed `head` and, when given, an archive ([`Attempt::inputs_call`]), the console
-    /// interrupt raised after its first output byte when `raise`.
+    /// One call of `gate box <verb>` fed `head`, whose word carries the call's `nonce`, and, when given, an archive
+    /// ([`Attempt::inputs_call`]), the console interrupt raised after its first output byte when `raise`. A call the
+    /// builder's drain refused by its tag for `nonce` ends the attempt [`End::Draining`].
     fn archive_call(
         &mut self,
         verb: BoxVerb,
         raise: bool,
-        (head, archive): (&Arc<str>, Option<(&File, u64)>),
+        (head, nonce, archive): (&Arc<str>, &str, Option<(&File, u64)>),
         sink: Option<&dyn Fn() -> Result<RawSink, String>>,
         watch: Watch,
     ) -> Result<Called, End> {
         self.go_on()?;
+        let nonce: Arc<str> = Arc::from(nonce);
         let (called, _) = self.with_retry(SSH_FAILED, |attempt| {
             let input = match archive {
                 Some((file, length)) => {
@@ -3109,6 +3204,7 @@ impl Attempt<'_, '_> {
             let only = CallOnly {
                 input,
                 nonce: None,
+                tag_nonce: Some(Arc::clone(&nonce)),
                 sink,
                 wire: Wire::Plain,
             };
@@ -3118,6 +3214,9 @@ impl Attempt<'_, '_> {
         if let Some(line) = install_refused(self.call.host(), &called) {
             self.say(line);
             return Err(End::Refused(FallbackReason::Install));
+        }
+        if let Some(drain) = called.draining() {
+            return Err(End::Draining(drain));
         }
         Ok(called)
     }
@@ -3151,6 +3250,7 @@ impl Attempt<'_, '_> {
             raise: false,
             input: None,
             nonce: None,
+            tag_nonce: None,
             sink: None,
         };
         self.started(&command, echo, watch, starts)
@@ -3187,7 +3287,11 @@ impl Attempt<'_, '_> {
         let reading = Reading {
             echo,
             capped: echo != Echo::Console,
-            lines: starts.nonce.as_deref().map(|nonce| Arc::new(ProtocolLines::new(nonce))),
+            lines: match (starts.nonce.as_deref(), starts.tag_nonce.as_deref()) {
+                (Some(nonce), _) => Some(Arc::new(ProtocolLines::new(nonce))),
+                (None, Some(nonce)) => Some(Arc::new(ProtocolLines::tags(nonce))),
+                (None, None) => None,
+            },
             log_cap: self.log_cap,
         };
         let copied = starts.sink.is_some();
@@ -3361,9 +3465,12 @@ impl Attempt<'_, '_> {
         self.lines.push(line);
     }
 
-    /// Appends the gate's own `line` to the log and says it on stderr; the first failure to is kept.
+    /// Appends the gate's own `line` to the log and says it on stderr, or to the log alone for a drain poll; the first
+    /// failure to is kept.
     pub(super) fn say(&mut self, line: String) {
-        if let Err(why) = super::say(self.call.log, &[&line], io::stderr().lock()) {
+        if self.log_only {
+            self.logged(&line);
+        } else if let Err(why) = super::say(self.call.log, &[&line], io::stderr().lock()) {
             self.problem.get_or_insert(why);
         }
         self.lines.push(line);
@@ -3406,7 +3513,12 @@ impl Attempt<'_, '_> {
         let killed = matches!(end, End::Killed);
         let warm = self.warm_outcome(&end);
         let mut detail = None;
+        let mut draining = None;
         let (status, reason) = match end {
+            End::Draining(drain) => {
+                draining = Some(drain);
+                (REFUSED, None)
+            }
             End::NotRouted(line) => {
                 detail = Some(line.strip_prefix(NOT_ROUTED).unwrap_or(&line).to_owned());
                 self.say(line);
@@ -3449,6 +3561,7 @@ impl Attempt<'_, '_> {
             transfer_failed,
             warm,
             raised: self.raised,
+            draining,
         }
     }
 
@@ -3511,6 +3624,8 @@ impl<'c, 'a> Attempt<'c, 'a> {
             marker_seen: false,
             raised: None,
             backstop_seam: None,
+            carried: Carried::default(),
+            log_only: false,
         }
     }
 }
@@ -3590,6 +3705,7 @@ fn called_of(ended: CallEnd, raised: Raised, mut heard: Heard) -> Result<Called,
         names_skipped: heard.names_skipped,
         started: heard.started,
         refused: heard.refused,
+        drain: heard.drain,
         box_killed: heard.box_killed,
         adjusted: heard.adjusted,
         written: None,
@@ -3939,13 +4055,15 @@ fn cannot_wait(shown: &str, error: &io::Error) -> End {
 /// How a call starts: whether its job lets a process in it start one outside it, which only the ssh of a transport
 /// whose `gate box` runs on this machine needs; and whether the console interrupt is raised after its first output
 /// byte; and what is fed on its standard input, `None` for none, as git's calls are; and the run's nonce its readers
-/// match the box's start marker and refusal tags by, `None` for every call but the run call; and the sink its standard
-/// output is copied to raw, `None` for every call but the outputs call.
+/// match the box's start marker and refusal tags by, `None` for every call but the run call; the nonce of a preflight,
+/// inputs or LFS call its readers match the box's refusal tags by, which makes it no run call; and the sink its
+/// standard output is copied to raw, `None` for every call but the outputs call.
 struct Starts {
     breakaway: bool,
     raise: bool,
     input: Option<Fed>,
     nonce: Option<Arc<str>>,
+    tag_nonce: Option<Arc<str>>,
     sink: Option<RawSink>,
 }
 
@@ -4002,11 +4120,13 @@ struct Feeder {
 }
 
 /// What one call of `gate box` alone gives it: what is fed on its standard input, the request ([`payload::input`])
-/// every call carries; the run call the run's nonce and a compressed connection, the outputs call the sink its
-/// standard output is copied to raw; neither of them, and a plain connection, for any other call.
+/// every call carries; the run call the run's nonce and a compressed connection, a preflight, inputs or LFS call the
+/// nonce its word carries, which its refusal tags name, the outputs call the sink its standard output is copied to
+/// raw; none of them, and a plain connection, for any other call.
 struct CallOnly {
     input: Input,
     nonce: Option<Arc<str>>,
+    tag_nonce: Option<Arc<str>>,
     sink: Option<RawSink>,
     wire: Wire,
 }
@@ -4017,6 +4137,7 @@ impl CallOnly {
         CallOnly {
             input: Input::Text(input),
             nonce: None,
+            tag_nonce: None,
             sink: None,
             wire: Wire::Plain,
         }
@@ -4184,6 +4305,7 @@ struct Heard {
     names_skipped: bool,
     started: bool,
     refused: Option<Tagged>,
+    drain: Option<Drain>,
     box_killed: Option<BoxKill>,
     adjusted: Option<f64>,
     problem: Option<String>,
@@ -4221,6 +4343,15 @@ impl Heard {
             }
             Protocol::SentRefused => {
                 self.refused.get_or_insert(Tagged::Sent);
+            }
+            Protocol::Drain => {
+                self.refused.get_or_insert(Tagged::Drain);
+                self.drain.get_or_insert_with(Drain::default);
+            }
+            Protocol::DrainLine(line) => {
+                if let Some(drain) = &mut self.drain {
+                    *drain = drain.with(line);
+                }
             }
             Protocol::Killed(kill) => self.box_killed = Some(kill),
             Protocol::Adjusted(seconds) => self.adjusted = Some(seconds),
@@ -4554,7 +4685,20 @@ impl Reader {
     /// Whether this reader marks the call's progress per line rather than per chunk read: a run call's does. A setup
     /// call's git progress ends its updates with a carriage return and no line feed, so its chunks mark it.
     fn marks_lines(&self) -> bool {
-        self.reading.lines.is_some()
+        self.reading.lines.as_deref().is_some_and(|lines| lines.run_call)
+    }
+
+    /// The box's place or barrier line `line` is, of standard error, once the call's drain tag was heard and before
+    /// any start marker: the two lines the box says after the tag ([`drain::line_of`]); `None` for any other line.
+    fn drain_line(&self, line: &str, shared: &Shared) -> Option<Protocol> {
+        if !self.error || self.reading.lines.is_none() {
+            return None;
+        }
+        let heard = held(&shared.heard);
+        if heard.drain.is_none() || heard.started {
+            return None;
+        }
+        drain::line_of(line).map(Protocol::DrainLine)
     }
 
     /// `part` less what a git call's reading drops of its progress updates: at a carriage return that more bytes
@@ -4606,7 +4750,7 @@ impl Reader {
         }
         let line = line_of(bytes, self.reading.echo);
         // Matched before any unstamping, so a command's own line, stamped by the box, never reads as one.
-        let protocol = self.reading.protocol(&line, self.error);
+        let protocol = self.reading.protocol(&line, self.error).or_else(|| self.drain_line(&line, shared));
         if protocol == Some(Protocol::Started) {
             shared.progress.mark_started();
         }
@@ -4834,9 +4978,10 @@ fn status_end(called: &Called, output: Range<usize>) -> End {
         return End::Lost(output);
     }
     let status = i64::from(called.status);
-    match called.refusal() {
-        Some(reason) if status == REFUSED => End::Refused(reason),
-        None if status == REFUSED && called.sent_refusal() => End::SentRefused,
+    match (called.refusal(), called.draining()) {
+        (Some(reason), _) if status == REFUSED => End::Refused(reason),
+        (None, Some(drain)) if status == REFUSED => End::Draining(drain),
+        (None, None) if status == REFUSED && called.sent_refusal() => End::SentRefused,
         _ => End::Status(status),
     }
 }
@@ -4919,6 +5064,7 @@ fn warm_reason(end: &End, started: bool) -> String {
         End::Status(status) => format!("the builder ended the warm-up before its commands with status {status}"),
         End::Refused(reason) => format!("the builder refused: {}", reason.as_str()),
         End::SentRefused => "the builder refused: sent".to_owned(),
+        End::Draining(_) => "the builder refused: drain".to_owned(),
         End::Killed => "the warm-up was killed: it ran out of its budget or went silent".to_owned(),
         End::Lost(_) => "the connection to the builder was lost".to_owned(),
         End::NotRouted(_) => "the client could not send the warm-up".to_owned(),
@@ -5047,6 +5193,41 @@ fn install_refused(host: &str, called: &Called) -> Option<String> {
     install_refusal(host, called.status, called.lines.iter().chain(&called.last_error).map(String::as_str))
 }
 
+/// How the preflight call `called` to the builder `host` under `root` ends the attempt, a kill ruled out first by its
+/// caller: the drain's refusal, read before anything else the box said, its version line included; then a refusal
+/// of its install or work root, a failed connection, a builder with no `gate box`, any other status, and a builder of
+/// another version, each with the line to say. `Ok` for a preflight that passed.
+fn preflight_ended(host: &str, root: &str, called: &Called) -> Result<(), (Option<String>, End)> {
+    if let Some(drain) = called.draining() {
+        return Err((None, End::Draining(drain)));
+    }
+    if let Some((line, reason)) = preflight_refusal(host, called) {
+        return Err((Some(line), End::Refused(reason)));
+    }
+    match called.status {
+        0 => {}
+        SSH_FAILED => {
+            let last = git::failure_text(&[called.last_error.as_deref().unwrap_or_default()]);
+            let line = format!("gate: remote {host} unreachable: {last}");
+            return Err((Some(line), End::Refused(FallbackReason::Unreachable)));
+        }
+        status if no_box(status, &called.lines, called.last_error.as_deref()) => {
+            let said = shell_said(status, called.last_error.as_deref());
+            let line = format!("gate: not routed: {host} has no gate box that takes this run (preflight status {status}){said}");
+            return Err((Some(line), End::Refused(FallbackReason::Version)));
+        }
+        status => {
+            let line = format!("gate: preparing {root} on {host} failed (status {status})");
+            return Err((Some(line), End::Status(i64::from(status))));
+        }
+    }
+    // The builder's whole text must be this build's, so another build of the same package version is refused too.
+    match version_refusal(host, their_version(&called.lines), &build_version()) {
+        Some(line) => Err((Some(line), End::Refused(FallbackReason::Version))),
+        None => Ok(()),
+    }
+}
+
 /// The line refusing a builder `host` whose box refused the preflight call `called`, and the reason the run falls back
 /// for: its install, read first ([`install_refused`]), then its work root ([`root_refused`]); `None` for any other call.
 fn preflight_refusal(host: &str, called: &Called) -> Option<(String, FallbackReason)> {
@@ -5131,15 +5312,21 @@ enum Protocol {
     /// The box's refusal tag for a work folder that does not hold the PC's build the run's `SentDigest` names, which
     /// no fallback answers: the client runs the call again with `--no-build` dropped ([`End::SentRefused`]).
     SentRefused,
+    /// The box's `drain` refusal tag, which no fallback answers ([`End::Draining`]).
+    Drain,
+    /// The place or barrier line the box says after its `drain` tag ([`drain::line_of`]).
+    DrainLine(DrainLine),
     /// The box's kill tag, said just after its kill line.
     Killed(BoxKill),
     /// The box's adjusted line, said once the command's readers drained.
     Adjusted(f64),
 }
 
-/// The start marker, the eight refusal tags, the two kill tags and the adjusted line's prefix of one run, made once for
-/// its run call's readers.
+/// The start marker, the nine refusal tags, the two kill tags and the adjusted line's prefix of one call, made once for
+/// its readers, and whether the call is the run call, whose readers mark its progress per line.
 struct ProtocolLines {
+    run_call: bool,
+    drain: String,
     started: String,
     busy: String,
     tools: String,
@@ -5155,9 +5342,19 @@ struct ProtocolLines {
 }
 
 impl ProtocolLines {
-    /// The lines of the run whose nonce is `nonce`.
+    /// The lines of the run call whose nonce is `nonce`.
     fn new(nonce: &str) -> ProtocolLines {
         ProtocolLines {
+            run_call: true,
+            ..ProtocolLines::tags(nonce)
+        }
+    }
+
+    /// The lines of the preflight, inputs or LFS call whose nonce is `nonce`, which is no run call.
+    fn tags(nonce: &str) -> ProtocolLines {
+        ProtocolLines {
+            run_call: false,
+            drain: refused_line(nonce, Refusal::Drain),
             started: started_line(nonce),
             busy: refused_line(nonce, Refusal::Busy),
             tools: refused_line(nonce, Refusal::Tools),
@@ -5187,6 +5384,7 @@ impl ProtocolLines {
             (&self.desktop, Protocol::Refused(FallbackReason::Desktop)),
             (&self.install, Protocol::Refused(FallbackReason::Install)),
             (&self.lfs, Protocol::Refused(FallbackReason::Lfs)),
+            (&self.drain, Protocol::Drain),
             (&self.timed_out, Protocol::Killed(BoxKill::TimedOut)),
             (&self.backstop, Protocol::Killed(BoxKill::Backstop)),
         ]
@@ -5254,10 +5452,12 @@ mod tests {
         sdks_of, seconds, their_version, version_refusal,
     };
     use super::{CSPROJ_BYTES, CSPROJ_FILES, Entry, csproj_pins, entries_of, manifest_entry, small_blobs_of};
+    use super::{Carried, VERSION, preflight_ended};
     use super::{DRAIN, KILLED, Received};
     use super::{KeyHold, RunEnd, Warm, cold_line, hold_key, hold_key_waiting, new_work_tree, status_end, warm_end, warm_of};
     use crate::boxside::WORK_ROOT_STEP;
     use crate::environment::Variables;
+    use crate::remote::drain::Drain;
     use crate::remote::git::{self, DOTNET_LIMIT, GIT_BOUNDS, Git, GitBounds, GitError};
     use crate::remote::held::tests::{Pair, junction};
     use crate::remote::outputs;
@@ -5373,6 +5573,7 @@ mod tests {
         RemoteCall {
             builder: &crate::test_support::HOST,
             key: "app-1a2b3c4d",
+            session: "0123456789abcdef0123456789abcdef",
             root: r"C:\no-such-worktree",
             root_id: gate_router::FolderId { volume: 0, file: [0; 16] },
             leaf: "app",
@@ -5446,6 +5647,8 @@ mod tests {
             marker_seen: false,
             raised: None,
             backstop_seam: None,
+            carried: Carried::default(),
+            log_only: false,
         }
     }
 
@@ -5929,6 +6132,7 @@ mod tests {
             names_skipped: false,
             started: false,
             refused: None,
+            drain: None,
             box_killed: None,
             adjusted: None,
             written: None,
@@ -7315,6 +7519,89 @@ mod tests {
         assert_eq!(said, format!("{other}\n"), "and is passed on");
     }
 
+    /// The box's `drain` refusal of the call whose nonce is [`NONCE`], as `boxside::drain::admission_said` says it: the
+    /// tag, then the place and barrier lines of `boxside::drain::refused_lines`.
+    fn drain_refusal(place: &str, barrier: &str) -> String {
+        format!(
+            "{}\ngate: drain place {place}\ngate: drain barrier {barrier}\n",
+            refused_line(NONCE, Refusal::Drain)
+        )
+    }
+
+    #[test]
+    fn a_drain_tag_is_never_a_fallback_reason() {
+        let (called, _) = run_call_said("", &drain_refusal("2", "100 1900"), "drain-tag");
+        assert_eq!(called.refusal(), None, "the drain names no fallback reason");
+        let drain = Drain {
+            place: Some(2),
+            raised: 100,
+            lapses: 1900,
+        };
+        assert!(
+            matches!(status_end(&called, 0..0), End::Draining(read) if read == drain),
+            "a 75 with the tag drains"
+        );
+
+        let log = unwritten_log();
+        let call = call(&log);
+        let transport = Local::new(r"local:C:\builder", None).expect("a local transport");
+        let outcome = attempt(&call, &transport).outcome(End::Draining(drain));
+        assert_eq!((outcome.status, outcome.reason), (75, None), "{outcome:?}");
+        assert_eq!(outcome.fallback(), None, "a drain is no fallback");
+        assert_eq!(outcome.draining, Some(drain));
+        assert!(!log.exists(), "nothing is said");
+
+        let (unplaced, _) = run_call_said("", &drain_refusal("none", "none"), "drain-none");
+        assert!(
+            matches!(
+                status_end(&unplaced, 0..0),
+                End::Draining(Drain {
+                    place: None,
+                    raised: 0,
+                    lapses: 0
+                })
+            ),
+            "no place and no barrier"
+        );
+        let marker = started_line(NONCE);
+        let (started, _) = run_call_said("", &format!("{marker}\n{}", drain_refusal("2", "100 1900")), "drain-after-marker");
+        assert!(
+            matches!(status_end(&started, 0..0), End::Status(75)),
+            "a tag after the marker is the command's own line"
+        );
+    }
+
+    #[test]
+    fn the_drain_tag_is_read_before_the_version_refusal() {
+        let other = format!("{VERSION}9.9.9\n");
+        let (drained, _) = run_call_said(&other, &drain_refusal("1", "100 1900"), "drain-before-version");
+        assert!(
+            matches!(preflight_ended("builder", r"C:\builder", &drained), Err((None, End::Draining(_)))),
+            "a drained builder of another version waits, saying nothing"
+        );
+
+        let (passed, _) = run_call_ended(&other, "", 0, "version-without-drain");
+        assert!(
+            matches!(
+                preflight_ended("builder", r"C:\builder", &passed),
+                Err((Some(_), End::Refused(FallbackReason::Version)))
+            ),
+            "without the tag the version is refused"
+        );
+    }
+
+    #[test]
+    fn the_drain_place_and_barrier_lines_are_kept_out_of_the_log_and_the_lines() {
+        let (drained, said) = run_call_said("", &format!("{}after\n", drain_refusal("3", "100 1900")), "drain-hidden");
+        assert_eq!(said, "after\n", "neither the tag nor its lines are passed on");
+        assert_eq!(drained.lines, ["after"], "nor kept");
+
+        let place = "gate: drain place 3\n";
+        let (untagged, said) = run_call_said("", place, "drain-untagged");
+        assert_eq!(said, place, "a place line with no tag before it is a line like any other");
+        assert_eq!(untagged.lines, ["gate: drain place 3"]);
+    }
+
     #[test]
     fn the_adjusted_line_is_read_from_this_run_s_line_on_standard_error_alone_with_finite_seconds() {
         let huge = format!("{}.000", "9".repeat(400));
@@ -8182,6 +8469,7 @@ mod tests {
         RemoteCall {
             builder: &crate::test_support::HOST,
             key: "app-1a2b3c4d",
+            session: "0123456789abcdef0123456789abcdef",
             root: r"C:\no-such-worktree",
             root_id: gate_router::FolderId { volume: 0, file: [0; 16] },
             leaf: "app",

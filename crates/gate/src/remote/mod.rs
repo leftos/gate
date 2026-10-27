@@ -35,6 +35,7 @@ pub(crate) use carried::{Sibling, carried};
 
 mod carried;
 mod client;
+pub(crate) mod drain;
 
 pub(crate) use client::KEY_WAIT_SLICE;
 pub(crate) mod git;
@@ -157,6 +158,12 @@ pub(crate) trait RemoteClient {
 
     /// Runs the call to its end, or to its refusal, on the run's thread.
     fn run(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome;
+
+    /// Polls the builder's drain for the call of a run waiting behind it, on the run's thread: its preflight alone,
+    /// with the run's session and no needs. A draining outcome ([`RemoteOutcome::draining`]) while the drain still
+    /// holds the run back, an `unreachable` fallback for a builder the poll could not reach or a poll the client
+    /// killed, and any other end once the builder admits the run, which then starts a full attempt ([`RemoteClient::run`]).
+    fn poll_drain(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome;
 }
 
 /// How a client's wait for the work-folder key's lock ended.
@@ -187,6 +194,9 @@ pub(crate) struct RemoteCall<'a> {
     /// out the run's paths and words on it, and its id names the PC folder of its per-worktree caches.
     pub builder: &'a Builder,
     pub key: &'a str,
+    /// The run's drain session (`Session`), 32 lower-case hex digits made once per run and kept across its attempts
+    /// and polls.
+    pub session: &'a str,
     pub root: &'a str,
     /// The id the route's decision read for the worktree root's folder, following links: the worktree lock refuses a
     /// root whose folder has another id at use.
@@ -300,6 +310,9 @@ pub(crate) struct RemoteOutcome {
     /// Whether the builder was sent the words with `--no-build` dropped ([`RemoteCall::dropped_no_build`]), a run whose
     /// send of the PC's build did not land among them: it built there, and brings nothing back.
     pub dropped_no_build: bool,
+    /// What the builder's `drain` refusal said, a status 75 with no reason that is no fallback: the run waits behind
+    /// the drain. `None` for any other end.
+    pub draining: Option<drain::Drain>,
 }
 
 /// How long a routed run's parts took: the run call, the command's own time, which its ceiling counts; the push; and the
@@ -466,6 +479,11 @@ mod snapshot_only {
     }
 
     impl RemoteClient for SnapshotOnly {
+        /// No builder is called, so none is ever drained: every poll admits the run.
+        fn poll_drain(&mut self, _call: &RemoteCall<'_>) -> RemoteOutcome {
+            RemoteOutcome::default()
+        }
+
         fn run(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome {
             let roots: Vec<PathBuf> = std::iter::once(call.root)
                 .chain(call.siblings.iter().map(super::Sibling::root))
@@ -526,6 +544,7 @@ mod snapshot_only {
             RemoteCall {
                 builder: &crate::test_support::HOST,
                 key: "app-1a2b3c4d",
+                session: "0123456789abcdef0123456789abcdef",
                 root,
                 root_id: gate_router::FolderId { volume: 0, file: [0; 16] },
                 leaf: "app",
@@ -615,9 +634,14 @@ mod snapshot_only {
 /// when the path exists or the interrupt is raised, the latter ending the run with `STATUS_CONTROL_C_EXIT`;
 /// `interrupt` raises the call's interrupt; `killed` marks the run killed; `status <n>` sets the status; `refuse
 /// <reason>` refuses with status 75; `fail-start <why>` ends the run as a client that could not start; `warmed`,
-/// `warm-failed commands|refused <reason>` and `warm-deleted` set how a warm-up ended. `on <alias>` starts a block of
-/// steps that run only for a call to that builder; the steps before the first `on` line run for every builder without a
-/// block of its own, and an alias has one block at most.
+/// `warm-failed commands|refused <reason>` and `warm-deleted` set how a warm-up ended. `draining <calls> <place|none>
+/// <raised> <lapses>` ends each of the client's first `<calls>` calls, runs and drain polls counted together, as the
+/// builder's drain refusal with that place and barrier, and nothing else of such a call runs; `draining-at <call>
+/// <place|none> <raised> <lapses>` so ends the one call of that number, counted from 1; `wait-at <call> <path>` waits
+/// until the path exists at the start of the call of that number, before its drain refusal; a drain poll no drain step
+/// ends performs only the `wait`, `interrupt`, `refuse` and `fail-start` steps, and admits the run when none refuses it. `on
+/// <alias>` starts a block of steps that run only for a call to that builder; the steps before the first `on` line run
+/// for every builder without a block of its own, and an alias has one block at most.
 #[cfg(feature = "test-seams")]
 mod scripted {
     use std::fs;
@@ -631,6 +655,7 @@ mod scripted {
     use gate_win32::Interrupt;
     use serde_json::{Value, json};
 
+    use super::drain::Drain;
     use super::{BoxKill, FolderId, REFUSED, RemoteCall, RemoteClient, RemoteOutcome, Sibling, WarmEnd, Warmth};
     use crate::run::CONTROL_C_EXIT;
 
@@ -673,10 +698,18 @@ mod scripted {
         Warmed,
         WarmFailed(WarmFailure, String),
         WarmDeleted,
+        /// Ends this many of the client's first calls as the builder's drain refusal says it.
+        Draining(usize, Drain),
+        /// Ends the client's call of this number, counted from 1, as the builder's drain refusal says it.
+        DrainingAt(usize, Drain),
+        /// Waits, before anything else of it, in the client's call of this number until the path exists.
+        WaitAt(usize, PathBuf),
     }
 
     pub(crate) struct ScriptedClient {
         steps: Vec<Step>,
+        /// The calls made so far, runs and drain polls together.
+        calls: usize,
     }
 
     impl ScriptedClient {
@@ -684,12 +717,69 @@ mod scripted {
         pub(crate) fn load(path: &Path) -> Result<ScriptedClient, String> {
             let cannot = |why: String| format!("gate: cannot use the remote client's steps {}: {why}", path.display());
             let text = fs::read_to_string(path).map_err(|error| cannot(error.to_string()))?;
-            parse(&text).map(|steps| ScriptedClient { steps }).map_err(cannot)
+            parse(&text).map(|steps| ScriptedClient { steps, calls: 0 }).map_err(cannot)
+        }
+
+        /// Counts a call of `call`, performs the `wait-at` steps of its number, and ends it as the builder's drain
+        /// refusal when it is among the first calls the host's `draining` step answers or the one a `draining-at` step
+        /// names; `None` for any other call whose waits came.
+        fn drained(&mut self, call: &RemoteCall<'_>) -> Option<RemoteOutcome> {
+            self.calls += 1;
+            let calls = self.calls;
+            let steps = steps_for(&self.steps, call.host());
+            for step in steps {
+                if let Step::WaitAt(at, path) = step
+                    && *at == calls
+                {
+                    let mut outcome = RemoteOutcome::default();
+                    match perform(&Step::Wait(path.clone()), call, &mut outcome) {
+                        Ok(true) => {}
+                        Ok(false) => return Some(outcome),
+                        Err(why) => return Some(RemoteOutcome::not_started(why)),
+                    }
+                }
+            }
+            steps
+                .iter()
+                .find_map(|step| match step {
+                    Step::Draining(drained, drain) if calls <= *drained => Some(*drain),
+                    Step::DrainingAt(at, drain) if calls == *at => Some(*drain),
+                    _ => None,
+                })
+                .map(|drain| RemoteOutcome {
+                    status: REFUSED,
+                    draining: Some(drain),
+                    ..RemoteOutcome::default()
+                })
         }
     }
 
     impl RemoteClient for ScriptedClient {
+        fn poll_drain(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome {
+            if let Some(drained) = self.drained(call) {
+                return drained;
+            }
+            let mut outcome = RemoteOutcome::default();
+            for step in steps_for(&self.steps, call.host()) {
+                let goes_on = match step {
+                    Step::Wait(_) => match perform(step, call, &mut outcome) {
+                        Ok(came) => came,
+                        Err(why) => return RemoteOutcome::not_started(why),
+                    },
+                    Step::Interrupt | Step::Refuse(_) | Step::FailStart(_) => settle(step, call, &mut outcome),
+                    _ => true,
+                };
+                if !goes_on {
+                    break;
+                }
+            }
+            outcome
+        }
+
         fn run(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome {
+            if let Some(drained) = self.drained(call) {
+                return drained;
+            }
             let mut outcome = RemoteOutcome {
                 dropped_no_build: call.dropped_no_build,
                 ..RemoteOutcome::default()
@@ -785,6 +875,15 @@ mod scripted {
                 .map(Step::Refuse)
                 .ok_or_else(|| format!("refuse takes a reason, got '{operand}'")),
             "warm-failed" => warm_failed(operand),
+            "draining" => drain_of("draining", operand).map(|(calls, drain)| Step::Draining(calls, drain)),
+            "draining-at" => drain_of("draining-at", operand).map(|(call, drain)| Step::DrainingAt(call, drain)),
+            "wait-at" => match operand.split_once(' ') {
+                Some((call, path)) if !path.is_empty() => call
+                    .parse()
+                    .map(|call| Step::WaitAt(call, PathBuf::from(path)))
+                    .map_err(|_| format!("wait-at takes a call's number and a path, got '{operand}'")),
+                _ => Err(format!("wait-at takes a call's number and a path, got '{operand}'")),
+            },
             "on" if !operand.is_empty() && !operand.contains(' ') => Ok(Step::On(operand.to_owned())),
             "on" => Err(format!("on takes one builder's alias, got '{operand}'")),
             other => Err(format!("unknown step '{other}'")),
@@ -799,6 +898,26 @@ mod scripted {
             _ => return Err(format!("warm-failed takes commands or refused and a reason, got '{operand}'")),
         };
         Ok(Step::WarmFailed(failure, reason.to_owned()))
+    }
+
+    /// The `draining` or `draining-at` step `name` of `operand`: the number of calls it answers or of the call it
+    /// answers, then the place, `none` for none, and the barrier's raise and lapse times in Unix seconds.
+    fn drain_of(name: &str, operand: &str) -> Result<(usize, Drain), String> {
+        let wrong = || format!("{name} takes calls, a place or none, and the raise and lapse seconds, got '{operand}'");
+        let words: Vec<&str> = operand.split(' ').collect();
+        let [calls, place, raised, lapses] = words[..] else {
+            return Err(wrong());
+        };
+        let place = match place {
+            "none" => None,
+            place => Some(place.parse().map_err(|_| wrong())?),
+        };
+        let drain = Drain {
+            place,
+            raised: raised.parse().map_err(|_| wrong())?,
+            lapses: lapses.parse().map_err(|_| wrong())?,
+        };
+        Ok((calls.parse().map_err(|_| wrong())?, drain))
     }
 
     /// Performs `step` of `call` into `outcome`; whether the run goes on to the next step, or why the client failed.
@@ -845,7 +964,14 @@ mod scripted {
                 });
             }
             Step::WarmDeleted => outcome.warm = Some(WarmEnd::Deleted),
-            Step::Out(_) | Step::Err(_) | Step::Record(_) | Step::Wait(_) | Step::On(_) => {}
+            Step::Out(_)
+            | Step::Err(_)
+            | Step::Record(_)
+            | Step::Wait(_)
+            | Step::On(_)
+            | Step::Draining(..)
+            | Step::DrainingAt(..)
+            | Step::WaitAt(..) => {}
         }
         true
     }
@@ -862,6 +988,7 @@ mod scripted {
         let recorded = json!({
             "host": call.host(),
             "key": call.key,
+            "session": call.session,
             "root": call.root,
             "rootId": recorded_id(call.root_id),
             "leaf": call.leaf,

@@ -473,6 +473,8 @@ pub(super) fn send(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &s
         Err(Unsent::Ended(End::Failed(why)) | Unsent::Refused(why)) => Err(refused(attempt, &why)),
         // The box refused for its install, its line said: the run falls back for that, not for its inputs.
         Err(Unsent::Ended(End::Refused(FallbackReason::Install))) => Err(End::Refused(FallbackReason::Install)),
+        // The builder's drain refused a session no longer live: the run waits behind it, then starts again.
+        Err(Unsent::Ended(End::Draining(drain))) => Err(End::Draining(drain)),
         Err(Unsent::Ended(End::Refused(reason))) => Err(refused(attempt, &format!("the inputs call ended {}", reason.as_str()))),
         Err(Unsent::Ended(other)) => Err(End::Failed(format!(
             "the inputs call ended {}, which no inputs call does",
@@ -497,8 +499,8 @@ const RESTORE_ENDS: [&str; 2] = [".nuget.g.props", ".nuget.g.targets"];
 ///
 /// `None` for a send that did not land, its reason in the log ([`build_not_sent`]): a restore file missing on the PC, no
 /// file under the bin folder, a manifest past a cap, a refusal, a failure or a lost connection; the run then takes the
-/// drop. Never the route's `inputs` refusal: a Ctrl+C ends the run, and the box's `install` refusal falls back as an
-/// inputs call's does.
+/// drop. Never the route's `inputs` refusal: a Ctrl+C ends the run, the box's `install` refusal falls back as an
+/// inputs call's does, and the builder's drain refusal ends the attempt [`End::Draining`], as an inputs call's does.
 pub(super) fn sent_build(attempt: &mut Attempt<'_, '_>, location: &Location, bin: &str) -> Result<Option<String>, End> {
     let started = Instant::now();
     let ended = build_sent(attempt, location, bin);
@@ -507,6 +509,8 @@ pub(super) fn sent_build(attempt: &mut Attempt<'_, '_>, location: &Location, bin
         Ok(digest) => return Ok(Some(digest)),
         Err(Unsent::Ended(End::Interrupted)) => return Err(End::Interrupted),
         Err(Unsent::Ended(End::Refused(FallbackReason::Install))) => return Err(End::Refused(FallbackReason::Install)),
+        // The builder's drain refused the send: the run waits behind it, then sends again, rather than taking the drop.
+        Err(Unsent::Ended(End::Draining(drain))) => return Err(End::Draining(drain)),
         Err(Unsent::Refused(why) | Unsent::Ended(End::Failed(why))) => why,
         Err(Unsent::Ended(other)) => format!("the inputs call ended {}", unexpected(&other)),
     };
@@ -601,6 +605,7 @@ pub(super) fn unexpected(end: &End) -> &'static str {
         End::NotRouted(_) => "not routed",
         End::Refused(_) => "refused",
         End::SentRefused => "refused for the PC's build",
+        End::Draining(_) => "refused by the builder's drain",
         End::Failed(_) => "failed",
         End::TransferFailed(_) => "with a failed transfer",
         End::Interrupted => "interrupted",
@@ -792,7 +797,10 @@ fn sent_line(label: &str, count: usize, bytes: u64, compressed: u64, took: Durat
 /// output and a transfer ceiling counted from its own start, as a fetch is.
 fn diffed<'b>(attempt: &mut Attempt<'_, '_>, request: &Request<'_>, built: &'b Built) -> Result<Vec<&'b Found>, Unsent> {
     let (nonce, kind) = (request.nonce, request.kind);
-    let word = payload::inputs_word(request.location, nonce, InputsStep::Diff, kind.bin());
+    // Each call's word carries a nonce new to it, which the box's refusal tags for the call name; the PC's own files
+    // keep the run's.
+    let call_nonce = payload::run_nonce();
+    let word = payload::inputs_word(request.location, &call_nonce, InputsStep::Diff, kind.bin());
     let head = payload::input(&word, Some(&built.line));
     let root = Path::new(attempt.call.root);
     let path = root.join(TMP).join(format!("{}-{nonce}.{}-diff", attempt.call.key, kind.file()));
@@ -813,7 +821,9 @@ fn diffed<'b>(attempt: &mut Attempt<'_, '_>, request: &Request<'_>, built: &'b B
         })
     };
     let watch = Watch::Fetch(attempt.limits_for("inputs-diff"), None);
-    let called = attempt.inputs_call(&head, None, Some(&make), watch).map_err(Unsent::Ended)?;
+    let called = attempt
+        .inputs_call((&head, &call_nonce), None, Some(&make), watch)
+        .map_err(Unsent::Ended)?;
     judged(attempt, &called, Step::Diff)?;
     let mut text = Vec::new();
     (&answer)
@@ -942,10 +952,14 @@ impl<W: Write> Write for Asking<'_, W> {
 /// sent included.
 fn put(attempt: &mut Attempt<'_, '_>, request: &Request<'_>, built: &Built, sent: (&File, u64, usize)) -> Result<(), Unsent> {
     let (archive, length, count) = sent;
-    let word = payload::inputs_word(request.location, request.nonce, InputsStep::Put, request.kind.bin());
+    // Each call's word carries a nonce new to it, which the box's refusal tags for the call name.
+    let call_nonce = payload::run_nonce();
+    let word = payload::inputs_word(request.location, &call_nonce, InputsStep::Put, request.kind.bin());
     let head = payload::input(&word, Some(&built.line));
     let watch = Watch::Put(attempt.limits_for("inputs"));
-    let called = attempt.inputs_call(&head, Some((archive, length)), None, watch).map_err(Unsent::Ended)?;
+    let called = attempt
+        .inputs_call((&head, &call_nonce), Some((archive, length)), None, watch)
+        .map_err(Unsent::Ended)?;
     judged(attempt, &called, Step::Put)?;
     installed_all(&called.lines, count).map_err(Unsent::Refused)
 }

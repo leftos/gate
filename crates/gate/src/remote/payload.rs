@@ -36,6 +36,14 @@ pub(crate) struct Location {
     pub job: String,
     pub pair: Option<Pair>,
     pub form: PathForm,
+    /// The run's drain session (`Session`), sent only when there is one.
+    pub session: Option<String>,
+    /// The PC's name (`Pc`), `COMPUTERNAME`, sent only when it is set and not empty.
+    pub pc: Option<String>,
+    /// The repo the run is of (`Repo`).
+    pub repo: String,
+    /// Whether the call takes no ticket in the drain's line (`NoTicket`): a warm-up's.
+    pub no_ticket: bool,
 }
 
 /// A sibling pair as the payload's `Pair` carries it: the main checkout's folder name and each sibling's, in order.
@@ -47,7 +55,7 @@ pub(crate) struct Pair {
 
 impl Location {
     /// The work folder `key` of `repo` on the builder of `profile`, laid out as its profile lays it out, its job named
-    /// with `job_nonce`, with no pair.
+    /// with `job_nonce`, with no pair, no drain session, the PC's name ([`pc_name`]) and a ticket asked for.
     pub(crate) fn under(profile: &Profile, repo: &str, key: &str, job_nonce: &str) -> Location {
         let work = profile.work(key);
         Location {
@@ -60,6 +68,19 @@ impl Location {
             job: profile.job(key, job_nonce),
             pair: None,
             form: profile.form(),
+            session: None,
+            pc: pc_name(),
+            repo: repo.to_owned(),
+            no_ticket: false,
+        }
+    }
+
+    /// This location with the run's drain `session`, taking no ticket when `no_ticket`.
+    pub(crate) fn with_session(self, session: &str, no_ticket: bool) -> Location {
+        Location {
+            session: Some(session.to_owned()),
+            no_ticket,
+            ..self
         }
     }
 
@@ -74,7 +95,7 @@ impl Location {
         }
     }
 
-    /// The payload keys every verb reads, `Pair` only when there is one.
+    /// The payload keys every verb reads, `Pair`, `Session` and `Pc` only when there is one.
     fn object(&self) -> Map<String, Value> {
         let mut object = Map::new();
         for (name, value) in [
@@ -85,14 +106,27 @@ impl Location {
             ("Index", &self.index),
             ("OutputFolder", &self.output_folder),
             ("Job", &self.job),
+            ("Repo", &self.repo),
         ] {
             object.insert(name.to_owned(), Value::String(value.clone()));
         }
         if let Some(pair) = &self.pair {
             object.insert("Pair".to_owned(), json!({"Leaf": pair.leaf, "Siblings": pair.siblings}));
         }
+        if let Some(session) = &self.session {
+            object.insert("Session".to_owned(), json!(session));
+        }
+        if let Some(pc) = &self.pc {
+            object.insert("Pc".to_owned(), json!(pc));
+        }
+        object.insert("NoTicket".to_owned(), json!(self.no_ticket));
         object
     }
+}
+
+/// The PC's name, `COMPUTERNAME`; `None` when it is unset, empty or not Unicode.
+fn pc_name() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok().filter(|name| !name.is_empty())
 }
 
 /// What a run call carries beside the location: the words the builder runs, the folder below the work folder they run
@@ -168,11 +202,12 @@ pub(crate) fn location_word(location: &Location) -> String {
     word(&location.object())
 }
 
-/// The payload word of a preflight that asks the builder to probe tools: the location and `Needs`, an object of each
-/// tool's name and the minimum version the run needs of it (empty for any version), in the order of `needs`. With no
-/// needs there is no `Needs`, and the word is [`location_word`]'s.
-pub(crate) fn preflight_word(location: &Location, needs: &[(String, String)]) -> String {
+/// The payload word of a preflight that asks the builder to probe tools: the location, the call's `Nonce`, which a
+/// refusal tag names, and `Needs`, an object of each tool's name and the minimum version the run needs of it (empty
+/// for any version), in the order of `needs`. With no needs there is no `Needs`.
+pub(crate) fn preflight_word(location: &Location, needs: &[(String, String)], nonce: &str) -> String {
     let mut object = location.object();
+    object.insert("Nonce".to_owned(), json!(nonce));
     if !needs.is_empty() {
         let needs: Map<String, Value> = needs
             .iter()
@@ -346,7 +381,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        InputsStep, Location, Pair, RunCall, WarmCall, input, inputs_word, job_nonce, location_word, preflight_word, run_nonce, run_word, warm_word,
+        InputsStep, Location, Pair, RunCall, WarmCall, input, inputs_word, job_nonce, location_word, outputs_word, pc_name, preflight_word,
+        run_nonce, run_word, warm_word,
     };
     use crate::remote::transport::Profile;
     use gate_router::{Builder, BuilderOs};
@@ -364,6 +400,44 @@ mod tests {
 
     fn location() -> Location {
         Location::under(&host(), "app", "app-1a2b3c4d", "0123456789ab")
+    }
+
+    /// The nonce of the preflights these tests word.
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+    /// The drain session of the routed calls these tests word.
+    const SESSION: &str = "fedcba9876543210fedcba9876543210";
+
+    #[test]
+    fn every_routed_call_carries_session_pc_repo_and_no_ticket() {
+        let routed = location().with_session(SESSION, false);
+        let commands = warm_commands();
+        let warm = WarmCall {
+            commands: &commands,
+            hash: SHA,
+        };
+        let words = [
+            ("preflight", preflight_word(&routed, &[], NONCE)),
+            ("inputs", inputs_word(&routed, NONCE, InputsStep::Diff, None)),
+            ("outputs", outputs_word(&routed, "app.zip")),
+            ("run", run_word(&routed, &warm_run(&[], None))),
+        ];
+        for (verb, word) in words {
+            let payload = on_the_box(&word);
+            assert_eq!(payload.session(), Ok(Some(SESSION)), "{verb}");
+            assert_eq!(payload.pc(), Ok(pc_name().as_deref()), "{verb}");
+            assert_eq!(payload.repo(), Ok(Some("app")), "{verb}");
+            assert_eq!(payload.no_ticket(), Ok(false), "{verb}");
+        }
+        let warm_up = location().with_session(SESSION, true);
+        let payload = on_the_box(&warm_word(&warm_up, &warm_run(&[], None), &warm));
+        assert_eq!(
+            (payload.session(), payload.no_ticket()),
+            (Ok(Some(SESSION)), Ok(true)),
+            "a warm-up takes no ticket"
+        );
+        let unrouted = on_the_box(&location_word(&location()));
+        assert_eq!(unrouted.session(), Ok(None), "a location with no session sends none");
+        assert_eq!(unrouted.repo(), Ok(Some("app")));
     }
 
     /// The macOS builder `mac-1` under `/Users/b/gate-remote`, reached over the ssh transport.
@@ -394,6 +468,10 @@ mod tests {
                 job: "gate-remote-duel-0a1b2c3d-0123456789ab".to_owned(),
                 pair: None,
                 form: PathForm::Unix,
+                session: None,
+                pc: pc_name(),
+                repo: "duel".to_owned(),
+                no_ticket: false,
             }
         );
         assert!(gate_wire::is_job_name(&location.job, "duel-0a1b2c3d", PathForm::Unix), "{}", location.job);
@@ -436,6 +514,10 @@ mod tests {
                 job: r"Local\gate-remote-app-1a2b3c4d-0123456789ab".to_owned(),
                 pair: None,
                 form: PathForm::Windows,
+                session: None,
+                pc: pc_name(),
+                repo: "app".to_owned(),
+                no_ticket: false,
             }
         );
     }
@@ -535,18 +617,20 @@ mod tests {
 
     #[test]
     fn a_preflight_with_needs_carries_them_in_order_and_one_without_is_the_location_alone() {
+        let mut alone = decoded(&location_word(&location()));
+        alone["Nonce"] = json!(NONCE);
         assert_eq!(
-            preflight_word(&location(), &[]),
-            location_word(&location()),
-            "no needs: the word is byte for byte the location's"
+            decoded(&preflight_word(&location(), &[], NONCE)),
+            alone,
+            "no needs: the location and the Nonce alone"
         );
         let needs = [
             ("node".to_owned(), "24.0.0".to_owned()),
             ("cargo-nextest".to_owned(), String::new()),
             ("ffmpeg".to_owned(), "7".to_owned()),
         ];
-        let with_needs = decoded(&preflight_word(&location(), &needs));
-        let mut expected = decoded(&location_word(&location()));
+        let with_needs = decoded(&preflight_word(&location(), &needs, NONCE));
+        let mut expected = alone;
         expected["Needs"] = json!({"node": "24.0.0", "cargo-nextest": "", "ffmpeg": "7"});
         assert_eq!(with_needs, expected);
         let order: Vec<&String> = with_needs["Needs"].as_object().expect("Needs is an object").keys().collect();
@@ -556,18 +640,21 @@ mod tests {
     #[test]
     fn the_payloads_are_base64_json_with_the_box_s_keys() {
         let preflight = decoded(&location_word(&location()));
-        assert_eq!(
-            preflight,
-            json!({
-                "Key": "app-1a2b3c4d",
-                "Bare": r"D:\gate-remote\app.git",
-                "Work": r"D:\gate-remote\work\app-1a2b3c4d",
-                "Lock": r"D:\gate-remote\work\app-1a2b3c4d.lock",
-                "Index": r"D:\gate-remote\work\app-1a2b3c4d.index",
-                "OutputFolder": r"D:\gate-remote\outputs",
-                "Job": r"Local\gate-remote-app-1a2b3c4d-0123456789ab",
-            })
-        );
+        let mut keys = json!({
+            "Key": "app-1a2b3c4d",
+            "Bare": r"D:\gate-remote\app.git",
+            "Work": r"D:\gate-remote\work\app-1a2b3c4d",
+            "Lock": r"D:\gate-remote\work\app-1a2b3c4d.lock",
+            "Index": r"D:\gate-remote\work\app-1a2b3c4d.index",
+            "OutputFolder": r"D:\gate-remote\outputs",
+            "Job": r"Local\gate-remote-app-1a2b3c4d-0123456789ab",
+            "Repo": "app",
+            "NoTicket": false,
+        });
+        if let Some(pc) = pc_name() {
+            keys["Pc"] = json!(pc);
+        }
+        assert_eq!(preflight, keys);
         let words = ["./tool.exe".to_owned(), "a b".to_owned()];
         let sha = "0123456789abcdef0123456789abcdef01234567";
         let run = RunCall {
