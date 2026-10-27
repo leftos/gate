@@ -382,6 +382,9 @@ pub struct TestSeams {
     /// The remote client's backstop on the run call in milliseconds, counted from the run call's start, in place of
     /// five ceilings and 60 s.
     pub remote_backstop_ms: Option<u64>,
+    /// How far before the moment it is taken the remote client puts each attempt's snapshot time, in milliseconds, in
+    /// place of none.
+    pub remote_snapshot_age_ms: Option<u64>,
     /// How often the remote client says an outputs pull's progress while it runs, in milliseconds, counted from the
     /// pull's start, before its first call, across all its calls, in place of 30 s.
     pub outputs_progress_ms: Option<u64>,

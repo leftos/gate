@@ -93,6 +93,8 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     RemoteBackstopMs,
     #[cfg(feature = "test-seams")]
+    RemoteSnapshotAgeMs,
+    #[cfg(feature = "test-seams")]
     OutputsProgressMs,
     #[cfg(feature = "test-seams")]
     LocalSdks,
@@ -377,6 +379,8 @@ impl RunBuilder {
             #[cfg(feature = "test-seams")]
             ValueOption::RemoteBackstopMs => self.test_seams.remote_backstop_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
+            ValueOption::RemoteSnapshotAgeMs => self.test_seams.remote_snapshot_age_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
             ValueOption::OutputsProgressMs => self.test_seams.outputs_progress_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::LocalSdks => self.test_seams.local_sdks = Some(value.to_owned()),
@@ -578,8 +582,8 @@ impl RunBuilder {
 
     /// Refuses the remote client's seams that cannot work together: `--test-remote-ssh`,
     /// `--test-remote-retry-pause-ms`, `--test-remote-bound-ms`, `--test-remote-interrupt-at`,
-    /// `--test-remote-watch-call`, `--test-remote-timeout-ms`, `--test-remote-backstop-ms`, `--test-outputs-progress-ms`,
-    /// `--test-remote-hint-from-pull`,
+    /// `--test-remote-watch-call`, `--test-remote-timeout-ms`, `--test-remote-backstop-ms`,
+    /// `--test-remote-snapshot-age-ms`, `--test-outputs-progress-ms`, `--test-remote-hint-from-pull`,
     /// `--test-local-sdks`,
     /// `--test-remote-fetch-cap-bytes`,
     /// `--test-remote-apply-cap-bytes`, `--test-remote-outputs-budget-bytes`, `--test-remote-inputs-budget-bytes`,
@@ -601,6 +605,7 @@ impl RunBuilder {
             (self.test_seams.remote_watch_call.is_some(), "--test-remote-watch-call"),
             (self.test_seams.remote_timeout_ms.is_some(), "--test-remote-timeout-ms"),
             (self.test_seams.remote_backstop_ms.is_some(), "--test-remote-backstop-ms"),
+            (self.test_seams.remote_snapshot_age_ms.is_some(), "--test-remote-snapshot-age-ms"),
             (self.test_seams.outputs_progress_ms.is_some(), "--test-outputs-progress-ms"),
             (self.test_seams.remote_hint_from_pull, "--test-remote-hint-from-pull"),
             (self.test_seams.local_sdks.is_some(), "--test-local-sdks"),

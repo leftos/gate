@@ -6149,8 +6149,9 @@ fn a_parity_refusal_leaves_no_outputs_pending_marker_and_the_next_run_sends_outp
 /// A routed run saves the hash of each file under its globs last written well before it: one line in the state root, no
 /// temporary file left beside it. A file written ahead of the run's start is not saved, and one the run brought back
 /// holds the hash of the file the outputs step put in place, not the PC's hash of the file it replaced. The builder's
-/// file was written an hour before the run, after a first run named its work folder, so the install keeps its hash; the
-/// pending marker has the box bring it back though the run did not write it.
+/// file was written after a first run named its work folder, and the seam puts the run's snapshot time, which the
+/// install stamps it with, an hour back, so the install keeps its hash; the pending marker has the box bring it back
+/// though the run did not write it.
 #[test]
 fn a_routed_run_saves_the_hashes_of_its_stable_files() {
     let case = outputs_case("client-hashes-saved", &BIN);
@@ -6166,7 +6167,7 @@ fn a_routed_run_saves_the_hashes_of_its_stable_files() {
     let steps = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
     let command = [r".\tool.exe", "write", r"bin\same.txt", "same"];
 
-    let outcome = finish(client_gate(&case, "out.log", &steps, &command));
+    let outcome = finish(aged_snapshot_gate(&case, "out.log", &steps, &command));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(outcome.stderr.contains("gate-remote-outputs: 1 "), "one file comes back: {outcome:?}");
@@ -6275,7 +6276,8 @@ fn a_corrupt_hashes_file_is_ignored_and_replaced() {
 
 /// While the pending marker stands the manifest takes no hash from the cache, and the cache is saved from the hashes
 /// the build read: a cache saying the PC holds what the builder writes still sees the file come back, and then holds
-/// the hash of the file the outputs step put in place, which the builder wrote an hour before the run.
+/// the hash of the file the outputs step put in place, stamped with the run's snapshot time, which the seam puts an
+/// hour back.
 #[test]
 fn a_pending_marker_builds_the_manifest_without_the_cache_and_saves_it() {
     let case = outputs_case("client-hashes-full", &BIN);
@@ -6290,7 +6292,7 @@ fn a_pending_marker_builds_the_manifest_without_the_cache_and_saves_it() {
     let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
     let command = [r".\tool.exe", "out", "ran there"];
 
-    let outcome = finish(client_gate(&case, "second.log", &second, &command));
+    let outcome = finish(aged_snapshot_gate(&case, "second.log", &second, &command));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(
@@ -7025,6 +7027,28 @@ fn a_passing_run_installs_its_fetched_outputs() {
     assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
     assert!(!pending_marker(&case).exists(), "the outputs step completed: {outcome:?}");
     assert!(!outcome.stderr.contains("not brought back"), "{outcome:?}");
+}
+
+/// The installed output's last write is the time the run's snapshot was taken: not before the gate started, not after
+/// it ended, and before the box's command marked [`RAN`]. The command writes the output a second after that mark, so
+/// the box's own last write, which the archive carries in whole seconds, falls after it.
+#[test]
+fn a_routed_build_s_installed_outputs_carry_the_snapshot_time() {
+    let case = outputs_case("client-outputs-snapshot-time", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+    let command = [r".\tool.exe", "mark", RAN, "sleep", "1000", "write", r"bin\new.txt", "built"];
+    let before = SystemTime::now();
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &command));
+
+    let after = SystemTime::now();
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let last_write = |path: &Path| fs::metadata(path).and_then(|metadata| metadata.modified()).expect("a last write");
+    let installed = last_write(&case.folder().join("bin").join("new.txt"));
+    let marked = last_write(&work_folder(&case).join(RAN));
+    assert!(installed >= before, "not before the gate started: {installed:?}, {before:?}");
+    assert!(installed <= after, "not after the gate ended: {installed:?}, {after:?}");
+    assert!(installed < marked, "taken before the box's command ran: {installed:?}, {marked:?}");
 }
 
 /// The builder streams more than the fetch cap the lowered outputs budget gives (`--test-remote-outputs-budget-bytes
@@ -8962,7 +8986,7 @@ fn a_coverage_file_that_cannot_be_rewritten_is_skipped_and_the_marker_cleared() 
     install_from_the_box(&case, "bin/x.dll", "built");
     let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
 
-    let outcome = finish(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
+    let outcome = finish(aged_snapshot_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
 
     assert_eq!(outcome.code, Some(0), "the pass stands: {outcome:?}");
     assert!(
@@ -9003,24 +9027,33 @@ fn first_run(case: &Case) {
     assert_eq!(cleared.code, Some(0), "{cleared:?}");
 }
 
-/// Writes `text` to the builder's work folder file `path`, its folders made, its last write [`HOUR`] ago: the install
-/// keeps no hash of a file written inside the 2 s window of its moves.
+/// Writes `text` to the builder's work folder file `path`, its folders made. The install stamps each file it moves with
+/// the run's snapshot time, not the box's last write, so a case that reads the hash the install keeps runs with
+/// [`SNAPSHOT_AN_HOUR_BACK`]: the install keeps no hash of a file stamped inside the 2 s window of its moves.
 fn install_from_the_box(case: &Case, path: &str, text: &str) {
     install_bytes_from_the_box(case, path, text.as_bytes());
 }
 
-/// Writes `bytes` to the builder's work folder file `path`, its folders made, its last write [`HOUR`] ago, as
-/// [`install_from_the_box`] does for text.
+/// Writes `bytes` to the builder's work folder file `path`, its folders made, as [`install_from_the_box`] does for text.
 fn install_bytes_from_the_box(case: &Case, path: &str, bytes: &[u8]) {
     let work = case.folder().join("builder").join("work").join(key_of(&events(case)));
     let full = work.join(path.replace('/', "\\"));
     fs::create_dir_all(full.parent().expect("a file has a folder")).expect("the folder can be made");
     fs::write(&full, bytes).expect("the builder's file can be written");
-    fs::File::options()
-        .write(true)
-        .open(&full)
-        .and_then(|file| file.set_modified(SystemTime::now() - HOUR))
-        .expect("the file's last write can be set");
+}
+
+/// The seam that puts each attempt's snapshot time an hour before the snapshot is taken. Every file the install moves
+/// is stamped with that time, and the moves begin after the snapshot, so the stamp is at least an hour before them
+/// however long the run takes, and the install keeps the file's hash.
+const SNAPSHOT_AN_HOUR_BACK: [&str; 2] = ["--test-remote-snapshot-age-ms", "3600000"];
+
+/// [`client_gate`] with [`SNAPSHOT_AN_HOUR_BACK`].
+fn aged_snapshot_gate(case: &Case, log: &str, steps: &Path, command: &[&str]) -> Command {
+    let tuned = Tuned {
+        extra: &SNAPSHOT_AN_HOUR_BACK,
+        ..Tuned::default()
+    };
+    client_gate_tuned(case, log, steps, &tuned, command)
 }
 
 /// `text` as UTF-16 little-endian bytes, the byte order mark first, as the .NET coverage collector writes it.
@@ -9032,8 +9065,8 @@ fn utf16_le(text: &str) -> Vec<u8> {
     bytes
 }
 
-/// A run that installs a file the builder wrote an hour ago keeps its hash at the stamp the installed file's own
-/// handle reads: the next run then takes that hash instead of reading the file.
+/// A run whose snapshot time the seam puts an hour back installs a file and keeps its hash at the stamp the installed
+/// file's own handle reads: the next run then takes that hash instead of reading the file.
 #[test]
 fn an_installed_file_is_cached_at_its_installed_stamp() {
     let case = outputs_case("client-outputs-cached", &BIN);
@@ -9041,7 +9074,7 @@ fn an_installed_file_is_cached_at_its_installed_stamp() {
     install_from_the_box(&case, "bin/x.dll", "built");
     let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
 
-    let outcome = finish(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
+    let outcome = finish(aged_snapshot_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let installed = case.folder().join("bin").join("x.dll");
@@ -9100,7 +9133,7 @@ fn a_run_after_an_install_does_not_rehash_what_it_installed() {
     first_run(&case);
     install_from_the_box(&case, "bin/x.dll", "built");
     let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
-    let installed = finish(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
+    let installed = finish(aged_snapshot_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
     assert_eq!(installed.code, Some(0), "{installed:?}");
     plant(&case, "bin/x.dll", &sha256_hex("sentinel"));
     let third = ssh_steps(&case, "third", &["ok", "ok", "ok"]);
@@ -9115,7 +9148,8 @@ fn a_run_after_an_install_does_not_rehash_what_it_installed() {
     );
 }
 
-/// An install the Ctrl+C stops keeps no hash, not even of the settled file it moved before the interrupt.
+/// An install the Ctrl+C stops keeps no hash, not even of the settled file it moved before the interrupt: the seam puts
+/// the snapshot time the install stamps it with an hour back, so the interrupt is the only reason it is not kept.
 #[test]
 fn an_interrupted_install_caches_nothing() {
     let case = outputs_case("client-outputs-install-ctrl-c-cache", &BIN);
@@ -9123,8 +9157,9 @@ fn an_interrupted_install_caches_nothing() {
     install_from_the_box(&case, "bin/a.txt", "a");
     install_from_the_box(&case, "bin/b.txt", "b");
     let steps = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
+    let extra = [&SNAPSHOT_AN_HOUR_BACK[..], &["--test-remote-interrupt-at", "install"]].concat();
     let tuned = Tuned {
-        extra: &["--test-remote-interrupt-at", "install"],
+        extra: &extra,
         ..Tuned::default()
     };
 

@@ -171,6 +171,9 @@ pub(crate) struct RustClient {
     timeout_ms: Option<u64>,
     /// `--test-remote-backstop-ms`: the run call's backstop, in milliseconds, in place of five ceilings and 60 s.
     backstop_ms: Option<u64>,
+    /// How far before the moment it is taken each attempt's snapshot time is put: `--test-remote-snapshot-age-ms`, else
+    /// none.
+    snapshot_age: Duration,
     /// `--test-remote-watch-call`: the one call `--test-stall-ms` applies to, when it is not the whole run's, and
     /// `--test-remote-timeout-ms` too, which names a call other than `run`; the backstop seam is the run call's alone.
     watch_call: Option<String>,
@@ -270,6 +273,7 @@ impl RustClient {
             stall_ms: seams.stall_ms,
             timeout_ms: seams.remote_timeout_ms,
             backstop_ms: seams.remote_backstop_ms,
+            snapshot_age: seams.remote_snapshot_age_ms.map_or(Duration::ZERO, Duration::from_millis),
             watch_call: seams.remote_watch_call.clone(),
             interrupt_at: seams.remote_interrupt_at.clone(),
             local_sdks: seams.local_sdks.clone(),
@@ -473,6 +477,8 @@ impl RustClient {
             problem: None,
             hang_said: false,
             command_started: None,
+            snapshot_taken: None,
+            snapshot_age: self.snapshot_age,
             outputs_progress: self.outputs_progress,
             pulling: None,
             pull_periods_said: Cell::new(0),
@@ -1399,6 +1405,12 @@ pub(super) struct Attempt<'c, 'a> {
     /// When the box's start marker of the run came, which the hang hint counts the run from through the outputs pull
     /// too; `None` until a run call heard it.
     command_started: Option<Instant>,
+    /// The moment the attempt began making its snapshot, by this PC's clock ([`Attempt::snapshots`]), less the
+    /// `--test-remote-snapshot-age-ms` age when a test gives one: the last write each file its outputs install moves into
+    /// place takes; `None` until it began.
+    pub(super) snapshot_taken: Option<std::time::SystemTime>,
+    /// How far before the moment the snapshot begins its time is put: none but under `--test-remote-snapshot-age-ms`.
+    snapshot_age: Duration,
     /// How often an outputs pull says its progress while it runs.
     outputs_progress: Duration,
     /// The outputs pull the call being made is, while the outputs call is made; `None` for every other call.
@@ -1961,6 +1973,9 @@ impl Attempt<'_, '_> {
     /// the main one's git failure ends the run. Each is then snapshotted at the place git found it, and the pair's
     /// folders read again after each snapshot.
     fn snapshots(&mut self, repos: &[Repo]) -> Result<Vec<Snapshot>, End> {
+        let now = std::time::SystemTime::now();
+        // A seam's age past the clock's start takes the start, so no age can panic.
+        self.snapshot_taken = Some(now.checked_sub(self.snapshot_age).unwrap_or(std::time::SystemTime::UNIX_EPOCH));
         let Some(ceiling) = self.ceiling.clone() else {
             return self.snapshot().map(|snapshot| vec![snapshot]);
         };
@@ -3609,6 +3624,8 @@ impl<'c, 'a> Attempt<'c, 'a> {
             problem: None,
             hang_said: false,
             command_started: None,
+            snapshot_taken: None,
+            snapshot_age: Duration::ZERO,
             outputs_progress: OUTPUTS_PROGRESS,
             pulling: None,
             pull_periods_said: Cell::new(0),
@@ -5632,6 +5649,8 @@ mod tests {
             problem: None,
             hang_said: false,
             command_started: None,
+            snapshot_taken: None,
+            snapshot_age: Duration::ZERO,
             outputs_progress: super::OUTPUTS_PROGRESS,
             pulling: None,
             pull_periods_said: Cell::new(0),
@@ -6979,6 +6998,8 @@ mod tests {
         call.outputs = if step.globs { &globs[..] } else { &[] };
         let transport = nowhere();
         let mut attempt = Attempt::for_tests(&call, &transport);
+        // The attempt is past its snapshot, as one that reaches its outputs is, so a fetch is tried.
+        attempt.snapshot_taken = Some(std::time::SystemTime::now());
         let sent = outputs::sent(&mut attempt).expect("no interrupt ends the manifest's build");
         let location = location();
         let ran = outputs::Ran {

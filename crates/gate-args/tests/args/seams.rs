@@ -854,6 +854,26 @@ fn the_remote_timeout_seam_needs_a_watched_call_other_than_run() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+fn the_remote_snapshot_age_seam_takes_whole_milliseconds_above_0_with_the_transport() {
+    use crate::support::run_request;
+
+    const SEAM: &str = "--test-remote-snapshot-age-ms";
+    let given = with(&RUN, &["--test-remote-transport", "local:b", SEAM, "3600000", "--", "cmd"]);
+    assert_eq!(run_request(&refs(&given)).test_seams.remote_snapshot_age_ms, Some(3_600_000));
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-remote-transport", "local:b", SEAM, "0", "--", "cmd"]))),
+        ["gate: --test-remote-snapshot-age-ms must be a whole number above 0, got '0'"]
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &[SEAM, "300", "--", "cmd"]))),
+        ["gate: --test-remote-snapshot-age-ms needs --test-remote-transport"]
+    );
+    let none = run_request(&refs(&with(&RUN, &["--test-remote-transport", "local:b", "--", "cmd"]))).test_seams;
+    assert_eq!(none.remote_snapshot_age_ms, None, "none unless given");
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
 fn box_seams_of_the_ceiling_refuse_a_bad_missing_or_repeated_value() {
     let rows: [(&[&str], &[&str]); 14] = [
         (
@@ -2340,6 +2360,7 @@ fn seam_flags_are_unknown_without_the_feature() {
         "--test-remote-watch-call",
         "--test-remote-timeout-ms",
         "--test-remote-backstop-ms",
+        "--test-remote-snapshot-age-ms",
         "--test-local-sdks",
         "--test-dotnet-limit-ms",
         "--test-remote-fetch-cap-bytes",

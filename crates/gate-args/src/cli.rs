@@ -322,6 +322,7 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-remote-watch-call" => Some(RunOption::Value(ValueOption::RemoteWatchCall)),
         "test-remote-timeout-ms" => Some(RunOption::Value(ValueOption::RemoteTimeoutMs)),
         "test-remote-backstop-ms" => Some(RunOption::Value(ValueOption::RemoteBackstopMs)),
+        "test-remote-snapshot-age-ms" => Some(RunOption::Value(ValueOption::RemoteSnapshotAgeMs)),
         "test-outputs-progress-ms" => Some(RunOption::Value(ValueOption::OutputsProgressMs)),
         "test-local-sdks" => Some(RunOption::Value(ValueOption::LocalSdks)),
         "test-remote-fetch-cap-bytes" => Some(RunOption::Value(ValueOption::RemoteFetchCapBytes)),

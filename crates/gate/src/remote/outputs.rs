@@ -548,6 +548,13 @@ pub(super) fn trees_of<'a>(
 /// past the cap only says so, and the install is held to the narrowed globs; the ends that fail a passing run are
 /// handed back as they are, and [`reports_end`] turns them to the command's status.
 fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced: End) -> (End, bool) {
+    // The install stamps every file it moves with the snapshot time; an attempt past its run without one is a bug of the
+    // client's, which pulls nothing rather than stamp the outputs with another time.
+    let Some(snapshot) = attempt.snapshot_taken else {
+        let reason = "the attempt reached its outputs with no snapshot time, which the install stamps every file with";
+        attempt.say(not_brought_back(kept.bringing(), reason));
+        return (End::Failed(reason.to_owned()), false);
+    };
     let started = Instant::now();
     let bringing = kept.bringing();
     attempt.say(pull_start_line(bringing, attempt.call.host(), kept.count, kept.size));
@@ -598,6 +605,7 @@ fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced
                         main_tree,
                         sibling_trees,
                         started,
+                        snapshot,
                         pulled,
                         reports: kept.reports,
                     };

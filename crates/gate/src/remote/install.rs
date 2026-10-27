@@ -8,14 +8,15 @@
 //! `--bring-tracked` glob matches it, or whose PC file is in use or read-only, or that records one of the run's box
 //! trees but is not text the install can rewrite, skipped and said; each of the run's trees on the box rewritten to its
 //! root on this PC in the files that record it (the work folder to the worktree for one repo; for a pair, the main's
-//! tree to the worktree and each sibling's to the sibling's root); and each file, its last write clamped to this PC's
-//! clock in the stage and checked against the manifest once more, moved into place, unless its PC file is now in place
-//! by the same rule, which is left as it is, or something holds it open against the move, which is skipped as in use
-//! and said. A complete install also keeps the hash of each file it put in place, at the stamp that file's handle
-//! reads after the move, in the worktree's hash cache, so the next run takes it instead of reading the file again. The
-//! success line says what came back; every end removes the archive and the stage this run made, and the pending
-//! marker is cleared by a success whose skips a refetch would not clear, and by a refusal a refetch of the same
-//! archive would be refused the same way.
+//! tree to the worktree and each sibling's to the sibling's root); and each file, its last write set in the stage to
+//! the time the attempt began its snapshot, clamped to this PC's clock, so a source changed here after the snapshot is
+//! newer than every output the run built from it, and checked against the manifest once more, moved into place, unless
+//! its PC file is now in place by the same rule, which is left as it is, or something holds it open against the move,
+//! which is skipped as in use and said. A complete install also keeps the hash of each file it put in place, at the
+//! stamp that file's handle reads after the move, in the worktree's hash cache, so the next run takes it instead of
+//! reading the file again. The success line says what came back; every end removes the archive and the stage this run
+//! made, and the pending marker is cleared by a success whose skips a refetch would not clear, and by a refusal a
+//! refetch of the same archive would be refused the same way.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -81,6 +82,10 @@ pub(super) struct Fetched<'f> {
     /// Each sibling's tree on the box and the sibling's root it stands for, in the pair's order; none for one repo.
     pub(super) sibling_trees: Vec<(String, &'f str)>,
     pub(super) started: Instant,
+    /// The moment the attempt began making its snapshot, by this PC's clock, less the `--test-remote-snapshot-age-ms` age
+    /// when a test gives one: the last write every file the install moves into place takes, clamped to this PC's clock
+    /// as the moves begin.
+    pub(super) snapshot: SystemTime,
     /// How long the fetch alone took, from its start to the archive's last byte.
     pub(super) pulled: Duration,
     /// For a failed run's test reports, the run's output globs narrowed to those that name a `TestResults` folder: the
@@ -382,7 +387,7 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
     let total = entries.len();
     // The file time the moves begin at, from which the racy rule keeps the hash of a file written long enough before.
     let started = file_time_now();
-    let moves = moved(&fetched.stage, &root, &entries, fetched.manifest, |done| {
+    let moves = moved((&fetched.stage, &root), &entries, fetched.manifest, fetched.snapshot, |done| {
         if done == 1
             && let Some(interrupt) = raise
         {
@@ -948,12 +953,19 @@ struct Moves {
     in_use: Vec<String>,
 }
 
-/// Moves each of `entries` from `stage` into place below `root`, as [`move_one`] does against `manifest`, asking
+/// Moves each of `entries` from `stage` into place below `root`, as [`move_one`] does against `manifest`, each file moved
+/// taking as its last write the `snapshot` time, or this PC's clock as the moves begin when that is earlier, asking
 /// `go_on`, given the files moved so far, before each one; else the interrupt once `go_on` says no, or why a file
 /// failed, the files handled before it counted and left in place. What the moves did ([`Moves`]); a member left in place
 /// ([`Placed::InPlace`]) is in neither list.
-fn moved(stage: &Path, root: &Path, entries: &[Entry], manifest: &Manifest, mut go_on: impl FnMut(usize) -> bool) -> Result<Moves, Unmoved> {
-    let now = SystemTime::now();
+fn moved(
+    (stage, root): (&Path, &Path),
+    entries: &[Entry],
+    manifest: &Manifest,
+    snapshot: SystemTime,
+    mut go_on: impl FnMut(usize) -> bool,
+) -> Result<Moves, Unmoved> {
+    let stamped = snapshot.min(SystemTime::now());
     let total = entries.len();
     let mut moves = Moves {
         moved: Vec::with_capacity(total),
@@ -963,7 +975,7 @@ fn moved(stage: &Path, root: &Path, entries: &[Entry], manifest: &Manifest, mut 
         if !go_on(done) {
             return Err(Unmoved::Interrupted { done });
         }
-        let placed = move_one(stage, root, entry, manifest, now)
+        let placed = move_one(stage, root, entry, manifest, stamped)
             .map_err(|error| Unmoved::Failed(format!("{done} of {total} files were installed before {} failed: {error}", entry.path)))?;
         match placed {
             Placed::Moved(stamp) => moves.moved.push(Moved { entry: entry.clone(), stamp }),
@@ -988,17 +1000,17 @@ enum Placed {
 }
 
 /// Moves the staged file of `entry` below `stage` to the same path below `root`, replacing a file there, each folder
-/// between `root` and it made when missing and refused when it is a link, a junction or not a folder. Its last write,
-/// when past `now`, is set to `now` in the stage, before the move; the PC's file is then checked against `manifest`
+/// between `root` and it made when missing and refused when it is a link, a junction or not a folder. Its last write is
+/// set to `stamped` in the stage, before the move, whatever the box wrote; the PC's file is then checked against `manifest`
 /// once more ([`pc_file`]), just before the move, and one in place is left ([`Placed::InPlace`]): one already holding the
 /// member's bytes, or one recording a root that a PC writer changed or made. Any member whose rename is refused because
 /// something holds a file open ([`held_open`]) is not moved when its PC file is the one held, as it is when that file
 /// cannot be opened for deletion ([`held_against_replacing`]) ([`Placed::InUse`]); else the rename is tried once more,
 /// and its error, a held staged file's included, is the failure. Any other rename error is the failure at once.
-/// The stamp read after the move through a handle opened on the staged file before it, the clamp included, is returned:
+/// The stamp read after the move through a handle opened on the staged file before it, `stamped` included, is returned:
 /// the moved file's own, never that of a file put at its path after the move. None when the handle cannot be opened or
 /// read, which costs the file its hash cache entry only.
-fn move_one(stage: &Path, root: &Path, entry: &Entry, manifest: &Manifest, now: SystemTime) -> io::Result<Placed> {
+fn move_one(stage: &Path, root: &Path, entry: &Entry, manifest: &Manifest, stamped: SystemTime) -> io::Result<Placed> {
     let path = entry.path.as_str();
     let source = below(stage, path);
     let (parents, _) = path.rsplit_once('/').unwrap_or(("", path));
@@ -1010,11 +1022,11 @@ fn move_one(stage: &Path, root: &Path, entry: &Entry, manifest: &Manifest, now: 
             _ => check_folder(&folder)?,
         }
     }
-    let written = fs::metadata(&source)?.modified()?;
-    if written > now {
-        // Its attributes alone: a handle open on the staged file, sharing its deletion, then neither refuses nor is moved.
-        OpenOptions::new().access_mode(FILE_WRITE_ATTRIBUTES).open(&source)?.set_modified(now)?;
-    }
+    // Its attributes alone: a handle open on the staged file, sharing its deletion, then neither refuses nor is moved.
+    OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .open(&source)?
+        .set_modified(stamped)?;
     // A file refused here was checked before the moves; one that changed in between is the reason said, of the kind a
     // refetch may clear ([`Refused::transient`]), and one in place is left as it is.
     match pc_file(root, entry, manifest).map_err(io::Error::other)? {
@@ -1837,7 +1849,7 @@ mod tests {
         fs::create_dir_all(root.join("bin").join("b.txt")).expect("a folder in the file's place");
         let entries = [entry("bin/a.txt"), entry("bin/b.txt"), entry("bin/c.txt")];
 
-        let unmoved = moved(&stage, &root, &entries, &Manifest::default(), |_| true).expect_err("b cannot be moved over a folder");
+        let unmoved = moved((&stage, &root), &entries, &Manifest::default(), an_hour_ago(), |_| true).expect_err("b cannot be moved over a folder");
 
         let reason = failure(unmoved);
         assert!(reason.starts_with("1 of 3 files were installed before bin/b.txt failed: "), "{reason}");
@@ -1854,7 +1866,7 @@ mod tests {
         fs::create_dir_all(&root).expect("the root can be made");
         let entries = [entry("bin/a.txt"), entry("bin/b.txt")];
 
-        let unmoved = moved(&stage, &root, &entries, &Manifest::default(), |done| done < 1);
+        let unmoved = moved((&stage, &root), &entries, &Manifest::default(), an_hour_ago(), |done| done < 1);
 
         assert_eq!(unmoved, Err(Unmoved::Interrupted { done: 1 }));
         assert_eq!(files_below(&root), ["bin/a.txt"]);
@@ -1881,7 +1893,8 @@ mod tests {
         fs::create_dir_all(&outside).expect("the outside folder can be made");
         junction(&root.join("bin"), &outside);
 
-        let unmoved = moved(&stage, &root, &[entry("bin/a.txt")], &Manifest::default(), |_| true).expect_err("the junction is refused");
+        let unmoved =
+            moved((&stage, &root), &[entry("bin/a.txt")], &Manifest::default(), an_hour_ago(), |_| true).expect_err("the junction is refused");
 
         let reason = failure(unmoved);
         assert!(reason.starts_with("0 of 1 files were installed before bin/a.txt failed: "), "{reason}");
@@ -1894,7 +1907,7 @@ mod tests {
     }
 
     #[test]
-    fn a_last_write_past_this_clock_is_clamped_and_one_before_it_kept() {
+    fn a_box_last_write_either_side_of_this_clock_gives_way_to_the_snapshot_time() {
         let folder = scratch("move-clamp");
         let (stage, root) = (folder.join("stage"), folder.join("root"));
         let ahead = put(&stage, "bin/ahead.txt", b"a");
@@ -1910,15 +1923,58 @@ mod tests {
         }
 
         let entries = [entry("bin/ahead.txt"), entry("bin/behind.txt")];
-        assert!(moved(&stage, &root, &entries, &Manifest::default(), |_| true).is_ok());
+        let snapshot = an_hour_ago();
+        assert!(moved((&stage, &root), &entries, &Manifest::default(), snapshot, |_| true).is_ok());
 
-        let modified = |name: &str| {
-            fs::metadata(root.join("bin").join(name))
-                .and_then(|metadata| metadata.modified())
-                .expect("a last write")
-        };
-        assert!(modified("ahead.txt") <= SystemTime::now(), "clamped to this clock");
-        assert_eq!(modified("behind.txt"), past, "kept");
+        assert_eq!(modified(&root.join("bin").join("ahead.txt")), snapshot, "a box write ahead of this clock");
+        assert_eq!(modified(&root.join("bin").join("behind.txt")), snapshot, "a box write behind it");
+    }
+
+    #[test]
+    fn a_moved_file_takes_the_snapshot_time_and_an_in_place_one_keeps_its_own() {
+        let folder = scratch("move-snapshot");
+        let (stage, root) = (folder.join("stage"), folder.join("root"));
+        let snapshot = an_hour_ago();
+        let staged = put(&stage, "bin/a.txt", b"box");
+        put(&stage, "bin/b.txt", b"box");
+        let in_place = put(&root, "bin/b.txt", b"box");
+        for full in [&staged, &in_place] {
+            File::options()
+                .write(true)
+                .open(full)
+                .and_then(|file| file.set_modified(snapshot - Duration::from_hours(1)))
+                .expect("the last write can be set");
+        }
+        let kept = modified(&in_place);
+        let entries = [entry("bin/a.txt"), member("bin/b.txt", b"box")];
+
+        let moves = moved((&stage, &root), &entries, &Manifest::default(), snapshot, |_| true).expect("the files are handled");
+
+        let paths: Vec<&str> = moves.moved.iter().map(|moved| moved.entry.path.as_str()).collect();
+        assert_eq!(paths, ["bin/a.txt"], "b is left in place: {moves:?}");
+        assert_eq!(
+            modified(&root.join("bin").join("a.txt")),
+            snapshot,
+            "the moved file takes the snapshot time"
+        );
+        assert_eq!(modified(&in_place), kept, "the file left in place keeps its own");
+
+        put(&stage, "bin/c.txt", b"box");
+        let future = SystemTime::now() + Duration::from_hours(3);
+        moved((&stage, &root), &[entry("bin/c.txt")], &Manifest::default(), future, |_| true).expect("c is moved");
+        let clamped = modified(&root.join("bin").join("c.txt"));
+        assert!(clamped < future, "a snapshot time past this clock is clamped to it: {clamped:?}");
+        assert!(clamped <= SystemTime::now(), "clamped to this clock: {clamped:?}");
+    }
+
+    /// The last write of the file at `full`.
+    fn modified(full: &Path) -> SystemTime {
+        fs::metadata(full).and_then(|metadata| metadata.modified()).expect("a last write")
+    }
+
+    /// A snapshot time an hour ago: long enough before any move that the racy rule keeps a file stamped with it.
+    fn an_hour_ago() -> SystemTime {
+        SystemTime::now() - Duration::from_hours(1)
     }
 
     /// An install that moved `moved` into place and skipped no file.
@@ -1953,7 +2009,7 @@ mod tests {
         aged(&put(&stage, "bin/a.txt", b"box"), Duration::from_hours(2));
         fs::create_dir_all(&root).expect("the root can be made");
 
-        let moved = moved(&stage, &root, &[entry("bin/a.txt")], &Manifest::default(), |_| true)
+        let moved = moved((&stage, &root), &[entry("bin/a.txt")], &Manifest::default(), an_hour_ago(), |_| true)
             .expect("the file is moved")
             .moved;
 
@@ -1970,20 +2026,19 @@ mod tests {
     fn a_file_clamped_to_now_is_not_cached() {
         let folder = scratch("cache-clamped");
         let (stage, root) = (folder.join("stage"), folder.join("root"));
-        let ahead = put(&stage, "bin/ahead.txt", b"a");
-        aged(&put(&stage, "bin/behind.txt", b"b"), Duration::from_hours(3));
-        File::options()
-            .write(true)
-            .open(&ahead)
-            .and_then(|file| file.set_modified(SystemTime::now() + Duration::from_hours(3)))
-            .expect("the last write can be set");
+        put(&stage, "bin/ahead.txt", b"a");
+        put(&stage, "bin/behind.txt", b"b");
         fs::create_dir_all(&root).expect("the root can be made");
-        let entries = [entry("bin/ahead.txt"), entry("bin/behind.txt")];
         // Taken before the moves, as the install takes it: the clamp to this clock then falls at or after it.
         let started = file_time_now();
-        let moved = moved(&stage, &root, &entries, &Manifest::default(), |_| true)
-            .expect("both files are moved")
+        let future = SystemTime::now() + Duration::from_hours(3);
+        let mut moved_files = moved((&stage, &root), &[entry("bin/ahead.txt")], &Manifest::default(), future, |_| true)
+            .expect("the file of a snapshot time ahead is moved")
             .moved;
+        let behind = moved((&stage, &root), &[entry("bin/behind.txt")], &Manifest::default(), an_hour_ago(), |_| true)
+            .expect("the file of a snapshot time behind is moved");
+        moved_files.extend(behind.moved);
+        let moved = moved_files;
         let clamped = moved
             .iter()
             .find(|file| file.entry.path == "bin/ahead.txt")
@@ -2013,7 +2068,7 @@ mod tests {
         }
         fs::create_dir_all(&root).expect("the root can be made");
         let entries: Vec<Entry> = paths.iter().map(|path| entry(path)).collect();
-        let moved = moved(&stage, &root, &entries, &Manifest::default(), |_| true)
+        let moved = moved((&stage, &root), &entries, &Manifest::default(), an_hour_ago(), |_| true)
             .expect("every file is moved")
             .moved;
         let path = cache_path(&folder);
@@ -2033,7 +2088,7 @@ mod tests {
         let (stage, root) = (folder.join("stage"), folder.join("root"));
         aged(&put(&stage, "bin/a.txt", b"a"), Duration::from_hours(2));
         fs::create_dir_all(&root).expect("the root can be made");
-        let moved = moved(&stage, &root, &[entry("bin/a.txt")], &Manifest::default(), |_| true)
+        let moved = moved((&stage, &root), &[entry("bin/a.txt")], &Manifest::default(), an_hour_ago(), |_| true)
             .expect("the file is moved")
             .moved;
         let mut installed = installed_of(moved);
@@ -2046,9 +2101,9 @@ mod tests {
     }
 
     /// The staged file is held, sharing only its deletion, so it moves with its handle open and no one may open it for
-    /// writing after: only a clamp set on the stage, before the move, can succeed.
+    /// writing after: only a last write set on the stage, before the move, can succeed.
     #[test]
-    fn a_future_last_write_is_clamped_in_the_stage_never_on_the_target() {
+    fn the_snapshot_time_is_set_in_the_stage_never_on_the_target() {
         let folder = scratch("move-clamp-staged");
         let (stage, root) = (folder.join("stage"), folder.join("root"));
         let staged = put(&stage, "bin/ahead.txt", b"a");
@@ -2064,13 +2119,12 @@ mod tests {
             .open(&staged)
             .expect("the file can be held");
 
-        let result = moved(&stage, &root, &[entry("bin/ahead.txt")], &Manifest::default(), |_| true);
+        let snapshot = an_hour_ago();
+        let result = moved((&stage, &root), &[entry("bin/ahead.txt")], &Manifest::default(), snapshot, |_| true);
         drop(held);
 
         assert!(result.is_ok(), "{result:?}");
-        let target = root.join("bin").join("ahead.txt");
-        let modified = fs::metadata(&target).and_then(|metadata| metadata.modified()).expect("a last write");
-        assert!(modified <= SystemTime::now(), "clamped to this clock");
+        assert_eq!(modified(&root.join("bin").join("ahead.txt")), snapshot, "the snapshot time");
     }
 
     #[test]
@@ -2083,7 +2137,7 @@ mod tests {
         let manifest = manifest_of(&root, &["bin/b.txt"]);
         let entries = [entry("bin/a.txt"), entry("bin/b.txt")];
 
-        let unmoved = moved(&stage, &root, &entries, &manifest, |done| {
+        let unmoved = moved((&stage, &root), &entries, &manifest, an_hour_ago(), |done| {
             if done == 1 {
                 fs::write(&pc, b"edited after the checks").expect("the file can be written");
             }
@@ -2106,7 +2160,7 @@ mod tests {
         let manifest = manifest_of(&root, &["bin/b.txt"]);
         let entries = [entry("bin/a.txt"), member("bin/b.txt", b"box")];
 
-        let installed = moved(&stage, &root, &entries, &manifest, |done| {
+        let installed = moved((&stage, &root), &entries, &manifest, an_hour_ago(), |done| {
             if done == 1 {
                 fs::write(&pc, b"box").expect("the file can be written");
             }
@@ -2133,7 +2187,7 @@ mod tests {
         let manifest = manifest_of(&root, &["bin/b.txt"]);
         let entries = [entry("bin/a.txt"), member("bin/b.txt", b"box")];
 
-        let unmoved = moved(&stage, &root, &entries, &manifest, |done| {
+        let unmoved = moved((&stage, &root), &entries, &manifest, an_hour_ago(), |done| {
             if done == 1 {
                 fs::write(&pc, b"xyz").expect("the file can be written");
             }
@@ -2376,7 +2430,7 @@ mod tests {
 
         assert_eq!(checked(&root, &entries, &bin_globs(), &manifest), Ok(Checked::default()));
         assert_eq!(rewritten(&stage, &entries, &one_tree()), Ok(Vec::new()));
-        let installed = moved(&stage, &root, &entries, &manifest, |_| true);
+        let installed = moved((&stage, &root), &entries, &manifest, an_hour_ago(), |_| true);
 
         let paths: Vec<&str> = installed
             .as_ref()
@@ -2413,7 +2467,7 @@ mod tests {
     /// on for reading, with the sharing paired with it; what the moves returned.
     fn moved_holding(stage: &Path, root: &Path, entries: &[Entry], manifest: &Manifest, holds: &[(&Path, u32)]) -> Result<Moves, Unmoved> {
         let mut held = Vec::new();
-        let installed = moved(stage, root, entries, manifest, |done| {
+        let installed = moved((stage, root), entries, manifest, an_hour_ago(), |done| {
             if done == 1 {
                 for (full, sharing) in holds {
                     let file = fs::OpenOptions::new()
@@ -2525,7 +2579,7 @@ mod tests {
         fs::write(&roots, b"the PC writer's roots").expect("the file can be written");
         let entries = [member("bin/.msCoverageSourceRootsMapping_X", b"box"), entry("bin/b.txt")];
 
-        let unmoved = moved(&stage, &root, &entries, &manifest, |done| {
+        let unmoved = moved((&stage, &root), &entries, &manifest, an_hour_ago(), |done| {
             if done == 1 {
                 fs::write(&pc, b"edited after the checks").expect("the file can be written");
             }
@@ -2561,7 +2615,7 @@ mod tests {
         let manifest = manifest_of(&root, &["bin/.msCoverageSourceRootsMapping_X"]);
         let entries = [entry("bin/a.txt"), member("bin/.msCoverageSourceRootsMapping_X", b"the builder's roots")];
 
-        let installed = moved(&stage, &root, &entries, &manifest, |done| {
+        let installed = moved((&stage, &root), &entries, &manifest, an_hour_ago(), |done| {
             if done == 1 {
                 fs::write(&pc, b"the PC writer's roots").expect("the file can be written");
             }
@@ -2735,7 +2789,7 @@ mod tests {
 
         let paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
         assert_eq!(paths, ["bin/new.dll", "bin/other.dll"], "the copy is listed with the member");
-        moved(&stage, &root, &entries, &manifest, |_| true).expect("the files move");
+        moved((&stage, &root), &entries, &manifest, an_hour_ago(), |_| true).expect("the files move");
         assert_eq!(fs::read(root.join("bin").join("new.dll")).expect("the copy is installed"), b"kept");
         assert_eq!(fs::read(root.join("bin").join("other.dll")).expect("the member is installed"), b"fresh");
         assert_eq!(fs::read(root.join("bin").join("held.dll")).expect("the source stays"), b"kept");
@@ -2802,7 +2856,7 @@ mod tests {
 
         let entries = unpacked_from(&archive[..], &stage, &root, &manifest).expect("the same bytes are a source");
 
-        moved(&stage, &root, &entries, &manifest, |_| true).expect("the copy moves");
+        moved((&stage, &root), &entries, &manifest, an_hour_ago(), |_| true).expect("the copy moves");
         assert_eq!(fs::read(root.join("bin").join("new.dll")).expect("the copy is installed"), b"kept");
     }
 
