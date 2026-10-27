@@ -6,15 +6,14 @@
 
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [/] GATE-696 Cross-build Windows outputs on a macOS builder and bring them back — Urgent · Remote
+- [!] GATE-828 Fix the flaky Unix box test a_clear_refuses_a_volume_mounted_in_the_work_folder_and_keeps_its_files — Urgent · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
 - [/] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
 - [ ] GATE-559 Drain the builder behind a barrier so it can be redeployed — High · Remote
-- [/] GATE-563 Builder drain 2: make a routed run wait on its PC for the lift — High · Remote
 - [ ] GATE-564 Builder drain 3: gate drain on the PC, and its docs — High · Remote
-- [/] GATE-807 Builder drain 1b: the barrier on the Unix box — High · Remote
 - [ ] GATE-621 Ask for a full outputs send when a worktree's routed runs switch builder — High · Remote
 - [ ] GATE-682 Explain or track a stall when a gated command is plain ssh to another machine — High · Remote
 - [/] GATE-683 Prune a deleted worktree's folders from every builder, and prune the Mac by space — High · Remote
@@ -23,8 +22,9 @@
 - [ ] GATE-751 Make a routed build's outputs pull fast enough for yaat's trees, or skip it for verdict-only runs — High · Remote
 - [ ] GATE-753 Log every step of a run in the gate's log: start, progress, end and duration — High · Remote
 - [ ] GATE-759 Move the rest of the box's shared wire rules into gate-wire (GATE-616 slices 2, 3, 5, 6) — High · Remote
-- [/] GATE-806 Send the gitignored project inputs a routed command names to the builder — High · Remote
-- [ ] GATE-820 Stamp a routed run's installed outputs with the time they land on the PC — High · Remote
+- [/] GATE-820 Stamp a routed run's installed outputs with the time they land on the PC — High · Remote
+- [ ] GATE-824 Copy chosen outputs back after a failing or killed routed run — High · Remote
+- [ ] GATE-831 Census the last week's local gate runs as a reusable skill, and route what is ready — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
@@ -275,6 +275,11 @@
 - [ ] GATE-821 Balance routed runs across every builder that can take them, not first-in-file-order
 - [ ] GATE-822 Remove a dead drain ticket by its listed name, not a rebuilt one, on both boxes
 - [ ] GATE-823 Settle GATE-806's carried inputs: the exact-path match cost and what the sweep skips
+- [ ] GATE-825 Leave the drain wait out of the slot claim's start and a pinned run's held seconds
+- [ ] GATE-826 Harden GATE-806's carried-copy cleanup: marker before the put, no digest on the cleanup run, router tests
+- [ ] GATE-827 Copy failure outputs back after a killed routed run too
+- [ ] GATE-829 Harden the Unix drain's group-record reads: reused leader pids, a linked work folder, a test hang guard
+- [ ] GATE-830 Test an LFS call the drain refuses, and restart the still-waiting timer for a second drain wait
 
 ## Cutover sweep
 
