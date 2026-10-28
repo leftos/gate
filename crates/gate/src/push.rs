@@ -35,6 +35,7 @@ use flate2::write::GzEncoder;
 use gate_args::{PruneRequest, PruneSeams, PushRequest};
 use gate_router::{BuilderOs, Config, escaped, is_unix_root};
 use gate_win32::{EnvironmentBlock, Job, LaunchError, PipedConsole, PipedFed, PipedLaunch, Running};
+use gate_wire::slots::MOST_SLOTS;
 use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -44,7 +45,7 @@ use crate::answer::FAILED_STATUS;
 use crate::console::Console;
 use crate::prune_cmd;
 use crate::remote::git;
-use crate::remote::transport::ssh::{Ssh, git_ssh_command};
+use crate::remote::transport::ssh::{BUILDER_ROOT, Ssh, git_ssh_command};
 use crate::remote::transport::{Transport, Wire, ssh_words};
 use crate::resolve::Environment;
 use crate::route::read_remote_json;
@@ -81,17 +82,24 @@ const DIR_SLOT: &str = "@DIR@";
 /// The stand-in for the Program Files folder the builder must have in [`SCRIPT`]; empty, it skips that pin and the
 /// trust checks of the install folder and the installed files.
 const PROGRAM_FILES_SLOT: &str = "@PF@";
+/// The stand-in for the PowerShell expression that gives the builder's remote root, where the slot count is written,
+/// in [`SCRIPT`].
+const ROOT_SLOT: &str = "@ROOT@";
+/// The stand-in for the builder's slot count in [`SCRIPT`].
+const COUNT_SLOT: &str = "@COUNT@";
 /// Where a builder's push installs: its admin-owned `C:\Program Files\gate\bin`, on a builder whose Program Files folder
-/// is `C:\Program Files`.
+/// is `C:\Program Files`; the slot count goes to each builder's own root.
 const PROGRAM_FILES: Place<'static> = Place {
     dir: r"'C:\Program Files\gate\bin'",
     program_files: r"C:\Program Files",
+    root: None,
 };
 /// Where a push through the `--test-push-ssh` seam installs: each fake builder's `%LOCALAPPDATA%\gate\bin`, with no
-/// Program Files pin and no trust check of the folder or the files.
+/// Program Files pin and no trust check of the folder or the files; its slot count goes to `%LOCALAPPDATA%\gate-remote`.
 const PER_USER: Place<'static> = Place {
     dir: r"(Join-Path $env:LOCALAPPDATA 'gate\bin')",
     program_files: "",
+    root: Some(r"(Join-Path $env:LOCALAPPDATA 'gate-remote')"),
 };
 
 /// What the push line runs: it reads stdin's first line, [`SCRIPT`] as base64 of its UTF-8, and runs it dot-sourced,
@@ -134,10 +142,16 @@ const BOOTSTRAP: &str = "$l=[Console]::In.ReadLine();. ([ScriptBlock]::Create([T
 /// `gate-desktop-helper.exe.*.old` copies no process holds, its own aside copy kept, with the same `note` for one it cannot
 /// delete or a folder it cannot list; a push that ends with no such gate, a failed one included, keeps every aside copy,
 /// and says `kept` and their number when there are any and it ends with `gate.exe` missing or one it could not verify in
-/// place. With `gate.exe` in place, installed or the same, it installs the helper beside it as `gate-desktop-helper.exe`
-/// unless that holds the same bytes already, which it then judges, failing on a refusal: it writes
-/// `gate-desktop-helper.exe.<pid>.tmp` afresh and reads its file id from the handle that wrote it, judges it and on a
-/// refusal deletes it and fails with nothing moved, moves an old helper aside to
+/// place. With `gate.exe` in place, installed or the same, it writes the slot count, [`COUNT_SLOT`]'s, into the remote
+/// root [`ROOT_SLOT`]'s expression gives, the whole step in one `try`: when the root is a folder and no link, and its
+/// `slots.json` is missing or a plain file, it deletes every `slots.json.*.tmp` there, which `push.lock` lets no other
+/// push hold, writes `{"v":1,"slots":N}` to a fresh `slots.json.<pid>.tmp` and moves it over `slots.json` with
+/// `[IO.File]::Move`, the one move by force, and says `slots` and the count; for a root that does not exist yet, its
+/// drive missing included, it says a `note` that a routed run makes it, and for a root that is a link or no folder, a
+/// `slots.json` that is a folder or a link, or any other error, a `note` and why, deletes its temp, and goes on. Then it
+/// installs the helper beside gate.exe as `gate-desktop-helper.exe` unless that holds the same bytes already, which it
+/// then judges, failing on a refusal: it writes `gate-desktop-helper.exe.<pid>.tmp` afresh and reads its file id from the handle that wrote it,
+/// judges it and on a refusal deletes it and fails with nothing moved, moves an old helper aside to
 /// `gate-desktop-helper.exe.<yyyyMMddHHmmss>.<pid>.old`, moves the temp into place, never by force, checks that the helper
 /// in place has the temp's file id and the pushed SHA-256, and says `helper-installed`. A move into place or a check that
 /// fails puts the old helper back, or removes the push's own copy when there was none, but leaves a helper another process
@@ -271,6 +285,19 @@ Clean
 if($old){Say replaced $old}
 Say installed $v
 $gs=if($a){"; gate $v is installed and its previous copy is at $a"}else{"; gate $v is installed"}}
+$sw='no slot count written:';$sn=$null
+try{$sr=@ROOT@;if(!(Test-Path -LiteralPath $sr)){
+Say note "$sw $sr does not exist yet; a routed run makes it, and the next push writes the count"}else{
+$si=Get-Item -LiteralPath $sr -Force
+if($si.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)){throw "$sr is a link"}
+if(!$si.PSIsContainer){throw "$sr is not a folder"}
+$sj=Join-Path $sr 'slots.json';$sk=Get-Item -LiteralPath $sj -Force -EA Ignore
+if($sk -and ($sk.Attributes -band ([IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint))){throw "$sj is not a plain file"}
+foreach($f in Get-ChildItem -LiteralPath $sr -File -Force -Filter 'slots.json.*.tmp'){Drop $f.FullName}
+$sn="$sj.$PID.tmp";$sc=[Text.Encoding]::UTF8.GetBytes('{"v":1,"slots":@COUNT@}')
+$s=[IO.File]::Open($sn,'CreateNew','Write','None');try{$s.Write($sc,0,$sc.Length)}finally{$s.Dispose()}
+[IO.File]::Move($sn,$sj,$true);Say slots @COUNT@}}
+catch{if($sn){Drop $sn};Say note "$sw $($_.Exception.Message)"}
 $st.u=0;$hp=Join-Path $dir 'gate-desktop-helper.exe';$hc="could not install ${hp}:";$ha=$null;$hi=''
 function HFail($t){Fail "$t$gs"}
 function HMine{if(!(Test-Path -LiteralPath $hp)){return 'missing'};try{if([GateFile]::Of($hp) -eq $hi){'mine'}else{'foreign'}}catch{'foreign'}}
@@ -328,8 +355,8 @@ const NO_SOURCE: &str = "no source.json beside the installed gate; reinstall it 
 /// Why a macOS builder is not pushed to when `source.json` says the installed gate was built from a dirty tree.
 const DIRTY: &str = "the installed gate was built from uncommitted changes; commit them and reinstall";
 
-/// The macOS builder script, POSIX sh run as `/bin/sh -s -- prepare <root>` or `/bin/sh -s -- build <root> <sha> <id>
-/// <version>` with this text on stdin. Its body is one function called on the last line, so a stream cut short runs
+/// The macOS builder script, POSIX sh run as `/bin/sh -s -- prepare <root> <count>` or `/bin/sh -s -- build <root> <sha>
+/// <id> <version>` with this text on stdin. Its body is one function called on the last line, so a stream cut short runs
 /// nothing; it reads nothing more from stdin, ignores `SIGPIPE` and `SIGHUP`, so a PC that went away never stops it
 /// midway, runs in the C locale, and says what it did on `gate-push: ` lines whose write failures it ignores. It checks
 /// every argument again, refuses a builder without `/usr/bin/perl`, removes every `GIT_*` variable, sets
@@ -349,11 +376,14 @@ const DIRTY: &str = "the installed gate was built from uncommitted changes; comm
 /// note and `build` fails on. Both delete the ref locks under `src.git/refs` and its `packed-refs.lock`, `HEAD.lock`
 /// and `config.lock` older than 30 minutes, which a git push or a config write cut short leaves, and turn off its
 /// automatic gc, writing each setting only when it differs, so no gc a git push starts prunes objects the checkout
-/// borrows. `prepare` says `version` and the installed `gate-box`'s version, empty when there is none or it is a link,
-/// then `ready`. `build`, under the lock to its end, refuses a `bin/gate-box` that is a link or a folder, sweeps
-/// `bin/gate-box.*.tmp`, wipes `gate-push/target` when the `building` marker a build killed by something but its own
-/// bound left is there, and readies the checkout `gate-push/src`: it makes its `.git` afresh, a repo borrowing
-/// `src.git`'s objects, then
+/// borrows. `prepare`, whose count must be a whole number 1 to 64, removes every `<root>/slots.json.*.tmp`, then, unless
+/// `<root>/slots.json` is a folder or a link, which it says in a `note` and leaves, writes `{"v":1,"slots":<count>}` to
+/// `<root>/slots.json.<pid>.tmp`, 0600 by the umask, and moves it over `<root>/slots.json` by force, saying `slots` and
+/// the count, or for a write or move that fails a `note` after removing its temp; it then says `version` and the
+/// installed `gate-box`'s version, empty when there is none or it is a link, then `ready`. `build`, under the lock to
+/// its end, refuses a `bin/gate-box` that is a link or a folder, sweeps `bin/gate-box.*.tmp`, wipes `gate-push/target`
+/// when the `building` marker a build killed by something but its own bound left is there, and readies the checkout `gate-push/src`: it makes its
+/// `.git` afresh, a repo borrowing `src.git`'s objects, then
 /// fetches, checks out and cleans the pushed ref, and on a failure of those says a note, removes the checkout and
 /// readies it once more. It checks the checkout is `<sha>` and differs from it in no file, then builds `gate-box-unix`
 /// from `/`, so no cargo config or toolchain file above the checkout is read, with `GATE_BUILD_ID=<id>` into
@@ -428,7 +458,7 @@ g -C src clean -q -ffdx >>build.log 2>&1
 }
 clt='install the Xcode Command Line Tools (xcode-select --install)'
 case ${1-} in
-prepare) [ "$#" = 2 ] || fail "the push sent $# words, not 2";;
+prepare) [ "$#" = 3 ] || fail "the push sent $# words, not 3";;
 build) [ "$#" = 5 ] || fail "the push sent $# words, not 5";;
 *) fail 'the push sent no step this script knows';;
 esac
@@ -445,6 +475,10 @@ case $sha in "$id"*) ;; *) fail "the build id $id does not start the commit $sha
 num=${version%"+$id"}
 case $num in *[!0-9.]*|.*|*.|*..*|*.*.*.*) num='';; *.*.*) ;; *) num='';; esac
 [ -n "$num" ] && [ "$num+$id" = "$version" ] || fail "the version $version is not <x.y.z>+$id"
+else
+count=$3
+case $count in ''|0*|*[!0-9]*) fail "the slot count $count is not a whole number from 1 to 64";; esac
+[ "$count" -le 64 ] 2>/dev/null || fail "the slot count $count is not a whole number from 1 to 64"
 fi
 [ -x /usr/bin/perl ] || fail 'the builder has no /usr/bin/perl'
 for v in $(env | sed -n 's/^\(GIT_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
@@ -496,6 +530,12 @@ locks src.git/refs -name '*.lock' -mmin +30
 locks src.git -maxdepth 1 '(' -name packed-refs.lock -o -name HEAD.lock -o -name config.lock ')' -mmin +30
 { setting receive.autogc false && setting gc.auto 0; } || fail "could not turn off gc in $gp/src.git; see $gp/build.log"
 if [ "$mode" = prepare ]; then
+sj=$root/slots.json
+st=$root/slots.json.$$.tmp
+/bin/rm -f "$root"/slots.json.*.tmp
+if [ -d "$sj" ] || [ -L "$sj" ]; then say "note no slot count written: $sj is not a plain file"
+elif printf '{"v":1,"slots":%s}\n' "$count" >"$st" && /bin/mv -f "$st" "$sj"; then say "slots $count"
+else /bin/rm -f "$st"; say "note no slot count written: could not write $sj"; fi
 say "version $(version_of "$box")"
 say ready
 exit 0
@@ -569,13 +609,14 @@ pub(crate) fn push(request: &PushRequest, environment: &Environment, console: &m
     };
     let bound = request.seams.bound_ms.map_or(BOUND, Duration::from_millis);
     let mut status = 0;
-    for host in &prepared.builders {
+    for builder in &prepared.builders {
+        let host = &builder.alias;
         console.out(&format!("push: {host}: sending gate {}", prepared.version));
         let heard = match &ssh {
             Ok(program) => called(&Call {
                 program,
                 args: ssh_words(host, &prepared.line, Wire::Plain),
-                input: prepared.input.as_bytes(),
+                input: prepared.input_of(builder).as_bytes(),
                 variables: &variables,
                 bound,
             }),
@@ -628,12 +669,17 @@ fn swept(ssh: &Result<PathBuf, String>, environment: &Environment, console: &mut
     prune_cmd::prune_through(&request, environment, transport, console);
 }
 
-/// What every builder is sent: the Windows builders, the exe as its call is fed it, [`pushed_input`], the exe's version
-/// as shown and as read, and the ssh line; then the macOS builders and, when there are any, what `source.json` says
-/// the installed gate was built from, or why it cannot be used.
+/// What every builder is sent: the Windows builders, what [`SCRIPT`]'s slots hold but the root and the count, which are
+/// each builder's own, the exe and the helper as every call is fed them, the exe's version as shown and as read, and the
+/// ssh line; then the macOS builders and, when there are any, what `source.json` says the installed gate was built
+/// from, or why it cannot be used.
 struct Prepared {
-    builders: Vec<String>,
-    input: String,
+    builders: Vec<Windows>,
+    sha: String,
+    helper_sha: String,
+    register: String,
+    place: Place<'static>,
+    payload: Payload,
     version: String,
     line: String,
     raw_version: String,
@@ -641,17 +687,48 @@ struct Prepared {
     source: Option<Result<Source, String>>,
 }
 
+impl Prepared {
+    /// What the Windows builder `builder`'s call is fed: [`pushed_input`] with its root and its count in the slots.
+    fn input_of(&self, builder: &Windows) -> String {
+        let root = root_expression(self.place, &builder.root);
+        let slots = Slots {
+            sha: &self.sha,
+            helper_sha: &self.helper_sha,
+            register: &self.register,
+            place: self.place,
+            root: &root,
+            count: builder.count,
+        };
+        pushed_input(&slots, &self.payload)
+    }
+}
+
+/// The PowerShell expression [`ROOT_SLOT`] holds for a builder whose root is `root`, installed into `place`: the
+/// place's own root when it has one, else `root` as a single-quoted string, each `'` in it doubled.
+fn root_expression(place: Place<'_>, root: &str) -> String {
+    place.root.map_or_else(|| format!("'{}'", root.replace('\'', "''")), str::to_owned)
+}
+
 /// The builders a push reaches: `host` and each `hosts` entry, Windows builders, then the macOS `builders` entries.
 struct Listed {
-    hosts: Vec<String>,
+    hosts: Vec<Windows>,
     macs: Vec<Mac>,
 }
 
-/// A macOS `builders` entry the push builds `gate-box` on: its alias and its root.
+/// A Windows builder the push installs gate on: its alias, its remote root and its slot count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Windows {
+    alias: String,
+    root: String,
+    count: u32,
+}
+
+/// A macOS `builders` entry the push builds `gate-box` on: its alias, its root and its slot count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Mac {
     alias: String,
     root: String,
+    count: u32,
 }
 
 /// What the installed gate was built from, as `source.json` says it: the repo, the commit and the build id, checked.
@@ -677,7 +754,12 @@ struct MacPush<'a> {
 /// The push's builders, exe, desktop helper and line, read from `LOCALAPPDATA`, the exe's version read with `variables`
 /// as its environment, each builder's registration done as [`register_command`] says for `register_ok`, installed into
 /// `place`; else the line saying why there is nothing to push or nowhere to push it.
-fn prepared(environment: &Environment, variables: &[(OsString, OsString)], register_ok: Option<bool>, place: Place<'_>) -> Result<Prepared, String> {
+fn prepared(
+    environment: &Environment,
+    variables: &[(OsString, OsString)],
+    register_ok: Option<bool>,
+    place: Place<'static>,
+) -> Result<Prepared, String> {
     let folder = environment
         .local_app_data
         .as_deref()
@@ -697,40 +779,56 @@ fn prepared(environment: &Environment, variables: &[(OsString, OsString)], regis
     let source = (!macs.is_empty()).then(|| source_of(&bin.join(SOURCE_FILE), &raw_version));
     let version = shown(&raw_version);
     drop(lock);
-    let line = push_line();
-    let slots = Slots {
-        sha: &sha256_hex(&bytes),
-        helper_sha: &sha256_hex(&helper),
-        register: &register_command(register_ok),
-        place,
-    };
-    let input = pushed_input(&slots, &bytes, &helper);
     Ok(Prepared {
         builders,
-        input,
+        sha: sha256_hex(&bytes),
+        helper_sha: sha256_hex(&helper),
+        register: register_command(register_ok),
+        place,
+        payload: Payload::of(&bytes, &helper),
+        line: push_line(),
         version,
-        line,
         raw_version,
         macs,
         source,
     })
 }
 
-/// What [`SCRIPT`]'s slots hold for one push: the exe's SHA-256, the desktop helper's, the command that registers
-/// the desktop task, and where the builder installs them.
+/// What [`SCRIPT`]'s slots hold for one builder's push: the exe's SHA-256, the desktop helper's, the command that
+/// registers the desktop task, where the builder installs them, the expression of its remote root ([`ROOT_SLOT`]) and
+/// its slot count ([`COUNT_SLOT`]).
 struct Slots<'a> {
     sha: &'a str,
     helper_sha: &'a str,
     register: &'a str,
     place: Place<'a>,
+    root: &'a str,
+    count: u32,
 }
 
 /// Where [`SCRIPT`] installs, each as its slot's text: the folder's expression ([`DIR_SLOT`]) and the Program Files
-/// folder the builder must have, or empty for none ([`PROGRAM_FILES_SLOT`]).
+/// folder the builder must have, or empty for none ([`PROGRAM_FILES_SLOT`]); and the expression of the remote root
+/// every builder's slot count goes to, `None` for each builder's own root ([`root_expression`]).
 #[derive(Clone, Copy)]
 struct Place<'a> {
     dir: &'a str,
     program_files: &'a str,
+    root: Option<&'a str>,
+}
+
+/// The exe and the desktop helper as every builder's call is fed them, each [`gzipped`] once for the whole push.
+struct Payload {
+    exe: String,
+    helper: String,
+}
+
+impl Payload {
+    fn of(exe: &[u8], helper: &[u8]) -> Payload {
+        Payload {
+            exe: gzipped(exe),
+            helper: gzipped(helper),
+        }
+    }
 }
 
 /// Where a push installs: [`PER_USER`] when `ssh_seam`, the `--test-push-ssh` seam, stands in for ssh, else
@@ -739,10 +837,10 @@ fn place(ssh_seam: bool) -> Place<'static> {
     if ssh_seam { PER_USER } else { PROGRAM_FILES }
 }
 
-/// What a builder's call is fed for `exe` and `helper`, whose SHA-256s `slots` holds: [`script_line`], then the
-/// [`gzipped`] exe, then the [`gzipped`] helper, each on a line of its own.
-fn pushed_input(slots: &Slots<'_>, exe: &[u8], helper: &[u8]) -> String {
-    format!("{}\n{}\n{}", script_line(slots), gzipped(exe), gzipped(helper))
+/// What a builder's call is fed for the exe and the helper of `payload`, whose SHA-256s `slots` holds: [`script_line`],
+/// then the gzipped exe, then the gzipped helper, each on a line of its own.
+fn pushed_input(slots: &Slots<'_>, payload: &Payload) -> String {
+    format!("{}\n{}\n{}", script_line(slots), payload.exe, payload.helper)
 }
 
 /// [`SCRIPT`] with `slots` put in.
@@ -753,6 +851,8 @@ fn filled(slots: &Slots<'_>) -> String {
         .replace(REGISTER_SLOT, slots.register)
         .replace(DIR_SLOT, slots.place.dir)
         .replace(PROGRAM_FILES_SLOT, slots.place.program_files)
+        .replace(ROOT_SLOT, slots.root)
+        .replace(COUNT_SLOT, &slots.count.to_string())
 }
 
 /// [`filled`] as base64 of its UTF-8: one line, as [`BOOTSTRAP`] reads it.
@@ -789,9 +889,19 @@ fn builders(path: &Path) -> Result<Listed, String> {
         Ok(Some(config)) => {
             let hosts = config.builders().map(<[String]>::to_vec).map_err(ignored)?;
             let macs = macs_of(&config, &hosts);
+            let hosts = hosts.into_iter().map(|alias| windows_of(&config, alias)).collect();
             Ok(Listed { hosts, macs })
         }
     }
+}
+
+/// The Windows builder `alias`, `host` or a `hosts` entry of `config`: the count and root of the builder `config` names
+/// by it ([`Config::named_builder`]), the top-level `slots` and [`BUILDER_ROOT`] when it gives none.
+fn windows_of(config: &Config, alias: String) -> Windows {
+    let builder = config.named_builder(&alias).ok().flatten();
+    let count = builder.as_ref().map_or_else(|| config.slots(), |builder| builder.slots);
+    let root = builder.and_then(|builder| builder.root).unwrap_or_else(|| BUILDER_ROOT.to_owned());
+    Windows { alias, root, count }
 }
 
 /// The `builders` entries of `config` with `os: macos`, in file order, each alias `hosts` (the Windows builders, `host`
@@ -805,6 +915,7 @@ fn macs_of(config: &Config, hosts: &[String]) -> Vec<Mac> {
             builder.root.as_ref().map(|root| Mac {
                 alias: builder.alias.clone(),
                 root: root.clone(),
+                count: builder.slots,
             })
         })
         .collect()
@@ -922,10 +1033,14 @@ fn checked_root(root: &str) -> Result<(), String> {
     }
 }
 
-/// The line that runs [`MAC_SCRIPT`]'s prepare on a macOS builder whose root is `root`; else why `root` is refused.
-fn mac_prepare_line(root: &str) -> Result<String, String> {
+/// The line that runs [`MAC_SCRIPT`]'s prepare on a macOS builder whose root is `root` and slot count `count`; else why
+/// `root` or `count`, a whole number 1 to [`MOST_SLOTS`], is refused.
+fn mac_prepare_line(root: &str, count: u32) -> Result<String, String> {
     checked_root(root)?;
-    Ok(format!("{MAC_SH} prepare {root}"))
+    if !(1..=MOST_SLOTS).contains(&count) {
+        return Err(format!("the slot count {count} is not a whole number from 1 to {MOST_SLOTS}"));
+    }
+    Ok(format!("{MAC_SH} prepare {root} {count}"))
 }
 
 /// The line that runs [`MAC_SCRIPT`]'s build on a macOS builder whose root is `root`, of the commit `sha` with the build
@@ -1025,7 +1140,7 @@ fn mac_installed(mac: &Mac, push: &MacPush<'_>, console: &mut Console) -> Result
     let source = push.source.as_ref().map_err(Clone::clone)?;
     let ssh = push.ssh.as_ref().map_err(Clone::clone)?;
     let (alias, version) = (&mac.alias, shown(push.version));
-    let prepare = mac_prepare_line(&mac.root)?;
+    let prepare = mac_prepare_line(&mac.root, mac.count)?;
     let build = mac_build_line(&mac.root, &source.commit, &source.build_id, push.version)?;
     let heard = mac_called(ssh, alias, &prepare, push, push.bound);
     let facts = mac_facts(alias, &heard, console);
@@ -1033,15 +1148,44 @@ fn mac_installed(mac: &Mac, push: &MacPush<'_>, console: &mut Console) -> Result
     if !facts.contains(&Fact::Ready) {
         return Err(no_answer(&heard));
     }
+    let counted = slot_line(alias, &facts);
     if facts.contains(&Fact::Version(push.version.to_owned())) {
-        return Ok(vec![format!("push: {alias}: gate-box {version} already installed")]);
+        let same = format!("push: {alias}: gate-box {version} already installed");
+        return Ok(std::iter::once(same).chain(counted).collect());
     }
+    match mac_built(mac, (ssh, source, &build), push, console) {
+        Ok(mut lines) => {
+            lines.extend(counted);
+            Ok(lines)
+        }
+        Err(reason) => {
+            // The prepare call wrote the count before the build failed: the push still says it.
+            if let Some(line) = counted {
+                console.out(&line);
+            }
+            Err(reason)
+        }
+    }
+}
+
+/// The lines of the push of `source` to `mac` through `ssh` after its prepare call: the git push, then the `build` line's
+/// call, and what it replaced and installed; else why it failed.
+fn mac_built(mac: &Mac, (ssh, source, build): (&Path, &Source, &str), push: &MacPush<'_>, console: &mut Console) -> Result<Vec<String>, String> {
+    let (alias, version) = (&mac.alias, shown(push.version));
     sent(mac, ssh, source, push)?;
     console.out(&format!("push: {alias}: building gate-box {version}"));
-    let heard = mac_called(ssh, alias, &build, push, push.build_bound);
+    let heard = mac_called(ssh, alias, build, push, push.build_bound);
     let facts = mac_facts(alias, &heard, console);
     mac_ended(&heard, &facts, push.build_bound)?;
     installed_lines(alias, "gate-box", &version, &facts).ok_or_else(|| no_answer(&heard))
+}
+
+/// The line saying the slot count a push to `host` wrote there, when its `facts` say it wrote one.
+fn slot_line(host: &str, facts: &[Fact]) -> Option<String> {
+    facts.iter().find_map(|fact| match fact {
+        Fact::Slots(count) => Some(format!("push: {host}: slot count {}", shown(count))),
+        _ => None,
+    })
 }
 
 /// The call of `line` on the macOS builder `alias` through `ssh`, fed [`MAC_SCRIPT`], bounded at `bound`.
@@ -1475,6 +1619,8 @@ enum Fact {
     Registered,
     /// The desktop task was not registered, for this reason.
     Unregistered(String),
+    /// The builder's slot count was written: this count.
+    Slots(String),
     Failed(String),
     /// A macOS builder's installed box says this version, empty for none.
     Version(String),
@@ -1496,6 +1642,7 @@ fn fact(line: &str) -> Option<Fact> {
         "helper-installed" => Some(Fact::HelperInstalled),
         "registered" => Some(Fact::Registered),
         "unregistered" => Some(Fact::Unregistered(text)),
+        "slots" => Some(Fact::Slots(text)),
         "failed" => Some(Fact::Failed(text)),
         "version" => Some(Fact::Version(text)),
         "ready" => Some(Fact::Ready),
@@ -1513,8 +1660,8 @@ struct Said {
 }
 
 /// What the push to `host` of the gate `version` says after its call was `heard`, limited by `bound`: each note the
-/// builder gave, whatever the push's end, the end, and after its stdout lines the aside copies it kept, whatever the
-/// push's end.
+/// builder gave, whatever the push's end, the end, the slot count it wrote said by a failed push too, and after its
+/// stdout lines the aside copies it kept, whatever the push's end.
 fn said(host: &str, version: &str, heard: &Heard, bound: Duration) -> Said {
     let facts: Vec<Fact> = heard.marked.iter().filter_map(|line| fact(line)).collect();
     let notes = facts
@@ -1528,9 +1675,13 @@ fn said(host: &str, version: &str, heard: &Heard, bound: Duration) -> Said {
         Fact::Kept(count) => Some(format!("push: {host}: kept {} aside copies: gate.exe is not verified", shown(count))),
         _ => None,
     });
+    // A push that failed after it wrote the count still says the count it left there.
     let (mut out, failure) = match ended(host, version, heard, &facts, bound) {
         Ok(out) => (out, None),
-        Err(reason) => (Vec::new(), Some(format!("push: {host} failed: {reason}"))),
+        Err(reason) => (
+            slot_line(host, &facts).into_iter().collect(),
+            Some(format!("push: {host} failed: {reason}")),
+        ),
     };
     out.extend(kept);
     Said { notes, out, failure }
@@ -1547,11 +1698,12 @@ fn ended(host: &str, version: &str, heard: &Heard, facts: &[Fact], bound: Durati
 }
 
 /// The lines of a push whose builder said it holds `version` already, or installed it, then what it did with the
-/// desktop helper and task ([`desktop`]): `None` when it said neither. A version the builder could not read is said as
-/// `version`, this PC's.
+/// desktop helper and task ([`desktop`]), then the slot count it wrote ([`slot_line`]): `None` when it said neither. A
+/// version the builder could not read is said as `version`, this PC's.
 fn succeeded(host: &str, version: &str, facts: &[Fact]) -> Option<Vec<String>> {
     let mut out = gate_lines(host, version, facts)?;
     out.extend(desktop(host, facts));
+    out.extend(slot_line(host, facts));
     Some(out)
 }
 
@@ -1602,9 +1754,9 @@ mod tests {
     use flate2::read::GzDecoder;
 
     use super::{
-        BOOTSTRAP, BUILD_BOUND, CARGO_BOUND, Call, End, Fact, Heard, LINE_CAP, MAC_SCRIPT, MARKED_CAP, PWSH, Place, REGISTER, Said, Slots, called,
-        encoded_line, fact, filled, gzipped, installed_lines, kept, mac_build_line, mac_ended, mac_prepare_line, place, push_line, pushed_input,
-        register_command, said, sha256_hex, version_of,
+        BOOTSTRAP, BUILD_BOUND, CARGO_BOUND, Call, End, Fact, Heard, LINE_CAP, MAC_SCRIPT, MARKED_CAP, MOST_SLOTS, PWSH, Payload, Place, REGISTER,
+        Said, Slots, called, encoded_line, fact, filled, gzipped, installed_lines, kept, mac_build_line, mac_ended, mac_prepare_line, place,
+        push_line, pushed_input, register_command, root_expression, said, sha256_hex, slot_line, succeeded, version_of,
     };
     use crate::environment::Variables;
     use crate::run::find_program;
@@ -1630,8 +1782,13 @@ mod tests {
             helper_sha: &sha256_hex(HELPER),
             register: REGISTERS,
             place: place(true),
+            root: SEAM_ROOT,
+            count: 1,
         })
     }
+
+    /// The remote root the ssh seam's push writes the slot count to: the scratch `LOCALAPPDATA`'s `gate-remote`.
+    const SEAM_ROOT: &str = r"(Join-Path $env:LOCALAPPDATA 'gate-remote')";
 
     /// What a builder is fed for `exe`, whose SHA-256 the script checks as `sha`, and `helper`, checked as [`HELPER`]'s,
     /// the task registered by [`REGISTERS`], installed where the ssh seam's push installs.
@@ -1642,8 +1799,10 @@ mod tests {
             helper_sha: &helper_sha,
             register: REGISTERS,
             place: place(true),
+            root: SEAM_ROOT,
+            count: 1,
         };
-        pushed_input(&slots, exe, helper)
+        pushed_input(&slots, &Payload::of(exe, helper))
     }
 
     #[test]
@@ -1673,8 +1832,10 @@ mod tests {
             helper_sha: HELPER_SHA,
             register: REGISTER,
             place: place(false),
+            root: r"'D:\gate-remote'",
+            count: 2,
         };
-        let input = pushed_input(&slots, b"an exe", b"a helper");
+        let input = pushed_input(&slots, &Payload::of(b"an exe", b"a helper"));
         let lines: Vec<&str> = input.split('\n').collect();
         assert_eq!(lines.len(), 3, "the script, the exe and the helper, each on a line: {input}");
         assert_eq!(lines[1], gzipped(b"an exe"), "the exe follows the script's line");
@@ -1711,10 +1872,10 @@ mod tests {
     #[test]
     fn a_mac_prepare_line_carries_only_a_root_a_macos_builder_may_have() {
         assert_eq!(
-            mac_prepare_line("/Users/b/gate-remote"),
-            Ok("/bin/sh -s -- prepare /Users/b/gate-remote".to_owned())
+            mac_prepare_line("/Users/b/gate-remote", 1),
+            Ok("/bin/sh -s -- prepare /Users/b/gate-remote 1".to_owned())
         );
-        assert_eq!(mac_prepare_line("/r_1/x.y-z"), Ok("/bin/sh -s -- prepare /r_1/x.y-z".to_owned()));
+        assert_eq!(mac_prepare_line("/r_1/x.y-z", 1), Ok("/bin/sh -s -- prepare /r_1/x.y-z 1".to_owned()));
         for root in [
             "",
             "/",
@@ -1731,8 +1892,81 @@ mod tests {
             "/a\nb",
             "/a`b",
         ] {
-            assert!(mac_prepare_line(root).is_err(), "{root:?} is refused");
+            assert!(mac_prepare_line(root, 1).is_err(), "{root:?} is refused");
         }
+    }
+
+    #[test]
+    fn a_mac_prepare_line_carries_the_slot_count_and_refuses_one_outside_1_to_64() {
+        assert_eq!(MOST_SLOTS, 64, "the script's own check names 64");
+        assert_eq!(mac_prepare_line("/r", 7), Ok("/bin/sh -s -- prepare /r 7".to_owned()));
+        assert_eq!(mac_prepare_line("/r", 64), Ok("/bin/sh -s -- prepare /r 64".to_owned()));
+        for count in [0, 65, u32::MAX] {
+            assert_eq!(
+                mac_prepare_line("/r", count),
+                Err(format!("the slot count {count} is not a whole number from 1 to 64")),
+                "{count} makes no line"
+            );
+        }
+    }
+
+    #[test]
+    fn the_mac_script_writes_the_slot_count_in_prepare_mode_only() {
+        for needed in [
+            "prepare) [ \"$#\" = 3 ] || fail \"the push sent $# words, not 3\";;",
+            "case $count in ''|0*|*[!0-9]*) fail \"the slot count $count is not a whole number from 1 to 64\";; esac\n",
+            "[ \"$count\" -le 64 ] 2>/dev/null || fail \"the slot count $count is not a whole number from 1 to 64\"\n",
+            "st=$root/slots.json.$$.tmp\n",
+            "/bin/rm -f \"$root\"/slots.json.*.tmp\n",
+            "if [ -d \"$sj\" ] || [ -L \"$sj\" ]; then say \"note no slot count written: $sj is not a plain file\"\n",
+            "elif printf '{\"v\":1,\"slots\":%s}\\n' \"$count\" >\"$st\" && /bin/mv -f \"$st\" \"$sj\"; then say \"slots $count\"\n",
+            "else /bin/rm -f \"$st\"; say \"note no slot count written: could not write $sj\"; fi\n",
+        ] {
+            assert!(MAC_SCRIPT.contains(needed), "the script holds {needed:?}");
+        }
+        let prepare = MAC_SCRIPT.find("if [ \"$mode\" = prepare ]; then\n").expect("the prepare step");
+        let write = MAC_SCRIPT.find("elif printf '{\"v\":1").expect("the count's write");
+        let refused = MAC_SCRIPT.find("if [ -d \"$sj\" ] || [ -L \"$sj\" ]").expect("the count file's check");
+        let swept = MAC_SCRIPT.find("/bin/rm -f \"$root\"/slots.json.*.tmp").expect("the temps' sweep");
+        assert!(
+            prepare < swept && swept < refused && refused < write,
+            "the sweep and the check come before the write"
+        );
+        let judged = MAC_SCRIPT.find("owned \"$root\" || fail").expect("the root is judged");
+        assert!(
+            judged < prepare && prepare < write,
+            "the count is written in prepare, after the root is judged"
+        );
+        assert!(
+            MAC_SCRIPT.find("umask 077").is_some_and(|at| at < write),
+            "the count file is 0600 by the umask"
+        );
+    }
+
+    #[test]
+    fn a_slots_fact_is_said_as_the_builder_s_slot_count_after_its_desktop_lines() {
+        assert_eq!(fact("gate-push: slots 3"), Some(Fact::Slots("3".to_owned())));
+        let facts: Vec<Fact> = [
+            "gate-push: installed 0.2.0",
+            "gate-push: slots 3",
+            "gate-push: helper-installed",
+            REGISTERED,
+        ]
+        .iter()
+        .filter_map(|line| fact(line))
+        .collect();
+        assert_eq!(slot_line("b1", &facts), Some("push: b1: slot count 3".to_owned()));
+        assert_eq!(
+            succeeded("b1", "0.2.0", &facts),
+            Some(vec![
+                "push: b1: installed gate 0.2.0".to_owned(),
+                "push: b1: installed the desktop helper".to_owned(),
+                "push: b1: registered the desktop task".to_owned(),
+                "push: b1: slot count 3".to_owned(),
+            ])
+        );
+        assert_eq!(slot_line("b1", &facts[..1]), None, "a push that wrote no count says no count");
+        assert_eq!(root_expression(place(false), "D:\\gate-remote"), "'D:\\gate-remote'");
     }
 
     #[test]
@@ -2127,6 +2361,18 @@ mod tests {
             said(&heard(1, &["gate-push: failed the copy arrived damaged"], Some("noise"))),
             failure("push: b1 failed: the copy arrived damaged")
         );
+        assert_eq!(
+            said(&heard(
+                1,
+                &["gate-push: installed 0.2.0", "gate-push: slots 3", "gate-push: failed the helper failed"],
+                None
+            )),
+            Said {
+                out: vec!["push: b1: slot count 3".to_owned()],
+                ..failure("push: b1 failed: the helper failed")
+            },
+            "a push that failed after it wrote the count still says it"
+        );
         assert_eq!(said(&heard(0, &[], None)), failure("push: b1 failed: no answer"));
         assert_eq!(
             said(&heard(255, &[], Some("ssh: connect to host b1 port 22: Connection refused"))),
@@ -2326,6 +2572,7 @@ mod tests {
             heard.marked,
             [
                 format!("gate-push: installed {ANSWERED}"),
+                no_root(&local_app_data),
                 "gate-push: helper-installed ".to_owned(),
                 REGISTERED.to_owned()
             ],
@@ -2358,7 +2605,11 @@ mod tests {
         assert_eq!(heard.end, End::Exited(0), "{heard:?}");
         assert_eq!(
             heard.marked,
-            [format!("gate-push: installed {ANSWERED}"), REGISTERED.to_owned()],
+            [
+                format!("gate-push: installed {ANSWERED}"),
+                no_root(&local_app_data),
+                REGISTERED.to_owned()
+            ],
             "no helper-installed for the same bytes: {heard:?}"
         );
         assert_eq!(listed(&bin), [HELPER_NAME, "gate.exe", "push.lock"], "the helper was not set aside");
@@ -2388,6 +2639,7 @@ mod tests {
             heard.marked,
             [
                 format!("gate-push: same {ANSWERED}"),
+                no_root(&local_app_data),
                 "gate-push: helper-installed ".to_owned(),
                 REGISTERED.to_owned()
             ],
@@ -2402,11 +2654,23 @@ mod tests {
         let local_app_data = scratch(test);
         let exe = stand_in();
         let heard = run_lines("", &answering_with(&sha256_hex(&exe), &exe, register), &exe, &local_app_data);
+        let installed = [
+            format!("gate-push: installed {ANSWERED}"),
+            no_root(&local_app_data),
+            "gate-push: helper-installed ".to_owned(),
+        ];
         let _ = fs::remove_dir_all(&local_app_data);
         assert_eq!(heard.end, End::Exited(0), "a registration never fails the push: {heard:?}");
-        let installed = [format!("gate-push: installed {ANSWERED}"), "gate-push: helper-installed ".to_owned()];
-        assert_eq!(heard.marked.get(..2), Some(installed.as_slice()), "{heard:?}");
-        heard.marked[2..].to_vec()
+        assert_eq!(heard.marked.get(..3), Some(installed.as_slice()), "{heard:?}");
+        heard.marked[3..].to_vec()
+    }
+
+    /// The note a script run in `local_app_data` says once gate.exe is in place, as no case makes the seam's remote root.
+    fn no_root(local_app_data: &Path) -> String {
+        format!(
+            "gate-push: note no slot count written: {} does not exist yet; a routed run makes it, and the next push writes the count",
+            local_app_data.join("gate-remote").display()
+        )
     }
 
     #[test]
@@ -2644,6 +2908,8 @@ mod tests {
             helper_sha: &helper_sha,
             register,
             place,
+            root: SEAM_ROOT,
+            count: 1,
         });
         assert!(script.contains(VER), "the script reads versions with Ver");
         let stand_in = format!(
@@ -2705,6 +2971,7 @@ mod tests {
         let place = Place {
             dir: &dir,
             program_files: r"Q:\Program Files",
+            root: None,
         };
         let heard = run_script_in(place, &stand_in(), &local_app_data);
         let program_files = std::env::var("ProgramFiles").expect("ProgramFiles is set");
@@ -2728,6 +2995,7 @@ mod tests {
         let place = Place {
             dir: &dir,
             program_files: r"C:\Program Files",
+            root: None,
         };
         let heard = run_script_in(place, &stand_in(), &local_app_data);
         let line = failed_line(&heard, &local_app_data);
@@ -2754,6 +3022,7 @@ mod tests {
         let place = Place {
             dir: &dir,
             program_files: r"C:\Program Files",
+            root: None,
         };
         let heard = run_script_in(place, &stand_in(), &local_app_data);
         let line = failed_line(&heard, &local_app_data);
@@ -2846,19 +3115,68 @@ mod tests {
     #[test]
     fn a_push_without_the_ssh_seam_installs_into_program_files() {
         let script = |ssh_seam| {
+            let place = place(ssh_seam);
             filled(&Slots {
                 sha: SHA,
                 helper_sha: HELPER_SHA,
                 register: REGISTER,
-                place: place(ssh_seam),
+                place,
+                root: &root_expression(place, r"E:\it's\gate-remote"),
+                count: 7,
             })
         };
         let production = script(false);
         assert!(production.contains(r"$dir='C:\Program Files\gate\bin';"), "{production}");
         assert!(production.contains(r"$pin='C:\Program Files'"), "{production}");
+        assert!(
+            production.contains(r"$sr='E:\it''s\gate-remote';"),
+            "the builder's own root, quoted: {production}"
+        );
         let seamed = script(true);
         assert!(seamed.contains(r"$dir=(Join-Path $env:LOCALAPPDATA 'gate\bin');"), "{seamed}");
         assert!(seamed.contains("$pin=''"), "{seamed}");
+        assert!(
+            seamed.contains(r"$sr=(Join-Path $env:LOCALAPPDATA 'gate-remote');"),
+            "the fake builder's own remote root: {seamed}"
+        );
+        assert!(
+            seamed.contains(r"[IO.File]::Move($sn,$sj,$true);Say slots 7}}"),
+            "the count's temp replaces a slots.json file in place, never moves into a folder: {seamed}"
+        );
+    }
+
+    #[test]
+    fn the_slot_count_step_runs_in_one_try_and_writes_its_temp_as_the_exe_s() {
+        let script = filled(&Slots {
+            sha: SHA,
+            helper_sha: HELPER_SHA,
+            register: REGISTER,
+            place: place(false),
+            root: "'Q:\\gate-remote'",
+            count: 7,
+        });
+        let at = |needle: &str| {
+            let found = script.find(needle);
+            assert!(found.is_some(), "the script holds {needle:?}: {script}");
+            found.unwrap_or_default()
+        };
+        // A missing drive makes Join-Path throw, so the root string is tested first, and inside the step's one try.
+        let tried = at(r"try{$sr='Q:\gate-remote';if(!(Test-Path -LiteralPath $sr)){");
+        let joined = at(r"$sj=Join-Path $sr 'slots.json'");
+        let swept = at(r"foreach($f in Get-ChildItem -LiteralPath $sr -File -Force -Filter 'slots.json.*.tmp'){Drop $f.FullName}");
+        let fresh = at(r"$s=[IO.File]::Open($sn,'CreateNew','Write','None')");
+        let moved = at(r"[IO.File]::Move($sn,$sj,$true);Say slots 7}}");
+        let caught = at(r#"catch{if($sn){Drop $sn};Say note "$sw $($_.Exception.Message)"}"#);
+        assert!(
+            tried < joined && joined < swept && swept < fresh && fresh < moved && moved < caught,
+            "{script}"
+        );
+        at(r#"$sr does not exist yet; a routed run makes it, and the next push writes the count""#);
+        at(r#"throw "$sj is not a plain file""#);
+        assert!(
+            !script.contains("Move-Item -LiteralPath $sn"),
+            "no move that could land in a folder: {script}"
+        );
     }
 
     #[test]
@@ -3076,7 +3394,13 @@ mod tests {
         assert_eq!(heard.end, End::Exited(0), "{heard:?}");
         assert_eq!(
             heard.marked,
-            ["gate-push: kept 1", "gate-push: same ", "gate-push: helper-installed ", REGISTERED],
+            [
+                "gate-push: kept 1".to_owned(),
+                "gate-push: same ".to_owned(),
+                no_root(&local_app_data),
+                "gate-push: helper-installed ".to_owned(),
+                REGISTERED.to_owned()
+            ],
             "{heard:?}"
         );
         assert_eq!(listed(&bin), [HELPER_NAME, "gate.exe", ASIDE, "push.lock"], "the aside copy is kept");
@@ -3449,6 +3773,7 @@ mod tests {
                     bin.display()
                 ),
                 format!("gate-push: installed {ANSWERED}"),
+                no_root(&local_app_data),
                 "gate-push: helper-installed ".to_owned(),
                 REGISTERED.to_owned()
             ],

@@ -1118,8 +1118,125 @@ fn behind_drain(
     }
 }
 
+/// What a routed run's waits after its call may use: the run's request, whose seams set each wait's poll
+/// (`--test-drain-poll-ms`) and heartbeat (`--test-heartbeat-ms`), what is left of the run's remote budget for its waits
+/// for a builder slot, and the time the run's remote waits have taken, which those waits add to.
+struct SlotWait<'w> {
+    request: &'w RunRequest,
+    left: Duration,
+    waited: &'w mut Duration,
+}
+
+/// The outcome a routed run of `call` goes on with once `first`, the outcome of its call, ended. Each call of the
+/// attempt is judged in turn: one the builder's drain refused waits behind the drain ([`behind_drain`]), unbounded by
+/// the remote budget; one the builder refused `full` while some of the budget is `left` waits for a slot there
+/// ([`behind_full`]), whose own time alone counts into the `waited` of `wait`; any other is the outcome. A slot wait a
+/// poll ends calls the builder once more, and the builder admitted the run just before the last such call, or the
+/// drain wait's admitted one. `None` for a Ctrl+C during either wait.
+fn after_waits(
+    client: &mut dyn RemoteClient,
+    call: &RemoteCall<'_>,
+    first: RemoteOutcome,
+    wait: SlotWait<'_>,
+    console: &mut Console,
+) -> Option<Behind> {
+    let SlotWait { request, left, waited } = wait;
+    let (mut outcome, mut admitted, mut spent) = (first, None, Duration::ZERO);
+    loop {
+        let behind = behind_drain(client, call, outcome, request, console)?;
+        admitted = behind.admitted.or(admitted);
+        outcome = behind.outcome;
+        let rest = left.saturating_sub(spent);
+        if !waits_for_slot(&outcome, rest, call) {
+            return Some(Behind { outcome, admitted });
+        }
+        let begun = Instant::now();
+        let ended = behind_full(client, call, outcome, (request, rest), console);
+        let took = begun.elapsed();
+        spent += took;
+        *waited += took;
+        match ended? {
+            // A run that falls back from its wait was never admitted, whatever call an earlier poll admitted.
+            SlotEnd::Spent(refused) => {
+                return Some(Behind {
+                    outcome: refused,
+                    admitted: None,
+                });
+            }
+            SlotEnd::Drained(polled) => outcome = polled,
+            SlotEnd::Polled => {
+                admitted = Some(Instant::now());
+                outcome = client.run(call);
+            }
+        }
+    }
+}
+
+/// Whether the run of `call` waits for a slot on its builder after `outcome`: the builder refused it `full`, some of the
+/// run's remote budget is `left`, and no Ctrl+C was raised during the call, which then ends the run as it would end it.
+fn waits_for_slot(outcome: &RemoteOutcome, left: Duration, call: &RemoteCall<'_>) -> bool {
+    builder_full(outcome) && !left.is_zero() && !call.interrupt.is_some_and(Interrupt::is_raised)
+}
+
+/// How a routed run's wait for a slot on its builder ([`behind_full`]) ended, when no Ctrl+C ended it.
+enum SlotEnd {
+    /// A poll neither the builder's pool nor its drain refused: the run calls the builder again.
+    Polled,
+    /// A poll the builder's drain refused, this one: the run waits behind the drain.
+    Drained(RemoteOutcome),
+    /// The budget was spent: the run is refused `full`, with the outcome of the call that started the wait.
+    Spent(RemoteOutcome),
+}
+
+/// Waits for a slot on the builder of `call`, which refused the run `full` in `first`, its own slots all held, for what
+/// is `left` of the run's remote budget, its remote slot here kept, the poll and the heartbeat read from the seams of
+/// `request` as [`SlotWait`] says. It says the waiting line, polls the builder's preflight alone
+/// ([`RemoteClient::poll_drain`]) every drain poll, and says the still-waiting line every heartbeat. A poll refused
+/// `full` keeps waiting; any other ends the wait as [`SlotEnd`] says. `None` for a Ctrl+C during the wait.
+fn behind_full(
+    client: &mut dyn RemoteClient,
+    call: &RemoteCall<'_>,
+    first: RemoteOutcome,
+    (request, left): (&RunRequest, Duration),
+    console: &mut Console,
+) -> Option<SlotEnd> {
+    let alias = &call.builder.alias;
+    console.err(&format!("gate: waiting for a slot on the builder {alias} (its slots are all held)"));
+    let poll = request.test_seams.drain_poll_ms.map_or(wait::DRAIN_POLL, Duration::from_millis);
+    let mut beat = Beat::new(request.test_seams.heartbeat_ms.map_or(wait::HEARTBEAT, Duration::from_millis));
+    let begun = Instant::now();
+    loop {
+        let rest = left.saturating_sub(begun.elapsed());
+        if rest.is_zero() {
+            return Some(SlotEnd::Spent(first));
+        }
+        if !slept(poll.min(rest), call.interrupt) {
+            return None;
+        }
+        if let Some(waited) = beat.due() {
+            console.err(&format!("gate: still waiting for a slot on the builder {alias} ({} s)", waited.as_secs()));
+        }
+        let polled = client.poll_drain(call);
+        if call.interrupt.is_some_and(Interrupt::is_raised) {
+            return None;
+        }
+        if polled.draining.is_some() {
+            return Some(SlotEnd::Drained(polled));
+        }
+        if !builder_full(&polled) {
+            return Some(SlotEnd::Polled);
+        }
+    }
+}
+
+/// Whether `outcome` is the builder's own `full` refusal: its slots were all held.
+fn builder_full(outcome: &RemoteOutcome) -> bool {
+    outcome.fallback() == Some(FallbackReason::Full)
+}
+
 /// How a routed run goes on after its call: the outcome of its last attempt, and when the builder admitted that
-/// attempt after a wait behind its drain, `None` for a run that never waited and for one that fell back from its wait.
+/// attempt after a wait for a slot there or behind its drain, `None` for a run that never waited and for one that fell
+/// back from its wait.
 struct Behind {
     outcome: RemoteOutcome,
     admitted: Option<Instant>,
@@ -2167,12 +2284,7 @@ impl Run<'_> {
     /// attempts, which this wait adds to, then calls the client ([`Run::call_builder`]). A full pool is a refusal. A
     /// Ctrl+C ends the run here, with the remote slot released: one raised before the call, or during it over a refusal.
     fn attempt(&mut self, remote: &RemoteRun, hold: &mut Hold, (waited, session): (&mut Duration, &str), console: &mut Console) -> Attempt {
-        // A light run a critical request sent here never waits for a remote slot.
-        let left = if self.rerouted_for.is_some() {
-            Duration::ZERO
-        } else {
-            wait::remote_budget(self.request).saturating_sub(*waited)
-        };
+        let left = self.remote_left(*waited);
         let begun = Instant::now();
         // A light run a critical request sent here counts its remote take's wait from its first queue line.
         let since = self.queued_at.filter(|_| self.rerouted_for.is_some());
@@ -2199,17 +2311,34 @@ impl Run<'_> {
         if self.host.interrupt.is_some_and(Interrupt::is_raised) {
             return Attempt::Done(Remotely::Ended(self.interrupted_before_start(console)));
         }
-        self.call_builder(remote, hold, (figures, session), console)
+        self.call_builder(remote, hold, (figures, session, waited), console)
+    }
+
+    /// What is left of the run's remote budget ([`wait::remote_budget`]) after `waited`, the time its remote waits took
+    /// so far: none for a light run a critical request sent here, which never waits for the remote.
+    fn remote_left(&self, waited: Duration) -> Duration {
+        if self.rerouted_for.is_some() {
+            Duration::ZERO
+        } else {
+            wait::remote_budget(self.request).saturating_sub(waited)
+        }
     }
 
     /// Calls the client for the routed run `remote` under `figures`, the remote slot held in `hold`, and ends the run as
     /// the client ended it. A refusal or a client that cannot start is a refusal, with the slot still held. A Ctrl+C
-    /// during the call over a refusal ends the run here, with the remote slot released. A call the builder's drain refused
-    /// waits behind the drain ([`behind_drain`]) with the slot still held, and a Ctrl+C during that wait ends the run here
-    /// as one before the command started. A client that ended on its own
-    /// keeps its own status, and the run writes or clears the worktree's nothing-back record
+    /// during the call over a refusal ends the run here, with the remote slot released. A call the builder refused
+    /// `full` waits for a slot there within what is left of the run's remote budget after `waited`, which the wait adds
+    /// to ([`behind_full`]), and a call the builder's drain refused waits behind the drain ([`behind_drain`]), each with
+    /// the slot still held; a Ctrl+C during either wait ends the run here as one before the command started. A client
+    /// that ended on its own keeps its own status, and the run writes or clears the worktree's nothing-back record
     /// ([`Run::leave_nothing_back`]).
-    fn call_builder(&mut self, remote: &RemoteRun, hold: &mut Hold, (figures, session): (Figures, &str), console: &mut Console) -> Attempt {
+    fn call_builder(
+        &mut self,
+        remote: &RemoteRun,
+        hold: &mut Hold,
+        (figures, session, waited): (Figures, &str, &mut Duration),
+        console: &mut Console,
+    ) -> Attempt {
         let mut started = Instant::now();
         let env = routed_env(&self.request.env, remote.source_revision.as_deref());
         let parts = CallParts {
@@ -2227,12 +2356,18 @@ impl Run<'_> {
             Err(why) => return Attempt::refused(FallbackReason::Client, RemoteOutcome::not_started(why), hold.taken.take()),
         };
         let first = self.client.run(&call);
-        // A drain's refusal is no fallback: the run waits behind it, and goes on with the outcome of its admitted attempt.
-        let Some(Behind { outcome, admitted }) = behind_drain(self.client.as_mut(), &call, first, self.request, console) else {
+        let wait = SlotWait {
+            request: self.request,
+            left: self.remote_left(*waited),
+            waited,
+        };
+        // A full builder is waited for within the run's remote budget, and a drain's refusal is no fallback: the run
+        // waits behind it, and goes on with the outcome of its admitted attempt.
+        let Some(Behind { outcome, admitted }) = after_waits(self.client.as_mut(), &call, first, wait, console) else {
             return Attempt::Done(Remotely::Ended(self.interrupted_before_start(console)));
         };
-        // The wait behind the drain is no part of the run's time: its slot's hold and its wall time count from the
-        // admission.
+        // A wait for a builder slot or behind the drain is no part of the run's time: its slot's hold and its wall time
+        // count from the admission.
         if let Some(admitted) = admitted {
             started = admitted;
             hold.took = Some(admitted);

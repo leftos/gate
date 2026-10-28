@@ -18,11 +18,11 @@ use serde_json::{Value, json};
 
 use crate::nesting::{LOOK_OFTEN, end_parent, first_event, marked, orphaned_as, spawned, test_marker};
 
-use crate::remote_client::{Tuned, client_case, client_gate, client_gate_tuned};
+use crate::remote_client::{Tuned, client_case, client_gate, client_gate_tuned, fallbacks};
 use crate::support::{
-    Case, DenyEntry, FAKE_TOOL, GATE, Go, Junction, LOCAL_REASON, Outcome, Running, assert_in_order, beside, calls, copy_tool, critical_words,
-    events, finish, git, git_init, heavy_words, log_texts, nothing_back, powershell_folder, record_path, release, run_words, shown, ssh_steps, start,
-    wait_for_journal_line, wait_until, write_counts, write_remote_json,
+    Case, DenyEntry, FAKE_TOOL, GATE, Go, Junction, LOCAL_REASON, Outcome, Running, UNTIL_KILLED, assert_in_order, beside, calls, copy_tool,
+    critical_words, events, finish, git, git_init, heavy_words, log_texts, nothing_back, powershell_folder, record_path, release, run_words, shown,
+    ssh_steps, start, wait_for_journal_line, wait_until, write_counts, write_remote_json,
 };
 
 pub(crate) const HOST: &str = "builder";
@@ -5604,4 +5604,245 @@ fn each_routed_run_has_its_own_session() {
         );
     }
     assert_ne!(sessions[0], sessions[1], "each run makes its own session");
+}
+
+/// The line a routed run says once as it starts to wait for a slot on the full builder [`HOST`].
+const BUILDER_SLOT_WAITING: &str = "gate: waiting for a slot on the builder builder (its slots are all held)";
+/// The start of the line a routed run says every heartbeat of its wait for a slot on [`HOST`].
+const BUILDER_SLOT_STILL_WAITING: &str = "gate: still waiting for a slot on the builder builder (";
+/// The `builders` entry a two-builder slot case lists before [`HOST`].
+const SLOT_FIRST: &str = "builder-a";
+
+/// Gives the builder whose root is `root` a slot count of 1 and holds its one slot with a `gate box hold` the case
+/// `case` starts, returned once the hold's claim is there; the hold's command sleeps until the case ends it.
+fn held_builder_slot(case: &Case, root: &Path) -> Running {
+    fs::create_dir_all(root).expect("the builder root can be made");
+    fs::write(root.join("slots.json"), r#"{"v":1,"slots":1}"#).expect("the count file can be written");
+    let (stop, held_root) = (shown(&case.folder()), shown(root));
+    let hold = start(case.gate_without_state_dir(&[
+        "box",
+        "--test-box-root-walk-stop",
+        &stop,
+        "--test-box-drain-readable-only",
+        "true",
+        "hold",
+        "--root",
+        &held_root,
+        "--holder",
+        "a routing case",
+        "--ceiling",
+        "600",
+        "--",
+        FAKE_TOOL,
+        "sleep",
+        UNTIL_KILLED,
+    ]));
+    let claim = root.join("slots").join("0.json");
+    hold.wait_until("the hold claims the builder's one slot", || claim.exists());
+    hold
+}
+
+/// A routed run of the [`client_case`] `case` through the stand-in of the steps file `steps`, polling the full builder
+/// every 20 ms with a heartbeat of 50 ms, its remote budget `budget_ms`, `extra` given before the command.
+fn builder_slot_run(case: &Case, steps: &Path, budget_ms: &str, extra: &[&str], command: &[&str]) -> Command {
+    let mut words = vec![
+        "--test-drain-poll-ms",
+        "20",
+        "--test-heartbeat-ms",
+        "50",
+        "--test-remote-wait-ms",
+        budget_ms,
+    ];
+    words.extend_from_slice(extra);
+    let tuned = Tuned {
+        extra: &words,
+        ..Tuned::default()
+    };
+    client_gate_tuned(case, "out.log", steps, &tuned, command)
+}
+
+/// The stand-in's steps for a run the builder refuses `full` and then polls: the refused call and three polls answer at
+/// once, so the wait has slept at least four 20 ms polls, past its 50 ms heartbeat, and said the still-waiting line
+/// whatever the load; the next poll waits until `go` exists; then enough answers for the run's own calls.
+fn polled_until(go: &Path) -> Vec<String> {
+    let mut steps = vec!["ok".to_owned(); 4];
+    steps.push(format!("hold {}", shown(go)));
+    steps.extend(vec!["ok".to_owned(); 10]);
+    steps
+}
+
+/// Starts a routed run of `command` that its builder, its one slot held by `hold`, refuses `full`; waits until it says
+/// the still-waiting line, then ends the hold and lets the stand-in answer the poll after. The run, which then runs on
+/// the builder.
+fn admitted_after_a_slot_wait(case: &Case, hold: Running, command: &[&str]) -> Running {
+    let go = case.folder().join("go");
+    let steps: Vec<String> = polled_until(&go);
+    let steps = ssh_steps(case, "ssh", &steps.iter().map(String::as_str).collect::<Vec<_>>());
+    // A budget no busy machine spends, so the run waits until the case lets the slot go.
+    let running = start(builder_slot_run(case, &steps, "3600000", &[], command));
+    running.wait_for_stderr(BUILDER_SLOT_STILL_WAITING);
+    hold.kill();
+    fs::write(&go, "").expect("the go file can be made");
+    running
+}
+
+#[test]
+fn a_routed_run_refused_full_by_its_builder_waits_for_a_builder_slot_then_runs_there() {
+    let case = client_case("routing-builder-slot-wait");
+    let hold = held_builder_slot(&case, &case.folder().join("builder"));
+    let running = admitted_after_a_slot_wait(&case, hold, &[r".\tool.exe", "out", "ran there"]);
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
+    assert!(has_line_once(&outcome.stderr, BUILDER_SLOT_WAITING), "{outcome:?}");
+    for line in outcome.stderr.lines().filter(|line| line.starts_with(BUILDER_SLOT_STILL_WAITING)) {
+        let seconds = line.strip_prefix(BUILDER_SLOT_STILL_WAITING).and_then(|rest| rest.strip_suffix(" s)"));
+        assert!(seconds.is_some_and(|seconds| seconds.parse::<u64>().is_ok()), "{line}");
+    }
+    assert!(!outcome.stderr.contains(FULL_LINE), "{outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "it ran on the builder");
+}
+
+/// The builder slot's held time counts from the builder's admission, so it covers the command's whole run there.
+#[test]
+fn a_run_admitted_after_a_builder_slot_wait_holds_its_slot_for_the_whole_command() {
+    let case = client_case("routing-builder-slot-held");
+    let hold = held_builder_slot(&case, &case.folder().join("builder"));
+    let running = admitted_after_a_slot_wait(&case, hold, &[r".\tool.exe", "sleep", "1500"]);
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let own = own(&case, pid);
+    let release = own.iter().find(|event| event["event"] == "release").expect("the run released its slot");
+    let held = release["heldSeconds"].as_f64().expect("the release has its held seconds");
+    assert!(held >= 1.5, "the hold covers the command's 1.5 s sleep: {release}");
+}
+
+#[test]
+fn a_builder_slot_wait_that_spends_the_remote_budget_falls_back_full_and_runs_here() {
+    let case = client_case("routing-builder-slot-spent");
+    let hold = held_builder_slot(&case, &case.folder().join("builder"));
+    // Polls 20 ms apart within a 200 ms budget make at most eleven calls besides the refused one.
+    let steps = ssh_steps(&case, "ssh", &["ok"; 20]);
+
+    let outcome = finish(builder_slot_run(&case, &steps, "200", &[], &[r".\tool.exe", "out", "ran"]));
+    hold.kill();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran"), "{outcome:?}");
+    assert!(outcome.stderr.contains(FULL_LINE), "{outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), ["full"], "it fell back full and ran here");
+}
+
+#[test]
+fn a_pinned_run_whose_builder_slot_wait_spends_the_budget_ends_as_a_pinned_full_refusal() {
+    let case = client_case("routing-builder-slot-pinned");
+    let hold = held_builder_slot(&case, &case.folder().join("builder"));
+    let steps = ssh_steps(&case, "ssh", &["ok"; 20]);
+
+    let pin = ["--builder", HOST];
+    let outcome = finish(builder_slot_run(&case, &steps, "200", &pin, &[r".\tool.exe", "out", "pinned"]));
+    hold.kill();
+
+    assert_ne!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stdout.contains("pinned"), "nothing ran here: {outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate: remote builder full; --builder given, so not running here"),
+        "{outcome:?}"
+    );
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "a pinned refusal journals no fallback");
+}
+
+/// A run whose first builder stays full spends the remote budget waiting there, and the next builder, given only what
+/// is left of it, still takes and runs it.
+#[test]
+fn a_builder_slot_wait_that_spends_the_budget_hands_the_run_to_the_next_builder() {
+    let case = client_case("routing-builder-slot-next");
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({
+        "host": HOST,
+        "repos": { &repo: ["*tool*"] },
+        "outputs": { &repo: [] },
+        "builders": [{ "host": SLOT_FIRST, "os": "windows", "repos": { &repo: ["*tool*"] } }],
+    });
+    write_remote_json(&case, &routing.to_string());
+    let (first, next) = (case.folder().join("builder").join("a"), case.folder().join("builder").join("b"));
+    fs::create_dir_all(&next).expect("the next builder's folder can be made");
+    let hold = held_builder_slot(&case, &first);
+    let mut answers = vec!["on builder-a"];
+    answers.extend(["ok"; 20]);
+    answers.extend(["on builder", "ok", "ok", "ok", "ok"]);
+    let steps = ssh_steps(&case, "ssh", &answers);
+    let folders = format!("{SLOT_FIRST}={}|{HOST}={}", shown(&first), shown(&next));
+    let words = ["--test-drain-poll-ms", "20", "--test-remote-wait-ms", "200"];
+    let tuned = Tuned {
+        extra: &words,
+        folders: Some(&folders),
+        ..Tuned::default()
+    };
+    let running = start(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]));
+    let pid = running.id();
+    let outcome = running.finish();
+    hold.kill();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .lines()
+            .any(|line| line == format!("gate: remote {SLOT_FIRST} full; trying {HOST}")),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("running here"), "nothing ran here: {outcome:?}");
+    assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
+    let own = own(&case, pid);
+    let took = |host: &str| own.iter().filter(|event| event["event"] == "take" && event["host"] == host).count();
+    assert_eq!((took(SLOT_FIRST), took(HOST)), (1, 1), "{own:#?}");
+}
+
+/// A Ctrl+C during the wait for a builder slot ends the run before its command started, its remote slot released.
+#[test]
+fn a_ctrl_c_in_the_builder_slot_wait_ends_the_run_and_frees_the_remote_slot() {
+    let case = routed_case("routing-builder-slot-ctrl-c");
+    // The builder refuses the run's call full; the wait's first poll, the client's second call, raises the interrupt.
+    let steps = shown(&stub(&case, &["refuse full", "interrupt-at 2"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &DRAIN_POLL, &[r".\tool.exe", "out", "ran here"])));
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    assert!(!outcome.stdout.contains("ran here"), "the command ran nowhere: {outcome:?}");
+    assert_in_order(&outcome.stderr, &[BUILDER_SLOT_WAITING, "gate: interrupted before the command started"]);
+    assert!(!outcome.stderr.contains(FULL_LINE), "{outcome:?}");
+    let events = events(&case);
+    assert_eq!(names(&events), ["queue", "take", "release"], "{events:#?}");
+    assert!(events.iter().all(has_remote_tag), "{events:#?}");
+    assert!(!remote_claim(&case).exists(), "the remote claim is gone");
+}
+
+/// A run the builder admits after a wait behind its drain, whose admitted call the builder then refuses `full`, waits
+/// for a slot there like any other, and runs there once a poll passes.
+#[test]
+fn a_run_admitted_after_a_drain_wait_and_refused_full_waits_for_a_builder_slot() {
+    let case = routed_case("routing-drain-then-full");
+    let now = unix_now();
+    let (raised, lapses) = (now - 60, now + 1800);
+    // Call 1 is the drain's refusal, call 2 the drain poll that passes, call 3 the admitted run the builder refuses
+    // full, call 4 the slot poll that passes, and call 5 the run.
+    let drained = draining(1, "1", raised, lapses);
+    let steps = shown(&stub(&case, &[&drained, "refuse-at 3 full", "out ran there", "status 0"]));
+    let running = case.start(&routed_words("out.log", &steps, &DRAIN_POLL, &[r".\tool.exe", "out", "ran here"]));
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_in_order(
+        &outcome.stderr,
+        &[&drain_waiting(raised, lapses, Some(1)), DRAIN_LIFTED, BUILDER_SLOT_WAITING],
+    );
+    assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
+    assert!(!outcome.stdout.contains("ran here"), "nothing ran here: {outcome:?}");
+    assert!(!outcome.stderr.contains(FULL_LINE), "{outcome:?}");
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "take", "release"], "no fallback: {own:#?}");
 }

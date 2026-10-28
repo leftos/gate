@@ -535,7 +535,7 @@ pub(crate) mod ssh {
     use crate::remote::git::judged;
     use crate::run::find_program;
 
-    pub(super) const BUILDER_ROOT: &str = r"D:\gate-remote";
+    pub(crate) const BUILDER_ROOT: &str = r"D:\gate-remote";
     /// The one name ssh is looked for by: no `ssh.cmd` or `ssh.bat` shim earlier on `PATH` runs in its place.
     const SSH_EXE: &str = "ssh.exe";
 

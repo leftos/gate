@@ -116,8 +116,23 @@ fn is_aside_name(name: &str) -> bool {
         .is_some_and(|(stamp, pid)| stamp.len() == 14 && digits(stamp) && digits(pid))
 }
 
-/// Writes `steps`, one a line, as the stand-in's steps file in the case folder; its path.
+/// The stand-in builder `host`'s remote root, `<its LOCALAPPDATA>\gate-remote`, made when missing; its path.
+fn remote_root(case: &Case, host: &str) -> PathBuf {
+    let root = builders(case).join(host).join("gate-remote");
+    fs::create_dir_all(&root).expect("the builder's remote root can be made");
+    root
+}
+
+/// The line a push says on stdout once it wrote the slot count `count` on `host`.
+fn slot_line(host: &str, count: u32) -> String {
+    format!("push: {host}: slot count {count}\n")
+}
+
+/// Writes `steps`, one a line, as the stand-in's steps file in the case folder; its path. It makes the remote root of
+/// [`HOST`] and [`OTHER_HOST`] first, as a builder a routed run reached has it, so a push writes its slot count there.
 fn steps(case: &Case, steps: &[&str]) -> PathBuf {
+    remote_root(case, HOST);
+    remote_root(case, OTHER_HOST);
     let path = case.folder().join("push.steps");
     fs::write(&path, steps.join("\n")).expect("the steps file can be written");
     path
@@ -297,9 +312,74 @@ fn installed_lines(host: &str) -> String {
     )
 }
 
-/// The lines a push that installed the helper on `host` and registered the task there says after its gate lines.
+/// The lines a push that installed the helper on `host`, registered the task there and wrote the top-level slot count,
+/// 1 when the routing file gives none, says after its gate lines.
 fn desktop_lines(host: &str) -> String {
-    format!("push: {host}: installed the desktop helper\npush: {host}: registered the desktop task\n")
+    format!(
+        "push: {host}: installed the desktop helper\npush: {host}: registered the desktop task\n{}",
+        slot_line(host, 1)
+    )
+}
+
+#[test]
+fn a_push_writes_the_top_level_slot_count_into_the_builder_s_remote_root() {
+    let case = push_case("a_push_writes_the_top_level_slot_count_into_the_builder_s_remote_root");
+    route(&case, &json!({ "host": HOST, "slots": 3, "repos": {} }));
+    let steps = steps(&case, &["ok"]);
+
+    let outcome = push(&case, &steps);
+
+    let version = version();
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stdout),
+        format!(
+            "push: {HOST}: sending gate {version}\npush: {HOST}: installed gate {version}\npush: {HOST}: installed the desktop \
+             helper\npush: {HOST}: registered the desktop task\n{}",
+            slot_line(HOST, 3)
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    let root = remote_root(&case, HOST);
+    assert_eq!(
+        fs::read_to_string(root.join("slots.json")).expect("the count file was written"),
+        r#"{"v":1,"slots":3}"#
+    );
+    assert_eq!(names(&root), ["slots.json"], "no temporary copy is left");
+}
+
+#[test]
+fn a_push_to_a_builder_with_no_remote_root_writes_no_slot_count_says_so_and_passes() {
+    let case = push_case("a_push_to_a_builder_with_no_remote_root_writes_no_slot_count_says_so_and_passes");
+    let steps = steps(&case, &["ok"]);
+    let root = remote_root(&case, HOST);
+    fs::remove_dir(&root).expect("the builder's remote root can be removed");
+
+    let outcome = push(&case, &steps);
+
+    let version = version();
+    assert_eq!(
+        outcome.code,
+        Some(0),
+        "a builder with no count file enforces none, so the push passes: {outcome:?}"
+    );
+    assert_eq!(
+        unix(&outcome.stdout),
+        format!(
+            "push: {HOST}: sending gate {version}\npush: {HOST}: installed gate {version}\npush: {HOST}: installed the desktop \
+             helper\npush: {HOST}: registered the desktop task\n"
+        ),
+        "{outcome:?}"
+    );
+    let stderr = unix(&outcome.stderr);
+    assert!(
+        stderr.starts_with(&format!("push: {HOST}: no slot count written: "))
+            && stderr.ends_with("gate-remote does not exist yet; a routed run makes it, and the next push writes the count\n")
+            && stderr.lines().count() == 1,
+        "{outcome:?}"
+    );
+    assert!(!root.exists(), "the push made no remote root");
 }
 
 /// Asserts `outcome` is a push that installed the built gate and the helper on [`HOST`] and registered the task there,
@@ -400,7 +480,8 @@ fn a_push_to_an_identical_gate_says_already_installed_and_registers_again() {
         unix(&outcome.stdout),
         format!(
             "push: {HOST}: sending gate {version}\npush: {HOST}: gate {version} already installed\n\
-             push: {HOST}: registered the desktop task\n"
+             push: {HOST}: registered the desktop task\n{}",
+            slot_line(HOST, 1)
         ),
         "an identical gate and helper still register the task again: {outcome:?}"
     );
@@ -538,7 +619,7 @@ fn a_push_tries_every_builder_and_fails_if_one_did() {
         "the builder after the failed one is tried too"
     );
     assert_eq!(calls(&steps), ["push", "push"]);
-    assert!(!builders(&case).join(HOST).exists(), "the failed call ran nothing");
+    assert!(!builder_bin(&case, HOST).exists(), "the failed call ran nothing");
     assert_holds(
         &builder_bin(&case, OTHER_HOST).join("gate.exe"),
         &fs::read(installed_gate(&case)).expect("the installed gate can be read"),
@@ -855,7 +936,8 @@ fn a_failed_registration_is_said_on_the_builder_s_line_and_push_exits_0() {
         unix(&outcome.stdout),
         format!(
             "push: {HOST}: sending gate {version}\npush: {HOST}: installed gate {version}\n\
-             push: {HOST}: installed the desktop helper\npush: {HOST}: desktop task not registered: the test seam refused\n"
+             push: {HOST}: installed the desktop helper\npush: {HOST}: desktop task not registered: the test seam refused\n{}",
+            slot_line(HOST, 1)
         ),
         "{outcome:?}"
     );
@@ -880,8 +962,8 @@ fn a_failed_helper_install_fails_the_push() {
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
     assert_eq!(
         unix(&outcome.stdout),
-        format!("push: {HOST}: sending gate {}\n", version()),
-        "{outcome:?}"
+        format!("push: {HOST}: sending gate {}\npush: {HOST}: slot count 1\n", version()),
+        "the count was written before the helper's install failed: {outcome:?}"
     );
     let stderr = unix(&outcome.stderr);
     assert!(
@@ -1012,7 +1094,38 @@ fn mac_lines(mac: &str, version: &str, lines: &str) -> String {
 /// the box `replaced` names.
 fn built_lines(mac: &str, version: &str, replaced: Option<&str>) -> String {
     let replaced = replaced.map_or_else(String::new, |old| format!("push: {mac}: replaced gate-box {old}\n"));
-    format!("push: {mac}: building gate-box {version}\n{replaced}push: {mac}: installed gate-box {version}\n")
+    format!(
+        "push: {mac}: building gate-box {version}\n{replaced}push: {mac}: installed gate-box {version}\n{}",
+        slot_line(mac, 1)
+    )
+}
+
+#[test]
+fn a_macos_builders_entry_s_own_slots_is_its_slot_count() {
+    let mut routing = mac_routing(&[], &[MAC_HOST]);
+    routing["builders"][0]["slots"] = json!(4);
+    let mac = mac_case("a_macos_builders_entry_s_own_slots_is_its_slot_count", &routing);
+    let steps = steps(&mac.case, &["ok", "ok", "ok", "ok"]);
+
+    let outcome = mac_push(&mac, &steps);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let stdout = unix(&outcome.stdout);
+    assert!(
+        stdout.contains(&slot_line(HOST, 1)) && stdout.ends_with(&slot_line(MAC_HOST, 4)),
+        "host takes the top-level count, the entry its own: {outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    let root = mac_root(&mac.case, MAC_HOST);
+    assert_eq!(
+        fs::read_to_string(root.join("slots.json")).expect("the count file was written"),
+        "{\"v\":1,\"slots\":4}\n"
+    );
+    assert!(
+        !names(&root).iter().any(|name| name.starts_with("slots.json.")),
+        "no temporary copy is left: {:?}",
+        names(&root)
+    );
 }
 
 /// The commit the macOS builder `host`'s stand-in bare repo holds as the pushed ref.
@@ -1232,7 +1345,7 @@ fn a_macos_builder_whose_box_is_the_gate_s_build_gets_no_git_push_and_no_build()
     let outcome = mac_push(&mac, &steps);
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    let lines = format!("push: {MAC_HOST}: gate-box {} already installed\n", mac.version);
+    let lines = format!("push: {MAC_HOST}: gate-box {} already installed\n{}", mac.version, slot_line(MAC_HOST, 1));
     assert_eq!(unix(&outcome.stdout), mac_stdout(&mac.version, &[(MAC_HOST, &lines)]), "{outcome:?}");
     assert_eq!(outcome.stderr, "", "{outcome:?}");
     assert_eq!(calls(&steps), ["push", "mac-prepare"], "one prepare call only");
@@ -1268,7 +1381,8 @@ fn a_failed_build_on_a_macos_builder_fails_the_push_and_leaves_its_box() {
     let outcome = mac_push(&mac, &steps);
 
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
-    let building = format!("push: {MAC_HOST}: building gate-box {}\n", mac.version);
+    // The prepare call wrote the count before the build failed, so the push still says it.
+    let building = format!("push: {MAC_HOST}: building gate-box {}\npush: {MAC_HOST}: slot count 1\n", mac.version);
     assert_eq!(unix(&outcome.stdout), mac_stdout(&mac.version, &[(MAC_HOST, &building)]), "{outcome:?}");
     let stderr = unix(&outcome.stderr);
     assert!(
@@ -1397,7 +1511,8 @@ fn a_macos_builder_whose_box_is_a_folder_is_refused_before_the_build() {
     let outcome = mac_push(&mac, &steps);
 
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
-    let building = format!("push: {MAC_HOST}: building gate-box {}\n", mac.version);
+    // The prepare call wrote the count before the build failed, so the push still says it.
+    let building = format!("push: {MAC_HOST}: building gate-box {}\npush: {MAC_HOST}: slot count 1\n", mac.version);
     assert_eq!(unix(&outcome.stdout), mac_stdout(&mac.version, &[(MAC_HOST, &building)]), "{outcome:?}");
     let stderr = unix(&outcome.stderr);
     assert!(
@@ -1607,7 +1722,8 @@ fn a_macos_build_meeting_a_broken_src_git_fails_and_leaves_it() {
     let outcome = mac_push(&mac, &steps);
 
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
-    let building = format!("push: {MAC_HOST}: building gate-box {}\n", mac.version);
+    // The prepare call wrote the count before the build failed, so the push still says it.
+    let building = format!("push: {MAC_HOST}: building gate-box {}\npush: {MAC_HOST}: slot count 1\n", mac.version);
     assert_eq!(unix(&outcome.stdout), mac_stdout(&mac.version, &[(MAC_HOST, &building)]), "{outcome:?}");
     let stderr = unix(&outcome.stderr);
     assert!(

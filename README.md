@@ -12,7 +12,7 @@ Pre-release. Nothing here is ready to use yet, and gate is not yet a replacement
 
 So far `gate` reads its command line (`--version`, `--help`, and the argument checks for `run`, `stop-tree`, `cutover`, `push`, `drain`, `prune`, `check`, `burn` and `expect`), and `gate run` starts a command under a slot, logs its output, prints the tail and a verdict line, and exits with the command's status.
 
-The watchdog kills a stalled command, one past its ceiling and one past the backstop, and Ctrl+C stops a run; routing is not built yet. `gate stop-tree <pid>` stops a process tree and the gate jobs inside it. `gate push` copies the installed `gate.exe` and desktop helper to the builders and registers the desktop task there.
+The watchdog kills a stalled command, one past its ceiling and one past the backstop, and Ctrl+C stops a run; routing is not built yet. `gate stop-tree <pid>` stops a process tree and the gate jobs inside it. `gate push` copies the installed `gate.exe` and desktop helper to the builders and registers the desktop task there, and writes each builder's slot count.
 
 `gate drain` raises a drain barrier on a builder and waits until no routed run is going there, so it can be redeployed; `gate drain --lift` lifts the barrier and `gate drain --status` says how the drain stands. `gate prune --builders` marks the worktree records of worktrees that are gone and, for each that has been gone an hour, prunes its work folder on every builder `remote.json` lists, then removes what this PC keeps of its key: the files, the `refs/gate-remote` refs and last the record.
 

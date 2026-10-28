@@ -647,7 +647,9 @@ mod snapshot_only {
 /// <raised> <lapses>` ends each of the client's first `<calls>` calls, runs and drain polls counted together, as the
 /// builder's drain refusal with that place and barrier, and nothing else of such a call runs; `draining-at <call>
 /// <place|none> <raised> <lapses>` so ends the one call of that number, counted from 1; `wait-at <call> <path>` waits
-/// until the path exists at the start of the call of that number, before its drain refusal; a drain poll no drain step
+/// until the path exists at the start of the call of that number, before its drain refusal; `interrupt-at <call>` raises
+/// the call's interrupt at the start of the call of that number, after its `wait-at` steps; `refuse-at <call> <reason>`
+/// ends the call of that number, one no drain step ends, as that refusal, and nothing else of it runs; a drain poll no drain step
 /// ends performs only the `wait`, `interrupt`, `refuse` and `fail-start` steps, and admits the run when none refuses it. `on
 /// <alias>` starts a block of steps that run only for a call to that builder; the steps before the first `on` line run
 /// for every builder without a block of its own, and an alias has one block at most.
@@ -713,6 +715,10 @@ mod scripted {
         DrainingAt(usize, Drain),
         /// Waits, before anything else of it, in the client's call of this number until the path exists.
         WaitAt(usize, PathBuf),
+        /// Raises the interrupt at the start of the client's call of this number.
+        InterruptAt(usize),
+        /// Ends the client's call of this number as this refusal.
+        RefuseAt(usize, FallbackReason),
     }
 
     pub(crate) struct ScriptedClient {
@@ -729,9 +735,9 @@ mod scripted {
             parse(&text).map(|steps| ScriptedClient { steps, calls: 0 }).map_err(cannot)
         }
 
-        /// Counts a call of `call`, performs the `wait-at` steps of its number, and ends it as the builder's drain
+        /// Counts a call of `call`, performs the `wait-at` and `interrupt-at` steps of its number, and ends it as the builder's drain
         /// refusal when it is among the first calls the host's `draining` step answers or the one a `draining-at` step
-        /// names; `None` for any other call whose waits came.
+        /// names, else as the refusal a `refuse-at` step names for it; `None` for any other call whose waits came.
         fn drained(&mut self, call: &RemoteCall<'_>) -> Option<RemoteOutcome> {
             self.calls += 1;
             let calls = self.calls;
@@ -748,6 +754,9 @@ mod scripted {
                     }
                 }
             }
+            if steps.contains(&Step::InterruptAt(calls)) {
+                call.interrupt.into_iter().for_each(Interrupt::raise);
+            }
             steps
                 .iter()
                 .find_map(|step| match step {
@@ -759,6 +768,16 @@ mod scripted {
                     status: REFUSED,
                     draining: Some(drain),
                     ..RemoteOutcome::default()
+                })
+                .or_else(|| {
+                    steps.iter().find_map(|step| match step {
+                        Step::RefuseAt(at, reason) if *at == calls => Some(RemoteOutcome {
+                            status: REFUSED,
+                            reason: Some(*reason),
+                            ..RemoteOutcome::default()
+                        }),
+                        _ => None,
+                    })
                 })
         }
     }
@@ -898,10 +917,24 @@ mod scripted {
                     .map_err(|_| format!("wait-at takes a call's number and a path, got '{operand}'")),
                 _ => Err(format!("wait-at takes a call's number and a path, got '{operand}'")),
             },
+            "interrupt-at" => operand
+                .parse()
+                .map(Step::InterruptAt)
+                .map_err(|_| format!("interrupt-at takes a call's number, got '{operand}'")),
+            "refuse-at" => refuse_at(operand),
             "on" if !operand.is_empty() && !operand.contains(' ') => Ok(Step::On(operand.to_owned())),
             "on" => Err(format!("on takes one builder's alias, got '{operand}'")),
             other => Err(format!("unknown step '{other}'")),
         }
+    }
+
+    /// The `refuse-at` step of `operand`: a call's number, then a reason a `refuse` step may give.
+    fn refuse_at(operand: &str) -> Result<Step, String> {
+        let wrong = || format!("refuse-at takes a call's number and a reason, got '{operand}'");
+        let (call, word) = operand.split_once(' ').ok_or_else(wrong)?;
+        let call = call.parse().map_err(|_| wrong())?;
+        let reason = REASONS.into_iter().find(|reason| reason.as_str() == word).ok_or_else(wrong)?;
+        Ok(Step::RefuseAt(call, reason))
     }
 
     /// The `warm-failed` step of `operand`: `commands` or `refused`, then the reason.
@@ -985,7 +1018,9 @@ mod scripted {
             | Step::On(_)
             | Step::Draining(..)
             | Step::DrainingAt(..)
-            | Step::WaitAt(..) => {}
+            | Step::WaitAt(..)
+            | Step::InterruptAt(_)
+            | Step::RefuseAt(..) => {}
         }
         true
     }
@@ -1136,6 +1171,26 @@ mod scripted {
                 ])
             );
             assert_eq!(parse(""), Ok(Vec::new()), "no steps");
+        }
+
+        #[test]
+        fn an_interrupt_at_step_names_its_call_by_number() {
+            assert_eq!(parse("interrupt-at 2\n"), Ok(vec![Step::InterruptAt(2)]));
+            assert_eq!(
+                parse("interrupt-at two"),
+                Err("line 1: interrupt-at takes a call's number, got 'two'".to_owned())
+            );
+        }
+
+        #[test]
+        fn a_refuse_at_step_names_its_call_and_its_reason() {
+            assert_eq!(parse("refuse-at 3 full\n"), Ok(vec![Step::RefuseAt(3, FallbackReason::Full)]));
+            for wrong in ["3", "x full", "3 tired"] {
+                assert_eq!(
+                    parse(&format!("refuse-at {wrong}")),
+                    Err(format!("line 1: refuse-at takes a call's number and a reason, got '{wrong}'"))
+                );
+            }
         }
 
         #[test]
