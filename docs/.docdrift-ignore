@@ -1,0 +1,39 @@
+# Names the docs use that are never tracked in this repo (docdrift, plan-doc-hygiene step 5).
+
+# Runtime state and config files the gate reads or writes.
+source.json
+slots.json
+slots/*.json
+gate-critical.json
+gate-*.json
+v1/slot-counts.json
+durations.json
+local.toml
+env.toml
+desktop.toml
+windows.toml
+siblings.toml
+warmup.toml
+
+# Files in caller repos.
+global.json
+rust-toolchain.toml
+dotnet-tools.json
+obj/project.assets.json
+*.csproj
+MvcTestingAppManifest.json
+package.json
+package-lock.json
+npm-shrinkwrap.json
+pnpm-lock.yaml
+pnpm-workspace.yaml
+bunfig.toml
+
+# The PowerShell gate and launchers in claude-config.
+tools/gate/*
+remote-wrapper.ps1
+remote-bridge.ps1
+tools/sync-launchers.ps1
+
+# Placeholders.
+X.rs
