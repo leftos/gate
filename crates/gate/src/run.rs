@@ -2435,7 +2435,11 @@ impl Run<'_> {
     /// that passed with its outputs brought back ([`brought_everything_back`]) clears the record, as a passing build here
     /// of its words would ([`Run::clear_nothing_back`]); any other dotnet build writes it, an unknown counting as not
     /// brought back. The record names the builder and the configuration, framework and runtime the words set
-    /// ([`build_settings`]); one that cannot be written, or whose presence cannot be read, is said. The command's
+    /// ([`build_settings`]), but for the configuration only when the record it replaces names the same one, compared
+    /// ignoring letter case with one naming none differing from one naming a value: a record holds the last build's
+    /// alone, so a build here of another configuration must not leave a standing record that a later `--no-build` run
+    /// of the older configuration would keep its word by. One that cannot be written, or whose presence cannot be read,
+    /// is said. The command's
     /// `words`, `None` when one is not valid Unicode ([`unicode_words`]), are the caller's, so one reading of them serves
     /// this record and the stale line.
     fn leave_nothing_back(&self, remote: &RemoteRun, outcome: &RemoteOutcome, words: Option<&[String]>, console: &mut Console) {
@@ -2459,9 +2463,25 @@ impl Run<'_> {
             return;
         }
         let settings = build_settings(words);
+        let standing = match no_build::read_record(&path) {
+            Ok(standing) => standing,
+            Err(error) => {
+                console.err(&format!("gate: cannot read {}: {error}", path.display()));
+                None
+            }
+        };
+        let differs = |old: &Option<String>| match (old, &settings.configuration) {
+            (Some(old), Some(new)) => old.to_lowercase() != new.to_lowercase(),
+            (None, None) => false,
+            _ => true,
+        };
+        let configuration = match standing.as_ref() {
+            Some(record) if differs(&record.settings.configuration) => None,
+            _ => settings.configuration.clone(),
+        };
         let record = v1::NothingBackRecord {
             host: remote.builder.alias.clone(),
-            configuration: settings.configuration,
+            configuration,
             framework: settings.framework,
             runtime: settings.runtime,
             built: Vec::new(),
@@ -2895,8 +2915,11 @@ impl Run<'_> {
     /// nothing-back record that does not list the project the words name as built here
     /// ([`no_build::named_project_key`]) under the configuration, framework and runtime the words set
     /// ([`BuildSettings::same_as`]), or a project it builds has no `obj\project.assets.json`
-    /// ([`Run::without_assets`]), asked only without such a record ([`no_build::drop_reason`]). A record that cannot be
-    /// read counts as there, said.
+    /// ([`Run::without_assets`]), asked only without such a record ([`no_build::drop_reason`]). A record that names a
+    /// configuration other than the one the words set (compared as the send veto compares them, ignoring letter case) is
+    /// set aside as no record: it says nothing of this build, so the obj check decides. A record naming no configuration
+    /// stands for every run, and words setting no `-c` keep the old rule, dropped by any record that stands. A record
+    /// that cannot be read counts as there, said.
     fn no_build_reason(&self, root: &str, words: &[String], console: &mut Console) -> Option<String> {
         if no_build::last_build_ran_here(&self.root.path, root, words).is_some() {
             return None;
@@ -2910,9 +2933,15 @@ impl Run<'_> {
                 built: Vec::new(),
             })
         });
+        let settings = build_settings(words);
         let record = record.filter(|record| {
             let built = no_build::named_project_key(words, Path::new(root)).is_some_and(|key| record.built.contains(&key));
-            !(built && record.settings.same_as(&build_settings(words)))
+            let same_settings = built && record.settings.same_as(&settings);
+            let other_configuration = matches!(
+                (&record.settings.configuration, &settings.configuration),
+                (Some(left), Some(right)) if left.to_lowercase() != right.to_lowercase()
+            );
+            !(same_settings || other_configuration)
         });
         no_build::drop_reason(record, || self.without_assets(Path::new(root), words, console))
     }

@@ -2208,7 +2208,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   A run that stays local (the Local route) drops the same `--no-build` words before it takes a slot, when it would find no build here, saying `gate: dropped --no-build: <reason>; building on a heavy slot`, `gate: dropped --no-build: <reason>; building on its critical slot` for a critical run, or `gate: dropped --no-build: <reason>; building on the parent gate's <heavy|critical|light> slot` under a covering or lending parent.
 
   A routed run is never dropped here, but its fallback here is, by the same rule, before its plan is made. `<reason>` is one of two:
-  - `the last build ran on <host> and brought nothing back`, when the worktree's nothing-back record stands (`<host>` is the record's builder, else `the builder`) and does not list the project the command names as built here (below).
+  - `the last build ran on <host> and brought nothing back`, when the worktree's nothing-back record stands (`<host>` is the record's builder, else `the builder`), names no configuration, the command sets none, or it names the command's own `-c` in any letter case, and does not list the project the command names as built here (below).
   - `<project> has no obj\project.assets.json here`, asked only when no such record stands.
 
   Neither is asked when the built-here record says the last build of what the command builds ran here under its own settings (below): a run here keeps its word then, whatever the nothing-back record holds, and the obj check is not made.
@@ -2219,7 +2219,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   An `--alone` run measures the command as given, so one whose `--no-build` would be dropped is refused instead, exit 2, before it takes a slot, with nothing journaled; its log is readied only after the drop is decided, so an earlier `<log>` and `<log>.err` stay untouched: `gate: refused: --no-build cannot stand: <reason>; an --alone run measures the command as given, so build first (a passing local build of the project clears the record) and run it again`.
 
-  The obj check covers the project the command names (a project file, or `--project`), else the projects a named `.sln`, `.slnx` or `.slnf` lists, else the worktree's tracked `*.csproj`, `*.fsproj` and `*.vbproj` (`git ls-files`). A run of a project the record lists as built here keeps its word only when its own `-c`, `-f` and `-r` match the record's (otherwise it drops as usual), and the obj check still applies: the word is kept only while the project has its `obj\project.assets.json`.
+  The obj check covers the project the command names (a project file, or `--project`), else the projects a named `.sln`, `.slnx` or `.slnf` lists, else the worktree's tracked `*.csproj`, `*.fsproj` and `*.vbproj` (`git ls-files`).
+  A run of a project the record lists as built here keeps its word only when its own `-c`, `-f` and `-r` match the record's (otherwise it drops as usual), and the obj check still applies: the word is kept only while the project has its `obj\project.assets.json`.
+  A record naming a configuration other than the one the run's `-c` sets is set aside as no record, so such a run is judged by the obj check alone; a run setting no `-c` is dropped by any record that stands.
 
   The check is skipped, and the word kept, when the worktree root's `Directory.Build.props` or `Directory.Build.targets` names `UseArtifactsOutput`, `ArtifactsPath`, `BaseIntermediateOutputPath` or `MSBuildProjectExtensionsPath`. Solution entries that are not plain names inside the worktree are skipped.
 
@@ -2237,6 +2239,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A record that cannot be removed says `gate: cannot remove <path>: <error>`, as the clear here does.
   A routed build that leaves nothing back writes a fresh record, replacing one that stands, so its `built` is empty.
+  A record it replaces that named a configuration other than the new build's, compared ignoring letter case with one naming none differing from one naming a value, is written with no configuration: the record holds the last build's alone, so a later `--no-build` run here of any `-c` still drops its word rather than keeping it over a bin that never came back.
 
   A passing local dotnet `build`, `test` or `run` (no `--no-build`; never `msbuild`, `pack` or `publish`) of one project inside the worktree, with no output option (`-o`, `--output`, `--artifacts-path`), no runtime-part option (`-a`, `--arch`, `--os`, `--ucr`), no target switch (`-t:`, `/t:`, `--target:`, or with `=`) and no `-p:`, `/p:` or `--property:` setting of `OutputPath`, `BaseOutputPath`, `UseArtifactsOutput`, `OutDir`, `Platform`, `Configuration`, `TargetFramework` or `RuntimeIdentifier` (a build that moves its output, or may not build, adds no key), adds that project's key to the record's `built` list, when the record's `-c`, `-f` and `-r` are the run's: the key is the project's folder (a project file's folder, the `--project` folder, or a positional folder argument that exists inside the worktree, read against the working folder) relative to the worktree root, lexical, lower-cased, `/`-separated, `.` for the root.
 

@@ -2522,7 +2522,7 @@ fn a_passing_local_build_of_a_project_folder_lets_its_no_build_run_keep_the_word
 }
 
 #[test]
-fn a_no_build_run_under_other_settings_drops_its_word_though_its_project_is_listed() {
+fn a_no_build_run_under_other_settings_keeps_its_word_under_another_configuration() {
     let case = project_case("routing-nothing-back-listed-other-settings");
 
     let build = finish(case.gate(&run_words("build.log", &[], &[r".\dotnet.cmd", "build", "One", "-c", "Release"])));
@@ -2542,8 +2542,106 @@ fn a_no_build_run_under_other_settings_drops_its_word_though_its_project_is_list
     );
     assert!(plain.stderr.contains(NOTHING_BACK_LINE), "no configuration: {plain:?}");
     assert_eq!(command_lines(&plain.stdout), ["run --project One"], "{plain:?}");
-    assert!(debug.stderr.contains(NOTHING_BACK_LINE), "another configuration: {debug:?}");
-    assert_eq!(command_lines(&debug.stdout), ["run --project One -c Debug"], "{debug:?}");
+    assert_eq!(debug.code, Some(0), "{debug:?}");
+    assert!(!debug.stderr.contains(DROPPED), "a Release record says nothing of bin\\Debug: {debug:?}");
+    assert_eq!(command_lines(&debug.stdout), ["run --project One -c Debug --no-build"], "{debug:?}");
+}
+
+/// A record a routed `-c Debug` build left says nothing of the PC's `bin\Release`: a `-c Release` `--no-build` run here
+/// of a restored project keeps its word, as a routed run's send does for a record of another configuration, while a run
+/// that sets no configuration still drops it. A record set aside is no record, so the obj check still decides.
+#[test]
+fn a_record_of_another_configuration_lets_a_no_build_run_here_keep_the_word() {
+    let case = project_case("routing-nothing-back-other-configuration");
+    tracked_project(&case, "Three/Three.csproj", false);
+    rewrite_record(&case, r#"{"v":1,"host":"builder","configuration":"Debug"}"#);
+
+    let release = finish(case.gate(&run_words(
+        "release.log",
+        &[],
+        &[r".\dotnet.cmd", "test", "--project", "One", "-c", "Release", "--no-build"],
+    )));
+    let plain = finish(case.gate(&run_words("plain.log", &[], &[r".\dotnet.cmd", "test", "--project", "One", "--no-build"])));
+    let unrestored = finish(case.gate(&run_words(
+        "unrestored.log",
+        &[],
+        &[r".\dotnet.cmd", "test", "--project", "Three", "-c", "Release", "--no-build"],
+    )));
+
+    assert_eq!(release.code, Some(0), "{release:?}");
+    assert!(
+        !release.stderr.contains(DROPPED),
+        "a Debug record says nothing of bin\\Release: {release:?}"
+    );
+    assert_eq!(
+        command_lines(&release.stdout),
+        ["test --project One -c Release --no-build"],
+        "{release:?}"
+    );
+    assert!(
+        plain.stderr.contains(NOTHING_BACK_LINE),
+        "a run naming no configuration may build Debug: {plain:?}"
+    );
+    assert_eq!(command_lines(&plain.stdout), ["test --project One"], "{plain:?}");
+    assert!(
+        !unrestored.stderr.contains(NOTHING_BACK_LINE),
+        "a record set aside is no reason to drop: {unrestored:?}"
+    );
+    assert!(
+        unrestored.stderr.contains(r"has no obj\project.assets.json here"),
+        "the obj check decides a run of another project: {unrestored:?}"
+    );
+    assert_eq!(command_lines(&unrestored.stdout), ["test --project Three -c Release"], "{unrestored:?}");
+}
+
+#[test]
+fn a_record_of_another_letter_case_names_the_same_configuration() {
+    let case = project_case("routing-nothing-back-letter-case");
+    rewrite_record(&case, r#"{"v":1,"host":"builder","configuration":"release"}"#);
+
+    let release = finish(case.gate(&run_words(
+        "release.log",
+        &[],
+        &[r".\dotnet.cmd", "test", "--project", "One", "-c", "Release", "--no-build"],
+    )));
+
+    assert_eq!(release.code, Some(0), "{release:?}");
+    assert!(
+        release.stderr.contains(NOTHING_BACK_LINE),
+        "another letter case is the same configuration: {release:?}"
+    );
+    assert_eq!(command_lines(&release.stdout), ["test --project One -c Release"], "{release:?}");
+}
+
+#[test]
+fn a_routed_build_of_another_configuration_leaves_a_record_that_drops_every_run() {
+    let case = routed_case("routing-nothing-back-two-configurations");
+    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
+
+    let debug_steps = shown(&stub(&case, &["status 0"]));
+    let debug = finish(case.gate(&routed_words("debug.log", &debug_steps, &[], &[r".\dotnet.exe", "build", "-c", "Debug"])));
+    let first = nothing_back(&case);
+    let release_steps = shown(&stub(&case, &["status 0"]));
+    let release = finish(case.gate(&routed_words(
+        "release.log",
+        &release_steps,
+        &[],
+        &[r".\dotnet.exe", "build", "-c", "Release"],
+    )));
+    let second = nothing_back(&case);
+    let dropped = finish(case.gate(&run_words("dropped.log", &[], &[r".\dotnet.cmd", "test", "-c", "Debug", "--no-build"])));
+
+    assert_eq!(debug.code, Some(0), "{debug:?}");
+    assert_eq!(first.as_deref(), Some(r#"{"v":1,"host":"builder","configuration":"Debug"}"#), "{debug:?}");
+    assert_eq!(release.code, Some(0), "{release:?}");
+    assert_eq!(
+        second.as_deref(),
+        Some(NOTHING_BACK_RECORD),
+        "another configuration names none: {release:?}"
+    );
+    assert!(dropped.stderr.contains(NOTHING_BACK_LINE), "{dropped:?}");
+    assert_eq!(command_lines(&dropped.stdout), ["test -c Debug"], "{dropped:?}");
 }
 
 #[test]

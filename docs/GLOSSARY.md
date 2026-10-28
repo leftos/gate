@@ -198,7 +198,11 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **No slot**: the slot kind `none` (`--slot none`), for a command that only dispatches or watches remote work: it takes no slot, mutex, ticket or claim, never waits, and still has its job, log, ceiling and watchdog.
 - **Not-routed builder**: a `builders` entry with `"routed": false`, which no unpinned run picks or tries and `gate push`, `gate check --builder` and a pinned run reach; the way to trial a new builder.
 - **Notes**: the gate's own lines, each stamped `gat` when it is said and written to the log as it goes; a note said before the log is open is held and written when it opens.
-- **Nothing-back record**: the JSON file `remote\<key>.nothing-back` in the state root, left by a routed dotnet build that ended on the builder without its outputs known to be brought back, or, when none stands, by a routed dotnet `--no-build` command whose word was dropped on the builder; while it stands, a local dotnet `test` or `run` drops its `--no-build`, unless the built-here record says the last build of what it builds ran here, or the record's optional `built` list names the project and the run's own configuration, framework and runtime match the record's.
+- **Nothing-back record**: the JSON file `remote\<key>.nothing-back` in the state root, left by a routed dotnet build that ended on the builder without its outputs known to be brought back, or, when none stands, by a routed dotnet `--no-build` command whose word was dropped on the builder.
+
+  While it stands, a local dotnet `test` or `run` drops its `--no-build`, unless the built-here record says the last build of what it builds ran here, or the record's optional `built` list names the project and the run's own configuration, framework and runtime match the record's.
+
+  A record naming a configuration other than the one the run's `-c` sets, in any letter case, stands for nothing, as it does for a send; a run setting no `-c` is dropped by any record.
 
   A passing local build of the whole worktree with the same configuration, framework and runtime removes it, and so does a passing routed build of that kind that brought all its outputs back; a routed `--no-build` command never clears it.
 
