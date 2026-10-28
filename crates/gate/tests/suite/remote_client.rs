@@ -395,6 +395,14 @@ fn pending_marker(case: &Case) -> PathBuf {
     case.root().join("remote").join(format!("{}.outputs-pending", key_of(&events(case))))
 }
 
+/// Plants the case's record of the work-folder key's last complete outputs pull, naming `builder`: a run of the worktree
+/// on that builder then sends only what changed, while a worktree with no record sends every output that differs.
+fn plant_outputs_from(case: &Case, builder: &str) {
+    let record = case.root().join("remote").join(format!("{}.outputs-from", key_of(&events(case))));
+    fs::create_dir_all(record.parent().expect("the record has a folder")).expect("the remote folder can be made");
+    fs::write(&record, builder).expect("the record can be written");
+}
+
 /// The hash cache of the case's work-folder key, which its first run's queue line names, in its state root.
 fn hashes_file(case: &Case) -> PathBuf {
     case.root().join("remote").join(format!("{}.outputs-hashes", key_of(&events(case))))
@@ -2152,6 +2160,64 @@ fn a_command_a_macos_builder_picks_is_sent_its_unix_wire_and_caches_in_its_own_f
         listed(&remote.join(MAC_ID))
     );
     assert!(!remote.join(&hashes).exists(), "host's folder holds no cache of mac-1's");
+}
+
+/// The record of a work folder's last complete outputs pull names the builder that made it, so a run on another builder
+/// asks for every output that differs from the PC's (`OutputsFull`), and the next run on that same builder does not: a
+/// worktree whose runs go host, `builder-a`, `builder-a`, host sends full on both switches.
+#[test]
+fn a_run_after_another_builder_s_run_sends_outputs_full_and_the_next_on_the_same_builder_does_not() {
+    let case = outputs_case("client-outputs-builder-switch", &BIN);
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({
+        "host": HOST,
+        "repos": { &repo: ["*tool* out b*"] },
+        "outputs": { &repo: BIN },
+        "builders": [{ "host": FIRST_BUILDER, "os": "windows", "repos": { &repo: ["*tool* out a*"] } }],
+    });
+    write_remote_json(&case, &routing.to_string());
+    // The builders' own folders are laid out under the case's, which must be there for them to be made in.
+    fs::create_dir_all(case.folder().join("builder")).expect("the builders' folder can be made");
+    let folders = map_folders(&case);
+    let tuned = Tuned {
+        folders: Some(&folders),
+        ..Tuned::default()
+    };
+    // The run call's request is kept for the assertions below, which only `fed-hold` does: it feeds the call its
+    // standard input and returns at once, the case folder being there already.
+    let fed = format!("fed-hold {}", shown(&case.folder()));
+    let run = |name: &str, letter: &str| {
+        let log = case.folder().join(format!("{name}.log"));
+        let steps = ssh_steps(&case, name, &["ok", &fed, "ok"]);
+        let outcome = finish(client_gate_tuned(&case, &shown(&log), &steps, &tuned, &[r".\tool.exe", "out", letter]));
+        assert_eq!(outcome.code, Some(0), "{name}: {outcome:?}");
+        last_request(&steps)
+    };
+
+    let first = run("first", "b");
+    assert_eq!(
+        first["OutputsFull"],
+        json!(true),
+        "a worktree with no record sends full on its first run: {first}"
+    );
+    let switched = run("second", "a");
+    assert_eq!(
+        switched["OutputsFull"],
+        json!(true),
+        "a run after another builder's complete pull asks for every output: {switched}"
+    );
+    let same = run("third", "a");
+    assert_eq!(
+        same["OutputsFull"],
+        json!(false),
+        "the next run on that builder sends changed only: {same}"
+    );
+    let back = run("fourth", "b");
+    assert_eq!(
+        back["OutputsFull"],
+        json!(true),
+        "back on the first builder, the switch asks again: {back}"
+    );
 }
 
 #[test]
@@ -6090,6 +6156,9 @@ fn a_failing_run_leaves_the_marker_and_the_next_run_sends_outputs_full() {
     assert_eq!(failed.code, Some(3), "{failed:?}");
     assert!(!failed.stderr.contains("gate-remote-outputs:"), "a failing run packs nothing: {failed:?}");
     assert!(pending_marker(&case).exists(), "a failing run leaves the marker: {failed:?}");
+    // The record names the builder the next run goes to, so the marker alone makes it full: a worktree with no record
+    // sends full on its first run whether a marker is there or not.
+    plant_outputs_from(&case, HOST);
     let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
 
     let outcome = finish(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
@@ -6128,6 +6197,9 @@ fn a_parity_refusal_leaves_no_outputs_pending_marker_and_the_next_run_sends_outp
     // an earlier run's files on the builder: the next run leaves it alone, and only the pre-command listing tells such
     // a file from one the run made.
     let key = key_of(&events(&case));
+    // The record names the builder the next run goes to, so the run is held to the marker alone: a worktree with no
+    // record sends full on its first run.
+    plant_outputs_from(&case, HOST);
     write(&case, &format!(r"builder\work\{key}\bin\left.txt"), "box");
     let served_steps = ssh_steps(&case, "served", &["ok", "ok", "ok"]);
     let mut served_gate = client_gate(&case, "served.log", &served_steps, &[r".\tool.exe", "out", "ran there"]);
@@ -6380,6 +6452,9 @@ fn a_failed_run_still_leaves_the_pcs_valid_hashes() {
     assert_eq!(failed.code, Some(3), "{failed:?}");
     assert!(pending_marker(&case).exists(), "a failing run leaves the marker: {failed:?}");
     assert_eq!(hashes(&case)["files"]["bin/built.txt"]["sha256"], sha256_hex("pc"), "{failed:?}");
+    // The record names the builder the next run goes to, so the marker alone makes it full: a worktree with no record
+    // sends full on its first run whether a marker is there or not.
+    plant_outputs_from(&case, HOST);
     let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
 
     let outcome = finish(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran there"]));
@@ -7897,6 +7972,9 @@ fn a_refused_install_of_a_member_outside_the_globs_clears_the_pending_marker() {
     // The run refused its archive whole, so the PC keeps no `bin/a.txt`; the builder's work folder, which holds it, gains
     // a file an earlier run built and this run leaves alone.
     let key = key_of(&events(&case));
+    // The record names the builder the next run goes to, so the run is held to the marker alone: a worktree with no
+    // record sends full on its first run.
+    plant_outputs_from(&case, HOST);
     write(&case, &format!(r"builder\work\{key}\bin\left.txt"), "box");
     let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
 
@@ -8889,6 +8967,9 @@ fn a_routed_build_after_a_withheld_run_sends_a_full_manifest_and_keeps_the_recor
     ));
     assert_eq!(withheld.code, Some(0), "{withheld:?}");
     assert_eq!(nothing_back(&case).as_deref(), Some(RELEASE_RECORD), "{withheld:?}");
+    // The record names the builder the next run goes to, so the marker alone makes it full: a worktree with no record
+    // sends full on its first run whether a marker is there or not.
+    plant_outputs_from(&case, HOST);
     let second = ssh_steps(&case, "second", &["ok", "ok", PAST_THE_CAP]);
     let tuned = Tuned {
         extra: &LOW_BUDGET,

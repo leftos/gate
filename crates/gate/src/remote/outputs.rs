@@ -65,6 +65,9 @@ pub(super) const GENERIC_WRITE: u32 = 0x4000_0000;
 pub(super) const DELETE: u32 = 0x0001_0000;
 /// The most of an outputs cap record that is read: its one count fits many times over.
 const CAP_RECORD_BYTES: u64 = 4096;
+/// The most of the record of the work folder's last complete outputs pull that is read: a builder's alias fits many
+/// times over, so a longer file is not one.
+const OUTPUTS_FROM_LIMIT: usize = 512;
 /// What an archive fetched whole and handed to the install is called when it cannot be removed.
 pub(super) const FETCHED: &str = "fetched";
 
@@ -234,7 +237,8 @@ pub(super) struct Sent<'a> {
     /// The failure output globs the run call carries: the run's, or none when it has none, its manifest was not built,
     /// or they were dropped because the manifest over both lists could not be built ([`manifest_over`]).
     pub(super) failure_globs: &'a [String],
-    /// Whether the run asks for every output that differs from the PC's: the pending marker was there.
+    /// Whether the run asks for every output that differs from the PC's: the pending marker was there, or the record of
+    /// the work folder's last complete outputs pull ([`v1::outputs_from_path`]) names another builder than this run's.
     pub(super) full: bool,
     /// The manifest line, fed on the run call's standard input.
     pub(super) manifest: Option<Arc<str>>,
@@ -286,12 +290,14 @@ impl Sent<'_> {
 
 /// What `attempt`'s run call carries of its outputs. A run whose outputs the route withheld records the marker's path
 /// as [`Sent::withheld`] alone, for [`marked`] to write unless its send of the PC's build lands, and no end to clear,
-/// whatever globs it has. A run with no output globs and no failure output globs carries none, and reads no pending
-/// marker. One with either reads whether the marker is there, builds the manifest over both lists ([`manifest_over`]),
-/// polling the console interrupt as it hashes and taking each hash the worktree's hash cache holds at the file's stamp,
-/// unless the marker is there, saves the cache that build leaves, whatever the run's end, unless it equals the one it
-/// read, and, unless the route withheld its outputs, records the marker's path for [`marked`] to write once the
-/// snapshot is pushed. A run with only failure output globs does so too: a failed command brings back the
+/// whatever globs it has. A run with no output globs and no failure output globs carries none, and reads neither the
+/// pending marker nor the record of the work folder's last complete outputs pull. One with either reads both, asking for
+/// every output that differs from the PC's ([`Sent::full`]) when the marker is there or that record
+/// ([`v1::outputs_from_path`]) names another builder, builds the manifest over both lists ([`manifest_over`]), polling
+/// the console interrupt as it hashes and taking each hash the worktree's hash cache holds at the file's stamp, unless
+/// the marker is there, saves the cache that build leaves, whatever the run's end, unless it equals the one it read,
+/// and, unless the route withheld its outputs, records the marker's path for [`marked`] to write once the snapshot is
+/// pushed. A run with only failure output globs does so too: a failed command brings back the
 /// files under them, and a passing one nothing. When the build over both lists fails and one over the output globs
 /// alone does not, the failure output globs are dropped from the run call, said in a line, and that manifest is sent; a
 /// run with no output globs then carries nothing, as one with no globs at all. When the output globs alone fail too,
@@ -307,10 +313,16 @@ pub(super) fn sent<'a>(attempt: &mut Attempt<'_, 'a>) -> Result<Sent<'a>, End> {
         return Ok(sent);
     }
     let marker = v1::outputs_pending_path(call.state_dir, call.key);
-    let full = pending(&marker);
+    let marker_full = pending(&marker);
+    let from = v1::outputs_from_path(call.state_dir, call.key);
+    // Only a run with output globs records its builder, so only one is held to the switch: a failure-only run brings
+    // nothing back and would otherwise send full for good.
+    let full = marker_full || (!call.outputs.is_empty() && !pulled_by(&from, &call.builder.alias));
     let hashes = v1::outputs_hashes_path(call.state_dir, call.builder.id.as_deref(), call.key);
-    // The full send is the recovery path: it reuses no hash that may be wrong, and its own then replace the cache's.
-    let previous = if full { None } else { HashCache::load(&hashes) };
+    // The marker's full send is the recovery path: it reuses no hash that may be wrong, and its own then replace the
+    // cache's. A run sent full only because another builder made the last pull is not: the cache holds this PC's own
+    // hashes, which hold whichever builder the run goes to.
+    let previous = if marker_full { None } else { HashCache::load(&hashes) };
     let none = HashCache::default();
     let cache = previous.as_ref().unwrap_or(&none);
     let lists = (call.outputs, call.failure_outputs);
@@ -360,9 +372,10 @@ pub(super) fn marked(sent: &Sent<'_>) -> Result<(), End> {
 /// has none. A run whose passing status the sync-back turned to 1 says its outputs were not brought back, for the
 /// sync-back's reason ([`turned_reason`]). A passing run whose manifest was not built, or whose box said no outputs
 /// line the client accepts, says why and ends 1. A passing run whose box packed an archive fetches it, as [`fetched`]
-/// says. A passing run whose box packed nothing removes the pending marker and the outputs cap record ([`uncapped`]),
-/// unless the route withheld its outputs, when it touches neither; one that cannot be removed is said, and the run's
-/// status stands. A withheld run whose send of the PC's build landed has no marker, but still its outputs step. The other
+/// says. A passing run whose box packed nothing first records its builder as the work folder's last complete outputs
+/// pull ([`recorded`]), then removes the pending marker and the outputs cap record ([`uncapped`]), unless the route
+/// withheld its outputs, when it touches neither; a record it cannot write is said and leaves the marker, so the next
+/// run is full, while one that cannot be removed is said and the run's status stands. A withheld run whose send of the PC's build landed has no marker, but still its outputs step. The other
 /// ends that do not reach [`fetched`] leave both. A run whose command failed brings back its test reports and the files
 /// under its failure output globs when its box packed them, as [`reports_end`] says, keeping its status, and otherwise
 /// says nothing and leaves both. A run with only failure output globs takes the same steps: its passing command's box
@@ -389,7 +402,11 @@ fn turned_reason(status: i64, synced: &Synced) -> Option<&'static str> {
 const WORKTREE_CHANGED: &str = "the worktree changed during the run";
 
 /// The end of the outputs step [`ended`] says, and whether it left the PC every output the box packed or found the PC
-/// holding them all, the box's names skip aside: never for a failed run, whose end [`reports_end`] gives.
+/// holding them all, the box's names skip aside: never for a failed run, whose end [`reports_end`] gives. A passing run
+/// whose box packed nothing and whose outputs the route did not withhold also records its builder as the work folder's
+/// last complete outputs pull ([`recorded`]) before it clears the marker, for a run with output globs: a failure-only
+/// run brings nothing back ([`holds_outputs`]). A record that cannot be written is said, and the marker is left, so the
+/// next run asks for every output that differs rather than send a stale builder's changed set.
 fn step_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synced: Synced, brought: Option<&Brought>) -> (End, bool) {
     let reason = turned_reason(ran.status, &synced);
     let synced = synced.end;
@@ -426,11 +443,25 @@ fn step_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synce
         }
         (Ok(files), Some(Brought::Nothing)) => {
             if !attempt.call.outputs_withheld {
-                if let Some(marker) = marker
+                // The record goes before the marker's clear: a gate killed between the two, or a record it cannot
+                // write, leaves the marker, so the next run is full rather than the old builder's changed set.
+                // A failure-only run has no output globs, so it completed no outputs pull and records no builder.
+                let written = sent.globs.is_empty()
+                    || match recorded(attempt) {
+                        Ok(()) => true,
+                        Err(why) => {
+                            attempt.say(format!("gate: {why}"));
+                            false
+                        }
+                    };
+                if written
+                    && let Some(marker) = marker
                     && let Err(why) = clear_pending(marker)
                 {
                     attempt.say(format!("gate: {why}"));
                 }
+                // The run's outputs step ran whatever its record's write did, so the fetch cap's count in a row ends
+                // with it: only the marker stays, to make the next run full.
                 uncapped(attempt);
             }
             return (synced, holds_outputs(files, sent.globs));
@@ -1103,6 +1134,40 @@ fn unbrought(bringing: Bringing, reason: &str) -> String {
 /// asks for every output that differs from the PC's, which is never wrong, only slower.
 fn pending(marker: &Path) -> bool {
     marker.try_exists().unwrap_or(true)
+}
+
+/// The builder alias the record at `path` ([`v1::outputs_from_path`]) names, read as the outputs cap record beside it
+/// is: a link or junction at its name is read as itself, and at most [`OUTPUTS_FROM_LIMIT`] bytes. `None` when the
+/// record is missing, cannot be opened or read, is not UTF-8, or is over [`OUTPUTS_FROM_LIMIT`] bytes, which the reader
+/// tells by taking one byte past that; `Some` of nothing when it holds no alias.
+fn pulled_from(path: &Path) -> Option<String> {
+    let file = OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path).ok()?;
+    let limit = u64::try_from(OUTPUTS_FROM_LIMIT).ok()?;
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > OUTPUTS_FROM_LIMIT {
+        return None;
+    }
+    let alias = String::from_utf8(bytes).ok()?;
+    let alias = alias.trim();
+    (!alias.is_empty()).then(|| alias.to_owned())
+}
+
+/// Whether the record at `path` ([`v1::outputs_from_path`]) says the work folder's last complete outputs pull was made
+/// on the builder whose alias is `alias`, compared without regard to ASCII case. A record that is not there, cannot be
+/// read, is empty or is over [`OUTPUTS_FROM_LIMIT`] bytes says another builder's, so the run asks for every output that
+/// differs from the PC's: a full send is never wrong, only slower.
+fn pulled_by(path: &Path, alias: &str) -> bool {
+    pulled_from(path).is_some_and(|last| last.eq_ignore_ascii_case(alias.trim()))
+}
+
+/// Writes the alias of `attempt`'s builder to the record of the work folder's last complete outputs pull
+/// ([`v1::outputs_from_path`]) whole or not at all, over whatever it held: this run brought the worktree's outputs back
+/// whole, so a later run on another builder asks for every output that differs from the PC's ([`Sent::full`]). Else
+/// why it could not be written, which the run says and leaves its marker for: the next run is then full.
+pub(super) fn recorded(attempt: &mut Attempt<'_, '_>) -> Result<(), String> {
+    let path = v1::outputs_from_path(attempt.call.state_dir, attempt.call.key);
+    v1::write_outputs_from(&path, &attempt.call.builder.alias).map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
 /// Writes the pending marker at `marker`, its folder made when missing; else why it could not be written.
@@ -2141,6 +2206,441 @@ mod tests {
             "another run's",
             "a file this run did not make stays"
         );
+    }
+
+    /// The tests of the record of the work folder's last complete outputs pull: they drive the client's own attempt,
+    /// which only the `test-seams` feature builds (`Attempt::for_tests` and the local transport).
+    #[cfg(feature = "test-seams")]
+    mod seams {
+        use std::fs;
+        use std::path::{Path, PathBuf};
+        use std::sync::LazyLock;
+
+        use gate_router::{Builder, BuilderOs};
+        use gate_state::{StateRoot, v1};
+
+        use super::super::{Brought, OUTPUTS_FROM_LIMIT, Ran, sent, step_end};
+        use super::{KEY, NONCE, cached_worktree, scratch, sentinel};
+        use crate::outputs::hash::sha256_of;
+        use crate::remote::client::{Attempt, End};
+        use crate::remote::payload::Location;
+        use crate::remote::syncback::Synced;
+        use crate::remote::transport::{Local, Profile};
+        use crate::remote::{RemoteCall, Warmth};
+
+        /// A state root no run here reads: every call names its own state folder for what it touches.
+        static STATE: LazyLock<StateRoot> = LazyLock::new(|| StateRoot::new(r"C:\gate-outputs-tests", None));
+
+        /// The `mac-1` builder of the runs here: an entry with an id of its own, so its caches sit in their own folder.
+        static MAC: LazyLock<Builder> = LazyLock::new(|| Builder {
+            alias: "mac-1".to_owned(),
+            os: BuilderOs::Macos,
+            root: Some("/Users/b/gate-remote".to_owned()),
+            slots: 1,
+            id: Some("1f0efc62".to_owned()),
+        });
+
+        /// A call running in `root`, its state under `state` and its lines written to `log`.
+        fn call_in<'a>(root: &'a str, state: &'a Path, log: &'a Path) -> RemoteCall<'a> {
+            RemoteCall {
+                builder: &crate::test_support::HOST,
+                key: KEY,
+                session: "0123456789abcdef0123456789abcdef",
+                root,
+                root_id: gate_router::FolderId { volume: 0, file: [0; 16] },
+                leaf: "app",
+                siblings: Vec::new(),
+                repo: "app",
+                subfolder: "",
+                words: &[],
+                outputs: &[],
+                outputs_withheld: false,
+                failure_outputs: &[],
+                dropped_no_build: false,
+                send: None,
+                cross_build: None,
+                desktop: false,
+                inputs: &[],
+                log,
+                timeout: 60,
+                usual: None,
+                stall: 60,
+                tail: 0,
+                no_markers: false,
+                bring_tracked: &[],
+                env: &[],
+                interrupt: None,
+                state: &STATE,
+                state_dir: state,
+                warmth: Warmth::Unasked,
+            }
+        }
+
+        /// A call of [`call_in`]'s on `builder`, its output globs `globs`.
+        fn on<'a>(builder: &'a Builder, root: &'a str, globs: &'a [String], state: &'a Path, log: &'a Path) -> RemoteCall<'a> {
+            RemoteCall {
+                builder,
+                outputs: globs,
+                ..call_in(root, state, log)
+            }
+        }
+
+        /// The transport no run here reaches: a local one at a folder that does not exist.
+        fn nowhere() -> Local {
+            Local::new(r"local:C:\builder", None).expect("a local transport")
+        }
+
+        /// An attempt of `call` through `transport`, as the client makes one.
+        fn attempt_of<'c, 'a>(call: &'c RemoteCall<'a>, transport: &'c Local) -> Attempt<'c, 'a> {
+            Attempt::for_tests(call, transport)
+        }
+
+        /// The place of a run in the work folder [`KEY`].
+        fn location() -> Location {
+            Location::under(&Profile::new("builder", BuilderOs::Windows, r"C:\builder"), "app", KEY, "0123456789ab")
+        }
+
+        /// The state folder of the test `name`, its `remote` folder made.
+        fn state_of(name: &str) -> PathBuf {
+            let state = scratch(&format!("{name}-state"));
+            fs::create_dir_all(v1::remote_dir(&state)).expect("the remote folder can be made");
+            state
+        }
+
+        /// A scratch worktree at `name`'s folder, and the state folder and log beside it.
+        fn worktree(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+            let root = scratch(&format!("{name}-app")).join("app");
+            fs::create_dir_all(&root).expect("the worktree can be made");
+            let log = scratch(&format!("{name}-log")).join("out.log");
+            (root, state_of(name), log)
+        }
+
+        /// A passing run's [`Ran`], its place in the work folder [`KEY`].
+        fn passed(place: &Location) -> Ran<'_> {
+            Ran {
+                location: place,
+                nonce: NONCE,
+                status: 0,
+                names_skipped: false,
+                cross_not_brought_back: false,
+            }
+        }
+
+        /// The record of the work folder [`KEY`]'s last complete outputs pull in `state`, holding `mac-1`'s alias.
+        fn record_of_another_builder(state: &Path) -> PathBuf {
+            let record = v1::outputs_from_path(state, KEY);
+            fs::write(&record, "mac-1").expect("the record can be written");
+            record
+        }
+
+        /// The record says the PC's outputs came from another builder, so the run asks for every output that differs from
+        /// the PC's (`OutputsFull`) though no pending marker is there. The hash cache holds this PC's own hashes, which hold
+        /// for whichever builder ran, so the full send reads it.
+        #[test]
+        fn a_run_on_another_builder_than_the_last_pull_s_sends_full_and_reads_the_cache() {
+            let (root, cache) = cached_worktree("switch-full");
+            let state = state_of("switch-full");
+            let log = scratch("switch-full-log").join("out.log");
+            let globs = ["**/bin/**".to_owned()];
+            let hashes = v1::outputs_hashes_path(&state, None, KEY);
+            cache.save(&hashes);
+            let record = record_of_another_builder(&state);
+            let root = root.to_string_lossy().into_owned();
+            let call = on(&crate::test_support::HOST, &root, &globs, &state, &log);
+            let transport = nowhere();
+
+            let sent = sent(&mut attempt_of(&call, &transport)).expect("the manifest is built");
+
+            assert!(sent.full, "another builder's pull makes the run ask for every output");
+            assert_eq!(
+                sent.built
+                    .as_ref()
+                    .ok()
+                    .and_then(|files| files.get("bin/a.dll"))
+                    .map(|held| held.sha256.clone()),
+                Some(sentinel()),
+                "the switch's full send still reuses the PC's own hashes: {record:?}"
+            );
+        }
+
+        /// A builder's alias is compared without regard to ASCII case: `Mac-1` and `mac-1` are one builder, so a run on it
+        /// sends only what changed.
+        #[test]
+        fn a_run_on_the_last_pull_s_builder_in_another_letter_case_sends_changed_only() {
+            let (root, state, log) = worktree("switch-case");
+            let globs = ["**/bin/**".to_owned()];
+            fs::write(v1::outputs_from_path(&state, KEY), "Mac-1").expect("the record can be written");
+            let root = root.to_string_lossy().into_owned();
+            let call = on(&MAC, &root, &globs, &state, &log);
+            let transport = nowhere();
+
+            let sent = sent(&mut attempt_of(&call, &transport)).expect("the manifest is built");
+
+            assert!(!sent.full, "the same builder's alias in another case is no switch");
+        }
+
+        /// Whether a run on `host` with the record `write` plants at the record's path sends full.
+        fn sends_full(name: &str, globs: &[String], write: impl Fn(&Path)) -> bool {
+            let (root, state, log) = worktree(name);
+            let record = v1::outputs_from_path(&state, KEY);
+            write(&record);
+            let root = root.to_string_lossy().into_owned();
+            let call = on(&crate::test_support::HOST, &root, globs, &state, &log);
+            let transport = nowhere();
+            sent(&mut attempt_of(&call, &transport)).expect("the manifest is built").full
+        }
+
+        /// A record that is not there, cannot be read, is empty or is absurdly long says another builder's, so the run asks
+        /// for every output that differs from the PC's: a full send is never wrong, only slower.
+        #[test]
+        fn a_missing_or_unreadable_outputs_from_record_sends_full() {
+            let globs = ["**/bin/**".to_owned()];
+
+            assert!(sends_full("from-missing", &globs, |_| {}), "no record yet");
+            assert!(
+                sends_full("from-empty", &globs, |record| fs::write(record, "").expect("the record can be written")),
+                "an empty record"
+            );
+            assert!(
+                sends_full("from-long", &globs, |record| fs::write(record, "a".repeat(OUTPUTS_FROM_LIMIT + 1))
+                    .expect("the record can be written")),
+                "a record over the limit"
+            );
+            assert!(
+                sends_full("from-folder", &globs, |record| fs::create_dir(record).expect("the folder can be made")),
+                "a record that cannot be read as a file"
+            );
+        }
+
+        /// A passing run whose box packed nothing, its outputs not withheld, completed its outputs step: it records its
+        /// builder as the work folder's last complete outputs pull, even when its manifest held nothing under the globs.
+        #[test]
+        fn a_passing_run_the_box_packed_nothing_for_records_its_builder() {
+            let (root, state, log) = worktree("record-nothing");
+            let globs = ["**/bin/**".to_owned()];
+            let record = record_of_another_builder(&state);
+            let place = location();
+            let root = root.to_string_lossy().into_owned();
+            let call = on(&crate::test_support::HOST, &root, &globs, &state, &log);
+            let transport = nowhere();
+            let mut attempt = attempt_of(&call, &transport);
+            let sent = sent(&mut attempt).expect("the manifest is built");
+
+            let (end, complete) = step_end(
+                &mut attempt,
+                &sent,
+                &passed(&place),
+                Synced {
+                    end: End::Status(0),
+                    reason: None,
+                },
+                Some(&Brought::Nothing),
+            );
+
+            assert!(matches!(end, End::Status(0)), "{end:?}");
+            assert!(
+                !complete,
+                "a manifest holding nothing under the globs leaves no output to have brought back"
+            );
+            assert_eq!(
+                fs::read_to_string(&record).expect("the record is there"),
+                "builder",
+                "the run's builder is recorded"
+            );
+        }
+
+        /// A run whose outputs the route withheld, and a failed run's report pull, leave the record as it was: neither
+        /// brought the worktree's outputs back whole.
+        #[test]
+        fn a_withheld_run_and_a_failed_run_s_report_pull_leave_the_record() {
+            let (root, state, log) = worktree("record-kept");
+            let globs = ["**/bin/**".to_owned()];
+            let record = record_of_another_builder(&state);
+            let place = location();
+            let root = root.to_string_lossy().into_owned();
+            let transport = nowhere();
+            let held = RemoteCall {
+                outputs_withheld: true,
+                ..on(&crate::test_support::HOST, &root, &globs, &state, &log)
+            };
+            let mut attempt = attempt_of(&held, &transport);
+            let withheld_sent = sent(&mut attempt).expect("the withheld run's manifest is built");
+
+            let (end, _) = step_end(
+                &mut attempt,
+                &withheld_sent,
+                &passed(&place),
+                Synced {
+                    end: End::Status(0),
+                    reason: None,
+                },
+                Some(&Brought::Nothing),
+            );
+
+            assert!(matches!(end, End::Status(0)), "{end:?}");
+            assert_eq!(
+                fs::read_to_string(&record).expect("the record is there"),
+                "mac-1",
+                "a withheld run brings nothing back"
+            );
+            let failed = on(&crate::test_support::HOST, &root, &globs, &state, &log);
+            let mut attempt = attempt_of(&failed, &transport);
+            let failed_sent = sent(&mut attempt).expect("the failed run's manifest is built");
+            let ran = Ran {
+                location: &place,
+                nonce: NONCE,
+                status: 3,
+                names_skipped: false,
+                cross_not_brought_back: false,
+            };
+
+            let (end, complete) = step_end(
+                &mut attempt,
+                &failed_sent,
+                &ran,
+                Synced {
+                    end: End::Status(3),
+                    reason: None,
+                },
+                Some(&Brought::Nothing),
+            );
+
+            assert!(matches!(end, End::Status(3)), "{end:?}");
+            assert!(!complete, "a failed run brings no outputs back");
+            assert_eq!(
+                fs::read_to_string(&record).expect("the record is there"),
+                "mac-1",
+                "a failed run's report pull leaves it"
+            );
+        }
+
+        /// A failure-only run has no output globs, so its box packing nothing for a passing command completes no outputs
+        /// pull: the record stays another builder's, and the next run asks full again.
+        #[test]
+        fn a_failure_only_run_that_brings_nothing_leaves_the_record() {
+            let (root, state, log) = worktree("record-failure-only");
+            let failure = ["**/TestResults/**".to_owned()];
+            let record = record_of_another_builder(&state);
+            let place = location();
+            let root = root.to_string_lossy().into_owned();
+            let call = RemoteCall {
+                failure_outputs: &failure,
+                ..call_in(&root, &state, &log)
+            };
+            let transport = nowhere();
+            let mut attempt = attempt_of(&call, &transport);
+            let sent = sent(&mut attempt).expect("the manifest is built");
+
+            let (end, _) = step_end(
+                &mut attempt,
+                &sent,
+                &passed(&place),
+                Synced {
+                    end: End::Status(0),
+                    reason: None,
+                },
+                Some(&Brought::Nothing),
+            );
+
+            assert!(matches!(end, End::Status(0)), "{end:?}");
+            assert_eq!(
+                fs::read_to_string(&record).expect("the record is there"),
+                "mac-1",
+                "a failure-only run brings nothing back"
+            );
+        }
+
+        /// The marker's full send is still the recovery path: it reuses no hash of the cache, since one may be wrong, while
+        /// a send made full only by another builder's pull reads it.
+        #[test]
+        fn a_marker_full_send_still_bypasses_the_cache() {
+            let (root, cache) = cached_worktree("marker-bypass");
+            let state = state_of("marker-bypass");
+            let log = scratch("marker-bypass-log").join("out.log");
+            let globs = ["**/bin/**".to_owned()];
+            cache.save(&v1::outputs_hashes_path(&state, None, KEY));
+            fs::write(v1::outputs_from_path(&state, KEY), "builder").expect("the record can be written");
+            fs::write(v1::outputs_pending_path(&state, KEY), "").expect("the marker can be written");
+            let root = root.to_string_lossy().into_owned();
+            let call = on(&crate::test_support::HOST, &root, &globs, &state, &log);
+            let transport = nowhere();
+            let (abc, _) = sha256_of(&b"abc"[..]).expect("the file's bytes hash");
+
+            let sent = sent(&mut attempt_of(&call, &transport)).expect("the manifest is built");
+
+            assert!(sent.full, "the marker asks for every output");
+            assert_eq!(
+                sent.built
+                    .as_ref()
+                    .ok()
+                    .and_then(|files| files.get("bin/a.dll"))
+                    .map(|held| held.sha256.clone()),
+                Some(abc),
+                "the marker's full send hashes the file again rather than reuse a hash that may be wrong"
+            );
+        }
+
+        /// A record the gate cannot write is said, and its marker is left: the next run then asks for every output that
+        /// differs rather than send a stale builder's changed set, so a gate killed between the record and the clear,
+        /// or one that cannot write its record, is never an under-ask.
+        #[test]
+        fn a_record_that_cannot_be_written_leaves_the_marker_and_the_next_run_sends_full() {
+            let (root, state, log) = worktree("record-unwritable");
+            let globs = ["**/bin/**".to_owned()];
+            // A folder where the record belongs, which the write's move over it cannot replace.
+            let record = v1::outputs_from_path(&state, KEY);
+            fs::create_dir(&record).expect("the folder can be made");
+            let marker = v1::outputs_pending_path(&state, KEY);
+            fs::write(&marker, "").expect("the marker can be written");
+            // The fetch cap's count in a row: this run's outputs step ends whatever its record's write did.
+            let capped = v1::outputs_capped_path(&state, None, KEY);
+            fs::write(&capped, r#"{"v":1,"hits":1}"#).expect("the cap record can be written");
+            let place = location();
+            let root = root.to_string_lossy().into_owned();
+            let call = on(&crate::test_support::HOST, &root, &globs, &state, &log);
+            let transport = nowhere();
+            let mut attempt = attempt_of(&call, &transport);
+            let first = sent(&mut attempt).expect("the manifest is built");
+
+            let (end, _) = step_end(
+                &mut attempt,
+                &first,
+                &passed(&place),
+                Synced {
+                    end: End::Status(0),
+                    reason: None,
+                },
+                Some(&Brought::Nothing),
+            );
+
+            assert!(matches!(end, End::Status(0)), "{end:?}");
+            assert!(marker.is_file(), "a record the gate cannot write leaves the marker");
+            assert!(record.is_dir(), "the record's place holds the folder that was there");
+            assert!(!capped.exists(), "the outputs step's end resets the fetch cap's count in a row");
+            let said = crate::remote::log_texts(&log);
+            let cannot = format!("gate: cannot write {}: ", record.display());
+            assert!(said.contains(&cannot), "the run says the record it cannot write: {said}");
+            let next = sent(&mut attempt_of(&call, &transport)).expect("the next run's manifest is built");
+            assert!(next.full, "the marker left sends the next run full");
+        }
+
+        /// A run with no output globs records no builder, so it is held to the marker alone: a failure-only run of a
+        /// worktree with no record sends only what changed rather than full for good.
+        #[test]
+        fn a_failure_only_run_with_no_record_sends_changed_only() {
+            let (root, state, log) = worktree("failure-only-no-record");
+            let failure = ["**/TestResults/**".to_owned()];
+            let root = root.to_string_lossy().into_owned();
+            let call = RemoteCall {
+                failure_outputs: &failure,
+                ..call_in(&root, &state, &log)
+            };
+            let transport = nowhere();
+
+            let sent = sent(&mut attempt_of(&call, &transport)).expect("the manifest is built");
+
+            assert!(!sent.full, "a run with no output globs is held to the marker alone");
+        }
     }
 
     #[test]

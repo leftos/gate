@@ -5739,6 +5739,11 @@ mod tests {
             ..call(&log)
         };
         let transport = nowhere();
+        // The record of the worktree's last complete outputs pull names the builder each run goes to, so the test's
+        // subject stays the marker: a worktree with no record, or one of another builder, sends full on its own.
+        let record = gate_state::v1::outputs_from_path(&state, "app-1a2b3c4d");
+        fs::create_dir_all(record.parent().expect("the record has a folder")).expect("the state's remote folder can be made");
+        fs::write(&record, "mac-1").expect("the record can be written");
 
         let left = outputs::sent(&mut attempt(&on_mac, &transport)).expect("the mac run's manifest is built");
         outputs::marked(&left).expect("the mac run's marker can be written");
@@ -5746,6 +5751,8 @@ mod tests {
             builder: &crate::test_support::HOST,
             ..on_mac
         };
+        // The host is the builder this run goes to, so no switch makes it full: the marker alone does.
+        fs::write(&record, &crate::test_support::HOST.alias).expect("the record can be rewritten");
         let next = outputs::sent(&mut attempt(&on_host, &transport)).expect("the host run's manifest is built");
 
         assert!(!left.full, "the mac run found no marker");

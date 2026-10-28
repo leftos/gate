@@ -228,6 +228,16 @@ fn the_outputs_pending_marker_sits_in_the_remote_folder() {
 }
 
 #[test]
+fn the_outputs_from_record_sits_in_the_remote_folder() {
+    let root = Path::new("state-root");
+
+    assert_eq!(
+        parts_under(root, &v1::outputs_from_path(root, "app-1a2b3c4d")),
+        ["remote", "app-1a2b3c4d.outputs-from"]
+    );
+}
+
+#[test]
 fn a_builder_s_cache_folder_is_the_remote_folder_for_host_and_its_id_folder_for_an_entry() {
     let root = Path::new("state-root");
 
@@ -252,6 +262,11 @@ fn a_builder_s_cache_folder_is_the_remote_folder_for_host_and_its_id_folder_for_
         parts_under(root, &v1::outputs_pending_path(root, key)),
         ["remote", "app-1a2b3c4d.outputs-pending"],
         "the outputs-pending marker stays PC-wide"
+    );
+    assert_eq!(
+        parts_under(root, &v1::outputs_from_path(root, key)),
+        ["remote", "app-1a2b3c4d.outputs-from"],
+        "the outputs-from record stays PC-wide"
     );
     assert_eq!(parts_under(root, &v1::warm_cap_lock_path(root)), ["remote", "warm.lock"]);
 }

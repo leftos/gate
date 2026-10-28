@@ -159,6 +159,28 @@ pub fn outputs_pending_path(root: &Path, key: &str) -> PathBuf {
     remote_dir(root).join(format!("{key}.outputs-pending"))
 }
 
+/// The record of the work folder `key`'s last complete outputs pull, `<root>\remote\<key>.outputs-from`, whichever
+/// builder that pull was made on: its whole content is the alias of the builder whose run last brought the worktree's
+/// outputs back whole, `host`'s or an entry's as the routing file names it, overwritten by each such
+/// run. A routed run on another builder asks for every output that differs from the PC's (`OutputsFull`), since that
+/// builder's work folder holds files its own run never wrote.
+#[must_use]
+pub fn outputs_from_path(root: &Path, key: &str) -> PathBuf {
+    remote_dir(root).join(format!("{key}.outputs-from"))
+}
+
+/// Writes the record of the work folder's last complete outputs pull at `path` ([`outputs_from_path`]) whole or not at
+/// all, as [`write_nothing_back`] writes, but with one move over the record and no retry, since a routed run writes it
+/// on its way: the temp file beside it is made new, a link or junction standing at its name opened as itself rather
+/// than followed, then moved over any record there. `alias` is the builder's alias.
+///
+/// # Errors
+///
+/// A folder, temp file or move that fails.
+pub fn write_outputs_from(path: &Path, alias: &str) -> io::Result<()> {
+    write_replacing_once(path, alias)
+}
+
 /// The hash cache of the work folder `key` on the builder whose id is `id`, `<folder>\<key>.outputs-hashes` in its
 /// folder ([`builder_cache_dir`]): the outputs manifest line of the worktree's last built manifest, its files whose
 /// last write came well before that build, so the next build reuses the hash of each file whose size and last write

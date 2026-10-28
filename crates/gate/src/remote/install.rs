@@ -275,7 +275,8 @@ pub(super) fn pc_spelling(root: &str) -> io::Result<PathBuf> {
 /// that was there before, saying a removal that fails; only a success that skipped nothing keeps the hashes of the files
 /// it put in place ([`cached`]), which no other end does.
 /// With the end, whether the install was complete ([`Installed::complete`]): a success whose skips are all ones a
-/// refetch of the same outputs would clear, and so the one whose files the hash cache may keep.
+/// refetch of the same outputs would clear, and so the one whose files the hash cache may keep, and which records this
+/// run's builder as the work folder's last complete outputs pull ([`outputs::recorded`]) before clearing the marker.
 ///
 /// A failed run's test reports ([`Bringing::Reports`]) are installed the same way, each line naming them, but no end
 /// clears the pending marker.
@@ -310,7 +311,20 @@ pub(super) fn installed(attempt: &mut Attempt<'_, '_>, fetched: &Fetched<'_>) ->
         attempt.say(format!("gate: cannot remove the outputs stage {}: {error}", fetched.stage.display()));
     }
     outputs::removed(attempt, fetched.archive, outputs::FETCHED);
+    // A complete install brought the worktree's outputs back whole: it records the builder before it clears the marker,
+    // as `step_end` records it for a passing run whose box packed nothing. A record it cannot write is said, and the
+    // marker is left, so the next run is full. A failed run's reports never record one, nor a refusal that leaves the
+    // install short.
+    let recorded = !(complete && bringing == Bringing::Outputs)
+        || match outputs::recorded(attempt) {
+            Ok(()) => true,
+            Err(why) => {
+                attempt.say(format!("gate: {why}"));
+                false
+            }
+        };
     if clear
+        && recorded
         && let Some(marker) = fetched.marker
         && let Err(why) = outputs::clear_pending(marker)
     {
@@ -2004,6 +2018,298 @@ mod tests {
     /// The hash cache path of a scratch `folder`, as the client names it.
     fn cache_path(folder: &Path) -> PathBuf {
         folder.join("app-1a2b3c4d.outputs-hashes")
+    }
+
+    /// The test of the record of the work folder's last complete outputs pull: it drives the client's own attempt,
+    /// which only the `test-seams` feature builds (`Attempt::for_tests` and the local transport).
+    #[cfg(feature = "test-seams")]
+    mod seams {
+        use std::fs::{self, File};
+        use std::path::Path;
+        use std::process::Command;
+        use std::sync::LazyLock;
+        use std::time::{Duration, Instant, SystemTime};
+
+        use gate_state::StateRoot;
+
+        use super::super::{Fetched, installed};
+        use super::{put, scratch};
+        use crate::outputs::archive::pack;
+        use crate::outputs::glob::Globs;
+        use crate::outputs::manifest::{Chosen, HeldBy, Manifest};
+        use crate::outputs::walk::walk;
+        use crate::remote::client::{Attempt, End};
+        use crate::remote::outputs::{Archive, Narrowed};
+        use crate::remote::transport::Local;
+        use crate::remote::{RemoteCall, Warmth};
+
+        /// A state root no run here reads: the call below names its own state folder for what it touches.
+        static STATE: LazyLock<StateRoot> = LazyLock::new(|| StateRoot::new(r"C:\gate-install-tests", None));
+
+        /// A call running in `root`, its state under `state` and its lines written to `log`.
+        fn call_in<'a>(root: &'a str, state: &'a Path, log: &'a Path) -> RemoteCall<'a> {
+            RemoteCall {
+                builder: &crate::test_support::HOST,
+                key: "app-1a2b3c4d",
+                session: "0123456789abcdef0123456789abcdef",
+                root,
+                root_id: gate_router::FolderId { volume: 0, file: [0; 16] },
+                leaf: "app",
+                siblings: Vec::new(),
+                repo: "app",
+                subfolder: "",
+                words: &[],
+                outputs: &[],
+                outputs_withheld: false,
+                failure_outputs: &[],
+                dropped_no_build: false,
+                send: None,
+                cross_build: None,
+                desktop: false,
+                inputs: &[],
+                log,
+                timeout: 60,
+                usual: None,
+                stall: 60,
+                tail: 0,
+                no_markers: false,
+                bring_tracked: &[],
+                env: &[],
+                interrupt: None,
+                state: &STATE,
+                state_dir: state,
+                warmth: Warmth::Unasked,
+            }
+        }
+
+        /// The transport no install here reaches: a local one at a folder that does not exist.
+        fn nowhere() -> Local {
+            Local::new(r"local:C:\builder", None).expect("a local transport")
+        }
+
+        /// A complete install brought the worktree's outputs back whole, so it records the run's builder as the work
+        /// folder's last complete outputs pull: a later run on another builder then asks for every output that differs
+        /// from the PC's.
+        #[test]
+        fn a_complete_install_records_its_builder() {
+            let folder = scratch("record-install");
+            let root = folder.join("root");
+            fs::create_dir_all(&root).expect("the worktree can be made");
+            let source = folder.join("source");
+            fs::create_dir_all(&source).expect("the source folder can be made");
+            let archive = folder.join("outputs.tar.zst");
+            let file = File::create(&archive).expect("the archive can be made");
+            pack(file, &source, &[], &HeldBy::new()).expect("an archive of no members is packed");
+            let state = folder.join("state");
+            fs::create_dir_all(state.join("remote")).expect("the remote folder can be made");
+            let key = "app-1a2b3c4d";
+            let marker = gate_state::v1::outputs_pending_path(&state, key);
+            fs::write(&marker, "").expect("the marker can be written");
+            let globs = ["**/bin/**".to_owned()];
+            let root = root.to_string_lossy().into_owned();
+            let log = folder.join("out.log");
+            let call = call_in(&root, &state, &log);
+            let transport = nowhere();
+            let mut attempt = Attempt::for_tests(&call, &transport);
+            let held = Archive::new(Path::new(&root), archive);
+            let manifest = Manifest::default();
+            let fetched = Fetched {
+                archive: &held,
+                stage: folder.join("stage"),
+                marker: Some(marker.as_path()),
+                manifest: &manifest,
+                globs: &globs,
+                main_tree: r"D:\gate-remote\work\app-1a2b3c4d".to_owned(),
+                sibling_trees: Vec::new(),
+                started: Instant::now(),
+                snapshot: SystemTime::now() - Duration::from_hours(1),
+                pulled: Duration::ZERO,
+                reports: None,
+            };
+
+            let (end, complete) = installed(&mut attempt, &fetched);
+
+            assert!(matches!(end, End::Status(0)), "{end:?}");
+            assert!(complete, "an install that skipped nothing completed");
+            assert!(!marker.exists(), "a complete install clears the marker");
+            assert_eq!(
+                fs::read_to_string(gate_state::v1::outputs_from_path(Path::new(&state), key)).expect("the record is there"),
+                "builder",
+                "the run's builder is recorded"
+            );
+        }
+
+        /// Runs `git` in `folder` with `words`: a test's own repository, made and added to itself.
+        #[expect(clippy::disallowed_methods, reason = "a test's own git calls take no spawn lock")]
+        fn git_in(folder: &Path, words: &[&str]) {
+            let made = Command::new("git").arg("-C").arg(folder).args(words).output().expect("git runs");
+            assert!(made.status.success(), "git {words:?} succeeds: {made:?}");
+        }
+
+        /// An install that skipped a file git tracks is incomplete, so it records no builder: the record stays as it
+        /// was, and the marker stays too, so the next run asks for every output that differs.
+        #[test]
+        fn an_incomplete_install_leaves_the_record() {
+            let folder = scratch("record-incomplete");
+            let root = folder.join("root");
+            fs::create_dir_all(root.join("bin")).expect("the worktree can be made");
+            git_in(&root, &["init", "--quiet"]);
+            fs::write(root.join("bin").join("a.txt"), "pc").expect("the file can be written");
+            git_in(&root, &["add", "bin/a.txt"]);
+            // A clean of a build's folder leaves the tracked file out of the PC's tree while the index still names it, as
+            // a build of this worktree would: the manifest holds none, and the install finds it git tracks.
+            fs::remove_file(root.join("bin").join("a.txt")).expect("the file can be removed");
+            let source = folder.join("source");
+            put(&source, "bin/a.txt", b"box");
+            let archive = folder.join("outputs.tar.zst");
+            let file = File::create(&archive).expect("the archive can be made");
+            let found = walk(&source, &Globs::new(&["**".to_owned()]).expect("a glob")).expect("the source is walked");
+            let chosen: Vec<Chosen<'_>> = found.iter().map(Chosen::from).collect();
+            pack(file, &source, &chosen, &HeldBy::new()).expect("the archive is packed");
+            let state = folder.join("state");
+            fs::create_dir_all(state.join("remote")).expect("the remote folder can be made");
+            let key = "app-1a2b3c4d";
+            let marker = gate_state::v1::outputs_pending_path(&state, key);
+            fs::write(&marker, "").expect("the marker can be written");
+            let record = gate_state::v1::outputs_from_path(&state, key);
+            fs::write(&record, "mac-1").expect("the record can be written");
+            let globs = ["**/bin/**".to_owned()];
+            let root = root.to_string_lossy().into_owned();
+            let log = folder.join("out.log");
+            let call = call_in(&root, &state, &log);
+            let transport = nowhere();
+            let mut attempt = Attempt::for_tests(&call, &transport);
+            let held = Archive::new(Path::new(&root), archive);
+            let manifest = Manifest::default();
+            let fetched = Fetched {
+                archive: &held,
+                stage: folder.join("stage"),
+                marker: Some(marker.as_path()),
+                manifest: &manifest,
+                globs: &globs,
+                main_tree: r"D:\gate-remote\work\app-1a2b3c4d".to_owned(),
+                sibling_trees: Vec::new(),
+                started: Instant::now(),
+                snapshot: SystemTime::now() - Duration::from_hours(1),
+                pulled: Duration::ZERO,
+                reports: None,
+            };
+
+            let (end, complete) = installed(&mut attempt, &fetched);
+
+            assert!(matches!(end, End::Status(0)), "{end:?}");
+            assert!(!complete, "a file git tracks skipped leaves the install incomplete");
+            assert_eq!(
+                fs::read_to_string(&record).expect("the record is there"),
+                "mac-1",
+                "an incomplete install records no builder"
+            );
+            assert!(marker.is_file(), "the marker stays, so the next run is full");
+        }
+
+        /// An install of a failed run's reports is complete but brings no outputs back, so it records no builder: the
+        /// record stays as it was, and the marker stays too.
+        #[test]
+        fn a_reports_install_leaves_the_record() {
+            let folder = scratch("record-reports");
+            let root = folder.join("root");
+            fs::create_dir_all(&root).expect("the worktree can be made");
+            let source = folder.join("source");
+            fs::create_dir_all(&source).expect("the source folder can be made");
+            let archive = folder.join("outputs.tar.zst");
+            let file = File::create(&archive).expect("the archive can be made");
+            pack(file, &source, &[], &HeldBy::new()).expect("an archive of no members is packed");
+            let state = folder.join("state");
+            fs::create_dir_all(state.join("remote")).expect("the remote folder can be made");
+            let key = "app-1a2b3c4d";
+            let marker = gate_state::v1::outputs_pending_path(&state, key);
+            fs::write(&marker, "").expect("the marker can be written");
+            let record = gate_state::v1::outputs_from_path(&state, key);
+            fs::write(&record, "mac-1").expect("the record can be written");
+            let globs = ["**/bin/**".to_owned()];
+            let narrowed = Globs::new(&globs).expect("the globs are well formed");
+            let root = root.to_string_lossy().into_owned();
+            let log = folder.join("out.log");
+            let call = call_in(&root, &state, &log);
+            let transport = nowhere();
+            let mut attempt = Attempt::for_tests(&call, &transport);
+            let held = Archive::new(Path::new(&root), archive);
+            let manifest = Manifest::default();
+            let fetched = Fetched {
+                archive: &held,
+                stage: folder.join("stage"),
+                marker: Some(marker.as_path()),
+                manifest: &manifest,
+                globs: &globs,
+                main_tree: r"D:\gate-remote\work\app-1a2b3c4d".to_owned(),
+                sibling_trees: Vec::new(),
+                started: Instant::now(),
+                snapshot: SystemTime::now() - Duration::from_hours(1),
+                pulled: Duration::ZERO,
+                reports: Some((&narrowed, Narrowed::TestReports)),
+            };
+
+            let (end, complete) = installed(&mut attempt, &fetched);
+
+            assert!(matches!(end, End::Status(0)), "{end:?}");
+            assert!(complete, "a reports install of no members skipped nothing");
+            assert_eq!(
+                fs::read_to_string(&record).expect("the record is there"),
+                "mac-1",
+                "a failed run's reports record no builder"
+            );
+            assert!(marker.is_file(), "the marker stays, as a failed run's reports never clear it");
+        }
+
+        /// A record the gate cannot write is said, and its marker is left: a complete install that cannot record its
+        /// builder still makes the next run ask for every output that differs.
+        #[test]
+        fn a_complete_install_whose_record_cannot_be_written_keeps_the_marker() {
+            let folder = scratch("record-unwritable-install");
+            let root = folder.join("root");
+            fs::create_dir_all(&root).expect("the worktree can be made");
+            let source = folder.join("source");
+            fs::create_dir_all(&source).expect("the source folder can be made");
+            let archive = folder.join("outputs.tar.zst");
+            let file = File::create(&archive).expect("the archive can be made");
+            pack(file, &source, &[], &HeldBy::new()).expect("an archive of no members is packed");
+            let state = folder.join("state");
+            fs::create_dir_all(state.join("remote")).expect("the remote folder can be made");
+            let key = "app-1a2b3c4d";
+            let marker = gate_state::v1::outputs_pending_path(&state, key);
+            fs::write(&marker, "").expect("the marker can be written");
+            // A folder where the record belongs, which the write's move over it cannot replace.
+            let record = gate_state::v1::outputs_from_path(&state, key);
+            fs::create_dir(&record).expect("the folder can be made");
+            let globs = ["**/bin/**".to_owned()];
+            let root = root.to_string_lossy().into_owned();
+            let log = folder.join("out.log");
+            let call = call_in(&root, &state, &log);
+            let transport = nowhere();
+            let mut attempt = Attempt::for_tests(&call, &transport);
+            let held = Archive::new(Path::new(&root), archive);
+            let manifest = Manifest::default();
+            let fetched = Fetched {
+                archive: &held,
+                stage: folder.join("stage"),
+                marker: Some(marker.as_path()),
+                manifest: &manifest,
+                globs: &globs,
+                main_tree: r"D:\gate-remote\work\app-1a2b3c4d".to_owned(),
+                sibling_trees: Vec::new(),
+                started: Instant::now(),
+                snapshot: SystemTime::now() - Duration::from_hours(1),
+                pulled: Duration::ZERO,
+                reports: None,
+            };
+
+            let (end, complete) = installed(&mut attempt, &fetched);
+
+            assert!(matches!(end, End::Status(0)), "{end:?}");
+            assert!(complete, "an install that skipped nothing completed");
+            assert!(marker.is_file(), "a record the gate cannot write leaves the marker");
+            assert!(record.is_dir(), "the record's place holds the folder that was there");
+        }
     }
 
     #[test]

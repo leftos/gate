@@ -126,13 +126,8 @@ fn shared_files(state: &Path, key: &str) -> [PathBuf; 5] {
         v1::nothing_back_path(state, key),
         v1::warm_record_path(state, key),
         v1::warm_log_path(state, key),
-        outputs_from_path(state, key),
+        v1::outputs_from_path(state, key),
     ]
-}
-
-/// The record of which builder last brought `key`'s outputs back, `<state>\remote\<key>.outputs-from`.
-fn outputs_from_path(state: &Path, key: &str) -> PathBuf {
-    v1::builder_cache_dir(state, None).join(format!("{key}.outputs-from"))
 }
 
 /// Removes the file at `path`, one that is not there being removed; else says why it cannot be, and is false.
