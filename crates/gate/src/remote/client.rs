@@ -39,6 +39,7 @@ use gate_state::v1::{self, WarmFailure};
 use gate_state::{FallbackReason, KernelObject, key_hash};
 use gate_win32::{AcquireError, Interrupt, Job, NamedMutex, OwnedMutexGuard, PipedConsole, Running, Share};
 use gate_wire::build_version;
+use gate_wire::slots::{BOX_SLOTS_LINE, BoxSlots};
 use gate_wire::stamp::{self, Tag};
 use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
@@ -2313,6 +2314,7 @@ impl Attempt<'_, '_> {
             };
             attempt.ssh(BoxVerb::Preflight, Echo::LogOnly, watch, raise, only)
         })?;
+        let at = Timestamp::now();
         let new_tree = new_work_tree(&called.lines);
         let created = called
             .lines
@@ -2324,7 +2326,13 @@ impl Attempt<'_, '_> {
         let sdks = sdks_of(&called.lines);
         let tools = toolchain::reported(&called.lines, &sent);
         let ended = preflight_ended(self.call.host(), self.profile().root(), &called);
+        let cache = v1::box_slots_path(self.call.state_dir, self.call.builder.id.as_deref());
+        let unkept = box_slots_kept(&called.lines, &ended, &cache, at);
         self.lines.append(&mut called.lines);
+        // The cache is ops-tower's, not the run's: its problems go to the log alone.
+        for problem in unkept {
+            self.logged_kept(format!("gate: {problem}"));
+        }
         self.not_started_if_killed("the preflight", &called)?;
         if let Err((line, end)) = ended {
             if let Some(line) = line {
@@ -5398,6 +5406,55 @@ fn warm_reason(end: &End, started: bool) -> String {
     }
 }
 
+/// The builder's own slots its preflight `lines` said, from the last box slots line ([`BOX_SLOTS_LINE`]); `None` when
+/// it said none. Else why the one it said is ignored, with no prefix.
+pub(crate) fn box_slots_of(lines: &[String]) -> Result<Option<BoxSlots>, String> {
+    let Some(line) = lines.iter().rev().find(|line| line.starts_with(BOX_SLOTS_LINE)) else {
+        return Ok(None);
+    };
+    BoxSlots::of_line(line)
+        .map(Some)
+        .map_err(|why| format!("ignored a malformed box slots line: {}", escaped(&why)))
+}
+
+/// Writes the builder's own slots `slots`, read at `at`, as its cache at `path` ([`v1::box_slots_path`]).
+fn cache_box_slots(path: &Path, at: Timestamp, slots: &BoxSlots) -> io::Result<()> {
+    v1::write_box_slots(path, &v1::BoxSlotsRecord::read_at(at, slots))
+}
+
+/// The builder's own slots its preflight `lines` said ([`box_slots_of`]), read at `at`, cached at `path`, or the cache
+/// there removed when they said none or a malformed line, so no stale one stays. The slots read, and the problems to
+/// say, with no prefix: a malformed line, a cache that cannot be written or removed.
+pub(crate) fn box_slots_cached(lines: &[String], path: &Path, at: Timestamp) -> (Option<BoxSlots>, Vec<String>) {
+    let mut problems = Vec::new();
+    let slots = box_slots_of(lines).unwrap_or_else(|problem| {
+        problems.push(problem);
+        None
+    });
+    let (verb, kept) = match &slots {
+        Some(slots) => ("write", cache_box_slots(path, at, slots)),
+        None => ("remove", v1::remove_box_slots(path)),
+    };
+    if let Err(error) = kept {
+        problems.push(format!(
+            "cannot {verb} the box slots cache {}: {error}",
+            escaped(&path.display().to_string())
+        ));
+    }
+    (slots, problems)
+}
+
+/// Caches at `path`, read at `at`, the builder's own slots a preflight that ended `ended` said among its `lines`
+/// ([`box_slots_cached`]): for one that passed, or was refused `full` by a builder of this build; for any other, a
+/// version refusal among them, the cache is neither written nor removed. The problems to say, with no prefix.
+fn box_slots_kept(lines: &[String], ended: &Result<(), (Option<String>, End)>, path: &Path, at: Timestamp) -> Vec<String> {
+    let answered = matches!(ended, Ok(()) | Err((_, End::Refused(FallbackReason::Full))));
+    if !answered || other_build(their_version(lines), &build_version()).is_some() {
+        return Vec::new();
+    }
+    box_slots_cached(lines, path, at).1
+}
+
 /// The builder's version, from the last `gate: remote version <v>` line of its preflight; `None` when it said none.
 pub(crate) fn their_version(lines: &[String]) -> Option<&str> {
     lines.iter().rev().find_map(|line| line.strip_prefix(VERSION)).map(str::trim)
@@ -5809,7 +5866,7 @@ mod tests {
         sdks_of, seconds, their_version, version_refusal,
     };
     use super::{CSPROJ_BYTES, CSPROJ_FILES, Entry, csproj_pins, entries_of, manifest_entry, small_blobs_of};
-    use super::{Carried, VERSION, preflight_ended};
+    use super::{Carried, VERSION, box_slots_kept, preflight_ended};
     use super::{DRAIN, KILLED, Received};
     use super::{KeyHold, RunEnd, Warm, cold_line, hold_key, hold_key_waiting, new_work_tree, status_end, warm_end, warm_of};
     use crate::boxside::WORK_ROOT_STEP;
@@ -5828,8 +5885,11 @@ mod tests {
     use crate::remote::{INSTALL_UNTRUSTED, install_untrusted_line};
     use crate::remote::{Refusal, RemoteCall, RemoteClient, Sibling, WarmEnd, Warmth, adjusted_line, busy_line, carried, refused_line, started_line};
     use crate::run::CONTROL_C_EXIT;
-    use gate_router::BuilderOs;
-    use gate_state::v1::WarmFailure;
+    use gate_router::{BuilderOs, escaped};
+    use gate_state::v1::{self, WarmFailure};
+    use gate_wire::build_version;
+    use gate_wire::slots::{BoxSlots, Claim, HoldClaim, Holder};
+    use jiff::Timestamp;
 
     /// A state root no gate uses; no test here takes its key's lock.
     static STATE: LazyLock<StateRoot> = LazyLock::new(|| StateRoot::new(r"C:\gate-client-tests", None));
@@ -8195,6 +8255,166 @@ mod tests {
         assert_eq!(heard.last_error.as_deref(), Some("next"));
         let lines = heard.kept.into_lines();
         assert_eq!(lines.iter().map(String::len).collect::<Vec<_>>(), [LINE_CAP, 4]);
+    }
+
+    /// A box slots line of a builder with two slots, slot 0 held by a hold.
+    fn box_slots_line() -> String {
+        BoxSlots {
+            now: "2026-10-28T12:00:04Z".to_owned(),
+            count: Some(2),
+            count_problem: None,
+            unreadable: 0,
+            more: 0,
+            holders: vec![Holder {
+                slot: 0,
+                claim: Claim::Hold(HoldClaim {
+                    holder: "github-actions app ci/test run 7".to_owned(),
+                    ceiling: 600,
+                    pid: 42,
+                    started: "2026-10-28T11:00:00Z".to_owned(),
+                }),
+            }],
+        }
+        .line()
+    }
+
+    /// A preflight's lines holding [`box_slots_line`] among others.
+    fn lines_with_box_slots() -> Vec<String> {
+        vec![
+            format!("{VERSION}{}", build_version()),
+            "gate: remote boot 2026-10-28T08:00:00Z".to_owned(),
+            box_slots_line(),
+        ]
+    }
+
+    /// The box slots cache of `host` in a fresh state root of the test `name`, none there yet.
+    fn box_slots_cache(name: &str) -> PathBuf {
+        let state = crate::test_support::temp_dir().join(format!("gate-client-box-slots-{name}-{}", std::process::id()));
+        if state.exists() {
+            fs::remove_dir_all(&state).expect("an earlier run's folder is removed");
+        }
+        v1::box_slots_path(&state, None)
+    }
+
+    /// What [`box_slots_kept`] returns with no problem to say.
+    const NOTHING_SAID: Vec<String> = Vec::new();
+
+    /// The record a cache holds.
+    fn cached(path: &Path) -> v1::BoxSlotsRecord {
+        v1::box_slots(&fs::read(path).expect("the cache was written")).expect("the cache reads")
+    }
+
+    #[test]
+    fn a_passing_preflight_that_says_its_box_slots_caches_them_with_the_time_it_read_them() {
+        let path = box_slots_cache("passed");
+        let at: Timestamp = "2026-10-28T12:00:05Z".parse().expect("a time");
+
+        assert_eq!(box_slots_kept(&lines_with_box_slots(), &Ok(()), &path, at), NOTHING_SAID);
+
+        let record = cached(&path);
+        assert_eq!(record.at, at);
+        assert_eq!(record.now, "2026-10-28T12:00:04Z");
+        assert_eq!(record.count, Some(2));
+        assert_eq!(
+            record.holders,
+            [v1::BoxSlotHolder::Hold {
+                slot: 0,
+                holder: "github-actions app ci/test run 7".to_owned(),
+                ceiling: 600,
+                builder_pid: 42,
+                started: "2026-10-28T11:00:00Z".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_full_refusal_that_says_its_box_slots_caches_them() {
+        let path = box_slots_cache("full");
+        let at: Timestamp = "2026-10-28T12:00:05Z".parse().expect("a time");
+        let full = Err((None, End::Refused(FallbackReason::Full)));
+
+        assert_eq!(box_slots_kept(&lines_with_box_slots(), &full, &path, at), NOTHING_SAID);
+
+        assert_eq!(cached(&path).holders.len(), 1);
+    }
+
+    #[test]
+    fn a_version_refusal_leaves_the_cache_as_it_was() {
+        let path = box_slots_cache("version");
+        let version = Err((Some("gate: not routed".to_owned()), End::Refused(FallbackReason::Version)));
+
+        assert_eq!(
+            box_slots_kept(&lines_with_box_slots(), &version, &path, Timestamp::UNIX_EPOCH),
+            NOTHING_SAID
+        );
+        assert!(!path.exists(), "a version refusal caches nothing");
+        stale_cache(&path);
+        let without = vec![format!("{VERSION}{}", build_version())];
+        let root = Err((Some("gate: not routed: root".to_owned()), End::Refused(FallbackReason::Root)));
+        assert_eq!(box_slots_kept(&without, &root, &path, Timestamp::UNIX_EPOCH), NOTHING_SAID);
+        assert!(path.exists(), "a refusal other than full, by a box of this build, removes nothing");
+    }
+
+    #[test]
+    fn a_full_refusal_from_a_box_of_another_build_caches_nothing() {
+        let path = box_slots_cache("other-build");
+        let lines = vec![format!("{VERSION}0.0.0-another-build"), box_slots_line()];
+        let full = Err((None, End::Refused(FallbackReason::Full)));
+
+        assert_eq!(box_slots_kept(&lines, &full, &path, Timestamp::UNIX_EPOCH), NOTHING_SAID);
+
+        assert!(!path.exists(), "a box of another build caches nothing");
+    }
+
+    /// Writes a cache at `path`, as an earlier preflight left it.
+    fn stale_cache(path: &Path) {
+        let slots = BoxSlots::of_line(&box_slots_line()).expect("the line reads");
+        v1::write_box_slots(path, &v1::BoxSlotsRecord::read_at(Timestamp::UNIX_EPOCH, &slots)).expect("the cache can be written");
+    }
+
+    #[test]
+    fn a_passing_preflight_with_no_box_slots_line_removes_the_cache() {
+        let path = box_slots_cache("no-line");
+        stale_cache(&path);
+        let without = vec![format!("{VERSION}{}", build_version())];
+
+        assert_eq!(box_slots_kept(&without, &Ok(()), &path, Timestamp::UNIX_EPOCH), NOTHING_SAID);
+
+        assert!(!path.exists(), "the stale cache is removed");
+        assert_eq!(
+            box_slots_kept(&without, &Ok(()), &path, Timestamp::UNIX_EPOCH),
+            NOTHING_SAID,
+            "none there is no problem"
+        );
+    }
+
+    #[test]
+    fn a_malformed_box_slots_line_removes_the_cache_and_is_said() {
+        let path = box_slots_cache("malformed");
+        stale_cache(&path);
+        let lines = vec![
+            format!("{VERSION}{}", build_version()),
+            r#"gate: remote box slots {"v":2,"now":"t","count":1,"holders":[]}"#.to_owned(),
+        ];
+
+        let said = box_slots_kept(&lines, &Ok(()), &path, Timestamp::UNIX_EPOCH);
+
+        assert_eq!(said, ["ignored a malformed box slots line: its v is not 1"]);
+        assert!(!path.exists(), "the stale cache is removed");
+    }
+
+    #[test]
+    fn a_box_slots_cache_that_cannot_be_written_is_said() {
+        let path = box_slots_cache("unwritable");
+        let remote = path.parent().expect("the cache has a folder");
+        fs::create_dir_all(remote).expect("the remote folder can be made");
+        fs::create_dir(&path).expect("a folder stands at the cache's name");
+
+        let said = box_slots_kept(&lines_with_box_slots(), &Ok(()), &path, Timestamp::UNIX_EPOCH);
+
+        let cannot = format!("cannot write the box slots cache {}: ", escaped(&path.display().to_string()));
+        assert!(matches!(said.as_slice(), [line] if line.starts_with(&cannot)), "{said:?}");
+        assert!(path.is_dir(), "what stood there is left");
     }
 
     fn unwritten_log() -> std::path::PathBuf {

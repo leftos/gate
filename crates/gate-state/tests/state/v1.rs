@@ -488,6 +488,152 @@ fn a_worktree_record_of_another_shape_is_refused() {
     }
 }
 
+const BOX_SLOTS_TEXT: &str = include_str!("fixtures/v1-box-slots.json");
+
+/// The record `v1-box-slots.json` holds.
+fn box_slots_record() -> v1::BoxSlotsRecord {
+    v1::BoxSlotsRecord {
+        at: ts("2026-10-28T12:00:05Z"),
+        now: "2026-10-28T12:00:04Z".to_owned(),
+        count: Some(2),
+        count_problem: None,
+        unreadable: 0,
+        more: 0,
+        holders: vec![
+            v1::BoxSlotHolder::Session {
+                slot: 0,
+                session: "0123456789abcdef0123456789abcdef".to_owned(),
+                pc: "PC-1".to_owned(),
+                repo: "app".to_owned(),
+                command: "cargo test".to_owned(),
+                taken: "2026-10-28T11:58:00Z".to_owned(),
+            },
+            v1::BoxSlotHolder::Hold {
+                slot: 1,
+                holder: "github-actions app ci/test run 7".to_owned(),
+                ceiling: 3600,
+                builder_pid: 4242,
+                started: "2026-10-28T11:30:00Z".to_owned(),
+            },
+        ],
+    }
+}
+
+#[test]
+fn the_box_slots_cache_sits_in_the_remote_folder_named_by_the_builder_s_id_or_host() {
+    let root = Path::new("state-root");
+
+    assert_eq!(
+        parts_under(root, &v1::box_slots_path(root, Some("1a2b3c4d"))),
+        ["remote", "1a2b3c4d.box-slots"]
+    );
+    assert_eq!(parts_under(root, &v1::box_slots_path(root, None)), ["remote", "host.box-slots"]);
+}
+
+#[test]
+fn the_box_slots_fixture_reads_as_the_record_it_holds() {
+    assert_eq!(
+        v1::box_slots(BOX_SLOTS_TEXT.trim_end().as_bytes()).expect("the fixture reads"),
+        box_slots_record()
+    );
+}
+
+#[test]
+fn a_box_slots_record_is_written_whole_with_v_first_and_read_back() {
+    let root = scratch("box-slots");
+    let path = v1::box_slots_path(&root, None);
+    let mut written = box_slots_record();
+    v1::write_box_slots(&path, &written).expect("the record can be written");
+    let text = fs::read_to_string(&path).expect("the record can be read");
+    assert_eq!(text, BOX_SLOTS_TEXT.trim_end(), "written as the fixture holds it");
+    assert_eq!(v1::box_slots(text.as_bytes()).expect("the record reads"), written);
+
+    written.count = None;
+    written.count_problem = Some("its v is not 1".to_owned());
+    written.unreadable = 1;
+    written.more = 3;
+    v1::write_box_slots(&path, &written).expect("the last writer wins");
+    let text = fs::read_to_string(&path).expect("the record can be read");
+    assert!(
+        text.contains(r#""count":null,"countProblem":"its v is not 1","unreadable":1,"more":3,"#),
+        "{text}"
+    );
+    assert_eq!(v1::box_slots(text.as_bytes()).expect("the record reads"), written);
+    let names: Vec<_> = fs::read_dir(v1::remote_dir(&root))
+        .expect("the remote folder can be listed")
+        .map(|entry| entry.expect("an entry can be read").file_name())
+        .collect();
+    assert_eq!(names, ["host.box-slots"], "no temp file is left beside it");
+}
+
+#[test]
+fn a_box_slots_record_of_another_version_or_a_hold_naming_a_pid_is_refused() {
+    let hold = r#"{"kind":"hold","slot":1,"holder":"h","ceiling":5,"builderPid":7,"started":"t"}"#;
+    let body = |v: &str, holder: &str| format!(r#"{{"v":{v},"at":"2026-10-28T12:00:05Z","now":"t","count":1,"holders":[{holder}]}}"#);
+    assert!(v1::box_slots(body("1", hold).as_bytes()).is_ok(), "the hold as written reads");
+    let with_pid = hold.replace(r#""builderPid":7"#, r#""pid":7"#);
+    let with_both = hold.replace(r#""builderPid":7"#, r#""builderPid":7,"pid":7"#);
+    let rows: [(&str, String); 6] = [
+        ("another version", body("2", hold)),
+        ("no version", body("1", hold).replace(r#""v":1,"#, "")),
+        ("a hold naming a pid", body("1", &with_pid)),
+        ("a hold naming a pid beside its builderPid", body("1", &with_both)),
+        ("an at that is no time", body("1", hold).replace("2026-10-28T12:00:05Z", "noon")),
+        (
+            "a holder of another kind",
+            body("1", &hold.replace(r#""kind":"hold""#, r#""kind":"other""#)),
+        ),
+    ];
+    for (label, text) in rows {
+        assert!(v1::box_slots(text.as_bytes()).is_err(), "{label}: {text}");
+    }
+    assert!(v1::box_slots(b"\xff").is_err(), "not UTF-8");
+}
+
+#[test]
+fn removing_a_box_slots_cache_that_is_not_there_is_ok() {
+    let root = scratch("box-slots-missing");
+    let path = v1::box_slots_path(&root, None);
+    assert!(!path.exists());
+
+    v1::remove_box_slots(&path).expect("a cache not there counts as removed");
+}
+
+#[test]
+fn a_box_slots_cache_is_removed() {
+    let root = scratch("box-slots-removed");
+    let path = v1::box_slots_path(&root, None);
+    v1::write_box_slots(&path, &box_slots_record()).expect("the record can be written");
+
+    v1::remove_box_slots(&path).expect("the cache is removed");
+
+    assert!(!path.exists());
+}
+
+/// A box slots record holding `count` and one hold whose `builderPid` is `pid`.
+fn box_slots_text(count: &str, pid: &str) -> String {
+    let hold = format!(r#"{{"kind":"hold","slot":0,"holder":"h","ceiling":5,"builderPid":{pid},"started":"t"}}"#);
+    format!(r#"{{"v":1,"at":"2026-10-28T12:00:05Z","now":"t","count":{count},"holders":[{hold}]}}"#)
+}
+
+#[test]
+fn a_box_slots_record_with_a_count_of_0_is_refused() {
+    assert!(v1::box_slots(box_slots_text("1", "7").as_bytes()).is_ok(), "a count of 1 reads");
+    assert!(v1::box_slots(box_slots_text("0", "7").as_bytes()).is_err());
+}
+
+#[test]
+fn a_box_slots_record_with_a_count_above_64_is_refused() {
+    assert!(v1::box_slots(box_slots_text("64", "7").as_bytes()).is_ok(), "a count of 64 reads");
+    assert!(v1::box_slots(box_slots_text("65", "7").as_bytes()).is_err());
+}
+
+#[test]
+fn a_box_slots_record_with_a_builder_pid_of_0_is_refused() {
+    assert!(v1::box_slots(box_slots_text("1", "1").as_bytes()).is_ok(), "a builderPid of 1 reads");
+    assert!(v1::box_slots(box_slots_text("1", "0").as_bytes()).is_err());
+}
+
 #[test]
 fn needs_write_when_the_worktree_record_is_missing_or_unreadable() {
     assert!(v1::needs_write(None, &worktree(worktree_now())));

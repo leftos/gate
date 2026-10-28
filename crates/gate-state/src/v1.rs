@@ -12,12 +12,13 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use gate_wire::slots::{BoxSlots, Claim as BoxClaim, Holder, MOST_SLOTS};
 use jiff::{SignedDuration, Timestamp};
 use serde::de::{self, DeserializeOwned, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-use crate::counts::{PoolCount, ignored_line, write_replacing, write_replacing_once};
+use crate::counts::{PoolCount, WRITE_ATTEMPTS, ignored_line, remove_if_present, with_retry, write_replacing, write_replacing_once};
 use crate::model::{SlotCount, SlotCounts, SlotKind};
 use crate::root::KernelObject;
 
@@ -120,15 +121,20 @@ pub fn remote_dir(root: &Path) -> PathBuf {
 /// else `<root>\remote\<id>`, so two builders' caches of one worktree never mix.
 #[must_use]
 pub fn builder_cache_dir(root: &Path, id: Option<&str>) -> PathBuf {
-    debug_assert!(
-        id.is_none_or(|id| id.len() == 8 && id.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))),
-        "a builder's id is 8 lower-case hex digits: {id:?}"
-    );
+    debug_assert_builder_id(id);
     let remote = remote_dir(root);
     match id {
         Some(id) => remote.join(id),
         None => remote,
     }
+}
+
+/// Asserts, in a debug build, that a builder's `id` is 8 lower-case hex digits; `None`, `host`'s, always passes.
+fn debug_assert_builder_id(id: Option<&str>) {
+    debug_assert!(
+        id.is_none_or(|id| id.len() == 8 && id.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))),
+        "a builder's id is 8 lower-case hex digits: {id:?}"
+    );
 }
 
 /// The folder of the drain markers, `<root>\remote\drain`: one folder a builder ([`drain_marker_dir`]).
@@ -143,10 +149,7 @@ pub fn drain_dir(root: &Path) -> PathBuf {
 /// wait and one that opens is dead.
 #[must_use]
 pub fn drain_marker_dir(root: &Path, id: Option<&str>) -> PathBuf {
-    debug_assert!(
-        id.is_none_or(|id| id.len() == 8 && id.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))),
-        "a builder's id is 8 lower-case hex digits: {id:?}"
-    );
+    debug_assert_builder_id(id);
     drain_dir(root).join(id.unwrap_or("host"))
 }
 
@@ -525,6 +528,165 @@ pub fn write_prune_sweep_stamp(path: &Path, stamp: &PruneSweepStamp) -> io::Resu
 pub fn prune_sweep_stamp(bytes: &[u8]) -> Result<PruneSweepStamp, FormatError> {
     let text = std::str::from_utf8(bytes).map_err(|_| FormatError::Syntax("not UTF-8".to_owned()))?;
     parse_strict(text)
+}
+
+/// The cache of the builder whose id is `id`'s own held slots, `<root>\remote\<id>.box-slots`, or
+/// `<root>\remote\host.box-slots` for `host`, which has none ([`BoxSlotsRecord`]).
+#[must_use]
+pub fn box_slots_path(root: &Path, id: Option<&str>) -> PathBuf {
+    debug_assert_builder_id(id);
+    remote_dir(root).join(format!("{}.box-slots", id.unwrap_or("host")))
+}
+
+/// The builder's own held slots as its last preflight on this PC said them ([`box_slots_path`]): the JSON object
+/// `{"v": 1, "at": …, "now": …, "count": N|null, "countProblem"?: …, "unreadable"?: N, "more"?: N, "holders": […]}`.
+/// `at` is this PC's clock when it read the line, written as a claim's times are; every other field is the box's line
+/// as it said it, its times the box's own text, so a holder's age is `now` minus its `taken` or `started`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoxSlotsRecord {
+    /// When this PC read the box's line.
+    #[serde(with = "iso_time")]
+    pub at: Timestamp,
+    /// The box's clock when it looked, in UTC, as the box wrote it.
+    pub now: String,
+    /// The builder's slot count; `None` with no count file or one that does not read.
+    pub count: Option<u32>,
+    /// Why the builder's count file did not read, for one that is there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_problem: Option<String>,
+    /// How many claim files did not read or are no claim; written only when not 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unreadable: usize,
+    /// How many claims that read the box's line left out; written only when not 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub more: usize,
+    /// The claims the line holds, by slot, live or not: the box judges none of them for its look.
+    pub holders: Vec<BoxSlotHolder>,
+}
+
+impl BoxSlotsRecord {
+    /// The record of the box's look `slots`, read on this PC at `at`.
+    #[must_use]
+    pub fn read_at(at: Timestamp, slots: &BoxSlots) -> BoxSlotsRecord {
+        BoxSlotsRecord {
+            at,
+            now: slots.now.clone(),
+            count: slots.count,
+            count_problem: slots.count_problem.clone(),
+            unreadable: slots.unreadable,
+            more: slots.more,
+            holders: slots.holders.iter().map(BoxSlotHolder::of).collect(),
+        }
+    }
+
+    /// Why the record breaks a rule of the box's line its types cannot carry, as the line's reader refuses it: a `count`
+    /// that is not 1 to [`MOST_SLOTS`], or a hold whose `builderPid` is 0.
+    fn problem(&self) -> Option<String> {
+        if self.count.is_some_and(|count| !(1..=MOST_SLOTS).contains(&count)) {
+            return Some(format!("its count is not null or a whole number from 1 to {MOST_SLOTS}"));
+        }
+        self.holders
+            .iter()
+            .position(|holder| matches!(holder, BoxSlotHolder::Hold { builder_pid: 0, .. }))
+            .map(|at| format!("its holder {at}: its builderPid is not a process id above 0"))
+    }
+}
+
+/// One claim of a [`BoxSlotsRecord`], by its `kind`: a routed run's drain session, or a `gate box hold`. A hold's process
+/// id is the builder's, `builderPid`, never `pid`, so no reader takes it for a process on this PC; a holder with a field
+/// its kind does not have is refused.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum BoxSlotHolder {
+    /// A slot a routed run's drain session holds.
+    Session {
+        /// The slot's index.
+        slot: usize,
+        /// The drain session.
+        session: String,
+        /// The host name of the PC that sent the run.
+        pc: String,
+        /// The run's repository.
+        repo: String,
+        /// The run's command.
+        command: String,
+        /// When the slot was taken, the box's text.
+        taken: String,
+    },
+    /// A slot a `gate box hold` holds.
+    Hold {
+        /// The slot's index.
+        slot: usize,
+        /// The holder's text.
+        holder: String,
+        /// The hold's ceiling, in seconds.
+        ceiling: u64,
+        /// The hold's process id on the builder.
+        #[serde(rename = "builderPid")]
+        builder_pid: u32,
+        /// When the hold started, the box's text.
+        started: String,
+    },
+}
+
+impl BoxSlotHolder {
+    /// The holder the box's line said as `holder`.
+    fn of(holder: &Holder) -> BoxSlotHolder {
+        match &holder.claim {
+            BoxClaim::Session(claim) => BoxSlotHolder::Session {
+                slot: holder.slot,
+                session: claim.session.clone(),
+                pc: claim.pc.clone(),
+                repo: claim.repo.clone(),
+                command: claim.command.clone(),
+                taken: claim.taken.clone(),
+            },
+            BoxClaim::Hold(claim) => BoxSlotHolder::Hold {
+                slot: holder.slot,
+                holder: claim.holder.clone(),
+                ceiling: claim.ceiling,
+                builder_pid: claim.pid,
+                started: claim.started.clone(),
+            },
+        }
+    }
+}
+
+/// Writes the box slots `record` at `path` ([`box_slots_path`]) whole or not at all, the move over it retried while a
+/// reader holds the file ([`write_replacing`]): the last writer wins.
+///
+/// # Errors
+///
+/// A folder, temp file or move that fails.
+pub fn write_box_slots(path: &Path, record: &BoxSlotsRecord) -> io::Result<()> {
+    write_replacing(path, &versioned_text(record)?)
+}
+
+/// Removes the box slots cache at `path` ([`box_slots_path`]), retried while a reader holds the file as
+/// [`write_box_slots`] retries; one not there counts as removed.
+///
+/// # Errors
+///
+/// A removal that fails on every try.
+pub fn remove_box_slots(path: &Path) -> io::Result<()> {
+    with_retry(WRITE_ATTEMPTS, || remove_if_present(path))
+}
+
+/// The box slots record a file's bytes hold, read strictly as every file of this module is; fields of the record it
+/// does not know are ignored, but not a holder's.
+///
+/// # Errors
+///
+/// Bytes that are not UTF-8 or not the record's format, its `v` missing or not 1 among them, a hold that names a
+/// `pid`, and a value the box's line would refuse: a `count` of 0 or above [`MOST_SLOTS`], or a `builderPid` of 0.
+pub fn box_slots(bytes: &[u8]) -> Result<BoxSlotsRecord, FormatError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| FormatError::Syntax("not UTF-8".to_owned()))?;
+    let record: BoxSlotsRecord = parse_strict(text)?;
+    match record.problem() {
+        Some(problem) => Err(FormatError::Invalid(problem)),
+        None => Ok(record),
+    }
 }
 
 /// Where a work folder's warm-up stands.
@@ -1204,6 +1366,11 @@ impl<'de> Visitor<'de> for StrictValue<'_> {
 )]
 fn is_not_true(value: &Option<bool>) -> bool {
     *value != Some(true)
+}
+
+#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde's skip_serializing_if passes the field by reference")]
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// A time as an ISO 8601 UTC string: written with seven fractional digits and `Z`, read from any RFC 3339 time.

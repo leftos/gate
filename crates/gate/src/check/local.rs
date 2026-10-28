@@ -333,6 +333,7 @@ fn checked(place: &Place, seams: &CheckSeams) -> Checked {
         siblings_skipped: false,
         warmup: warmed.items,
         tailscale: None,
+        box_slots: None,
     }
 }
 

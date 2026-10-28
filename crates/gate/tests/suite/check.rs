@@ -1495,6 +1495,74 @@ fn check_builder_lists_every_item_and_exits_0_when_nothing_is_missing() {
     assert_eq!(calls(&steps), ["preflight"], "one call reached the builder");
 }
 
+/// A builder with a slot count says its held slots in the check's report, one line a holder after the count, and the
+/// check caches them, stamped with the time it read them, in the state root `GATE_STATE_DIR` names; it takes no slot.
+#[test]
+fn check_builder_says_the_builder_s_held_slots_and_caches_them() {
+    let case = builder_case("check_builder_box_slots");
+    let slots = builder_root(&case).join("slots");
+    fs::create_dir_all(&slots).expect("the slots folder can be made");
+    fs::write(builder_root(&case).join("slots.json"), r#"{"v":1,"slots":2}"#).expect("the count file can be written");
+    let hold = r#"{"v":1,"kind":"hold","holder":"a check case","ceiling":600,"pid":4242,"started":"2026-10-28T11:00:00Z"}"#;
+    fs::write(slots.join("0.json"), hold).expect("the claim can be written");
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+    let mut command = builder_check(&case, "builder-1", &[], &steps);
+    command.env("GATE_STATE_DIR", case.root());
+
+    let before = Timestamp::now();
+    let outcome = finish(command);
+    let after = Timestamp::now();
+
+    let [header, created] = first_lines(&case, "builder-1");
+    assert_eq!(
+        lines(&outcome.stdout),
+        [
+            header.as_str(),
+            created.as_str(),
+            "check: builder-1: app declares no toolchain",
+            "check: builder-1: tailscale path: not checked: tailscale is not installed",
+            "check: builder-1: box slots: 1 of 2 held",
+            "check: builder-1: box slot 0: hold by a check case (ceiling 600 s, builder pid 4242, started 2026-10-28T11:00:00Z)",
+            "check: builder-1: nothing missing",
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let cache = v1::box_slots_path(&case.root(), None);
+    let record = v1::box_slots(&fs::read(&cache).expect("the check wrote the cache")).expect("the cache reads");
+    assert!(before <= record.at && record.at <= after, "read during the check: {record:?}");
+    assert_eq!(record.count, Some(2));
+    assert_eq!(
+        record.holders,
+        [v1::BoxSlotHolder::Hold {
+            slot: 0,
+            holder: "a check case".to_owned(),
+            ceiling: 600,
+            builder_pid: 4242,
+            started: "2026-10-28T11:00:00Z".to_owned(),
+        }]
+    );
+    let pc_slots = case.root().join("slots");
+    assert!(
+        !pc_slots.exists() || fs::read_dir(&pc_slots).expect("the PC's slots folder can be listed").next().is_none(),
+        "the check takes no slot on this PC: {pc_slots:?}"
+    );
+    let journal = case.root().join("events.jsonl");
+    if journal.exists() {
+        let events = fs::read_to_string(&journal).expect("the journal can be read");
+        assert!(
+            !events.contains(r#""event":"take""#),
+            "the check took no slot, not even for a moment: {events}"
+        );
+    }
+    let claims: Vec<_> = fs::read_dir(&slots)
+        .expect("the builder's slots folder can be listed")
+        .map(|entry| entry.expect("an entry can be read").file_name())
+        .collect();
+    assert_eq!(claims, ["0.json"], "the check takes no slot on the builder");
+}
+
 /// Tailscale's status JSON with one peer, `builder-1` at an invented tailnet address, whose path fields are `path`.
 fn tailnet_with_builder(path: &str) -> String {
     let names = r#""HostName": "builder-1", "DNSName": "builder-1.tail0000.ts.net.""#;

@@ -663,6 +663,32 @@ fn a_routed_run_runs_on_the_box_and_passes_its_output_and_status() {
     assert!(log.contains(&format!("gate: pushed snapshot {} in ", &snapshot[..8])), "{log}");
 }
 
+/// A routed run whose builder has a slot count caches the builder's held slots its preflight said, its own session's
+/// among them, in `remote\host.box-slots` of its state root, stamped with the time the PC read them.
+#[test]
+fn a_routed_run_caches_the_builder_s_held_slots_its_preflight_said() {
+    let case = client_case("client-box-slots");
+    let builder = case.folder().join("builder");
+    fs::create_dir_all(&builder).expect("the builder root can be made");
+    fs::write(builder.join("slots.json"), r#"{"v":1,"slots":2}"#).expect("the count file can be written");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let before = jiff::Timestamp::now();
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there"]));
+    let after = jiff::Timestamp::now();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    let cache = gate_state::v1::box_slots_path(&case.root(), None);
+    let record = gate_state::v1::box_slots(&fs::read(&cache).expect("the run wrote the cache")).expect("the cache reads");
+    assert!(before <= record.at && record.at <= after, "read during the run: {record:?}");
+    assert_eq!(record.count, Some(2), "{record:?}");
+    assert!(
+        matches!(record.holders.as_slice(), [gate_state::v1::BoxSlotHolder::Session { slot: 0, .. }]),
+        "the run's own session holds slot 0: {record:?}"
+    );
+}
+
 /// The words of each `gat` process line of `log` that starts with `start`, its text split at spaces.
 fn process_words<'l>(log: &'l str, start: &str) -> Vec<Vec<&'l str>> {
     log.lines()

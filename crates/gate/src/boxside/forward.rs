@@ -33,7 +33,7 @@ use crate::log_writer::{LogSink, LogWriter};
 
 /// The most bytes of one stamped line: a longer line is written as several lines of at most this many bytes, each cut
 /// between two characters.
-pub(crate) const LINE_CAP: usize = 64 * 1024;
+pub(crate) const LINE_CAP: usize = gate_wire::slots::MOST_LINE_BYTES;
 
 /// How long the readers get, once the command's main process has exited, to reach the end of its output.
 pub(crate) const DRAIN: Duration = Duration::from_secs(2);

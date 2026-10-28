@@ -1,7 +1,8 @@
 //! What `gate check` says, as a pure function of where it looked ([`At`]) and what it found ([`Checked`]): a header, a
 //! builder's created folders, each item's line in the order manifest tools, the .NET SDK, workloads, the routing file's
 //! `siblings` problem, siblings, the warm-up's items (`warm-up: ...`), a builder's Tailscale path
-//! (`tailscale path: ...`), an install hint per missing or too-old item, then a summary, all prefixed `check: <where>: `
+//! (`tailscale path: ...`), a builder's held slots (`box slots: ...`, then a `box slot <n>: ...` line per holder), an
+//! install hint per missing or too-old item, then a summary, all prefixed `check: <where>: `
 //! (`install: <where>: ` for a hint), `<where>` being `here` for this PC and the host for a builder, and the problems of
 //! the `.gate` files on stderr as `check: .gate/<file>: <problem>`. A builder's hints are commands that work over ssh,
 //! and its SDK line names the builder. The exit status is 0 only when nothing is missing or too old: a skipped item, a
@@ -9,6 +10,7 @@
 
 use gate_router::warm::{shown_value, warming_text};
 use gate_router::{SiblingFolder, escaped, spelled};
+use gate_wire::slots::{BoxSlots, Claim, Holder};
 
 use crate::answer::FAILED_STATUS;
 use crate::remote::toolchain::{Pin, Pinned, Reported, Standing, ToolNeed, Version, pinned, standing};
@@ -188,6 +190,8 @@ pub(crate) struct Checked {
     pub warmup: Vec<Warmup>,
     /// Tailscale's path from this PC to a builder the check reached; `None` for this PC.
     pub tailscale: Option<tailscale::Found>,
+    /// The builder's own held slots its preflight said; `None` for this PC and for a builder that said none.
+    pub box_slots: Option<BoxSlots>,
 }
 
 impl Checked {
@@ -363,7 +367,57 @@ fn items(at: At<'_>, checked: &Checked) -> Vec<Item> {
     if let (At::Builder { host, .. }, Some(found)) = (at, &checked.tailscale) {
         items.push(tailscale_item(host, found));
     }
+    if let Some(slots) = &checked.box_slots {
+        items.extend(box_slots_items(slots));
+    }
     items
+}
+
+/// The lines of a builder's own held slots `slots`, none counted: how many claims it holds of its count, or why it has
+/// no count, then each holder by its slot, its texts escaped, then how many more the box left out.
+fn box_slots_items(slots: &BoxSlots) -> Vec<Item> {
+    let held = slots.holders.len() + slots.more;
+    let counted = match (slots.count, &slots.count_problem) {
+        (Some(count), _) => format!("box slots: {held} of {count} held"),
+        (None, Some(why)) => format!("box slots: {held} held; the slot count cannot be read: {}", escaped(why)),
+        (None, None) => format!("box slots: {held} held; the builder has no slot count"),
+    };
+    let unreadable = match slots.unreadable {
+        0 => String::new(),
+        1 => "; 1 claim cannot be read".to_owned(),
+        unreadable => format!("; {unreadable} claims cannot be read"),
+    };
+    let mut items = vec![Item::new(format!("{counted}{unreadable}"), Kind::Unchecked)];
+    items.extend(slots.holders.iter().map(|holder| Item::new(holder_text(holder), Kind::Unchecked)));
+    match slots.more {
+        0 => {}
+        1 => items.push(Item::new("box slots: and 1 more holder".to_owned(), Kind::Unchecked)),
+        more => items.push(Item::new(format!("box slots: and {more} more holders"), Kind::Unchecked)),
+    }
+    items
+}
+
+/// The line of one holder of a builder's slot: a routed run's session, by its repo, PC and command, or a hold, by its
+/// holder text, each time the box's own.
+fn holder_text(holder: &Holder) -> String {
+    match &holder.claim {
+        Claim::Session(claim) => format!(
+            "box slot {}: session of {} from {}: {} (taken {})",
+            holder.slot,
+            escaped(&claim.repo),
+            escaped(&claim.pc),
+            escaped(&claim.command),
+            escaped(&claim.taken)
+        ),
+        Claim::Hold(claim) => format!(
+            "box slot {}: hold by {} (ceiling {} s, builder pid {}, started {})",
+            holder.slot,
+            escaped(&claim.holder),
+            claim.ceiling,
+            claim.pid,
+            escaped(&claim.started)
+        ),
+    }
 }
 
 /// The line of Tailscale's path to the builder `host` as `found`: a direct path is ok, and every other path, or a path
@@ -626,10 +680,11 @@ mod tests {
     use gate_router::{FolderId, SiblingFolder};
     use gate_wire::{Probed, build_version};
 
-    use super::{Kind, items};
+    use super::{Kind, box_slots_items, items};
     use crate::check::local::record_item;
     use crate::remote::toolchain::{Pin, Reported, ToolNeed, Version};
     use crate::tailscale::{Found as TailscaleFound, PeerPath};
+    use gate_wire::slots::BoxSlots;
 
     fn need(name: &str, min: Option<&str>) -> ToolNeed {
         ToolNeed {
@@ -679,7 +734,34 @@ mod tests {
             siblings_skipped: false,
             warmup: Vec::new(),
             tailscale: None,
+            box_slots: None,
         }
+    }
+
+    /// A builder's held slots say each count of claims that cannot be read and of holders left out in the singular at 1
+    /// and the plural above it.
+    #[test]
+    fn a_builder_s_box_slots_count_one_in_the_singular() {
+        let texts = |left: usize| {
+            let slots = BoxSlots {
+                now: "2026-10-28T12:00:04Z".to_owned(),
+                count: Some(2),
+                count_problem: None,
+                unreadable: left,
+                more: left,
+                holders: Vec::new(),
+            };
+            box_slots_items(&slots).into_iter().map(|item| item.text).collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            texts(1),
+            ["box slots: 1 of 2 held; 1 claim cannot be read", "box slots: and 1 more holder"]
+        );
+        assert_eq!(
+            texts(2),
+            ["box slots: 2 of 2 held; 2 claims cannot be read", "box slots: and 2 more holders"]
+        );
     }
 
     /// Tailscale's path to a builder is said after the warm-up as one item of each wording, a direct path ok and every

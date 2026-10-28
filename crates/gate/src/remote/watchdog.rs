@@ -13,7 +13,7 @@ const LONGEST_TICK: Duration = Duration::from_millis(1000);
 const SHORTEST_TICK: Duration = Duration::from_millis(10);
 /// The most bytes of one line the client keeps, the most lines of one call it keeps, and the most bytes those whole
 /// lines may total: the last ones.
-pub(super) const LINE_CAP: usize = 64 * 1024;
+pub(super) const LINE_CAP: usize = gate_wire::slots::MOST_LINE_BYTES;
 const BYTES_KEPT: usize = 1024 * 1024;
 const LINES_KEPT: usize = 1000;
 /// The most bytes the job of the sync-back's fetch may write: 4 GiB.

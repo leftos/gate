@@ -7,12 +7,15 @@
 //! folders it created, its SDK list, what it found of each tool, and whether its work folder is warm for the
 //! worktree's warm-up file. The warm-up's items are this PC's, its record said only when it names the builder checked.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gate_args::{BoxVerb, CheckRequest, CheckSeams};
 use gate_router::{Builder, Place, escaped, repo_name, work_folder_key};
+use gate_state::v1;
 use gate_win32::PipedConsole;
+use gate_wire::slots::BoxSlots;
+use jiff::Timestamp;
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
 use crate::check::local::{self, Declarations, Declared, SiblingsFile, WarmSources, Warmed};
@@ -28,7 +31,8 @@ use crate::remote::toolchain::{self, Reported};
 use crate::remote::transport::ssh::Ssh;
 use crate::remote::transport::{Program, Transport, Wire};
 use crate::remote::{
-    CREATED, SSH_FAILED, Warm, install_why, no_box, other_build, root_busy_why, root_why, sdks_of, shell_said, their_version, warm_of,
+    CREATED, SSH_FAILED, Warm, box_slots_cached, box_slots_of, install_why, no_box, other_build, root_busy_why, root_why, sdks_of, shell_said,
+    their_version, warm_of,
 };
 use crate::route;
 use crate::tailscale;
@@ -77,6 +81,9 @@ pub(crate) fn check(request: &CheckRequest, host: &str, console: &mut Console) -
     let drain = request.seams.probe_drain_ms.map_or(launch::DRAIN, Duration::from_millis);
     match asked(&*transport, &builder, &place, bound, drain) {
         Ok(mut asked) => {
+            for line in &asked.said {
+                console.err(line);
+            }
             // Read just after the preflight's ssh call, while the tailnet peer is active.
             let reads = tailscale::Reads {
                 worktree: Path::new(&place.root),
@@ -137,10 +144,12 @@ fn ssh(host: &str) -> Result<Box<dyn Transport>, String> {
         .map_err(|why| format!("check: {host}: {why}"))
 }
 
-/// A builder that answered: what it has, and the work-folder key it was asked about.
+/// A builder that answered: what it has, the work-folder key it was asked about, and the lines to say on stderr of its
+/// box slots line or their cache.
 struct Asked {
     checked: Checked,
     key: String,
+    said: Vec<String>,
 }
 
 /// What `builder`, reached over `transport` within `bound`, the call's readers given `drain` once it has exited, and laid
@@ -167,6 +176,7 @@ fn asked(transport: &dyn Transport, builder: &Builder, place: &Place, bound: Dur
     let sent: Vec<String> = needs.into_iter().map(|(name, _)| name).collect();
     let program = transport.call(host, &profile.line(BoxVerb::Preflight), Wire::Plain);
     let heard = called(&program, bound, drain, input.as_bytes()).map_err(|failure| failure.line(host))?;
+    let at = Timestamp::now();
     if let Some(line) = refusal(host, profile.root(), &heard) {
         return Err(line);
     }
@@ -178,6 +188,8 @@ fn asked(transport: &dyn Transport, builder: &Builder, place: &Place, bound: Dur
     };
     let siblings = local::read_siblings_file(root, &mut declarations, &mut declared.problems);
     let sources = WarmSources::from_process(&repo, declarations);
+    let (box_slots, problems) = box_slots_heard(&heard, builder.id.as_deref(), &sources.state, at);
+    let said = problems.into_iter().map(|problem| format!("check: {host}: {problem}")).collect();
     let warmed = warm_items(&place.root, sources, host, &heard.lines, &mut declared.problems);
     let mut checked = answer.checked(declared, repo, place.root.clone(), &siblings, warmed.unreadable);
     checked.warmup = warmed.items;
@@ -185,7 +197,33 @@ fn asked(transport: &dyn Transport, builder: &Builder, place: &Place, bound: Dur
     checked.shadowed = warmed.declarations.shadowed;
     checked.declarations_problem = warmed.declarations.problem;
     checked.root_problem = root_problem(&heard);
-    Ok(Asked { checked, key })
+    checked.box_slots = box_slots;
+    Ok(Asked { checked, key, said })
+}
+
+/// [`box_slots_read`] of the preflight `heard`, unless its box refused its work root: a routed run takes that preflight
+/// as a refusal and leaves the cache as it is, so the check reads no slots and leaves it too.
+fn box_slots_heard(heard: &Heard, id: Option<&str>, state: &Result<PathBuf, String>, at: Timestamp) -> (Option<BoxSlots>, Vec<String>) {
+    if root_problem(heard).is_some() {
+        return (None, Vec::new());
+    }
+    box_slots_read(&heard.lines, id, state, at)
+}
+
+/// The builder's own slots its preflight `lines` said, for the report, and the problems to say, with no prefix. They
+/// are cached, read at `at`, as the builder whose id is `id`'s in the state root `state`, or that cache removed when
+/// they said none or a malformed line, as a routed run's preflight does ([`box_slots_cached`]); with no state root,
+/// a malformed line is said and slots that read are said as not cached.
+fn box_slots_read(lines: &[String], id: Option<&str>, state: &Result<PathBuf, String>, at: Timestamp) -> (Option<BoxSlots>, Vec<String>) {
+    let state = match state {
+        Ok(state) => return box_slots_cached(lines, &v1::box_slots_path(state, id), at),
+        Err(why) => why,
+    };
+    match box_slots_of(lines) {
+        Ok(Some(slots)) => (Some(slots), vec![format!("cannot write the box slots cache: {}", escaped(state))]),
+        Ok(None) => (None, Vec::new()),
+        Err(problem) => (None, vec![problem]),
+    }
 }
 
 /// Whether the repo at the worktree `root` uses LFS, as routing judges it ([`lfs::tracks_lfs_filter`]); else the line
@@ -428,6 +466,7 @@ impl Answer<'_> {
             siblings_skipped: siblings.declares,
             warmup: Vec::new(),
             tailscale: None,
+            box_slots: None,
         }
     }
 
@@ -468,7 +507,7 @@ mod tests {
     use gate_wire::{build_version, root_busy_line, root_unsafe_line};
     use jiff::Timestamp;
 
-    use super::{Answer, Failure, Heard, builder_warmth, failure, refusal, root_problem, warm_items};
+    use super::{Answer, Failure, Heard, box_slots_heard, builder_warmth, failure, refusal, root_problem, warm_items};
     use crate::boxside::WORK_ROOT_STEP;
     use crate::check::local::{Consent, Declarations, Declared, SiblingsFile, WarmSources};
     use crate::check::report::{At, Checked, Line, Sdk, Warmup, said};
@@ -476,6 +515,7 @@ mod tests {
     use crate::remote::install_untrusted_line;
     use crate::remote::parity::pin_of;
     use crate::remote::toolchain::{self, Manifest, Pin, Reported, ToolNeed, Version};
+    use gate_wire::slots::BoxSlots;
 
     const HOST: &str = "builder-1";
     const AT: At<'static> = At::Builder {
@@ -966,6 +1006,24 @@ mod tests {
 
     /// A box's refusal of its work root is said as the report's problem: unsafe with the installer step, busy with
     /// none; another status, the install refusal or no refusal is none.
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test that cannot write its cache must fail loudly")]
+    fn a_box_that_refuses_its_work_root_leaves_the_box_slots_cache_as_it_was() {
+        let (_, state) = warm_scratch("root-refused-box-slots");
+        let cache = v1::box_slots_path(&state, None);
+        let slots_line = r#"gate: remote box slots {"v":1,"now":"2026-10-28T12:00:04Z","count":1,"holders":[]}"#;
+        let slots = BoxSlots::of_line(slots_line).expect("the line reads");
+        v1::write_box_slots(&cache, &v1::BoxSlotsRecord::read_at(Timestamp::UNIX_EPOCH, &slots)).expect("the cache can be written");
+        let version = format!("gate: remote version {}", build_version());
+        let line = root_unsafe_line(r"D:\gate-remote lets S-1-5-11 add files to it", WORK_ROOT_STEP);
+        let refused = heard(Some(1), lines(&[&version]), Some(&line));
+
+        let read = box_slots_heard(&refused, None, &Ok(state), Timestamp::now());
+
+        assert_eq!(read, (None, Vec::new()));
+        assert!(cache.exists(), "a refused work root leaves the cache");
+    }
+
     #[test]
     fn a_box_that_refuses_its_work_root_is_said_as_its_problem() {
         let version = format!("gate: remote version {}", build_version());

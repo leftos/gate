@@ -35,7 +35,7 @@ use flate2::write::GzEncoder;
 use gate_args::{PruneRequest, PruneSeams, PushRequest};
 use gate_router::{BuilderOs, Config, escaped, is_unix_root};
 use gate_win32::{EnvironmentBlock, Job, LaunchError, PipedConsole, PipedFed, PipedLaunch, Running};
-use gate_wire::slots::MOST_SLOTS;
+use gate_wire::slots::{MOST_LINE_BYTES, MOST_SLOTS};
 use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -62,7 +62,7 @@ const NOTE_MARK: &str = "gate-push: note ";
 /// other line the last note's, else the last place, so the facts and the call's last line are kept ([`Kept::mark`]).
 const MARKED_CAP: usize = 16;
 /// The most bytes kept of one line of a call's output; the rest of a longer line is skipped.
-const LINE_CAP: u64 = 64 * 1024;
+const LINE_CAP: u64 = MOST_LINE_BYTES as u64;
 /// What the builder's cmd runs: pwsh with [`BOOTSTRAP`], as UTF-16LE base64, its one other word.
 const PWSH: &str = "pwsh -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand ";
 /// The Win32 error of an open refused because another handle shares nothing.

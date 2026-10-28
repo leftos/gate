@@ -16,7 +16,7 @@ use crate::model::{Generation, SlotCount, SlotCounts, SlotKind, StateInputs};
 use crate::v1;
 
 /// How many times a write tries to move its file into place, or to delete the file, before it fails.
-const WRITE_ATTEMPTS: u32 = 10;
+pub(crate) const WRITE_ATTEMPTS: u32 = 10;
 /// The pause between two of those tries.
 const WRITE_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// The next `<n>` a temp file name takes, counted across every thread of this process.
@@ -356,7 +356,7 @@ pub(crate) fn remove_partial(temp: &Path, error: io::Error) -> io::Error {
 
 /// Runs `operation` until it succeeds, up to `attempts` times, [`WRITE_RETRY_DELAY`] apart, returning the last error
 /// when every try fails.
-fn with_retry(attempts: u32, mut operation: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+pub(crate) fn with_retry(attempts: u32, mut operation: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     let mut failure = io::Error::other("no attempt was made");
     for attempt in 1..=attempts {
         match operation() {
@@ -416,7 +416,7 @@ pub(crate) fn temp_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-fn remove_if_present(path: &Path) -> io::Result<()> {
+pub(crate) fn remove_if_present(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         result => result,
