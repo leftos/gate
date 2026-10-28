@@ -17,8 +17,9 @@ use crate::durations::seed;
 use crate::nesting::{marked, test_marker};
 use crate::routing::{BUSY_LINE, GIT_HANG_GUARDS, HOST, has_no_remote_fields, has_remote_tag, names, own, repo, routed_case, routed_words, stub};
 use crate::support::{
-    Case, FAKE_TOOL, GATE, LOCAL_REASON, POLL, Running, UNTIL_KILLED, USAGE, assert_in_order, critical_words, events, events_of, finish, heavy_words,
-    log_texts, none_words, run_words, shown, start, take_of, wait_for_file, wait_for_journal_line, wait_until, write_counts, write_remote_json,
+    Case, FAKE_TOOL, GATE, LOCAL_REASON, POLL, Running, UNTIL_KILLED, USAGE, assert_in_order, critical_words, events, events_of, finish, git,
+    heavy_words, log_texts, none_words, run_words, shown, start, take_of, wait_for_file, wait_for_journal_line, wait_until, write_counts,
+    write_remote_json,
 };
 
 /// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code.
@@ -666,6 +667,20 @@ fn reroute_case(name: &str, slots: u32) -> Case {
     case
 }
 
+/// A linked worktree of the case's repo beside its folder, as `git worktree add` makes one, and its path.
+fn other_worktree(case: &Case) -> PathBuf {
+    git(case, &["commit", "--quiet", "--allow-empty", "-m", "a"]);
+    let mut name = case.folder().file_name().expect("the case folder has a name").to_owned();
+    name.push(".other");
+    let other = case.folder().with_file_name(name);
+    if other.exists() {
+        fs::remove_dir_all(&other).expect("a folder left by an earlier run can be removed");
+    }
+    fs::create_dir_all(&other).expect("the folder beside the case can be made");
+    git(case, &["worktree", "add", "--quiet", "--detach", &shown(&other)]);
+    other
+}
+
 /// The gates that hold a light gate back: a critical gate holding until `go`, and light gates beside it holding until
 /// `light_go`.
 struct HeldBack {
@@ -799,6 +814,40 @@ fn a_light_gate_sent_to_a_builder_says_why_before_its_route_lines() {
     assert_passed(&outcome);
     assert_in_order(&outcome.stderr, &[&sent_to_builder(critical_pid), "gate: routed "]);
     held.finish();
+}
+
+/// A light gate the critical request holds back whose log lies in another worktree of its repository is not sent to the
+/// builder: it keeps waiting here, says the refusal line in its log, and runs here once a light slot frees.
+#[test]
+fn a_light_gate_held_back_logging_into_another_worktree_stays_here_saying_so() {
+    let case = reroute_case("a_light_gate_held_back_logging_into_another_worktree_stays_here_saying_so", 2);
+    let held = HeldBack::start(&case, false, 2);
+    let critical_pid = held.critical_pid();
+    let call = case.folder().join("call.json");
+    let steps = recording_stub(&case, &call);
+    let other = other_worktree(&case);
+    let log = shown(&other.join("light.log"));
+    let line = format!("run it with --cd {}", shown(&other).replace('/', "\\"));
+
+    let light = light_with_client(&case, &log, &steps, &with_heartbeat(), &ROUTED_COMMAND);
+    let pid = light.id();
+    // A still-waiting line beside the critical request is only said once the run's reroute came back here.
+    light.wait_for_stderr(&still_beside(critical_pid));
+    held.let_lights_go();
+    let outcome = light.finish();
+    held.finish();
+
+    assert_passed(&outcome);
+    assert!(!call.exists(), "nothing went to the builder: {outcome:?}");
+    assert!(
+        !outcome.stderr.contains("sending this light run to"),
+        "a run whose log is elsewhere keeps waiting here: {outcome:?}"
+    );
+    assert_stayed_here(&own(&case, pid));
+    assert!(
+        log_texts(&other.join("light.log")).contains(&line),
+        "the refused run's log holds its line"
+    );
 }
 
 #[test]

@@ -187,6 +187,15 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
         },
         route => route,
     };
+    // A run that would route is refused when its log belongs to another worktree of its repo than the one the snapshot
+    // is of.
+    let route = match route {
+        Route::Routed(run) => match log_in_other_worktree(machine.run_log.as_deref(), &run) {
+            Some(refusal) => Route::Refused(refusal),
+            None => Route::Routed(run),
+        },
+        route => route,
+    };
     let (warm_hash, declared) = match &route {
         Route::Routed(remote) => (consented_hash(remote, &machine), declared_prefixes(remote, &machine)),
         Route::Local { .. } | Route::Refused(_) => (None, Ok(Vec::new())),
@@ -221,6 +230,53 @@ fn run_log(request: &RunRequest) -> Option<PathBuf> {
     resolve::log(&request.log).ok()
 }
 
+/// The refusal of a routed `run` whose log lies in another worktree of its repository than the run's root or a carried
+/// sibling's: the snapshot is of the gate's folder's worktree, so the caller would read another tree's log as this
+/// run's. `None` for a log outside any worktree, in the run's own tree or a sibling's, in a worktree of another
+/// repository, and for one whose trees cannot be told.
+fn log_in_other_worktree(log: Option<&Path>, run: &RemoteRun) -> Option<PinRefusal> {
+    let log = log?;
+    let tree = worktree_of(log)?;
+    if !same_repository(&tree, Path::new(&run.root)) {
+        return None;
+    }
+    // The run's own tree or a sibling's, judged by folder id as the decision judges another worktree: a tree whose id
+    // cannot be read is no folder to refuse a run by.
+    let id = root_id(&tree.to_string_lossy()).ok()?;
+    if id == run.root_id || run.siblings.iter().any(|sibling| sibling.id == id) {
+        return None;
+    }
+    Some(PinRefusal::LogInOtherWorktree {
+        log: log.to_path_buf(),
+        tree,
+        root: PathBuf::from(&run.root),
+    })
+}
+
+/// Whether the worktrees `left` and `right` are of one repository: their git common folders ([`common_folder_of`]) are
+/// the same folder.
+fn same_repository(left: &Path, right: &Path) -> bool {
+    let (Some(left), Some(right)) = (common_folder_of(left), common_folder_of(right)) else {
+        return false;
+    };
+    same_folder(&left, &right)
+}
+
+/// Whether `left` and `right` are one folder, judged by folder id as the decision judges another worktree, and, when an
+/// id cannot be read, by a spelling in any letter case and with either separator, so a folder the gate spells another
+/// way is still one folder.
+fn same_folder(left: &Path, right: &Path) -> bool {
+    match (root_id(&left.to_string_lossy()), root_id(&right.to_string_lossy())) {
+        (Ok(left_id), Ok(right_id)) => left_id == right_id,
+        _ => folded(left) == folded(right),
+    }
+}
+
+/// The folder `path` as a comparison of spellings reads it: each `\` written `/`, in lower case.
+fn folded(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/").to_lowercase()
+}
+
 /// Says the lines of `request`'s routed `run`: its route lines, the problem of its repo's `.gate/env.toml` when
 /// `declared` is one ([`declared_prefixes`]), and the line of the watched variables it does not send ([`dropped_line`]).
 fn say_routed(request: &RunRequest, run: &RemoteRun, declared: Result<Vec<String>, String>, console: &mut Console) {
@@ -237,18 +293,29 @@ fn say_routed(request: &RunRequest, run: &RemoteRun, declared: Result<Vec<String
 /// The routed run a light gate held back behind a critical request gets when its command would route on heavy: the
 /// decision `decision` saw asked again with the heavy slot ([`would_route_on_heavy`]'s question), with the git limits
 /// and the `HEAD` a routed run reads. Says that the critical request of gate `by` sends the run to its builder, then
-/// the routed run's lines as [`route`] does, and notes the decision's log lines. `None`, saying nothing, when the
-/// decision would keep the run here or a word is not valid Unicode. With the run, the hash of its repo's warm-up file
-/// when its warm-up is set up ([`consented_hash`]).
+/// the routed run's lines as [`route`] does, and notes the decision's log lines. `None` when the decision would keep
+/// the run here or a word is not valid Unicode, and `None` when the log lies in another worktree of the run's repo than
+/// its root, which keeps the run here like a run that stays local and notes the refusal line ([`log_in_other_worktree`]).
+/// With the run, the hash of its repo's warm-up file when its warm-up is set up ([`consented_hash`]).
 pub(crate) fn route_as_heavy(request: &RunRequest, decision: &Decision, by: u32, console: &mut Console) -> Option<(RemoteRun, Option<String>)> {
     let machine = Machine::of(decision.local_app_data.as_deref(), &request.test_seams).with_state(decision);
+    let mut refusal = None;
     let routed = match decide(&decision.inputs(gate_router::Slot::Heavy), &machine) {
-        Route::Routed(run) if decision.unicode => Some(run),
+        Route::Routed(run) if decision.unicode => match log_in_other_worktree(run_log(request).as_deref(), &run) {
+            Some(why) => {
+                refusal = Some(why);
+                None
+            }
+            None => Some(run),
+        },
         Route::Routed(_) | Route::Local { .. } | Route::Refused(_) => None,
     };
     let Some(run) = routed else {
         for line in machine.unsaid_notes() {
             console.note(&line);
+        }
+        if let Some(refusal) = refusal {
+            console.note(&refusal.line());
         }
         return None;
     };
@@ -1937,8 +2004,8 @@ mod tests {
     use super::{
         CHANGE_DEADLINE, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, GATE_FILE_NOT_A_FILE, HINT_GIT_LIMIT, Machine, Origin, SIBLING_GIT_LINK,
         SIBLING_LINK, SIBLING_NOT_A_FOLDER, Source, change_error, change_limit, checkout_of, hint_holds, holds_existing_path, is_fixed_local,
-        is_share_target, judge_declarations, not_routed, nul_separated, parse_head, parse_place, read_declaration, read_siblings, sibling_folder,
-        worktree_of,
+        is_share_target, judge_declarations, not_routed, nul_separated, parse_head, parse_place, read_declaration, read_siblings, same_folder,
+        sibling_folder, worktree_of,
     };
     use crate::remote::box_trees;
     use crate::remote::git;
@@ -3148,5 +3215,16 @@ mod tests {
         assert_eq!(not_routed(&outside), None, "an outside word in no other worktree writes none");
         assert_eq!(not_routed(&failed), None);
         assert_eq!(not_routed(&Route::Local { reason: None }), None);
+    }
+
+    #[test]
+    fn a_folder_spelled_with_another_case_or_separator_is_the_same_folder() {
+        let git = Path::new(r"X:\dev\no such repo\.git");
+
+        assert!(
+            same_folder(git, Path::new(r"x:/dev/NO SUCH repo/.git")),
+            "no id to read, so the spellings count"
+        );
+        assert!(!same_folder(git, Path::new(r"X:\dev\no such other\.git")));
     }
 }

@@ -5944,3 +5944,134 @@ fn a_run_admitted_after_a_drain_wait_and_refused_full_waits_for_a_builder_slot()
     let own = own(&case, pid);
     assert_eq!(names(&own), ["queue", "take", "release"], "no fallback: {own:#?}");
 }
+
+#[test]
+fn a_heavy_run_logging_into_another_worktree_of_its_repo_sends_no_snapshot_and_says_to_cd() {
+    let case = routed_case("routing-log-other-worktree");
+    git(&case, &["commit", "--quiet", "--allow-empty", "-m", "a"]);
+    let other = beside_case(&case, ".other");
+    git(&case, &["worktree", "add", "--quiet", "--detach", &shown(&other)]);
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let log = shown(&other.join("out.log"));
+
+    // Started in the case's checkout, its log in the linked worktree: the run the caller meant is the other tree's.
+    let outcome = finish(case.gate(&routed_words(&log, &steps, &[], &[FAKE_TOOL, "out", "ran"])));
+
+    assert!(
+        !call.exists(),
+        "no snapshot of the checkout the gate started in goes to a builder: {outcome:?}"
+    );
+    let tree = shown(&other).replace('/', "\\");
+    assert!(outcome.stderr.contains(&format!("run it with --cd {tree}")), "{outcome:?}");
+    assert_eq!(outcome.code, Some(2), "refused as a usage error, nothing run: {outcome:?}");
+    let log_text = log_texts(&other.join("out.log"));
+    assert!(
+        log_text.contains(&format!("run it with --cd {tree}")),
+        "the log the run readied first holds its line: {log_text}"
+    );
+}
+
+#[test]
+fn a_run_logging_into_a_worktree_of_another_repository_routes_as_before() {
+    let case = routed_case("routing-log-other-repository");
+    let main = beside_case(&case, ".main");
+    let git_folder = main.join(".git").join("worktrees").join("other");
+    fs::create_dir_all(&git_folder).expect("the other repository's git folder can be made");
+    fs::write(git_folder.join("commondir"), "../..\n").expect("the commondir file can be written");
+    let other = beside_case(&case, ".other");
+    let gitdir = shown(&git_folder).replace('\\', "/");
+    fs::write(other.join(".git"), format!("gitdir: {gitdir}\n")).expect("a linked worktree's .git file can be written");
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let log = shown(&other.join("out.log"));
+
+    let outcome = finish(case.gate(&routed_words(&log, &steps, &[], &[FAKE_TOOL, "out", "ran"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(call.exists(), "a worktree of another repository is no reason to refuse: {outcome:?}");
+    assert!(!outcome.stderr.contains("run it with --cd"), "no refusal: {outcome:?}");
+}
+
+#[test]
+fn a_run_logging_into_a_carried_sibling_s_worktree_routes_as_before() {
+    let case = routed_case("routing-log-sibling-worktree");
+    git(&case, &["commit", "--quiet", "--allow-empty", "-m", "a"]);
+    let (_, beside) = declare_sibling(&case);
+    git(&case, &["worktree", "add", "--quiet", "--detach", &shown(&beside)]);
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let log = shown(&beside.join("out.log"));
+
+    let outcome = finish(case.gate(&routed_words(&log, &steps, &[], &[FAKE_TOOL, "out", "ran"])));
+    fs::remove_dir_all(&beside).expect("the sibling can be removed");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(call.exists(), "a carried sibling's tree is the run's own: {outcome:?}");
+    assert!(!outcome.stderr.contains("run it with --cd"), "no refusal: {outcome:?}");
+}
+
+#[test]
+fn a_pinned_run_logging_into_another_worktree_of_its_repo_is_refused() {
+    let case = routed_case("routing-log-other-worktree-pinned");
+    git(&case, &["commit", "--quiet", "--allow-empty", "-m", "a"]);
+    let other = beside_case(&case, ".other");
+    git(&case, &["worktree", "add", "--quiet", "--detach", &shown(&other)]);
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let log = shown(&other.join("out.log"));
+    // A pinned run's log is readied only once routing accepted the pin, so an earlier file stays as it was.
+    fs::write(other.join("out.log"), "earlier\n").expect("an earlier log can be written");
+
+    let outcome = finish(case.gate(&routed_words(&log, &steps, &["--builder", HOST], &[FAKE_TOOL, "out", "ran"])));
+
+    assert_eq!(outcome.code, Some(2), "refused as a usage error, nothing run: {outcome:?}");
+    assert!(!call.exists(), "nothing goes to the pinned builder: {outcome:?}");
+    let tree = shown(&other).replace('/', "\\");
+    assert!(outcome.stderr.contains(&format!("run it with --cd {tree}")), "{outcome:?}");
+    assert_eq!(
+        fs::read_to_string(other.join("out.log")).expect("the earlier log is still there"),
+        "earlier\n",
+        "an earlier log of a pinned run is left as it was"
+    );
+}
+
+#[test]
+fn a_routed_run_logging_into_its_own_worktree_routes_as_before() {
+    let case = routed_case("routing-log-own-worktree");
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let log = shown(&case.folder().join("out.log"));
+
+    let outcome = finish(case.gate(&routed_words(&log, &steps, &[], &[FAKE_TOOL, "out", "ran"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(call.exists(), "a log in the run's own worktree is no reason to refuse: {outcome:?}");
+    assert!(!outcome.stderr.contains("run it with --cd"), "no refusal: {outcome:?}");
+}
+
+#[test]
+fn a_local_run_logging_into_another_worktree_of_its_repo_runs_here_as_before() {
+    let case = routed_case("routing-log-other-worktree-local");
+    git(&case, &["commit", "--quiet", "--allow-empty", "-m", "a"]);
+    let other = beside_case(&case, ".other");
+    git(&case, &["worktree", "add", "--quiet", "--detach", &shown(&other)]);
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let log = shown(&other.join("out.log"));
+
+    let outcome = finish(case.gate(&routed_words(
+        &log,
+        &steps,
+        &["--local", LOCAL_REASON[0], LOCAL_REASON[1]],
+        &[FAKE_TOOL, "out", "ran"],
+    )));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!call.exists(), "a run that stays local sends nothing: {outcome:?}");
+    assert!(outcome.stdout.contains("ran"), "the command ran here: {outcome:?}");
+    assert!(
+        !outcome.stderr.contains("run it with --cd"),
+        "a run that stays local is not checked: {outcome:?}"
+    );
+}

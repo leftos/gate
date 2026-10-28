@@ -468,7 +468,7 @@ pub enum Route {
     Refused(PinRefusal),
 }
 
-/// Why a run pinned to one builder with `--builder <host>` cannot go to it; `host` is as given.
+/// Why a run cannot go on as asked: a pin that cannot be met, or a log in another worktree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PinRefusal {
     /// The routing file is not there or cannot be used, for `why`.
@@ -479,6 +479,17 @@ pub enum PinRefusal {
     NotRouted { host: String, why: String },
     /// The run cannot route at all, for `why`.
     CannotRoute { host: String, why: String },
+    /// The log is in the worktree `tree` of the run's repository, neither the run's root `root` nor a carried
+    /// sibling's: the snapshot is of the gate's folder's worktree, so the caller would read another tree's log as
+    /// this run's.
+    LogInOtherWorktree {
+        /// The log, as the run resolved it.
+        log: PathBuf,
+        /// The worktree the log lies in.
+        tree: PathBuf,
+        /// The run's worktree root, as git gave it.
+        root: PathBuf,
+    },
 }
 
 /// Why a pinned run on a covering parent's slot, or inside a box run, cannot route.
@@ -494,7 +505,7 @@ impl PinRefusal {
         }
     }
 
-    /// The line the gate says on standard error and in the log, the host shown [`escaped`].
+    /// The line the gate says on standard error and in the log, the host and each path shown [`escaped`].
     #[must_use]
     pub fn line(&self) -> String {
         match self {
@@ -502,6 +513,13 @@ impl PinRefusal {
             Self::Unlisted { host } => format!("gate: --builder {} is not a builder remote.json lists", escaped(host)),
             Self::NotRouted { host, why } => format!("gate: --builder {}: this command is not one the repo routes ({why})", escaped(host)),
             Self::CannotRoute { host, why } => format!("gate: --builder {} cannot route this run: {why}", escaped(host)),
+            Self::LogInOtherWorktree { log, tree, root } => format!(
+                "gate: the log {} is in the worktree {}, but the command runs in {}; run it with --cd {}",
+                escaped(&log.display().to_string()),
+                escaped(&tree.display().to_string()),
+                escaped(&root.display().to_string()),
+                cd_value(tree)
+            ),
         }
     }
 }
@@ -3457,7 +3475,9 @@ fn project_folder(project: &str, place: &Place) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Place, derived_outputs, names_bin_folder, send_bin, switch_outputs};
+    use std::path::PathBuf;
+
+    use super::{PinRefusal, Place, derived_outputs, names_bin_folder, send_bin, switch_outputs};
 
     #[test]
     fn a_glob_names_a_bin_folder_by_a_bin_segment_unless_it_names_test_results_too() {
@@ -3775,5 +3795,23 @@ mod tests {
     #[test]
     fn a_test_that_builds_sends_nothing() {
         assert_eq!(sent("dotnet test App.csproj -c Release"), None);
+    }
+
+    #[test]
+    fn the_refusal_of_a_log_in_another_worktree_names_both_trees_and_the_cd() {
+        let refusal = |log: &str, tree: &str, root: &str| PinRefusal::LogInOtherWorktree {
+            log: PathBuf::from(log),
+            tree: PathBuf::from(tree),
+            root: PathBuf::from(root),
+        };
+
+        assert_eq!(
+            refusal(r"X:\dev\app.wt\other\out.log", r"X:\dev\app.wt\other", r"X:\dev\app").line(),
+            r"gate: the log X:\dev\app.wt\other\out.log is in the worktree X:\dev\app.wt\other, but the command runs in X:\dev\app; run it with --cd X:\dev\app.wt\other"
+        );
+        assert_eq!(
+            refusal(r"X:\dev\a b\out.log", r"X:\dev\a b", r"X:\dev\c").line(),
+            r#"gate: the log X:\dev\a b\out.log is in the worktree X:\dev\a b, but the command runs in X:\dev\c; run it with --cd "X:\dev\a b""#
+        );
     }
 }

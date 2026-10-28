@@ -1737,12 +1737,18 @@ impl<'a> Run<'a> {
     }
 }
 
-/// The status a run of `request` ends with as soon as it is routed by `route`: a refused pin's usage status, said by the
-/// decision with every note it gathered before the log is readied; or, for a run pinned with `--builder`, whose log is
-/// readied only once routing accepted the pin, the failed status of a log that cannot be readied. `None` for a run that
-/// goes on.
+/// The status a run of `request` ends with as soon as it is routed by `route`: a refusal's usage status, its lines said
+/// by the decision, written to the log a run readies before routing so that an earlier file there is replaced by them
+/// ([`readies_log_first`]), while a run pinned with `--builder`, whose log is readied only once routing accepted the
+/// pin, leaves an earlier file as it was; or, for such a pinned run, the failed status of a log that cannot be readied.
+/// `None` for a run that goes on.
 fn ended_at_route(route: &Route, request: &RunRequest, log: &Log, console: &mut Console) -> Option<u32> {
     if matches!(route, Route::Refused(_)) {
+        if readies_log_first(request)
+            && let Err(error) = log.finish(console)
+        {
+            console.err(&format!("gate: cannot write to {}: {error}", log.path().display()));
+        }
         return Some(u32::from(USAGE_STATUS));
     }
     if request.builder.is_some() {
