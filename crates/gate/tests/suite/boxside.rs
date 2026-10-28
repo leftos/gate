@@ -24,9 +24,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::support::{
-    Case, Escapee, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, NetfxKey, Outcome, Running, StderrCloser, UNTIL_KILLED, allow_breakaway, box_payload,
-    build_version, copy_tool, finish, junction, log_texts, names, shown, start_with_closable_stderr, start_with_closed_stdout, start_with_stdin,
-    wait_until, wait_until_closed,
+    Case, Escapee, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, HANG_GUARD, NetfxKey, Outcome, Running, StderrCloser, UNTIL_KILLED, allow_breakaway,
+    box_payload, build_version, copy_tool, finish, junction, log_texts, names, shown, start_with_closable_stderr, start_with_closed_stdout,
+    start_with_stdin, wait_until, wait_until_closed,
 };
 
 mod desktop;
@@ -97,15 +97,19 @@ impl BoxCall {
     }
 }
 
-/// Waits for `running`, a box whose client is gone, to end, failing once `guard` has passed while it still runs.
+/// Waits for `running`, a box whose client went or whose step parked, to end, failing once `guard` has passed while it
+/// still runs: the box is ended then, and the failure prints what it said so far, so a fired guard says where it was.
+#[expect(clippy::panic, reason = "a box that never ended fails its case with what it said so far")]
 fn ended_within(mut running: Running, guard: Duration) -> Outcome {
     let deadline = Instant::now() + guard;
     while running.is_running() {
-        assert!(
-            Instant::now() < deadline,
-            "the box still runs {} s after its client's stderr closed",
-            guard.as_secs()
-        );
+        if Instant::now() >= deadline {
+            let said = read_back(&running.kill());
+            panic!(
+                "the box still runs {} s after its client went or its step parked; it said {said:?}",
+                guard.as_secs()
+            );
+        }
         thread::sleep(Duration::from_millis(50));
     }
     read_back(&running.finish())
@@ -1003,9 +1007,10 @@ fn preflight_a_dotnet_that_does_not_answer_is_an_unreadable_sdk_list() {
     assert!(outcome.stderr.lines().any(|line| line == unreadable), "{unreadable}: {outcome:?}");
 }
 
-/// How long a box whose git step parks may take to end once its bound passes or its client goes: a hang guard only, as
-/// the bound and the probe each end the step within a second or two of their own.
-const PARKED_GIT_GUARD: Duration = Duration::from_secs(120);
+/// How long a box's tail after its client went or its step parked may take to end: the suite's [`HANG_GUARD`], so a
+/// loaded run's tail stays inside it and a box that never ends still fails its case. A hang guard only, as the bound and
+/// the probe each end the step within a second or two of their own.
+const PARKED_GIT_GUARD: Duration = HANG_GUARD;
 
 /// The bound `--test-box-git-limit` gives a parked step whose own child's pid a case reads, armed by that pid file
 /// (`--test-box-git-armed-by`): the clock starts only once the stub's child has written the pid, so the step's start
@@ -1039,7 +1044,7 @@ fn preflight_ends_a_git_step_that_does_not_answer_within_its_limit() {
     let mut call = box_call(&case, &words, &folders.payload());
     call.env("PATH", path_with_git(&[stub]));
 
-    let outcome = ended_within(call.start(), PARKED_GIT_GUARD);
+    let outcome = call.start().finish_read();
 
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
     let bound = format!(
@@ -1109,7 +1114,7 @@ fn preflight_a_config_read_at_its_bound_fails_with_its_own_line() {
     );
     call.env("PATH", path_with_git(&[stub]));
 
-    let outcome = ended_within(call.start(), PARKED_GIT_GUARD);
+    let outcome = call.start().finish_read();
 
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
     let bound = "gate: remote git config failed: git did not answer within 2 s";
@@ -2424,14 +2429,15 @@ fn parking_checkout(case: &Case) -> (Value, OsString, PathBuf) {
 }
 
 /// `gate box run` of `payload` with `PATH` set to `path`, `seams` before the verb and the suite's quiet heartbeat, to
-/// its end, failing once [`PARKED_GIT_GUARD`] has passed.
+/// its end: every step it runs is bound by its own clock, so the whole run is waited for under the suite's [`HANG_GUARD`]
+/// alone, which no passing run reaches.
 fn run_box_parked(case: &Case, payload: &Value, path: &OsString, seams: &[&str]) -> Outcome {
     let mut words = vec!["box"];
     words.extend_from_slice(seams);
     words.push("run");
     let mut call = box_call(case, &words, &self::payload(payload));
     call.env("PATH", path);
-    ended_within(call.start(), PARKED_GIT_GUARD)
+    call.start().finish_read()
 }
 
 /// `gate box run` of `payload` with `PATH` set to `path`, `seams` before the verb and a heartbeat every 200 ms: once

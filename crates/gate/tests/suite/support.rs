@@ -76,7 +76,7 @@ pub const GIT_REDIRECTS: [&str; 6] = [
 const INHERITED: [&str; 5] = ["GATE_STATE_DIR", "GATE_SLOT_HELD", "GATE_COMMIT_SLOT", "GATE_BOX_JOB", "GATE_BOX_EXE"];
 /// Only guards against a stuck case; no case asserts how long anything took. Ten minutes, since a loaded machine
 /// (several heavy gates building at once) has kept a healthy case past a minute, and a real hang still ends.
-const HANG_GUARD: Duration = Duration::from_secs(600);
+pub const HANG_GUARD: Duration = Duration::from_secs(600);
 /// How long the output readers get to end once the program has exited; a reader whose pipe a grandchild still holds
 /// would otherwise keep its case waiting the whole hang guard.
 const READER_GRACE: Duration = Duration::from_secs(60);

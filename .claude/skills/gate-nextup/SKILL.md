@@ -136,6 +136,10 @@ Never suspend a thread during its start-up: it holds the loader lock, and the ri
 
 `cdb -pv` plus `llvm-symbolizer --relative-address` reads a hung test's stacks without disturbing it.
 
+The suspend rig cannot stretch a box whose own CPU use is small and whose git children live only briefly: a one-target freezer that catches the box at its creation (by the case folder in its command line) and cycles freeze and run on it alone does. GATE-859 was found that way (rig in `.tmp/859-rig/` of its worktree while it lasts).
+
+A suite guard clocked from a call's start times the whole run, which a loaded full suite stretches: a hang guard is clocked from the event it guards, or is the suite's `HANG_GUARD`.
+
 A gated command run in a worktree from elsewhere takes an absolute `-Log`: the launcher reads a relative one against the caller's folder before `-Cd` (design.md P5), so it lands in the main checkout's `.tmp`, where two agents' logs of one name overwrite each other. Every brief that names `-Cd` names its logs by absolute path under that worktree.
 
 A rig that reads `SystemProcessInformation` back to back holds a lock every `CreateProcess` on the PC waits on (a reused start went from 4 ms to 590 ms): sample at 100 ms or slower, or the rig measures itself. ESET's CPU (`ekrn`, 12-35% of a core with other sessions active) is never evidence about one job.
