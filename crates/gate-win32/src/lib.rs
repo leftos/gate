@@ -24,6 +24,7 @@
 mod adopt;
 mod console;
 mod create;
+mod detached;
 mod device;
 mod event;
 mod file;
@@ -57,6 +58,7 @@ pub use adopt::{
 };
 pub use console::{Donor, Utf8Console};
 pub use create::spawn;
+pub use detached::start_detached;
 pub use device::device_target;
 pub use event::{EventWait, NamedEvent};
 pub use gpu::{AdapterUse, Gpu3dWindow, PdhError};

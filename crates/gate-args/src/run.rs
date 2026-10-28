@@ -146,6 +146,7 @@ pub(crate) enum SwitchOption {
     Lift,
     Status,
     Builders,
+    Quiet,
     #[cfg(feature = "test-seams")]
     PrintRequest,
     #[cfg(feature = "test-seams")]
@@ -172,6 +173,8 @@ pub(crate) enum SwitchOption {
     RemoteSnapshot,
     #[cfg(feature = "test-seams")]
     JobBreakaway,
+    #[cfg(feature = "test-seams")]
+    PruneSweep,
     #[cfg(feature = "test-seams")]
     CutoverInterruptAfterList,
     #[cfg(feature = "test-seams")]
@@ -220,6 +223,8 @@ pub(crate) struct RunBuilder {
     drain_seams: DrainSeams,
     /// `gate prune`'s `--builders`.
     builders: bool,
+    /// `gate prune`'s `--quiet`.
+    quiet: bool,
     /// `gate prune`'s `--test-prune-gone-age-ms`; its transport is read into `test_seams`, as a run's is.
     prune_gone_age_ms: Option<u64>,
     bring_tracked: Vec<String>,
@@ -497,6 +502,7 @@ impl RunBuilder {
             SwitchOption::Lift => self.lift = on,
             SwitchOption::Status => self.status = on,
             SwitchOption::Builders => self.builders = on,
+            SwitchOption::Quiet => self.quiet = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::PrintRequest => self.print_request = on,
             #[cfg(feature = "test-seams")]
@@ -523,6 +529,8 @@ impl RunBuilder {
             SwitchOption::RemoteSnapshot => self.test_seams.remote_snapshot = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::JobBreakaway => self.test_seams.job_breakaway = on,
+            #[cfg(feature = "test-seams")]
+            SwitchOption::PruneSweep => self.test_seams.prune_sweep = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::CutoverInterruptAfterList => self.cutover_seams.interrupt_after_list = on,
             #[cfg(feature = "test-seams")]
@@ -802,6 +810,7 @@ impl RunBuilder {
                 remote_ssh: self.test_seams.remote_ssh,
                 gone_age_ms: self.prune_gone_age_ms,
             },
+            quiet: self.quiet,
         })
     }
 

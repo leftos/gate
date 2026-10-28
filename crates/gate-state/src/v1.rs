@@ -420,6 +420,49 @@ pub fn warm_cap_lock_path(root: &Path) -> PathBuf {
     remote_dir(root).join("warm.lock")
 }
 
+/// The stamp of the last background prune sweep a routed run started, `<root>\remote\prune-sweep.stamp`
+/// ([`PruneSweepStamp`]).
+#[must_use]
+pub fn prune_sweep_stamp_path(root: &Path) -> PathBuf {
+    remote_dir(root).join("prune-sweep.stamp")
+}
+
+/// The output of the last background prune sweep, `<root>\remote\prune-sweep.log`, replaced at each start.
+#[must_use]
+pub fn prune_sweep_log_path(root: &Path) -> PathBuf {
+    remote_dir(root).join("prune-sweep.log")
+}
+
+/// The stamp of the last background prune sweep ([`prune_sweep_stamp_path`]): the JSON object `{"v": 1, "at": …}`,
+/// `at` when the routed run that started it did so, written as a claim's times are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneSweepStamp {
+    /// When the sweep was started.
+    #[serde(with = "iso_time")]
+    pub at: Timestamp,
+}
+
+/// Writes the sweep `stamp` at `path` whole or not at all, with one move over it and no retry, as
+/// [`write_worktree_record`] writes.
+///
+/// # Errors
+///
+/// A folder, temp file or move that fails.
+pub fn write_prune_sweep_stamp(path: &Path, stamp: &PruneSweepStamp) -> io::Result<()> {
+    write_replacing_once(path, &versioned_text(stamp)?)
+}
+
+/// The sweep stamp a file's bytes hold, read strictly as every file of this module is; fields it does not know are
+/// ignored.
+///
+/// # Errors
+///
+/// Bytes that are not UTF-8 or not the stamp's format, its `v` missing or not 1 among them.
+pub fn prune_sweep_stamp(bytes: &[u8]) -> Result<PruneSweepStamp, FormatError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| FormatError::Syntax("not UTF-8".to_owned()))?;
+    parse_strict(text)
+}
+
 /// Where a work folder's warm-up stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

@@ -447,6 +447,18 @@ fn no_worktree_records_says_so_and_passes() {
 }
 
 #[test]
+fn a_quiet_sweep_with_no_worktree_records_says_nothing_and_passes() {
+    let case = prune_case("prune_quiet_no_records");
+    let steps = ssh_steps(&case, "ssh", &ANSWERS);
+
+    let outcome = pruned(&case, &steps, &["--quiet"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_eq!(calls(&steps), Vec::<String>::new(), "no builder is called");
+}
+
+#[test]
 fn a_live_worktree_s_record_is_left_alone_and_no_builder_is_called() {
     let case = prune_case("prune_live");
     let (root, common) = worktree(&case);

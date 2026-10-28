@@ -180,6 +180,100 @@ fn merged(case: &Case, mut command: Command) -> (Option<i32>, String) {
     (status.and_then(|status| status.code()), unix(&text))
 }
 
+/// The key of the worktree record a sweep case seeds.
+const SWEPT_KEY: &str = "app-1a2b3c4d";
+
+/// Seeds a worktree record of [`SWEPT_KEY`] in the case's state root whose worktree is gone, a real linked worktree of a
+/// repo in the case folder whose folder was deleted, marked gone long before the case, so the sweep calls its
+/// builders at once.
+fn seed_gone_record(case: &Case) {
+    git(case, &["init", "--quiet", "repo"]);
+    git(case, &["-C", "repo", "commit", "--allow-empty", "--quiet", "-m", "first"]);
+    git(case, &["-C", "repo", "worktree", "add", "--quiet", "../wt"]);
+    let root = case.folder().join("wt");
+    fs::remove_dir_all(&root).expect("the worktree's folder can be deleted");
+    let record = json!({
+        "v": 1,
+        "root": shown(&root),
+        "commonDir": shown(&case.folder().join("repo").join(".git")),
+        "repo": "app",
+        "lastRouted": "2026-01-01T00:00:00Z",
+        "goneSince": "2026-01-01T00:00:00Z",
+    });
+    let folder = case.root().join("remote");
+    fs::create_dir_all(&folder).expect("the records' folder can be made");
+    fs::write(folder.join(format!("{SWEPT_KEY}.worktree")), record.to_string()).expect("the record can be written");
+}
+
+/// `gate push` for `case` through the stand-in acting on `steps`, its state root the case's, where a sweep case seeds
+/// its record.
+fn push_sweeping(case: &Case, steps: &Path) -> Outcome {
+    let mut command = push_command(case, steps, FAKE_SSH, &[]);
+    command.env("GATE_STATE_DIR", case.root());
+    finish(command)
+}
+
+/// The lines the stand-in of the steps file `steps` was called with, the host before each.
+fn call_lines(steps: &Path) -> Vec<String> {
+    fs::read_to_string(beside(steps, ".lines")).map_or_else(|_| Vec::new(), |text| text.lines().map(str::to_owned).collect())
+}
+
+#[test]
+fn a_push_prunes_a_gone_worktree_s_key_from_the_builders() {
+    let case = push_case("push_sweep_prunes");
+    seed_gone_record(&case);
+    let pruned = format!("out-exit 0 gate: remote pruned {SWEPT_KEY} (worktree gone)");
+    let steps = steps(&case, &["ok", &pruned]);
+
+    let outcome = push_sweeping(&case, &steps);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(unix(&outcome.stdout), installed_lines(HOST), "{outcome:?}");
+    assert_eq!(calls(&steps), ["push", "prune"], "{outcome:?}");
+    let lines = call_lines(&steps);
+    assert!(
+        lines.last().is_some_and(
+            |line| line.starts_with(&format!("{HOST} ")) && line.ends_with(&format!(" box prune --root D:\\gate-remote --keys {SWEPT_KEY}"))
+        ),
+        "the sweep's keyed prune went to {HOST}: {lines:?}"
+    );
+    assert!(
+        outcome
+            .stderr
+            .contains(&format!("gate: remote {HOST} pruned {SWEPT_KEY} (worktree gone)\n")),
+        "the sweep's line is said on stderr: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_push_whose_sweep_fails_keeps_push_s_status() {
+    let case = push_case("push_sweep_fails");
+    seed_gone_record(&case);
+    let steps = steps(&case, &["ok", "fail-other"]);
+
+    let outcome = push_sweeping(&case, &steps);
+
+    assert_eq!(outcome.code, Some(0), "the install passed, so the push passes: {outcome:?}");
+    assert_eq!(unix(&outcome.stdout), installed_lines(HOST), "{outcome:?}");
+    assert_eq!(calls(&steps), ["push", "prune"], "{outcome:?}");
+    assert!(
+        outcome.stderr.contains(&format!("gate: remote {HOST} could not be reached: {REFUSED}\n")),
+        "the sweep's failure is said: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_push_with_no_worktree_records_says_nothing_of_prune() {
+    let case = push_case("push_sweep_no_records");
+    let steps = steps(&case, &["ok"]);
+
+    let outcome = push_sweeping(&case, &steps);
+
+    assert_installed(&case, &outcome);
+    assert!(!outcome.stderr.contains("prune:"), "{outcome:?}");
+    assert_eq!(calls(&steps), ["push"], "no builder is called to prune: {outcome:?}");
+}
+
 /// What the built gate prints after `gate `, read once: the version every case's installed gate says.
 static VERSION: LazyLock<String> = LazyLock::new(|| version_of(Path::new(GATE)));
 

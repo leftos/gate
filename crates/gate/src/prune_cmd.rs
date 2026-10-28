@@ -65,6 +65,17 @@ pub(crate) type Outcomes = BTreeMap<String, Vec<(Option<String>, Outcome)>>;
 
 /// Runs `gate prune --builders` and returns its exit status: 0 when nothing failed, 1 when anything did.
 pub(crate) fn prune(request: &PruneRequest, environment: &Environment, console: &mut Console) -> u32 {
+    prune_through(request, environment, || transport(&request.seams), console)
+}
+
+/// Runs the sweep as [`prune`] does, its builders reached through the transport `transport` makes, asked for only once a
+/// record is a candidate; else the line saying why there is none. Returns the sweep's exit status.
+pub(crate) fn prune_through(
+    request: &PruneRequest,
+    environment: &Environment,
+    transport: impl FnOnce() -> Result<Box<dyn Transport>, String>,
+    console: &mut Console,
+) -> u32 {
     let state = match resolve::root(None, environment) {
         Ok(resolved) => resolved,
         Err(line) => return failed_with(&line, console),
@@ -72,7 +83,9 @@ pub(crate) fn prune(request: &PruneRequest, environment: &Environment, console: 
     let records = match scanned(&state.path, console) {
         Ok(Some(records)) => records,
         Ok(None) => {
-            console.err("gate: prune: no worktree records");
+            if !request.quiet {
+                console.err("gate: prune: no worktree records");
+            }
             return 0;
         }
         Err(line) => return failed_with(&line, console),
@@ -103,7 +116,7 @@ pub(crate) fn prune(request: &PruneRequest, environment: &Environment, console: 
         Ok(listed) => listed,
         Err(line) => return failed_with(&line, console),
     };
-    let transport = match transport(&request.seams) {
+    let transport = match transport() {
         Ok(transport) => transport,
         Err(line) => return failed_with(&line, console),
     };

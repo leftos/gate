@@ -430,6 +430,9 @@ pub struct TestSeams {
     /// Let a process in the command's job create one outside it (`JOB_OBJECT_LIMIT_BREAKAWAY_OK`), so a case can stand
     /// a process that left the job in for a packaged app the command's descendant starts.
     pub job_breakaway: bool,
+    /// Let a routed run whose builder call ended start the background prune sweep (`--test-prune-sweep`), which a
+    /// gate built with the `test-seams` feature starts only then, its child given the run's remote transport seams.
+    pub prune_sweep: bool,
     /// How long `gate warm` waits for the key mutex and for the warm-up cap each, in milliseconds, in place of the
     /// warm-up file's ceiling.
     pub warm_wait_ms: Option<u64>,
@@ -614,11 +617,15 @@ pub struct DrainSeams {
     pub remote_ssh: Option<PathBuf>,
 }
 
-/// A valid `gate prune --builders`, which takes no other words: the hidden seams the black-box suite gives it.
+/// A valid `gate prune --builders`, which takes no other words but `--quiet`: whether an empty sweep says nothing, and
+/// the hidden seams the black-box suite gives it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PruneRequest {
     /// The hidden `--test-*` flags that set the transport and the least age of a gone worktree's mark.
     pub seams: PruneSeams,
+    /// `--quiet`, which the usage line leaves out: a sweep with no worktree records says nothing, as the background
+    /// sweep and the one at `gate push` do.
+    pub quiet: bool,
 }
 
 /// What the black-box suite sets on `gate prune --builders` through its hidden `--test-*` flags; each field keeps its

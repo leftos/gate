@@ -296,6 +296,7 @@ fn drain_seam_option(_name: &str) -> Option<RunOption> {
 fn prune_option(name: &str) -> Option<RunOption> {
     match name {
         "builders" => Some(RunOption::Switch(SwitchOption::Builders)),
+        "quiet" => Some(RunOption::Switch(SwitchOption::Quiet)),
         _ => prune_seam_option(name),
     }
 }
@@ -390,6 +391,7 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-parent-job-trusted" => Some(RunOption::Switch(SwitchOption::ParentJobTrusted)),
         "test-diagnostics-fail" => Some(RunOption::Switch(SwitchOption::DiagnosticsFail)),
         "test-job-breakaway" => Some(RunOption::Switch(SwitchOption::JobBreakaway)),
+        "test-prune-sweep" => Some(RunOption::Switch(SwitchOption::PruneSweep)),
         "test-remote-client" => Some(RunOption::Value(ValueOption::RemoteClient)),
         "test-remote-wait-ms" => Some(RunOption::Value(ValueOption::RemoteWaitMs)),
         "test-key-wait-ms" => Some(RunOption::Value(ValueOption::KeyWaitMs)),

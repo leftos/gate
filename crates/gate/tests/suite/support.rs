@@ -1652,6 +1652,21 @@ pub fn allow_breakaway() {
     });
 }
 
+/// Puts the suite's process in a fresh job that sets no limit, so refuses breakaway, nested in the job it already runs
+/// in: every gate it starts afterwards runs in a job that refuses breakaway. The job lasts as long as this process.
+pub fn refuse_breakaway() {
+    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    // SAFETY: no security attributes and no name are allowed; a null handle is a failure.
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    assert!(!job.is_null(), "the job is created: {}", io::Error::last_os_error());
+    // SAFETY: the job is open and the pseudo-handle of this process is always open. The job's handle is never closed:
+    // the job lasts as long as this process, which it holds.
+    let assigned = unsafe { AssignProcessToJobObject(job, GetCurrentProcess()) };
+    assert_ne!(assigned, 0, "this process enters the job: {}", io::Error::last_os_error());
+}
+
 /// The words of a valid run that prints its request, the command after `--` last.
 pub fn print_run(command: &[&'static str]) -> Vec<&'static str> {
     let mut words = vec![

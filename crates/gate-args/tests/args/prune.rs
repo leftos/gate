@@ -9,9 +9,23 @@ fn prune_builders_parses() {
     assert_eq!(
         invocation(&["prune", "--builders"]),
         Invocation::Prune(PruneRequest {
-            seams: PruneSeams::default()
+            seams: PruneSeams::default(),
+            quiet: false,
         })
     );
+}
+
+#[test]
+fn prune_builders_quiet_parses_in_every_build() {
+    assert_eq!(
+        invocation(&["prune", "--builders", "--quiet"]),
+        Invocation::Prune(PruneRequest {
+            seams: PruneSeams::default(),
+            quiet: true,
+        })
+    );
+    assert_eq!(problems(&["prune", "--quiet"]), ["gate: missing --builders"], "--quiet is no --builders");
+    assert_eq!(problems(&["prune", "--builders", "--quiet", "--quiet"]), ["gate: --quiet is given twice"]);
 }
 
 #[test]
@@ -79,6 +93,7 @@ fn prune_seams_parse_with_the_feature() {
                 remote_ssh: Some(PathBuf::from("fake-ssh.exe")),
                 gone_age_ms: Some(60000),
             },
+            quiet: false,
         })
     );
     assert_eq!(
@@ -88,6 +103,7 @@ fn prune_seams_parse_with_the_feature() {
                 gone_age_ms: Some(0),
                 ..PruneSeams::default()
             },
+            quiet: false,
         }),
         "a gone worktree may be pruned at once"
     );

@@ -32,7 +32,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use gate_args::PushRequest;
+use gate_args::{PruneRequest, PruneSeams, PushRequest};
 use gate_router::{BuilderOs, Config, escaped, is_unix_root};
 use gate_win32::{EnvironmentBlock, Job, LaunchError, PipedConsole, PipedFed, PipedLaunch, Running};
 use regex::Regex;
@@ -42,9 +42,10 @@ use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATT
 
 use crate::answer::FAILED_STATUS;
 use crate::console::Console;
+use crate::prune_cmd;
 use crate::remote::git;
 use crate::remote::transport::ssh::{Ssh, git_ssh_command};
-use crate::remote::transport::{Wire, ssh_words};
+use crate::remote::transport::{Transport, Wire, ssh_words};
 use crate::resolve::Environment;
 use crate::route::read_remote_json;
 
@@ -608,7 +609,23 @@ pub(crate) fn push(request: &PushRequest, environment: &Environment, console: &m
             }
         }
     }
+    swept(&ssh, environment, console);
     status
+}
+
+/// The prune sweep after a push, quiet when there is no worktree record, through the ssh the push called its builders
+/// with; its status is dropped, as it never changes the push's.
+fn swept(ssh: &Result<PathBuf, String>, environment: &Environment, console: &mut Console) {
+    let request = PruneRequest {
+        seams: PruneSeams::default(),
+        quiet: true,
+    };
+    let transport = || {
+        ssh.clone()
+            .map(|program| Box::new(Ssh { program }) as Box<dyn Transport>)
+            .map_err(|why| format!("gate: prune: {why}"))
+    };
+    prune_cmd::prune_through(&request, environment, transport, console);
 }
 
 /// What every builder is sent: the Windows builders, the exe as its call is fed it, [`pushed_input`], the exe's version

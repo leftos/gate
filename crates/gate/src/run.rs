@@ -37,7 +37,7 @@ use gate_win32::{
     AcquireError, Interrupt, Job, JobEvent, Launch, LaunchError, LaunchOutput, NamedMutex, OpenedJob, OwnedMutexGuard, PriorityClass, Running,
     StoppableProcess, Suspended,
 };
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use proc_table::{ProcessTree, Win32ProcessTable};
 use serde_json::{Map, Value};
 
@@ -189,6 +189,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         reroute_tried: false,
         restore_after: None,
         closing: Vec::new(),
+        builder_call: BuilderCall::NotEnded,
     };
     let (route, placed) = run.route(environment, console);
     if let Some(status) = ended_at_route(&route, request, &run.log, console) {
@@ -212,7 +213,117 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         }
     };
     run.finish_log(console);
+    run.sweep_after();
     status
+}
+
+/// Whether a routed run's builder call ended, passing or failing its command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuilderCall {
+    /// The run made no builder call, or one that was refused or interrupted before it started.
+    NotEnded,
+    /// The builder ran the command to its end.
+    Ended,
+}
+
+impl Run<'_> {
+    /// Starts the background prune sweep ([`start_prune_sweep`]) after a run whose builder call ended, unless a Ctrl+C
+    /// came or the gate runs inside a box run.
+    fn sweep_after(&self) {
+        let interrupted = self.host.interrupt.is_some_and(Interrupt::is_raised);
+        if self.builder_call == BuilderCall::Ended && !interrupted && !matches!(self.nesting, Nesting::InBox) {
+            start_prune_sweep(self.request, &self.root.path);
+        }
+    }
+}
+
+/// How long a background prune sweep's stamp stands before a routed run starts the next sweep.
+const PRUNE_SWEEP_EVERY: SignedDuration = SignedDuration::from_hours(6);
+/// How far in the future a sweep stamp may be, for a clock set back a little, before it counts as stale.
+const PRUNE_SWEEP_SKEW: SignedDuration = SignedDuration::from_mins(5);
+/// The variable that names the state root, which the background sweep is given the run's in.
+const STATE_DIR_VARIABLE: &str = "GATE_STATE_DIR";
+/// The most bytes a sweep stamp is read to.
+const PRUNE_SWEEP_STAMP_CAP: usize = 4096;
+
+/// Starts the background prune sweep, `gate prune --builders --quiet` detached from this run, when its stamp under the
+/// state root `state` is missing, unreadable, six hours old or more, or more than five minutes in the future, and this
+/// process's job lets it break away: the stamp is written first, and removed again when the sweep cannot be started.
+/// Whatever fails is dropped unsaid: the sweep never changes the run's status or output.
+fn start_prune_sweep(request: &RunRequest, state: &Path) {
+    if !prune_sweep_on(request) || !gate_win32::breakaway_refused().is_ok_and(|refused| !refused) {
+        return;
+    }
+    let stamp = v1::prune_sweep_stamp_path(state);
+    let now = Timestamp::now();
+    if !prune_sweep_due(&stamp, now) || v1::write_prune_sweep_stamp(&stamp, &v1::PruneSweepStamp { at: now }).is_err() {
+        return;
+    }
+    if prune_sweep_started(request, state).is_err() {
+        // A stamp left would hold the next sweep back six hours for one that never ran; one that cannot be removed
+        // leaves nothing more to do.
+        let _ = fs::remove_file(&stamp);
+    }
+}
+
+/// Whether the background sweep is due at `now` by the stamp at `path`: when it cannot be read as a stamp, or its `at`
+/// is [`PRUNE_SWEEP_EVERY`] or more before `now` or more than [`PRUNE_SWEEP_SKEW`] after it.
+fn prune_sweep_due(path: &Path, now: Timestamp) -> bool {
+    let read = worktree_record::read_regular_within(path, PRUNE_SWEEP_STAMP_CAP)
+        .ok()
+        .and_then(|bytes| v1::prune_sweep_stamp(&bytes).ok());
+    let Some(stamp) = read else {
+        return true;
+    };
+    let age = now.duration_since(stamp.at);
+    age >= PRUNE_SWEEP_EVERY || age < -PRUNE_SWEEP_SKEW
+}
+
+/// Starts this gate's own exe as `prune --builders --quiet` detached ([`gate_win32::start_detached`]), with this
+/// process's environment and `GATE_STATE_DIR` set to `state`, in `state`, its output replacing the sweep log there;
+/// its pid, or why it was not started.
+fn prune_sweep_started(request: &RunRequest, state: &Path) -> Result<u32, String> {
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let output = fs::File::create(v1::prune_sweep_log_path(state)).map_err(|error| error.to_string())?;
+    let mut args: Vec<OsString> = ["prune", "--builders", "--quiet"].map(OsString::from).to_vec();
+    args.extend(prune_sweep_seams(request));
+    let variables = std::env::vars_os()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(STATE_DIR_VARIABLE))
+        .chain([(OsString::from(STATE_DIR_VARIABLE), state.as_os_str().to_owned())]);
+    let block = gate_win32::EnvironmentBlock::new(variables).map_err(|error| error.to_string())?;
+    gate_win32::start_detached(&exe, &args, &block, state, &output).map_err(|error| error.to_string())
+}
+
+/// Whether a routed run whose builder call ended starts the background sweep: in a gate built with the `test-seams`
+/// feature, only when the run carries `--test-prune-sweep`.
+#[cfg(feature = "test-seams")]
+fn prune_sweep_on(request: &RunRequest) -> bool {
+    request.test_seams.prune_sweep
+}
+
+/// Whether a routed run whose builder call ended starts the background sweep: always.
+#[cfg(not(feature = "test-seams"))]
+fn prune_sweep_on(_request: &RunRequest) -> bool {
+    true
+}
+
+/// The run's remote transport seams, `--test-remote-transport` and `--test-remote-ssh`, as the sweep's own words.
+#[cfg(feature = "test-seams")]
+fn prune_sweep_seams(request: &RunRequest) -> Vec<OsString> {
+    let mut words = Vec::new();
+    if let Some(transport) = &request.test_seams.remote_transport {
+        words.extend([OsString::from("--test-remote-transport"), OsString::from(transport)]);
+    }
+    if let Some(ssh) = &request.test_seams.remote_ssh {
+        words.extend([OsString::from("--test-remote-ssh"), ssh.as_os_str().to_owned()]);
+    }
+    words
+}
+
+/// No seams: a gate built without the `test-seams` feature has none.
+#[cfg(not(feature = "test-seams"))]
+fn prune_sweep_seams(_request: &RunRequest) -> Vec<OsString> {
+    Vec::new()
 }
 
 /// The machine the run waits and runs on: its processors, and the Ctrl+C handler, installed now; one that cannot be
@@ -700,6 +811,9 @@ struct Run<'a> {
     restore_after: Option<RoutedBuild>,
     /// The verdict's closing lines, held while a restore here is still to run so they stay the run's last lines.
     closing: Vec<Said>,
+    /// Whether the routed run's builder call ended, passing or failing its command, rather than being refused or
+    /// interrupted before it started: such a run may start the background prune sweep ([`start_prune_sweep`]).
+    builder_call: BuilderCall,
 }
 
 /// A routed dotnet build that passed and brought everything back: its words, its worktree's root, the routed command's
@@ -2061,6 +2175,7 @@ impl Run<'_> {
             ceiling,
             stale: &stale,
         };
+        self.builder_call = BuilderCall::Ended;
         Attempt::Done(Remotely::Ended(self.remote_ended(&outcome, passing, wall, console)))
     }
 

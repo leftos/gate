@@ -30,7 +30,8 @@ use crate::remote_inputs::inputs_case;
 use crate::support::{
     ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, GIT_REDIRECTS, Go, Junction, NetfxKey, Outcome, PREFLIGHT_SEAMS_VARIABLE, Running,
     STEPS_VARIABLE, allow_breakaway, assert_in_order, beside, build_version, calls, copy_tool, events, finish, git, git_init, heavy_words, log_texts,
-    nothing_back, release, run_words, shown, ssh_steps, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
+    nothing_back, refuse_breakaway, release, run_words, shown, ssh_steps, start, wait_for_journal_line, wait_until, wait_until_closed,
+    write_remote_json,
 };
 
 const HOST: &str = "builder";
@@ -10414,4 +10415,249 @@ fn a_poll_refused_for_its_version_says_no_lifted_line() {
     assert!(outcome.stderr.contains(&line), "{outcome:?}");
     assert!(outcome.stdout.contains("ran here") || outcome.stdout.contains("ran there"), "{outcome:?}");
     assert_eq!(fallbacks(&events(&case)), ["version"]);
+}
+
+/// The key of the gone worktree's record a background sweep case seeds.
+const SWEPT_KEY: &str = "app-1a2b3c4d";
+
+/// The background sweep's stamp in the case's state root.
+fn sweep_stamp(case: &Case) -> PathBuf {
+    case.root().join("remote").join("prune-sweep.stamp")
+}
+
+/// The background sweep's log in the case's state root.
+fn sweep_log(case: &Case) -> PathBuf {
+    case.root().join("remote").join("prune-sweep.log")
+}
+
+/// Seeds the record of [`SWEPT_KEY`], whose worktree root and git common folder are both missing in the case folder, so
+/// the first sweep finds it gone and says so.
+fn seed_gone_record(case: &Case) {
+    let record = json!({
+        "v": 1,
+        "root": shown(&case.folder().join("gone-wt")),
+        "commonDir": shown(&case.folder().join("gone-repo").join(".git")),
+        "repo": "app",
+        "lastRouted": "2026-01-01T00:00:00Z",
+    });
+    let folder = case.root().join("remote");
+    fs::create_dir_all(&folder).expect("the records' folder can be made");
+    fs::write(folder.join(format!("{SWEPT_KEY}.worktree")), record.to_string()).expect("the record can be written");
+}
+
+/// Writes the case's sweep stamp holding `at` as its time.
+fn seed_stamp(case: &Case, at: jiff::Timestamp) {
+    let stamp = sweep_stamp(case);
+    fs::create_dir_all(stamp.parent().expect("the stamp has a folder")).expect("the stamp's folder can be made");
+    fs::write(&stamp, json!({ "v": 1, "at": at.to_string() }).to_string()).expect("the stamp can be written");
+}
+
+/// The time the case's sweep stamp holds, which it must hold as the stamp's format says.
+fn stamp_time(case: &Case) -> jiff::Timestamp {
+    let text = fs::read_to_string(sweep_stamp(case)).expect("the stamp was written");
+    let stamp: Value = serde_json::from_str(&text).expect("the stamp is JSON");
+    assert_eq!(stamp["v"], 1, "{text}");
+    stamp["at"]
+        .as_str()
+        .expect("the stamp's time is text")
+        .parse()
+        .expect("the stamp's time is a time")
+}
+
+/// A routed run of the case through the stand-in of `steps`, with `extra` before its command, which says `ran there`
+/// and exits `status`.
+fn sweeping_run(case: &Case, steps: &Path, extra: &[&str], status: &str) -> Outcome {
+    let tuned = Tuned { extra, ..Tuned::default() };
+    finish(client_gate_tuned(
+        case,
+        "out.log",
+        steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran there", "exit", status],
+    ))
+}
+
+/// Waits until the background sweep has ended, its log no longer held open, and asserts the log says the seeded
+/// record's worktree is gone.
+fn assert_swept(case: &Case) {
+    assert!(sweep_stamp(case).exists(), "a sweep starts only once its stamp is written");
+    let log = sweep_log(case);
+    wait_until(&format!("{} appearing", log.display()), || log.exists());
+    wait_until_closed(&log);
+    let text = fs::read_to_string(&log).expect("the sweep's log can be read");
+    assert!(
+        text.contains(&format!("gate: prune: {SWEPT_KEY}: ")) && text.contains(" is gone"),
+        "{text}"
+    );
+}
+
+/// Asserts the routed run ran its command there, with nothing of a sweep said on its console.
+fn assert_ran_there(outcome: &Outcome, status: i32) {
+    assert_eq!(outcome.code, Some(status), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("prune"), "the run says nothing of the sweep: {outcome:?}");
+}
+
+#[test]
+fn a_routed_run_with_no_stamp_writes_one_and_starts_the_sweep() {
+    let case = client_case("client-sweep-no-stamp");
+    seed_gone_record(&case);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let before = jiff::Timestamp::now();
+
+    let outcome = sweeping_run(&case, &steps, &["--test-prune-sweep"], "0");
+
+    assert_ran_there(&outcome, 0);
+    assert!(stamp_time(&case) >= before, "the stamp holds the run's time");
+    assert_swept(&case);
+}
+
+#[test]
+fn a_routed_run_within_six_hours_of_the_stamp_starts_no_sweep() {
+    let case = client_case("client-sweep-fresh-stamp");
+    seed_gone_record(&case);
+    seed_stamp(&case, jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1));
+    let seeded = fs::read_to_string(sweep_stamp(&case)).expect("the stamp was seeded");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = sweeping_run(&case, &steps, &["--test-prune-sweep"], "0");
+
+    assert_ran_there(&outcome, 0);
+    assert_eq!(
+        fs::read_to_string(sweep_stamp(&case)).expect("the stamp is there"),
+        seeded,
+        "the stamp is left"
+    );
+    assert!(!sweep_log(&case).exists(), "no sweep started");
+}
+
+#[test]
+fn a_routed_run_past_six_hours_of_the_stamp_starts_the_sweep() {
+    let case = client_case("client-sweep-old-stamp");
+    seed_gone_record(&case);
+    let old = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(7);
+    seed_stamp(&case, old);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = sweeping_run(&case, &steps, &["--test-prune-sweep"], "0");
+
+    assert_ran_there(&outcome, 0);
+    assert!(stamp_time(&case) > old, "the stamp is written again");
+    assert_swept(&case);
+}
+
+#[test]
+fn a_future_stamp_starts_the_sweep() {
+    let case = client_case("client-sweep-future-stamp");
+    seed_gone_record(&case);
+    let future = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
+    seed_stamp(&case, future);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = sweeping_run(&case, &steps, &["--test-prune-sweep"], "0");
+
+    assert_ran_there(&outcome, 0);
+    assert!(stamp_time(&case) < future, "the stamp is written again with the run's time");
+    assert_swept(&case);
+}
+
+#[test]
+fn a_malformed_stamp_starts_the_sweep() {
+    let case = client_case("client-sweep-malformed-stamp");
+    seed_gone_record(&case);
+    let stamp = sweep_stamp(&case);
+    fs::create_dir_all(stamp.parent().expect("the stamp has a folder")).expect("the stamp's folder can be made");
+    fs::write(&stamp, "nonsense").expect("the stamp can be written");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = sweeping_run(&case, &steps, &["--test-prune-sweep"], "0");
+
+    assert_ran_there(&outcome, 0);
+    stamp_time(&case);
+    assert_swept(&case);
+}
+
+#[test]
+fn a_routed_run_whose_breakaway_is_refused_starts_no_sweep_and_writes_no_stamp() {
+    let case = client_case("client-sweep-refused");
+    refuse_breakaway();
+    seed_gone_record(&case);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = sweeping_run(&case, &steps, &["--test-prune-sweep"], "0");
+
+    assert_ran_there(&outcome, 0);
+    assert_eq!(calls(&steps), ["preflight", "run"], "the builder was called");
+    assert!(!sweep_stamp(&case).exists(), "no stamp is written");
+    assert!(!sweep_log(&case).exists(), "no sweep started");
+}
+
+#[test]
+fn a_routed_run_without_the_seam_starts_no_sweep() {
+    let case = client_case("client-sweep-no-seam");
+    seed_gone_record(&case);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = sweeping_run(&case, &steps, &[], "0");
+
+    assert_ran_there(&outcome, 0);
+    assert!(!sweep_stamp(&case).exists(), "no stamp is written");
+    assert!(!sweep_log(&case).exists(), "no sweep started");
+}
+
+#[test]
+fn a_local_run_starts_no_sweep() {
+    let case = client_case("client-sweep-local");
+    seed_gone_record(&case);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = sweeping_run(&case, &steps, &["--test-prune-sweep", "--local", "--reason", "kept here"], "0");
+
+    assert_ran_there(&outcome, 0);
+    assert_eq!(calls(&steps), Vec::<String>::new(), "no builder is called");
+    assert!(!sweep_stamp(&case).exists(), "no stamp is written");
+    assert!(!sweep_log(&case).exists(), "no sweep started");
+}
+
+#[test]
+fn a_routed_run_that_falls_back_before_its_builder_call_starts_no_sweep() {
+    let case = client_case("client-sweep-fallback");
+    seed_gone_record(&case);
+    let steps = ssh_steps(&case, "ssh", &["fail-other"]);
+
+    let outcome = sweeping_run(&case, &steps, &["--test-prune-sweep"], "0");
+
+    assert_ran_there(&outcome, 0);
+    assert_eq!(calls(&steps), ["preflight"], "only the preflight was called");
+    assert_eq!(fallbacks(&events(&case)), ["unreachable"]);
+    assert!(!sweep_stamp(&case).exists(), "no stamp is written");
+    assert!(!sweep_log(&case).exists(), "no sweep started");
+}
+
+#[test]
+fn a_sweep_that_cannot_start_removes_its_stamp_and_leaves_the_run_s_status() {
+    let case = client_case("client-sweep-unstartable");
+    seed_gone_record(&case);
+    fs::create_dir_all(sweep_log(&case)).expect("a folder can stand at the sweep log's path");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = sweeping_run(&case, &steps, &["--test-prune-sweep"], "3");
+
+    assert_ran_there(&outcome, 3);
+    assert!(outcome.stderr.contains("gate: FAILED (status 3)"), "{outcome:?}");
+    assert!(!sweep_stamp(&case).exists(), "the stamp of a sweep that never started is removed");
+    assert!(sweep_log(&case).is_dir(), "the folder is left as it was");
+}
+
+#[test]
+fn a_routed_run_s_status_and_output_are_unchanged_by_the_sweep() {
+    let case = client_case("client-sweep-status");
+    seed_gone_record(&case);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = sweeping_run(&case, &steps, &["--test-prune-sweep"], "3");
+
+    assert_ran_there(&outcome, 3);
+    assert!(outcome.stderr.contains("gate: FAILED (status 3)"), "{outcome:?}");
+    assert_swept(&case);
 }
