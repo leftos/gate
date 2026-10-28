@@ -1236,7 +1236,7 @@ mod unix {
     }
 
     #[test]
-    fn cross_build_that_fails_says_so_and_fails_the_outputs_bringing_nothing_back() {
+    fn cross_build_that_fails_says_so_and_brings_nothing_back_keeping_the_command_s_status() {
         let case = Case::new("cross-failed");
         let commit = case.snapshot_holding(&[(".gitignore", "bin/\n")]);
         let script = format!("mkdir -p {NATIVE_FOLDER} && echo native > {NATIVE_FOLDER}/A.dll");
@@ -1244,7 +1244,7 @@ mod unix {
 
         let ended = ran(&[], &request, Reading::All, &case.base.join("beaten"));
 
-        assert_eq!(ended.status, Some(1), "{:?}", ended.err);
+        assert_eq!(ended.status, Some(0), "the command's own status: {:?}", ended.err);
         assert_said_then_not_brought_back(&ended, &cross_failed_line(3), CROSS_FAILED);
         assert!(texts(&ended.out).contains(&"cross said"), "its output is forwarded: {:?}", ended.out);
         assert!(outputs_said(&ended).is_empty(), "{:?}", ended.err);
@@ -1253,7 +1253,7 @@ mod unix {
     }
 
     #[test]
-    fn cross_build_that_leaves_a_mach_o_among_its_outputs_brings_nothing_back() {
+    fn cross_build_that_leaves_a_mach_o_among_its_outputs_brings_nothing_back_keeping_the_command_s_status() {
         let case = Case::new("cross-mach-o");
         let commit = case.snapshot_holding(&[(".gitignore", "bin/\n")]);
         let cross = format!("mkdir -p {CROSS_FOLDER} && printf '{PE}' > {CROSS_FOLDER}/A.exe && printf '{MACH_O}' > {CROSS_FOLDER}/A");
@@ -1261,7 +1261,7 @@ mod unix {
 
         let ended = ran(&[], &request, Reading::All, &case.base.join("beaten"));
 
-        assert_eq!(ended.status, Some(1), "{:?}", ended.err);
+        assert_eq!(ended.status, Some(0), "the command's own status: {:?}", ended.err);
         let refused =
             format!("gate: the cross build for win-x64 left a non-Windows file {NATIVE_FOLDER}/A; the Windows outputs were not brought back");
         assert_said_then_not_brought_back(&ended, &refused, CROSS_REFUSED);

@@ -49,7 +49,7 @@ const OUTPUTS: &str = "gate-remote-outputs: ";
 const OUTPUTS_SIZE: &str = "gate-remote-outputs-size: ";
 /// Why a passing run whose box said no outputs line the client accepts brings nothing back, as the PowerShell client
 /// says it.
-const NO_OUTPUTS_LINE: &str = "the box printed no 'gate-remote-outputs: <n> <archive>' line";
+pub(super) const NO_OUTPUTS_LINE: &str = "the box printed no 'gate-remote-outputs: <n> <archive>' line";
 /// The worktree's folder the fetched archive is kept in, made when missing.
 const TMP: &str = ".tmp";
 /// Why a fetch the watchdog stopped brings nothing back, as the PowerShell client says it.
@@ -76,6 +76,8 @@ pub(super) struct Ran<'r> {
     pub(super) nonce: &'r str,
     pub(super) status: i64,
     pub(super) names_skipped: bool,
+    /// Whether the box said the run's cross build brought no Windows outputs back ([`gate_wire::is_cross_not_brought_back`]).
+    pub(super) cross_not_brought_back: bool,
 }
 
 /// The file in the worktree a fetched archive is written to, the worktree it must sit inside, the `.tmp` folder held
@@ -408,6 +410,8 @@ fn step_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synce
     }
     let reason = match (&sent.built, brought) {
         (Err(reason), _) => format!("the manifest could not be built: {reason}"),
+        // The box said the cross build this call sent brought nothing back, and the passing command keeps its status.
+        (Ok(_), None) if ran.cross_not_brought_back && attempt.call.cross_build.is_some() => return (synced, false),
         (Ok(_), None) => NO_OUTPUTS_LINE.to_owned(),
         (Ok(files), Some(Brought::Archive { count, size, .. })) => {
             let kept = Kept {

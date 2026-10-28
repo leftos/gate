@@ -374,7 +374,7 @@ On stdout, each line prefixed `check: here: `, `here` being this PC, in this ord
    A line `check: here: .gate/<name>: read from <full path>` follows for each file taken from the declarations folder, and `check: here: .gate/<name>: the worktree's copy wins over <full path>` for each file of the worktree's own that shadows a copy there, readable or not.
 
    The same lines, with the builder's name for `here`, come from `gate check --builder`.
-2. One line per item, every item printed, the ones that are fine included: the manifest's tools in manifest order, then the .NET SDK, then the workloads, then the `remote.json` item when it applies, then `declarations for <repo>: <why>` when the repo's declarations folder cannot be used, judged on every check whether or not a read reaches it (counted missing, so the exit is 1; `<why>` is the reason the log line gives), then the siblings, then the warm-up's items ([The warm-up items](#the-warm-up-items)).
+2. One line per item, every item printed, the ones that are fine included: the manifest's tools in manifest order, then the .NET SDK, then the workloads, then the `remote.json` item when it applies, then `declarations for <repo>: <why>` when the repo's declarations folder cannot be used, judged on every check whether or not a read reaches it (counted missing, so the exit is 1; `<why>` is the reason the log line gives), then one `remote.json: builders[N].crossBuild…` line per `builders` entry whose `crossBuild` cannot be used (whatever the repo, control characters escaped, counted missing; a routed run says nothing of it), then the siblings, then the warm-up's items ([The warm-up items](#the-warm-up-items)).
 3. One `install: here: <subject>: <command>` hint line per missing or too-old item, in item order.
 4. The summary: `check: here: nothing missing` or `check: here: <n> missing, <n> too old`, with `, <n> skipped` added when any item was skipped; with nothing missing and some skipped it is `check: here: nothing missing (<n> skipped)`. When a file could not be read it is `check: here: could not read <files>; <n> missing, <n> too old`, `, <n> skipped` added as above, the files comma separated in the order `.gate/toolchain.toml`, `.gate/siblings.toml`, `.gate/warmup.toml`, `global.json`.
 
@@ -1415,7 +1415,7 @@ The optional `hosts` is an array of strings naming further builders, which `gate
 
 The push order is `host`, then `hosts` in file order, an entry equal to an earlier one in any letter case skipped. A `hosts` that is not an array of strings, or holds a bad entry, never affects routing: `gate push` alone refuses the file with `push: ignored <path>: <reason>`.
 
-The optional `builders` is an array of further builders that a routed run can go to, each `{"host", "os", "root", "slots", "routed", "repos", "outputs", "failureOutputs"}`:
+The optional `builders` is an array of further builders that a routed run can go to, each `{"host", "os", "root", "slots", "routed", "repos", "outputs", "failureOutputs", "crossBuild"}`:
 - `host` is the builder's ssh alias, passing the checks the top-level `host` does (`Builder::alias`).
 - `os` is `windows` or `macos` in any letter case.
 - `root` is the builder's work root. It is required for `macos`: an absolute path rooted at `/`, each name made of ASCII letters, digits, `.`, `_` and `-`, none empty, `.` or `..`. For `windows` it defaults to `D:\gate-remote` and must be `X:\` followed by names joined by `\`, each made of ASCII letters, digits, `.`, `_` and `-`, none starting or ending with `.` or a reserved device name; `/` is refused (`builders[N].root must be an absolute drive path for a windows builder`).
@@ -1426,6 +1426,10 @@ The optional `builders` is an array of further builders that a routed run can go
 A bad entry, an alias that repeats the top-level `host`, an earlier `builders` entry or a `hosts` entry in any ASCII letter case, or a `builders` that is not an array makes the whole file unusable: `gate: ignored <path>: builders[N]...; running locally`. The top-level `outputs` apply to `host` alone; a `builders` entry with no `outputs` brings nothing back when it is `macos` and uses the default output globs when it is `windows`.
 
 A `macos` entry's `outputs` are honoured, since the Unix box brings outputs back.
+
+`crossBuild` is an optional object of repo name (matched in any letter case) to a runtime identifier (`Rid`) such as `win-x64`, on a `macos` entry alone: it opts the repo's routed `dotnet build` and `dotnet test` on that builder into a cross build, so the outputs come back built for Windows ([The Unix box](#the-unix-box)).
+Its `Rid` is held to the box's rule (ASCII letters, digits, `-` and `.`, not starting with `.`), and the repo needs a non-empty list in the same entry's `outputs`.
+A bad `crossBuild` is a soft problem, never an unusable file: a value that is no object, a `crossBuild` on a `windows` entry, a `Rid` that is no string or no runtime identifier, or a repo without a non-empty `outputs` list on the entry drops that entry's cross builds alone, and the rest of the file is read as it stands.
 
 `failureOutputs` is an optional object of repo name to an array of globs, beside `outputs`, with the same glob rules (non-empty `-like` patterns, no `[` or `]`) and the same key on a `builders` entry, whose list wins for a run on that builder (an entry that does not name the repo has none). It is absent by default and has no default or derived globs. The files under them come back only from a failed command (Routing, Outputs).
 
@@ -2808,6 +2812,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     A run says at most one of these lines (a passing run then exits 1; a failed run keeps the command's own status, see the box side): `gate: remote outputs not brought back: the worktree changed during the run` (wins when it applies), `gate: remote outputs not brought back: the manifest could not be built: <msg>` (`<path> resolves outside the worktree`, `it is larger than the box takes (64 MiB)`, checked as the manifest is built before the rest is hashed, or the read error), or a third.
 
     The third is `gate: remote outputs not brought back: the box printed no 'gate-remote-outputs: <n> <archive>' line`.
+
+    A passing run that sent a cross build and heard the box's own stamped standard-error line that the cross build brought nothing back (`gate: remote outputs not brought back: the cross build failed` or `the cross build left a non-Windows file`) ends on the command's status (0) instead, with the outputs left not brought back so the next `--no-build` run builds first. A copy of that line the command printed on its own stream, or the line on a run that sent no cross build, does not count and the run ends 1 with the third line.
 
   - **Sync-back.** In `remote/syncback.rs`, after a run call that ended with the command's own status (a refusal, an interrupt or a failed call never syncs back).
 
@@ -4387,15 +4393,24 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
     After a command that exited 0 and pushed its back commits, and before the outputs are walked, the box runs `Words` as a second command with the first's working folder, environment and `Timeout`, a fresh ceiling of its own; its output is forwarded as the command's, and `box stop` ends it as it ends the command. It says no start marker, kill tag or adjusted line of its own.
 
-  A cross build that exits 0 says `gate: the cross build for <rid> took <s> s` and the outputs are brought back. One that ends otherwise says `gate: the cross build for <rid> failed with exit <status>; the Windows outputs were not brought back`, then `gate: remote outputs not brought back: the cross build failed`, and the run ends 1. A client gone before or during it ends the run 255.
+  A cross build that exits 0 says `gate: the cross build for <rid> took <s> s` and the outputs are brought back. One that ends otherwise says `gate: the cross build for <rid> failed with exit <status>; the Windows outputs were not brought back`, then `gate: remote outputs not brought back: the cross build failed`.
+  The run keeps the passing command's status (0) after a cross build that exits by a code, 143 included and a trapped stop with it. A cross build the box kills for its ceiling or backstop ends the run 124 with the box's kill line and kill tag for the command, and none of the cross-failure lines.
+  A cross build that ends by a signal, cannot start, or that the box cannot see to its end ends the run 1 with the same two lines, so a stopped run never reads as passed. A client gone before or during it ends the run 255.
+  The PC's nothing-back record then stands for the build, so the next `--no-build` run builds first.
 
   The outputs of a run with a cross build are listed at the output path map: a file under `bin/<a>/<b>/<rid>/...` is judged by the output globs, and brought back, at its path with the `<rid>` folder removed, which is the path a native Windows build writes it at; a folder is entered by the globs at its mapped path too.
 
   A native file at a mapped file's path is left out, the mapped one being the only file at it. Only the files to be sent are checked, by their first bytes (a file the PC holds unchanged is never opened).
 
-  A file at its own path that opens as a Mach-O or ELF program, which the PC cannot run, is left out. A mapped file that opens as one was not built for Windows: nothing is brought back, and the run says `gate: the cross build for <rid> left a non-Windows file <path>; the Windows outputs were not brought back` (the PC path, control characters escaped), then `gate: remote outputs not brought back: the cross build left a non-Windows file`, and ends 1.
+  A file at its own path that opens as a Mach-O or ELF program, which the PC cannot run, is left out. A mapped file that opens as one was not built for Windows: nothing is brought back, and the run says `gate: the cross build for <rid> left a non-Windows file <path>; the Windows outputs were not brought back` (the PC path, control characters escaped), then `gate: remote outputs not brought back: the cross build left a non-Windows file`, and keeps the passing command's status.
 
-  The Windows box refuses a `CrossBuild` payload with `gate: box payload CrossBuild is a macOS builder's key; this box cannot cross-build`. A malformed one, or one without `Outputs`, is a usage line on either box (`gate: box payload CrossBuild is not an object`, `lacks Rid`, `Rid is not a text`, `lacks Words`, `Words holds an empty word`, `needs Outputs`, among them). The PC's client does not send `CrossBuild` yet.
+  The Windows box refuses a `CrossBuild` payload with `gate: box payload CrossBuild is a macOS builder's key; this box cannot cross-build`. A malformed one, or one without `Outputs`, is a usage line on either box (`gate: box payload CrossBuild is not an object`, `lacks Rid`, `Rid is not a text`, `lacks Words`, `Words holds an empty word`, `needs Outputs`, among them).
+
+  The PC's router sends `CrossBuild` to a macOS builder whose `builders` entry opts the repo in (`crossBuild` in [remote.json](#remotejson)), for a routed direct `dotnet build` or a `dotnet test` without `--no-build` (the `--no-build` the router would drop counts) that builds in place, names no runtime and has output globs; never to a Windows builder, and a warm-up never carries it.
+  Its `Rid` is the entry's, and its `Words` are `dotnet build <target> -c <configuration> -r <rid>` (`Debug` when the command names no configuration; no target word when the command names none), then the command's `-f`/`--framework` and `--source` words with their values as written, then its property words.
+  `-s` is carried as a source for `dotnet build` alone, since in `dotnet test` it is the settings file.
+  The target is the first word that is no option and no option's value: `dotnet test --blame-hang-timeout 10m tests/A.Tests` cross-builds `tests/A.Tests`, and `dotnet build --property Bar=2` cross-builds with no target. After `--self-contained`, `--sc` or `--interactive`, a `true` or `false` next word is the switch's value. Words after the dotnet command's own `--` are never read.
+  A command naming `-a`, `--arch`, `--os`, `--ucr`, `--use-current-runtime`, `-r`, `--runtime`, `-o`, `--output` or `--artifacts-path`, or an option word the router does not know (`--made-up-switch`, `-bl` and `-m` among them), gets no cross build, and its route says `gate: no cross build for this command: it names <word>` after the route's other lines.
 
   A pair run brings back from its main tree only. `OutputsFull` with no globs is taken and does nothing. `--test-outputs-budget-bytes` reaches the run. Every other verb (`inflight`, `lfs`, `register-desktop`) says `gate: box <verb> is not built on this builder` and exits 2.
 

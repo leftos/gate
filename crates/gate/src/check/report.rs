@@ -169,6 +169,9 @@ pub(crate) struct Checked {
     pub consent_problem: Option<String>,
     /// Why this PC's routing file's `hooks` value cannot be used, when it cannot.
     pub hooks_problem: Option<String>,
+    /// Why each `builders` entry's `crossBuild` in this PC's routing file cannot be used, one per such entry in file
+    /// order; none for a builder.
+    pub cross_build_problems: Vec<String>,
     /// Why a builder's box refused its work root: not locked down, naming the installer step that locks it, or busy;
     /// `None` for this PC and for a builder that took its root.
     pub root_problem: Option<String>,
@@ -328,6 +331,9 @@ fn items(at: At<'_>, checked: &Checked) -> Vec<Item> {
         items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
     }
     if let Some(problem) = &checked.hooks_problem {
+        items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
+    }
+    for problem in &checked.cross_build_problems {
         items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
     }
     if let Some(problem) = &checked.root_problem {
@@ -641,6 +647,7 @@ mod tests {
             workloads: Vec::new(),
             consent_problem: None,
             hooks_problem: None,
+            cross_build_problems: Vec::new(),
             root_problem: None,
             siblings: Vec::new(),
             created: Vec::new(),
@@ -1339,6 +1346,29 @@ mod tests {
                     r"check: here: remote.json: hooks[0] is not a non-empty string\u{202e}",
                     "check: here: 1 missing, 0 too old"
                 ),
+                status: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn each_cross_build_value_that_cannot_be_used_is_its_own_escaped_missing_line() {
+        let checked = Checked {
+            cross_build_problems: vec![
+                "builders[0].crossBuild is a macos builder's key".to_owned(),
+                "builders[2].crossBuild.\"g\" is not a runtime identifier\u{202e}".to_owned(),
+            ],
+            ..checked(Vec::new())
+        };
+        assert_eq!(
+            said(HERE, &checked),
+            Said {
+                lines: vec![
+                    out("check: here: app at X:/dev/app"),
+                    out("check: here: remote.json: builders[0].crossBuild is a macos builder's key"),
+                    out(r#"check: here: remote.json: builders[2].crossBuild."g" is not a runtime identifier\u{202e}"#),
+                    out("check: here: 2 missing, 0 too old"),
+                ],
                 status: 1,
             }
         );

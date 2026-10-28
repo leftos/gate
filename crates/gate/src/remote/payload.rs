@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use gate_args::{BoxVerb, DrainAction};
+use gate_router::CrossBuild;
 use gate_wire::PathForm;
 use serde_json::{Map, Value, json};
 
@@ -175,6 +176,9 @@ pub(crate) struct RunCall<'a> {
     /// Whether the run asks for the builder's desktop (`Desktop: true` and `DesktopWait`, the usual remote wait in
     /// whole seconds, sent only then); a warm-up never sends them, as the box refuses a warm-up on the desktop.
     pub desktop: bool,
+    /// The cross build a macOS builder runs after the passing command (`CrossBuild`, its `Rid` and `Words`, sent only
+    /// when there is one and the run asks for outputs, as the box takes it only then); a warm-up never sends it.
+    pub cross_build: Option<&'a CrossBuild>,
 }
 
 /// The step an inputs call asks the box for: which files the work folder needs (`diff`), or installing them (`put`).
@@ -245,7 +249,7 @@ pub(crate) fn drain_word(root: &str, action: DrainAction) -> String {
 /// The payload word of the run call, with the run's variables (the caller's `--env` pairs and the gate's
 /// `SourceRevisionId`) as `Env` when there is one, and `Desktop: true`
 /// with `DesktopWait` ([`REMOTE_LIMIT`] in whole seconds, which the box caps at the run's `Timeout`) for a run that asks
-/// for the builder's desktop.
+/// for the builder's desktop, and `CrossBuild` (`Rid` and `Words`) for a run with a cross build and output globs.
 pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
     let mut object = location.object();
     for (name, value) in [
@@ -271,6 +275,9 @@ pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
     if run.desktop {
         object.insert("Desktop".to_owned(), json!(true));
         object.insert("DesktopWait".to_owned(), json!(REMOTE_LIMIT.as_secs()));
+    }
+    if let Some(cross) = run.cross_build.filter(|_| !run.outputs.is_empty()) {
+        object.insert("CrossBuild".to_owned(), json!({"Rid": cross.rid, "Words": cross.words}));
     }
     insert_siblings_and_inputs(&mut object, run);
     word(&object)
@@ -406,7 +413,7 @@ mod tests {
         run_nonce, run_word, warm_word,
     };
     use crate::remote::transport::Profile;
-    use gate_router::{Builder, BuilderOs};
+    use gate_router::{Builder, BuilderOs, CrossBuild};
     use gate_wire::{PathForm, Payload};
 
     fn decoded(word: &str) -> Value {
@@ -549,6 +556,7 @@ mod tests {
     fn run_call(sibling_snapshots: &[(String, String)]) -> String {
         let words = ["./tool.exe".to_owned()];
         let run = RunCall {
+            cross_build: None,
             words: &words,
             subfolder: "",
             nonce: "0123456789abcdef0123456789abcdef",
@@ -680,6 +688,7 @@ mod tests {
         let words = ["./tool.exe".to_owned(), "a b".to_owned()];
         let sha = "0123456789abcdef0123456789abcdef01234567";
         let run = RunCall {
+            cross_build: None,
             words: &words,
             subfolder: "sub",
             nonce: "n1",
@@ -727,6 +736,7 @@ mod tests {
         let words = ["./tool.exe".to_owned()];
         let globs = ["**/bin/**".to_owned(), "out/*.dll".to_owned()];
         let run = RunCall {
+            cross_build: None,
             words: &words,
             subfolder: "",
             nonce: "n2",
@@ -799,6 +809,7 @@ mod tests {
         let words = ["./tool.exe".to_owned()];
         let env = [("NuGetAudit".to_owned(), "false".to_owned()), ("EMPTY".to_owned(), String::new())];
         let run = RunCall {
+            cross_build: None,
             words: &words,
             subfolder: "",
             nonce: "n3",
@@ -839,6 +850,7 @@ mod tests {
     fn a_run_and_a_warm_up_send_the_chosen_godot_version_and_none_without_one() {
         let words = ["Godot_console.exe".to_owned()];
         let mut run = RunCall {
+            cross_build: None,
             words: &words,
             subfolder: "",
             nonce: "0123456789abcdef0123456789abcdef",
@@ -885,6 +897,7 @@ mod tests {
     fn a_run_and_a_warm_up_send_the_chosen_unreal_version_and_none_without_one() {
         let words = ["build.cmd".to_owned()];
         let mut run = RunCall {
+            cross_build: None,
             words: &words,
             subfolder: "",
             nonce: "0123456789abcdef0123456789abcdef",
@@ -932,6 +945,7 @@ mod tests {
         let words = ["build.cmd".to_owned()];
         let names = ["UE_MCP_TEST_ENGINE_ROOT".to_owned()];
         let mut run = RunCall {
+            cross_build: None,
             words: &words,
             subfolder: "",
             nonce: "0123456789abcdef0123456789abcdef",
@@ -983,6 +997,7 @@ mod tests {
     fn a_desktop_run_asks_for_the_desktop_with_the_usual_remote_wait_and_no_other_call_does() {
         let words = ["./tool.exe".to_owned()];
         let mut run = RunCall {
+            cross_build: None,
             words: &words,
             subfolder: "",
             nonce: "0123456789abcdef0123456789abcdef",
@@ -1027,6 +1042,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_run_with_a_cross_build_and_outputs_sends_it_and_no_other_call_does() {
+        let words = ["dotnet".to_owned(), "build".to_owned()];
+        let outputs = ["**/bin/**".to_owned()];
+        let cross = CrossBuild {
+            rid: "win-x64".to_owned(),
+            words: ["dotnet", "build", "-c", "Debug", "-r", "win-x64", "-p:A=1"].map(str::to_owned).to_vec(),
+        };
+        let mut run = RunCall {
+            cross_build: Some(&cross),
+            failure_outputs: &[],
+            words: &words,
+            subfolder: "",
+            nonce: "0123456789abcdef0123456789abcdef",
+            snapshot: SHA,
+            outputs: &outputs,
+            full: false,
+            timeout: 300,
+            host: "builder",
+            sibling_snapshots: &[],
+            inputs_digest: None,
+            lfs_digest: None,
+            sent_digest: None,
+            env: &[],
+            godot_version: None,
+            unreal_version: None,
+            engine_env: &[],
+            desktop: false,
+        };
+        let commands = warm_commands();
+        let warm = WarmCall {
+            commands: &commands,
+            hash: WARM_HASH,
+        };
+
+        let word = run_word(&location(), &run);
+        assert_eq!(
+            decoded(&word)["CrossBuild"],
+            json!({"Rid": "win-x64", "Words": ["dotnet", "build", "-c", "Debug", "-r", "win-x64", "-p:A=1"]})
+        );
+        let read = gate_wire::CrossBuild {
+            rid: cross.rid.clone(),
+            words: cross.words.clone(),
+        };
+        assert_eq!(on_the_box(&word).cross_build(), Ok(Some(read)), "the box reads CrossBuild back");
+        let warm_sent = decoded(&warm_word(&location(), &run, &warm));
+        assert!(warm_sent.get("CrossBuild").is_none(), "a warm-up never carries it: {warm_sent}");
+
+        run.outputs = &[];
+        let sent = decoded(&run_word(&location(), &run));
+        assert!(
+            sent.get("CrossBuild").is_none(),
+            "a run with no outputs sends none, as the box takes none: {sent}"
+        );
+
+        run.outputs = &outputs;
+        run.cross_build = None;
+        let word = run_word(&location(), &run);
+        assert!(decoded(&word).get("CrossBuild").is_none(), "a run without one sends none");
+        assert_eq!(on_the_box(&word).cross_build(), Ok(None));
+    }
+
     const WARM_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const WARM_NONCE: &str = "fedcba9876543210fedcba9876543210";
 
@@ -1041,6 +1118,7 @@ mod tests {
     /// The run call the warm cases build their word from, with `sibling_snapshots` and `inputs_digest`.
     fn warm_run<'a>(sibling_snapshots: &'a [(String, String)], inputs_digest: Option<&'a str>) -> RunCall<'a> {
         RunCall {
+            cross_build: None,
             words: &[],
             subfolder: "sub",
             nonce: WARM_NONCE,

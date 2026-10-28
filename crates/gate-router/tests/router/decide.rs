@@ -100,6 +100,8 @@ fn the_control_command_routes_from_the_root() {
             desktop: false,
             source_revision: Some(HEAD.to_owned()),
             later: Vec::new(),
+            cross_build: None,
+            cross_build_blocked: None,
         }
     );
     assert_eq!(run.lines(), Vec::<&str>::new());
@@ -983,6 +985,17 @@ fn a_dotnet_build_reads_its_configuration_framework_and_runtime_in_every_spellin
     );
     assert!(BuildSettings::default().same_as(&BuildSettings::default()), "absent equals absent");
     assert!(!set(None, Some("net9.0"), None).same_as(&set(None, Some("net10.0"), None)));
+}
+
+#[test]
+fn the_cross_build_s_own_value_options_leave_the_shared_target_reading_alone() {
+    for (given, named) in [
+        (&["dotnet", "run", "-p", "App"][..], "App"),
+        (&["dotnet", "test", "--blame-hang-timeout", "10m"], "10m"),
+    ] {
+        assert_eq!(sdk_build_target(&words(given)), Some(BuildTarget::Other), "{given:?}");
+        assert_eq!(gate_router::positional_target(&words(given)).as_deref(), Some(named), "{given:?}");
+    }
 }
 
 #[test]
@@ -4317,4 +4330,290 @@ fn a_word_outside_the_worktree_wins_over_a_gitignored_input() {
         Some(r"gate: not routed: ..\other\x.csproj is outside the worktree")
     );
     assert!(facts.gitignored_asked.borrow().is_empty(), "{:?}", facts.gitignored_asked);
+}
+
+/// The routing file whose macOS entry `mac-1` runs `yaat`'s dotnet commands, brings back `bin/**` and cross-builds the
+/// repos `cross` names; `host` lists the repo too.
+fn cross_routing(cross: &str) -> Config {
+    let mac = format!(
+        r#"[{{"host": "mac-1", "os": "macos", "root": "/m", "repos": {{"yaat": ["dotnet *"]}}, "outputs": {{"yaat": ["**/bin/**"]}},
+             "crossBuild": {cross}}}]"#
+    );
+    with_builders(r#"{"yaat": ["*"]}"#, &mac)
+}
+
+/// The facts of a worktree at the root whose routing file is `config` and whose builder trees give a path-map word.
+fn cross_facts(config: Config) -> FakeFacts {
+    FakeFacts {
+        given_trees: Some(vec![("/m/work/k".to_owned(), ROOT.to_owned())]),
+        ..FakeFacts::with_config(config)
+    }
+}
+
+/// The two words the stamp adds to a routed build's words, as `run` carries them: the source revision, then the path map.
+fn stamp_words(run: &RemoteRun) -> Vec<String> {
+    let stamped: Vec<String> = run
+        .words
+        .iter()
+        .filter(|word| word.starts_with("-p:SourceRevisionId=") || word.starts_with("-p:PathMap="))
+        .cloned()
+        .collect();
+    assert_eq!(stamped.len(), 2, "the stamp's two words: {:?}", run.words);
+    assert_eq!(stamped[0], stamp());
+    stamped
+}
+
+#[test]
+fn a_dotnet_build_to_an_opted_in_mac_gets_a_cross_build_of_its_target_configuration_and_properties() {
+    let command = words(&[
+        "dotnet",
+        "build",
+        "src/App/App.csproj",
+        "-c",
+        "Release",
+        "-p:Foo=1",
+        "--property",
+        "Bar=2",
+        "/p:Baz=3",
+    ]);
+    let run = routed(decide(&heavy(&command), &cross_facts(cross_routing(r#"{"yaat": "win-x64"}"#))));
+
+    let cross = run.cross_build.clone().expect("a cross build");
+    assert_eq!(cross.rid, "win-x64");
+    let mut expected = words(&[
+        "dotnet",
+        "build",
+        "src/App/App.csproj",
+        "-c",
+        "Release",
+        "-r",
+        "win-x64",
+        "-p:Foo=1",
+        "--property",
+        "Bar=2",
+        "/p:Baz=3",
+    ]);
+    expected.extend(stamp_words(&run));
+    assert_eq!(cross.words, expected);
+    assert_eq!(run.cross_build_blocked, None);
+    assert_eq!(run.lines(), Vec::<String>::new());
+}
+
+#[test]
+fn a_dotnet_test_to_an_opted_in_mac_gets_a_cross_build_and_debug_when_no_configuration_is_named() {
+    let command = words(&["dotnet", "test", "tests/A.Tests"]);
+    let run = routed(decide(&heavy(&command), &cross_facts(cross_routing(r#"{"yaat": "win-x64"}"#))));
+
+    let cross = run.cross_build.clone().expect("a cross build");
+    let mut expected = words(&["dotnet", "build", "tests/A.Tests", "-c", "Debug", "-r", "win-x64"]);
+    expected.extend(stamp_words(&run));
+    assert_eq!(cross.words, expected, "build, never test");
+}
+
+#[test]
+fn a_dotnet_build_naming_no_target_gets_a_cross_build_without_one() {
+    let command = words(&["dotnet", "build"]);
+    let run = routed(decide(&heavy(&command), &cross_facts(cross_routing(r#"{"yaat": "win-x64"}"#))));
+
+    let cross = run.cross_build.clone().expect("a cross build");
+    let mut expected = words(&["dotnet", "build", "-c", "Debug", "-r", "win-x64"]);
+    expected.extend(stamp_words(&run));
+    assert_eq!(cross.words, expected);
+}
+
+#[test]
+fn no_cross_build_for_a_dropped_no_build_another_command_or_a_build_that_sets_its_runtime_or_output_by_property() {
+    for command in [
+        words(&["dotnet", "test", "--no-build", "tests/A.Tests"]),
+        words(&["dotnet", "publish", "src/App/App.csproj"]),
+        words(&["dotnet", "build", "src/App/App.csproj", "-p:RuntimeIdentifier=osx-arm64"]),
+        words(&["dotnet", "build", "src/App/App.csproj", "-p:OutputPath=out"]),
+        words(&["pwsh", "-File", "b.ps1", "--", "dotnet", "build"]),
+    ] {
+        let run = routed(decide(&heavy(&command), &cross_facts(cross_routing(r#"{"yaat": "win-x64"}"#))));
+        assert_eq!(run.cross_build, None, "{command:?}");
+        assert_eq!(run.cross_build_blocked, None, "{command:?}: no line");
+    }
+}
+
+#[test]
+fn each_blocking_word_keeps_a_build_from_its_cross_build_and_says_so() {
+    for word in [
+        "-a",
+        "--arch",
+        "--os",
+        "--ucr",
+        "--use-current-runtime",
+        "-r",
+        "--runtime",
+        "-o",
+        "--output",
+        "--artifacts-path",
+    ] {
+        let command = words(&["dotnet", "build", "src/App/App.csproj", word, "x64"]);
+        let run = routed(decide(&heavy(&command), &cross_facts(cross_routing(r#"{"yaat": "win-x64"}"#))));
+        assert_eq!(run.cross_build, None, "{word}");
+        assert_eq!(run.cross_build_blocked.as_deref(), Some(word), "{word}");
+        assert_eq!(run.lines(), [format!("gate: no cross build for this command: it names {word}")], "{word}");
+    }
+}
+
+#[test]
+fn no_cross_build_on_a_windows_builder_or_for_a_repo_not_opted_in() {
+    let windows = with_builders(
+        r#"{"yaat": ["*"]}"#,
+        concat!(
+            r#"[{"host": "win-1", "os": "windows", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["**/bin/**"]}, "#,
+            r#""crossBuild": {"yaat": "win-x64"}}]"#
+        ),
+    );
+    let command = words(&["dotnet", "build", "src/App/App.csproj", "-o", "out"]);
+    for config in [windows, cross_routing(r#"{"other": "win-x64"}"#), cross_routing(r#"{"yaat": "win x64"}"#)] {
+        let run = routed(decide(&heavy(&command), &cross_facts(config)));
+        assert_eq!(run.cross_build, None);
+        assert_eq!(run.cross_build_blocked, None, "a blocking word says nothing without the opt-in");
+    }
+}
+
+#[test]
+fn a_value_of_a_known_option_is_never_the_cross_build_s_target() {
+    let command = words(&["dotnet", "test", "--blame-hang-timeout", "10m", "tests/A.Tests"]);
+    let run = routed(decide(&heavy(&command), &cross_facts(cross_routing(r#"{"yaat": "win-x64"}"#))));
+
+    let cross = run.cross_build.clone().expect("a cross build");
+    let mut expected = words(&["dotnet", "build", "tests/A.Tests", "-c", "Debug", "-r", "win-x64"]);
+    expected.extend(stamp_words(&run));
+    assert_eq!(cross.words, expected, "10m is the timeout's value");
+}
+
+#[test]
+fn a_property_list_after_a_bare_property_switch_is_no_target() {
+    let command = words(&["dotnet", "build", "--property", "Bar=2"]);
+    let run = routed(decide(&heavy(&command), &cross_facts(cross_routing(r#"{"yaat": "win-x64"}"#))));
+
+    let cross = run.cross_build.clone().expect("a cross build");
+    let mut expected = words(&["dotnet", "build", "-c", "Debug", "-r", "win-x64", "--property", "Bar=2"]);
+    expected.extend(stamp_words(&run));
+    assert_eq!(cross.words, expected);
+}
+
+/// The cross build's words of the routed `command` to the opted-in mac, the stamp's two words left out.
+fn cross_words(command: &[&str]) -> Vec<String> {
+    let run = routed(decide(&heavy(&words(command)), &cross_facts(cross_routing(r#"{"yaat": "win-x64"}"#))));
+    let stamped = stamp_words(&run);
+    let cross = run.cross_build.expect("a cross build");
+    let kept = cross.words.len() - stamped.len();
+    assert_eq!(cross.words[kept..], stamped[..], "the stamp's words end the cross build's");
+    cross.words[..kept].to_vec()
+}
+
+#[test]
+fn a_true_or_false_after_an_optional_boolean_switch_is_its_value_and_any_other_word_is_not() {
+    for (command, target) in [
+        (&["dotnet", "build", "--self-contained", "false", "App.csproj"][..], "App.csproj"),
+        (&["dotnet", "build", "--self-contained", "App.csproj"], "App.csproj"),
+        (&["dotnet", "build", "--self-contained", "FALSE", "src/App"], "src/App"),
+        (&["dotnet", "build", "--sc", "true", "src/App"], "src/App"),
+        (&["dotnet", "build", "--interactive", "false", "src/App"], "src/App"),
+        (&["dotnet", "build", "--sc", "src/App"], "src/App"),
+    ] {
+        assert_eq!(
+            cross_words(command),
+            words(&["dotnet", "build", target, "-c", "Debug", "-r", "win-x64"]),
+            "{command:?}"
+        );
+    }
+}
+
+#[test]
+fn a_test_s_short_s_names_its_settings_and_is_never_carried_while_its_long_source_is() {
+    assert_eq!(
+        cross_words(&["dotnet", "test", "-s", "ci.runsettings", "tests/A.Tests"]),
+        words(&["dotnet", "build", "tests/A.Tests", "-c", "Debug", "-r", "win-x64"])
+    );
+    assert_eq!(
+        cross_words(&["dotnet", "test", "-s:ci.runsettings", "--source", "feed", "tests/A.Tests"]),
+        words(&["dotnet", "build", "tests/A.Tests", "-c", "Debug", "-r", "win-x64", "--source", "feed"])
+    );
+}
+
+#[test]
+fn the_words_after_the_dotnet_command_s_own_separator_are_neither_options_targets_nor_carried() {
+    assert_eq!(
+        cross_words(&["dotnet", "test", "tests/A.Tests", "--", "RunConfiguration.X=1"]),
+        words(&["dotnet", "build", "tests/A.Tests", "-c", "Debug", "-r", "win-x64"])
+    );
+    assert_eq!(
+        cross_words(&["dotnet", "test", "--", "--made-up-switch", "-p:Foo=1"]),
+        words(&["dotnet", "build", "-c", "Debug", "-r", "win-x64"])
+    );
+}
+
+#[test]
+fn an_option_the_gate_does_not_know_keeps_a_build_from_its_cross_build_and_says_so() {
+    let command = words(&["dotnet", "build", "--made-up-switch", "App.csproj"]);
+    let run = routed(decide(&heavy(&command), &cross_facts(cross_routing(r#"{"yaat": "win-x64"}"#))));
+
+    assert_eq!(run.cross_build, None);
+    assert_eq!(run.cross_build_blocked.as_deref(), Some("--made-up-switch"));
+    assert_eq!(run.lines(), ["gate: no cross build for this command: it names --made-up-switch"]);
+}
+
+#[test]
+fn a_cross_build_carries_the_framework_and_source_in_each_spelling() {
+    let command = words(&[
+        "dotnet",
+        "build",
+        "src/App/App.csproj",
+        "-f",
+        "net8.0",
+        "--source=https://a.test/v3/index.json",
+        "--framework:net9.0",
+        "-s",
+        "feed",
+        "--framework",
+        "net10.0",
+        "-s:other",
+        "-f=net11.0",
+        "--source",
+        "third",
+    ]);
+    let run = routed(decide(&heavy(&command), &cross_facts(cross_routing(r#"{"yaat": "win-x64"}"#))));
+
+    let cross = run.cross_build.clone().expect("a cross build");
+    let mut expected = words(&[
+        "dotnet",
+        "build",
+        "src/App/App.csproj",
+        "-c",
+        "Debug",
+        "-r",
+        "win-x64",
+        "-f",
+        "net8.0",
+        "--source=https://a.test/v3/index.json",
+        "--framework:net9.0",
+        "-s",
+        "feed",
+        "--framework",
+        "net10.0",
+        "-s:other",
+        "-f=net11.0",
+        "--source",
+        "third",
+    ]);
+    expected.extend(stamp_words(&run));
+    assert_eq!(cross.words, expected);
+}
+
+#[test]
+fn the_current_runtime_switch_in_either_spelling_builds_out_of_place() {
+    let build = |extra: &[&str]| {
+        let mut given = vec!["dotnet", "build", "src/App/App.csproj"];
+        given.extend(extra);
+        gate_router::builds_in_place(&words(&given))
+    };
+    assert!(build(&[]), "the plain build builds in place");
+    assert!(!build(&["--ucr"]));
+    assert!(!build(&["--use-current-runtime"]));
 }

@@ -301,6 +301,7 @@ fn checked(place: &Place, seams: &CheckSeams) -> Checked {
         (tools, sdk)
     });
     let hooks_problem = hooks_problem(&repo);
+    let cross_build_problems = cross_build_problems();
     let (allowed, consent_problem) = match allowed_siblings(&repo) {
         None => (None, None),
         Some(Ok(names)) => (Some(names), None),
@@ -325,6 +326,7 @@ fn checked(place: &Place, seams: &CheckSeams) -> Checked {
         workloads: declared.manifest.workloads,
         consent_problem,
         hooks_problem,
+        cross_build_problems,
         root_problem: None,
         siblings,
         created: Vec::new(),
@@ -706,6 +708,19 @@ fn hooks_problem(repo: &str) -> Option<String> {
         return None;
     };
     config.hooks_allowed(repo).err().map(str::to_owned)
+}
+
+/// Why each `builders` entry's `crossBuild` in this PC's routing file cannot be used, one reason per such entry in file
+/// order ([`gate_router::Config::cross_build_problems`]), whatever the repo. A routing file that cannot be read at all
+/// gives none, as its own line says it.
+fn cross_build_problems() -> Vec<String> {
+    let Some(path) = route::remote_json_path(std::env::var_os("LOCALAPPDATA").as_deref()) else {
+        return Vec::new();
+    };
+    let Ok(Some(config)) = route::read_remote_json(&path) else {
+        return Vec::new();
+    };
+    config.cross_build_problems().into_iter().map(str::to_owned).collect()
 }
 
 /// The sibling names this PC's routing file allows the repo `repo`, as routing reads them

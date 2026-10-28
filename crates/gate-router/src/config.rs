@@ -68,6 +68,9 @@ struct BuilderEntry {
     outputs: RepoTable,
     failure_outputs: RepoTable,
     routed: bool,
+    /// Each repo name's runtime identifier its routed dotnet builds are cross-built for, or why `crossBuild` cannot be
+    /// used, which cross-builds none of the entry's repos.
+    cross_build: Result<Vec<(String, String)>, String>,
 }
 
 /// A usable routing file.
@@ -145,7 +148,10 @@ impl Config {
     /// [`Config::allowed_desktop`] gives its reason, and a bad `hooks`, consenting to no hook routing, and
     /// [`Config::hooks_allowed`] gives its reason, and a bad `sendBuild`, letting no repo send its build, and
     /// [`Config::send_build_allowed`] gives its reason, and a bad `declarations`, naming no folder, and
-    /// [`Config::declarations_folder`] gives its reason.
+    /// [`Config::declarations_folder`] gives its reason. A `builders` entry's bad `crossBuild` (no object, on an entry
+    /// whose `os` is not `macos`, a value that is no string or no runtime identifier, or a repo without a non-empty
+    /// list in the entry's `outputs`) leaves the file usable too, cross-building none of that entry's repos, and
+    /// [`Config::cross_build_rid`] gives its reason.
     pub fn parse(text: &str) -> Result<Self, String> {
         let text = strict_json(text.strip_prefix('\u{feff}').unwrap_or(text));
         // PowerShell's JSON reader gives no value at all for blank text, which is then no JSON object.
@@ -426,6 +432,34 @@ impl Config {
     #[must_use]
     pub fn failure_outputs(&self, repo: &str) -> Vec<String> {
         find(&self.failure_outputs, repo).map(globs_text).unwrap_or_default()
+    }
+
+    /// The runtime identifier `builder`'s `builders` entry cross-builds `repo`'s routed dotnet builds for, its repo name
+    /// matched in any letter case: `None` when its `crossBuild` does not name the repo or there is no such key, and for
+    /// `host` and a `hosts` entry, which are no `builders` entry.
+    ///
+    /// # Errors
+    ///
+    /// Why the entry's `crossBuild` cannot be used ([`Config::parse`]). Such a value cross-builds none of the entry's
+    /// repos, and the rest of the file is read whatever it holds.
+    pub fn cross_build_rid(&self, builder: &Builder, repo: &str) -> Result<Option<&str>, &str> {
+        let Some(entry) = self.entries.iter().find(|entry| entry.builder == *builder) else {
+            return Ok(None);
+        };
+        match &entry.cross_build {
+            Err(problem) => Err(problem),
+            Ok(table) => Ok(table.iter().find(|(name, _)| eq_ignoring_case(name, repo)).map(|(_, rid)| rid.as_str())),
+        }
+    }
+
+    /// Why each `builders` entry's `crossBuild` cannot be used, one reason per such entry in file order, as
+    /// [`Config::cross_build_rid`] gives it; none when every entry's value can be.
+    #[must_use]
+    pub fn cross_build_problems(&self) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.cross_build.as_ref().err().map(String::as_str))
+            .collect()
     }
 
     /// The patterns `repos` lists for `repo`, matched in any letter case, or `None` when it does not list it.
@@ -763,6 +797,7 @@ fn read_builder_entry(object: &Map<String, Value>, prefix: &str) -> Result<Build
     }
     let outputs = read_table(object, "outputs", false, prefix)?;
     let failure_outputs = read_table(object, "failureOutputs", false, prefix)?;
+    let cross_build = read_cross_build(object, os, &outputs, prefix);
     let id = Some(builder_id(&alias));
     Ok(BuilderEntry {
         builder: Builder { alias, os, root, slots, id },
@@ -770,7 +805,48 @@ fn read_builder_entry(object: &Map<String, Value>, prefix: &str) -> Result<Build
         outputs,
         failure_outputs,
         routed,
+        cross_build,
     })
+}
+
+/// A `builders` entry's `crossBuild` table: each repo name's runtime identifier ([`is_runtime_identifier`]), in file
+/// order; an empty table when the key is missing. Its reasons start with `prefix` (`builders[0].`) and write the repo
+/// name quoted and escaped. A value that is no object, an entry whose `os` is not `macos`, a value that is no string or
+/// no runtime identifier, and a repo the entry's `outputs` gives no non-empty list are each why the table cannot be
+/// used; the rest of the file is read whatever it holds.
+fn read_cross_build(object: &Map<String, Value>, os: BuilderOs, outputs: &RepoTable, prefix: &str) -> Result<Vec<(String, String)>, String> {
+    let Some(value) = property(object, "crossBuild") else {
+        return Ok(Vec::new());
+    };
+    let Value::Object(table) = value else {
+        return Err(format!("{prefix}crossBuild must be a JSON object"));
+    };
+    if os != BuilderOs::Macos {
+        return Err(format!("{prefix}crossBuild is a macos builder's key"));
+    }
+    table
+        .iter()
+        .map(|(repo, rid)| {
+            let Value::String(rid) = rid else {
+                return Err(format!("{prefix}crossBuild.{repo:?} is not a string"));
+            };
+            if !is_runtime_identifier(rid) {
+                return Err(format!("{prefix}crossBuild.{repo:?} is not a runtime identifier"));
+            }
+            if find(outputs, repo).is_none_or(<[Pattern]>::is_empty) {
+                return Err(format!(
+                    "{prefix}crossBuild.{repo:?} needs an outputs list for the repo on the same entry"
+                ));
+            }
+            Ok((repo.clone(), rid.clone()))
+        })
+        .collect()
+}
+
+/// Whether `rid` is a runtime identifier a cross build may be asked for, as the box's payload reader takes one: a
+/// non-empty text of ASCII letters, digits, `-` and `.`, not starting with `.`.
+fn is_runtime_identifier(rid: &str) -> bool {
+    !rid.is_empty() && !rid.starts_with('.') && rid.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.')
 }
 
 /// A `builders` entry's `root`. A macOS builder needs one: `/`, then names separated by single `/`, none empty, `.` or

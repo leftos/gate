@@ -2187,6 +2187,7 @@ mod tests {
         let interrupt = Interrupt::install().expect("the console handler is installed");
         interrupt.raise();
         let call = RemoteCall {
+            cross_build: None,
             builder: &crate::test_support::HOST,
             key: "app-1a2b3c4d",
             session: "0123456789abcdef0123456789abcdef",
@@ -3002,6 +3003,7 @@ mod tests {
     /// The call of a wiring test in the repository `root`, its lines written to `log`.
     fn call_in<'a>(root: &'a str, log: &'a Path, state: &'a StateRoot) -> RemoteCall<'a> {
         RemoteCall {
+            cross_build: None,
             builder: &crate::test_support::HOST,
             key: KEY,
             session: "0123456789abcdef0123456789abcdef",
@@ -3734,6 +3736,8 @@ mod tests {
             desktop: false,
             source_revision: None,
             later: Vec::new(),
+            cross_build: None,
+            cross_build_blocked: None,
         };
         let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
         let mut call = call_in(&root, &case.log, &state);

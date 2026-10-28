@@ -979,3 +979,110 @@ fn a_bad_builders_entry_makes_the_whole_file_unusable() {
         format!("gate: ignored remote.json: {macos_root}; running locally")
     );
 }
+
+/// The routing file with a macOS entry `mac-1` and a Windows entry `win-1`, each listing `g` and `h` with outputs for
+/// both, the macOS entry's `crossBuild` holding `mac_cross` and the Windows entry's none.
+fn cross_build_file(mac_cross: &str) -> Config {
+    Config::parse(&format!(
+        r#"{{"host": "builder-1", "slots": 2, "repos": {{"g": ["x"]}},
+            "builders": [
+              {{"host": "mac-1", "os": "macos", "root": "/m", "repos": {{"g": ["x"], "h": ["x"]}},
+                "outputs": {{"g": ["bin/**"], "h": ["bin/**"]}}, "crossBuild": {mac_cross}}},
+              {{"host": "win-1", "os": "windows", "repos": {{"g": ["x"]}}, "outputs": {{"g": ["bin/**"]}}}}
+            ]}}"#
+    ))
+    .expect("routing reads the file whatever crossBuild holds")
+}
+
+/// The file's builder whose alias is `alias`.
+fn entry_builder(config: &Config, alias: &str) -> Builder {
+    config.builder(alias).expect("the builder is listed").clone()
+}
+
+#[test]
+fn cross_build_names_each_repo_s_runtime_identifier_in_any_letter_case() {
+    let config = cross_build_file(r#"{"G": "win-x64", "h": "win-arm64"}"#);
+    let mac = entry_builder(&config, "mac-1");
+
+    assert_eq!(config.cross_build_rid(&mac, "g"), Ok(Some("win-x64")), "the repo name in any case");
+    assert_eq!(config.cross_build_rid(&mac, "H"), Ok(Some("win-arm64")));
+    assert_eq!(config.cross_build_rid(&mac, "other"), Ok(None), "a repo it does not name");
+    assert_eq!(
+        config.cross_build_rid(&entry_builder(&config, "win-1"), "g"),
+        Ok(None),
+        "an entry without the key"
+    );
+    assert_eq!(
+        config.cross_build_rid(&entry_builder(&config, "builder-1"), "g"),
+        Ok(None),
+        "host is no entry"
+    );
+    assert!(config.cross_build_problems().is_empty(), "{:?}", config.cross_build_problems());
+}
+
+#[test]
+fn an_unusable_cross_build_value_drops_only_that_entry_s_cross_build_and_keeps_the_rest_of_the_file() {
+    for (value, problem) in [
+        (r#"["g"]"#, "builders[0].crossBuild must be a JSON object"),
+        (r#""win-x64""#, "builders[0].crossBuild must be a JSON object"),
+        (r#"{"g": 3}"#, r#"builders[0].crossBuild."g" is not a string"#),
+        (r#"{"g": ["win-x64"]}"#, r#"builders[0].crossBuild."g" is not a string"#),
+        (r#"{"g": "win x64"}"#, r#"builders[0].crossBuild."g" is not a runtime identifier"#),
+        (r#"{"g": ".."}"#, r#"builders[0].crossBuild."g" is not a runtime identifier"#),
+        (r#"{"g": ""}"#, r#"builders[0].crossBuild."g" is not a runtime identifier"#),
+        (
+            r#"{"g": "win-x64", "z": "win-x64"}"#,
+            r#"builders[0].crossBuild."z" needs an outputs list for the repo on the same entry"#,
+        ),
+    ] {
+        let config = cross_build_file(value);
+        let mac = entry_builder(&config, "mac-1");
+        assert_eq!(config.cross_build_rid(&mac, "g"), Err(problem), "{value}");
+        assert_eq!(config.host(), "builder-1", "{value}");
+        assert_eq!(config.slots(), 2, "{value}");
+        assert_eq!(config.builder_entries().count(), 2, "{value}: both entries stay");
+        assert!(config.builder_routed(&mac), "{value}: the entry still routes");
+    }
+}
+
+#[test]
+fn cross_build_on_a_windows_entry_or_without_its_outputs_drops_only_that_entry_s_cross_build() {
+    let config = Config::parse(
+        r#"{"host": "builder-1", "repos": {"g": ["x"]},
+            "builders": [
+              {"host": "win-1", "os": "windows", "repos": {"g": ["x"]}, "outputs": {"g": ["bin/**"]}, "crossBuild": {"g": "win-x64"}},
+              {"host": "mac-1", "os": "macos", "root": "/m", "repos": {"g": ["x"]}, "crossBuild": {"g": "win-x64"}},
+              {"host": "mac-2", "os": "macos", "root": "/m", "repos": {"g": ["x"]}, "outputs": {"g": []}, "crossBuild": {"g": "win-x64"}},
+              {"host": "mac-3", "os": "macos", "root": "/m", "repos": {"g": ["x"]}, "outputs": {"g": ["bin/**"]}, "crossBuild": {"g": "win-x64"}}
+            ]}"#,
+    )
+    .expect("routing reads the file whatever crossBuild holds");
+
+    assert_eq!(
+        config.cross_build_rid(&entry_builder(&config, "win-1"), "g"),
+        Err("builders[0].crossBuild is a macos builder's key")
+    );
+    for (alias, index) in [("mac-1", 1), ("mac-2", 2)] {
+        let problem = format!(r#"builders[{index}].crossBuild."g" needs an outputs list for the repo on the same entry"#);
+        assert_eq!(
+            config.cross_build_rid(&entry_builder(&config, alias), "g"),
+            Err(problem.as_str()),
+            "{alias}"
+        );
+    }
+    assert_eq!(
+        config.cross_build_rid(&entry_builder(&config, "mac-3"), "g"),
+        Ok(Some("win-x64")),
+        "another entry's problem leaves this one's cross build"
+    );
+    assert_eq!(config.builder_entries().count(), 4);
+    assert_eq!(
+        config.cross_build_problems(),
+        [
+            "builders[0].crossBuild is a macos builder's key",
+            r#"builders[1].crossBuild."g" needs an outputs list for the repo on the same entry"#,
+            r#"builders[2].crossBuild."g" needs an outputs list for the repo on the same entry"#,
+        ],
+        "one reason per bad entry, in file order"
+    );
+}

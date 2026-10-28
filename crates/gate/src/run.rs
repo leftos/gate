@@ -1225,6 +1225,7 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         failure_outputs: &remote.failure_outputs,
         dropped_no_build: remote.dropped_no_build,
         send: remote.send.as_ref(),
+        cross_build: remote.cross_build.as_ref(),
         inputs: &remote.inputs,
         desktop: remote.desktop,
         log: log.path(),

@@ -53,7 +53,7 @@ const IN_PLACE_VERBS: [&str; 3] = ["build", "test", "run"];
 /// show, beside [`OUTPUT_PROPERTIES`], which move its output.
 const SETTING_PROPERTIES: [&str; 3] = ["Configuration", "TargetFramework", "RuntimeIdentifier"];
 /// The dotnet options that set the runtime identifier as `-r` does, which [`build_settings`] does not read.
-const RUNTIME_PART_OPTIONS: [&str; 4] = ["-a", "--arch", "--os", "--ucr"];
+const RUNTIME_PART_OPTIONS: [&str; 5] = ["-a", "--arch", "--os", "--ucr", "--use-current-runtime"];
 /// The names of the switch that sets the `MSBuild` targets a build runs, the longer first; their case is ignored.
 const TARGET_SWITCH_NAMES: [&str; 2] = ["target", "t"];
 /// The dotnet verbs whose `--no-build` the gate drops; `pack` and `publish` keep theirs.
@@ -117,6 +117,41 @@ const VALUE_OPTIONS: [&str; 18] = [
     "-lp",
     "--launch-profile",
 ];
+/// Every spelling of an option that takes the next word as its value when written without `=` or `:`, as
+/// [`sdk_build_target`] and [`positional_target`] read them.
+const VALUE_SPELLINGS: [&[&str]; 4] = [&CONFIGURATION_OPTIONS, &FRAMEWORK_OPTIONS, &RUNTIME_OPTIONS, &VALUE_OPTIONS];
+/// The spellings of the package source option, which a cross build carries with the framework.
+const SOURCE_OPTIONS: [&str; 2] = ["-s", "--source"];
+/// The dotnet build and test options beyond [`VALUE_OPTIONS`] that take the next word as their value when written
+/// without `=` or `:`, which only the cross build reads ([`cross_plan`]); an option in none of [`CROSS_VALUE_SPELLINGS`]
+/// and [`NO_VALUE_OPTIONS`] keeps a build from its cross build ([`unknown_option`]).
+const CROSS_VALUE_OPTIONS: [&str; 4] = ["--blame-hang-timeout", "--blame-crash-dump-type", "-p", "--property"];
+/// Every spelling of an option the cross build reads as taking the next word as its value: [`VALUE_SPELLINGS`]' and
+/// [`CROSS_VALUE_OPTIONS`].
+const CROSS_VALUE_SPELLINGS: [&[&str]; 5] = [
+    &CONFIGURATION_OPTIONS,
+    &FRAMEWORK_OPTIONS,
+    &RUNTIME_OPTIONS,
+    &VALUE_OPTIONS,
+    &CROSS_VALUE_OPTIONS,
+];
+/// The dotnet build and test switches that take no next word as their value, each alone or with its value after `=`
+/// or `:` (`--tl:off`), but those of [`OPTIONAL_BOOLEAN_OPTIONS`] followed by `true` or `false`.
+const NO_VALUE_OPTIONS: [&str; 10] = [
+    "--no-restore",
+    "--no-dependencies",
+    "--nologo",
+    "--force",
+    "--no-incremental",
+    "--interactive",
+    "--self-contained",
+    "--sc",
+    "--no-self-contained",
+    "--tl",
+];
+/// The dotnet build and test switches whose next word is their value when it is `true` or `false` in any letter case,
+/// and no value otherwise.
+const OPTIONAL_BOOLEAN_OPTIONS: [&str; 3] = ["--self-contained", "--sc", "--interactive"];
 
 /// The configuration, framework and runtime a dotnet command's own words set (`-c`, `-f`, `-r` and their long forms),
 /// each as written and `None` when the words set none.
@@ -638,6 +673,23 @@ pub struct RemoteRun {
     /// one a pattern of whose own list the command matched, held by its alias alone. A caller that falls back builds a
     /// candidate's run when it tries it ([`later_run`]); nothing is built here.
     pub later: Vec<LaterCandidate>,
+    /// The cross build the macOS builder runs after the passing command, so its outputs come back built for Windows:
+    /// set only for a direct `dotnet build`, or `dotnet test` without `--no-build`, of a repo the builder's entry
+    /// cross-builds ([`Config::cross_build_rid`]) with outputs to bring back, that builds in place and names no runtime.
+    pub cross_build: Option<CrossBuild>,
+    /// The word that kept such a command from its cross build ([`CROSS_BLOCKING_OPTIONS`], or an option whose arity the
+    /// gate does not know), which [`RemoteRun::lines`] names.
+    pub cross_build_blocked: Option<String>,
+}
+
+/// A routed run's cross build ([`RemoteRun::cross_build`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossBuild {
+    /// The runtime identifier it builds for, from the entry's `crossBuild`.
+    pub rid: String,
+    /// Its words, the dotnet word first: `dotnet build {target} -c {configuration} -r {rid}` and the command's property
+    /// words.
+    pub words: Vec<String>,
 }
 
 /// A builder a routed run may try next when it falls back, by its alias; its entry is read from the routing file when
@@ -662,7 +714,9 @@ pub struct SendPlan {
 impl RemoteRun {
     /// The lines the gate says for this route, in order: [`RemoteRun::program_line`], [`DROPPED_NO_BUILD_LINE`] unless
     /// the run has a send, whose client says it only when the send does not land, [`NO_OUTPUTS_LINE`], then, for a run
-    /// carrying siblings, `gate: routed with siblings: {name} ({root}), ...` naming each in declared order.
+    /// carrying siblings, `gate: routed with siblings: {name} ({root}), ...` naming each in declared order, then, for a
+    /// command a word kept from its cross build ([`RemoteRun::cross_build_blocked`]),
+    /// `gate: no cross build for this command: it names {word}`.
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
@@ -682,6 +736,9 @@ impl RemoteRun {
                 .map(|sibling| format!("{} ({})", sibling.name, sibling.root))
                 .collect();
             lines.push(format!("gate: routed with siblings: {}", named.join(", ")));
+        }
+        if let Some(word) = &self.cross_build_blocked {
+            lines.push(format!("gate: no cross build for this command: it names {}", escaped(word)));
         }
         lines
     }
@@ -990,7 +1047,7 @@ pub fn sdk_build_target(words: &[String]) -> Option<BuildTarget> {
     if matches!(dotnet_target(words), Some(DotnetTarget::Project(_))) {
         return Some(BuildTarget::Other);
     }
-    Some(match named_words(own)?.as_slice() {
+    Some(match named_words(own, &SHARED_VALUES)?.as_slice() {
         [] => BuildTarget::Unnamed,
         [one] if has_extension(one, &SOLUTION_EXTENSIONS) => BuildTarget::Solution,
         _ => BuildTarget::Other,
@@ -1003,27 +1060,85 @@ pub fn sdk_build_target(words: &[String]) -> Option<BuildTarget> {
 #[must_use]
 pub fn positional_target(words: &[String]) -> Option<String> {
     let own = dotnet_own(words)?;
-    named_words(&words[own])?.first().map(|word| (*word).clone())
+    first_named(&words[own], &SHARED_VALUES)
+}
+
+/// The options one reading of a dotnet command's words takes a next word as the value of: each of `spellings` always,
+/// and each of `booleans` when that word is `true` or `false` in any letter case.
+struct Values {
+    spellings: &'static [&'static [&'static str]],
+    booleans: &'static [&'static str],
+}
+
+impl Values {
+    /// Whether `word`, spelled exactly as one of these options, takes `next` as its value.
+    fn takes(&self, word: &str, next: Option<&String>) -> bool {
+        let boolean = |next: &String| next.eq_ignore_ascii_case("true") || next.eq_ignore_ascii_case("false");
+        self.spellings.iter().any(|options| options.contains(&word)) || (self.booleans.contains(&word) && next.is_some_and(boolean))
+    }
+}
+
+/// The values [`sdk_build_target`] and [`positional_target`] read: [`VALUE_SPELLINGS`]' options, and no optional one.
+const SHARED_VALUES: Values = Values {
+    spellings: &VALUE_SPELLINGS,
+    booleans: &[],
+};
+/// The values the cross build reads ([`cross_plan`]): [`CROSS_VALUE_SPELLINGS`]' options and the switches of
+/// [`OPTIONAL_BOOLEAN_OPTIONS`].
+const CROSS_VALUES: Values = Values {
+    spellings: &CROSS_VALUE_SPELLINGS,
+    booleans: &OPTIONAL_BOOLEAN_OPTIONS,
+};
+
+/// The first word a dotnet command's own words (`own`, its dotnet word first) name after its verb ([`named_words`]),
+/// read with `values`.
+fn first_named(own: &[String], values: &Values) -> Option<String> {
+    named_words(own, values)?.first().map(|word| (*word).clone())
 }
 
 /// The words a dotnet command's own words (`own`, its dotnet word first) name after its verb: each not starting with
-/// `-` or `/` that is no value of a known option ([`BuildSettings`]'s, [`VALUE_OPTIONS`]). `None` without a verb.
-fn named_words(own: &[String]) -> Option<Vec<&String>> {
-    let takes_value = |word: &str| {
-        [&CONFIGURATION_OPTIONS[..], &FRAMEWORK_OPTIONS, &RUNTIME_OPTIONS, &VALUE_OPTIONS]
-            .iter()
-            .any(|spellings| spellings.contains(&word))
-    };
+/// `-` or `/` that is no value of an option `values` reads ([`Values::takes`]). `None` without a verb.
+fn named_words<'w>(own: &'w [String], values: &Values) -> Option<Vec<&'w String>> {
     let mut named = Vec::new();
-    let mut rest = own.iter().skip(verb_at(own)? + 1);
-    while let Some(word) = rest.next() {
-        if takes_value(word) {
-            rest.next();
-        } else if !word.is_empty() && !word.starts_with(['-', '/']) {
+    let mut at = verb_at(own)? + 1;
+    while let Some(word) = own.get(at) {
+        if values.takes(word, own.get(at + 1)) {
+            at += 2;
+            continue;
+        }
+        if !word.is_empty() && !word.starts_with(['-', '/']) {
             named.push(word);
         }
+        at += 1;
     }
     Some(named)
+}
+
+/// The first of a dotnet command's own words (`own`, its dotnet word first) after its verb that is an option whose
+/// arity the cross build does not know, so cannot tell its value from a target: a word starting with `-` or `/` that is
+/// no option of [`CROSS_VALUE_SPELLINGS`] or [`NO_VALUE_OPTIONS`] nor `--project`, alone or with its value after `=` or
+/// `:` ignoring letter case, and sets no property list ([`property_list`]). The word after an option that takes it as
+/// its value ([`CROSS_VALUES`]) is skipped. `None` without a verb or such a word.
+fn unknown_option(own: &[String]) -> Option<&String> {
+    let known = |word: &str, next: Option<&String>| {
+        CROSS_VALUE_SPELLINGS
+            .iter()
+            .chain([&NO_VALUE_OPTIONS[..], &[PROJECT_OPTION]].iter())
+            .any(|spellings| is_option_of(word, spellings))
+            || property_list(word, next).is_some()
+    };
+    let mut at = verb_at(own)? + 1;
+    while let Some(word) = own.get(at) {
+        if CROSS_VALUES.takes(word, own.get(at + 1)) {
+            at += 2;
+            continue;
+        }
+        if word.starts_with(['-', '/']) && !known(word, own.get(at + 1)) {
+            return Some(word);
+        }
+        at += 1;
+    }
+    None
 }
 
 /// Whether the words are a dotnet command that builds ([`dotnet_builds`]) with one of [`IN_PLACE_VERBS`] ignoring
@@ -2498,11 +2613,20 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         outputs.clear();
     }
     let failure_outputs = config.failure_outputs_on(&target.builder, &target.repo);
+    let rid = match (target.builder.os, config.cross_build_rid(&target.builder, &target.repo)) {
+        (BuilderOs::Macos, Ok(Some(rid))) if !outputs.is_empty() => Some(rid.to_owned()),
+        _ => None,
+    };
+    let crosses = rid.is_some() && cross_verb(&sent);
     let mut words = without_no_build(sent);
     let dropped_no_build = words.len() != sent_count;
     mark_bare_first_word(&mut words, facts, program_named);
     let source_revision = head_of(&target.place, facts);
     stamp(&mut words, || source_revision.clone(), &target, facts);
+    let (cross_build, cross_build_blocked) = match rid.filter(|_| crosses) {
+        Some(rid) => cross_plan(rid, &words),
+        None => (None, None),
+    };
     RemoteRun {
         builder: target.builder,
         key: target.key,
@@ -2525,7 +2649,102 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         desktop,
         source_revision,
         later,
+        cross_build,
+        cross_build_blocked,
     }
+}
+
+/// Whether a routed command's words, before `--no-build` is dropped, may get a cross build: a dotnet command run
+/// directly (its first non-empty word names `dotnet`) whose verb is `build`, or `test` with no `--no-build` among its
+/// own words, the rule [`derived_outputs`] reads.
+fn cross_verb(sent: &[String]) -> bool {
+    let direct = first_word(sent).is_some_and(|(_, word)| names_program(word, DOTNET));
+    let Some(own) = dotnet_own(sent).filter(|_| direct) else {
+        return false;
+    };
+    let own = &sent[own];
+    verb_in(own, &["build"]) || (verb_in(own, &["test"]) && !own.iter().any(|word| word == NO_BUILD))
+}
+
+/// The cross build for `rid` of a routed dotnet build or test whose final words, marked and stamped, are `words`, or
+/// the first of its own words that blocks one ([`CROSS_BLOCKING_OPTIONS`]). None, and no blocking word, for a build
+/// that does not build in place ([`builds_in_place`]); none, and the option as the blocking word, for one naming an
+/// option whose arity the gate does not know ([`unknown_option`]). Its words are the command's dotnet word, `build`,
+/// the target as the words name it ([`dotnet_target`], else the first word named past the values of
+/// [`CROSS_VALUES`], [`first_named`]) when there is one, `-c` and the configuration (`Debug` when the words set none),
+/// `-r` and `rid`, each framework and source word of the words with its value ([`carried_options`]: `--source` alone
+/// for a verb other than [`SOURCE_SHORT_VERB`], whose `-s` is no source), then each property word
+/// ([`carried_properties`]).
+fn cross_plan(rid: String, words: &[String]) -> (Option<CrossBuild>, Option<String>) {
+    let Some(own) = dotnet_own(words) else {
+        return (None, None);
+    };
+    let own = &words[own];
+    let blocks = |word: &&String| CROSS_BLOCKING_OPTIONS.iter().any(|options| is_option_of(word, options));
+    if let Some(blocking) = own.iter().find(blocks) {
+        return (None, Some(blocking.clone()));
+    }
+    if !builds_in_place(words) {
+        return (None, None);
+    }
+    if let Some(unknown) = unknown_option(own) {
+        return (None, Some(unknown.clone()));
+    }
+    let target = match dotnet_target(words) {
+        Some(DotnetTarget::Project(name) | DotnetTarget::Solution(name)) => Some(name).filter(|name| !name.is_empty()),
+        None => first_named(own, &CROSS_VALUES),
+    };
+    let configuration = build_settings(words).configuration.unwrap_or_else(|| DEFAULT_CONFIGURATION.to_owned());
+    let source: &[&str] = if verb_in(own, &[SOURCE_SHORT_VERB]) {
+        &SOURCE_OPTIONS
+    } else {
+        &["--source"]
+    };
+    let mut cross = vec![own[0].clone(), "build".to_owned()];
+    cross.extend(target);
+    cross.extend(["-c".to_owned(), configuration, "-r".to_owned(), rid.clone()]);
+    cross.extend(carried_options(own, &[&FRAMEWORK_OPTIONS[..], source].concat()));
+    cross.extend(carried_properties(own));
+    (Some(CrossBuild { rid, words: cross }), None)
+}
+
+/// The words among a dotnet command's own words that set one of the options `spellings` names, in order, as
+/// [`option_value`] reads them: a bare spelling and the word after it, or a spelling with its value after `=` or `:`.
+fn carried_options(own: &[String], spellings: &[&str]) -> Vec<String> {
+    let mut carried = Vec::new();
+    let mut rest = own.iter();
+    while let Some(word) = rest.next() {
+        if spellings.contains(&word.as_str()) {
+            carried.push(word.clone());
+            carried.extend(rest.next().cloned());
+        } else if spellings
+            .iter()
+            .any(|spelling| word.strip_prefix(spelling).is_some_and(|after| after.starts_with(['=', ':'])))
+        {
+            carried.push(word.clone());
+        }
+    }
+    carried
+}
+
+/// The property words among a dotnet command's own words, in order: each starting with `-` or `/` that sets a property
+/// list ([`property_list`]), and, for a switch whose list is the next word, that word after it.
+fn carried_properties(own: &[String]) -> Vec<String> {
+    let mut carried = Vec::new();
+    let mut at = 0;
+    while at < own.len() {
+        let word = &own[at];
+        let next = own.get(at + 1);
+        if word.starts_with(['-', '/']) && property_list(word, next).is_some() {
+            carried.push(word.clone());
+            if property_list(word, None).is_none() {
+                carried.extend(next.cloned());
+                at += 1;
+            }
+        }
+        at += 1;
+    }
+    carried
 }
 
 /// The words without each of the dotnet command's own words ([`is_dotnet`]) that is exactly `--no-build`, when its
@@ -2682,6 +2901,13 @@ const OUTPUT_OPTIONS: [&str; 3] = ["-o", "--output", "--artifacts-path"];
 /// `--no-build` no send keeps: `Platform` among them, as a platform other than `AnyCPU` builds into
 /// `bin\{platform}\{configuration}`.
 pub const OUTPUT_PROPERTIES: [&str; 5] = ["OutputPath", "BaseOutputPath", "UseArtifactsOutput", "OutDir", "Platform"];
+/// The options whose word, among a routed dotnet build's own words, keeps it from a cross build: they name its runtime
+/// or move its output folder, which the box's output path map does not follow.
+const CROSS_BLOCKING_OPTIONS: [&[&str]; 3] = [&RUNTIME_PART_OPTIONS, &RUNTIME_OPTIONS, &OUTPUT_OPTIONS];
+/// The verb whose `-s` is the package source a cross build carries; `dotnet test`'s `-s` names its settings file.
+const SOURCE_SHORT_VERB: &str = "build";
+/// The configuration a dotnet build builds when its words set none.
+const DEFAULT_CONFIGURATION: &str = "Debug";
 /// The [`OUTPUT_PROPERTIES`] that move a routed dotnet build's output out of the project's `bin` folder, which
 /// [`derived_outputs`] reads: `Platform` left out, whose build lands under `bin\{platform}\{configuration}` still.
 const DERIVED_OUTPUT_PROPERTIES: [&str; 4] = ["OutputPath", "BaseOutputPath", "UseArtifactsOutput", "OutDir"];

@@ -421,9 +421,13 @@ fn run_with<S: LineSink + 'static>(launch: &Launch<'_>, output: &Arc<Output<S>>,
 pub enum CrossEnd {
     /// It exited 0, after this long.
     Passed(Duration),
-    /// It ended otherwise, with the status a command that ended so gives ([`command_status`]): the box's ceiling kill
-    /// [`crate::lines::KILLED_STATUS`], a `box stop`'s `SIGTERM` 143.
+    /// It exited with this other code of its own, 143 included.
     Failed(u8),
+    /// A signal the box did not send ended it, a `box stop`'s `SIGTERM` among them, or it could not be started, or the
+    /// box could not see it to its end: the status a command that ended so gives ([`command_status`]).
+    Ended(u8),
+    /// The box killed it for its ceiling or its backstop, its kill line and tag said ([`killed`]).
+    Killed,
     /// Its client is gone.
     Gone,
 }
@@ -435,7 +439,7 @@ pub enum CrossEnd {
 /// load-adjusted line is said or written for it: the run's are the command's.
 pub fn run_cross<S: LineSink + 'static>(launch: &Launch<'_>, words: &[String], output: &Arc<Output<S>>) -> CrossEnd {
     let Some((program, rest)) = words.split_first() else {
-        return CrossEnd::Failed(command_status(CommandEnd::NotStarted));
+        return CrossEnd::Ended(command_status(CommandEnd::NotStarted));
     };
     let group = GroupRecord::new(PathBuf::from(group_record(launch.work)), launch.job, launch.lock);
     let ceiling = Ceiling::new(launch.timeout, launch.sample, launch.sampler);
@@ -469,22 +473,33 @@ pub fn run_cross<S: LineSink + 'static>(launch: &Launch<'_>, words: &[String], o
     let began = Instant::now();
     let ran = run_watched(command_of(launch, program, rest), &watch);
     let took = began.elapsed();
-    cross_end(program, ran, &ceiling.verdict(), took, output)
+    cross_of(cross_end(launch, program, ran, &ceiling.verdict(), output), took)
 }
 
-/// How the cross build of `program` that ran as `ran` in `took` ended, the ceiling's `verdict` on it: gone once the
-/// client is; else the line of its ceiling's sampler's failure said when there is one, then the line of a start that
-/// failed or of the box's own failure.
-fn cross_end<S: LineSink>(program: &str, ran: Result<Ran, NotRan>, verdict: &Verdict, took: Duration, output: &Output<S>) -> CrossEnd {
+/// How a cross build that ended as `end` after `took` ends the run: its exit of 0 passed; its own other exit failed,
+/// keeping the command's status; the box's kill as the box's kill of the command; a signal, a failed start or the
+/// box's own failure ended it otherwise; gone with its client.
+fn cross_of(end: CommandEnd, took: Duration) -> CrossEnd {
+    match end {
+        CommandEnd::Exited(0) => CrossEnd::Passed(took),
+        CommandEnd::Exited(_) => CrossEnd::Failed(command_status(end)),
+        CommandEnd::Killed(_) => CrossEnd::Killed,
+        CommandEnd::Gone => CrossEnd::Gone,
+        CommandEnd::Signalled(_) | CommandEnd::NotStarted | CommandEnd::Failed => CrossEnd::Ended(command_status(end)),
+    }
+}
+
+/// How the cross build of `program`, run as `launch` started the command, that ran as `ran` ended, the ceiling's
+/// `verdict` on it: gone once the client is; the box's kill said as the box's kill of the command is ([`killed`]),
+/// naming the command; else the line of its ceiling's sampler's failure said when there is one, then the line of a
+/// start that failed or of the box's own failure.
+fn cross_end<S: LineSink>(launch: &Launch<'_>, program: &str, ran: Result<Ran, NotRan>, verdict: &Verdict, output: &Output<S>) -> CommandEnd {
     if output.client_gone() {
-        return CrossEnd::Gone;
+        return CommandEnd::Gone;
     }
     let failed = verdict.failed.iter().map(|line| (GAT, line.clone()));
-    let end = match (verdict.kill, ran) {
-        (Some(kill), _) => {
-            said_together(output, &failed.collect::<Vec<_>>());
-            CommandEnd::Killed(tag_of(kill).0)
-        }
+    match (verdict.kill, ran) {
+        (Some(kill), ran) => killed(launch, kill, ran, verdict, output),
         (None, Ok(ran)) => {
             said_together(output, &failed.collect::<Vec<_>>());
             end_of(&ran, false)
@@ -498,11 +513,6 @@ fn cross_end<S: LineSink>(program: &str, ran: Result<Ran, NotRan>, verdict: &Ver
             said_together(output, &failed.chain([(GAT, failed_line(&unran(not)))]).collect::<Vec<_>>());
             CommandEnd::Failed
         }
-    };
-    match end {
-        CommandEnd::Gone => CrossEnd::Gone,
-        CommandEnd::Exited(0) => CrossEnd::Passed(took),
-        end => CrossEnd::Failed(command_status(end)),
     }
 }
 
@@ -778,7 +788,9 @@ mod tests {
     use gate_wire::stamp::{is_process_line, unstamped};
     use gate_wire::{BoxKill, adjusted_prefix, killed_line, started_line};
 
-    use super::{Beat, Ceiling, Launch, Sampler, Verdict, command_record, ended, removed_if_held, run_command, run_with};
+    use super::{
+        Beat, Ceiling, CrossEnd, Launch, Sampler, Verdict, command_record, cross_end, cross_of, ended, removed_if_held, run_command, run_with,
+    };
     use crate::console::{Forwarding, HungUpSink, LineSink, Output, RecordingSink, Stamp, Stream};
     use crate::files::{HeldLock, held_for_test};
     use crate::heartbeat;
@@ -1136,6 +1148,48 @@ mod tests {
         assert!(case.record().exists(), "the command's record is kept");
         assert!(!case.group_record().exists(), "the group record is removed");
         assert!(group_gone_soon(group), "the command's group is ended");
+    }
+
+    #[test]
+    fn each_end_of_a_cross_build_maps_to_how_it_ends_the_run() {
+        let took = Duration::from_secs(1);
+        let not_started = command_status(CommandEnd::NotStarted);
+        let failed = command_status(CommandEnd::Failed);
+        for (end, crossed) in [
+            (CommandEnd::Exited(0), CrossEnd::Passed(took)),
+            (CommandEnd::Exited(3), CrossEnd::Failed(3)),
+            (CommandEnd::Exited(143), CrossEnd::Failed(143)),
+            (CommandEnd::Signalled(libc::SIGTERM), CrossEnd::Ended(143)),
+            (CommandEnd::NotStarted, CrossEnd::Ended(not_started)),
+            (CommandEnd::Failed, CrossEnd::Ended(failed)),
+            (CommandEnd::Killed(BoxKill::TimedOut), CrossEnd::Killed),
+            (CommandEnd::Killed(BoxKill::Backstop), CrossEnd::Killed),
+            (CommandEnd::Gone, CrossEnd::Gone),
+        ] {
+            assert_eq!(cross_of(end, took), crossed, "{end:?}");
+        }
+    }
+
+    #[test]
+    fn a_cross_build_the_box_kills_says_the_kill_line_and_tag_as_the_command_s_kill() {
+        let case = Case::new("cross-kill");
+        let output = recording();
+        let words = ["/bin/sh".to_owned()];
+        let ran = Ran {
+            status: ExitStatus::from_raw(libc::SIGKILL),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            leftover: false,
+            ended_by: Some(EndedBy::Halted(Halt("backstop".to_owned()))),
+        };
+        let end = cross_end(&case.launch(&words, &unwatched()), "dotnet", Ok(ran), &backstop_verdict(), &output);
+        assert_eq!(end, CommandEnd::Killed(BoxKill::Backstop));
+        let lines = output.sink().lines();
+        assert_eq!(
+            lines.last().map(|(_, line)| line.clone()),
+            Some(killed_line(NONCE, BoxKill::Backstop)),
+            "{lines:?}"
+        );
     }
 
     #[test]

@@ -96,7 +96,11 @@ The box gets onto the Mac by `gate push`, which builds it there ([design.md, `ga
 
 `remote.json`'s `builders` array (an entry with `os` `macos` and a `root`) is read and routes ([design.md, remote.json](design.md#remotejson)), and the transport, payload layout, path map and PC caches follow the entry's profile.
 
-A Mac entry may carry `outputs`, and its box brings them back like a Windows builder's (a route whose output is a TRX, as yaat's, works); the project bin a Windows builder's routed `dotnet build` adds to a repo's own list is not derived for a Mac. That a build whose outputs are launched on the PC stays off the Mac is a convention of the `remote.json` entries: no code enforces it until GATE-696 lands.
+A Mac entry may carry `outputs`, and its box brings them back like a Windows builder's (a route whose output is a TRX, as yaat's, works); the project bin a Windows builder's routed `dotnet build` adds to a repo's own list is not derived for a Mac. A Mac's routed build brings Windows outputs back only when the entry opts the repo in with `crossBuild`, an object of repo name to a Windows runtime identifier (`"crossBuild": {"app": "win-x64"}`), which needs the repo's `outputs` list on the same entry and is for a `macos` entry alone ([design.md, remote.json](design.md#remotejson)).
+The Mac then runs `dotnet build <target> -c <configuration> -r <rid>` after a passing `dotnet build` or `dotnet test` (without `--no-build`) and brings `bin/<config>/<tfm>/<rid>/` back as `bin/<config>/<tfm>/`; a command with `-o`, `--output`, `--artifacts-path`, `-a`, `--arch`, `--os`, `--ucr`, `--use-current-runtime`, `-r`, `--runtime` or an option word the router does not know gets none, and says so.
+A bad `crossBuild` value drops only that entry's cross builds (`gate check` prints a `check: here: remote.json: builders[N].crossBuild…` line for it and fails), and a cross build that fails by its own exit leaves the command's status, says the Windows outputs were not brought back, and makes the next `--no-build` build first.
+A cross build the box kills for its ceiling or backstop ends the run 124, and one that ends by a signal or cannot be seen to its end ends it 1.
+A build whose outputs are launched on the PC and that is not opted in stays off the Mac by the `remote.json` entries alone.
 
 The words a macOS builder is sent are spelled for the Mac: the recognised paths use `/`, and a relative word written with `\` (`src\Duel.sln`) is sent with `/` when the snapshot carries that file or folder, in its exact letter case.
 

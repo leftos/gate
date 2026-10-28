@@ -9,7 +9,7 @@ use std::path::Path;
 
 use gate_inputs::manifest::Chosen;
 use gate_inputs::walk::Found;
-use gate_wire::{escaped, ordinal_upper};
+use gate_wire::{CROSS_BUILD_START, CROSS_NOT_BROUGHT_BACK, escaped, ordinal_upper};
 
 /// The bytes of a file's start the portability check reads: a fat Mach-O's magic and its arch count.
 pub const HEAD_BYTES: u64 = 8;
@@ -132,7 +132,7 @@ pub fn passed_line(rid: &str, seconds: f64) -> String {
 /// The line a cross build for `rid` that ended with the status `status` says.
 #[must_use]
 pub fn failed_line(rid: &str, status: u8) -> String {
-    format!("gate: the cross build for {rid} failed with exit {status}; the Windows outputs were not brought back")
+    format!("{CROSS_BUILD_START}{rid} failed with exit {status}{CROSS_NOT_BROUGHT_BACK}")
 }
 
 /// The line a cross build for `rid` that left the program the PC cannot run at the PC path `path` says, the path shown
@@ -140,7 +140,7 @@ pub fn failed_line(rid: &str, status: u8) -> String {
 #[must_use]
 pub fn refused_line(rid: &str, path: &str) -> String {
     format!(
-        "gate: the cross build for {rid} left a non-Windows file {}; the Windows outputs were not brought back",
+        "{CROSS_BUILD_START}{rid} left a non-Windows file {}{CROSS_NOT_BROUGHT_BACK}",
         escaped(path)
     )
 }

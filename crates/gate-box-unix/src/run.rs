@@ -837,7 +837,8 @@ fn of_its_own(end: CommandEnd) -> bool {
 /// gives [`FAILED_STATUS`] for a command that exited 0, else `status`; a client gone gives the closed status. Once the
 /// back commits are pushed, a command that exited 0 with output globs has its cross build run, when the payload asks
 /// for one, as `launch` started the command ([`cross_built`]), then its outputs brought back ([`brought_back`]), which
-/// gives its status; a failed command has only its test reports brought back ([`Asked::test_reports`]), with no cross
+/// gives its status; a failed command has only its test reports and failure outputs brought back
+/// ([`Asked::failed_run`] under [`Caps::BUILT_IN`]), with no cross
 /// build, and ends on its own status whatever the pack gives, and one with no glob naming a `TestResults` folder, a
 /// failed sync-back or a cross build that did not pass packs nothing.
 fn synced_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, status: u8, budget: u64, launch: &Launch<'_>) -> u8 {
@@ -883,24 +884,28 @@ fn synced_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>
 }
 
 /// Runs the cross build `build` as `launch` started the command ([`command::run_cross`]): `None` once it passed, the
-/// line saying how long it took said; else the status the run ends on, its outputs not brought back: [`FAILED_STATUS`]
-/// after the line saying the cross build failed and [`outputs::not_brought_back`]'s, as any outputs failure ends, or
-/// the closed status for a client gone before or during it.
+/// line saying how long it took said; else the status the run ends on, its outputs not brought back. A cross build that
+/// exited by a non-zero code says it failed and [`outputs::not_brought_back`]'s line, and leaves the passing command's
+/// 0, a build that trapped a `box stop`'s signal and exited by code among them; one a signal ended, that could not
+/// start or that the box could not see to its end says the same lines and gives [`FAILED_STATUS`]; one the box killed gives
+/// [`KILLED_STATUS`](crate::lines::KILLED_STATUS) after its kill line and tag, as the box's kill of the command does;
+/// a client gone before or during it gives the closed status.
 fn cross_built<S: LineSink + 'static>(launch: &Launch<'_>, build: &CrossBuild, output: &Arc<Output<S>>) -> Option<u8> {
     if output.client_gone() {
         return Some(CLOSED_STATUS);
     }
-    match command::run_cross(launch, &build.words, output) {
+    let (cross_status, status) = match command::run_cross(launch, &build.words, output) {
         CrossEnd::Passed(took) => {
             noted(output, GAT, &cross::passed_line(&build.rid, took.as_secs_f64()));
-            None
+            return None;
         }
-        CrossEnd::Failed(status) => {
-            let not_brought = outputs::not_brought_back(cross::FAILED_REASON);
-            Some(said(output, &[&cross::failed_line(&build.rid, status), &not_brought], FAILED_STATUS))
-        }
-        CrossEnd::Gone => Some(CLOSED_STATUS),
-    }
+        CrossEnd::Failed(cross_status) => (cross_status, 0),
+        CrossEnd::Ended(cross_status) => (cross_status, FAILED_STATUS),
+        CrossEnd::Killed => return Some(crate::lines::KILLED_STATUS),
+        CrossEnd::Gone => return Some(CLOSED_STATUS),
+    };
+    let not_brought = outputs::not_brought_back(cross::FAILED_REASON);
+    Some(said(output, &[&cross::failed_line(&build.rid, cross_status), &not_brought], status))
 }
 
 /// The status of the run `ready` once its outputs `asked`, a passing command's or a failed one's test reports, read
@@ -909,7 +914,8 @@ fn cross_built<S: LineSink + 'static>(launch: &Launch<'_>, build: &CrossBuild, o
 /// one, and left out; then the pack ([`outputs::bring_back`]), its skipped line, when there is one, and its
 /// `gate-remote-outputs:` line said; then, when it wrote an archive, the output folder trimmed to `budget` bytes
 /// ([`outputs::trim`]), each line said, the archive held under its pack's lock until the trim is done. 0, or
-/// [`FAILED_STATUS`] with [`outputs::not_brought_back`]'s line when the outputs are not brought back; a client gone
+/// [`FAILED_STATUS`] with [`outputs::not_brought_back`]'s line when the outputs are not brought back, but 0 when a cross
+/// build's set is refused for a program the PC cannot run, which leaves the passing command's status; a client gone
 /// while the paths are read, or found gone before the pack or before the trim, gives the closed status, nothing more
 /// packed or trimmed.
 fn brought_back<S: LineSink + 'static>(
@@ -935,9 +941,10 @@ fn brought_back<S: LineSink + 'static>(
         Ok(brought) => brought,
         Err(reason) => return said(output, &[&outputs::not_brought_back(&reason)], FAILED_STATUS),
     };
-    // A cross build that built a program the PC cannot run brings nothing back, as any outputs failure.
+    // A cross build that built a program the PC cannot run brings nothing back, and leaves the passing command's
+    // status as it was.
     if let Some(refused) = &brought.refused {
-        return said(output, &[refused, &outputs::not_brought_back(cross::REFUSED_REASON)], FAILED_STATUS);
+        return said(output, &[refused, &outputs::not_brought_back(cross::REFUSED_REASON)], 0);
     }
     if let Some(skipped) = &brought.skipped {
         noted(output, GAT, skipped);

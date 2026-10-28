@@ -104,6 +104,8 @@ mod tests {
             desktop: false,
             source_revision: None,
             later: Vec::new(),
+            cross_build: None,
+            cross_build_blocked: None,
         }
     }
 

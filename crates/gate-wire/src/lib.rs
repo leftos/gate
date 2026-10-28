@@ -20,6 +20,19 @@ use serde_json::{Map, Value};
 pub mod drain;
 pub mod stamp;
 
+/// The start of the line a macOS box says on standard error when a run's cross build ended without bringing its
+/// Windows outputs back: it failed, or it left a program the PC cannot run among them.
+pub const CROSS_BUILD_START: &str = "gate: the cross build for ";
+/// The end of that line ([`CROSS_BUILD_START`]).
+pub const CROSS_NOT_BROUGHT_BACK: &str = "; the Windows outputs were not brought back";
+
+/// Whether `line` is the line a box says when a run's cross build ended without bringing its Windows outputs back
+/// ([`CROSS_BUILD_START`], [`CROSS_NOT_BROUGHT_BACK`]).
+#[must_use]
+pub fn is_cross_not_brought_back(line: &str) -> bool {
+    line.starts_with(CROSS_BUILD_START) && line.ends_with(CROSS_NOT_BROUGHT_BACK)
+}
+
 /// The commit this build was made from, from `GATE_BUILD_ID` at compile time; `None` for a build made without one, or
 /// with an empty one.
 const BUILD_ID: Option<&str> = option_env!("GATE_BUILD_ID");

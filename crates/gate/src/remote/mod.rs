@@ -15,7 +15,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use gate_args::TestSeams;
-use gate_router::{Builder, FolderId, SendPlan, Target, escaped};
+use gate_router::{Builder, CrossBuild, FolderId, SendPlan, Target, escaped};
 use gate_state::v1::WarmFailure;
 use gate_state::{FallbackReason, StateRoot, Verdict};
 use gate_win32::{Interrupt, OwnedMutexGuard};
@@ -222,6 +222,9 @@ pub(crate) struct RemoteCall<'a> {
     /// The route's send of the PC's build, which lets the builder keep a `dotnet test`'s `--no-build`
     /// ([`gate_router::RemoteRun::send`]); `None` for every other run.
     pub send: Option<&'a SendPlan>,
+    /// The route's cross build, which a macOS builder runs after the passing command so its outputs come back built for
+    /// Windows ([`gate_router::RemoteRun::cross_build`]); `None` for every other run, a warm-up among them.
+    pub cross_build: Option<&'a CrossBuild>,
     /// The input globs the run sends: the repo's `inputs` list, none when it has no entry.
     pub inputs: &'a [String],
     /// Whether the run asks for the builder's desktop, as the route's decision judged it; a warm-up never does.
@@ -545,6 +548,7 @@ mod snapshot_only {
         /// call before it starts.
         fn call<'a>(root: &'a str, log: &'a Path, interrupt: Option<Interrupt>) -> RemoteCall<'a> {
             RemoteCall {
+                cross_build: None,
                 builder: &crate::test_support::HOST,
                 key: "app-1a2b3c4d",
                 session: "0123456789abcdef0123456789abcdef",

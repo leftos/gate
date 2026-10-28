@@ -43,7 +43,7 @@ use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
 use gate_router::{Config, DROPPED_NO_BUILD_LINE, SendPlan, escaped, repo_name};
-use gate_wire::{PairRefused, Payload, SHA256_DIGITS, is_lower_hex};
+use gate_wire::{PairRefused, Payload, SHA256_DIGITS, is_cross_not_brought_back, is_lower_hex};
 
 use super::drain::{self, Drain, DrainLine};
 use super::git::{self, Git, GitBounds, GitError, NO_CURRENT_FOLDER, last_update};
@@ -1217,6 +1217,10 @@ pub(super) enum Echo {
 /// standard output, its first standard error line (a heartbeat included) and its last one (none), and the last lines
 /// it wrote but heartbeats, each cut to the cap; for a run call, whether the box said the run's start marker and the
 /// refusal its tag named; and, for a call the client killed, what else went wrong meanwhile.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent fact the call's streams said, read by name; no two form a state machine"
+)]
 pub(super) struct Called {
     pub(super) status: i32,
     pub(super) cut: Option<Cut>,
@@ -1233,6 +1237,9 @@ pub(super) struct Called {
     back_commits: Option<String>,
     /// Whether it said on standard error that the box skipped outputs for names this PC cannot take.
     names_skipped: bool,
+    /// Whether the box said on standard error, stamped as its own line, that the run's cross build brought no Windows
+    /// outputs back ([`is_cross_not_brought_back`]).
+    cross_not_brought_back: bool,
     /// Whether the box said the run's start marker on standard error.
     started: bool,
     /// What the box's refusal tag for the run named on standard error, the first when it said more than one.
@@ -1475,6 +1482,7 @@ struct RunEnd {
     outputs: Option<outputs::OutputsLines>,
     back_commits: Option<String>,
     names_skipped: bool,
+    cross_not_brought_back: bool,
     started: bool,
     last_error: Option<String>,
 }
@@ -1569,6 +1577,7 @@ impl Attempt<'_, '_> {
             unreal_version: chosen.unreal.as_deref(),
             engine_env: &chosen.engine_env,
             desktop: self.call.desktop,
+            cross_build: self.call.cross_build,
         };
         let (called, nonce) = self.run_called(&location, &run, &mut sent, withheld)?;
         // A warm-up brings nothing back: its end is classed, and neither the sync-back nor the outputs step follows.
@@ -1592,6 +1601,7 @@ impl Attempt<'_, '_> {
                         nonce: &nonce,
                         status,
                         names_skipped: called.names_skipped,
+                        cross_not_brought_back: called.cross_not_brought_back,
                     };
                     outputs::ended(self, &sent, &ran, synced, brought.as_ref())
                 });
@@ -2806,6 +2816,7 @@ impl Attempt<'_, '_> {
         let mut heard = None;
         let mut back_commits = None;
         let mut names_skipped = false;
+        let mut cross_not_brought_back = false;
         let mut adjusted = None;
         let mut started = false;
         let mut last_error = None;
@@ -2824,6 +2835,7 @@ impl Attempt<'_, '_> {
             heard.clone_from(&called.outputs);
             back_commits.clone_from(&called.back_commits);
             names_skipped = called.names_skipped;
+            cross_not_brought_back = called.cross_not_brought_back;
             adjusted = called.adjusted;
             started = called.started;
             last_error.clone_from(&called.last_error);
@@ -2837,6 +2849,7 @@ impl Attempt<'_, '_> {
             outputs: heard,
             back_commits,
             names_skipped,
+            cross_not_brought_back,
             started,
             last_error,
         })
@@ -3721,6 +3734,7 @@ fn called_of(ended: CallEnd, raised: Raised, mut heard: Heard) -> Result<Called,
         outputs: heard.outputs,
         back_commits: heard.back_commits,
         names_skipped: heard.names_skipped,
+        cross_not_brought_back: heard.cross_not_brought_back,
         started: heard.started,
         refused: heard.refused,
         drain: heard.drain,
@@ -4313,6 +4327,10 @@ fn git_end(error: GitError) -> End {
 /// ([`NAMES_SKIPPED`]), whether the box said the run's start marker and the refusal its first tag named, its last
 /// lines, and the first problem reading them.
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent fact the call's streams said, read by name; no two form a state machine"
+)]
 struct Heard {
     kept: Kept,
     output_seen: bool,
@@ -4321,6 +4339,7 @@ struct Heard {
     outputs: Option<outputs::OutputsLines>,
     back_commits: Option<String>,
     names_skipped: bool,
+    cross_not_brought_back: bool,
     started: bool,
     refused: Option<Tagged>,
     drain: Option<Drain>,
@@ -4784,7 +4803,10 @@ impl Reader {
         }
         self.mark_line(shared);
         self.passed(&logged_line(&line, read.tag), Some(read.text), true, shared);
-        held(&shared.heard).record(read.text, self.error, None);
+        let mut heard = held(&shared.heard);
+        heard.record(read.text, self.error, None);
+        // Only the box's own stamp tells its line from a copy of it the command printed on the same stream.
+        heard.cross_not_brought_back |= self.error && read.tag == Some(Tag::Gat) && is_cross_not_brought_back(read.text);
         true
     }
 
@@ -5589,6 +5611,7 @@ mod tests {
     /// A call whose interrupt is raised, logging to `log`, which no test here writes.
     fn call(log: &Path) -> RemoteCall<'_> {
         RemoteCall {
+            cross_build: None,
             builder: &crate::test_support::HOST,
             key: "app-1a2b3c4d",
             session: "0123456789abcdef0123456789abcdef",
@@ -6151,6 +6174,7 @@ mod tests {
             outputs: None,
             back_commits: None,
             names_skipped: false,
+            cross_not_brought_back: false,
             started: false,
             refused: None,
             drain: None,
@@ -6963,8 +6987,12 @@ mod tests {
     }
 
     /// An outputs step as [`brought_back_after`] ends it: the worktree its manifest is built from, whether the run has
-    /// output globs, the run call's status and the one the sync-back left, what the box said it packed, and whether it
-    /// said it skipped outputs for names.
+    /// output globs, the run call's status and the one the sync-back left, what the box said it packed, whether it said
+    /// it skipped outputs for names and that the cross build brought nothing back, and whether the call sent one.
+    #[expect(
+        clippy::struct_excessive_bools,
+        reason = "each flag is an independent fact of the step a case sets by name; no two form a state machine"
+    )]
     struct Step<'s> {
         root: &'s Path,
         globs: bool,
@@ -6972,10 +7000,12 @@ mod tests {
         synced: i64,
         brought: Option<outputs::Brought>,
         names_skipped: bool,
+        cross_not_brought_back: bool,
+        crossed: bool,
     }
 
-    /// The outputs step of a passing run with output globs in `root`, the box having said it packed `brought` and, when
-    /// `names_skipped`, that it skipped outputs for names.
+    /// The outputs step of a passing run with output globs in `root` that sent no cross build, the box having said it
+    /// packed `brought` and, when `names_skipped`, that it skipped outputs for names.
     fn passed(root: &Path, brought: Option<outputs::Brought>, names_skipped: bool) -> Step<'_> {
         Step {
             root,
@@ -6984,20 +7014,40 @@ mod tests {
             synced: 0,
             brought,
             names_skipped,
+            cross_not_brought_back: false,
+            crossed: false,
         }
     }
 
-    /// Whether an attempt's outputs are brought back once its outputs step ended as `step` says, through a transport
-    /// whose every call fails to start, the state in a fresh folder of the test `name`'s own.
+    /// Whether an attempt's outputs are brought back once its outputs step ended as `step` says ([`ended_after`]).
     fn brought_back_after(name: &str, step: &Step<'_>) -> Option<bool> {
+        ended_after(name, step).1
+    }
+
+    /// The end of an attempt's outputs step that ended as `step` says, and whether its outputs are brought back
+    /// ([`said_after`]).
+    fn ended_after(name: &str, step: &Step<'_>) -> (End, Option<bool>) {
+        let (end, brought, _) = said_after(name, step);
+        (end, brought)
+    }
+
+    /// The end of an attempt's outputs step that ended as `step` says, whether its outputs are brought back, and the
+    /// lines the attempt said, through a transport whose every call fails to start, the state in a fresh folder of the
+    /// test `name`'s own; the call sends a cross build when `step.crossed`.
+    fn said_after(name: &str, step: &Step<'_>) -> (End, Option<bool>, Vec<String>) {
         let state = fresh_state(name);
         let log = unwritten_log();
         let globs = ["**/bin/**".to_owned()];
+        let cross = gate_router::CrossBuild {
+            rid: "win-x64".to_owned(),
+            words: vec!["dotnet".to_owned(), "build".to_owned()],
+        };
         let mut call = call(&log);
         call.interrupt = None;
         call.root = step.root.to_str().expect("a test worktree's path is Unicode");
         call.state_dir = &state;
         call.outputs = if step.globs { &globs[..] } else { &[] };
+        call.cross_build = step.crossed.then_some(&cross);
         let transport = nowhere();
         let mut attempt = Attempt::for_tests(&call, &transport);
         // The attempt is past its snapshot, as one that reaches its outputs is, so a fetch is tried.
@@ -7009,13 +7059,29 @@ mod tests {
             nonce: "0123456789ab",
             status: step.status,
             names_skipped: step.names_skipped,
+            cross_not_brought_back: step.cross_not_brought_back,
         };
         let synced = crate::remote::syncback::Synced {
             end: End::Status(step.synced),
             reason: None,
         };
-        outputs::ended(&mut attempt, &sent, &ran, synced, step.brought.as_ref());
-        attempt.brought_back
+        let end = outputs::ended(&mut attempt, &sent, &ran, synced, step.brought.as_ref());
+        (end, attempt.brought_back, attempt.lines.clone())
+    }
+
+    #[test]
+    fn a_passing_run_whose_cross_build_brought_nothing_back_keeps_its_status_and_brings_nothing_back() {
+        let held = outputs_worktree("cross-not-back", true);
+        let crossed = Step {
+            cross_not_brought_back: true,
+            crossed: true,
+            ..passed(&held, None, false)
+        };
+        let (end, brought) = ended_after("cross-not-back", &crossed);
+        assert!(matches!(end, End::Status(0)), "the command's own status: {end:?}");
+        assert_eq!(brought, Some(false), "the outputs stay not brought back");
+        let (end, _) = ended_after("cross-not-back-other", &passed(&held, None, false));
+        assert!(matches!(end, End::Status(1)), "any other missing outputs line ends 1: {end:?}");
     }
 
     #[test]
@@ -8445,6 +8511,7 @@ mod tests {
             outputs: None,
             back_commits: None,
             names_skipped: false,
+            cross_not_brought_back: false,
             started,
             last_error,
         }
@@ -8490,6 +8557,7 @@ mod tests {
     /// test raises: [`call`] raises its own.
     fn key_call<'a>(log: &'a Path, state: &'a StateRoot, interrupt: Option<Interrupt>) -> RemoteCall<'a> {
         RemoteCall {
+            cross_build: None,
             builder: &crate::test_support::HOST,
             key: "app-1a2b3c4d",
             session: "0123456789abcdef0123456789abcdef",
@@ -9350,9 +9418,11 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         use gate_wire::stamp::{self, Tag};
+        use gate_wire::{CROSS_BUILD_START, CROSS_NOT_BROUGHT_BACK};
 
-        use super::super::{BoxKill, Echo, ProtocolLines, Reader, Reading, Shared, held, killed_line, relay};
-        use super::{Chunks, UNMARKED};
+        use super::super::{BoxKill, Echo, End, ProtocolLines, Reader, Reading, Shared, held, killed_line, relay};
+        use super::{Chunks, Step, UNMARKED, outputs_worktree, passed, said_after};
+        use crate::remote::outputs::NO_OUTPUTS_LINE;
         use crate::remote::watchdog::LOG_CAP;
 
         /// The nonce of the run these cases read the lines of.
@@ -9391,6 +9461,52 @@ mod tests {
                 Some(BoxKill::TimedOut),
                 "the box's own tag, bare, kills it"
             );
+        }
+
+        /// The line the box says when a run's cross build brought no Windows outputs back.
+        fn cross_line() -> String {
+            format!("{CROSS_BUILD_START}win-x64 failed with exit 1{CROSS_NOT_BROUGHT_BACK}")
+        }
+
+        /// Whether a run call that heard `line` on standard error heard the box say its cross build brought nothing back.
+        fn heard_cross_not_back(line: &str) -> bool {
+            let shared = Shared::new();
+            relay(format!("{line}\n").as_bytes(), Reader::new(true, run_reading(), None), &shared);
+            held(&shared.heard).cross_not_brought_back
+        }
+
+        #[test]
+        fn only_the_box_s_own_stamped_cross_build_line_is_heard() {
+            let at = stamp::now();
+            assert!(heard_cross_not_back(&stamp::stamped(&at, Tag::Gat, &cross_line())), "the box's own line");
+            assert!(!heard_cross_not_back(&stamp::stamped(&at, Tag::Err, &cross_line())), "the command's copy");
+            assert!(!heard_cross_not_back(&cross_line()), "an unstamped copy");
+        }
+
+        #[test]
+        fn a_cross_build_line_on_a_run_that_sent_no_cross_build_still_ends_1_with_no_outputs_line() {
+            let held_tree = outputs_worktree("cross-line-uncrossed", true);
+            let heard = heard_cross_not_back(&stamp::stamped(&stamp::now(), Tag::Gat, &cross_line()));
+            let step = Step {
+                cross_not_brought_back: heard,
+                ..passed(&held_tree, None, false)
+            };
+            let (end, _, lines) = said_after("cross-line-uncrossed", &step);
+            assert!(matches!(end, End::Status(1)), "{end:?}");
+            assert!(lines.iter().any(|line| line.contains(NO_OUTPUTS_LINE)), "{lines:?}");
+        }
+
+        #[test]
+        fn an_unstamped_cross_build_line_on_a_cross_build_run_still_ends_1() {
+            let held_tree = outputs_worktree("cross-line-unstamped", true);
+            let step = Step {
+                cross_not_brought_back: heard_cross_not_back(&cross_line()),
+                crossed: true,
+                ..passed(&held_tree, None, false)
+            };
+            let (end, _, lines) = said_after("cross-line-unstamped", &step);
+            assert!(matches!(end, End::Status(1)), "{end:?}");
+            assert!(lines.iter().any(|line| line.contains(NO_OUTPUTS_LINE)), "{lines:?}");
         }
 
         #[test]
