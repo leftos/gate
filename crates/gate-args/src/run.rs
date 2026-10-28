@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use crate::problem::{Problem, Required, Spelling};
 use crate::request::{
     BurnRequest, Ceiling, CheckRequest, CheckSeams, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, DrainAction,
-    DrainRequest, DrainSeams, ExpectRequest, PushRequest, PushSeams, RunRequest, Slot, StopRequest, TestSeams, WarmRequest,
+    DrainRequest, DrainSeams, ExpectRequest, PruneRequest, PruneSeams, PushRequest, PushSeams, RunRequest, Slot, StopRequest, TestSeams, WarmRequest,
 };
 use crate::values;
 
@@ -132,6 +132,8 @@ pub(crate) enum ValueOption {
     WarmWaitMs,
     #[cfg(feature = "test-seams")]
     DrainRaiseMs,
+    #[cfg(feature = "test-seams")]
+    PruneGoneAgeMs,
 }
 
 /// An option that is on or off.
@@ -143,6 +145,7 @@ pub(crate) enum SwitchOption {
     Background,
     Lift,
     Status,
+    Builders,
     #[cfg(feature = "test-seams")]
     PrintRequest,
     #[cfg(feature = "test-seams")]
@@ -215,6 +218,10 @@ pub(crate) struct RunBuilder {
     /// `--test-drain-interrupt-before-raise`; its poll,
     /// still-waiting period and transport are read into `test_seams`, as a run's are.
     drain_seams: DrainSeams,
+    /// `gate prune`'s `--builders`.
+    builders: bool,
+    /// `gate prune`'s `--test-prune-gone-age-ms`; its transport is read into `test_seams`, as a run's is.
+    prune_gone_age_ms: Option<u64>,
     bring_tracked: Vec<String>,
     /// The `--env` pairs the gate can set, in the order given.
     env: Vec<(String, String)>,
@@ -383,7 +390,8 @@ impl RunBuilder {
             | ValueOption::SdkLimitMs
             | ValueOption::NetfxKey
             | ValueOption::WarmWaitMs
-            | ValueOption::DrainRaiseMs => self.apply_seam(option, spelled, value)?,
+            | ValueOption::DrainRaiseMs
+            | ValueOption::PruneGoneAgeMs => self.apply_seam(option, spelled, value)?,
         }
         Ok(())
     }
@@ -441,6 +449,7 @@ impl RunBuilder {
             ValueOption::SdkLimitMs => self.check_seams.sdk_limit_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::NetfxKey => self.check_seams.netfx_key = Some(value.to_owned()),
             ValueOption::DrainRaiseMs => self.drain_seams.raise_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::PruneGoneAgeMs => self.prune_gone_age_ms = Some(values::zero_or_above(spelled, value)?),
             ValueOption::Slot
             | ValueOption::Timeout
             | ValueOption::Log
@@ -487,6 +496,7 @@ impl RunBuilder {
             SwitchOption::Background => self.background = on,
             SwitchOption::Lift => self.lift = on,
             SwitchOption::Status => self.status = on,
+            SwitchOption::Builders => self.builders = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::PrintRequest => self.print_request = on,
             #[cfg(feature = "test-seams")]
@@ -765,6 +775,32 @@ impl RunBuilder {
                 remote_transport: self.test_seams.remote_transport,
                 remote_ssh: self.test_seams.remote_ssh,
                 ..self.drain_seams
+            },
+        })
+    }
+
+    /// The prune request, its seams the transport, ssh and least age read, or every problem found: those found while
+    /// reading, then a missing `--builders`, then `--test-remote-ssh` without `--test-remote-transport`, whose local
+    /// transport alone starts it.
+    pub(crate) fn finish_prune(mut self) -> Result<PruneRequest, Vec<Problem>> {
+        if !self.builders {
+            self.problems.push(Problem::Missing(Required::Builders, Spelling::Cli));
+        }
+        #[cfg(feature = "test-seams")]
+        if self.test_seams.remote_ssh.is_some() && self.test_seams.remote_transport.is_none() {
+            self.problems.push(Problem::SeamNeeds {
+                option: "--test-remote-ssh",
+                needs: "--test-remote-transport",
+            });
+        }
+        if !self.problems.is_empty() {
+            return Err(self.problems);
+        }
+        Ok(PruneRequest {
+            seams: PruneSeams {
+                remote_transport: self.test_seams.remote_transport,
+                remote_ssh: self.test_seams.remote_ssh,
+                gone_age_ms: self.prune_gone_age_ms,
             },
         })
     }

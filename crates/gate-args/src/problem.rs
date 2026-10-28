@@ -30,6 +30,8 @@ pub enum Required {
     Command,
     /// `gate burn`'s `--seconds`, which it cannot do without.
     Seconds,
+    /// `gate prune`'s `--builders`, which it cannot do without.
+    Builders,
 }
 
 /// One thing wrong with the command line. `option` is the option as the caller spelled it, without its value.
@@ -289,5 +291,6 @@ fn missing_text(required: Required, spelling: Spelling) -> &'static str {
         (Required::Log, Spelling::Compat) => "-Log <path>",
         (Required::Command, _) => "the command after --",
         (Required::Seconds, _) => "--seconds <seconds>",
+        (Required::Builders, _) => "--builders",
     }
 }

@@ -43,6 +43,7 @@ mod orphan;
 )]
 mod outputs;
 mod pause;
+mod prune_cmd;
 mod push;
 mod remote;
 mod request_json;

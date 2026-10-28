@@ -10,9 +10,11 @@ gate run --slot heavy --timeout 900 --log .tmp/test.log -- cargo test --workspac
 
 Pre-release. Nothing here is ready to use yet, and gate is not yet a replacement for anything. The design is written ([docs/design.md](docs/design.md)); the code is being built slice by slice.
 
-So far `gate` reads its command line (`--version`, `--help`, and the argument checks for `run`, `stop-tree`, `cutover`, `push`, `check`, `burn` and `expect`), and `gate run` starts a command under a slot, logs its output, prints the tail and a verdict line, and exits with the command's status.
+So far `gate` reads its command line (`--version`, `--help`, and the argument checks for `run`, `stop-tree`, `cutover`, `push`, `drain`, `prune`, `check`, `burn` and `expect`), and `gate run` starts a command under a slot, logs its output, prints the tail and a verdict line, and exits with the command's status.
 
 The watchdog kills a stalled command, one past its ceiling and one past the backstop, and Ctrl+C stops a run; routing is not built yet. `gate stop-tree <pid>` stops a process tree and the gate jobs inside it. `gate push` copies the installed `gate.exe` and desktop helper to the builders and registers the desktop task there.
+
+`gate drain` raises a drain barrier on a builder and waits until no routed run is going there, so it can be redeployed; `gate drain --lift` lifts the barrier and `gate drain --status` says how the drain stands. `gate prune --builders` marks the worktree records of worktrees that are gone and, for each that has been gone an hour, prunes its work folder on every builder `remote.json` lists; it removes nothing on this PC.
 
 `gate check` says what this PC lacks for the repo in the current folder (the tools its `.gate/toolchain.toml` names, the SDK its `global.json` pins, the sibling worktrees `.gate/siblings.toml` declares) and the command that installs each; it installs nothing, and exits 1 when something is missing or the check could not run (not in a git repository, or a `.gate/toolchain.toml`, `.gate/siblings.toml` or `global.json` it cannot read).
 

@@ -4,7 +4,9 @@ use std::ffi::OsString;
 use std::iter::Peekable;
 
 use crate::problem::Problem;
-use crate::request::{BurnRequest, CheckRequest, CutoverRequest, DrainRequest, ExpectRequest, PushRequest, RunRequest, StopRequest, WarmRequest};
+use crate::request::{
+    BurnRequest, CheckRequest, CutoverRequest, DrainRequest, ExpectRequest, PruneRequest, PushRequest, RunRequest, StopRequest, WarmRequest,
+};
 use crate::run::{RunBuilder, RunOption, SwitchOption, ValueOption, next_text};
 use crate::values;
 
@@ -103,6 +105,21 @@ pub(crate) fn parse_drain(words: impl Iterator<Item = OsString>) -> Result<Drain
         }
     }
     builder.finish_drain()
+}
+
+/// Reads the words after `gate prune`, which takes none: every word is a problem, `--` included, save `--builders`,
+/// which it needs, and the hidden seams of a build with the `test-seams` feature.
+pub(crate) fn parse_prune(words: impl Iterator<Item = OsString>) -> Result<PruneRequest, Vec<Problem>> {
+    let mut words = words.peekable();
+    let mut builder = RunBuilder::default();
+    while let Some(text) = next_text(&mut words, &mut builder) {
+        if text.starts_with('-') && text != "--" {
+            read_option(&mut builder, &mut words, &text, prune_option);
+        } else {
+            builder.problems.push(Problem::UnexpectedArgument(text));
+        }
+    }
+    builder.finish_prune()
 }
 
 /// Reads the words after `gate check`, which takes none: every word is a problem, `--` included, save `--builder
@@ -273,6 +290,29 @@ fn drain_seam_option(name: &str) -> Option<RunOption> {
 
 #[cfg(not(feature = "test-seams"))]
 fn drain_seam_option(_name: &str) -> Option<RunOption> {
+    None
+}
+
+fn prune_option(name: &str) -> Option<RunOption> {
+    match name {
+        "builders" => Some(RunOption::Switch(SwitchOption::Builders)),
+        _ => prune_seam_option(name),
+    }
+}
+
+/// The transport as `gate check --builder` takes it, and the least age of a gone worktree's mark.
+#[cfg(feature = "test-seams")]
+fn prune_seam_option(name: &str) -> Option<RunOption> {
+    match name {
+        "test-remote-transport" => Some(RunOption::Value(ValueOption::RemoteTransport)),
+        "test-remote-ssh" => Some(RunOption::Value(ValueOption::RemoteSsh)),
+        "test-prune-gone-age-ms" => Some(RunOption::Value(ValueOption::PruneGoneAgeMs)),
+        _ => None,
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+fn prune_seam_option(_name: &str) -> Option<RunOption> {
     None
 }
 

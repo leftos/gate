@@ -43,7 +43,9 @@
 //! `inputs` or `drain` call given the words of the variable `GATE_FAKE_SSH_BOX_SEAMS`, when set, before its verb as box
 //! seams, and a `preflight` call those of `GATE_FAKE_SSH_PREFLIGHT_SEAMS` the same way, a `preflight` or `drain` call
 //! then `--test-box-root-walk-stop <folder>` when the variable `GATE_FAKE_SSH_ROOT_WALK_STOP` names the folder, one path
-//! never split, or `git upload-pack <path>` or `git receive-pack <path>`, or a push call's words with this PC's `pwsh`, its `LOCALAPPDATA`
+//! never split; a keyed prune's line, `<exe> box prune --root <root> --keys <key>...`, which has no `--stdin`, runs
+//! `<gate> box` with that walk stop, `prune` and the words after it, split at each space;
+//! or `git upload-pack <path>` or `git receive-pack <path>`, or a push call's words with this PC's `pwsh`, its `LOCALAPPDATA`
 //! the folder named as the host, the word before the line, in the folder the variable `GATE_FAKE_SSH_BUILDERS` names,
 //! made when missing, fed this process's standard input, which it reads whole first and keeps as `<steps file>.input`;
 //! its standard streams are otherwise this process's, and it exits with its status;
@@ -618,9 +620,15 @@ fn hold(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// What a keyed prune's line holds after the box's exe: the verb, whose words after it are its root and keys, with no
+/// `--stdin`.
+const PRUNE_LINE: &str = " box prune ";
+/// The verb of a keyed prune call.
+const PRUNE: &str = "prune";
+
 /// The call the line carries: `gate box`'s verb and the word after it, `--stdin`, a git service's name and the
-/// repository's path, or [`PUSH`] and the push call's whole line, as `rest`; the host it was made to, and the steps
-/// file it acts on.
+/// repository's path, [`PRUNE`] and the prune's words after it, or [`PUSH`] and the push call's whole line, as `rest`;
+/// the host it was made to, and the steps file it acts on.
 struct BoxCall<'a> {
     verb: &'a str,
     rest: &'a str,
@@ -659,6 +667,14 @@ impl<'a> BoxCall<'a> {
                 steps,
             });
         }
+        if let Some((_, rest)) = line.split_once(PRUNE_LINE) {
+            return Ok(BoxCall {
+                verb: PRUNE,
+                rest,
+                host,
+                steps,
+            });
+        }
         match words[..] {
             [.., "box", verb, rest @ "--stdin"] => Ok(BoxCall { verb, rest, host, steps }),
             [.., "box", _, _] | [.., "box", _] => Err(format!("box call without --stdin: {line}")),
@@ -688,12 +704,16 @@ impl<'a> BoxCall<'a> {
         if let Some(name) = seams {
             command.args(seams_of(name)?.split_whitespace());
         }
-        if matches!(self.verb, "preflight" | "drain")
+        if matches!(self.verb, "preflight" | "drain" | PRUNE)
             && let Some(stop) = std::env::var_os("GATE_FAKE_SSH_ROOT_WALK_STOP")
         {
             command.arg("--test-box-root-walk-stop").arg(stop);
         }
-        command.args([self.verb, self.rest]);
+        if self.verb == PRUNE {
+            command.arg(PRUNE).args(self.rest.split(' '));
+        } else {
+            command.args([self.verb, self.rest]);
+        }
         Ok(command)
     }
 

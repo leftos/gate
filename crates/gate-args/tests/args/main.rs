@@ -12,6 +12,7 @@ mod cutover;
 mod drain;
 mod expect;
 mod program;
+mod prune;
 mod push;
 mod quoting;
 mod run;

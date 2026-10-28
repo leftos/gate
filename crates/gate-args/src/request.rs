@@ -29,6 +29,8 @@ pub enum Invocation {
     Check(CheckRequest),
     /// `gate drain`.
     Drain(DrainRequest),
+    /// `gate prune --builders`.
+    Prune(PruneRequest),
     /// `gate burn`.
     Burn(BurnRequest),
     /// `gate expect`.
@@ -610,6 +612,26 @@ pub struct DrainSeams {
     pub remote_transport: Option<String>,
     /// The program the local transport's call starts with ssh's own words (`--test-remote-ssh`).
     pub remote_ssh: Option<PathBuf>,
+}
+
+/// A valid `gate prune --builders`, which takes no other words: the hidden seams the black-box suite gives it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PruneRequest {
+    /// The hidden `--test-*` flags that set the transport and the least age of a gone worktree's mark.
+    pub seams: PruneSeams,
+}
+
+/// What the black-box suite sets on `gate prune --builders` through its hidden `--test-*` flags; each field keeps its
+/// default, `None`, in a gate built without the `test-seams` feature.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PruneSeams {
+    /// The local transport to the builders, as `gate check --builder` takes it (`--test-remote-transport`).
+    pub remote_transport: Option<String>,
+    /// The program the local transport's call starts with ssh's own words (`--test-remote-ssh`).
+    pub remote_ssh: Option<PathBuf>,
+    /// How long, in milliseconds, a worktree must have been found gone before its builders are called, in place of an
+    /// hour (`--test-prune-gone-age-ms`).
+    pub gone_age_ms: Option<u64>,
 }
 
 /// A valid `gate warm`, which takes no words: the folder to warm from, whether it runs in the background, the state

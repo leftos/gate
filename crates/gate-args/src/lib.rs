@@ -1,5 +1,5 @@
 //! The gate's own argv: the subcommand CLI (`gate run`, `gate burn`, `gate expect`, `gate stop-tree`, `gate cutover`,
-//! `gate push`, `gate drain`, `gate check`, `gate warm`, the hidden `gate box`, `--version`, `--help`/`-h`) and the compatibility
+//! `gate push`, `gate drain`, `gate prune`, `gate check`, `gate warm`, the hidden `gate box`, `--version`, `--help`/`-h`) and the compatibility
 //! layer that reads the PowerShell gate's `-Log <path> -TimeoutSeconds <n> -Slot <kind> -- <command>` form. Parsing is
 //! pure: it reads the words it is given, opens no file and reads no environment, so it builds and tests everywhere. A
 //! usage error is a list of [`Problem`]s, each printed on its own `gate: ` line before the [`USAGE`]; a malformed
@@ -31,8 +31,8 @@ pub use program::{ProgramSearch, is_godot_console, resolve_program};
 pub use request::WarmRequest;
 pub use request::{
     BoxRequest, BoxSeams, BoxVerb, BurnRequest, Ceiling, CheckRequest, CheckSeams, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS,
-    DEFAULT_TAIL_LINES, DesktopMode, DesktopSession, DrainAction, DrainRequest, DrainSeams, ExpectRequest, Invocation, ProcessScan, PushRequest,
-    PushSeams, RunRequest, Slot, StopRequest, TestSeams,
+    DEFAULT_TAIL_LINES, DesktopMode, DesktopSession, DrainAction, DrainRequest, DrainSeams, ExpectRequest, Invocation, ProcessScan, PruneRequest,
+    PruneSeams, PushRequest, PushSeams, RunRequest, Slot, StopRequest, TestSeams,
 };
 pub use usage::USAGE;
 pub use values::{
@@ -43,10 +43,10 @@ pub use values::{
 /// Reads the gate's arguments, without the program name.
 ///
 /// The first word picks the parser: `--version`, `--help`, `-h` and `help` first, then a subcommand name (`run`,
-/// `burn`, `expect`, `stop-tree`, `cutover`, `push`, `drain`, `check`, `warm`, the hidden `box`) selects the CLI and a
+/// `burn`, `expect`, `stop-tree`, `cutover`, `push`, `drain`, `prune`, `check`, `warm`, the hidden `box`) selects the CLI and a
 /// first word starting with `-` selects the compatibility layer.
 ///
-/// A `--help` or `-h` word before the first `--` separator of a `run`, `stop-tree`, `cutover`, `push`, `drain`, `check`, `warm`,
+/// A `--help` or `-h` word before the first `--` separator of a `run`, `stop-tree`, `cutover`, `push`, `drain`, `prune`, `check`, `warm`,
 /// `burn` or `expect` line is the usage too, whatever else the line holds. The words after `--` belong to the command the gate
 /// runs, so `gate run --slot light -- tool --help` runs `tool --help`.
 ///
@@ -67,7 +67,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Invocation, Vec<Problem>> {
     match text {
         "--version" => alone(rest.into_iter(), Invocation::Version),
         "--help" | "-h" | "help" => alone(rest.into_iter(), Invocation::Help),
-        "run" | "stop-tree" | "cutover" | "push" | "drain" | "check" | "warm" | "burn" | "expect" if help_before_separator(&rest) => {
+        "run" | "stop-tree" | "cutover" | "push" | "drain" | "prune" | "check" | "warm" | "burn" | "expect" if help_before_separator(&rest) => {
             Ok(Invocation::Help)
         }
         "run" => cli::parse_run(rest.into_iter()).map(Invocation::Run),
@@ -75,6 +75,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Invocation, Vec<Problem>> {
         "cutover" => cli::parse_cutover(rest.into_iter()).map(Invocation::Cutover),
         "push" => cli::parse_push(rest.into_iter()).map(Invocation::Push),
         "drain" => cli::parse_drain(rest.into_iter()).map(Invocation::Drain),
+        "prune" => cli::parse_prune(rest.into_iter()).map(Invocation::Prune),
         "check" => cli::parse_check(rest.into_iter()).map(Invocation::Check),
         "warm" => cli::parse_warm(rest.into_iter()).map(Invocation::Warm),
         "burn" => cli::parse_burn(rest.into_iter()).map(Invocation::Burn),

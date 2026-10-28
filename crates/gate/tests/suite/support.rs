@@ -36,6 +36,7 @@ usage: gate run --slot heavy|light|critical|none [--alone] [--reason \"<why>\"] 
        gate cutover
        gate push
        gate drain [--lift | --status] [--builder <host>]
+       gate prune --builders
        gate check [--builder <host>]
        gate warm [--cd <folder>] [--background] [--state-dir <path>]
        gate burn [--cores <n>] --seconds <s>

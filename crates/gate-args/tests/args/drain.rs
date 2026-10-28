@@ -88,14 +88,14 @@ fn drain_help_prints_the_usage() {
 }
 
 #[test]
-fn the_usage_lists_drain_between_push_and_check() {
+fn the_usage_lists_drain_between_push_and_prune() {
     let lines: Vec<&str> = USAGE.lines().collect();
     let at = lines
         .iter()
         .position(|line| *line == "       gate drain [--lift | --status] [--builder <host>]")
         .expect("the usage lists gate drain");
     assert_eq!(lines[at - 1], "       gate push", "{USAGE}");
-    assert_eq!(lines[at + 1], "       gate check [--builder <host>]", "{USAGE}");
+    assert_eq!(lines[at + 1], "       gate prune --builders", "{USAGE}");
 }
 
 #[cfg(feature = "test-seams")]

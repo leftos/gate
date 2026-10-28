@@ -30,6 +30,7 @@ mod launcher;
 mod nesting;
 mod orphan;
 mod pause;
+mod prune;
 mod push;
 mod remote_client;
 mod remote_inputs;
