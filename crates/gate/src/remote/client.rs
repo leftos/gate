@@ -5941,6 +5941,7 @@ mod tests {
             words: &[],
             outputs: &[],
             outputs_withheld: false,
+            bins_withheld: false,
             failure_outputs: &[],
             dropped_no_build: false,
             send: None,
@@ -7389,6 +7390,7 @@ mod tests {
         names_skipped: bool,
         cross_not_brought_back: bool,
         crossed: bool,
+        bins_withheld: bool,
     }
 
     /// The outputs step of a passing run with output globs in `root` that sent no cross build, the box having said it
@@ -7403,6 +7405,7 @@ mod tests {
             names_skipped,
             cross_not_brought_back: false,
             crossed: false,
+            bins_withheld: false,
         }
     }
 
@@ -7435,6 +7438,7 @@ mod tests {
         call.state_dir = &state;
         call.outputs = if step.globs { &globs[..] } else { &[] };
         call.cross_build = step.crossed.then_some(&cross);
+        call.bins_withheld = step.bins_withheld;
         let transport = nowhere();
         let mut attempt = Attempt::for_tests(&call, &transport);
         // The attempt is past its snapshot, as one that reaches its outputs is, so a fetch is tried.
@@ -7513,6 +7517,14 @@ mod tests {
             ("no manifest", passed(unbuilt, nothing(), false), Some(false)),
             ("no outputs line", passed(&held, None, false), Some(false)),
             ("nothing packed for a PC holding outputs", passed(&held, nothing(), false), Some(true)),
+            (
+                "nothing packed for a PC holding outputs, its bin globs withheld",
+                Step {
+                    bins_withheld: true,
+                    ..passed(&held, nothing(), false)
+                },
+                Some(false),
+            ),
             ("nothing packed for a PC holding none", passed(&empty, nothing(), false), Some(false)),
             ("nothing packed, names skipped", passed(&held, nothing(), true), Some(false)),
             ("an archive whose fetch failed", passed(&held, archive(), false), Some(false)),
@@ -8980,6 +8992,7 @@ mod tests {
             words: &[],
             outputs: &[],
             outputs_withheld: false,
+            bins_withheld: false,
             failure_outputs: &[],
             dropped_no_build: false,
             send: None,
@@ -9044,6 +9057,7 @@ mod tests {
         let warm_call = RemoteCall {
             outputs: &globs,
             outputs_withheld: true,
+            bins_withheld: false,
             failure_outputs: &[],
             dropped_no_build: false,
             send: None,

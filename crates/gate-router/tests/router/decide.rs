@@ -6,10 +6,10 @@ use std::path::PathBuf;
 
 use gate_router::windows::WindowsChange;
 use gate_router::{
-    BuildSettings, BuildTarget, Builder, BuilderOs, CARRIED_INPUT, Config, ConfigProblem, DROPPED_NO_BUILD_LINE, DotnetTarget, Facts,
-    GitignoredInput, Inputs, LocalReason, NO_OUTPUTS_LINE, PROJECT_EXTENSIONS, Pattern, PinRefusal, Place, RemoteRun, Route, SiblingFolder, Slot,
-    Target, build_settings, builder_words, decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet, is_usable_host, later_run, sdk_build_target,
-    target, without_no_build, work_folder_key,
+    BuildSettings, BuildTarget, Builder, BuilderOs, CARRIED_INPUT, Config, ConfigProblem, CrossBlocked, CrossTarget, DROPPED_NO_BUILD_LINE,
+    DotnetTarget, Facts, GitignoredInput, Inputs, LocalReason, NO_OUTPUTS_LINE, PROJECT_EXTENSIONS, Pattern, PinRefusal, Place, RemoteRun, Route,
+    SiblingFolder, Slot, Target, build_settings, builder_words, decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet, is_usable_host, later_run,
+    sdk_build_target, target, without_no_build, work_folder_key,
 };
 
 use crate::support::{FakeFacts, HEAD, ROOT, carried, fake_id, heavy, place_at, sibling_root, words};
@@ -103,6 +103,7 @@ fn the_control_command_routes_from_the_root() {
             later: Vec::new(),
             cross_build: None,
             cross_build_blocked: None,
+            bins_withheld: false,
         }
     );
     assert_eq!(run.lines(), Vec::<&str>::new());
@@ -4687,6 +4688,228 @@ fn a_dotnet_build_naming_no_target_gets_a_cross_build_without_one() {
     assert_eq!(cross.words, expected);
 }
 
+/// The output globs of [`reports_routing`]: a bin set, the test reports under the bins, crash dumps and a folder of no
+/// bin.
+const MIXED_OUTPUTS: [&str; 4] = ["src/Yaat.Client/bin/Debug/**", "tests/*/bin/*/*/TestResults/*.trx", "**/*.dmp", "out/**"];
+/// [`MIXED_OUTPUTS`] with the bin set left out.
+const NO_BIN_OUTPUTS: [&str; 3] = ["tests/*/bin/*/*/TestResults/*.trx", "**/*.dmp", "out/**"];
+
+/// The globs as a JSON list.
+fn json_list(globs: &[&str]) -> String {
+    let quoted: Vec<String> = globs.iter().map(|glob| format!("\"{glob}\"")).collect();
+    format!("[{}]", quoted.join(", "))
+}
+
+/// [`cross_routing`] whose macOS entry brings back `outputs` and, on a failure, `failure_outputs`.
+fn mac_routing(cross: &str, outputs: &[&str], failure_outputs: &[&str]) -> Config {
+    let (outputs, failure_outputs) = (json_list(outputs), json_list(failure_outputs));
+    let mac = format!(
+        r#"[{{"host": "mac-1", "os": "macos", "root": "/m", "repos": {{"yaat": ["dotnet *"]}}, "outputs": {{"yaat": {outputs}}},
+             "failureOutputs": {{"yaat": {failure_outputs}}}, "crossBuild": {cross}}}]"#
+    );
+    with_builders(r#"{"yaat": ["*"]}"#, &mac)
+}
+
+/// [`mac_routing`] bringing back [`MIXED_OUTPUTS`] and no failure outputs.
+fn reports_routing(cross: &str) -> Config {
+    mac_routing(cross, &MIXED_OUTPUTS, &[])
+}
+
+#[test]
+fn a_mac_run_of_an_opted_in_repo_without_a_cross_build_sends_no_bin_glob_and_says_nothing() {
+    for command in [
+        words(&["dotnet", "run", "--project", "tests/X"]),
+        words(&["dotnet", "build", "src/App/App.csproj", "-r", "osx-arm64"]),
+        words(&["dotnet", "test", "X.slnx"]),
+    ] {
+        let run = routed(decide(&heavy(&command), &cross_facts(reports_routing(r#"{"yaat": "win-x64"}"#))));
+        assert_eq!(run.cross_build, None, "{command:?}");
+        assert_eq!(run.outputs, words(&NO_BIN_OUTPUTS), "{command:?}");
+        assert!(run.bins_withheld, "{command:?}");
+        assert!(!run.lines().iter().any(|line| line.contains("output")), "{command:?}: {:?}", run.lines());
+    }
+}
+
+#[test]
+fn a_mac_run_of_an_opted_in_repo_without_a_cross_build_withholds_its_bins_whatever_its_globs_name() {
+    for globs in [&["**/*.dll"][..], &["src/**"]] {
+        let config = mac_routing(r#"{"yaat": "win-x64"}"#, globs, &[]);
+        let run = routed(decide(&heavy(&words(&["dotnet", "test", "X.slnx"])), &cross_facts(config)));
+        assert!(run.bins_withheld, "{globs:?}: no glob names bin, yet the Mac's bins come back");
+        assert_eq!(run.outputs, words(globs), "{globs:?}: the drop is only a best effort");
+    }
+}
+
+#[test]
+fn a_mac_run_whose_bins_are_withheld_drops_its_bin_failure_outputs_too() {
+    let config = mac_routing(r#"{"yaat": "win-x64"}"#, &MIXED_OUTPUTS, &["**/bin/**/*.dll", "**/*.dmp"]);
+    let run = routed(decide(&heavy(&words(&["dotnet", "test", "X.slnx"])), &cross_facts(config)));
+    assert!(run.bins_withheld);
+    assert_eq!(run.failure_outputs, words(&["**/*.dmp"]));
+
+    let crossed = mac_routing(r#"{"yaat": "win-x64"}"#, &MIXED_OUTPUTS, &["**/bin/**/*.dll", "**/*.dmp"]);
+    let run = routed(decide(&heavy(&words(&["dotnet", "build", "src/App/App.csproj"])), &cross_facts(crossed)));
+    assert_eq!(run.failure_outputs, words(&["**/bin/**/*.dll", "**/*.dmp"]), "a crossed run keeps them");
+}
+
+#[test]
+fn a_dropped_no_build_run_of_an_opted_in_repo_withholds_its_bins_and_drops_its_bin_failure_outputs() {
+    let config = mac_routing(r#"{"yaat": "win-x64"}"#, &["**/bin/**"], &["**/bin/**", "**/*.trx"]);
+    let run = routed(decide(&heavy(&words(&["dotnet", "test", "--no-build"])), &cross_facts(config)));
+
+    assert!(run.outputs_withheld, "its outputs are withheld already");
+    assert!(run.bins_withheld, "opted in needs no outputs");
+    assert_eq!(run.failure_outputs, words(&["**/*.trx"]));
+}
+
+#[test]
+fn a_mac_run_that_carries_its_cross_build_or_of_a_repo_not_opted_in_keeps_every_glob() {
+    let command = words(&["dotnet", "build", "src/App/App.csproj"]);
+    for (cross, crosses) in [(r#"{"yaat": "win-x64"}"#, true), (r#"{"other": "win-x64"}"#, false)] {
+        let run = routed(decide(&heavy(&command), &cross_facts(reports_routing(cross))));
+        assert_eq!(run.cross_build.is_some(), crosses, "{cross}");
+        assert_eq!(run.outputs, words(&MIXED_OUTPUTS), "{cross}");
+        assert!(!run.bins_withheld, "{cross}");
+    }
+    let other = routed(decide(
+        &heavy(&words(&["dotnet", "run", "--project", "tests/X"])),
+        &cross_facts(reports_routing(r#"{"other": "win-x64"}"#)),
+    ));
+    assert_eq!(other.outputs, words(&MIXED_OUTPUTS), "a repo not opted in");
+    assert!(!other.bins_withheld);
+}
+
+#[test]
+fn a_mac_run_whose_only_glob_is_a_bin_one_sends_no_outputs() {
+    let command = words(&["dotnet", "run", "--project", "tests/X"]);
+    let run = routed(decide(&heavy(&command), &cross_facts(cross_routing(r#"{"yaat": "win-x64"}"#))));
+    assert_eq!(run.outputs, Vec::<String>::new());
+    assert!(run.bins_withheld);
+    assert!(!run.outputs_withheld, "no --no-build was dropped");
+}
+
+/// [`cross_facts`] of [`cross_routing`] opting `yaat` in for `win-x64`, whose disk says the target is `cross_target`.
+fn cross_facts_saying(cross_target: CrossTarget) -> FakeFacts {
+    FakeFacts {
+        cross_target,
+        ..cross_facts(cross_routing(r#"{"yaat": "win-x64"}"#))
+    }
+}
+
+/// The targets the decision asked the disk about ([`FakeFacts::cross_targets_asked`]), in order.
+fn targets_asked(facts: &FakeFacts) -> Vec<Option<String>> {
+    facts.cross_targets_asked.borrow().clone()
+}
+
+/// What the disk says of a folder that holds two projects.
+fn two_projects() -> CrossTarget {
+    CrossTarget::NotOneProject("src/Two holds more than one project file".to_owned())
+}
+
+#[test]
+fn a_bare_dotnet_test_in_a_folder_the_disk_calls_a_solution_gets_no_cross_build_and_says_so() {
+    let facts = cross_facts_saying(CrossTarget::Solution);
+    let run = routed(decide(&heavy(&words(&["dotnet", "test"])), &facts));
+
+    assert_eq!(run.cross_build, None);
+    assert_eq!(run.cross_build_blocked, Some(CrossBlocked::Solution(None)));
+    assert_eq!(
+        run.lines(),
+        ["gate: no cross build: the command's folder is a solution, which cannot be built for one runtime"]
+    );
+    assert_eq!(targets_asked(&facts), [None], "asked once, of the gate's folder");
+}
+
+#[test]
+fn a_dotnet_test_naming_a_solution_gets_no_cross_build_without_a_disk_question() {
+    let facts = cross_facts_saying(CrossTarget::OneProject);
+    let run = routed(decide(&heavy(&words(&["dotnet", "test", "X.slnx"])), &facts));
+
+    assert_eq!(run.cross_build, None);
+    assert_eq!(run.cross_build_blocked, Some(CrossBlocked::Solution(Some("X.slnx".to_owned()))));
+    assert_eq!(
+        run.lines(),
+        ["gate: no cross build: X.slnx is a solution, which cannot be built for one runtime"]
+    );
+    assert_eq!(targets_asked(&facts), Vec::<Option<String>>::new(), "the extension says it");
+}
+
+#[test]
+fn a_dotnet_test_of_a_folder_the_disk_calls_one_project_carries_the_cross_build() {
+    let facts = cross_facts_saying(CrossTarget::OneProject);
+    let run = routed(decide(&heavy(&words(&["dotnet", "test", "tests/A.Tests"])), &facts));
+
+    assert!(run.cross_build.is_some(), "{run:?}");
+    assert_eq!(run.cross_build_blocked, None);
+    assert_eq!(
+        targets_asked(&facts),
+        [Some("tests/A.Tests".to_owned())],
+        "asked once, of the target the cross build names"
+    );
+}
+
+#[test]
+fn a_dotnet_build_naming_a_project_file_asks_the_disk_nothing() {
+    let facts = cross_facts_saying(two_projects());
+    let run = routed(decide(&heavy(&words(&["dotnet", "build", "src/App/App.csproj"])), &facts));
+
+    assert!(run.cross_build.is_some(), "{run:?}");
+    assert_eq!(targets_asked(&facts), Vec::<Option<String>>::new(), "the extension says it");
+}
+
+#[test]
+fn a_dotnet_build_of_a_folder_the_disk_calls_not_one_project_gets_no_cross_build_and_says_why_on_one_line() {
+    let facts = cross_facts_saying(two_projects());
+    let run = routed(decide(&heavy(&words(&["dotnet", "build", "src/Two"])), &facts));
+
+    assert_eq!(run.cross_build, None);
+    assert_eq!(
+        run.cross_build_blocked,
+        Some(CrossBlocked::NotOneProject {
+            target: Some("src/Two".to_owned()),
+            why: "src/Two holds more than one project file".to_owned(),
+        })
+    );
+    assert_eq!(
+        run.lines(),
+        ["gate: no cross build: src/Two does not name one project (src/Two holds more than one project file)"]
+    );
+    assert_eq!(targets_asked(&facts), [Some("src/Two".to_owned())]);
+
+    let bare = routed(decide(&heavy(&words(&["dotnet", "build"])), &cross_facts_saying(two_projects())));
+    assert_eq!(
+        bare.lines(),
+        ["gate: no cross build: the command's folder does not name one project (src/Two holds more than one project file)"]
+    );
+}
+
+#[test]
+fn a_dotnet_build_naming_an_empty_project_gets_no_cross_build_and_says_so() {
+    let facts = cross_facts_saying(CrossTarget::OneProject);
+    let run = routed(decide(&heavy(&words(&["dotnet", "build", "--project", ""])), &facts));
+
+    assert_eq!(run.cross_build, None);
+    assert_eq!(run.cross_build_blocked, Some(CrossBlocked::EmptyProject));
+    assert_eq!(run.lines(), ["gate: no cross build: the command names an empty project"]);
+    assert_eq!(
+        targets_asked(&facts),
+        Vec::<Option<String>>::new(),
+        "never the gate's folder in its place"
+    );
+}
+
+#[test]
+fn a_repo_not_opted_in_asks_the_disk_nothing_of_its_target() {
+    let facts = FakeFacts {
+        cross_target: CrossTarget::Solution,
+        ..cross_facts(cross_routing(r#"{"other": "win-x64"}"#))
+    };
+    let run = routed(decide(&heavy(&words(&["dotnet", "test"])), &facts));
+
+    assert_eq!(run.cross_build_blocked, None);
+    assert_eq!(targets_asked(&facts), Vec::<Option<String>>::new());
+}
+
 #[test]
 fn no_cross_build_for_a_dropped_no_build_another_command_or_a_build_that_sets_its_runtime_or_output_by_property() {
     for command in [
@@ -4719,7 +4942,7 @@ fn each_blocking_word_keeps_a_build_from_its_cross_build_and_says_so() {
         let command = words(&["dotnet", "build", "src/App/App.csproj", word, "x64"]);
         let run = routed(decide(&heavy(&command), &cross_facts(cross_routing(r#"{"yaat": "win-x64"}"#))));
         assert_eq!(run.cross_build, None, "{word}");
-        assert_eq!(run.cross_build_blocked.as_deref(), Some(word), "{word}");
+        assert_eq!(run.cross_build_blocked, Some(CrossBlocked::Word(word.to_owned())), "{word}");
         assert_eq!(run.lines(), [format!("gate: no cross build for this command: it names {word}")], "{word}");
     }
 }
@@ -4821,7 +5044,7 @@ fn an_option_the_gate_does_not_know_keeps_a_build_from_its_cross_build_and_says_
     let run = routed(decide(&heavy(&command), &cross_facts(cross_routing(r#"{"yaat": "win-x64"}"#))));
 
     assert_eq!(run.cross_build, None);
-    assert_eq!(run.cross_build_blocked.as_deref(), Some("--made-up-switch"));
+    assert_eq!(run.cross_build_blocked, Some(CrossBlocked::Word("--made-up-switch".to_owned())));
     assert_eq!(run.lines(), ["gate: no cross build for this command: it names --made-up-switch"]);
 }
 

@@ -325,6 +325,14 @@ pub trait Facts {
     /// sends on to the next builder that is no macOS one.
     fn windows_only_tests(&self, place: &Place, words: &[String]) -> bool;
 
+    /// What the cross build's `target` (as its words name it, read against the gate's folder at `place`; `None` for the
+    /// gate's folder itself) builds, read from disk: a project file is itself, a folder its one project file, else its
+    /// one solution file; [`CrossTarget::NotOneProject`], with why, for a path that is not there or is neither, or a
+    /// folder holding neither, more than one of a kind, or that cannot be read. A named target is never replaced by the
+    /// gate's folder. Asked at most once per decision, only of a routed run that would get a cross build
+    /// ([`RemoteRun::cross_build`]) and whose target is no project or solution file by its extension.
+    fn cross_target(&self, place: &Place, target: Option<&str>) -> CrossTarget;
+
     /// What the change of the worktree at `place`, and of each of its declared `siblings` an entry of its
     /// `.gate/windows.toml` names, is to that file's paths ([`WindowsChange`]): untouched when there is no such file,
     /// touched with the first changed path a declared path matches, or unknown, with why, when that cannot be told.
@@ -703,9 +711,73 @@ pub struct RemoteRun {
     /// set only for a direct `dotnet build`, or `dotnet test` without `--no-build`, of a repo the builder's entry
     /// cross-builds ([`Config::cross_build_rid`]) with outputs to bring back, that builds in place and names no runtime.
     pub cross_build: Option<CrossBuild>,
-    /// The word that kept such a command from its cross build ([`CROSS_BLOCKING_OPTIONS`], or an option whose arity the
-    /// gate does not know), which [`RemoteRun::lines`] names.
-    pub cross_build_blocked: Option<String>,
+    /// Why such a command got no cross build, which [`RemoteRun::lines`] says ([`CrossBlocked::line`]).
+    pub cross_build_blocked: Option<CrossBlocked>,
+    /// Whether the run withholds the Mac's bins: a run of a repo the macOS builder's entry cross-builds ([`RemoteRun::cross_build`]'s
+    /// opt-in) that carries no cross build. Its output and failure output globs that name a `bin` folder are dropped
+    /// ([`names_bin_folder`]) as a best effort, since any other glob may still match a Mac-built bin file, and the run
+    /// counts as not having brought its outputs back, whatever its globs.
+    pub bins_withheld: bool,
+}
+
+/// What a routed dotnet build or test builds, as [`Facts::cross_target`] reads it from disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CrossTarget {
+    /// One project file.
+    OneProject,
+    /// A solution, which the SDK refuses to build for one runtime.
+    Solution,
+    /// No one project, and why: a path that is not there or is no project file, or a folder holding no project or
+    /// solution file, more than one of a kind, or that cannot be read.
+    NotOneProject(String),
+}
+
+/// Why a routed dotnet build or test got no cross build ([`RemoteRun::cross_build_blocked`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CrossBlocked {
+    /// The word that blocks one ([`CROSS_BLOCKING_OPTIONS`]), or an option whose arity the gate does not know.
+    Word(String),
+    /// Its target is a solution: the target as the words name it, `None` for the command's folder.
+    Solution(Option<String>),
+    /// Its target names no one project: the target as the words name it, `None` for the command's folder, and why
+    /// ([`CrossTarget::NotOneProject`]).
+    NotOneProject {
+        /// The target as the words name it, `None` for the command's folder.
+        target: Option<String>,
+        /// Why it names no one project, as the disk told it.
+        why: String,
+    },
+    /// Its words name an empty project (`--project ""`).
+    EmptyProject,
+}
+
+impl CrossBlocked {
+    /// The line the run says: `gate: no cross build for this command: it names {word}`, `gate: no cross build: {target}
+    /// is a solution, which cannot be built for one runtime`, `gate: no cross build: {target} does not name one project
+    /// ({why})` or `gate: no cross build: the command names an empty project`, the target escaped, or `the command's
+    /// folder` when the words name none.
+    #[must_use]
+    pub fn line(&self) -> String {
+        match self {
+            Self::Word(word) => format!("gate: no cross build for this command: it names {}", escaped(word)),
+            Self::Solution(target) => format!(
+                "gate: no cross build: {} is a solution, which cannot be built for one runtime",
+                shown_target(target.as_deref())
+            ),
+            Self::NotOneProject { target, why } => {
+                format!(
+                    "gate: no cross build: {} does not name one project ({why})",
+                    shown_target(target.as_deref())
+                )
+            }
+            Self::EmptyProject => "gate: no cross build: the command names an empty project".to_owned(),
+        }
+    }
+}
+
+/// A cross build's target as a line names it: escaped, or `the command's folder` for none.
+fn shown_target(target: Option<&str>) -> String {
+    target.map_or_else(|| "the command's folder".to_owned(), escaped)
 }
 
 /// A routed run's cross build ([`RemoteRun::cross_build`]).
@@ -757,8 +829,7 @@ impl RemoteRun {
     /// The lines the gate says for this route, in order: [`RemoteRun::program_line`], [`DROPPED_NO_BUILD_LINE`] unless
     /// the run has a send, whose client says it only when the send does not land, [`NO_OUTPUTS_LINE`], then, for a run
     /// carrying siblings, `gate: routed with siblings: {name} ({root}), ...` naming each in declared order, then, for a
-    /// command a word kept from its cross build ([`RemoteRun::cross_build_blocked`]),
-    /// `gate: no cross build for this command: it names {word}`.
+    /// command kept from its cross build ([`RemoteRun::cross_build_blocked`]), why ([`CrossBlocked::line`]).
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
@@ -779,8 +850,8 @@ impl RemoteRun {
                 .collect();
             lines.push(format!("gate: routed with siblings: {}", named.join(", ")));
         }
-        if let Some(word) = &self.cross_build_blocked {
-            lines.push(format!("gate: no cross build for this command: it names {}", escaped(word)));
+        if let Some(blocked) = &self.cross_build_blocked {
+            lines.push(blocked.line());
         }
         lines
     }
@@ -2736,11 +2807,14 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
     if outputs_withheld {
         outputs.clear();
     }
-    let failure_outputs = config.failure_outputs_on(&target.builder, &target.repo);
-    let rid = match (target.builder.os, config.cross_build_rid(&target.builder, &target.repo)) {
-        (BuilderOs::Macos, Ok(Some(rid))) if !outputs.is_empty() => Some(rid.to_owned()),
+    let mut failure_outputs = config.failure_outputs_on(&target.builder, &target.repo);
+    // Opted in whatever the run's outputs: a failure-only run or a dropped `--no-build` one still builds the Mac's bins.
+    let opted_rid = match (target.builder.os, config.cross_build_rid(&target.builder, &target.repo)) {
+        (BuilderOs::Macos, Ok(Some(rid))) => Some(rid.to_owned()),
         _ => None,
     };
+    let opted_in = opted_rid.is_some();
+    let rid = opted_rid.filter(|_| !outputs.is_empty());
     let crosses = rid.is_some() && cross_verb(&sent);
     let mut words = without_no_build(sent);
     let dropped_no_build = words.len() != sent_count;
@@ -2748,9 +2822,16 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
     let source_revision = head_of(&target.place, facts);
     stamp(&mut words, || source_revision.clone(), &target, facts);
     let (cross_build, cross_build_blocked) = match rid.filter(|_| crosses) {
-        Some(rid) => cross_plan(rid, &words),
+        Some(rid) => cross_plan(rid, &words, |named| facts.cross_target(&target.place, named)),
         None => (None, None),
     };
+    // A Mac build that is not crossed would bring back the Mac's own bins over the PC's Windows ones. Dropping the globs
+    // that name a bin folder is a best effort: any glob may match a bin file, so the run never counts as complete.
+    let bins_withheld = opted_in && cross_build.is_none();
+    if bins_withheld {
+        outputs.retain(|glob| !names_bin_folder(glob));
+        failure_outputs.retain(|glob| !names_bin_folder(glob));
+    }
     Ok(RemoteRun {
         builder: target.builder,
         key: target.key,
@@ -2775,6 +2856,7 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         later,
         cross_build,
         cross_build_blocked,
+        bins_withheld,
     })
 }
 
@@ -2837,31 +2919,37 @@ fn cross_verb(sent: &[String]) -> bool {
 /// The cross build for `rid` of a routed dotnet build or test whose final words, marked and stamped, are `words`, or
 /// the first of its own words that blocks one ([`CROSS_BLOCKING_OPTIONS`]). None, and no blocking word, for a build
 /// that does not build in place ([`builds_in_place`]); none, and the option as the blocking word, for one naming an
-/// option whose arity the gate does not know ([`unknown_option`]). Its words are the command's dotnet word, `build`,
+/// option whose arity the gate does not know ([`unknown_option`]). None, and why, for a target that is no one project
+/// ([`one_project_blocked`], which asks `target_on_disk` only when the words name no project or solution file). Its
+/// words are the command's dotnet word, `build`,
 /// the target as the words name it ([`dotnet_target`], else the first word named past the values of
 /// [`CROSS_VALUES`], [`first_named`]) when there is one, `-c` and the configuration (`Debug` when the words set none),
 /// `-r` and `rid`, each framework and source word of the words with its value ([`carried_options`]: `--source` alone
 /// for a verb other than [`SOURCE_SHORT_VERB`], whose `-s` is no source), then each property word
 /// ([`carried_properties`]).
-fn cross_plan(rid: String, words: &[String]) -> (Option<CrossBuild>, Option<String>) {
+fn cross_plan(rid: String, words: &[String], target_on_disk: impl FnOnce(Option<&str>) -> CrossTarget) -> (Option<CrossBuild>, Option<CrossBlocked>) {
     let Some(own) = dotnet_own(words) else {
         return (None, None);
     };
     let own = &words[own];
     let blocks = |word: &&String| CROSS_BLOCKING_OPTIONS.iter().any(|options| is_option_of(word, options));
     if let Some(blocking) = own.iter().find(blocks) {
-        return (None, Some(blocking.clone()));
+        return (None, Some(CrossBlocked::Word(blocking.clone())));
     }
     if !builds_in_place(words) {
         return (None, None);
     }
     if let Some(unknown) = unknown_option(own) {
-        return (None, Some(unknown.clone()));
+        return (None, Some(CrossBlocked::Word(unknown.clone())));
     }
-    let target = match dotnet_target(words) {
-        Some(DotnetTarget::Project(name) | DotnetTarget::Solution(name)) => Some(name).filter(|name| !name.is_empty()),
+    let named = dotnet_target(words);
+    let target = match &named {
+        Some(DotnetTarget::Project(name) | DotnetTarget::Solution(name)) => Some(name.clone()).filter(|name| !name.is_empty()),
         None => first_named(own, &CROSS_VALUES),
     };
+    if let Some(blocked) = one_project_blocked(named.as_ref(), target.as_deref(), target_on_disk) {
+        return (None, Some(blocked));
+    }
     let configuration = build_settings(words).configuration.unwrap_or_else(|| DEFAULT_CONFIGURATION.to_owned());
     let source: &[&str] = if verb_in(own, &[SOURCE_SHORT_VERB]) {
         &SOURCE_OPTIONS
@@ -2874,6 +2962,35 @@ fn cross_plan(rid: String, words: &[String]) -> (Option<CrossBuild>, Option<Stri
     cross.extend(carried_options(own, &[&FRAMEWORK_OPTIONS[..], source].concat()));
     cross.extend(carried_properties(own));
     (Some(CrossBuild { rid, words: cross }), None)
+}
+
+/// Why a cross build of the target the words name (`named`, [`dotnet_target`]; `target` as the cross build would name
+/// it) cannot be one runtime's build of one project: an empty project, a solution by its extension, or what
+/// `target_on_disk` says of `target` when it is no project file by its extension. `None` for one project.
+fn one_project_blocked(
+    named: Option<&DotnetTarget>,
+    target: Option<&str>,
+    target_on_disk: impl FnOnce(Option<&str>) -> CrossTarget,
+) -> Option<CrossBlocked> {
+    let kind = match named {
+        Some(DotnetTarget::Project(name)) if name.is_empty() => return Some(CrossBlocked::EmptyProject),
+        Some(DotnetTarget::Solution(_)) => CrossTarget::Solution,
+        Some(DotnetTarget::Project(name)) if has_extension(name, &PROJECT_EXTENSIONS) => CrossTarget::OneProject,
+        _ => target_on_disk(target),
+    };
+    let target = target.map(str::to_owned);
+    match kind {
+        CrossTarget::OneProject => None,
+        CrossTarget::Solution => Some(CrossBlocked::Solution(target)),
+        CrossTarget::NotOneProject(why) => Some(CrossBlocked::NotOneProject { target, why }),
+    }
+}
+
+/// Whether the output glob names a bin folder: one of its segments, split at `/` or `\`, is `bin` and none is
+/// `TestResults`, each in any letter case, so the test reports a run writes under its bins still come back.
+fn names_bin_folder(glob: &str) -> bool {
+    let has = |name: &str| glob.split(['/', '\\']).any(|segment| segment.eq_ignore_ascii_case(name));
+    has("bin") && !has("TestResults")
 }
 
 /// The words among a dotnet command's own words that set one of the options `spellings` names, in order, as
@@ -3218,7 +3335,18 @@ fn project_folder(project: &str, place: &Place) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Place, derived_outputs, send_bin};
+    use super::{Place, derived_outputs, names_bin_folder, send_bin};
+
+    #[test]
+    fn a_glob_names_a_bin_folder_by_a_bin_segment_unless_it_names_test_results_too() {
+        assert!(names_bin_folder("src/Yaat.Client/bin/Debug/**"));
+        assert!(names_bin_folder("**/BIN/**"), "any letter case");
+        assert!(names_bin_folder(r"src\App\bin\**"), "either separator");
+        assert!(!names_bin_folder("tests/*/bin/*/*/TestResults/*.trx"));
+        assert!(!names_bin_folder("**/*.dmp"));
+        assert!(!names_bin_folder("out/**"));
+        assert!(!names_bin_folder("binaries/**"), "a whole segment only");
+    }
 
     /// The place of a gate at `prefix` below the worktree root `X:/dev/app`.
     fn place(prefix: &str) -> Place {

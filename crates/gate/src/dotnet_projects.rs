@@ -3,11 +3,12 @@
 //! files with no `MSBuild` evaluation.
 
 use std::fs;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use gate_router::{DotnetTarget, PROJECT_EXTENSIONS, dotnet_target, escaped, names_program};
+use gate_router::{CrossTarget, DotnetTarget, PROJECT_EXTENSIONS, dotnet_target, escaped, names_program};
 
-use crate::no_build::{project_files, read_regular, sln_entries, slnx_entries};
+use crate::no_build::{below_root, project_files, read_regular, sln_entries, slnx_entries};
 
 /// The program a dotnet command runs.
 const DOTNET: &str = "dotnet";
@@ -60,14 +61,61 @@ enum Tested {
 /// that names a file that is neither a project nor a solution, a file that cannot be read ([`read_regular`]), a
 /// solution that cannot be listed ([`members`]) or a target framework set from a property. The text is escaped.
 pub(crate) fn windows_only_tests(root: &Path, prefix: &str, words: &[String]) -> Result<bool, String> {
-    let folder = prefix
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .fold(root.to_path_buf(), |path, segment| path.join(segment));
-    match tested(&folder, words)? {
+    match tested(&below_root(root, prefix), words)? {
         Tested::Project(project) => windows_only(&read_text(&project)?).map_err(|why| cannot(&project, &why)),
         Tested::Solution(solution) => solution_windows_only(root, &solution),
     }
+}
+
+/// The one project file a cross build's `target` builds, read against the gate's folder `prefix` (`/`-separated and
+/// `/`-ended, empty at the root) below the worktree root `root`: a project file is itself; a folder is its one project
+/// file, else its one solution file ([`in_folder`]); `None` is the gate's folder, the only case it is read. A named
+/// target is never replaced by the gate's folder. The path is the project a caller would build or restore; the cross
+/// build's fact reads only whether there is one.
+///
+/// # Errors
+///
+/// [`CrossTarget::Solution`] for a solution file or a folder whose pick is one; [`CrossTarget::NotOneProject`], with
+/// why, escaped, for a path that is not there or is neither, or a folder holding no project or solution file, more
+/// than one of a kind, or that cannot be read. Never [`CrossTarget::OneProject`].
+pub(crate) fn one_project(root: &Path, prefix: &str, target: Option<&str>) -> Result<PathBuf, CrossTarget> {
+    let folder = below_root(root, prefix);
+    let Some(named) = target else {
+        return one_in_folder(&folder);
+    };
+    let path = folder.join(named);
+    match fs::metadata(&path) {
+        Ok(found) if found.is_dir() => one_in_folder(&path),
+        Ok(_) if is_project_file(named) => Ok(path),
+        Ok(_) if is_solution_file(&path) => Err(CrossTarget::Solution),
+        Ok(_) => Err(CrossTarget::NotOneProject(format!("{} is no project file", shown(&path)))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(CrossTarget::NotOneProject(format!("{} does not exist", shown(&path)))),
+        Err(error) => Err(CrossTarget::NotOneProject(cannot(&path, &error.to_string()))),
+    }
+}
+
+/// The one project file in `folder` when it holds no solution file, else [`CrossTarget::Solution`] for its one solution
+/// file, else why not ([`in_folder`]). A folder holding a solution beside its one project is no one project: `MSBuild`
+/// builds the solution when their names match and refuses the pair (MSB1011) when they do not.
+fn one_in_folder(folder: &Path) -> Result<PathBuf, CrossTarget> {
+    match in_folder(folder) {
+        Ok(Tested::Project(project)) => match solution_files(folder) {
+            Ok(solutions) if solutions.is_empty() => Ok(project),
+            Ok(_) => Err(CrossTarget::NotOneProject(format!(
+                "{} holds a project and a solution file",
+                shown(folder)
+            ))),
+            Err(error) => Err(CrossTarget::NotOneProject(cannot(folder, &error.to_string()))),
+        },
+        Ok(Tested::Solution(_)) => Err(CrossTarget::Solution),
+        Err(why) => Err(CrossTarget::NotOneProject(why)),
+    }
+}
+
+/// Whether `path` ends in a solution extension ([`SOLUTION_EXTENSIONS`]), ignoring letter case.
+fn is_solution_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| SOLUTION_EXTENSIONS.iter().any(|known| extension.eq_ignore_ascii_case(known)))
 }
 
 /// What the words run, read against `folder`.
@@ -143,10 +191,7 @@ fn solution_files(folder: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(folder)? {
         let path = entry?.path();
-        let named = path
-            .extension()
-            .is_some_and(|extension| SOLUTION_EXTENSIONS.iter().any(|known| extension.eq_ignore_ascii_case(known)));
-        if named && path.is_file() {
+        if is_solution_file(&path) && path.is_file() {
             files.push(path);
         }
     }
@@ -385,7 +430,9 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use super::{is_test_project, windows_only, windows_only_tests};
+    use gate_router::CrossTarget;
+
+    use super::{is_test_project, one_project, windows_only, windows_only_tests};
     use crate::no_build::FILE_CAP;
 
     /// The yaat-server form of a test project the tests of turn off off Windows.
@@ -521,6 +568,90 @@ mod tests {
             let judged = windows_only_tests(&root, "", &words(&["dotnet", "test", folder]));
             assert!(judged.is_err(), "{folder}: {judged:?}");
         }
+    }
+
+    /// Whether `resolved` is no one project, its why holding `why`.
+    fn not_one(resolved: &Result<PathBuf, CrossTarget>, why: &str) -> bool {
+        matches!(resolved, Err(CrossTarget::NotOneProject(said)) if said.contains(why))
+    }
+
+    #[test]
+    fn one_project_is_a_named_project_itself_or_a_folder_s_one_project_file() {
+        let root = scratch("one-project-resolved");
+        write(&root, "tests/A/A.csproj", CROSS_TEST);
+        let project = root.join("tests").join("A").join("A.csproj");
+        assert_eq!(one_project(&root, "", Some("tests/A")), Ok(project.clone()));
+        assert_eq!(one_project(&root, "tests/A/", None), Ok(project.clone()));
+        assert_eq!(one_project(&root, "tests/", Some("A")), Ok(project));
+        assert_eq!(one_project(&root, "", Some("tests/A/A.csproj")), Ok(root.join("tests/A/A.csproj")));
+    }
+
+    #[test]
+    fn one_project_of_a_solution_named_or_held_alone_is_a_solution() {
+        let root = scratch("one-project-solution");
+        write(&root, "All.slnx", "<Solution><Project Path=\"tests/A/A.csproj\" /></Solution>");
+        write(&root, "tests/A/A.csproj", CROSS_TEST);
+        assert_eq!(one_project(&root, "", None), Err(CrossTarget::Solution));
+        assert_eq!(one_project(&root, "", Some("All.slnx")), Err(CrossTarget::Solution));
+    }
+
+    #[test]
+    fn one_project_of_a_folder_with_two_projects_or_none_is_not_one_saying_why() {
+        let root = scratch("one-project-unresolved");
+        write(&root, "empty/a.txt", "a");
+        write(&root, "two/A.csproj", CROSS_TEST);
+        write(&root, "two/B.csproj", CROSS_TEST);
+        for (prefix, why) in [
+            ("two/", "holds more than one project file"),
+            ("empty/", "holds no project or solution file"),
+        ] {
+            let resolved = one_project(&root, prefix, None);
+            assert!(not_one(&resolved, why), "{prefix}: {resolved:?}");
+        }
+    }
+
+    #[test]
+    fn a_named_folder_is_resolved_itself_and_never_the_gate_s_folder_in_its_place() {
+        let root = scratch("one-project-named-empty");
+        write(&root, "App.csproj", CROSS_TEST);
+        write(&root, "src/Empty/a.txt", "a");
+        let resolved = one_project(&root, "", Some("src/Empty"));
+        assert!(not_one(&resolved, "holds no project or solution file"), "{resolved:?}");
+
+        let solution = scratch("one-project-named-empty-solution");
+        write(&solution, "All.slnx", "<Solution />");
+        write(&solution, "src/Empty/a.txt", "a");
+        let resolved = one_project(&solution, "", Some("src/Empty"));
+        assert!(
+            not_one(&resolved, "holds no project or solution file"),
+            "never the root's solution: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn a_folder_holding_a_project_and_a_solution_is_not_one_project() {
+        let root = scratch("one-project-and-solution");
+        write(&root, "App.csproj", CROSS_TEST);
+        write(&root, "App.sln", &sln(&["App.csproj"]));
+        write(&root, "src/App/App.csproj", CROSS_TEST);
+        write(&root, "src/App/Other.slnx", "<Solution />");
+        for target in [None, Some("src/App")] {
+            let resolved = one_project(&root, "", target);
+            assert!(not_one(&resolved, "holds a project and a solution file"), "{target:?}: {resolved:?}");
+        }
+    }
+
+    #[test]
+    fn a_named_path_that_is_not_there_or_is_no_project_is_not_one_project() {
+        let root = scratch("one-project-missing");
+        write(&root, "App.csproj", CROSS_TEST);
+        write(&root, "notes.txt", "a");
+        for named in ["src/Missing", "gone/Gone.csproj"] {
+            let resolved = one_project(&root, "", Some(named));
+            assert!(not_one(&resolved, "does not exist"), "{named}: {resolved:?}");
+        }
+        let resolved = one_project(&root, "", Some("notes.txt"));
+        assert!(not_one(&resolved, "is no project file"), "{resolved:?}");
     }
 
     #[test]

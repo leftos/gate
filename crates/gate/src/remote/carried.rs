@@ -107,6 +107,7 @@ mod tests {
             later: Vec::new(),
             cross_build: None,
             cross_build_blocked: None,
+            bins_withheld: false,
         }
     }
 

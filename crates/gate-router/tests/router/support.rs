@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 
 use gate_router::windows::WindowsChange;
 use gate_router::{
-    CarriedSibling, Config, ConfigProblem, Facts, FolderId, GitignoredInput, Inputs, Pattern, Place, SiblingFolder, SiblingRoot, Slot, Target,
+    CarriedSibling, Config, ConfigProblem, CrossTarget, Facts, FolderId, GitignoredInput, Inputs, Pattern, Place, SiblingFolder, SiblingRoot, Slot,
+    Target,
 };
 
 /// The worktree root the fixtures use.
@@ -123,6 +124,10 @@ pub struct FakeFacts {
     pub windows_only: bool,
     /// How many times that was asked, kept apart from [`FakeFacts::asked`].
     pub windows_only_asked: Cell<u32>,
+    /// What a routed build or test that gets a cross build builds: one project unless a case says otherwise.
+    pub cross_target: CrossTarget,
+    /// The target each time that was asked, in order, kept apart from [`FakeFacts::asked`].
+    pub cross_targets_asked: RefCell<Vec<Option<String>>>,
     /// What the change is to `.gate/windows.toml`'s paths.
     pub windows_change: WindowsChange,
     /// How many times that was asked, kept apart from [`FakeFacts::asked`].
@@ -178,6 +183,8 @@ impl FakeFacts {
             given_trees: None,
             windows_only: false,
             windows_only_asked: Cell::new(0),
+            cross_target: CrossTarget::OneProject,
+            cross_targets_asked: RefCell::new(Vec::new()),
             windows_change: WindowsChange::Untouched,
             windows_change_asked: Cell::new(0),
             gitignored: Vec::new(),
@@ -258,6 +265,12 @@ impl Facts for FakeFacts {
     fn windows_only_tests(&self, _place: &Place, _words: &[String]) -> bool {
         self.windows_only_asked.set(self.windows_only_asked.get() + 1);
         self.windows_only
+    }
+
+    /// What [`FakeFacts::cross_target`] says.
+    fn cross_target(&self, _place: &Place, target: Option<&str>) -> CrossTarget {
+        self.cross_targets_asked.borrow_mut().push(target.map(str::to_owned));
+        self.cross_target.clone()
     }
 
     /// What [`FakeFacts::windows_change`] says.

@@ -16,8 +16,8 @@ use gate_args::{GATE_SET_NAMES, RunRequest, Slot, TestSeams, env_refusal};
 use gate_router::warm::FileRead;
 use gate_router::windows::{self, WindowsChange};
 use gate_router::{
-    Config, ConfigProblem, Facts, FolderId, GitignoredInput, Inputs, LaterCandidate, LocalReason, Pattern, PinRefusal, Place, RemoteRun, Route,
-    SiblingFolder, SiblingRoot, Target, decide, dropped_env, dropped_env_line, escaped, is_input_file, is_project_or_solution, repo_name,
+    Config, ConfigProblem, CrossTarget, Facts, FolderId, GitignoredInput, Inputs, LaterCandidate, LocalReason, Pattern, PinRefusal, Place, RemoteRun,
+    Route, SiblingFolder, SiblingRoot, Target, decide, dropped_env, dropped_env_line, escaped, is_input_file, is_project_or_solution, repo_name,
 };
 use gate_win32::Share;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -1109,10 +1109,7 @@ impl Facts for Machine<'_> {
 
     /// A folder that cannot be listed holds none, saying why in the log.
     fn project_files(&self, place: &Place, folder: &str) -> Vec<String> {
-        let path = folder
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-            .fold(PathBuf::from(&place.root), |path, segment| path.join(segment));
+        let path = no_build::below_root(Path::new(&place.root), folder);
         match no_build::project_files(&path) {
             Ok(files) => files
                 .iter()
@@ -1141,6 +1138,12 @@ impl Facts for Machine<'_> {
             self.notes.borrow_mut().push(format!("gate: kept off the macOS builder: {why}"));
             true
         })
+    }
+
+    /// What [`dotnet_projects::one_project`] finds; a target that names no one project carries why, which the run's one
+    /// line says ([`gate_router::CrossBlocked::line`]).
+    fn cross_target(&self, place: &Place, target: Option<&str>) -> CrossTarget {
+        dotnet_projects::one_project(Path::new(&place.root), &place.prefix, target).map_or_else(|kind| kind, |_| CrossTarget::OneProject)
     }
 
     /// A change that touches a declared path, or cannot be told to, says why in the log ([`Machine::read_change`]).
@@ -1923,7 +1926,10 @@ mod tests {
     use std::time::Duration;
 
     use gate_router::windows::WindowsChange;
-    use gate_router::{CarriedSibling, Config, Facts, FolderId, GitignoredInput, LocalReason, Place, Route, SiblingFolder, SiblingRoot, Target};
+    use gate_router::{
+        CarriedSibling, Config, CrossBlocked, CrossTarget, Facts, FolderId, GitignoredInput, LocalReason, Place, Route, SiblingFolder, SiblingRoot,
+        Target,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
@@ -2392,6 +2398,30 @@ mod tests {
                 &[(".tmp/probe/Probe.csproj", 1), (".tmp/probe/Program.cs", 1)]
             )]
         );
+    }
+
+    #[test]
+    fn a_named_empty_folder_beside_a_root_project_or_solution_names_no_one_project_on_one_line() {
+        for (name, beside) in [("cross-empty-project", "App.csproj"), ("cross-empty-solution", "All.slnx")] {
+            let (root, _removed) = scratch(name);
+            put(&root, beside);
+            put(&root, "src/Empty/a.txt");
+            let machine = Machine::at(None, Duration::from_secs(60), Duration::from_secs(5));
+
+            let answer = machine.cross_target(&place_of(&root), Some("src/Empty"));
+
+            let CrossTarget::NotOneProject(why) = answer else {
+                panic!("{beside}: the folder is resolved itself: {answer:?}");
+            };
+            let line = CrossBlocked::NotOneProject {
+                target: Some("src/Empty".to_owned()),
+                why,
+            }
+            .line();
+            assert!(line.starts_with("gate: no cross build: src/Empty does not name one project ("), "{line}");
+            assert!(line.ends_with("holds no project or solution file)"), "{line}");
+            assert_eq!(machine.notes.take(), Vec::<String>::new(), "{beside}: the run's one line says why");
+        }
     }
 
     #[test]

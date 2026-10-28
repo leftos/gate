@@ -296,7 +296,8 @@ impl Sent<'_> {
 /// every output that differs from the PC's ([`Sent::full`]) when the marker is there or that record
 /// ([`v1::outputs_from_path`]) names another builder, builds the manifest over both lists ([`manifest_over`]), polling
 /// the console interrupt as it hashes and taking each hash the worktree's hash cache holds at the file's stamp, unless
-/// the marker is there, saves the cache that build leaves, whatever the run's end, unless it equals the one it read,
+/// the marker is there, saves the cache that build leaves, whatever the run's end, unless it equals the one it read or
+/// the route withheld the run's outputs or its bins ([`RemoteCall::bins_withheld`]),
 /// and, unless the route withheld its outputs, records the marker's path for [`marked`] to write once the snapshot is
 /// pushed. A run with only failure output globs does so too: a failed command brings back the
 /// files under them, and a passing one nothing. When the build over both lists fails and one over the output globs
@@ -337,8 +338,9 @@ pub(super) fn sent<'a>(attempt: &mut Attempt<'_, 'a>) -> Result<Sent<'a>, End> {
     match manifested.built {
         None => return Ok(sent),
         Some(Ok((line, files, next))) => {
-            // A withheld run's manifest covers its failure output globs alone: saved, it would replace every output's hash.
-            if !call.outputs_withheld && previous.as_ref() != Some(&next) {
+            // A withheld run's manifest covers its failure output globs alone, and one whose bins were withheld covers no
+            // bin glob: saved, either would replace hashes the next run needs, which would then hash every file again.
+            if !call.outputs_withheld && !call.bins_withheld && previous.as_ref() != Some(&next) {
                 next.save(&hashes);
             }
             sent.globs = call.outputs;
@@ -384,11 +386,12 @@ pub(super) fn marked(sent: &Sent<'_>) -> Result<(), End> {
 ///
 /// The attempt's outputs are marked brought back only when a passing run's install ends complete, as
 /// [`install::installed`] says, or when its box packed nothing for a manifest that held files under its output globs
-/// ([`holds_outputs`]); never when the box said it skipped outputs for names this PC cannot take, nor for a failed run,
-/// whatever its reports' install did. Every other end marks them not brought back.
+/// ([`holds_outputs`]); never when the box said it skipped outputs for names this PC cannot take, nor for a run whose
+/// bin globs the route withheld ([`RemoteCall::bins_withheld`]), nor for a failed run, whatever its reports' install
+/// did. Every other end marks them not brought back.
 pub(super) fn ended(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synced: Synced, brought: Option<&Brought>) -> End {
     let (end, complete) = step_end(attempt, sent, ran, synced, brought);
-    attempt.brought_back = Some(complete && !ran.names_skipped);
+    attempt.brought_back = Some(complete && !ran.names_skipped && !attempt.call.bins_withheld);
     end
 }
 
@@ -2287,6 +2290,7 @@ mod tests {
                 words: &[],
                 outputs: &[],
                 outputs_withheld: false,
+                bins_withheld: false,
                 failure_outputs: &[],
                 dropped_no_build: false,
                 send: None,
@@ -2368,6 +2372,29 @@ mod tests {
         /// The record says the PC's outputs came from another builder, so the run asks for every output that differs from
         /// the PC's (`OutputsFull`) though no pending marker is there. The hash cache holds this PC's own hashes, which hold
         /// for whichever builder ran, so the full send reads it.
+        /// A run whose bins the route withheld covers no bin glob, so its manifest's cache is not saved over the one the
+        /// next run needs: that run would hash every bin file again.
+        #[test]
+        fn a_run_whose_bins_are_withheld_saves_no_hash_cache() {
+            let globs = ["**/bin/**".to_owned()];
+            for (withheld, saved) in [(false, true), (true, false)] {
+                let name = format!("bins-withheld-cache-{withheld}");
+                let (root, _) = cached_worktree(&name);
+                let state = state_of(&name);
+                let log = scratch(&format!("{name}-log")).join("out.log");
+                let root = root.to_string_lossy().into_owned();
+                let call = RemoteCall {
+                    bins_withheld: withheld,
+                    ..on(&crate::test_support::HOST, &root, &globs, &state, &log)
+                };
+                let transport = nowhere();
+
+                sent(&mut attempt_of(&call, &transport)).expect("the manifest is built");
+
+                assert_eq!(v1::outputs_hashes_path(&state, None, KEY).exists(), saved, "bins withheld: {withheld}");
+            }
+        }
+
         #[test]
         fn a_run_on_another_builder_than_the_last_pull_s_sends_full_and_reads_the_cache() {
             let (root, cache) = cached_worktree("switch-full");
@@ -2493,6 +2520,7 @@ mod tests {
             let transport = nowhere();
             let held = RemoteCall {
                 outputs_withheld: true,
+                bins_withheld: false,
                 ..on(&crate::test_support::HOST, &root, &globs, &state, &log)
             };
             let mut attempt = attempt_of(&held, &transport);

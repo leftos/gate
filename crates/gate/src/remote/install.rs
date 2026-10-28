@@ -2061,6 +2061,7 @@ mod tests {
                 words: &[],
                 outputs: &[],
                 outputs_withheld: false,
+                bins_withheld: false,
                 failure_outputs: &[],
                 dropped_no_build: false,
                 send: None,

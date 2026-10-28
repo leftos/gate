@@ -1495,6 +1495,7 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         words: &remote.words,
         outputs: &remote.outputs,
         outputs_withheld: remote.outputs_withheld,
+        bins_withheld: remote.bins_withheld,
         failure_outputs: &remote.failure_outputs,
         dropped_no_build: remote.dropped_no_build,
         send: remote.send.as_ref(),

@@ -438,6 +438,14 @@ pub(crate) fn moves_intermediates(root: &Path) -> Result<bool, String> {
     build_files_name(root, &MOVING_PROPERTIES)
 }
 
+/// The folder `folder` (`/`-separated, empty at the root, a trailing `/` or none) below the worktree root `root`.
+pub(crate) fn below_root(root: &Path, folder: &str) -> PathBuf {
+    folder
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .fold(root.to_path_buf(), |path, segment| path.join(segment))
+}
+
 /// Whether a build file of the project in `folder` below the worktree root `root` (`/`-separated and `/`-ended, empty at
 /// the root) names one of the properties that move a project's build output ([`OUTPUT_PROPERTIES`]), ignoring letter
 /// case, as text anywhere in it (`IntermediateOutputPath` names `OutputPath` too), or, when `default_configuration`
@@ -455,10 +463,7 @@ pub(crate) fn moves_output(root: &Path, folder: &str, file: Option<&str>, defaul
     if default_configuration {
         names.extend(CONFIGURATION_ELEMENTS);
     }
-    let project = folder
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .fold(root.to_path_buf(), |path, segment| path.join(segment));
+    let project = below_root(root, folder);
     let cannot = |path: &Path, error: io::Error| format!("cannot read {}: {error}", escaped(&path.to_string_lossy()));
     let files = match file {
         Some(file) => vec![project.join(file)],

@@ -215,6 +215,9 @@ pub(crate) struct RemoteCall<'a> {
     /// Whether the route withheld the run's outputs, its command a dotnet `--no-build` one whose word the builder
     /// dropped: the builder builds, and nothing comes back.
     pub outputs_withheld: bool,
+    /// Whether the route dropped the run's bin globs, its macOS builder cross-building the repo but not this run
+    /// ([`gate_router::RemoteRun::bins_withheld`]): what comes back is never every output.
+    pub bins_withheld: bool,
     /// The failure output globs a failed run brings back beside its test reports
     /// ([`gate_router::RemoteRun::failure_outputs`]).
     pub failure_outputs: &'a [String],
@@ -562,6 +565,7 @@ mod snapshot_only {
                 words: &[],
                 outputs: &[],
                 outputs_withheld: false,
+                bins_withheld: false,
                 failure_outputs: &[],
                 dropped_no_build: false,
                 send: None,
