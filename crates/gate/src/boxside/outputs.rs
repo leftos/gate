@@ -2,26 +2,34 @@
 //! removes the outputs archives older than a day, lists the files under the globs before the command, and after a
 //! passing command and its back commit packs the files the PC lacks or holds otherwise into `<key>-<nonce>.tar.zst` in
 //! the output folder, as the PowerShell wrapper's `Publish-RunOutput` does. The `outputs` verb sends one such archive
-//! raw on stdout, then removes it unless a barrier stands and the run's session is not live; it takes no work folder
-//! lock, so it never waits on a run. A pack that pushes the folder past its size budget removes the archives last
-//! written before its own, oldest first, never one written with or after it, and removes its own when that alone is
-//! over the budget, ending the run's outputs as not brought back.
+//! raw on stdout, or over a data channel the request asks for, then removes it unless a barrier stands and the run's
+//! session is not live; it takes no work folder lock, so it never waits on a run. A pack that pushes the folder past
+//! its size budget removes the archives last written before its own, oldest first, never one written with or after
+//! it, and removes its own when that alone is over the budget, ending the run's outputs as not brought back.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufWriter, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant, SystemTime};
 
 use gate_args::BoxSeams;
 use gate_inputs::failure::{self, Capping, Caps};
+use gate_inputs::hash::Hashing;
 use gate_router::escaped;
-use gate_wire::{Payload, archive_file_name, archive_key};
+use gate_win32::socket::{self, Listener, Stream};
+use gate_wire::{
+    CHANNEL_FIRST_PORT, CHANNEL_LAST_PORT, Channel, PROOF_BYTES, Payload, Refusal, archive_file_name, archive_key, channel_line,
+    channel_not_completed_line, channel_sent_line, lower_hex, refused_line,
+};
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
 use crate::boxside::drain;
-use crate::boxside::run::FILE_FLAG_OPEN_REPARSE_POINT;
+use crate::boxside::forward::{ClientGone, OutputLock};
+use crate::boxside::heartbeat;
+use crate::boxside::run::{FILE_FLAG_OPEN_REPARSE_POINT, REFUSED_STATUS};
 use crate::boxside::stamping;
 use crate::console::Console;
 use crate::outputs::archive::pack;
@@ -477,11 +485,13 @@ pub(super) fn not_brought_back(reason: &str) -> String {
 /// Before it sends, the call renews the payload's drain session ([`drain::renewed_at`]) and holds it until it returns.
 /// It is never refused: an archive of a session the drain found dead while a barrier stands is sent and kept, said
 /// with [`KEPT_DRAINED`], as is one sent when the drain could not be read, said `gate: drain failed: {why}`.
+///
+/// A payload with a `Channel` ([`Payload::channel`]) has the archive sent over a data channel of its own instead
+/// ([`served`]), only once every check above passed and the archive is open: nothing goes on stdout, the archive is
+/// removed (or kept, as above) only once the PC's ack matched what was sent, and a channel that did not complete keeps
+/// it, says the `channel` refusal tag and why, and ends with the refusal status.
 pub(super) fn outputs(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
-    let read = payload
-        .work_folder()
-        .and_then(|(_, work)| Ok((work, payload.output_folder(work)?, payload.session()?)));
-    let (work, folder, session) = match read {
+    let (work, folder, session, channel) = match asked_of(payload) {
         Ok(read) => read,
         Err(line) => {
             stamping::err(console, &line);
@@ -497,24 +507,311 @@ pub(super) fn outputs(payload: &Payload, seams: &BoxSeams, console: &mut Console
         }
     };
     let path = Path::new(folder).join(name);
-    let (_held, removal) = match drain::renewed_at(work, session, seams, console) {
+    let (_held, removal) = renewal(work, session, seams, console);
+    let archive = match opened(&path) {
+        Ok(archive) => archive,
+        Err(unsent) => {
+            stamping::err(console, &unsent.line(name));
+            return u32::from(FAILED_STATUS);
+        }
+    };
+    let then = |console: &mut Console| removed(&removal, &path, name, console);
+    match &channel {
+        Some((channel, nonce)) => over_channel(&archive, (channel, nonce), seams, console, then),
+        None => over_stdout(archive, name, console, then),
+    }
+}
+
+/// The work folder, the output folder, the drain session and the data channel with its nonce the payload asks for;
+/// else the usage line.
+#[expect(clippy::type_complexity, reason = "the four reads the verb takes at once, each named where it is bound")]
+fn asked_of(payload: &Payload) -> Result<(&str, &str, Option<&str>, Option<(Channel, &str)>), String> {
+    let (_, work) = payload.work_folder()?;
+    Ok((work, payload.output_folder(work)?, payload.session()?, asked_channel(payload)?))
+}
+
+/// The drain renewal of the call's session and what the call does with the archive once it is sent: removes it, keeps
+/// it for a dead session under a standing barrier, or keeps it when the drain could not be read, which it says.
+fn renewal(work: &str, session: Option<&str>, seams: &BoxSeams, console: &mut Console) -> (Option<drain::Admitted>, Removal) {
+    match drain::renewed_at(work, session, seams, console) {
         Ok(renewal) if renewal.may_delete => (renewal.held, Removal::Remove),
         Ok(renewal) => (renewal.held, Removal::KeepDrained),
         Err(why) => {
             stamping::err(console, &format!("gate: drain failed: {why}"));
             (None, Removal::Keep)
         }
-    };
-    if let Err(unsent) = send(&path, &mut io::stdout().lock()) {
-        stamping::err(console, &unsent.line(name));
-        return u32::from(FAILED_STATUS);
     }
+}
+
+/// Sends the opened `archive` named `name` on stdout, then does `then` with it; the verb's status.
+fn over_stdout(archive: File, name: &str, console: &mut Console, then: impl FnOnce(&mut Console)) -> u32 {
+    match copy(archive, &mut io::stdout().lock()) {
+        Ok(()) => {
+            then(console);
+            0
+        }
+        Err(unsent) => {
+            stamping::err(console, &unsent.line(name));
+            u32::from(FAILED_STATUS)
+        }
+    }
+}
+
+/// Sends the opened `archive` over the data channel of the call carrying the nonce ([`served`]); once the PC's ack
+/// matched, does `then` with it and waits for the PC to close. The verb's status: 0, or the refusal status once the
+/// `channel` refusal tag and why are said.
+fn over_channel(archive: &File, asked: (&Channel, &str), seams: &BoxSeams, console: &mut Console, then: impl FnOnce(&mut Console)) -> u32 {
+    let (channel, nonce) = asked;
+    match served(archive, channel, nonce, seams, console) {
+        Ok(acked) => {
+            then(console);
+            acked.closed();
+            0
+        }
+        Err(why) => {
+            stamping::protocol(console, &refused_line(nonce, Refusal::Channel));
+            stamping::err(console, &channel_not_completed_line(&why));
+            REFUSED_STATUS
+        }
+    }
+}
+
+/// The request's data channel and the nonce its lines carry; `None` for a request without one. Else the usage line.
+fn asked_channel(payload: &Payload) -> Result<Option<(Channel, &str)>, String> {
+    match payload.channel()? {
+        Some(channel) => Ok(Some((channel, payload.nonce()?))),
+        None => Ok(None),
+    }
+}
+
+/// Does with the sent archive `name` at `path` what `removal` says.
+fn removed(removal: &Removal, path: &Path, name: &str, console: &mut Console) {
     match removal {
-        Removal::Remove => removed_after_send(&path, name, console),
+        Removal::Remove => removed_after_send(path, name, console),
         Removal::KeepDrained => stamping::err(console, KEPT_DRAINED),
         Removal::Keep => {}
     }
-    0
+}
+
+/// The ports a data channel may listen on: 47100 to 47131.
+const CHANNEL_PORTS: (u16, u16) = (CHANNEL_FIRST_PORT, CHANNEL_LAST_PORT);
+/// How long a data channel waits for the PC's connection.
+const ACCEPT_WINDOW: Duration = Duration::from_secs(10);
+/// How long a data channel waits for the PC's whole proof once it connected, or the idle limit when that is shorter.
+const PROOF_WAIT: Duration = Duration::from_secs(10);
+/// How long each read and write of a data channel may wait: 10 s, shorter than the PC's 15 s stall floor, because the
+/// idle limit must be shorter than the PC's stall window so the PC hears the box's `channel` verdict before its stall
+/// watch ends the call.
+const IDLE: Duration = Duration::from_secs(10);
+/// How often a data channel's waits probe stderr for a gone client.
+const PROBE_EVERY: Duration = Duration::from_secs(1);
+/// The send buffer a data channel's connection gets: 16 MiB.
+const SEND_BUFFER: i32 = 16 * 1024 * 1024;
+/// The bytes of the archive read and written at a time over a data channel.
+const CHANNEL_CHUNK: usize = 1024 * 1024;
+/// The bytes of the PC's ack: the SHA-256 of what it took.
+const ACK_BYTES: usize = 32;
+
+/// What a data channel's waits watch besides their own deadline: whether the client of the call is gone, by a zero-byte
+/// probe of stderr at most every [`PROBE_EVERY`].
+struct Watch {
+    lock: OutputLock,
+    gone: ClientGone,
+    probed: Instant,
+}
+
+impl Watch {
+    fn new() -> Watch {
+        Watch {
+            lock: OutputLock::default(),
+            gone: ClientGone::default(),
+            probed: Instant::now(),
+        }
+    }
+
+    /// Probes stderr when the last probe is [`PROBE_EVERY`] old; why the channel ends when the client is gone.
+    fn looked(&mut self) -> Result<(), String> {
+        if self.probed.elapsed() >= PROBE_EVERY {
+            self.probed = Instant::now();
+            heartbeat::probe_stderr(&self.lock, &self.gone);
+        }
+        if self.gone.load(Ordering::SeqCst) {
+            Err("the client has gone".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// The deadline of one wait that must end by `end`: `end`, or sooner so the next probe of a [`Watch`] is on time.
+fn probe_slice(end: Instant) -> Instant {
+    end.min(Instant::now() + PROBE_EVERY)
+}
+
+/// How long a read of a data channel may wait for its bytes.
+#[derive(Clone, Copy)]
+enum Limit {
+    /// Each read may wait this long for a byte: every byte read moves the end.
+    Idle(Duration),
+    /// The whole read must end by then: no byte moves it.
+    Until(Instant, Duration),
+}
+
+/// The PC's connection once its ack matched, which the box keeps open until the PC closes it.
+struct Acked {
+    stream: Stream,
+    idle: Duration,
+    watch: Watch,
+}
+
+impl Acked {
+    /// Waits for the PC to close the connection, up to the idle limit from the ack and never longer, stopping at the
+    /// first byte the PC sends, which it has no reason to; then closes it. The archive is delivered, so how the wait ends
+    /// changes nothing.
+    fn closed(mut self) {
+        let mut buffer = [0_u8; 1];
+        let end = Instant::now() + self.idle;
+        while Instant::now() < end && self.watch.looked().is_ok() {
+            if !matches!(self.stream.read(&mut buffer, probe_slice(end)), Ok(None)) {
+                return;
+            }
+        }
+    }
+}
+
+/// Serves the opened `archive` over the data channel `channel` of the call carrying `nonce`: binds a port of the range,
+/// says the channel line, takes the first connection from the PC's address within the accept window (closing any other
+/// unread), sends the box's proof, checks the PC's, sends the archive and checks the PC's ack against its SHA-256, then
+/// says the sent line. The connection once acked; else why the channel did not complete, which never holds a proof.
+fn served(archive: &File, channel: &Channel, nonce: &str, seams: &BoxSeams, console: &mut Console) -> Result<Acked, String> {
+    let (first, last) = seams.channel_ports.unwrap_or(CHANNEL_PORTS);
+    let start = socket::random_port(first, last).map_err(|error| format!("cannot draw a port: {}", shown_error(&error)))?;
+    let listener = Listener::bind_in_range(channel.address, first, last, start)
+        .map_err(|error| format!("cannot listen: {}", shown_error(&error)))?
+        .ok_or_else(|| "no data channel port is free".to_owned())?;
+    stamping::protocol(console, &channel_line(nonce, listener.port()));
+    let mut watch = Watch::new();
+    let accept = seams.channel_accept_ms.map_or(ACCEPT_WINDOW, Duration::from_millis);
+    let stream = accepted(&listener, channel, accept, &mut watch)?;
+    drop(listener);
+    let idle = seams.channel_idle_ms.map_or(IDLE, Duration::from_millis);
+    written(&stream, channel.box_proof.bytes(), idle, &mut watch)?;
+    let mut proof = [0_u8; PROOF_BYTES];
+    let proof_wait = PROOF_WAIT.min(idle);
+    read_exactly(&stream, &mut proof, Limit::Until(Instant::now() + proof_wait, proof_wait), &mut watch)
+        .map_err(|why| format!("{why} before its proof"))?;
+    if !channel.pc_proof.matches(&proof) {
+        return Err("the PC's proof does not match".to_owned());
+    }
+    let send_buffer = match seams.channel_send_buffer_bytes {
+        Some(bytes) => i32::try_from(bytes).map_err(|error| format!("cannot set the send buffer: {error}"))?,
+        None => SEND_BUFFER,
+    };
+    stream
+        .set_send_buffer(send_buffer)
+        .map_err(|error| format!("cannot set the send buffer: {}", shown_error(&error)))?;
+    let (sha256, bytes) = archive_sent(archive, &stream, idle, &mut watch)?;
+    let mut ack = [0_u8; ACK_BYTES];
+    read_exactly(&stream, &mut ack, Limit::Idle(idle), &mut watch).map_err(|why| format!("{why} before its acknowledgement"))?;
+    if lower_hex(&ack) != sha256 {
+        return Err("the PC's acknowledgement does not match what was sent".to_owned());
+    }
+    stamping::err(console, &channel_sent_line(bytes, &sha256));
+    Ok(Acked { stream, idle, watch })
+}
+
+/// The system's `error` as a channel's `why` shows it, its control characters escaped.
+fn shown_error(error: &io::Error) -> String {
+    escaped(&error.to_string())
+}
+
+/// The first connection from the PC's address within `window`. A connection from any other address is closed with
+/// nothing read or written, one whose setup failed included, and the wait goes on; else why none came.
+fn accepted(listener: &Listener, channel: &Channel, window: Duration, watch: &mut Watch) -> Result<Stream, String> {
+    let end = Instant::now() + window;
+    loop {
+        watch.looked()?;
+        if Instant::now() >= end {
+            return Err(format!("no connection from the PC within {} ms", window.as_millis()));
+        }
+        match listener.accept(probe_slice(end)) {
+            Ok(Some(taken)) if *taken.peer.ip() == channel.peer => {
+                return taken
+                    .stream
+                    .map_err(|error| format!("cannot set up the PC's connection: {}", shown_error(&error)));
+            }
+            Ok(Some(other)) => drop(other),
+            Ok(None) => {}
+            Err(error) => return Err(format!("cannot accept: {}", shown_error(&error))),
+        }
+    }
+}
+
+/// Writes all of `bytes` on `stream`, each write waiting at most `idle` for room; else why not.
+fn written(stream: &Stream, mut bytes: &[u8], idle: Duration, watch: &mut Watch) -> Result<(), String> {
+    let mut end = Instant::now() + idle;
+    while !bytes.is_empty() {
+        watch.looked()?;
+        if Instant::now() >= end {
+            return Err(format!("the PC took nothing for {} ms", idle.as_millis()));
+        }
+        match stream.write(bytes, probe_slice(end)) {
+            Ok(Some(wrote)) => {
+                bytes = &bytes[wrote..];
+                end = Instant::now() + idle;
+            }
+            Ok(None) => {}
+            Err(error) => return Err(format!("the channel failed: {}", shown_error(&error))),
+        }
+    }
+    Ok(())
+}
+
+/// Fills `buffer` from `stream` within `limit`; else why not, said of the PC.
+fn read_exactly(stream: &Stream, buffer: &mut [u8], limit: Limit, watch: &mut Watch) -> Result<(), String> {
+    let mut filled = 0;
+    let mut end = match limit {
+        Limit::Idle(idle) => Instant::now() + idle,
+        Limit::Until(end, _) => end,
+    };
+    while filled < buffer.len() {
+        watch.looked()?;
+        if Instant::now() >= end {
+            return Err(match limit {
+                Limit::Idle(idle) => format!("the PC sent nothing for {} ms", idle.as_millis()),
+                Limit::Until(_, within) => format!("the PC sent too little within {} ms", within.as_millis()),
+            });
+        }
+        match stream.read(&mut buffer[filled..], probe_slice(end)) {
+            Ok(Some(0)) => return Err("the PC closed the channel".to_owned()),
+            Ok(Some(read)) => {
+                filled += read;
+                if let Limit::Idle(idle) = limit {
+                    end = Instant::now() + idle;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => return Err(format!("the channel failed: {}", shown_error(&error))),
+        }
+    }
+    Ok(())
+}
+
+/// Sends the whole of `archive` on `stream` in [`CHANNEL_CHUNK`] pieces; the SHA-256 in lower-case hex and the count of
+/// the bytes sent, else why not.
+fn archive_sent(archive: &File, stream: &Stream, idle: Duration, watch: &mut Watch) -> Result<(String, u64), String> {
+    let mut buffer = vec![0_u8; CHANNEL_CHUNK];
+    let mut reader = Hashing::new(archive);
+    loop {
+        let read = match io::Read::read(&mut reader, &mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("cannot read the archive: {}", shown_error(&error))),
+        };
+        written(stream, &buffer[..read], idle, watch)?;
+    }
+    Ok(reader.finish())
 }
 
 /// The line an `outputs` call says when it keeps the archive it sent, its session dead under a standing barrier.
@@ -560,14 +857,19 @@ impl Unsent {
     }
 }
 
-/// Copies the plain file at `path`, never a link's target, to `sink` through a fixed buffer, then flushes it.
-fn send(path: &Path, sink: &mut impl Write) -> Result<(), Unsent> {
-    let mut archive = match OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path) {
+/// The plain file at `path` opened for reading, never a link's target; else why it cannot be sent.
+fn opened(path: &Path) -> Result<File, Unsent> {
+    let archive = match OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path) {
         Ok(archive) => archive,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(Unsent::Missing),
         Err(error) => return Err(Unsent::Unread(error)),
     };
     gate_win32::check_plain_file(&archive).map_err(Unsent::Unread)?;
+    Ok(archive)
+}
+
+/// Copies the opened `archive` to `sink` through a fixed buffer, then flushes it.
+fn copy(mut archive: File, sink: &mut impl Write) -> Result<(), Unsent> {
     let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = match io::Read::read(&mut archive, &mut buffer) {

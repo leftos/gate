@@ -750,7 +750,16 @@ pub(crate) fn is_sid_string(text: &str) -> bool {
 }
 
 /// 128 bits from the system's preferred random generator, as 32 lowercase hex digits.
-fn random_hex() -> io::Result<String> {
+pub(crate) fn random_hex() -> io::Result<String> {
+    let bytes = random_bytes()?;
+    let hex = bytes
+        .iter()
+        .flat_map(|&byte| [DIGITS[usize::from(byte >> 4)], DIGITS[usize::from(byte & 0xf)]]);
+    Ok(hex.map(char::from).collect())
+}
+
+/// 128 bits from the system's preferred random generator, the one draw this crate makes every random value with.
+pub(crate) fn random_bytes() -> io::Result<[u8; 16]> {
     let mut bytes = [0_u8; 16];
     let size = u32::try_from(bytes.len()).map_err(io::Error::other)?;
     // SAFETY: `bytes` is writable for `size` bytes; with `BCRYPT_USE_SYSTEM_PREFERRED_RNG` no algorithm handle is passed.
@@ -761,10 +770,7 @@ fn random_hex() -> io::Result<String> {
             status.cast_unsigned()
         )));
     }
-    let hex = bytes
-        .iter()
-        .flat_map(|&byte| [DIGITS[usize::from(byte >> 4)], DIGITS[usize::from(byte & 0xf)]]);
-    Ok(hex.map(char::from).collect())
+    Ok(bytes)
 }
 
 /// The client end of a [`PipeServer`]'s pipe, opened for overlapped I/O.

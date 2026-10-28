@@ -30,7 +30,7 @@ static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 /// Takes the spawn lock. A thread that panicked while holding it left nothing half done that the lock guards, so a
 /// poisoned lock is taken all the same.
-fn lock_spawns() -> MutexGuard<'static, ()> {
+pub(crate) fn lock_spawns() -> MutexGuard<'static, ()> {
     SPAWN_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
 }
 

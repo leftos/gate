@@ -111,6 +111,9 @@ pub(crate) const TAMPERS: &[&str] = &[
     "before-hold:replace-root",
     "after-first-snapshot:worktree",
 ];
+/// The faults `--test-remote-channel-fault` may name.
+#[cfg(feature = "test-seams")]
+pub(crate) const CHANNEL_FAULTS: &[&str] = &["box-proof", "truncate", "alter", "no-ack"];
 /// The calls `--test-remote-interrupt-at` may name.
 #[cfg(feature = "test-seams")]
 pub(crate) const INTERRUPTED_CALLS: &[&str] = &[
@@ -161,6 +164,24 @@ pub(crate) fn git_limit(option: &str, value: &str) -> Result<(String, u64), Prob
     match value.rsplit_once(':') {
         Some((step, ms)) if !step.is_empty() => Ok((step.to_owned(), above_zero_shown(option, ms, value)?)),
         _ => Err(Problem::BadGitLimit {
+            option: option.to_owned(),
+            value: value.to_owned(),
+        }),
+    }
+}
+
+/// The first and last port `--test-box-channel-ports`'s `<first>-<last>` names: two whole numbers from 1 to 65535, the
+/// first not above the last; else the problem naming the value as given.
+#[cfg(feature = "test-seams")]
+pub(crate) fn port_range(option: &str, value: &str) -> Result<(u16, u16), Problem> {
+    let port = |text: &str| {
+        text.parse::<u16>()
+            .ok()
+            .filter(|port| *port > 0 && text.bytes().all(|byte| byte.is_ascii_digit()))
+    };
+    match value.split_once('-').map(|(first, last)| (port(first), port(last))) {
+        Some((Some(first), Some(last))) if first <= last => Ok((first, last)),
+        _ => Err(Problem::BadPortRange {
             option: option.to_owned(),
             value: value.to_owned(),
         }),

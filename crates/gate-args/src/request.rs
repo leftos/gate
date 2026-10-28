@@ -150,6 +150,18 @@ pub struct BoxSeams {
     /// How long `gate box hold` waits between its looks for a free slot, in milliseconds, in place of the built-in
     /// 5 s; `None` without the feature.
     pub hold_poll_ms: Option<u64>,
+    /// The first and last port a box's data channel may listen on, in place of the built-in range; `None` without the
+    /// feature.
+    pub channel_ports: Option<(u16, u16)>,
+    /// How long a box's data channel waits for the PC's connection, in milliseconds, in place of the built-in 10 s;
+    /// `None` without the feature.
+    pub channel_accept_ms: Option<u64>,
+    /// How long each read and write of a box's data channel may wait, in milliseconds, in place of the built-in 10 s;
+    /// `None` without the feature.
+    pub channel_idle_ms: Option<u64>,
+    /// The send buffer a box's data channel connection gets, in bytes, in place of the built-in 16 MiB; `None` without
+    /// the feature.
+    pub channel_send_buffer_bytes: Option<u32>,
 }
 
 /// What `gate box hold` holds a builder slot for: its holder's text, its ceiling and its wait for a slot, both in
@@ -464,6 +476,10 @@ pub struct TestSeams {
     /// How long a routed run's Tailscale path read holds its launch guard, in milliseconds, between creating a program
     /// suspended and putting it in its job (`--test-tailscale-hold-start-ms`).
     pub tailscale_hold_start_ms: Option<u64>,
+    /// A fault the PC's side of an outputs pull's data channel takes once it dialled the box: it takes the box's proof
+    /// for a mismatch (`box-proof`), stops after half the archive's size (`truncate`), flips the first byte it reads
+    /// before it hashes and acks (`alter`), or drops the connection once it read everything, before its ack (`no-ack`).
+    pub remote_channel_fault: Option<String>,
     /// Make this gate's own start unreadable both ways, so the run refuses before it writes anything.
     pub own_start_fails: bool,
     /// Count every live parent a slot marker names as one this gate runs inside the command of, so a marker naming the

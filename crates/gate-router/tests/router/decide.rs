@@ -47,6 +47,7 @@ fn host_builder(alias: &str, slots: u32) -> Builder {
         root: None,
         slots,
         id: None,
+        data: None,
     }
 }
 
@@ -3016,6 +3017,7 @@ fn mac_builder() -> Builder {
         root: Some("/Users/me/gate".to_owned()),
         slots: 1,
         id: Some("1f0efc62".to_owned()),
+        data: None,
     }
 }
 
@@ -3056,6 +3058,7 @@ fn the_first_builder_entry_in_file_order_wins_when_two_match() {
             root: None,
             slots: 3,
             id: Some("084c286b".to_owned()),
+            data: None,
         }
     );
 }
@@ -3308,6 +3311,7 @@ fn a_pin_names_a_not_routed_builder() {
             root: None,
             slots: 1,
             id: Some("c1aaea5e".to_owned()),
+            data: None,
         },
         "a hosts entry is a Windows builder with the default root and an id of its own, so it shares no pool with host"
     );

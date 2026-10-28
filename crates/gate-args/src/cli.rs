@@ -426,6 +426,7 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-tailscale-delay-ms" => Some(RunOption::Value(ValueOption::TailscaleDelayMs)),
         "test-tailscale-wait-ms" => Some(RunOption::Value(ValueOption::TailscaleWaitMs)),
         "test-tailscale-hold-start-ms" => Some(RunOption::Value(ValueOption::TailscaleHoldStartMs)),
+        "test-remote-channel-fault" => Some(RunOption::Value(ValueOption::RemoteChannelFault)),
         _ => None,
     }
 }

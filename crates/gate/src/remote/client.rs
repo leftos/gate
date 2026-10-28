@@ -20,6 +20,7 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::net::Ipv4Addr;
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::os::windows::fs::FileExt;
@@ -43,8 +44,9 @@ use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
 use gate_router::{Config, DROPPED_NO_BUILD_LINE, SendPlan, build_settings, escaped, repo_name};
-use gate_wire::{PairRefused, Payload, SHA256_DIGITS, is_cross_not_brought_back, is_lower_hex};
+use gate_wire::{PairRefused, Payload, SHA256_DIGITS, channel_prefix, is_cross_not_brought_back, is_lower_hex};
 
+use super::channel;
 use super::drain::{self, Drain, DrainLine};
 use super::git::{self, Git, GitBounds, GitError, NO_CURRENT_FOLDER, last_update};
 use super::held::{Held, sibling_who};
@@ -179,6 +181,8 @@ pub(crate) struct RustClient {
     watch_call: Option<String>,
     /// `--test-remote-interrupt-at`: the call after whose first output byte the client raises the console interrupt.
     interrupt_at: Option<String>,
+    /// `--test-remote-channel-fault`: the fault the PC's side of an outputs pull's data channel takes.
+    channel_fault: Option<String>,
     /// `--test-local-sdks`: this PC's SDK list, read in place of `dotnet --list-sdks`.
     local_sdks: Option<String>,
     /// How long this PC's `dotnet --list-sdks` may take: `--test-dotnet-limit-ms`, else 30 s.
@@ -276,6 +280,7 @@ impl RustClient {
             snapshot_age: seams.remote_snapshot_age_ms.map_or(Duration::ZERO, Duration::from_millis),
             watch_call: seams.remote_watch_call.clone(),
             interrupt_at: seams.remote_interrupt_at.clone(),
+            channel_fault: seams.remote_channel_fault.clone(),
             local_sdks: seams.local_sdks.clone(),
             dotnet_limit: dotnet_limit(seams),
             fetch_cap: seams.remote_fetch_cap_bytes.unwrap_or(watchdog::FETCH_CAP),
@@ -458,6 +463,7 @@ impl RustClient {
                 ceiling: self.timeout_ms.map(Duration::from_millis),
             }),
             interrupt_at: self.interrupt_at.as_deref(),
+            channel_fault: self.channel_fault.as_deref(),
             local_sdks: self.local_sdks.as_deref(),
             dotnet_limit: self.dotnet_limit,
             fetch_cap: self.fetch_cap,
@@ -1256,6 +1262,10 @@ pub(super) struct Called {
     /// What its raw copy had written into its sink when the watch cut it, for a call with a raw copy the watch cut;
     /// `None` for any other.
     pub(super) received: Option<Received>,
+    /// How the data channel an outputs call asked for ended on the PC's side; `None` for a call that asked for none.
+    pub(super) channel: Option<channel::Dialled>,
+    /// Its last standard error line saying what the box sent over a data channel ([`gate_wire::channel_sent_line`]).
+    pub(super) channel_sent: Option<String>,
 }
 
 /// What a transfer after the command came to ([`Attempt::transfer_call`]): the call that counts, whether it failed as
@@ -1318,8 +1328,14 @@ impl Called {
     fn refusal(&self) -> Option<FallbackReason> {
         match self.refused.filter(|_| !self.started) {
             Some(Tagged::Fallback(reason)) => Some(reason),
-            Some(Tagged::Sent | Tagged::Drain) | None => None,
+            Some(Tagged::Sent | Tagged::Drain | Tagged::Channel) | None => None,
         }
+    }
+
+    /// Whether the box refused the outputs call's data channel by its `channel` tag, read as [`Called::refusal`] reads a
+    /// tag: the channel did not complete, nothing was installed and the archive is kept, so the pull goes over ssh.
+    pub(super) fn channel_refused(&self) -> bool {
+        self.refused == Some(Tagged::Channel) && !self.started
     }
 
     /// What the box's drain said when it refused the call by its `drain` tag, read as [`Called::refusal`] reads a tag;
@@ -1333,6 +1349,33 @@ impl Called {
     fn sent_refusal(&self) -> bool {
         self.refused == Some(Tagged::Sent) && !self.started
     }
+
+    /// A call that exited with `status`, said nothing, and asked for no data channel, for a test to fill in.
+    #[cfg(test)]
+    pub(super) fn exited_for_tests(status: i32) -> Called {
+        Called {
+            status,
+            cut: None,
+            problem: None,
+            output_seen: false,
+            first_error: None,
+            last_error: None,
+            lines: Vec::new(),
+            outputs: None,
+            back_commits: None,
+            names_skipped: false,
+            cross_not_brought_back: false,
+            started: false,
+            refused: None,
+            drain: None,
+            box_killed: None,
+            adjusted: None,
+            written: None,
+            received: None,
+            channel: None,
+            channel_sent: None,
+        }
+    }
 }
 
 /// What a box's refusal tag names: the fallback reason of the run's refusal, or `sent`, the PC's build the run's
@@ -1343,6 +1386,31 @@ enum Tagged {
     Fallback(FallbackReason),
     Sent,
     Drain,
+    /// The box's `channel` refusal of an outputs call's data channel, which the pull over ssh answers.
+    Channel,
+}
+
+/// What the box's line says after its `channel` refusal tag, before why ([`gate_wire::channel_not_completed_line`]).
+const NOT_COMPLETED: &str = "gate: data channel not completed: ";
+
+/// Why the outputs call that ended as `called`, refused by the box's `channel` tag, did not complete its data channel:
+/// the PC's own reason when it had one, else that the box said no size, else the box's from its line, else that the
+/// PC's channel did not end within the call's drain, else that the box did not complete it. A PC side that gave up
+/// because the call ended has no reason of its own.
+fn channel_why(called: &Called) -> String {
+    match &called.channel {
+        Some(channel::Dialled::Failed(why)) => return why.clone(),
+        Some(channel::Dialled::NoSize) => return "the box said no archive size".to_owned(),
+        _ => {}
+    }
+    let box_why = called
+        .said()
+        .find_map(|line| line.find(NOT_COMPLETED).map(|at| line[at + NOT_COMPLETED.len()..].to_owned()));
+    match (box_why, &called.channel) {
+        (Some(why), _) => why,
+        (None, Some(channel::Dialled::NotEnded)) => "the channel did not end".to_owned(),
+        (None, _) => "the box did not complete it".to_owned(),
+    }
 }
 
 /// One run of the client: the call, the way to the builder, the limits, every line the attempt wrote to the log, and
@@ -1373,6 +1441,9 @@ pub(super) struct Attempt<'c, 'a> {
     /// more while the stop call that Ctrl+C leads to runs; or `apply`, once a pair's sync-back has checked every patch
     /// and before it applies the first; or `lfs`, at the start of the LFS phase, before its first call.
     pub(super) interrupt_at: Option<&'c str>,
+    /// `--test-remote-channel-fault`: the fault the PC's side of the outputs pull's data channel takes once it dialled
+    /// the box ([`channel::Fault`]).
+    channel_fault: Option<&'c str>,
     /// `--test-local-sdks`: this PC's SDK list, read in place of `dotnet --list-sdks`.
     local_sdks: Option<&'c str>,
     /// How long this PC's `dotnet --list-sdks` may take before it is killed and its list counts as unreadable.
@@ -2861,6 +2932,7 @@ impl Attempt<'_, '_> {
                 tag_nonce: None,
                 sink: None,
                 wire: Wire::Compressed,
+                channel: None,
             };
             let called = attempt.ssh(BoxVerb::Run, Echo::Console, Watch::Run(limits), raise, run)?;
             heard.clone_from(&called.outputs);
@@ -3167,6 +3239,7 @@ impl Attempt<'_, '_> {
             nonce: only.nonce,
             tag_nonce: only.tag_nonce,
             sink: only.sink,
+            channel: only.channel,
         };
         self.started(&command, echo, watch, starts)
     }
@@ -3190,22 +3263,97 @@ impl Attempt<'_, '_> {
         self.pulled_bytes = 0;
         self.pulled_last = None;
         self.go_on()?;
-        let input = payload::input(&payload::outputs_word(location, name), None);
+        let input = payload::input(&payload::outputs_word(location, name, None), None);
         let raise = self.raises_at("outputs");
         self.pull_periods_said.set(0);
         self.pulling = Some(pull);
+        let towards = self.channel_towards();
+        // Why the proofs could not be drawn, said once for the call when its last attempt could not draw them either.
+        let mut undrawn = None;
         let retried = self.with_retry(SSH_FAILED, |attempt| {
             let cap = sent_limit(attempt.outputs_budget);
-            let only = CallOnly {
-                sink: Some(archive.create(cap).map_err(End::Failed)?),
-                ..CallOnly::plain(Arc::clone(&input))
+            let sink = Some(archive.create(cap).map_err(End::Failed)?);
+            let only = match towards.map(|(data, local)| channel::Asked::drawn(data, local)) {
+                Some(Ok(asked)) => {
+                    undrawn = None;
+                    // A nonce of the attempt's own, so only this attempt's reader takes its box's port line.
+                    let nonce = payload::run_nonce();
+                    let word = payload::outputs_word(location, name, Some((&asked, &nonce)));
+                    CallOnly {
+                        input: Input::Text(payload::input(&word, None)),
+                        nonce: None,
+                        tag_nonce: Some(Arc::from(nonce)),
+                        sink,
+                        wire: Wire::Plain,
+                        channel: Some(channel::Dial {
+                            asked,
+                            size: pull.total,
+                            fault: attempt.channel_fault.and_then(channel::Fault::named),
+                        }),
+                    }
+                }
+                drawn => {
+                    if let Some(Err(why)) = drawn {
+                        undrawn = Some(why);
+                    }
+                    CallOnly {
+                        sink,
+                        ..CallOnly::plain(Arc::clone(&input))
+                    }
+                }
             };
             attempt.ssh(BoxVerb::Outputs, Echo::LogOnly, watch, raise, only)
         });
+        if let Some(why) = undrawn {
+            self.logged(&channel::not_used_line(&why));
+        }
+        let retried = match retried {
+            Ok((called, _)) if called.channel_refused() => {
+                self.logged(&channel::not_used_line(&channel_why(&called)));
+                self.lines.extend_from_slice(&called.lines);
+                self.counted_with_channel(|attempt| {
+                    attempt.with_retry(SSH_FAILED, |attempt| {
+                        let only = CallOnly {
+                            sink: Some(archive.create(sent_limit(attempt.outputs_budget)).map_err(End::Failed)?),
+                            ..CallOnly::plain(Arc::clone(&input))
+                        };
+                        attempt.ssh(BoxVerb::Outputs, Echo::LogOnly, watch, raise, only)
+                    })
+                })
+            }
+            other => other,
+        };
         self.pulling = None;
         let (called, _) = retried?;
         self.lines.extend_from_slice(&called.lines);
         Ok(called)
+    }
+
+    /// Makes `fallback`, the pull over ssh after the box refused the data channel, counting what came over the channel
+    /// before it, the pull's figure as the channel's call left it, into the pull's total once, however the fallback
+    /// ends: before its watch ran, or after it, which sets the figure to the ssh call's own.
+    fn counted_with_channel<T>(&mut self, fallback: impl FnOnce(&mut Self) -> T) -> T {
+        let over_channel = self.pulled_bytes;
+        self.pulled_bytes = 0;
+        let ended = fallback(self);
+        self.pulled_bytes += over_channel;
+        ended
+    }
+
+    /// The builder's `data` address and this PC's own address toward it, when the outputs pull goes over a data channel
+    /// ([`channel::planned`]); `None` when it goes over ssh, the line saying why logged when the builder has `data`.
+    fn channel_towards(&mut self) -> Option<(Ipv4Addr, Ipv4Addr)> {
+        let towards = channel::planned(self.call.builder).and_then(|data| match data {
+            Some(data) => channel::local_toward(data).map(|local| Some((data, local))),
+            None => Ok(None),
+        });
+        match towards {
+            Ok(towards) => towards,
+            Err(why) => {
+                self.logged(&channel::not_used_line(&why));
+                None
+            }
+        }
     }
 
     /// One inputs call, `gate box inputs`, made again when it failed before the banner, watched as `watch` says,
@@ -3267,6 +3415,7 @@ impl Attempt<'_, '_> {
                 tag_nonce: Some(Arc::clone(&nonce)),
                 sink,
                 wire: Wire::Plain,
+                channel: None,
             };
             attempt.ssh(verb, Echo::LogOnly, watch, raise, only)
         })?;
@@ -3312,6 +3461,7 @@ impl Attempt<'_, '_> {
             nonce: None,
             tag_nonce: None,
             sink: None,
+            channel: None,
         };
         self.started(&command, echo, watch, starts)
     }
@@ -3355,19 +3505,22 @@ impl Attempt<'_, '_> {
             log_cap: self.log_cap,
         };
         let copied = starts.sink.is_some();
+        let asked_channel = starts.channel.is_some();
         let raw = if let Some(sink) = starts.sink {
-            Some(relayed_raw(
-                stdout,
-                Capped {
-                    inner: sink.file,
-                    cap: sink.cap,
-                    shared: Arc::clone(&shared),
-                    written: 0,
-                },
-                sink.shown,
-                &shared,
-                done.clone(),
-            ))
+            let capped = Capped {
+                inner: sink.file,
+                cap: sink.cap,
+                shared: Arc::clone(&shared),
+                written: 0,
+            };
+            Some(match starts.channel {
+                // The archive comes over the channel: the call's standard output is read as lines, as any call's.
+                Some(dial) => {
+                    relayed(stdout, Reader::new(false, reading.clone(), out_log), &shared, done.clone());
+                    dialled(dial, capped, sink.shown, &shared)
+                }
+                None => relayed_raw(stdout, capped, sink.shown, &shared, done.clone()),
+            })
         } else {
             relayed(stdout, Reader::new(false, reading.clone(), out_log), &shared, done.clone());
             None
@@ -3385,12 +3538,17 @@ impl Attempt<'_, '_> {
         };
         let raise = self.call.interrupt.filter(|_| starts.raise);
         let watching = watched.watch(watch, self.call.interrupt, raise);
+        let mut dialled = None;
         if let Some(raw) = raw {
-            // The call's end has come: the copy writes nothing more into an archive the fetch is about to remove.
+            // The call's end has come: the copy writes nothing more into an archive the fetch is about to remove, and a
+            // data channel's thread, which no drain waits on, gets the whole drain to close its sink and socket, which
+            // it does within a slice of the stop, before it is joined.
             shared.stop();
             let drained = watching.ended.as_ref().is_ok_and(|(ended, _)| ended.drained());
-            self.ended_raw(raw, drained);
+            dialled = self.ended_raw(raw, drained && !asked_channel);
         }
+        // A channel asked for whose thread gave no end, as one that did not end within the drain, counts as failed.
+        let dialled = asked_channel.then(|| dialled.unwrap_or(channel::Dialled::NotEnded));
         let cut = watching.ended.as_ref().ok().and_then(|(_, looks)| looks.received);
         self.kept_from_watch(&shared.progress, copied, run_call, cut);
         let watched = self.watched_out(watching);
@@ -3407,7 +3565,8 @@ impl Attempt<'_, '_> {
             self.emptied(&job, &shown);
         }
         let heard = std::mem::take(&mut *held(&shared.heard));
-        self.call_result(called_of(ended, shared.progress.raised(), heard), feeder, &looks, copied)
+        let called = self.call_result(called_of(ended, shared.progress.raised(), heard), feeder, &looks, copied);
+        called.map(|called| Called { channel: dialled, ..called })
     }
 
     /// The watched call's result from what it came to, `ended`: a call that finished, its feeder's end checked when
@@ -3502,19 +3661,26 @@ impl Attempt<'_, '_> {
     }
 
     /// Gives the raw copy's reader `raw` the rest of its [`DRAIN`] to end, when the call's own end did not already
-    /// drain the readers (`drained`), joins it, and says a reader that panicked or one that has not ended by then. The
-    /// sink has already been made to stop writing, so nothing more goes into the archive the fetch is about to remove.
-    fn ended_raw(&mut self, raw: thread::JoinHandle<()>, drained: bool) {
+    /// drain it (`drained`, never so for a data channel's thread, which says no drain), joins it, and says a reader
+    /// that panicked or one that has not ended by then. The sink has already been made to stop writing, so nothing more
+    /// goes into the archive the fetch is about to remove.
+    /// How the data channel the thread fed the sink from ended, for a channel's thread; `None` for a raw copy, and for a
+    /// thread that panicked or did not end.
+    fn ended_raw(&mut self, raw: thread::JoinHandle<Option<channel::Dialled>>, drained: bool) -> Option<channel::Dialled> {
         let deadline = if drained { Instant::now() } else { Instant::now() + DRAIN };
         while !raw.is_finished() && Instant::now() < deadline {
             thread::sleep(PAUSE_STEP);
         }
         if raw.is_finished() {
-            if raw.join().is_err() {
+            if let Ok(dialled) = raw.join() {
+                dialled
+            } else {
                 self.logged("gate: the outputs call's raw copy panicked");
+                None
             }
         } else {
             self.logged(&format!("gate: the outputs call's raw copy did not end within {} s", DRAIN.as_secs()));
+            None
         }
     }
 
@@ -3651,6 +3817,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             limits: Limits::for_tests(),
             one_call: None,
             interrupt_at: None,
+            channel_fault: None,
             local_sdks: None,
             dotnet_limit: git::DOTNET_LIMIT,
             fetch_cap: watchdog::FETCH_CAP,
@@ -3773,6 +3940,8 @@ fn called_of(ended: CallEnd, raised: Raised, mut heard: Heard) -> Result<Called,
         adjusted: heard.adjusted,
         written: None,
         received: None,
+        channel: None,
+        channel_sent: heard.channel_sent,
     })
 }
 
@@ -4128,6 +4297,8 @@ struct Starts {
     nonce: Option<Arc<str>>,
     tag_nonce: Option<Arc<str>>,
     sink: Option<RawSink>,
+    /// The data channel the sink is filled from instead of the call's standard output, for an outputs call asking one.
+    channel: Option<channel::Dial>,
 }
 
 /// What a call of `gate box` is fed on its standard input, `input`, and the `verb` of the call, which the line saying
@@ -4192,6 +4363,8 @@ struct CallOnly {
     tag_nonce: Option<Arc<str>>,
     sink: Option<RawSink>,
     wire: Wire,
+    /// The data channel the outputs call's archive comes over instead of its standard output, when it asks for one.
+    channel: Option<channel::Dial>,
 }
 
 impl CallOnly {
@@ -4203,6 +4376,7 @@ impl CallOnly {
             tag_nonce: None,
             sink: None,
             wire: Wire::Plain,
+            channel: None,
         }
     }
 }
@@ -4376,6 +4550,10 @@ struct Heard {
     drain: Option<Drain>,
     box_killed: Option<BoxKill>,
     adjusted: Option<f64>,
+    /// The port the box's data channel line for the call named, the first when it said more than one.
+    channel_port: Option<u16>,
+    /// Its last standard error line saying what the box sent over a data channel.
+    channel_sent: Option<String>,
     problem: Option<String>,
 }
 
@@ -4397,6 +4575,9 @@ impl Heard {
         }
         if error && is_heartbeat(line) {
             return;
+        }
+        if error && line.contains(CHANNEL_SENT) {
+            self.channel_sent = Some(line.to_owned());
         }
         self.kept_line(line, error);
     }
@@ -4423,6 +4604,12 @@ impl Heard {
             }
             Protocol::Killed(kill) => self.box_killed = Some(kill),
             Protocol::Adjusted(seconds) => self.adjusted = Some(seconds),
+            Protocol::Channel(port) => {
+                self.channel_port.get_or_insert(port);
+            }
+            Protocol::ChannelRefused => {
+                self.refused.get_or_insert(Tagged::Channel);
+            }
         }
     }
 
@@ -4941,7 +5128,7 @@ fn relayed_raw(
     shown: String,
     shared: &Arc<Shared>,
     done: Sender<()>,
-) -> thread::JoinHandle<()> {
+) -> thread::JoinHandle<Option<channel::Dialled>> {
     let shared = Arc::clone(shared);
     thread::spawn(move || {
         relay_raw(stream, &mut sink, &shown, &shared);
@@ -4949,7 +5136,74 @@ fn relayed_raw(
         drop(sink);
         // A killed call's watcher stops listening once its drain is over: a reader that ends later has no one to tell.
         done.send(()).ok();
+        None
     })
+}
+
+/// Fills `sink`, shown as `shown`, from the data channel `dial` on a thread of its own, once the call's standard error
+/// said the box's port line ([`Heard::channel_port`]), and hands the thread back; it gives how the channel ended. Each
+/// piece read, once written into the sink, marks the call's progress as a raw copy's chunk does ([`relay_raw`]), and so
+/// do the connect and the proof exchange, so the stall watch covers a silent channel. The thread ends within a
+/// [`channel::pulled`] slice of the call's end ([`Shared::stopped`]), the sink dropped and then the socket shut down and
+/// closed before then; it is no reader of the call's streams, so it says nothing on their channel.
+fn dialled(
+    dial: channel::Dial,
+    sink: impl Write + Send + 'static,
+    shown: String,
+    shared: &Arc<Shared>,
+) -> thread::JoinHandle<Option<channel::Dialled>> {
+    let shared = Arc::clone(shared);
+    thread::spawn(move || {
+        let port = loop {
+            if let Some(port) = held(&shared.heard).channel_port {
+                break port;
+            }
+            if shared.stopped() {
+                return Some(channel::Dialled::NoPort);
+            }
+            thread::sleep(PAUSE_STEP);
+        };
+        // With no size from the box's run call, the PC cannot tell where the archive ends: it does not dial, and the
+        // box's own `channel` refusal at its accept window sends the pull over ssh.
+        let Some(size) = dial.size else {
+            return Some(channel::Dialled::NoSize);
+        };
+        let mut fill = Filled {
+            sink: Some(sink),
+            shown,
+            shared: &shared,
+        };
+        let ended = || shared.stopped();
+        Some(channel::pulled(&dial.asked, (port, size, dial.fault), &mut fill, &ended))
+    })
+}
+
+/// The sink a data channel's thread fills, shown as `shown`, with the call's `shared` state whose progress each step
+/// marks; the sink is dropped, closing the archive's file, once the pull ends, before the connection is shut down.
+struct Filled<'s, W> {
+    sink: Option<W>,
+    shown: String,
+    shared: &'s Shared,
+}
+
+impl<W: Write> channel::Fill for Filled<'_, W> {
+    fn chunk(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let Some(sink) = self.sink.as_mut() else {
+            return Err(format!("{} was closed before the pull ended", self.shown));
+        };
+        sink.write_all(bytes).map_err(|error| format!("cannot write {}: {error}", self.shown))?;
+        self.shared.progress.mark();
+        held(&self.shared.heard).output_seen = true;
+        Ok(())
+    }
+
+    fn mark(&mut self) {
+        self.shared.progress.mark();
+    }
+
+    fn close(&mut self) {
+        drop(self.sink.take());
+    }
 }
 
 /// Copies `stream` into `sink`, shown as `shown`, byte for byte until it ends, in chunks of at most [`RAW_CHUNK`]: no
@@ -5398,9 +5652,16 @@ enum Protocol {
     Killed(BoxKill),
     /// The box's adjusted line, said once the command's readers drained.
     Adjusted(f64),
+    /// The box's data channel line for the call, and the port it names ([`gate_wire::channel_line`]).
+    Channel(u16),
+    /// The box's `channel` refusal tag: its data channel did not complete.
+    ChannelRefused,
 }
 
-/// The start marker, the ten refusal tags, the two kill tags and the adjusted line's prefix of one call, made once for
+/// What starts the box's line saying what it sent over a data channel ([`gate_wire::channel_sent_line`]).
+const CHANNEL_SENT: &str = "gate: data channel sent ";
+
+/// The start marker, the eleven refusal tags, the two kill tags and the adjusted line's prefix of one call, made once for
 /// its readers, and whether the call is the run call, whose readers mark its progress per line.
 struct ProtocolLines {
     run_call: bool,
@@ -5418,6 +5679,8 @@ struct ProtocolLines {
     timed_out: String,
     backstop: String,
     adjusted: String,
+    channel: String,
+    channel_refused: String,
 }
 
 impl ProtocolLines {
@@ -5447,7 +5710,18 @@ impl ProtocolLines {
             timed_out: killed_line(nonce, BoxKill::TimedOut),
             backstop: killed_line(nonce, BoxKill::Backstop),
             adjusted: adjusted_prefix(nonce),
+            channel: channel_prefix(nonce),
+            channel_refused: refused_line(nonce, Refusal::Channel),
         }
+    }
+
+    /// The port of the box's data channel line for this call that `line` is, compared as a whole line; `None` for any
+    /// other line, another call's included.
+    fn channel_port(&self, line: &str) -> Option<u16> {
+        let port = line.strip_prefix(self.channel.as_str())?;
+        // The box writes the port as a number does, so no digit but a lone 0 starts with a 0.
+        let digits = !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) && (port == "0" || !port.starts_with('0'));
+        digits.then(|| port.parse().ok()).flatten()
     }
 
     /// What `line`, compared as a whole line, is of the run: its start marker, one of its refusal tags, one of its kill
@@ -5468,9 +5742,11 @@ impl ProtocolLines {
             (&self.drain, Protocol::Drain),
             (&self.timed_out, Protocol::Killed(BoxKill::TimedOut)),
             (&self.backstop, Protocol::Killed(BoxKill::Backstop)),
+            (&self.channel_refused, Protocol::ChannelRefused),
         ]
         .into_iter()
         .find_map(|(tag, protocol)| (line == tag.as_str()).then_some(protocol))
+        .or_else(|| self.channel_port(line).map(Protocol::Channel))
         .or_else(|| {
             line.strip_prefix(self.adjusted.as_str())
                 .and_then(adjusted_seconds)
@@ -5697,6 +5973,7 @@ mod tests {
             limits: Limits::for_tests(),
             one_call: None,
             interrupt_at: None,
+            channel_fault: None,
             local_sdks: None,
             dotnet_limit: DOTNET_LIMIT,
             fetch_cap: watchdog::FETCH_CAP,
@@ -5770,6 +6047,7 @@ mod tests {
             root: Some("/Users/b/gate-remote".to_owned()),
             slots: 1,
             id: Some("1f0efc62".to_owned()),
+            data: None,
         };
         let on_mac = RemoteCall {
             builder: &mac,
@@ -6230,6 +6508,8 @@ mod tests {
             adjusted: None,
             written: None,
             received: None,
+            channel: None,
+            channel_sent: None,
         }
     }
 
@@ -6613,6 +6893,65 @@ mod tests {
         assert!(matches!(called, Err(End::Interrupted)), "the raised Ctrl+C ends it");
         assert_eq!(attempt.pulled_bytes, 0, "no earlier call's bytes");
         assert_eq!(attempt.pulled_last, None, "no earlier call's last byte");
+    }
+
+    /// What came over a refused data channel counts once in the pull's total, whether the ssh fallback ended before its
+    /// watch ran, leaving the figure alone, or after, setting it to the ssh call's own.
+    #[test]
+    fn the_channel_s_bytes_count_once_in_the_pull_whatever_way_the_ssh_fallback_ends() {
+        let log = unwritten_log();
+        let given = call(&log);
+        let transport = nowhere();
+        let mut attempt = attempt(&given, &transport);
+
+        attempt.pulled_bytes = 300;
+        attempt.counted_with_channel(|_| ());
+        assert_eq!(attempt.pulled_bytes, 300, "a fallback that ended before its watch adds nothing");
+
+        attempt.pulled_bytes = 300;
+        attempt.counted_with_channel(|attempt| attempt.pulled_bytes = 4096);
+        assert_eq!(attempt.pulled_bytes, 4396, "the channel's bytes and the ssh call's");
+    }
+
+    /// An outputs call refused by the box's `channel` tag whose PC side ended as `channel`, the box having said
+    /// `box_why` on its not-completed line, or nothing.
+    fn channel_refused_with(channel: super::channel::Dialled, box_why: Option<&str>) -> Called {
+        let mut called = Called::exited_for_tests(0);
+        called.channel = Some(channel);
+        called.lines = box_why.map(gate_wire::channel_not_completed_line).into_iter().collect();
+        called
+    }
+
+    /// The not-used reason takes the PC's own failure first, then a missing size, then the box's text, then a channel
+    /// that did not end, then that the box did not complete it; a PC side the call's end stopped has no reason of its own.
+    #[test]
+    fn a_refused_channel_s_reason_ranks_the_pc_s_failure_the_size_the_box_s_text_and_a_channel_that_did_not_end() {
+        use super::channel::Dialled;
+
+        let box_why = Some("no connection from the PC within 10000 ms");
+        let why = |channel, said| super::channel_why(&channel_refused_with(channel, said));
+        assert_eq!(why(Dialled::Failed("the PC's own".to_owned()), box_why), "the PC's own");
+        assert_eq!(why(Dialled::NoSize, box_why), "the box said no archive size");
+        assert_eq!(why(Dialled::CallEnded, box_why), "no connection from the PC within 10000 ms");
+        assert_eq!(why(Dialled::NotEnded, box_why), "no connection from the PC within 10000 ms");
+        assert_eq!(why(Dialled::NoPort, box_why), "no connection from the PC within 10000 ms");
+        assert_eq!(why(Dialled::NotEnded, None), "the channel did not end");
+        assert_eq!(why(Dialled::CallEnded, None), "the box did not complete it");
+    }
+
+    /// The box's data channel line is taken only whole, for this call's nonce, with the port as a number is written.
+    #[test]
+    fn the_channel_port_line_is_taken_only_whole_without_a_leading_zero() {
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let lines = super::ProtocolLines::tags(nonce);
+        assert_eq!(lines.channel_port(&gate_wire::channel_line(nonce, 47100)), Some(47100));
+        assert_eq!(lines.channel_port(&gate_wire::channel_line(nonce, 0)), Some(0));
+        let prefix = gate_wire::channel_prefix(nonce);
+        for refused in ["047100", "00", "", "70000", "47100 ", "4710x"] {
+            assert_eq!(lines.channel_port(&format!("{prefix}{refused}")), None, "{refused:?}");
+        }
+        let other = gate_wire::channel_line("fedcba9876543210fedcba9876543210", 47100);
+        assert_eq!(lines.channel_port(&other), None, "another call's line");
     }
 
     /// A pull says each progress period once across its calls: the call made again after one that said period 1 finds

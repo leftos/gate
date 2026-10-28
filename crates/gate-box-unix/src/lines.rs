@@ -7,7 +7,9 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use gate_wire::{BoxKill, PathForm, Refusal, SHA256_DIGITS, build_version, escaped, is_lower_hex, refused_line, work_root};
+use gate_wire::{
+    BoxKill, PathForm, Payload, Refusal, SHA256_DIGITS, build_version, channel_not_completed_line, escaped, is_lower_hex, refused_line, work_root,
+};
 
 /// The line saying the work folder's tree is new, which the client raises a run's ceiling for.
 pub const NEW_WORK_TREE: &str = "gate: remote new work tree";
@@ -610,6 +612,23 @@ pub fn rosetta_lines(nonce: &str) -> [String; 2] {
     [refused_line(nonce, Refusal::Install), ROSETTA_LINE.to_owned()]
 }
 
+/// The lines a request asking for a data channel (`Channel`) is refused with: this builder has none, so the `channel`
+/// refusal tag of the request's nonce, which has the PC send over ssh, then why. `None` for a request without one.
+///
+/// # Errors
+///
+/// The usage line of a malformed `Channel` ([`Payload::channel`]) or `Nonce` ([`Payload::nonce`]).
+pub fn channel_refusal(payload: &Payload) -> Result<Option<[String; 2]>, String> {
+    if payload.channel()?.is_none() {
+        return Ok(None);
+    }
+    let nonce = payload.nonce()?;
+    Ok(Some([
+        refused_line(nonce, Refusal::Channel),
+        channel_not_completed_line("this builder has no data channel"),
+    ]))
+}
+
 /// The time `seconds` and `hundreds` of 100 ns after the Unix epoch in .NET's round-trip `o` format of a UTC time:
 /// seven fractional digits and a `Z`, as the Windows box writes its times.
 #[must_use]
@@ -721,6 +740,41 @@ mod tests {
         write_failure,
     };
     use gate_wire::BoxKill;
+
+    /// This builder has no data channel: a request asking for one is refused `channel`, so the PC sends over ssh; one
+    /// without it is not; a malformed one is the payload's usage line, which never shows a proof.
+    #[test]
+    #[expect(clippy::expect_used, reason = "a payload the case cannot build must fail the case loudly")]
+    fn a_request_asking_for_a_data_channel_is_refused_channel() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+        use gate_wire::{PathForm, Payload};
+        use serde_json::json;
+
+        const NONCE: &str = "0123456789abcdef0123456789abcdef";
+        let decoded = |json: &serde_json::Value| Payload::decode(&STANDARD.encode(json.to_string()), PathForm::Unix).expect("the payload decodes");
+        let channel = json!({
+            "Address": "100.64.0.1",
+            "Peer": "100.64.0.2",
+            "BoxProof": "00112233445566778899aabbccddeeff",
+            "PcProof": "ffeeddccbbaa99887766554433221100",
+        });
+
+        assert_eq!(
+            super::channel_refusal(&decoded(&json!({ "Nonce": NONCE, "Channel": channel }))),
+            Ok(Some([
+                format!("gate-remote-refused: {NONCE} channel"),
+                "gate: data channel not completed: this builder has no data channel".to_owned(),
+            ]))
+        );
+        assert_eq!(super::channel_refusal(&decoded(&json!({ "Nonce": NONCE }))), Ok(None));
+        let mut bad = channel.clone();
+        bad["PcProof"] = json!("not a proof");
+        assert_eq!(
+            super::channel_refusal(&decoded(&json!({ "Nonce": NONCE, "Channel": bad }))),
+            Err("gate: box payload Channel PcProof is not 32 lower-case hex digits".to_owned())
+        );
+    }
 
     #[test]
     fn a_command_s_status_is_its_code_or_128_and_its_signal_and_the_box_s_own_ends_have_theirs() {

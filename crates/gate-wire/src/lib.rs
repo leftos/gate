@@ -136,6 +136,18 @@ pub fn is_lower_hex(text: &str, digits: usize) -> bool {
     text.len() == digits && text.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// `bytes` as lower-case hex, two digits a byte, as the gate writes a SHA-256 or a proof.
+#[must_use]
+pub fn lower_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut hex = String::with_capacity(2 * bytes.len());
+    for byte in bytes {
+        hex.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        hex.push(char::from(DIGITS[usize::from(byte & 0xf)]));
+    }
+    hex
+}
+
 /// The path rules a payload is read under, those of the box that reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PathForm {
@@ -989,6 +1001,150 @@ impl Payload {
     }
 }
 
+/// The first port of the range a builder's data channel listens in.
+pub const CHANNEL_FIRST_PORT: u16 = 47100;
+/// The last port of the range a builder's data channel listens in.
+pub const CHANNEL_LAST_PORT: u16 = 47131;
+
+/// The bytes of a data channel's proof, as the payload carries it in [`PROOF_DIGITS`] hex digits.
+pub const PROOF_BYTES: usize = 16;
+/// The hex digits of a data channel's proof in the payload.
+const PROOF_DIGITS: usize = 2 * PROOF_BYTES;
+
+/// One side's proof of a data channel: 128 bits the PC drew for one attempt. It is a secret, so its `Debug` shows no
+/// byte of it and it has no `Display`.
+pub struct Proof([u8; PROOF_BYTES]);
+
+impl Proof {
+    /// The proof of the 16 bytes `bytes`.
+    #[must_use]
+    pub fn new(bytes: [u8; PROOF_BYTES]) -> Proof {
+        Proof(bytes)
+    }
+
+    /// The proof's bytes, as they go on the channel.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8; PROOF_BYTES] {
+        &self.0
+    }
+
+    /// Whether `other` is this proof: the same length and every byte the same, compared by a fold over all of them.
+    #[must_use]
+    pub fn matches(&self, other: &[u8]) -> bool {
+        let differs = self.0.iter().zip(other).fold(0_u8, |differs, (mine, theirs)| differs | (mine ^ theirs));
+        other.len() == PROOF_BYTES && differs == 0
+    }
+}
+
+impl std::fmt::Debug for Proof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Proof(..)")
+    }
+}
+
+/// A request's data channel, the payload's `Channel`: the builder's address the box listens on, the PC's address the
+/// box takes a connection from, and the two proofs, the box's sent first and the PC's checked.
+#[derive(Debug)]
+pub struct Channel {
+    /// The builder's address the box binds.
+    pub address: std::net::Ipv4Addr,
+    /// The PC's address, the only peer the box serves.
+    pub peer: std::net::Ipv4Addr,
+    /// The proof the box sends first.
+    pub box_proof: Proof,
+    /// The proof the PC must send back.
+    pub pc_proof: Proof,
+}
+
+/// The line the box says on stderr once its data channel listens on `port` for the call whose payload carries `nonce`:
+/// `gate-remote-channel: <nonce> <port>`. Nothing secret is in it.
+#[must_use]
+pub fn channel_line(nonce: &str, port: u16) -> String {
+    format!("{}{port}", channel_prefix(nonce))
+}
+
+/// What the box's data channel line for the call whose payload carries `nonce` says before its port
+/// ([`channel_line`]).
+#[must_use]
+pub fn channel_prefix(nonce: &str) -> String {
+    format!("gate-remote-channel: {nonce} ")
+}
+
+/// The line the box says after its `channel` refusal tag ([`Refusal::Channel`]), for `why`, which never holds a proof.
+#[must_use]
+pub fn channel_not_completed_line(why: &str) -> String {
+    format!("gate: data channel not completed: {why}")
+}
+
+/// The line the box says on stderr once the PC acknowledged the `bytes` it sent over the data channel, whose SHA-256 is
+/// `sha256` in lower-case hex.
+#[must_use]
+pub fn channel_sent_line(bytes: u64, sha256: &str) -> String {
+    format!("gate: data channel sent {bytes} bytes sha256 {sha256}")
+}
+
+impl Payload {
+    /// The request's data channel, `Channel`; `None` when the key is absent or null, a request over ssh alone. Else the
+    /// usage line naming the field: an object whose `Address` is an IPv4 address that is not `0.0.0.0` and, in a build
+    /// without the `test-seams` feature, not loopback; whose `Peer` is an IPv4 address; and whose `BoxProof` and
+    /// `PcProof` are each [`PROOF_DIGITS`] lower-case hex digits. A line refusing a proof never shows it.
+    pub fn channel(&self) -> Result<Option<Channel>, String> {
+        let object = match self.object.get("Channel") {
+            None | Some(Value::Null) => return Ok(None),
+            Some(Value::Object(object)) => object,
+            Some(_) => return Err("gate: box payload Channel is not an object".to_owned()),
+        };
+        let address = channel_address(object, "Address")?;
+        if address.is_unspecified() {
+            return Err("gate: box payload Channel Address must not be the unspecified address 0.0.0.0".to_owned());
+        }
+        if address.is_loopback() && !cfg!(feature = "test-seams") {
+            return Err(format!("gate: box payload Channel Address must not be a loopback address: {address}"));
+        }
+        Ok(Some(Channel {
+            address,
+            peer: channel_address(object, "Peer")?,
+            box_proof: channel_proof(object, "BoxProof")?,
+            pc_proof: channel_proof(object, "PcProof")?,
+        }))
+    }
+}
+
+/// The text of the `Channel` field `key`; else the usage line saying the channel lacks it (absent, null or empty) or
+/// that it is not a text.
+fn channel_text<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a str, String> {
+    match object.get(key) {
+        None | Some(Value::Null) => Err(format!("gate: box payload Channel lacks {key}")),
+        Some(Value::String(text)) if text.is_empty() => Err(format!("gate: box payload Channel lacks {key}")),
+        Some(Value::String(text)) => Ok(text),
+        Some(_) => Err(format!("gate: box payload Channel {key} is not a text")),
+    }
+}
+
+/// The IPv4 address of the `Channel` field `key`, in its dotted form; else the usage line, the value shown escaped.
+fn channel_address(object: &Map<String, Value>, key: &str) -> Result<std::net::Ipv4Addr, String> {
+    let text = channel_text(object, key)?;
+    text.parse()
+        .map_err(|_| format!("gate: box payload Channel {key} is not an IPv4 address: {}", escaped(text)))
+}
+
+/// The proof of the `Channel` field `key`, [`PROOF_DIGITS`] lower-case hex digits; else the usage line, which does not
+/// show the value.
+fn channel_proof(object: &Map<String, Value>, key: &str) -> Result<Proof, String> {
+    let text = channel_text(object, key)?;
+    let not_a_proof = || format!("gate: box payload Channel {key} is not {PROOF_DIGITS} lower-case hex digits");
+    if !is_lower_hex(text, PROOF_DIGITS) {
+        return Err(not_a_proof());
+    }
+    let mut bytes = [0_u8; PROOF_BYTES];
+    let (pairs, _) = text.as_bytes().as_chunks::<2>();
+    for (byte, pair) in bytes.iter_mut().zip(pairs) {
+        let pair = std::str::from_utf8(pair).map_err(|_| not_a_proof())?;
+        *byte = u8::from_str_radix(pair, 16).map_err(|_| not_a_proof())?;
+    }
+    Ok(Proof(bytes))
+}
+
 /// The most characters a drain session id, the payload's `Session`, may have.
 pub const MOST_SESSION_CHARS: usize = 64;
 
@@ -1285,6 +1441,8 @@ pub enum Refusal {
     Drain,
     /// Every one of the builder's own slots is held.
     Full,
+    /// The data channel did not complete: nothing was installed, and the outputs archive is kept.
+    Channel,
 }
 
 impl Refusal {
@@ -1302,6 +1460,7 @@ impl Refusal {
             Refusal::Lfs => "lfs",
             Refusal::Drain => "drain",
             Refusal::Full => "full",
+            Refusal::Channel => "channel",
         }
     }
 }
@@ -1513,6 +1672,163 @@ mod tests {
         version_text, work_root,
     };
 
+    #[test]
+    fn lower_hex_writes_two_lower_case_digits_a_byte_in_order() {
+        assert_eq!(super::lower_hex(&[]), "");
+        assert_eq!(super::lower_hex(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
+        let every: Vec<u8> = (0..=255).collect();
+        let hex = super::lower_hex(&every);
+        assert_eq!(hex.len(), 512);
+        assert!(super::is_lower_hex(&hex, 512));
+        assert_eq!(&hex[2 * 0xab..2 * 0xab + 2], "ab");
+    }
+
+    #[expect(clippy::expect_used, reason = "a payload a case cannot build must fail the case loudly")]
+    mod channel {
+        use std::net::Ipv4Addr;
+
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+        use serde_json::{Value, json};
+
+        use crate::{Channel, PathForm, Payload};
+
+        const BOX_PROOF: &str = "00112233445566778899aabbccddeeff";
+        const PC_PROOF: &str = "ffeeddccbbaa99887766554433221100";
+
+        /// The `Channel` object with every field well formed, its builder address `address`.
+        fn channel_at(address: &str) -> Value {
+            json!({ "Address": address, "Peer": "100.64.0.2", "BoxProof": BOX_PROOF, "PcProof": PC_PROOF })
+        }
+
+        /// What the `Channel` reader makes of a payload whose `Channel` is `channel`.
+        fn read(channel: &Value) -> Result<Option<Channel>, String> {
+            let payload =
+                Payload::decode(&STANDARD.encode(json!({ "Channel": channel }).to_string()), PathForm::Windows).expect("the payload decodes");
+            payload.channel()
+        }
+
+        /// The usage line the `Channel` reader gives for `channel`.
+        fn refusal(channel: &Value) -> String {
+            read(channel).expect_err("the channel is refused")
+        }
+
+        #[test]
+        fn a_payload_without_a_channel_asks_for_none() {
+            let payload = Payload::decode(&STANDARD.encode("{}"), PathForm::Windows).expect("the payload decodes");
+            assert!(payload.channel().expect("no channel is no error").is_none());
+            assert!(read(&Value::Null).expect("a null channel is no error").is_none());
+        }
+
+        #[test]
+        fn a_well_formed_channel_is_read_whole() {
+            let channel = read(&channel_at("100.64.0.1"))
+                .expect("the channel is read")
+                .expect("a channel is asked for");
+
+            assert_eq!(channel.address, Ipv4Addr::new(100, 64, 0, 1));
+            assert_eq!(channel.peer, Ipv4Addr::new(100, 64, 0, 2));
+            assert_eq!(
+                channel.box_proof.bytes(),
+                &[
+                    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff
+                ]
+            );
+            assert!(channel.pc_proof.matches(&[
+                0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00
+            ]));
+            assert!(!channel.pc_proof.matches(channel.box_proof.bytes()), "another proof does not match");
+            assert!(!channel.pc_proof.matches(&[0xff; 15]), "a short proof does not match");
+        }
+
+        #[test]
+        fn each_malformed_field_is_a_usage_error_naming_it() {
+            let with = |key: &str, value: Value| {
+                let mut channel = channel_at("100.64.0.1");
+                channel[key] = value;
+                channel
+            };
+            let without = |key: &str| {
+                let mut channel = channel_at("100.64.0.1");
+                channel.as_object_mut().expect("the channel is an object").remove(key);
+                channel
+            };
+            assert_eq!(refusal(&json!("100.64.0.1")), "gate: box payload Channel is not an object");
+            for key in ["Address", "Peer", "BoxProof", "PcProof"] {
+                assert_eq!(refusal(&without(key)), format!("gate: box payload Channel lacks {key}"), "{key}");
+                assert_eq!(refusal(&with(key, json!(""))), format!("gate: box payload Channel lacks {key}"), "{key}");
+                assert_eq!(
+                    refusal(&with(key, json!(7))),
+                    format!("gate: box payload Channel {key} is not a text"),
+                    "{key}"
+                );
+            }
+            for bad in ["100.64.0", "100.64.0.256", "100.064.0.1", "::1", "::", "host", " 100.64.0.1"] {
+                for key in ["Address", "Peer"] {
+                    let line = refusal(&with(key, json!(bad)));
+                    assert!(
+                        line.starts_with(&format!("gate: box payload Channel {key} is not an IPv4 address: ")),
+                        "{key} {bad:?}: {line}"
+                    );
+                }
+            }
+            assert_eq!(
+                refusal(&channel_at("0.0.0.0")),
+                "gate: box payload Channel Address must not be the unspecified address 0.0.0.0"
+            );
+            for bad in [
+                "0011223344556677889900aabbccddeeff",
+                "00112233445566778899aabbccddeef",
+                "00112233445566778899AABBCCDDEEFF",
+                "00112233445566778899aabbccddeefg",
+            ] {
+                for key in ["BoxProof", "PcProof"] {
+                    let line = refusal(&with(key, json!(bad)));
+                    assert_eq!(
+                        line,
+                        format!("gate: box payload Channel {key} is not 32 lower-case hex digits"),
+                        "{key} {bad:?}"
+                    );
+                    assert!(!line.contains(bad), "the line shows no proof: {line}");
+                }
+            }
+        }
+
+        /// A loopback builder address is a test's alone: a build with the test seams takes it, a build without them
+        /// refuses it.
+        #[test]
+        fn a_loopback_address_is_taken_only_with_the_test_seams() {
+            for loopback in ["127.0.0.1", "127.0.0.2"] {
+                let read = read(&channel_at(loopback));
+                if cfg!(feature = "test-seams") {
+                    let channel = read.expect("a seams build takes loopback").expect("a channel is asked for");
+                    assert!(channel.address.is_loopback(), "{loopback}");
+                } else {
+                    assert_eq!(
+                        read.expect_err("a build without the seams refuses loopback"),
+                        format!("gate: box payload Channel Address must not be a loopback address: {loopback}")
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn a_proofs_debug_shows_no_hex() {
+            let channel = read(&channel_at("100.64.0.1"))
+                .expect("the channel is read")
+                .expect("a channel is asked for");
+
+            let shown = format!("{channel:?} {:?} {:#?}", channel.box_proof, channel.pc_proof);
+
+            assert_eq!(format!("{:?}", channel.box_proof), "Proof(..)");
+            for proof in [BOX_PROOF, PC_PROOF] {
+                assert!(!shown.contains(proof), "{shown}");
+                assert!(!shown.to_ascii_lowercase().contains(&proof[..8]), "{shown}");
+            }
+            assert!(!shown.contains("17,"), "no proof byte is shown as a number: {shown}");
+        }
+    }
+
     #[expect(clippy::expect_used, reason = "a payload a case cannot build must fail the case loudly")]
     mod run_lines {
         use base64::Engine;
@@ -1544,6 +1860,7 @@ mod tests {
                 (Refusal::Lfs, "lfs"),
                 (Refusal::Drain, "drain"),
                 (Refusal::Full, "full"),
+                (Refusal::Channel, "channel"),
             ] {
                 assert_eq!(refusal.word(), word);
                 assert_eq!(refused_line(NONCE, refusal), format!("gate-remote-refused: {NONCE} {word}"));
@@ -3117,7 +3434,10 @@ mod tests {
     fn root_lines_are_the_prefix_the_escaped_why_and_the_step() {
         assert_eq!(
             root_unsafe_line("D:\\g lets S-1-5-11 add\u{1b}", "install-x -Only \"Gate work root\""),
-            r#"gate: the builder's work root is not locked down: D:\g lets S-1-5-11 add\u{1b}; run the installer's "Gate work root" step (install-x -Only "Gate work root")"#
+            concat!(
+                r#"gate: the builder's work root is not locked down: D:\g lets S-1-5-11 add\u{1b}; "#,
+                r#"run the installer's "Gate work root" step (install-x -Only "Gate work root")"#
+            )
         );
         assert_eq!(
             root_busy_line("D:\\g is open\u{1b}"),

@@ -76,6 +76,7 @@ mod tests {
                 root: None,
                 slots: 1,
                 id: None,
+                data: None,
             },
             root: "X:/dev/app".to_owned(),
             root_id: ID,

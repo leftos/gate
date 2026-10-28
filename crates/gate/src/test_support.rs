@@ -13,6 +13,7 @@ pub(crate) static HOST: std::sync::LazyLock<gate_router::Builder> = std::sync::L
     root: None,
     slots: 1,
     id: None,
+    data: None,
 });
 
 /// The folder the unit tests make their own folders and files in, in place of the system temp folder:

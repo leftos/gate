@@ -9,7 +9,8 @@
 //! names whose gates started inside a git hook may route) and the optional `sendBuild` (the repo names whose routed
 //! `dotnet test --no-build` may send the PC's build) and the optional `declarations` (each repo name's folder
 //! holding the `.gate` files the repo has none of) and the optional `builders` (further builders a routed run may go
-//! to, each with its own `host`, `os`, `root`, `slots`, `repos` and `outputs`). Keys match in any letter case and
+//! to, each with its own `host`, `os`, `root`, `slots`, `repos` and `outputs`, and an optional `data`, the builder's
+//! tailnet IPv4 address a data channel dials). Keys match in any letter case and
 //! unknown keys are ignored.
 //! The text may hold `//` and `/* */` comments and trailing commas, as the
 //! PowerShell gate's JSON reader allows; single-quoted strings are refused. A file that breaks a rule is unusable as a
@@ -57,6 +58,9 @@ pub struct Builder {
     /// The first 8 lower-case hex digits of the SHA-256 of the lower-cased alias for a `builders` entry and for a `hosts`
     /// entry ([`Config::named_builder`]), so neither shares `host`'s remote pool or hash caches; `None` for `host`.
     pub id: Option<String>,
+    /// The builder's tailnet IPv4 address a data channel dials, a `builders` entry's `data`; `None` when the entry has
+    /// none, and always for `host` and a `hosts` entry, which then send every byte over ssh.
+    pub data: Option<std::net::Ipv4Addr>,
 }
 
 /// A `builders` entry: the builder, the repos it runs with their patterns, its own output globs, and whether a pick
@@ -183,6 +187,7 @@ impl Config {
                 root: None,
                 slots,
                 id: None,
+                data: None,
             },
             entries,
             repos,
@@ -366,6 +371,7 @@ impl Config {
             root: None,
             slots: self.slots(),
             id: Some(builder_id(alias)),
+            data: None,
         }))
     }
 
@@ -798,15 +804,41 @@ fn read_builder_entry(object: &Map<String, Value>, prefix: &str) -> Result<Build
     let outputs = read_table(object, "outputs", false, prefix)?;
     let failure_outputs = read_table(object, "failureOutputs", false, prefix)?;
     let cross_build = read_cross_build(object, os, &outputs, prefix);
+    let data = read_data(object, prefix)?;
     let id = Some(builder_id(&alias));
     Ok(BuilderEntry {
-        builder: Builder { alias, os, root, slots, id },
+        builder: Builder {
+            alias,
+            os,
+            root,
+            slots,
+            id,
+            data,
+        },
         repos,
         outputs,
         failure_outputs,
         routed,
         cross_build,
     })
+}
+
+/// A `builders` entry's `data`, the builder's tailnet address in dotted IPv4 form; `None` when the key is missing. The
+/// unspecified address, the broadcast address and a multicast address, which no connection is made to, are refused.
+/// Its reasons start with `prefix` (`builders[0].`).
+fn read_data(object: &Map<String, Value>, prefix: &str) -> Result<Option<std::net::Ipv4Addr>, String> {
+    let address = match property(object, "data") {
+        None => return Ok(None),
+        Some(Value::String(text)) => text.parse::<std::net::Ipv4Addr>().ok(),
+        Some(_) => None,
+    };
+    match address {
+        None => Err(format!("{prefix}data must be an IPv4 address")),
+        Some(address) if address.is_unspecified() || address.is_broadcast() || address.is_multicast() => {
+            Err(format!("{prefix}data must be a unicast IPv4 address"))
+        }
+        Some(address) => Ok(Some(address)),
+    }
 }
 
 /// A `builders` entry's `crossBuild` table: each repo name's runtime identifier ([`is_runtime_identifier`]), in file

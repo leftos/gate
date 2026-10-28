@@ -1954,6 +1954,7 @@ mod tests {
                 root: None,
                 slots: 1,
                 id: None,
+                data: None,
             },
             place: Place {
                 root: root.to_owned(),

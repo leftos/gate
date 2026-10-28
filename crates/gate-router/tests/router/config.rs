@@ -877,6 +877,7 @@ fn a_builders_entry_parses_a_macos_builder_with_its_root_and_a_windows_one_with_
         root: Some("/Users/me/gate".to_owned()),
         slots: 3,
         id: Some("1f0efc62".to_owned()),
+        data: None,
     };
     let win = Builder {
         alias: "win-2".to_owned(),
@@ -884,6 +885,7 @@ fn a_builders_entry_parses_a_macos_builder_with_its_root_and_a_windows_one_with_
         root: None,
         slots: 1,
         id: Some("084c286b".to_owned()),
+        data: None,
     };
     let entries: Vec<&Builder> = config.builder_entries().collect();
     assert_eq!(entries.len(), 3);
@@ -978,6 +980,55 @@ fn a_bad_builders_entry_makes_the_whole_file_unusable() {
         ignored_line(Path::new("remote.json"), &reason(&builders_file(&entry(repos)))),
         format!("gate: ignored remote.json: {macos_root}; running locally")
     );
+}
+
+#[test]
+fn a_builders_entry_s_data_is_its_tailnet_ipv4_address_and_none_without_the_key() {
+    let config = Config::parse(&builders_file(
+        r#"[{"host": "win-2", "os": "windows", "Data": "100.64.0.7", "repos": {"gate": []}},
+            {"host": "win-3", "os": "windows", "repos": {"gate": []}}]"#,
+    ))
+    .expect("usable");
+
+    assert_eq!(entry_builder(&config, "win-2").data, Some(std::net::Ipv4Addr::new(100, 64, 0, 7)));
+    assert_eq!(entry_builder(&config, "win-3").data, None, "no data key: no data channel");
+    assert_eq!(entry_builder(&config, "builder-1").data, None, "host has no data channel");
+}
+
+#[test]
+fn a_builders_entry_s_data_that_is_no_ipv4_address_makes_the_whole_file_unusable() {
+    let repos = r#""repos": {"gate": ["x"]}"#;
+    for data in [
+        r#""100.64.0""#,
+        r#""::1""#,
+        r#""builder.ts.net""#,
+        r#""""#,
+        "5",
+        "null",
+        r#"["100.64.0.7"]"#,
+    ] {
+        let file = builders_file(&format!(r#"[{{"host": "win", "os": "windows", "data": {data}, {repos}}}]"#));
+        assert_eq!(
+            Config::parse(&file).map(|_| ()),
+            Err("builders[0].data must be an IPv4 address".to_owned()),
+            "{data}"
+        );
+    }
+}
+
+/// A `data` address no connection can be made to or from, the unspecified address, the broadcast address or a
+/// multicast address, is refused as a field error of the whole file.
+#[test]
+fn a_builders_entry_s_data_that_is_unspecified_broadcast_or_multicast_makes_the_whole_file_unusable() {
+    let repos = r#""repos": {"gate": ["x"]}"#;
+    for data in ["0.0.0.0", "255.255.255.255", "224.0.0.1", "239.255.255.255"] {
+        let file = builders_file(&format!(r#"[{{"host": "win", "os": "windows", "data": "{data}", {repos}}}]"#));
+        assert_eq!(
+            Config::parse(&file).map(|_| ()),
+            Err("builders[0].data must be a unicast IPv4 address".to_owned()),
+            "{data}"
+        );
+    }
 }
 
 /// The routing file with a macOS entry `mac-1` and a Windows entry `win-1`, each listing `g` and `h` with outputs for

@@ -10,9 +10,10 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use gate_args::{BoxVerb, DrainAction};
 use gate_router::CrossBuild;
-use gate_wire::PathForm;
+use gate_wire::{PathForm, lower_hex};
 use serde_json::{Map, Value, json};
 
+use crate::remote::channel::Asked;
 use crate::remote::snapshot::IDENTITY;
 use crate::remote::transport::Profile;
 use crate::wait::REMOTE_LIMIT;
@@ -135,10 +136,10 @@ fn pc_name() -> Option<String> {
 /// outputs), and whether every file under them counts as changed (`OutputsFull`), as after an outputs step that did not
 /// complete; the run's ceiling in whole seconds, which the box counts in load-adjusted time (`Timeout`), and the PC's
 /// name for the builder, which the box's kill line names (`Host`); the run's variables, the caller's `--env` pairs and
-/// the gate's `SourceRevisionId` (`Env`, sent only when there is one); and each sibling's name and the commit its snapshot is (`SiblingSnapshots`, sent only when there is
-/// one); the versions of the builder's Godot install and Unreal Engine install the run uses (`GodotVersion` and
-/// `UnrealVersion`, each sent only when one is chosen); and the names set to the Unreal Engine install's root
-/// (`EngineEnv`, sent only when there is one).
+/// the gate's `SourceRevisionId` (`Env`, sent only when there is one); and each sibling's name and the commit its
+/// snapshot is (`SiblingSnapshots`, sent only when there is one); the versions of the builder's Godot install and
+/// Unreal Engine install the run uses (`GodotVersion` and `UnrealVersion`, each sent only when one is chosen); and the
+/// names set to the Unreal Engine install's root (`EngineEnv`, sent only when there is one).
 pub(crate) struct RunCall<'a> {
     pub words: &'a [String],
     pub subfolder: &'a str,
@@ -225,10 +226,24 @@ pub(crate) fn preflight_word(location: &Location, needs: &[(String, String)], no
     word(&object)
 }
 
-/// The payload word of the outputs call: the location and the outputs archive's `Name`, `name`.
-pub(crate) fn outputs_word(location: &Location, name: &str) -> String {
+/// The payload word of the outputs call: the location and the outputs archive's `Name`, `name`; with `channel`, the
+/// call's `Nonce` its lines carry and the data channel it asks for, `Channel`: the builder's `Address`, the PC's own
+/// `Peer` and the two proofs as lower-case hex, which this word alone carries, on the call's standard input.
+pub(crate) fn outputs_word(location: &Location, name: &str, channel: Option<(&Asked, &str)>) -> String {
     let mut object = location.object();
     object.insert("Name".to_owned(), Value::String(name.to_owned()));
+    if let Some((asked, nonce)) = channel {
+        object.insert("Nonce".to_owned(), json!(nonce));
+        object.insert(
+            "Channel".to_owned(),
+            json!({
+                "Address": asked.data.to_string(),
+                "Peer": asked.local.to_string(),
+                "BoxProof": lower_hex(asked.box_proof.bytes()),
+                "PcProof": lower_hex(asked.pc_proof.bytes()),
+            }),
+        );
+    }
     word(&object)
 }
 
@@ -446,7 +461,7 @@ mod tests {
         let words = [
             ("preflight", preflight_word(&routed, &[], NONCE)),
             ("inputs", inputs_word(&routed, NONCE, InputsStep::Diff, None)),
-            ("outputs", outputs_word(&routed, "app.zip")),
+            ("outputs", outputs_word(&routed, "app.zip", None)),
             ("run", run_word(&routed, &warm_run(&[], None))),
         ];
         for (verb, word) in words {
@@ -476,6 +491,7 @@ mod tests {
             root: Some("/Users/b/gate-remote".to_owned()),
             slots: 1,
             id: Some("00000000".to_owned()),
+            data: None,
         };
         Profile::of(&builder, r"D:\gate-remote")
     }

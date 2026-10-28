@@ -37,8 +37,9 @@ use crate::beneath::{self, Folder};
 use crate::console::Console;
 use crate::cross::{self, Portable};
 use crate::drain;
-use crate::lines::{FAILED_STATUS, USAGE_STATUS};
+use crate::lines::{FAILED_STATUS, USAGE_STATUS, channel_refusal};
 use crate::request::{Unread, bounded_line};
+use crate::run::REFUSED_STATUS;
 
 /// How long an outputs archive is kept in the output folder before a run with output globs removes it, as the wrapper's
 /// `$OutputArchiveHours` keeps it.
@@ -985,6 +986,9 @@ pub fn not_brought_back(reason: &str) -> String {
 /// and holds it until it returns. It is never refused: an archive of a session the drain found dead while a barrier
 /// stands is sent and kept, said with [`KEPT_DRAINED`], as is one sent when the drain could not be read, said
 /// `gate: drain failed: {why}`.
+///
+/// A request asking for a data channel is refused `channel` before anything is sent ([`channel_refusal`]): this builder
+/// has none, so the PC sends over ssh.
 #[must_use]
 pub fn outputs(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u8 {
     answered(payload, seams, &mut io::stdout().lock(), console)
@@ -1015,6 +1019,19 @@ fn answered(payload: &Payload, seams: &BoxSeams, sink: &mut impl Write, console:
             return USAGE_STATUS;
         }
     };
+    match channel_refusal(payload) {
+        Ok(None) => {}
+        Ok(Some(lines)) => {
+            for line in &lines {
+                console.err(line);
+            }
+            return REFUSED_STATUS;
+        }
+        Err(line) => {
+            console.err(&line);
+            return USAGE_STATUS;
+        }
+    }
     let name = match payload.archive_name() {
         Ok(name) => name,
         Err(line) => {

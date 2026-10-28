@@ -42,6 +42,7 @@ mod registry;
 mod scrub;
 mod security;
 mod session;
+pub mod socket;
 mod task;
 #[cfg(test)]
 mod test_support;

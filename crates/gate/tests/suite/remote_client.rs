@@ -10933,3 +10933,312 @@ fn a_routed_run_s_status_and_output_are_unchanged_by_the_sweep() {
     assert!(outcome.stderr.contains("gate: FAILED (status 3)"), "{outcome:?}");
     assert_swept(&case);
 }
+
+/// The line a routed run's log gets once its outputs pull moved its archive over the data channel.
+const CHANNEL_PULL: &str = r"(?m)^gate: data channel: pull (\d+) in \d+\.\d s\r?$";
+
+/// A loopback port free a moment ago: the system's pick for a listener closed at once, which the box's channel then
+/// listens on alone.
+fn free_channel_port() -> u16 {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("a loopback listener binds");
+    listener.local_addr().expect("the listener's address is read").port()
+}
+
+/// A [`client_case`] whose repo routes its `*tool*` commands to the Windows `builders` entry [`FIRST_BUILDER`] alone,
+/// with the output globs [`BIN`] and, when given, the `data` address `data`; `bin/` is left out of git.
+fn channel_case(name: &str, data: Option<&str>) -> Case {
+    let case = client_case(name);
+    write(&case, ".gitignore", &format!("{CLIENT_IGNORED}bin/\n"));
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let mut entry = json!({ "host": FIRST_BUILDER, "os": "windows", "repos": { &repo: ["*tool*"] }, "outputs": { &repo: BIN } });
+    if let Some(data) = data {
+        entry["data"] = json!(data);
+    }
+    let routing = json!({ "host": HOST, "repos": { &repo: ["*never*"] }, "builders": [entry] });
+    write_remote_json(&case, &routing.to_string());
+    case
+}
+
+/// A routed run of `case` logging to `log` whose command writes `content` to `bin\new.txt`, through the stand-in's
+/// steps file `name`: the preflight and the run call, then the outputs call, whose request the stand-in keeps; every
+/// box call is given a data channel on the loopback port `port` alone. The steps file and the run's outcome.
+fn channel_run(case: &Case, (name, log): (&str, &str), port: u16, content: &str) -> (PathBuf, Outcome) {
+    let fed = format!("fed-hold {}", shown(&case.folder()));
+    let steps = ssh_steps(case, name, &["ok", "ok", &fed]);
+    let mut gate = client_gate(case, log, &steps, &[r".\tool.exe", "write", r"bin\new.txt", content]);
+    gate.env(BOX_SEAMS_VARIABLE, format!("--test-box-channel-ports {port}-{port}"));
+    (steps, finish(gate))
+}
+
+/// The two proofs, as hex, of the data channel the outputs call kept by the steps file `steps` asked for.
+fn channel_proofs(steps: &Path) -> (String, String) {
+    let sent = last_request(steps);
+    let proof = |key: &str| {
+        sent["Channel"][key]
+            .as_str()
+            .expect("the outputs call asks for a channel with both proofs")
+            .to_owned()
+    };
+    (proof("BoxProof"), proof("PcProof"))
+}
+
+/// With `data` on a Windows builder, the outputs pull goes over the data channel: the request asks for it from this
+/// PC's loopback address, the log says the pull's bytes, which are the box's own sent count, and the built file is
+/// installed with the bytes the command wrote, as the ssh pull installs them.
+#[test]
+fn an_outputs_pull_with_data_goes_over_the_data_channel_and_installs_what_was_built() {
+    let case = channel_case("client-channel-pull", Some("127.0.0.1"));
+
+    let (steps, outcome) = channel_run(&case, ("ssh", "out.log"), free_channel_port(), "built over the channel");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs"]);
+    let sent = last_request(&steps);
+    assert_eq!(sent["Channel"]["Address"], json!("127.0.0.1"), "{sent}");
+    assert_eq!(sent["Channel"]["Peer"], json!("127.0.0.1"), "{sent}");
+    let log = out_log(&case);
+    let pulled = Regex::new(CHANNEL_PULL).expect("the pattern compiles").captures(&log);
+    let bytes = pulled.map(|found| found[1].to_owned());
+    assert!(bytes.is_some(), "the pull line is in the log: {log}");
+    let sent_line = format!("gate: data channel sent {} bytes sha256 ", bytes.unwrap_or_default());
+    assert!(log.contains(&sent_line), "the box sent what the PC counted: {log}");
+    assert!(!log.contains("gate: data channel not used"), "{log}");
+    let installed = fs::read_to_string(case.folder().join("bin").join("new.txt")).expect("the built file is installed");
+    assert_eq!(installed, "built over the channel");
+    assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
+}
+
+/// With no `data`, the outputs pull is today's: its request asks for no channel and the log says nothing of one.
+#[test]
+fn an_outputs_pull_without_data_asks_for_no_channel_and_logs_none() {
+    let case = channel_case("client-channel-none", None);
+
+    let (steps, outcome) = channel_run(&case, ("ssh", "out.log"), free_channel_port(), "built over ssh");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs"]);
+    let sent = last_request(&steps);
+    assert!(sent.get("Channel").is_none(), "{sent}");
+    assert!(!out_log(&case).contains("gate: data channel"), "{}", out_log(&case));
+    let installed = fs::read_to_string(case.folder().join("bin").join("new.txt")).expect("the built file is installed");
+    assert_eq!(installed, "built over ssh");
+}
+
+/// Each run's outputs call draws its own two proofs: two runs ask with four different ones.
+#[test]
+fn two_runs_outputs_calls_carry_different_proofs() {
+    let case = channel_case("client-channel-proofs", Some("127.0.0.1"));
+
+    let (first_steps, first) = channel_run(&case, ("ssh", "out.log"), free_channel_port(), "first");
+    let first_proofs = channel_proofs(&first_steps);
+    let (second_steps, second) = channel_run(&case, ("ssh2", "out2.log"), free_channel_port(), "second");
+    let second_proofs = channel_proofs(&second_steps);
+
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(second.code, Some(0), "{second:?}");
+    let all = [&first_proofs.0, &first_proofs.1, &second_proofs.0, &second_proofs.1];
+    for (at, proof) in all.iter().enumerate() {
+        assert!(all[at + 1..].iter().all(|other| other != proof), "every proof differs: {all:?}");
+    }
+}
+
+/// What of the outputs request kept by the steps file `steps` carries no proof's hex but only the proofs: the request's
+/// base64 word, and for each proof the 32 characters of the word that encode only its hex digits.
+fn proof_words(steps: &Path) -> Vec<String> {
+    let input = fs::read_to_string(beside(steps, ".input")).expect("the stand-in kept the call's input");
+    let word = input.lines().next().expect("the input has a request line").to_owned();
+    let json = STANDARD.decode(&word).expect("the request is base64");
+    let (box_proof, pc_proof) = channel_proofs(steps);
+    let mut words = vec![word.clone()];
+    for proof in [box_proof, pc_proof] {
+        let at = json
+            .windows(proof.len())
+            .position(|window| window == proof.as_bytes())
+            .expect("the request carries the proof's hex");
+        // The first whole group of three bytes inside the proof's 32 digits: its four characters, and the next 28,
+        // encode 24 of those digits alone.
+        let start = at.div_ceil(3) * 4;
+        words.push(word[start..start + 32].to_owned());
+    }
+    words
+}
+
+/// No proof the request carried reaches the run's log, its journal or its console, as hex or inside the request's
+/// base64 word.
+#[test]
+fn a_channel_pull_s_proofs_appear_in_no_log_journal_or_console_output() {
+    let case = channel_case("client-channel-secret", Some("127.0.0.1"));
+
+    let (steps, outcome) = channel_run(&case, ("ssh", "out.log"), free_channel_port(), "kept secret");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        Regex::new(CHANNEL_PULL).expect("the pattern compiles").is_match(&out_log(&case)),
+        "the pull went over the channel"
+    );
+    let (box_proof, pc_proof) = channel_proofs(&steps);
+    let words = proof_words(&steps);
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let journal = fs::read_to_string(case.root().join("events.jsonl")).expect("the journal was written");
+    for (what, text) in [
+        ("log", &log),
+        ("journal", &journal),
+        ("stdout", &outcome.stdout),
+        ("stderr", &outcome.stderr),
+    ] {
+        for proof in [&box_proof, &pc_proof] {
+            assert!(!text.to_ascii_lowercase().contains(proof.as_str()), "the {what} holds no proof");
+        }
+        for word in &words {
+            assert!(!text.contains(word.as_str()), "the {what} holds no part of the request word");
+        }
+    }
+}
+
+/// Two channel pulls in a row on a one-port range both go over the channel: the PC closes first, so the box's port is
+/// free again for the next.
+#[test]
+fn two_channel_pulls_in_a_row_on_one_port_both_go_over_the_channel() {
+    let case = channel_case("client-channel-one-port", Some("127.0.0.1"));
+    let port = free_channel_port();
+    let pulled = Regex::new(CHANNEL_PULL).expect("the pattern compiles");
+
+    let (_, first) = channel_run(&case, ("ssh", "out.log"), port, "first");
+    let (_, second) = channel_run(&case, ("ssh2", "out2.log"), port, "second");
+
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert!(
+        pulled.is_match(&out_log(&case)),
+        "the first pull went over the channel: {}",
+        out_log(&case)
+    );
+    assert_eq!(second.code, Some(0), "{second:?}");
+    let second_log = log_texts(&case.folder().join("out2.log"));
+    assert!(pulled.is_match(&second_log), "the second pull went over the channel: {second_log}");
+    let installed = fs::read_to_string(case.folder().join("bin").join("new.txt")).expect("the built file is installed");
+    assert_eq!(installed, "second");
+}
+
+/// A routed run of `case` logging to `log` whose command writes `content` to `bin\new.txt`, through the stand-in's
+/// steps file `name`: the preflight, the run call, the outputs call, whose request the stand-in keeps, and a second
+/// outputs call, the pull over ssh a `channel` refusal leads to. Every box call is given a data channel on the loopback
+/// port `port` alone and the box seams `box_seams` after it, and the run the options `extra`. The steps file and the
+/// run's outcome.
+fn channel_run_tuned(case: &Case, (name, log): (&str, &str), (port, box_seams): (u16, &str), extra: &[&str], content: &str) -> (PathBuf, Outcome) {
+    let fed = format!("fed-hold {}", shown(&case.folder()));
+    let steps = ssh_steps(case, name, &["ok", "ok", &fed, "ok"]);
+    let tuned = Tuned { extra, ..Tuned::default() };
+    let mut gate = client_gate_tuned(case, log, &steps, &tuned, &[r".\tool.exe", "write", r"bin\new.txt", content]);
+    gate.env(
+        BOX_SEAMS_VARIABLE,
+        format!("--test-box-channel-ports {port}-{port} {box_seams}").trim_end(),
+    );
+    (steps, finish(gate))
+}
+
+/// The box's line saying why its data channel did not complete, as the run's log holds it.
+const NOT_COMPLETED: &str = "gate: data channel not completed: ";
+
+/// A channel pull ends on the PC's close, never on a box-side window: with the box's accept window and idle limit an
+/// hour, past the suite's hang guards, the run still pulls over the channel, so the box's wait for the PC's close after
+/// the ack ended at that close and the box exited after it; and the log holds no line of a channel wait that ran out.
+#[test]
+fn a_channel_pull_ends_on_the_pc_s_close_without_sitting_out_a_box_side_window() {
+    let case = channel_case("client-channel-close", Some("127.0.0.1"));
+    let windows = "--test-box-channel-accept-ms 3600000 --test-box-channel-idle-ms 3600000";
+
+    let (steps, outcome) = channel_run_tuned(&case, ("ssh", "out.log"), (free_channel_port(), windows), &[], "closed first");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs"]);
+    let log = out_log(&case);
+    assert!(
+        Regex::new(CHANNEL_PULL).expect("the pattern compiles").is_match(&log),
+        "the pull went over the channel: {log}"
+    );
+    assert!(!log.contains(NOT_COMPLETED), "no channel wait ran out: {log}");
+    assert!(!log.contains("gate: data channel not used"), "{log}");
+    let installed = fs::read_to_string(case.folder().join("bin").join("new.txt")).expect("the built file is installed");
+    assert_eq!(installed, "closed first");
+}
+
+/// A channel pull of `case` whose PC side takes the fault `fault` (`--test-remote-channel-fault`), its stand-in's steps
+/// file `ssh`, logging to `out.log`, the command writing `content`: the steps file and the run's outcome.
+fn faulted_run(case: &Case, fault: &str, content: &str) -> (PathBuf, Outcome) {
+    let extra = ["--test-remote-channel-fault", fault];
+    channel_run_tuned(case, ("ssh", "out.log"), (free_channel_port(), ""), &extra, content)
+}
+
+/// Asserts that the run of `case` that ended as `outcome`, through the steps file `steps`, pulled its outputs over ssh
+/// after the box refused its data channel: the outputs call made twice, the not-used line saying why as `why` starts,
+/// the box's line saying why its channel did not complete as `box_why` starts, no pull line, and the built file
+/// installed whole with `content`, with no archive or stage left.
+fn assert_pulled_over_ssh(case: &Case, (steps, outcome): (&Path, &Outcome), (why, box_why): (&str, &str), content: &str) {
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(steps), ["preflight", "run", "outputs", "outputs"]);
+    let log = out_log(case);
+    let not_used = format!("gate: data channel not used: {why}");
+    assert!(
+        log.lines().any(|line| line.starts_with(&not_used) && line.ends_with("; sent over ssh")),
+        "{log}"
+    );
+    assert!(log.contains(&format!("{NOT_COMPLETED}{box_why}")), "the box refused the channel: {log}");
+    assert!(
+        !Regex::new(CHANNEL_PULL).expect("the pattern compiles").is_match(&log),
+        "nothing came over the channel: {log}"
+    );
+    let installed = fs::read_to_string(case.folder().join("bin").join("new.txt")).expect("the built file is installed");
+    assert_eq!(installed, content, "the ssh pull installed the archive whole");
+    assert_eq!(outputs_leftovers(case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
+}
+
+/// A PC that takes the box's proof for a mismatch sends nothing on the channel and drops it: the box, given no proof of
+/// the PC's, refuses the channel, and the run pulls over ssh.
+#[test]
+fn a_box_proof_the_pc_refuses_gets_no_byte_and_the_run_pulls_over_ssh() {
+    let case = channel_case("client-channel-box-proof", Some("127.0.0.1"));
+
+    let (steps, outcome) = faulted_run(&case, "box-proof", "proof refused");
+
+    assert_pulled_over_ssh(
+        &case,
+        (&steps, &outcome),
+        ("the box's proof does not match", "the PC closed the channel before its proof"),
+        "proof refused",
+    );
+}
+
+/// A PC that stops after half the archive and drops the channel without an ack installs nothing from it: the box
+/// refuses the channel, and the ssh pull installs the archive whole.
+#[test]
+fn a_truncated_channel_pull_installs_nothing_and_the_ssh_pull_installs_the_archive_whole() {
+    let case = channel_case("client-channel-truncate", Some("127.0.0.1"));
+
+    let (steps, outcome) = faulted_run(&case, "truncate", "truncated");
+
+    assert_pulled_over_ssh(&case, (&steps, &outcome), ("the test seam stopped the pull after ", ""), "truncated");
+}
+
+/// A PC that read an altered archive acks what it read, which the box's check refuses: nothing installs from the
+/// channel, and the ssh pull installs the archive whole.
+#[test]
+fn an_altered_channel_pull_is_refused_and_the_ssh_pull_installs_the_archive_whole() {
+    let case = channel_case("client-channel-alter", Some("127.0.0.1"));
+
+    let (steps, outcome) = faulted_run(&case, "alter", "altered");
+
+    let why = "the PC's acknowledgement does not match what was sent";
+    assert_pulled_over_ssh(&case, (&steps, &outcome), (why, why), "altered");
+}
+
+/// A PC that read the whole archive and drops the channel before its ack installs nothing from it: the box keeps the
+/// archive and refuses the channel, and the ssh pull installs it whole.
+#[test]
+fn a_channel_dropped_before_the_ack_leaves_the_archive_to_the_ssh_pull() {
+    let case = channel_case("client-channel-no-ack", Some("127.0.0.1"));
+
+    let (steps, outcome) = faulted_run(&case, "no-ack", "not acked");
+
+    let why = "the test seam dropped the channel before the PC's acknowledgement";
+    assert_pulled_over_ssh(&case, (&steps, &outcome), (why, ""), "not acked");
+}

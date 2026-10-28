@@ -13,7 +13,9 @@
 //! `--test-box-kill-leaves <n>`, `--test-probe-limit-ms <n>`, `--test-probe-drain-ms <n>`, `--test-box-desktop <fault>`,
 //! `--test-box-desktop-session <state>`, `--test-box-desktop-mutex <name>`, `--test-box-desktop-ms <n>`,
 //! `--test-box-desktop-message-ms <n>` and `--test-box-register ok|fail`, `--test-box-root-walk-stop <folder>`,
-//! `--test-box-git-limit <step>:<ms>` and `--test-box-git-armed-by <path>` (each also as `--<seam>=<value>`) before the
+//! `--test-box-git-limit <step>:<ms>`, `--test-box-git-armed-by <path>`, `--test-box-channel-ports <first>-<last>`,
+//! `--test-box-channel-accept-ms <n>`, `--test-box-channel-idle-ms <n>` and `--test-box-channel-send-buffer-bytes <n>`
+//! (each also as `--<seam>=<value>`) before the
 //! verb; without the feature each is no verb, and so the box usage.
 
 use std::ffi::{OsStr, OsString};
@@ -45,6 +47,11 @@ const MOST_HOLD_SECONDS: u64 = 604_800;
 /// The values `--test-box-register` takes: the registration succeeds, or fails as the seam refusing.
 #[cfg(feature = "test-seams")]
 const REGISTER_RESULTS: &[&str] = &["ok", "fail"];
+
+/// The largest send buffer `--test-box-channel-send-buffer-bytes` takes: the 16 MiB a data channel's connection gets
+/// without it.
+#[cfg(feature = "test-seams")]
+const CHANNEL_SEND_BUFFER_MOST: u32 = 16 * 1024 * 1024;
 
 /// Reads the words after `gate box`: the seams, then a verb, then exactly `--stdin`, and nothing after it; or, for
 /// `register-desktop`, which reads no request, nothing after the verb at all; or, for `prune`, exactly `--root` and
@@ -251,6 +258,14 @@ enum Seam {
     GitArmedBy,
     /// `--test-box-hold-poll-ms <n>`: how long `hold` waits between its looks for a free slot, in milliseconds.
     HoldPollMs,
+    /// `--test-box-channel-ports <first>-<last>`: the ports a data channel may listen on.
+    ChannelPorts,
+    /// `--test-box-channel-accept-ms <n>`: how long a data channel waits for the PC's connection.
+    ChannelAcceptMs,
+    /// `--test-box-channel-idle-ms <n>`: how long each read and write of a data channel may wait.
+    ChannelIdleMs,
+    /// `--test-box-channel-send-buffer-bytes <n>`: the send buffer a data channel's connection gets.
+    ChannelSendBufferBytes,
 }
 
 #[cfg(feature = "test-seams")]
@@ -289,6 +304,10 @@ impl Seam {
             "--test-box-git-limit" => Some(Seam::GitLimit),
             "--test-box-git-armed-by" => Some(Seam::GitArmedBy),
             "--test-box-hold-poll-ms" => Some(Seam::HoldPollMs),
+            "--test-box-channel-ports" => Some(Seam::ChannelPorts),
+            "--test-box-channel-accept-ms" => Some(Seam::ChannelAcceptMs),
+            "--test-box-channel-idle-ms" => Some(Seam::ChannelIdleMs),
+            "--test-box-channel-send-buffer-bytes" => Some(Seam::ChannelSendBufferBytes),
             _ => None,
         }
     }
@@ -326,6 +345,10 @@ impl Seam {
             Seam::GitLimit => "--test-box-git-limit",
             Seam::GitArmedBy => "--test-box-git-armed-by",
             Seam::HoldPollMs => "--test-box-hold-poll-ms",
+            Seam::ChannelPorts => "--test-box-channel-ports",
+            Seam::ChannelAcceptMs => "--test-box-channel-accept-ms",
+            Seam::ChannelIdleMs => "--test-box-channel-idle-ms",
+            Seam::ChannelSendBufferBytes => "--test-box-channel-send-buffer-bytes",
         }
     }
 }
@@ -411,6 +434,12 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::DesktopMessageMs => seams.desktop_message_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::GitLimit => seams.git_limit = Some(crate::values::git_limit(name, &value)?),
         Seam::GitArmedBy => seams.git_armed_by = Some(PathBuf::from(value)),
+        Seam::ChannelPorts => seams.channel_ports = Some(crate::values::port_range(name, &value)?),
+        Seam::ChannelAcceptMs => seams.channel_accept_ms = Some(crate::values::above_zero(name, &value)?),
+        Seam::ChannelIdleMs => seams.channel_idle_ms = Some(crate::values::above_zero(name, &value)?),
+        Seam::ChannelSendBufferBytes => {
+            seams.channel_send_buffer_bytes = Some(crate::values::in_range(name, &value, 1, CHANNEL_SEND_BUFFER_MOST)?);
+        }
         Seam::Register => seams.register_ok = Some(crate::values::remote_call(name, &value, REGISTER_RESULTS)? == "ok"),
         Seam::Console => seams.fail_console = the_word(name, value, "fail-before", |option, value| Problem::BadConsoleFailure { option, value })?,
         Seam::Token => seams.refuse_token = the_word(name, value, "refused", |option, value| Problem::BadTokenRefusal { option, value })?,

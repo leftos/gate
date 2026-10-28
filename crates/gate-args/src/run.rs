@@ -125,6 +125,8 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     TailscaleHoldStartMs,
     #[cfg(feature = "test-seams")]
+    RemoteChannelFault,
+    #[cfg(feature = "test-seams")]
     ConfirmMs,
     #[cfg(feature = "test-seams")]
     PushSsh,
@@ -404,6 +406,7 @@ impl RunBuilder {
             | ValueOption::TailscaleDelayMs
             | ValueOption::TailscaleWaitMs
             | ValueOption::TailscaleHoldStartMs
+            | ValueOption::RemoteChannelFault
             | ValueOption::ConfirmMs
             | ValueOption::PushSsh
             | ValueOption::PushBoundMs
@@ -468,6 +471,9 @@ impl RunBuilder {
             ValueOption::TailscaleDelayMs => seams.tailscale_delay_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::TailscaleWaitMs => seams.tailscale_wait_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::TailscaleHoldStartMs => seams.tailscale_hold_start_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::RemoteChannelFault => {
+                seams.remote_channel_fault = Some(values::remote_call(spelled, value, values::CHANNEL_FAULTS)?);
+            }
             ValueOption::WarmWaitMs => seams.warm_wait_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::ConfirmMs => self.cutover_seams.confirm_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::PushSsh => self.push_seams.ssh = Some(PathBuf::from(value)),
@@ -662,8 +668,8 @@ impl RunBuilder {
     /// `--test-local-sdks`,
     /// `--test-remote-fetch-cap-bytes`,
     /// `--test-remote-apply-cap-bytes`, `--test-remote-outputs-budget-bytes`, `--test-remote-inputs-budget-bytes`,
-    /// `--test-remote-lfs-budget-bytes`, `--test-remote-log-cap-bytes` and
-    /// `--test-remote-tamper` without
+    /// `--test-remote-lfs-budget-bytes`, `--test-remote-log-cap-bytes`, `--test-remote-tamper` and
+    /// `--test-remote-channel-fault` without
     /// `--test-remote-transport`,
     /// whose client alone reads them, `--test-remote-timeout-ms` with it unless `--test-remote-watch-call` names a call
     /// other than `run`, and `--test-remote-snapshot` with it, as each chooses the client.
@@ -694,6 +700,7 @@ impl RunBuilder {
             (self.test_seams.remote_lfs_budget_bytes.is_some(), "--test-remote-lfs-budget-bytes"),
             (self.test_seams.remote_log_cap_bytes.is_some(), "--test-remote-log-cap-bytes"),
             (self.test_seams.remote_tamper.is_some(), "--test-remote-tamper"),
+            (self.test_seams.remote_channel_fault.is_some(), "--test-remote-channel-fault"),
         ] {
             if read && !transport {
                 self.problems.push(Problem::SeamNeeds {

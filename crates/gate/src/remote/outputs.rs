@@ -19,12 +19,13 @@ use std::time::{Duration, Instant};
 use gate_inputs::failure;
 use gate_router::escaped;
 use gate_state::v1;
-use gate_wire::{PathForm, archive_file_name, trees};
+use gate_wire::{PathForm, archive_file_name, channel_sent_line, trees};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo, GetFileInformationByHandle, SetFileInformationByHandle,
 };
 
+use super::channel::{self, Dialled};
 use super::client::{self, Attempt, Called, End, Limits, RawSink, Transferred, Watch};
 use super::git::{FAILURE_BYTES, first_bytes};
 use super::install::{self, Fetched};
@@ -375,11 +376,11 @@ pub(super) fn marked(sent: &Sent<'_>) -> Result<(), End> {
 /// says. A passing run whose box packed nothing first records its builder as the work folder's last complete outputs
 /// pull ([`recorded`]), then removes the pending marker and the outputs cap record ([`uncapped`]), unless the route
 /// withheld its outputs, when it touches neither; a record it cannot write is said and leaves the marker, so the next
-/// run is full, while one that cannot be removed is said and the run's status stands. A withheld run whose send of the PC's build landed has no marker, but still its outputs step. The other
-/// ends that do not reach [`fetched`] leave both. A run whose command failed brings back its test reports and the files
-/// under its failure output globs when its box packed them, as [`reports_end`] says, keeping its status, and otherwise
-/// says nothing and leaves both. A run with only failure output globs takes the same steps: its passing command's box
-/// packs nothing.
+/// run is full, while one that cannot be removed is said and the run's status stands. A withheld run whose send of the
+/// PC's build landed has no marker, but still its outputs step. The other ends that do not reach [`fetched`] leave
+/// both. A run whose command failed brings back its test reports and the files under its failure output globs when its
+/// box packed them, as [`reports_end`] says, keeping its status, and otherwise says nothing and leaves both. A run with
+/// only failure output globs takes the same steps: its passing command's box packs nothing.
 ///
 /// The attempt's outputs are marked brought back only when a passing run's install ends complete, as
 /// [`install::installed`] says, or when its box packed nothing for a manifest that held files under its output globs
@@ -703,8 +704,13 @@ fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced
         .map_or_else(|| started.elapsed(), |last| last.saturating_duration_since(started));
     // A Ctrl+C raised by the call's end is read once, so the early end's line and `judged` agree on a pull not whole.
     let interrupted = attempt.go_on().is_err();
-    if !matches!(&called, Ok(called) if pulled_whole(called, interrupted)) {
-        attempt.say(pull_ended_line(bringing, pulled, attempt.pulled_bytes));
+    match &called {
+        Ok(called) if pulled_whole(called, interrupted) => {
+            if let Some(line) = channel_pull_line(called) {
+                attempt.logged(&line);
+            }
+        }
+        _ => attempt.say(pull_ended_line(bringing, pulled, attempt.pulled_bytes)),
     }
     match called {
         // `judged` hands back the run's end so far only when the archive was fetched whole, and `called` a cut when it
@@ -801,10 +807,35 @@ fn failure(called: &Called) -> String {
     }
 }
 
-/// Whether the outputs call that ended as `called` brought its archive whole: it ended 0, uncut, and no Ctrl+C was
-/// raised by its end (`interrupted`). [`judged`] hands back the run's end so far for such a pull alone.
+/// Whether the outputs call that ended as `called` brought its archive whole: it ended 0, uncut, no Ctrl+C was raised
+/// by its end (`interrupted`), and, for a call whose archive came over a data channel, the box's own line on the call's
+/// ssh stderr says the bytes and SHA-256 the PC counted ([`channel_whole`]). [`judged`] hands back the run's end so far
+/// for such a pull alone.
 fn pulled_whole(called: &Called, interrupted: bool) -> bool {
-    !interrupted && called.cut.is_none() && called.status == 0
+    !interrupted && called.cut.is_none() && called.status == 0 && channel_whole(called)
+}
+
+/// Whether what came over the outputs call's data channel is what the box says it sent: true for a call that asked for
+/// no channel; for one that did, only once the PC acked a pull whose count and SHA-256 are the box's last sent line's,
+/// read on ssh, never from the channel.
+fn channel_whole(called: &Called) -> bool {
+    match &called.channel {
+        None => true,
+        Some(Dialled::Pulled { bytes, sha256, .. }) => {
+            let sent = channel_sent_line(*bytes, sha256);
+            called.channel_sent.as_deref().is_some_and(|line| line.ends_with(&sent))
+        }
+        Some(_) => false,
+    }
+}
+
+/// The line the log gets for the outputs call that ended as `called`, judged whole ([`pulled_whole`]), when its archive
+/// came over a data channel ([`channel::pull_line`]); `None` for a call whose archive came over ssh.
+fn channel_pull_line(called: &Called) -> Option<String> {
+    match &called.channel {
+        Some(Dialled::Pulled { bytes, took, .. }) => Some(channel::pull_line(*bytes, *took)),
+        _ => None,
+    }
 }
 
 /// `end`, that of a fetch of what `bringing` names that did not end whole, the worktree's outputs cap record removed
@@ -2238,6 +2269,7 @@ mod tests {
             root: Some("/Users/b/gate-remote".to_owned()),
             slots: 1,
             id: Some("1f0efc62".to_owned()),
+            data: None,
         });
 
         /// A call running in `root`, its state under `state` and its lines written to `log`.
@@ -2701,5 +2733,46 @@ mod tests {
             found.len(),
             line.len()
         );
+    }
+
+    /// The SHA-256 the PC counted over the channel in the cases below.
+    const PULLED_SHA: &str = "aa00000000000000000000000000000000000000000000000000000000000001";
+
+    /// An outputs call that exited 0 having pulled 4096 bytes whose SHA-256 is [`PULLED_SHA`] over a data channel, and
+    /// whose ssh stderr said `sent` as the box's sent line, or none.
+    fn channel_pulled(sent: Option<String>) -> crate::remote::client::Called {
+        let mut called = crate::remote::client::Called::exited_for_tests(0);
+        called.channel = Some(super::Dialled::Pulled {
+            bytes: 4096,
+            sha256: PULLED_SHA.to_owned(),
+            took: Duration::from_millis(1_500),
+        });
+        called.channel_sent = sent.map(|line| format!("[box] {line}"));
+        called
+    }
+
+    #[test]
+    fn a_channel_pull_whose_sent_line_says_the_bytes_and_sha_the_pc_counted_is_whole_and_says_its_pull_line() {
+        let called = channel_pulled(Some(gate_wire::channel_sent_line(4096, PULLED_SHA)));
+
+        assert!(super::pulled_whole(&called, false));
+        assert_eq!(
+            super::channel_pull_line(&called).as_deref(),
+            Some("gate: data channel: pull 4096 in 1.5 s")
+        );
+    }
+
+    /// The PC's own compare of what it pulled with the box's sent line: another SHA-256, another count, or no sent line
+    /// at all each leave the pull not whole, so nothing is installed from it and no pull line is said.
+    #[test]
+    fn a_channel_pull_whose_sent_line_differs_or_is_missing_is_not_whole() {
+        let other_sha = "bb00000000000000000000000000000000000000000000000000000000000002";
+        for (sent, what) in [
+            (Some(gate_wire::channel_sent_line(4096, other_sha)), "another SHA-256"),
+            (Some(gate_wire::channel_sent_line(4095, PULLED_SHA)), "another byte count"),
+            (None, "no sent line"),
+        ] {
+            assert!(!super::pulled_whole(&channel_pulled(sent), false), "{what}");
+        }
     }
 }

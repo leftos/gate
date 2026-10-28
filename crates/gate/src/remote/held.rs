@@ -402,6 +402,7 @@ pub(super) mod tests {
                     root: None,
                     slots: 1,
                     id: None,
+                    data: None,
                 },
                 root: root.to_owned(),
                 root_id: id_of(&self.folder("app")),

@@ -40,7 +40,7 @@
 //! of `tools`, `/usr/bin` and the first folder holding a `git.exe` along `PATH` alone.
 //!
 //! `ok` runs `<gate> box <verb> --stdin` with the gate the variable `GATE_FAKE_SSH_GATE` names, a `run`, `lfs`,
-//! `inputs` or `drain` call given the words of the variable `GATE_FAKE_SSH_BOX_SEAMS`, when set, before its verb as box
+//! `inputs`, `drain` or `outputs` call given the words of the variable `GATE_FAKE_SSH_BOX_SEAMS`, when set, before its verb as box
 //! seams, and a `preflight` call those of `GATE_FAKE_SSH_PREFLIGHT_SEAMS` the same way, a `preflight` or `drain` call
 //! then `--test-box-root-walk-stop <folder>` when the variable `GATE_FAKE_SSH_ROOT_WALK_STOP` names the folder, one path
 //! never split; a keyed prune's line, `<exe> box prune --root <root> --keys <key>...`, which has no `--stdin`, runs
@@ -697,7 +697,7 @@ impl<'a> BoxCall<'a> {
         let mut command = Command::new(variable("GATE_FAKE_SSH_GATE")?);
         command.arg("box");
         let seams = match self.verb {
-            "run" | "lfs" | "inputs" | "drain" => Some("GATE_FAKE_SSH_BOX_SEAMS"),
+            "run" | "lfs" | "inputs" | "drain" | "outputs" => Some("GATE_FAKE_SSH_BOX_SEAMS"),
             "preflight" => Some("GATE_FAKE_SSH_PREFLIGHT_SEAMS"),
             _ => None,
         };

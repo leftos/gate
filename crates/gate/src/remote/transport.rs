@@ -636,6 +636,7 @@ mod tests {
             root: Some("/Users/b/gate-remote".to_owned()),
             slots: 1,
             id: Some("00000000".to_owned()),
+            data: None,
         };
         Profile::of(&builder, r"D:\gate-remote")
     }
@@ -648,6 +649,7 @@ mod tests {
             root: None,
             slots: 1,
             id: None,
+            data: None,
         };
         let ssh = Ssh {
             program: PathBuf::from(r"C:\Program Files\OpenSSH\ssh.exe"),
@@ -680,6 +682,7 @@ mod tests {
             root: Some(r"E:\remote".to_owned()),
             slots: 1,
             id: Some("084c286b".to_owned()),
+            data: None,
         };
         let local = Local::new(r"local:C:\builder", None).expect("a local transport");
         let ssh = Ssh {
@@ -701,6 +704,7 @@ mod tests {
             root: Some("/Users/b/gate-remote".to_owned()),
             slots: 1,
             id: Some("1f0efc62".to_owned()),
+            data: None,
         };
         assert_eq!(local.profile(&mac).root(), "/Users/b/gate-remote", "a macOS entry keeps its own root");
     }
@@ -713,6 +717,7 @@ mod tests {
             root: None,
             slots: 1,
             id: None,
+            data: None,
         }
     }
 

@@ -114,6 +114,13 @@ pub enum Problem {
     /// A `--test-box-git-armed-by` given without the `--test-box-git-limit` whose bound it arms.
     #[cfg(feature = "test-seams")]
     GitArmedByNeedsLimit,
+    /// A `--test-box-channel-ports` value that is not two ports from 1 to 65535 joined by `-`, the first not above the
+    /// last.
+    #[cfg(feature = "test-seams")]
+    BadPortRange {
+        option: String,
+        value: String,
+    },
     NeedsValue(String),
     /// A bare `--timeout auto`, which carries no floor.
     AutoNeedsFloor(String),
@@ -229,6 +236,11 @@ impl fmt::Display for Problem {
             Problem::BadGitLimit { option, value } => write!(f, "gate: {option} must be <step>:<ms>, got '{value}'"),
             #[cfg(feature = "test-seams")]
             Problem::GitArmedByNeedsLimit => f.write_str("gate: --test-box-git-armed-by needs --test-box-git-limit"),
+            #[cfg(feature = "test-seams")]
+            Problem::BadPortRange { option, value } => write!(
+                f,
+                "gate: {option} must be <first>-<last>, ports from 1 to 65535 with the first not above the last, got '{value}'"
+            ),
             Problem::NeedsValue(option) => write!(f, "gate: {option} needs a value"),
             Problem::AutoNeedsFloor(option) => write!(f, "gate: {option} auto needs a floor in seconds: auto:<n>"),
             Problem::GivenTwice(option) => write!(f, "gate: {option} is given twice"),

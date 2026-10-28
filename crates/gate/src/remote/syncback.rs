@@ -3711,6 +3711,7 @@ mod tests {
                 root: None,
                 slots: 1,
                 id: None,
+                data: None,
             },
             root: root.clone(),
             root_id: crate::route::root_id(&root).expect("the main worktree's id is read"),

@@ -1449,11 +1449,14 @@ The optional `hosts` is an array of strings naming further builders, which `gate
 
 The push order is `host`, then `hosts` in file order, an entry equal to an earlier one in any letter case skipped. A `hosts` that is not an array of strings, or holds a bad entry, never affects routing: `gate push` alone refuses the file with `push: ignored <path>: <reason>`.
 
-The optional `builders` is an array of further builders that a routed run can go to, each `{"host", "os", "root", "slots", "routed", "repos", "outputs", "failureOutputs", "crossBuild"}`:
+The optional `builders` is an array of further builders that a routed run can go to, each `{"host", "os", "root", "slots", "data", "routed", "repos", "outputs", "failureOutputs", "crossBuild"}`:
 - `host` is the builder's ssh alias, passing the checks the top-level `host` does (`Builder::alias`).
 - `os` is `windows` or `macos` in any letter case.
 - `root` is the builder's work root. It is required for `macos`: an absolute path rooted at `/`, each name made of ASCII letters, digits, `.`, `_` and `-`, none empty, `.` or `..`. For `windows` it defaults to `D:\gate-remote` and must be `X:\` followed by names joined by `\`, each made of ASCII letters, digits, `.`, `_` and `-`, none starting or ending with `.` or a reserved device name; `/` is refused (`builders[N].root must be an absolute drive path for a windows builder`).
 - `slots` is 1 to 16, default 1.
+- `data` is an optional string, the builder's tailnet IPv4 address in dotted form, the one address a [data channel](GLOSSARY.md) dials; a value that is not an IPv4 address makes the file unusable (`builders[N].data must be an IPv4 address`), and so does the unspecified address, the broadcast address or a multicast address (`builders[N].data must be a unicast IPv4 address`).
+
+  A builder with no `data`, `host` and every `hosts` entry send every byte over ssh, exactly as before. Only a `windows` entry's `data` is used: a `macos` entry with one still gets no channel.
 - `routed` is an optional boolean, default `true`; a value that is not `true` or `false` makes the file unusable (`builders[N].routed must be true or false`). With `false` the entry is a not-routed builder: `repos` may be empty or missing and no unpinned run picks or tries it, while `gate push`, `gate check --builder` and `gate run --builder` reach it like any `builders` entry.
 - `repos`, `outputs` and `failureOutputs` are the entry's own, shaped like the top-level ones.
 
@@ -3017,6 +3020,32 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The archive and the pending marker are kept for the install. The call's stderr goes to the log only.
 
+    **Data channel** (`remote/channel.rs`; the box's half is the `outputs` verb's, [The box side](#the-box-side)). A `windows` builder whose entry names `data` ([remote.json](#remotejson)) has the pull carried on a [data channel](GLOSSARY.md) instead of the call's stdout, with the ssh call as the control.
+
+    The outputs call's payload gains `Nonce`, drawn afresh for each attempt, and `Channel` (`Address` the builder's `data`, `Peer` this PC's own address toward it, found by a UDP connect to `data` that sends no packet, and `BoxProof` and `PcProof`, two 128-bit proofs drawn for the attempt from the same random source as the pipe names, as 32 lower-case hex digits each).
+
+    The payload is on the call's stdin, so no proof is on a command line, in the log, the journal, a note or an `End` text; the proof type has a redacting `Debug` and no `Display`.
+
+    A builder with no `data`, a `macos` builder and a build without the test seams given a loopback `data` take the ssh pull unchanged. A Mac box also refuses a `Channel` it is sent.
+
+    When the box's stderr says its port line `gate-remote-channel: <nonce> <port>` for this call's nonce and the box's size line, the PC dials `data` from its own address on the port, which must lie in 47100-47131 (a loopback `data` in a test build takes any port), within 10 s, in 200 ms slices that only look whether the call has ended.
+
+    It reads the box's proof first and sends nothing unless it matches, then sends its own, reads exactly the size the box's size line gave, and sends the SHA-256 of what it read as its ack. It then shuts the connection down and closes it first.
+
+    The PC keeps no idle timer of its own: each connect, proof and chunk marks the call's progress, so the stall watch covers a silent channel, and the thread closes the archive before the socket, within the call's 2 s drain of its end. A box that gives no size line gets no dial.
+
+    No length or digest is taken from the channel. The pull is whole only when the box's last ssh stderr line `gate: data channel sent <bytes> bytes sha256 <hex>` names the bytes and SHA-256 the PC counted; otherwise nothing is installed from it. A whole pull logs `gate: data channel: pull <bytes> in <s> s` (seconds to one decimal), to the log only. The box removes the archive only after the PC's ack matched.
+
+    The channel decides nothing about the pull's fate. A channel that did not complete (a refused connect, proof or archive, a drop before the ack) is answered by the box's `channel` refusal tag with status 75 over ssh once the control call has exited, and the pull is made again over ssh from byte 0, with `gate: data channel not used: <why>; sent over ssh` in the log only.
+
+    A socket error alone never starts the ssh pull, and after the ack matched nothing does.
+
+    `<why>` is the first that applies: the PC's own failure (for example `data address <addr> is loopback`, `cannot read this PC's address toward <addr>`, `the box's proof does not match`, `the box closed the channel after <got> of <size> bytes`), `the box said no archive size`, the box's own `gate: data channel not completed: ` text, `the channel did not end` (the PC's thread outlasting its 2 s drain), then `the box did not complete it`.
+
+    What the channel moved before the fallback counts into the pull's total in its ended line.
+
+    The test seam `--test-remote-channel-fault <kind>` ([The remote client's run](#routing)) drives each failure: the PC acts on the box's port line after its dial. It needs `--test-remote-transport` and exists only in a `test-seams` build.
+
     - A fetch the watchdog stops says its `gate: STALLED: ...` or `gate: TRANSFER TIMED OUT after 1800 s fetching the outputs` line (the ceiling counted from the fetch's own start), then `gate: remote outputs not brought back: the fetch was stopped by the watchdog after <size> in <n> s (<size>/s)`, and the run ends 124.
 
       The size is what the client's raw copy had received when the watchdog cut it, `<n>` the whole seconds since the fetch began (at least 1) and the rate the size over `<n>`, so a slow network (most of the archive arrived) reads apart from a hung builder (nothing did).
@@ -4104,6 +4133,16 @@ Built verbs:
 
   The Unix box answers `outputs` too, with its own folder modes and descriptor walk (Unix box differences: [The Unix box](#the-unix-box), `outputs`); the run does not yet bring outputs back there.
 
+  A payload with `Nonce` and `Channel` (`Address`, `Peer`, `BoxProof`, `PcProof`; a malformed one exits 2 with a usage line that shows no proof, `Address` may not be `0.0.0.0` nor, outside a `test-seams` build, loopback) has the archive sent over a [data channel](GLOSSARY.md) and not on stdout. Only once every check above passed and the archive is open as a plain file does the verb listen on `Address`.
+
+  It listens on a port of 47100-47131 tried from a random start upward with wraparound, bound exclusively (never shared) and not inheritable, and says `gate-remote-channel: <nonce> <port>` on stderr. It takes the first connection from `Peer` within 10 s (any other peer's is closed unread), sends `BoxProof`, reads the PC's 16 bytes within 10 s and checks them against `PcProof`.
+
+  It then sends the archive in 1 MiB chunks over a 16 MiB send buffer, each read and write waiting at most 10 s, reads the PC's 32-byte ack and compares it with the SHA-256 of what it sent. A matching ack makes it say `gate: data channel sent <bytes> bytes sha256 <hex>` on stderr, do what the ssh send would (remove the archive, or keep it under a drain), wait up to 10 s for the PC to close the connection and exit 0.
+
+  Any other end (no connection, a wrong proof, a stalled or gone peer, a wrong ack, a gone client, no free port) keeps the archive, says `gate-remote-refused: <nonce> channel` then `gate: data channel not completed: <why>` and exits 75, so the PC sends over ssh; the why never holds a proof.
+
+  The Windows box's seams are `--test-box-channel-ports <first>-<last>` (any ports within 1-65535 in place of the range), `--test-box-channel-accept-ms <n>` and `--test-box-channel-idle-ms <n>` (replacing the 10 s windows) and `--test-box-channel-send-buffer-bytes <n>` (1 B to 16 MiB), all test-seams only; the fake-ssh test bin hands the words of `GATE_FAKE_SSH_BOX_SEAMS` to an `outputs` call as to the other box verbs.
+
   A sent archive that cannot be removed prints `gate: remote could not remove the outputs archive <name>: <error>` and still exits 0; a later run's prune takes it. An archive already gone at its removal (another run's trim took it after it was sent) says nothing and exits 0.
 
 - **`inflight`** counts the routed runs holding a lock in the payload's `Root`, for the cutover's drain. It reads only `Root`; a trailing separator is folded off.
@@ -4643,6 +4682,8 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
   A member spelt otherwise than the manifest, in letter case alone included, is `the archive's member '<path>' is not in the manifest`. A copy whose device and inode match a manifest file found at its own spelling is never swept, and every recorded file is opened again and its stamp checked just before the record is sealed.
 - **`outputs`** (`outputs.rs`) answers the Windows box's `outputs` ([The box side](#the-box-side)) with the same payload (`Key`, `Work`, `OutputFolder`, `Name`), lines and statuses, and takes no lock; this lists where the Unix box differs. The run calls the module, so a Mac route brings outputs back.
 
+  The Unix box has no data channel: a payload with a `Channel` is refused, after the work folder and session reads, with `gate-remote-refused: <nonce> channel` then `gate: data channel not completed: this builder has no data channel` and exit 75 (a malformed `Channel` or `Nonce` is the payload's usage line); the PC never sends one to a `macos` builder.
+
   The output folder is `<root>/outputs`, made 0700 beneath the judged root, or adopted only when it is private (the box user's own, no mode letting another account in) and not a link; archives are `<key>-<32 hex digits>.tar.zst` with mode 0600, and a folder that cannot be made or adopted says `cannot make the output folder <folder>: it is not the box user's own or its mode lets another account in`. A work folder not below the work root is `the work folder is not below the work root`.
 
   The verb opens the archive without following a link and sends only a plain file: a link says the system's ELOOP text and anything else not plain says `it is not a plain file`, both as `gate: remote could not read the outputs archive <name>: <error>` (exit 1). An output folder or root the verb cannot open is that same line; a missing one is `does not exist`. A sent archive that cannot be removed is `gate: remote could not remove the outputs archive <name>: <error>` and the status stays 0.
@@ -5177,6 +5218,14 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   The first three are made before the client holds the run's folders, the last once the main repository's snapshot is taken (`remote/tamper.rs`).
 
   Refused without the transport with `gate: --test-remote-tamper needs --test-remote-transport`, and a value outside those four with `gate: --test-remote-tamper must be before-hold:case, before-hold:replace, before-hold:replace-root or after-first-snapshot:worktree, got '<v>'`. `--test-print-request` does not show it.
+
+  `--test-remote-channel-fault <kind>` makes the PC's side of an outputs pull's [data channel](GLOSSARY.md) take one fault once it dialled the box. It exists only in a `test-seams` build and needs `--test-remote-transport`, else `gate: --test-remote-channel-fault needs --test-remote-transport`.
+
+  The kinds are `box-proof` (the box's proof read is taken for a mismatch: the PC sends nothing and drops, with `the box's proof does not match`), `truncate` (stops after half the size and drops without an ack, `the test seam stopped the pull after <got> of <size> bytes`), `alter` (flips the first byte it reads, so the hash and the box's ack check fail) and `no-ack` (reads everything and drops before the ack, `the test seam dropped the channel before the PC's acknowledgement`).
+
+  Each ends with the box's `channel` refusal and the ssh pull installing the archive whole.
+
+  A kind outside the four is refused like the other call names.
 
   `--test-remote-timeout-ms <n>` (whole milliseconds above 0) applies only under `--test-remote-watch-call` naming a call other than `run`, as that call's transfer ceiling; given with `--test-remote-transport` without such a call it is refused with `gate: --test-remote-timeout-ms needs --test-remote-watch-call naming a call other than run`.
 

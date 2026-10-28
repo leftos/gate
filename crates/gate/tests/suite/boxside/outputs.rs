@@ -6,19 +6,23 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
+use gate_win32::socket::Stream;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
 use super::ReadBack;
 use super::{
-    BoxCall, bare_box_call, box_call, field, gate_box, git, git_folder, has_ref, path_for_run, payload, renamed, run_box, run_box_with_path, snapshot,
+    BoxCall, bare_box_call, box_call, ended_within, field, gate_box, git, git_folder, has_ref, path_for_run, payload, renamed, run_box,
+    run_box_with_path, snapshot,
 };
-use crate::support::{Case, FAKE_TOOL, Outcome, box_payload, shown};
+use crate::support::{Case, FAKE_TOOL, HANG_GUARD, Outcome, Running, box_payload, shown};
 
 /// The ignore file of an outputs case's snapshot: `bin/` is build output, so no back commit carries it.
 const IGNORE_BIN: (&str, &str) = (".gitignore", "bin/\n");
@@ -1189,4 +1193,471 @@ fn box_outputs_says_an_archive_that_does_not_exist() {
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
     assert_eq!(outcome.stdout, "");
     assert_eq!(outcome.stderr, format!("gate: remote outputs archive {name} does not exist\n"));
+}
+
+/// The proof the box sends first over a case's data channel.
+const BOX_PROOF: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+/// The proof a case's PC sends back.
+const PC_PROOF: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+
+/// The bytes the hex digits `hex` spell.
+fn hex_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("the case's hex is hex"))
+        .collect()
+}
+
+/// A loopback port free a moment ago: the system's pick for a listener closed at once.
+fn free_port() -> u16 {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback listener binds");
+    listener.local_addr().expect("the listener's address is read").port()
+}
+
+/// The `outputs` payload of the work folder `k`'s archive, asking for a data channel on loopback from loopback with the
+/// case's proofs, and the archive's path, written with `bytes` unless `bytes` is `None`.
+fn channel_payload(case: &Case, bytes: Option<&[u8]>) -> (Value, PathBuf) {
+    let mut payload = verb_payload(case, "");
+    payload["Name"] = json!(archive_name(&payload));
+    payload["Channel"] = json!({ "Address": "127.0.0.1", "Peer": "127.0.0.1", "BoxProof": BOX_PROOF, "PcProof": PC_PROOF });
+    let archive = archive_path(&payload);
+    if let Some(bytes) = bytes {
+        fs::create_dir_all(archive.parent().expect("the archive has a folder")).expect("the outputs folder can be made");
+        fs::write(&archive, bytes).expect("the archive can be written");
+    }
+    (payload, archive)
+}
+
+/// `gate box outputs` of `payload` started with its data channel's ports narrowed to `port` alone and the seams `seams`
+/// before the verb, its request written and its stdin closed.
+fn channel_box(case: &Case, payload: &Value, port: u16, seams: &[&str]) -> Running {
+    channel_call(case, payload, port, seams).start()
+}
+
+/// The `gate box outputs` call of `payload` with its data channel's ports narrowed to `port` alone and the seams
+/// `seams` before the verb, not yet started.
+fn channel_call(case: &Case, payload: &Value, port: u16, seams: &[&str]) -> BoxCall {
+    let ports = format!("{port}-{port}");
+    let mut args = vec!["box", "--test-box-channel-ports", &ports];
+    args.extend_from_slice(seams);
+    args.push("outputs");
+    box_call(case, &args, &self::payload(payload))
+}
+
+/// The data channel line of the call of `payload` on `port`.
+fn channel_line(payload: &Value, port: u16) -> String {
+    format!("gate-remote-channel: {} {port}", field(payload, "Nonce"))
+}
+
+/// What a call of `payload` whose data channel did not complete for `why` says on stderr after anything before it.
+fn not_completed(payload: &Value, why: &str) -> String {
+    format!(
+        "gate-remote-refused: {} channel\ngate: data channel not completed: {why}\n",
+        field(payload, "Nonce")
+    )
+}
+
+/// Waits for the box to say its data channel line on `port`.
+fn listening(running: &Running, payload: &Value, port: u16) {
+    let line = channel_line(payload, port);
+    running.wait_for_stderr_where("the data channel line", |said| has_line(said, &line));
+}
+
+/// The PC's connection to the box's data channel on `port`, its reads ending at the hang guard.
+fn pc_connected(port: u16) -> TcpStream {
+    let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("the PC connects");
+    stream.set_read_timeout(Some(HANG_GUARD)).expect("the read guard is set");
+    stream
+}
+
+/// Reads the box's proof on `stream`, checks it and sends `proof` back, as the PC does.
+fn proved(stream: &mut TcpStream, proof: &str) {
+    let mut box_proof = [0_u8; 16];
+    stream.read_exact(&mut box_proof).expect("the box's proof comes");
+    assert_eq!(box_proof.to_vec(), hex_bytes(BOX_PROOF), "the box sends its proof first");
+    stream.write_all(&hex_bytes(proof)).expect("the PC's proof is sent");
+}
+
+/// Reads `size` bytes of archive on `stream`.
+fn pulled(stream: &mut TcpStream, size: usize) -> Vec<u8> {
+    let mut bytes = vec![0_u8; size];
+    stream.read_exact(&mut bytes).expect("the archive's bytes come");
+    bytes
+}
+
+/// A whole pull over the box's data channel on `port`: proofs, the archive's `size` bytes and the ack of their SHA-256;
+/// then the PC closes first. The bytes pulled.
+fn pc_pull(port: u16, size: usize) -> Vec<u8> {
+    let mut stream = pc_connected(port);
+    proved(&mut stream, PC_PROOF);
+    let bytes = pulled(&mut stream, size);
+    stream.write_all(&Sha256::digest(&bytes)).expect("the ack is sent");
+    bytes
+}
+
+/// Fails when a proof's hex shows in what the box said.
+fn assert_no_proof(outcome: &Outcome) {
+    let stdout = String::from_utf8_lossy(&outcome.raw_stdout);
+    for proof in [BOX_PROOF, PC_PROOF] {
+        assert!(
+            !outcome.stderr.contains(proof) && !stdout.contains(proof),
+            "a proof is shown: {outcome:?}"
+        );
+    }
+}
+
+/// The bytes of a case's archive: every byte value, cycled past a socket buffer's worth.
+fn channel_archive() -> Vec<u8> {
+    (0..=255_u8).cycle().take(300_001).collect()
+}
+
+#[test]
+fn box_outputs_sends_the_archive_over_the_data_channel_and_removes_it_once_acked() {
+    let case = Case::new("box_outputs_channel_whole");
+    let bytes = channel_archive();
+    let (payload, archive) = channel_payload(&case, Some(&bytes));
+    let port = free_port();
+    let running = channel_box(&case, &payload, port, &[]);
+    listening(&running, &payload, port);
+
+    let pulled = pc_pull(port, bytes.len());
+    let outcome = running.finish_read();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(pulled == bytes, "the archive's bytes, exactly");
+    assert_eq!(
+        outcome.stderr,
+        format!(
+            "{}\ngate: data channel sent {} bytes sha256 {}\n",
+            channel_line(&payload, port),
+            bytes.len(),
+            sha256(&bytes)
+        )
+    );
+    assert!(outcome.raw_stdout.is_empty(), "nothing goes on stdout: {outcome:?}");
+    assert!(!archive.exists(), "an acked archive is removed");
+    assert_no_proof(&outcome);
+}
+
+#[test]
+fn box_outputs_keeps_the_archive_when_the_pcs_proof_is_wrong() {
+    let case = Case::new("box_outputs_channel_wrong_proof");
+    let (payload, archive) = channel_payload(&case, Some(&channel_archive()));
+    let port = free_port();
+    let running = channel_box(&case, &payload, port, &[]);
+    listening(&running, &payload, port);
+
+    let mut stream = pc_connected(port);
+    proved(&mut stream, BOX_PROOF);
+    let mut rest = Vec::new();
+    let read = stream.read_to_end(&mut rest);
+    let outcome = running.finish_read();
+
+    assert!(
+        read.is_err() || rest.is_empty(),
+        "no archive byte follows a wrong proof: {} came",
+        rest.len()
+    );
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!(
+            "{}\n{}",
+            channel_line(&payload, port),
+            not_completed(&payload, "the PC's proof does not match")
+        )
+    );
+    assert!(archive.exists(), "the archive is kept");
+    assert_no_proof(&outcome);
+}
+
+#[test]
+fn box_outputs_keeps_the_archive_when_the_pc_closes_before_its_ack() {
+    let case = Case::new("box_outputs_channel_no_ack");
+    let bytes = channel_archive();
+    let (payload, archive) = channel_payload(&case, Some(&bytes));
+    let port = free_port();
+    let running = channel_box(&case, &payload, port, &[]);
+    listening(&running, &payload, port);
+
+    let mut stream = pc_connected(port);
+    proved(&mut stream, PC_PROOF);
+    let pulled = pulled(&mut stream, bytes.len());
+    drop(stream);
+    let outcome = running.finish_read();
+
+    assert!(pulled == bytes, "the archive's bytes, exactly");
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!(
+            "{}\n{}",
+            channel_line(&payload, port),
+            not_completed(&payload, "the PC closed the channel before its acknowledgement")
+        )
+    );
+    assert!(archive.exists(), "the archive is kept");
+    assert_no_proof(&outcome);
+}
+
+#[test]
+fn box_outputs_with_a_channel_says_a_missing_archive_and_opens_no_channel() {
+    let case = Case::new("box_outputs_channel_missing");
+    let (payload, _) = channel_payload(&case, None);
+    let name = archive_name(&payload);
+
+    let outcome = channel_box(&case, &payload, free_port(), &[]).finish_read();
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(outcome.stderr, format!("gate: remote outputs archive {name} does not exist\n"));
+}
+
+#[test]
+fn box_outputs_with_a_channel_refuses_another_keys_archive_before_any_channel_line() {
+    let case = Case::new("box_outputs_channel_other_key");
+    let (mut payload, _) = channel_payload(&case, Some(b"archive"));
+    let other = format!("other-{}.tar.zst", field(&payload, "Nonce"));
+    payload["Name"] = json!(other);
+
+    let outcome = channel_box(&case, &payload, free_port(), &[]).finish_read();
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(
+        outcome.stderr,
+        format!("gate: remote outputs archive name '{other}' is not an outputs archive of this work folder\n")
+    );
+}
+
+#[test]
+fn box_outputs_of_a_drained_box_sends_over_the_channel_and_keeps_the_archive() {
+    const T: u64 = 1_800_000_000;
+    let case = Case::new("box_outputs_channel_drained");
+    let bytes = channel_archive();
+    let (mut payload, archive) = channel_payload(&case, Some(&bytes));
+    payload["Session"] = json!("s9");
+    let root = shown(&case.folder().join("remote"));
+    let raise = json!({ "Root": root, "Action": "raise" });
+    let now = T.to_string();
+    let raised = box_call(
+        &case,
+        &["box", "--test-box-now", &now, "--test-box-drain-readable-only", "true", "drain"],
+        &self::payload(&raise),
+    )
+    .finish();
+    assert_eq!(raised.code, Some(0), "{raised:?}");
+    let port = free_port();
+    let later = (T + 1).to_string();
+    let running = channel_box(
+        &case,
+        &payload,
+        port,
+        &["--test-box-now", &later, "--test-box-drain-readable-only", "true"],
+    );
+    listening(&running, &payload, port);
+
+    let pulled = pc_pull(port, bytes.len());
+    let outcome = running.finish_read();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(pulled == bytes, "the archive's bytes, exactly");
+    assert_eq!(
+        outcome.stderr,
+        format!(
+            "{}\ngate: data channel sent {} bytes sha256 {}\ngate: remote outputs kept: the builder is drained\n",
+            channel_line(&payload, port),
+            bytes.len(),
+            sha256(&bytes)
+        )
+    );
+    assert!(archive.exists(), "a drained box keeps the archive");
+    assert_no_proof(&outcome);
+}
+
+#[test]
+fn box_outputs_closes_a_connection_from_another_address_unread_and_serves_the_pc() {
+    let case = Case::new("box_outputs_channel_other_peer");
+    let bytes = channel_archive();
+    let (payload, archive) = channel_payload(&case, Some(&bytes));
+    let port = free_port();
+    let running = channel_box(&case, &payload, port, &[]);
+    listening(&running, &payload, port);
+
+    let impostor = Stream::connect(
+        Ipv4Addr::new(127, 0, 0, 2),
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+        Instant::now() + HANG_GUARD,
+    )
+    .expect("the connect does not fail")
+    .expect("the other address connects");
+    let mut buffer = [0_u8; 64];
+    let read = impostor.read(&mut buffer, Instant::now() + HANG_GUARD);
+    assert!(
+        matches!(read, Ok(Some(0)) | Err(_)),
+        "the box closes the other address's connection with no byte: {read:?}"
+    );
+    drop(impostor);
+    let pulled = pc_pull(port, bytes.len());
+    let outcome = running.finish_read();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(pulled == bytes, "the archive's bytes, exactly");
+    assert!(
+        has_line(
+            &outcome.stderr,
+            &format!("gate: data channel sent {} bytes sha256 {}", bytes.len(), sha256(&bytes))
+        ),
+        "{outcome:?}"
+    );
+    assert!(!archive.exists(), "an acked archive is removed");
+    assert_no_proof(&outcome);
+}
+
+/// The proof's wait has one end, which no byte moves: a PC sending its proof a byte at a time, slower than the whole
+/// wait allows, is refused once that end passes, however short each gap.
+#[test]
+fn box_outputs_refuses_a_proof_not_whole_by_its_fixed_end() {
+    let case = Case::new("box_outputs_channel_slow_proof");
+    let (payload, archive) = channel_payload(&case, Some(&channel_archive()));
+    let port = free_port();
+    let running = channel_box(&case, &payload, port, &["--test-box-channel-idle-ms", "300"]);
+    listening(&running, &payload, port);
+
+    let mut stream = pc_connected(port);
+    let mut box_proof = [0_u8; 16];
+    stream.read_exact(&mut box_proof).expect("the box's proof comes");
+    // Sixteen bytes 50 ms apart take at least 750 ms, past the 300 ms the whole proof has.
+    for byte in hex_bytes(PC_PROOF) {
+        if stream.write_all(&[byte]).is_err() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let outcome = running.finish_read();
+    drop(stream);
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!(
+            "{}\n{}",
+            channel_line(&payload, port),
+            not_completed(&payload, "the PC sent too little within 300 ms before its proof")
+        )
+    );
+    assert!(archive.exists(), "the archive is kept");
+    assert_no_proof(&outcome);
+}
+
+#[test]
+fn box_outputs_refuses_the_channel_when_no_pc_connects_within_the_accept_window() {
+    let case = Case::new("box_outputs_channel_no_pc");
+    let (payload, archive) = channel_payload(&case, Some(&channel_archive()));
+    let port = free_port();
+
+    let outcome = channel_box(&case, &payload, port, &["--test-box-channel-accept-ms", "200"]).finish_read();
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!(
+            "{}\n{}",
+            channel_line(&payload, port),
+            not_completed(&payload, "no connection from the PC within 200 ms")
+        )
+    );
+    assert!(archive.exists(), "the archive is kept");
+}
+
+#[test]
+fn box_outputs_refuses_the_channel_when_the_pc_goes_silent_after_its_proof() {
+    let case = Case::new("box_outputs_channel_silent_pc");
+    let (payload, archive) = channel_payload(&case, Some(&channel_archive()));
+    let port = free_port();
+    let running = channel_box(&case, &payload, port, &["--test-box-channel-idle-ms", "300"]);
+    listening(&running, &payload, port);
+
+    let mut stream = pc_connected(port);
+    proved(&mut stream, PC_PROOF);
+    let outcome = running.finish_read();
+    drop(stream);
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!(
+            "{}\n{}",
+            channel_line(&payload, port),
+            not_completed(&payload, "the PC sent nothing for 300 ms before its acknowledgement")
+        )
+    );
+    assert!(archive.exists(), "the archive is kept");
+    assert_no_proof(&outcome);
+}
+
+/// A PC that proves itself and then reads nothing leaves the box's writes no room: with the box's send buffer narrowed
+/// and an archive larger than the buffers hold, a write of the archive waits out the idle limit, and the box says so
+/// and keeps the archive.
+#[test]
+fn box_outputs_refuses_the_channel_when_the_pc_takes_nothing_of_the_archive() {
+    let case = Case::new("box_outputs_channel_pc_takes_nothing");
+    let bytes: Vec<u8> = (0..=255_u8).cycle().take(4 * 1024 * 1024 + 1).collect();
+    let (payload, archive) = channel_payload(&case, Some(&bytes));
+    let port = free_port();
+    let seams = ["--test-box-channel-idle-ms", "300", "--test-box-channel-send-buffer-bytes", "4096"];
+    let running = channel_box(&case, &payload, port, &seams);
+    listening(&running, &payload, port);
+
+    let mut stream = pc_connected(port);
+    proved(&mut stream, PC_PROOF);
+    let outcome = running.finish_read();
+    drop(stream);
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!(
+            "{}\n{}",
+            channel_line(&payload, port),
+            not_completed(&payload, "the PC took nothing for 300 ms")
+        )
+    );
+    assert!(archive.exists(), "the archive is kept");
+    assert_no_proof(&outcome);
+}
+
+/// The box learns its client went only when a write to stderr fails: the channel's accept wait probes stderr, so a
+/// box whose control call went while it waited for the PC ends without waiting out its window.
+#[test]
+fn box_outputs_ends_when_its_client_goes_during_the_accept_wait() {
+    let case = Case::new("box_outputs_channel_client_gone");
+    let (payload, archive) = channel_payload(&case, Some(&channel_archive()));
+    let port = free_port();
+    let call = channel_call(&case, &payload, port, &["--test-box-channel-accept-ms", "600000"]);
+    let (running, stderr) = call.start_with_closable_stderr();
+    listening(&running, &payload, port);
+
+    stderr.close();
+    let outcome = ended_within(running, HANG_GUARD);
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    assert!(archive.exists(), "the archive is kept");
+}
+
+#[test]
+fn box_outputs_refuses_the_channel_when_no_port_is_free_and_keeps_the_archive() {
+    let case = Case::new("box_outputs_channel_no_port");
+    let (payload, archive) = channel_payload(&case, Some(b"archive"));
+    let held = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback listener binds");
+    let port = held.local_addr().expect("the listener's address is read").port();
+
+    let outcome = channel_box(&case, &payload, port, &[]).finish_read();
+    drop(held);
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    assert_eq!(outcome.stderr, not_completed(&payload, "no data channel port is free"));
+    assert!(outcome.raw_stdout.is_empty(), "nothing goes on stdout: {outcome:?}");
+    assert!(archive.exists(), "the archive is kept");
+    assert_no_proof(&outcome);
 }
