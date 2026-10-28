@@ -676,6 +676,10 @@ fn process_words<'l>(log: &'l str, start: &str) -> Vec<Vec<&'l str>> {
 /// `out` and `err`, which no PC stamp would tag, and the box's process lines, its root and the command's spawn naming
 /// the box as its parent, then the command's exit.
 #[test]
+#[expect(
+    clippy::panic,
+    reason = "a log without the command's spawn fails the case with the log, so its shape shows"
+)]
 fn a_routed_run_logs_the_box_s_stamped_lines_and_its_process_lines_as_they_came() {
     let case = client_case("client-stamped");
     let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
@@ -697,7 +701,7 @@ fn a_routed_run_logs_the_box_s_stamped_lines_and_its_process_lines_as_they_came(
     let tool = spawns
         .iter()
         .find(|words| words.last() == Some(&"tool.exe"))
-        .expect("the command's spawn is logged");
+        .unwrap_or_else(|| panic!("the command's spawn is logged: {log}"));
     let parent = tool[2].strip_prefix("ppid=").expect("a spawn names its parent");
     assert!(
         process_words(&log, "gate pid=").iter().any(|words| words[1] == format!("pid={parent}")),

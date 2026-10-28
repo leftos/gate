@@ -1,5 +1,6 @@
 //! Named job objects: a job holds a command and every process it starts, and can end them all at once.
 
+use std::collections::HashMap;
 use std::io;
 use std::os::windows::io::BorrowedHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -174,6 +175,8 @@ struct Memory {
     drainer: Option<JoinHandle<()>>,
     /// What names the members, shared with the naming thread, which the job's drop closes and never waits for.
     traces: Arc<Mutex<Traces<Key>>>,
+    /// Where [`Job::assign`] hands the naming thread what it is to name of a member it remembers.
+    namer: SyncSender<Naming<Key>>,
 }
 
 /// What a remembering job shares with its drain thread.
@@ -226,7 +229,8 @@ impl Hold {
 /// The members the drain thread has found, and what keeps the memory from being whole.
 #[derive(Default)]
 struct Remembered {
-    /// Each process the port has reported joining the job and not yet forgotten, in the order reported, each once.
+    /// Each process [`Job::assign`] put in the job or the port has reported joining it, and not yet forgotten, in the
+    /// order remembered, each once.
     members: Vec<Member>,
     /// Why the drain thread stopped, once it has on a failure: nothing that joins the job is remembered after it.
     stopped: Option<String>,
@@ -240,6 +244,9 @@ struct Remembered {
     events: Option<Sender<JobEvent>>,
     /// Whether the finish is posted to the drain thread already ([`Job::post_finish`]), so it is posted once.
     finish_posted: bool,
+    /// The pids of the processes [`Job::assign`] put in the job, each with its start when it could be read, until the
+    /// drain thread takes its join message, which says nothing for it, or a recording that failed takes the mark away.
+    assigned: HashMap<u32, Option<Timestamp>>,
 }
 
 /// What a member's join read of it: for [`Job::traced`], a copy of its handle for the naming thread and its times
@@ -311,7 +318,7 @@ enum Opened<H> {
     Gone,
 }
 
-/// Why the drain thread remembers a process the port reported joining the job as no member: it takes no one.
+/// Why the drain thread, or [`Job::assign`], remembers a process that joined the job as no member: it takes no one.
 #[derive(Debug, PartialEq, Eq)]
 enum Missed {
     /// It had ended and its process object was gone, or a process outside the job held its pid, when the drain thread
@@ -475,8 +482,9 @@ impl Job {
             hold: Hold::default(),
         });
         let (namer, joins) = std::sync::mpsc::sync_channel(NAMING_QUEUE);
+        let assigner = namer.clone();
         let named = Arc::clone(&traces);
-        // Never joined: it holds no handle of the job's, and ends when the drain thread drops `namer`.
+        // Never joined: it holds no handle of the job's, and ends when the drain thread and the job drop `namer`.
         std::thread::Builder::new()
             .name("job-naming".to_owned())
             .spawn(move || traced::name_each(&named, &joins))?;
@@ -498,6 +506,7 @@ impl Job {
             shared,
             drainer: Some(drainer),
             traces,
+            namer: assigner,
         });
         Ok(())
     }
@@ -580,12 +589,22 @@ impl Job {
         &self.name
     }
 
-    /// Puts the process behind `process` in the job, and with it every process it starts from then on.
-    pub(crate) fn assign(&self, process: &OwnedHandle) -> io::Result<()> {
-        // SAFETY: both handles are open for the whole call; the process handle `CreateProcessW` or
-        // `CreateProcessAsUserW` returned has the `PROCESS_SET_QUOTA` and `PROCESS_TERMINATE` access the call asks for.
-        let assigned = unsafe { AssignProcessToJobObject(self.handle.raw(), process.raw()) };
-        if assigned == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    /// Puts the process behind `process` in the job, and with it every process it starts from then on. A job that
+    /// remembers remembers the process at once, from `process`, while it is still suspended: its spawn is sent now,
+    /// and its own join message, when the drain thread takes it, says nothing more.
+    pub(crate) fn assign(&self, process: &OwnedHandle, pid: u32) -> io::Result<()> {
+        let Some(memory) = &self.memory else {
+            return assign_to(&self.handle, process);
+        };
+        // Marked, with its start, before the join message can be posted, so the drain thread, whenever it takes that
+        // message, knows it, and a failed recording can tell whether it has taken it.
+        memory.shared.lock().assigned.insert(pid, start_of_process(process));
+        if let Err(error) = assign_to(&self.handle, process) {
+            memory.shared.lock().assigned.remove(&pid);
+            return Err(error);
+        }
+        memory.record(pid, duplicate_query(process), self.created_at);
+        Ok(())
     }
 
     /// The ids of every process in the job now, those in the jobs nested inside it included.
@@ -777,15 +796,23 @@ impl Shared {
                 take_message(&self.port, wait)
             }
         };
-        let found = |pid| match member(&self.job, pid, created_at) {
-            Ok((member, joined)) => {
-                let naming = self.lock().add(member, joined);
-                // An unnamed member is still traced, under its image's file name or its pid.
-                if let Some(naming) = naming {
-                    drop(namer.try_send(naming));
-                }
+        let found = |pid| {
+            // A process put in the job by `Job::assign` was remembered there; its join message says nothing more.
+            let marked = self.lock().assigned.remove(&pid);
+            // A mark without a start cannot be told from the process at its pid, so it is taken for it.
+            if marked.is_some_and(|start| start.is_none_or(|start| remembered_at_assignment(pid, start))) {
+                return;
             }
-            Err(missed) => self.lock().missed(pid, missed),
+            match member(&self.job, pid, created_at) {
+                Ok((member, joined)) => {
+                    let naming = self.lock().add(member, joined);
+                    // An unnamed member is still traced, under its image's file name or its pid.
+                    if let Some(naming) = naming {
+                        drop(namer.try_send(naming));
+                    }
+                }
+                Err(missed) => self.lock().missed(pid, missed),
+            }
         };
         let exited = |pid| self.lock().exited(pid);
         let finish = || {
@@ -800,6 +827,49 @@ impl Shared {
             remembered.stopped = Some(why);
             drop(remembered);
             self.sink_dropped.notify_all();
+        }
+    }
+}
+
+impl Memory {
+    /// Remembers the process `pid`, just put in the job created at `created_at`, through `copied`, a copy of its handle
+    /// with query access, as the drain thread remembers a process the port reports: read now, while it is still
+    /// suspended, so its spawn names its parent and its image however late the drain thread runs, and the copy is kept
+    /// while it runs.
+    ///
+    /// Nothing is recorded once the drain thread has stopped. A recording whose copy or read fails sends nothing of its
+    /// own: while the pid's mark is still there, it takes the mark away, so the drain thread reads the process as its
+    /// own when it takes its join message; once the drain thread has taken the message and passed the process by, the
+    /// recording reads the process at its pid, as the drain thread would have, and reports what that gives.
+    fn record(&self, pid: u32, copied: io::Result<OwnedHandle>, created_at: Timestamp) {
+        let read = copied.ok().and_then(|copy| read_member(pid, Opened::Held(copy), created_at).ok());
+        let read = if let Some(read) = read {
+            Ok(read)
+        } else {
+            let mut remembered = self.shared.lock();
+            if remembered.assigned.remove(&pid).is_some() || remembered.stopped.is_some() {
+                return;
+            }
+            drop(remembered);
+            member(&self.shared.job, pid, created_at)
+        };
+        let naming = {
+            let mut remembered = self.shared.lock();
+            if remembered.stopped.is_some() {
+                remembered.assigned.remove(&pid);
+                return;
+            }
+            match read {
+                Ok((member, joined)) => remembered.add(member, joined),
+                Err(missed) => {
+                    remembered.missed(pid, missed);
+                    None
+                }
+            }
+        };
+        // An unnamed member is still traced, under its image's file name or its pid.
+        if let Some(naming) = naming {
+            drop(self.namer.try_send(naming));
         }
     }
 }
@@ -850,9 +920,9 @@ impl Remembered {
         process.filter(|_| traced).map(|process| Naming { key, process })
     }
 
-    /// Notes the process `pid` the port reported joining the job, which is remembered as no member for `missed`: its
-    /// [`JobEvent::Missed`] is sent whatever the reason; one whose times could not be read is also said in
-    /// [`Remembered::unread`]; one found gone, or whose holder cannot be told, is not.
+    /// Notes the process `pid` that [`Job::assign`] put in the job or the port reported joining it, which is remembered
+    /// as no member for `missed`: its [`JobEvent::Missed`] is sent whatever the reason; one whose times could not be
+    /// read is also said in [`Remembered::unread`]; one found gone, or whose holder cannot be told, is not.
     fn missed(&mut self, pid: u32, missed: Missed) {
         let why = match &missed {
             Missed::Gone => "ended before it could be opened".to_owned(),
@@ -1110,25 +1180,64 @@ fn take_message(port: &OwnedHandle, wait: u32) -> io::Result<Message> {
 /// name and, when it has ended already, its times and its exit code, read while its process object is held; nothing
 /// is read of a process that is no member.
 fn member(job: &OwnedHandle, pid: u32, created_at: Timestamp) -> Result<(Member, Joined), Missed> {
+    read_member(pid, kept(open_any(pid), |process| holds(job, process)), created_at)
+}
+
+/// The process `pid` that joined the job created at `created_at`, `opened` at its pid or from the handle it was put in
+/// the job by, as [`remembered_as`] remembers it, with what its join reads of it ([`joined_of`]).
+fn read_member(pid: u32, opened: Opened<OwnedHandle>, created_at: Timestamp) -> Result<(Member, Joined), Missed> {
     let mut joined = Joined::default();
     let times = |process: &OwnedHandle| {
-        // SAFETY: the handle passed is the one `open_any` opened with `PROCESS_QUERY_LIMITED_INFORMATION` access,
-        // borrowed, so open, for the whole call.
-        let times = unsafe { start_and_exit_of(process.raw()) };
-        let ended = matches!(times, Ok((_, exit)) if exit != 0);
-        // Read after the exit: one the exit saw ended is ended in its span too, and its code is final; one that ends
-        // between the two reads stays running, for its settle to book.
-        joined = Joined {
-            process: duplicate(process).ok(),
-            span: span_of(process).ok().filter(|span| span.exited.is_some()),
-            ppid: proc_table::win32::parent_pid_of(process).ok(),
-            image: image_name(process),
-            code: if ended { exit_code(process) } else { None },
-        };
+        let (times, read) = joined_of(process);
+        joined = read;
         times
     };
-    let member = remembered_as(pid, kept(open_any(pid), |process| holds(job, process)), times, created_at)?;
+    let member = remembered_as(pid, opened, times, created_at)?;
     Ok((member, joined))
+}
+
+/// Whether the process the port reported joining the job as `pid` is the one [`Job::assign`] remembered, which
+/// started at `start`: the process at the pid started then, or it cannot be opened, or its start cannot be read, to
+/// tell it from that one.
+fn remembered_at_assignment(pid: u32, start: Timestamp) -> bool {
+    match open_any(pid) {
+        Ok(Some(process)) => start_of_process(&process).is_none_or(|found| found == start),
+        Ok(None) | Err(_) => true,
+    }
+}
+
+/// The start of the process behind `process`, open with query access; `None` when it cannot be read.
+fn start_of_process(process: &OwnedHandle) -> Option<Timestamp> {
+    // SAFETY: the handle has `PROCESS_QUERY_LIMITED_INFORMATION` access and stays open for the whole call.
+    let (start, _) = unsafe { start_and_exit_of(process.raw()) }.ok()?;
+    timestamp_of(start)
+}
+
+/// The times of the process behind `process`, open with query access, its start and its exit as FILETIME ticks, and
+/// what its join reads of it: a copy of its handle for the naming thread, its parent's pid, its image's file name and,
+/// when it has ended already, its span and its exit code.
+fn joined_of(process: &OwnedHandle) -> (io::Result<(u64, u64)>, Joined) {
+    // SAFETY: the handle passed has `PROCESS_QUERY_LIMITED_INFORMATION` access, borrowed, so open, for the whole call.
+    let times = unsafe { start_and_exit_of(process.raw()) };
+    let ended = matches!(times, Ok((_, exit)) if exit != 0);
+    // Read after the exit: one the exit saw ended is ended in its span too, and its code is final; one that ends
+    // between the two reads stays running, for its settle to book.
+    let joined = Joined {
+        process: duplicate_query(process).ok(),
+        span: span_of(process).ok().filter(|span| span.exited.is_some()),
+        ppid: proc_table::win32::parent_pid_of(process).ok(),
+        image: image_name(process),
+        code: if ended { exit_code(process) } else { None },
+    };
+    (times, joined)
+}
+
+/// Puts the process behind `process` in the job behind `job`.
+fn assign_to(job: &OwnedHandle, process: &OwnedHandle) -> io::Result<()> {
+    // SAFETY: both handles are open for the whole call; the process handle `CreateProcessW` or `CreateProcessAsUserW`
+    // returned has the `PROCESS_SET_QUOTA` and `PROCESS_TERMINATE` access the call asks for.
+    let assigned = unsafe { AssignProcessToJobObject(job.raw(), process.raw()) };
+    if assigned == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
 /// The process `pid` the port reported joining the job created at `created_at`, `opened` at its pid: while the job
@@ -1231,20 +1340,21 @@ fn now() -> io::Result<Timestamp> {
 
 /// A copy of `handle`, with the same access, that this process alone owns.
 fn duplicate(handle: &OwnedHandle) -> io::Result<OwnedHandle> {
+    copy_of(handle, 0, DUPLICATE_SAME_ACCESS)
+}
+
+/// A copy of the process handle `process`, with `PROCESS_QUERY_LIMITED_INFORMATION` access alone, that this process
+/// alone owns.
+fn duplicate_query(process: &OwnedHandle) -> io::Result<OwnedHandle> {
+    copy_of(process, PROCESS_QUERY_LIMITED_INFORMATION, 0)
+}
+
+/// A copy of `handle` with the `access` and the `options` `DuplicateHandle` takes, that this process alone owns.
+fn copy_of(handle: &OwnedHandle, access: u32, options: u32) -> io::Result<OwnedHandle> {
     let mut copy: HANDLE = std::ptr::null_mut();
     // SAFETY: both process handles are this process's pseudo-handle, which is always open; `handle` stays open for the
     // whole call, and `copy` is writable. The copy is not inheritable.
-    let copied = unsafe {
-        DuplicateHandle(
-            GetCurrentProcess(),
-            handle.raw(),
-            GetCurrentProcess(),
-            &raw mut copy,
-            0,
-            0,
-            DUPLICATE_SAME_ACCESS,
-        )
-    };
+    let copied = unsafe { DuplicateHandle(GetCurrentProcess(), handle.raw(), GetCurrentProcess(), &raw mut copy, access, 0, options) };
     if copied == 0 {
         return Err(io::Error::last_os_error());
     }

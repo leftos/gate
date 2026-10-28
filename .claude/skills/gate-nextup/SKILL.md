@@ -143,6 +143,11 @@ A race in the Unix box's own file handling is opened deterministically by a `DYL
 A rig reaches the Mac only through `cargo nextest run *` (the only command that routes there), and ignored files don't travel. So it goes base64-encoded in a `--config target.<triple>.runner=[…]` word, written as TOML literal strings, since backslashes are refused.
 
 Under `--success-output immediate`, a runner that runs the case several times must pass a `--list` call straight through.
+To hold a box's command launch from outside, a case that sets no box seams of its own inherits `GATE_FAKE_SSH_BOX_SEAMS="--test-box-park-launch <path>"` from the suite's environment. The box writes `<path>.parked` once parked, and a rig can then `SuspendThread` its `job-memory` thread, found by `GetThreadDescription`. GATE-890 was found that way (rig in `.tmp/890-rig/` of its worktree while it lasts).
+
+Holding a case's `out.log` open with delete sharing keeps its text past the case's drop.
+
+An exited process's image cannot be read even while a handle keeps it, so a process line read after the exit says `?`.
 
 A suite guard clocked from a call's start times the whole run, which a loaded full suite stretches: a hang guard is clocked from the event it guards, or is the suite's `HANG_GUARD`.
 

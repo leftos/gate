@@ -8,7 +8,8 @@ use windows_sys::Win32::System::IO::{CreateIoCompletionPort, PostQueuedCompletio
 
 use super::{
     DRAIN_WAIT_MS, Departure, ERROR_MORE_DATA, FINISH_KEY, Hold, JOBOBJECT_BASIC_PROCESS_ID_LIST, Job, JobEvent, Joined, Member, Message, Missed,
-    Opened, Remembered, Settled, Unread, Until, drain_loop, holds, kept, listed_ids, member, open_any, remembered_as, settled, take_message, trouble,
+    Opened, Remembered, Settled, Unread, Until, assign_to, drain_loop, duplicate, holds, image_name, kept, listed_ids, member, open_any,
+    remembered_as, settled, start_of_process, take_message, trouble,
 };
 use crate::{EnvironmentBlock, Launch, LaunchOutput, Running, Suspended, own_handle, start_and_exit_of, system_directory, timestamp_of};
 
@@ -650,12 +651,51 @@ fn a_member_the_drain_thread_has_not_taken_by_the_finish_still_gets_its_spawn_an
     let memory = job.memory.as_ref().expect("the job remembers");
     let held = Held::on(&memory.shared.hold);
     wait_until("the drain thread is parked on the hold", || held.parked());
+    // The child joins the job without `Job::assign`, so the drain thread alone reads it. It waits on stdin, a pipe whose
+    // write end the test holds, until the test has opened it.
+    let mut root = suspended("cmd /d /c set /p line=");
+    let release = root.take_pipes().expect("a piped launch has pipes");
+    let root = root.assign_and_resume(&job).expect("the root is assigned and resumed");
+    let is_cmd = |pid: u32| {
+        open_any(pid)
+            .ok()
+            .flatten()
+            .and_then(|process| image_name(&process))
+            .is_some_and(|image| image.eq_ignore_ascii_case("cmd.exe"))
+    };
+    let child_of_root = || job.process_ids().ok()?.into_iter().find(|&pid| pid != root.pid() && is_cmd(pid));
+    wait_until("the root has started the child", || child_of_root().is_some());
+    let child = child_of_root().expect("the child runs");
+    // Kept open, so the child's process object outlives its exit for the drain thread's late read.
+    let kept_open = open_any(child).expect("the child is opened").expect("the child runs");
+    drop(release);
+    assert!(root.wait(HANG_GUARD).expect("the wait answers").is_some(), "the tree ended");
+
+    assert!(job.post_finish(), "the finish is posted behind the members' messages");
+    drop(held);
+    // The drain thread itself drops the sink, so the caller's own finish below is not what sends the events.
+    wait_until("the drain thread drops the sink", || memory.shared.lock().events.is_none());
+    job.finish_events(HANG_GUARD);
+    let mine: Vec<JobEvent> = all_events(&events).into_iter().filter(|event| pid_of(event) == Some(child)).collect();
+    drop(kept_open);
+
+    assert!(
+        matches!(mine.as_slice(), [JobEvent::Spawned { ppid: Some(ppid), .. }, JobEvent::Exited { code: Some(_), .. }] if *ppid == root.pid()),
+        "a spawn and an exit of the child the drain thread had not taken: {mine:?}"
+    );
+}
+
+#[test]
+fn a_member_put_in_the_job_that_ended_before_the_drain_thread_took_it_is_spawned_by_its_image() {
+    let (job, events) = telling_job();
+    let memory = job.memory.as_ref().expect("the job remembers");
+    let held = Held::on(&memory.shared.hold);
+    wait_until("the drain thread is parked on the hold", || held.parked());
     let late = started(&job, "exit 0");
     assert_eq!(late.wait(HANG_GUARD).expect("the wait answers"), Some(0), "the member ended");
 
     assert!(job.post_finish(), "the finish is posted behind the member's messages");
     drop(held);
-    // The drain thread itself drops the sink, so the caller's own finish below is not what sends the events.
     wait_until("the drain thread drops the sink", || memory.shared.lock().events.is_none());
     job.finish_events(HANG_GUARD);
     let mine: Vec<JobEvent> = all_events(&events)
@@ -664,9 +704,227 @@ fn a_member_the_drain_thread_has_not_taken_by_the_finish_still_gets_its_spawn_an
         .collect();
 
     assert!(
-        matches!(mine.as_slice(), [JobEvent::Spawned { .. }, JobEvent::Exited { code: Some(0), .. }]),
-        "a spawn and an exit of the member the drain thread had not taken: {mine:?}"
+        matches!(
+            mine.as_slice(),
+            [JobEvent::Spawned { image: Some(image), .. }, JobEvent::Exited { code: Some(0), .. }] if image.eq_ignore_ascii_case("cmd.exe")
+        ),
+        "the member put in the job is spawned by its image and exits, though it ended before the drain thread took it: {mine:?}"
     );
+}
+
+#[test]
+fn a_member_put_in_the_job_is_spawned_and_exits_though_the_drain_thread_never_ran_before_the_finish() {
+    let (job, events) = telling_job();
+    let memory = job.memory.as_ref().expect("the job remembers");
+    let held = Held::on(&memory.shared.hold);
+    wait_until("the drain thread is parked on the hold", || held.parked());
+    let late = started(&job, "exit 0");
+    assert_eq!(late.wait(HANG_GUARD).expect("the wait answers"), Some(0), "the member ended");
+
+    // The drain thread is held through the whole budget, as a starved thread is: the caller runs the finish itself.
+    job.finish_events(Duration::from_millis(1));
+    let mine: Vec<JobEvent> = all_events(&events)
+        .into_iter()
+        .filter(|event| pid_of(event) == Some(late.pid()))
+        .collect();
+    drop(held);
+
+    assert!(
+        matches!(mine.as_slice(), [JobEvent::Spawned { .. }, JobEvent::Exited { code: Some(0), .. }]),
+        "the member put in the job is spawned and exits, though the drain thread never took it: {mine:?}"
+    );
+}
+
+#[test]
+fn a_child_of_a_member_put_in_the_job_is_spawned_once_by_the_drain_thread_and_the_member_once_at_its_assignment() {
+    let (job, events) = telling_job();
+    // The child waits on stdin, a pipe whose write end the test holds, so it runs while the drain thread opens it.
+    let mut root = suspended("cmd /d /c set /p line=");
+    let release = root.take_pipes().expect("a piped launch has pipes");
+    let root = root.assign_and_resume(&job).expect("the root is assigned and resumed");
+    let mut seen = Vec::new();
+    while cmd_started_by(&seen, root.pid()).is_none() {
+        seen.push(events.recv_timeout(HANG_GUARD).expect("the next event within the hang guard"));
+    }
+
+    drop(release);
+    assert!(root.wait(HANG_GUARD).expect("the wait answers").is_some(), "the tree ended");
+    job.finish_events(HANG_GUARD);
+    seen.extend(all_events(&events));
+
+    let child = cmd_started_by(&seen, root.pid()).expect("the root started the child");
+    let spawns_of = |pid: u32| {
+        seen.iter()
+            .filter(|event| matches!(event, JobEvent::Spawned { pid: of, .. } if *of == pid))
+            .count()
+    };
+    assert_eq!(spawns_of(root.pid()), 1, "the member put in the job is spawned once: {seen:?}");
+    assert_eq!(spawns_of(child), 1, "the child it started is spawned once: {seen:?}");
+    assert!(
+        !seen.iter().any(|event| matches!(event, JobEvent::Missed { .. })),
+        "no process of the tree is missed: {seen:?}"
+    );
+    for pid in [root.pid(), child] {
+        assert!(
+            seen.iter().any(|event| matches!(event, JobEvent::Exited { pid: of, .. } if *of == pid)),
+            "{pid} exits: {seen:?}"
+        );
+    }
+}
+
+#[test]
+fn the_join_message_of_a_member_put_in_the_job_that_is_gone_by_then_says_nothing() {
+    let (job, events) = telling_job();
+    let memory = job.memory.as_ref().expect("the job remembers");
+    let held = Held::on(&memory.shared.hold);
+    wait_until("the drain thread is parked on the hold", || held.parked());
+    let root = started(&job, "exit 0");
+    let pid = root.pid();
+    assert_eq!(root.wait(HANG_GUARD).expect("the wait answers"), Some(0), "the member ended");
+    let (start, _) = window(&root);
+    drop(root);
+    // The memory closes its own copy of the root's handle once it books the root's exit.
+    let _ = job.departed();
+    wait_until("the root's process object is gone", || {
+        open_any(pid).is_ok_and(|opened| opened.is_none_or(|process| start_of_process(&process) != Some(start)))
+    });
+
+    drop(held);
+    job.finish_events(HANG_GUARD);
+    let mine: Vec<JobEvent> = all_events(&events).into_iter().filter(|event| pid_of(event) == Some(pid)).collect();
+
+    assert!(
+        matches!(mine.as_slice(), [JobEvent::Spawned { .. }, JobEvent::Exited { code: Some(0), .. }]),
+        "the root's join message, taken once it is gone, says nothing beside its spawn and exit: {mine:?}"
+    );
+}
+
+#[test]
+fn a_mark_with_another_start_does_not_silence_the_process_that_joins_under_its_pid() {
+    let (job, events) = telling_job();
+    let memory = job.memory.as_ref().expect("the job remembers");
+    let joining = suspended("exit 0");
+    // As an assigned process whose join message was lost leaves its mark, its pid since taken by another process.
+    memory.shared.lock().assigned.insert(joining.pid, Some(Timestamp::UNIX_EPOCH));
+    let process = joining.process.as_ref().expect("the process is not taken yet");
+    assign_to(&job.handle, process).expect("the process is put in the job without Job::assign");
+    let joined = joining.resume().expect("the process is resumed");
+    assert_eq!(joined.wait(HANG_GUARD).expect("the wait answers"), Some(0), "the process ended");
+
+    job.finish_events(HANG_GUARD);
+    let mine: Vec<JobEvent> = all_events(&events)
+        .into_iter()
+        .filter(|event| pid_of(event) == Some(joined.pid()))
+        .collect();
+
+    assert!(
+        matches!(mine.as_slice(), [JobEvent::Spawned { .. }, JobEvent::Exited { code: Some(0), .. }]),
+        "the process that joined under a marked pid with another start is spawned and exits: {mine:?}"
+    );
+}
+
+#[test]
+fn a_recording_that_fails_leaves_the_drain_thread_its_own_read() {
+    let (job, _events) = telling_job();
+    let memory = job.memory.as_ref().expect("the job remembers");
+    let marked = Some(Timestamp::UNIX_EPOCH);
+    memory.shared.lock().assigned.insert(1, marked);
+    memory.shared.lock().assigned.insert(2, marked);
+
+    memory.record(1, Err(io::Error::other("no copy")), job.created_at);
+    // A handle that is no process's: its times cannot be read.
+    memory.record(2, duplicate(&job.handle), job.created_at);
+
+    let remembered = memory.shared.lock();
+    assert!(!remembered.assigned.contains_key(&1), "a handle that could not be copied leaves no mark");
+    assert!(!remembered.assigned.contains_key(&2), "times that could not be read leave no mark");
+}
+
+/// A process put in `job` without [`Job::assign`], marked as `Job::assign` marks it when `marked`, then resumed and run to
+/// its end; its handle stays open, so its process object outlives its exit.
+fn put_in_without_recording(job: &Job, command: &str, marked: bool) -> Running {
+    let joining = suspended(command);
+    let process = joining.process.as_ref().expect("the process is not taken yet");
+    if marked {
+        let memory = job.memory.as_ref().expect("the job remembers");
+        memory.shared.lock().assigned.insert(joining.pid, start_of_process(process));
+    }
+    assign_to(&job.handle, process).expect("the process is put in the job");
+    let joined = joining.resume().expect("the process is resumed");
+    assert_eq!(joined.wait(HANG_GUARD).expect("the wait answers"), Some(0), "the process ended");
+    joined
+}
+
+#[test]
+fn a_failed_recording_while_the_mark_is_there_says_nothing_and_leaves_the_report_to_the_drain_thread() {
+    let (job, events) = telling_job();
+    let memory = job.memory.as_ref().expect("the job remembers");
+    let held = Held::on(&memory.shared.hold);
+    wait_until("the drain thread is parked on the hold", || held.parked());
+    let joined = put_in_without_recording(&job, "exit 0", true);
+
+    memory.record(joined.pid(), Err(io::Error::other("no copy")), job.created_at);
+    assert!(
+        !job.remembers(joined.pid()),
+        "the failed recording remembers nothing of its own while the drain thread has not run"
+    );
+    drop(held);
+    job.finish_events(HANG_GUARD);
+    let mine: Vec<JobEvent> = all_events(&events)
+        .into_iter()
+        .filter(|event| pid_of(event) == Some(joined.pid()))
+        .collect();
+
+    assert!(
+        matches!(mine.as_slice(), [JobEvent::Spawned { .. }, JobEvent::Exited { code: Some(0), .. }]),
+        "the drain thread's own read is the one report: {mine:?}"
+    );
+    assert_eq!(memory.shared.lock().unread, Unread::default(), "nothing is unread of a remembered member");
+}
+
+#[test]
+fn a_failed_recording_after_the_drain_thread_passed_the_process_by_reads_it_itself() {
+    let (job, events) = telling_job();
+    let memory = job.memory.as_ref().expect("the job remembers");
+    // Unmarked, as the mark is once the drain thread has taken the join message and passed the process by.
+    let held = Held::on(&memory.shared.hold);
+    wait_until("the drain thread is parked on the hold", || held.parked());
+    let joined = put_in_without_recording(&job, "exit 0", false);
+
+    memory.record(joined.pid(), Err(io::Error::other("no copy")), job.created_at);
+    assert!(job.remembers(joined.pid()), "the recording's own read remembers the member");
+    drop(held);
+    job.finish_events(HANG_GUARD);
+    let mine: Vec<JobEvent> = all_events(&events)
+        .into_iter()
+        .filter(|event| pid_of(event) == Some(joined.pid()))
+        .collect();
+
+    assert!(
+        matches!(mine.as_slice(), [JobEvent::Spawned { .. }, JobEvent::Exited { code: Some(0), .. }]),
+        "the recording's own read gives the one report: {mine:?}"
+    );
+    assert_eq!(memory.shared.lock().unread, Unread::default(), "nothing is unread of a remembered member");
+}
+
+#[test]
+fn a_process_put_in_the_job_after_its_events_stopped_is_not_remembered() {
+    let (job, _events) = telling_job();
+    let memory = job.memory.as_ref().expect("the job remembers");
+    let held = Held::on(&memory.shared.hold);
+    wait_until("the drain thread is parked on the hold", || held.parked());
+    {
+        // As the drain thread does when it stops on a failure.
+        let mut remembered = memory.shared.lock();
+        remembered.stop_events("a test stopped the events");
+        remembered.stopped = Some("a test stopped the events".to_owned());
+    }
+
+    let late = started(&job, "exit 0");
+    let remembered = job.remembers(late.pid());
+    drop(held);
+
+    assert!(!remembered, "nothing that joins the job after the stop is remembered");
 }
 
 #[test]

@@ -674,7 +674,8 @@ impl Suspended {
             "" => "the job".to_owned(),
             name => format!("the job {name}"),
         };
-        job.assign(process).map_err(|error| setup(error, &format!("put the command in {named}")))
+        job.assign(process, self.pid)
+            .map_err(|error| setup(error, &format!("put the command in {named}")))
     }
 
     /// Lets the command run, once [`Suspended::assign`] has put it in its job.
