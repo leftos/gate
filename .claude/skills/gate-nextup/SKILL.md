@@ -138,6 +138,12 @@ Never suspend a thread during its start-up: it holds the loader lock, and the ri
 
 The suspend rig cannot stretch a box whose own CPU use is small and whose git children live only briefly: a one-target freezer that catches the box at its creation (by the case folder in its command line) and cycles freeze and run on it alone does. GATE-859 was found that way (rig in `.tmp/859-rig/` of its worktree while it lasts).
 
+A race in the Unix box's own file handling is opened deterministically by a `DYLD_INSERT_LIBRARIES` interposer filtered by `fcntl(F_GETPATH)` and argv. The suspend rig cannot do this: it freezes whole processes, on Windows only. GATE-895 was found that way (rig in `.tmp/895-rig/` of its worktree while it lasts).
+
+A rig reaches the Mac only through `cargo nextest run *` (the only command that routes there), and ignored files don't travel. So it goes base64-encoded in a `--config target.<triple>.runner=[…]` word, written as TOML literal strings, since backslashes are refused.
+
+Under `--success-output immediate`, a runner that runs the case several times must pass a `--list` call straight through.
+
 A suite guard clocked from a call's start times the whole run, which a loaded full suite stretches: a hang guard is clocked from the event it guards, or is the suite's `HANG_GUARD`.
 
 A gated command run in a worktree from elsewhere takes an absolute `-Log`: the launcher reads a relative one against the caller's folder before `-Cd` (design.md P5), so it lands in the main checkout's `.tmp`, where two agents' logs of one name overwrite each other. Every brief that names `-Cd` names its logs by absolute path under that worktree.
