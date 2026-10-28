@@ -22,8 +22,7 @@ use gate_args::{DEFAULT_STALL_SECONDS, Spelling, TestSeams, WarmRequest};
 use gate_router::warm::{FailureClass, FileRead, Record, RecordRead, RecordState, WarmupFile, read_warmup, warmup_hash};
 use gate_router::{Config, Facts, Place, Target, builder_words, escaped, repo_name, stays_local, target};
 use gate_state::v1::{self, WarmFailure, WarmRecord, WarmState};
-use gate_state::{KernelObject, key_hash};
-use gate_win32::{AcquireError, Interrupt, NamedMutex, OwnedMutexGuard};
+use gate_win32::{Interrupt, OwnedMutexGuard};
 use gate_wire::build_version;
 use jiff::Timestamp;
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
@@ -519,18 +518,10 @@ fn warm_up(prepared: &Prepared<'_>, request: &WarmRequest, started: Timestamp, c
 /// nothing: its routed run writes the record. A mutex that cannot be opened or taken is said, and writes none.
 fn leave_worktree_record(prepared: &Prepared<'_>, console: &mut Console) {
     let target = &prepared.target;
-    let name = prepared.root.root.object_name(KernelObject::Routed { hash: key_hash(&target.key) });
-    let held = NamedMutex::open(&name)
-        .map_err(|error| error.to_string())
-        .and_then(|mutex| match mutex.acquire_owned(Duration::ZERO) {
-            Ok(held) => Ok(Some(held)),
-            Err(AcquireError::Timeout) => Ok(None),
-            Err(AcquireError::Failed(error)) => Err(error.to_string()),
-        });
-    match held {
+    match worktree_record::try_hold_key(&prepared.root.root, &target.key) {
         Ok(Some(_key)) => worktree_record::leave(&prepared.root.path, &target.place.root, &target.repo, &target.key, console),
         Ok(None) => {}
-        Err(error) => console.err(&format!("gate: cannot take the mutex {name}: {error}")),
+        Err(line) => console.err(&format!("gate: {line}")),
     }
 }
 

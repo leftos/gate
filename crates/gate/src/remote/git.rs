@@ -275,6 +275,16 @@ impl Git {
         command
     }
 
+    /// The git command `call` runs: [`Git::command`] asked about its folder, its variables unset and set, then its args.
+    pub(crate) fn prepared(&self, call: &Call<'_>) -> Command {
+        let mut command = self.command(call.folder);
+        for name in call.unset {
+            command.env_remove(*name);
+        }
+        command.envs(call.set.iter().copied()).args(call.args);
+        command
+    }
+
     /// Runs git with `call`'s args and variables on the console `call` names, through [`bounded`].
     fn spawned<O, E>(
         &self,
@@ -287,11 +297,7 @@ impl Git {
         O: Send + 'static,
         E: Send + 'static,
     {
-        let mut command = self.command(call.folder);
-        for name in call.unset {
-            command.env_remove(*name);
-        }
-        command.envs(call.set.iter().copied()).args(call.args);
+        let command = self.prepared(call);
         let spawn = Spawn {
             name: "git",
             late: late_git_line(call.limit),

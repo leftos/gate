@@ -5,11 +5,17 @@
 use std::fs::{self, File, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
+use gate_state::{KernelObject, StateRoot, key_hash, v1};
+use gate_win32::NamedMutex;
 use serde_json::{Value, json};
+use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
 use crate::support::{
-    Case, FAKE_SSH, GATE, GATE_VARIABLE, Outcome, ROOT_WALK_STOP_VARIABLE, STEPS_VARIABLE, calls, finish, git, shown, ssh_steps, write_remote_json,
+    Case, FAKE_SSH, GATE, GATE_VARIABLE, GIT_REDIRECTS, Outcome, ROOT_WALK_STOP_VARIABLE, STEPS_VARIABLE, calls, finish, git, git_home_for, shown,
+    ssh_steps, write_remote_json,
 };
 
 /// The routing file of a prune case: two builders.
@@ -126,6 +132,308 @@ fn long_gone(case: &Case) -> (PathBuf, PathBuf) {
     (work_folder(case, "builder-1"), work_folder(case, "builder-2"))
 }
 
+/// The files the PC keeps of [`KEY`], each written: `host`'s own, `builder-2`'s own, and the ones they share, the
+/// record aside.
+struct PcFiles {
+    host: Vec<PathBuf>,
+    other: Vec<PathBuf>,
+    shared: Vec<PathBuf>,
+}
+
+/// The id of `builder-2`, the folder of its own files and refs.
+fn other_id() -> String {
+    gate_router::builder_id("builder-2")
+}
+
+/// Writes every file the PC keeps of [`KEY`] in the case's state root.
+fn pc_files(case: &Case) -> PcFiles {
+    let state = case.root();
+    let own = |id: Option<&str>| {
+        vec![
+            v1::outputs_hashes_path(&state, id, KEY),
+            v1::inputs_hashes_path(&state, id, KEY),
+            v1::inputs_carried_path(&state, id, KEY),
+            v1::sent_build_hashes_path(&state, id, KEY),
+            v1::outputs_capped_path(&state, id, KEY),
+        ]
+    };
+    let id = other_id();
+    let files = PcFiles {
+        host: own(None),
+        other: own(Some(&id)),
+        shared: vec![
+            v1::outputs_pending_path(&state, KEY),
+            v1::nothing_back_path(&state, KEY),
+            v1::warm_record_path(&state, KEY),
+            v1::warm_log_path(&state, KEY),
+            v1::warm_lock_path(&state, KEY),
+            v1::remote_dir(&state).join(format!("{KEY}.outputs-from")),
+        ],
+    };
+    for path in files.host.iter().chain(&files.other).chain(&files.shared) {
+        fs::create_dir_all(path.parent().expect("a file has a folder")).expect("the file's folder can be made");
+        fs::write(path, "x").expect("the file can be written");
+    }
+    files
+}
+
+/// Whether every one of `paths` is there.
+fn all_there(paths: &[PathBuf]) -> bool {
+    paths.iter().all(|path| path.exists())
+}
+
+/// Whether none of `paths` is there.
+fn none_there(paths: &[PathBuf]) -> bool {
+    paths.iter().all(|path| !path.exists())
+}
+
+/// The refs a routed run leaves for [`KEY`] in a repo, and one of another key that stays.
+fn key_refs() -> Vec<String> {
+    vec![
+        format!("refs/gate-remote/{KEY}"),
+        format!("refs/gate-remote/{KEY}-back"),
+        format!("refs/gate-remote/{}/{KEY}", other_id()),
+        "refs/gate-remote/other-1a2b3c4d".to_owned(),
+    ]
+}
+
+/// Points each of [`key_refs`] at the head of the repo in the case's folder `repo`, but the sync-back ref, which
+/// points at a commit of the head's tree committed in 2020, so the removal finds it old.
+fn leave_refs(case: &Case, repo: &str) {
+    let old = old_commit(case, repo);
+    for name in key_refs() {
+        let target = if name.ends_with("-back") { old.as_str() } else { "HEAD" };
+        git(case, &["-C", repo, "update-ref", &name, target]);
+    }
+}
+
+/// A commit of the head's tree of the repo in the case's folder `repo`, its committer date set in 2020 through
+/// `GIT_COMMITTER_DATE`: its id.
+fn old_commit(case: &Case, repo: &str) -> String {
+    let mut command = Command::new("git");
+    for name in GIT_REDIRECTS {
+        command.env_remove(name);
+    }
+    git_home_for(&mut command);
+    let output = command
+        .args(["-c", "user.name=gate suite", "-c", "user.email=suite@example.invalid", "-C", repo])
+        .args(["commit-tree", "HEAD^{tree}", "-m", "an old sync-back"])
+        .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
+        .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
+        .current_dir(case.folder())
+        .stdin(Stdio::null())
+        .output()
+        .expect("git starts");
+    assert!(output.status.success(), "git commit-tree: {output:?}");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// The names of the refs under `refs/gate-remote/` of the repo in the case's folder `repo`.
+fn refs_in(case: &Case, repo: &str) -> Vec<String> {
+    git(case, &["-C", repo, "for-each-ref", "--format=%(refname)", "refs/gate-remote/"])
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A record of a worktree long gone, each builder's work folder of [`KEY`], every file the PC keeps of it, and the
+/// key's refs in the worktree's repo: the record's path, its root, and the files.
+fn seeded(case: &Case) -> (PathBuf, String, PcFiles) {
+    let (root, common) = gone_worktree(case);
+    let record = write_record(case, &root, &common, Some(LONG_GONE));
+    work_folder(case, "builder-1");
+    work_folder(case, "builder-2");
+    leave_refs(case, "repo");
+    (record, root, pc_files(case))
+}
+
+/// The file at `path` held open sharing `share`, until the returned file is dropped.
+fn held_file(path: &Path, share: u32) -> File {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(share)
+        .open(path)
+        .expect("the file can be held")
+}
+
+#[test]
+fn a_key_every_builder_pruned_has_its_pc_files_refs_and_record_removed() {
+    let case = prune_case("prune_pc_removed");
+    let (record, root, files) = seeded(&case);
+    let steps = ssh_steps(&case, "ssh", &ANSWERS);
+
+    let outcome = pruned(&case, &steps, &[]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!(
+            "gate: remote builder-1 pruned {KEY} (worktree gone)\ngate: remote builder-2 pruned {KEY} (worktree gone)\n\
+             gate: prune: removed {KEY} ({root})\n"
+        ),
+        "{outcome:?}"
+    );
+    assert!(none_there(&files.host) && none_there(&files.other), "each builder's own files are gone");
+    assert!(none_there(&files.shared), "the shared files are gone");
+    assert!(!record.exists(), "the record is gone");
+    assert_eq!(
+        refs_in(&case, "repo"),
+        ["refs/gate-remote/other-1a2b3c4d"],
+        "only another key's ref stays"
+    );
+}
+
+#[test]
+fn a_key_one_builder_held_keeps_its_shared_files_and_record_and_loses_the_pruned_builder_s_own() {
+    let case = prune_case("prune_pc_one_held");
+    let (record, _, files) = seeded(&case);
+    let held = hold_lock(&case, "builder-1");
+    let steps = ssh_steps(&case, "ssh", &ANSWERS);
+
+    let outcome = pruned(&case, &steps, &[]);
+
+    drop(held);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!("gate: remote builder-1 kept {KEY}: in use\ngate: remote builder-2 pruned {KEY} (worktree gone)\n"),
+        "{outcome:?}"
+    );
+    assert!(all_there(&files.host), "the holding builder keeps its own files");
+    assert!(none_there(&files.other), "the pruned builder's own files are gone");
+    assert!(all_there(&files.shared), "the shared files stay");
+    assert!(record.exists(), "the record stays");
+    assert_eq!(refs_in(&case, "repo"), key_refs(), "every ref stays");
+}
+
+#[test]
+fn a_key_whose_mutex_is_held_is_kept_in_use() {
+    let case = prune_case("prune_pc_mutex_held");
+    let (record, _, files) = seeded(&case);
+    let name = StateRoot::new(&shown(&case.root()), None).object_name(KernelObject::Routed { hash: key_hash(KEY) });
+    let held = NamedMutex::open(&name)
+        .expect("the mutex opens")
+        .acquire_owned(Duration::from_secs(5))
+        .expect("the mutex is free");
+    let steps = ssh_steps(&case, "ssh", &ANSWERS);
+
+    let outcome = pruned(&case, &steps, &[]);
+
+    drop(held);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.ends_with(&format!("gate: prune: kept {KEY}: in use\n")), "{outcome:?}");
+    assert!(all_there(&files.host) && all_there(&files.other), "each builder's own files stay");
+    assert!(all_there(&files.shared), "the shared files stay");
+    assert!(record.exists(), "the record stays");
+    assert_eq!(refs_in(&case, "repo"), key_refs(), "every ref stays");
+}
+
+#[test]
+fn a_key_a_warm_up_holds_is_kept() {
+    let case = prune_case("prune_pc_warm_held");
+    let (record, _, files) = seeded(&case);
+    let held = held_file(&v1::warm_lock_path(&case.root(), KEY), FILE_SHARE_READ | FILE_SHARE_WRITE);
+    let steps = ssh_steps(&case, "ssh", &ANSWERS);
+
+    let outcome = pruned(&case, &steps, &[]);
+
+    drop(held);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stderr.ends_with(&format!("gate: prune: kept {KEY}: a warm-up holds it\n")),
+        "{outcome:?}"
+    );
+    assert!(all_there(&files.shared), "the shared files stay");
+    assert!(record.exists(), "the record stays");
+    assert_eq!(refs_in(&case, "repo"), key_refs(), "every ref stays");
+}
+
+#[test]
+fn a_sync_back_ref_younger_than_seven_days_is_kept_with_the_record() {
+    let case = prune_case("prune_pc_young_back");
+    let (record, _, files) = seeded(&case);
+    let back = format!("refs/gate-remote/{KEY}-back");
+    git(&case, &["-C", "repo", "update-ref", &back, "HEAD"]);
+    let steps = ssh_steps(&case, "ssh", &ANSWERS);
+
+    let outcome = pruned(&case, &steps, &[]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .ends_with(&format!("gate: prune: kept {KEY}'s sync-back ref {back}: it is less than 7 days old\n")),
+        "{outcome:?}"
+    );
+    assert!(none_there(&files.shared), "the shared files are gone");
+    assert!(record.exists(), "the record stays for a later sweep");
+    assert_eq!(
+        refs_in(&case, "repo"),
+        [back.as_str(), "refs/gate-remote/other-1a2b3c4d"],
+        "the young sync-back ref stays, the key's others go"
+    );
+}
+
+#[test]
+fn a_file_that_cannot_be_removed_keeps_the_record_and_fails() {
+    let case = prune_case("prune_pc_cannot_remove");
+    let (record, _, _) = seeded(&case);
+    let pending = v1::outputs_pending_path(&case.root(), KEY);
+    let held = held_file(&pending, FILE_SHARE_READ | FILE_SHARE_WRITE);
+    let steps = ssh_steps(&case, "ssh", &ANSWERS);
+
+    let outcome = pruned(&case, &steps, &[]);
+
+    drop(held);
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let said = format!("gate: prune: could not remove {}: ", shown(&pending));
+    assert!(outcome.stderr.contains(&said), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: prune: removed"), "{outcome:?}");
+    assert!(record.exists(), "the record stays for the next sweep");
+    assert!(pending.exists(), "the held file stays");
+}
+
+#[test]
+fn a_sibling_repo_s_refs_for_the_key_are_removed() {
+    let case = prune_case("prune_pc_sibling");
+    write_remote_json(
+        &case,
+        r#"{"host": "builder-1", "hosts": ["builder-2"], "repos": {"app": ["*"]}, "siblings": {"app": ["lib", "absent"]}}"#,
+    );
+    git(&case, &["init", "--quiet", "repo"]);
+    git(&case, &["-C", "repo", "commit", "--allow-empty", "--quiet", "-m", "first"]);
+    git(&case, &["-C", "repo", "worktree", "add", "--quiet", "../repo.wt/wt"]);
+    let root = case.folder().join(r"repo.wt\wt");
+    fs::remove_dir_all(&root).expect("the worktree's folder can be deleted");
+    let record = write_record(&case, &shown(&root), &shown(&case.folder().join(r"repo\.git")), Some(LONG_GONE));
+    for repo in [r"repo.wt\lib", "lib"] {
+        git(&case, &["init", "--quiet", repo]);
+        git(&case, &["-C", repo, "commit", "--allow-empty", "--quiet", "-m", "first"]);
+        leave_refs(&case, repo);
+    }
+    leave_refs(&case, "repo");
+    work_folder(&case, "builder-1");
+    work_folder(&case, "builder-2");
+    let steps = ssh_steps(&case, "ssh", &ANSWERS);
+
+    let outcome = pruned(&case, &steps, &[]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        refs_in(&case, r"repo.wt\lib"),
+        ["refs/gate-remote/other-1a2b3c4d"],
+        "the sibling beside the worktree keeps only another key's ref"
+    );
+    assert_eq!(refs_in(&case, "repo"), ["refs/gate-remote/other-1a2b3c4d"], "so does the worktree's repo");
+    assert_eq!(
+        refs_in(&case, "lib"),
+        key_refs(),
+        "a folder beside the main checkout is no sibling: every ref stays"
+    );
+    assert!(!record.exists(), "the record is gone: {outcome:?}");
+}
+
 #[test]
 fn no_worktree_records_says_so_and_passes() {
     let case = prune_case("prune_no_records");
@@ -208,7 +516,10 @@ fn a_gone_worktree_past_the_age_is_pruned_on_every_builder_and_said_with_each_al
     assert_eq!(second.code, Some(0), "{second:?}");
     assert_eq!(
         second.stderr,
-        format!("gate: remote builder-1 pruned {KEY} (worktree gone)\ngate: remote builder-2 pruned {KEY} (worktree gone)\n"),
+        format!(
+            "gate: remote builder-1 pruned {KEY} (worktree gone)\ngate: remote builder-2 pruned {KEY} (worktree gone)\n\
+             gate: prune: removed {KEY} ({root})\n"
+        ),
         "{second:?}"
     );
     assert_eq!(calls(&steps), ["prune", "prune"], "the second sweep alone calls each builder once");

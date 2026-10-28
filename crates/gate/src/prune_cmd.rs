@@ -2,8 +2,10 @@
 //! worktree is gone is marked so (`goneSince`) by the first sweep that finds it gone; once it has been gone an hour, its
 //! key is pruned on every builder `remote.json` lists, each through the box's keyed `gate box prune --root <root> --keys
 //! <key>...`, and each builder's answer is said with its alias. A record whose worktree is there again has its mark
-//! cleared. The sweep never runs `git worktree prune`, and removes nothing on the PC: it gives what each builder did
-//! with each key ([`Outcomes`]).
+//! cleared. The sweep never runs `git worktree prune`. What the PC keeps of a key is removed as each builder's answer
+//! allows ([`removal`]).
+
+mod removal;
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -13,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gate_args::{BoxVerb, PruneRequest, PruneSeams};
-use gate_router::{Builder, escaped};
+use gate_router::{Builder, Config, escaped};
 use gate_state::v1;
 use gate_win32::PipedConsole;
 use gate_wire::stamp;
@@ -22,7 +24,7 @@ use jiff::{SignedDuration, Timestamp};
 use crate::answer::FAILED_STATUS;
 use crate::console::Console;
 use crate::environment::Variables;
-use crate::remote::git::{self, GitError, ProgramCall, ProgramOutput, ProgramPlace};
+use crate::remote::git::{self, Git, GitError, ProgramCall, ProgramOutput, ProgramPlace};
 use crate::remote::launch;
 use crate::remote::transport::ssh::Ssh;
 use crate::remote::transport::{Program, Transport, Wire};
@@ -64,10 +66,10 @@ pub(crate) type Outcomes = BTreeMap<String, Vec<(Option<String>, Outcome)>>;
 /// Runs `gate prune --builders` and returns its exit status: 0 when nothing failed, 1 when anything did.
 pub(crate) fn prune(request: &PruneRequest, environment: &Environment, console: &mut Console) -> u32 {
     let state = match resolve::root(None, environment) {
-        Ok(resolved) => resolved.path,
+        Ok(resolved) => resolved,
         Err(line) => return failed_with(&line, console),
     };
-    let records = match scanned(&state, console) {
+    let records = match scanned(&state.path, console) {
         Ok(Some(records)) => records,
         Ok(None) => {
             console.err("gate: prune: no worktree records");
@@ -79,13 +81,17 @@ pub(crate) fn prune(request: &PruneRequest, environment: &Environment, console: 
         Ok(place) => place,
         Err(why) => return failed_with(&format!("gate: prune: {why}"), console),
     };
+    let git = match Git::find(&state.path) {
+        Ok(git) => git,
+        Err(why) => return failed_with(&format!("gate: prune: {why}"), console),
+    };
     let least = request.seams.gone_age_ms.map_or(LEAST_AGE, Duration::from_millis);
     let now = Timestamp::now();
     let mut failed = false;
     let mut candidates = Vec::new();
     for scanned in &records {
-        match judged(scanned, &place, least, now, console) {
-            Judged::Candidate => candidates.push(scanned.key.clone()),
+        match judged(scanned, &git, least, now, console) {
+            Judged::Candidate => candidates.push(scanned),
             Judged::Failed => failed = true,
             Judged::Kept => {}
         }
@@ -93,16 +99,24 @@ pub(crate) fn prune(request: &PruneRequest, environment: &Environment, console: 
     if candidates.is_empty() {
         return status(failed);
     }
-    let builders = match listed(environment.local_app_data.as_deref()) {
-        Ok(builders) => builders,
+    let (config, builders) = match listed(environment.local_app_data.as_deref()) {
+        Ok(listed) => listed,
         Err(line) => return failed_with(&line, console),
     };
     let transport = match transport(&request.seams) {
         Ok(transport) => transport,
         Err(line) => return failed_with(&line, console),
     };
-    let outcomes = swept(&*transport, &builders, &candidates, &place, console);
-    status(failed || outcomes.values().flatten().any(|(_, outcome)| *outcome == Outcome::Failed))
+    let keys: Vec<String> = candidates.iter().map(|scanned| scanned.key.clone()).collect();
+    let outcomes = swept(&*transport, &builders, &keys, &place, console);
+    failed |= outcomes.values().flatten().any(|(_, outcome)| *outcome == Outcome::Failed);
+    let removal = removal::Removal {
+        state: &state,
+        config: &config,
+        git: &git,
+    };
+    failed |= removal::removed(&removal, &candidates, &outcomes, console);
+    status(failed)
 }
 
 /// Says `line`; the status of a failure.
@@ -184,10 +198,10 @@ enum Judged {
 /// What the sweep at `now` makes of the record `scanned`, its worktree found as [`found`] finds it with git run in
 /// `place`, a worktree gone `least` or longer being a candidate: a live worktree's mark is cleared, silently; a gone
 /// one's is set on the first sweep that finds it gone; each else says why its builders are not called yet.
-fn judged(scanned: &Scanned, place: &ProgramPlace, least: Duration, now: Timestamp, console: &mut Console) -> Judged {
+fn judged(scanned: &Scanned, git: &Git, least: Duration, now: Timestamp, console: &mut Console) -> Judged {
     let Scanned { key, path, record } = scanned;
     let root = escaped(&record.root);
-    match found(record, place) {
+    match found(record, git) {
         Found::Live if record.gone_since.is_none() => Judged::Kept,
         Found::Live => {
             let cleared = v1::WorktreeRecord {
@@ -258,7 +272,7 @@ enum Found {
 /// How the worktree of `record` is found, `git worktree list` run in `place`: live when anything is at its root; gone
 /// when nothing is, the root's drive as the record spells it is there, and its common folder is gone or git does not
 /// list the root, or lists it prunable; unknown otherwise.
-fn found(record: &v1::WorktreeRecord, place: &ProgramPlace) -> Found {
+fn found(record: &v1::WorktreeRecord, git: &Git) -> Found {
     let looked = fs::symlink_metadata(&record.root);
     if looked.is_ok() {
         return Found::Live;
@@ -284,7 +298,7 @@ fn found(record: &v1::WorktreeRecord, place: &ProgramPlace) -> Found {
         }
         Ok(_) => {}
     }
-    match worktree_list(&record.common_dir, place) {
+    match worktree_list(&record.common_dir, git) {
         Ok(porcelain) => match listing(&porcelain, &record.root) {
             Listing::Absent | Listing::Prunable => Found::Gone,
             Listing::Listed => Found::Unknown("git still lists it as a worktree".to_owned()),
@@ -302,33 +316,61 @@ fn drive_root(root: &str) -> Option<String> {
     }
 }
 
-/// What `git --git-dir=<common> worktree list --porcelain` said on stdout, run in `place` and bounded at
-/// [`GIT_BOUND`]; else why it said nothing.
-fn worktree_list(common: &str, place: &ProgramPlace) -> Result<String, String> {
+/// What `git --git-dir=<common> worktree list --porcelain` said on stdout, asked about `common`, run as [`git_run`]
+/// runs git; else why it said nothing.
+fn worktree_list(common: &str, git: &Git) -> Result<String, String> {
     let git_dir = format!("--git-dir={common}");
     let args = [git_dir.as_str(), "worktree", "list", "--porcelain"];
-    let call = ProgramCall {
-        program: "git",
-        args: &args,
-        limit: GIT_BOUND,
-        drain: launch::DRAIN,
-        interrupt: None,
-        worktrees: &[],
-        console: PipedConsole::Attached,
-        stdin: None,
+    let at = GitAt {
+        folder: Path::new(common),
+        set: &[],
     };
-    match git::program_output(&call, place) {
-        Ok(Some(output)) if output.status.success() => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
-        Ok(Some(output)) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+    git_run(git, "git worktree list", &at, &args, None).map_err(|fault| match fault {
+        GitFault::Said(line) => format!("git worktree list failed: {line}"),
+        GitFault::Ended(why) => why,
+    })
+}
+
+/// Where one of the sweep's git calls runs: the folder git is asked about with `-C`, and the variables it is given
+/// beside the ones every call is given.
+struct GitAt<'a> {
+    folder: &'a Path,
+    set: &'a [(&'a str, &'a OsStr)],
+}
+
+/// The git call of the sweep at `at` with `args`, and `stdin` on its standard input, bounded at [`GIT_BOUND`]: run by
+/// [`Git`], so it is given none of the parent's git location or config variables and runs no hook.
+fn sweep_call<'a>(at: &GitAt<'a>, args: &'a [&'a str], stdin: Option<&'a [u8]>) -> git::Call<'a> {
+    git::Call {
+        set: at.set,
+        stdin,
+        ..git::Call::plain(at.folder, args, GIT_BOUND)
+    }
+}
+
+/// Why a git call the sweep made did not pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum GitFault {
+    /// It failed, and this is the last line it said on stderr, shown [`escaped`].
+    Said(String),
+    /// It failed saying nothing, could not run or was ended: the whole line saying so.
+    Ended(String),
+}
+
+/// What `git` said on stdout when run as [`sweep_call`] makes the call at `at` with `args` and `stdin`; else why it
+/// did not pass, the call named as `named` (`git worktree list`).
+fn git_run<'a>(git: &Git, named: &str, at: &GitAt<'a>, args: &'a [&'a str], stdin: Option<&'a [u8]>) -> Result<String, GitFault> {
+    match git.status_within(&sweep_call(at, args, stdin), git::OUTPUT_CAP) {
+        Ok((status, stdout, _)) if status.success() => Ok(String::from_utf8_lossy(&stdout).into_owned()),
+        Ok((status, _, stderr)) => {
+            let stderr = String::from_utf8_lossy(&stderr);
             Err(match stderr.lines().map(str::trim).rfind(|line| !line.is_empty()) {
-                Some(line) => format!("git worktree list failed: {}", escaped(line)),
-                None => format!("git worktree list ended with {}", output.status),
+                Some(line) => GitFault::Said(escaped(line)),
+                None => GitFault::Ended(format!("{named} ended with {status}")),
             })
         }
-        Ok(None) => Err("git is not found".to_owned()),
-        Err(GitError::Interrupted) => Err("git worktree list was interrupted".to_owned()),
-        Err(GitError::Failed(why) | GitError::OverCap(why)) => Err(escaped(&why)),
+        Err(GitError::Interrupted) => Err(GitFault::Ended(format!("{named} was interrupted"))),
+        Err(GitError::Failed(why) | GitError::OverCap(why)) => Err(GitFault::Ended(escaped(&why))),
     }
 }
 
@@ -365,10 +407,10 @@ fn compared(root: &str) -> String {
     root.replace('/', r"\").trim_end_matches('\\').to_lowercase()
 }
 
-/// Every builder `remote.json` under `local_app_data` lists, routed or not: `host`, each `hosts` entry, then each
-/// `builders` entry no `hosts` alias names in any letter case. Else the line saying the file is missing or why it is
-/// ignored.
-fn listed(local_app_data: Option<&OsStr>) -> Result<Vec<Builder>, String> {
+/// The routing file `remote.json` under `local_app_data`, and every builder it lists, routed or not: `host`, each
+/// `hosts` entry, then each `builders` entry no `hosts` alias names in any letter case. Else the line saying the file
+/// is missing or why it is ignored.
+fn listed(local_app_data: Option<&OsStr>) -> Result<(Config, Vec<Builder>), String> {
     let path =
         route::remote_json_path(local_app_data).ok_or_else(|| "gate: prune: no remote.json: LOCALAPPDATA is not an absolute folder".to_owned())?;
     let ignored = |reason: &str| format!("gate: prune: ignored {}: {reason}", path.display());
@@ -388,7 +430,7 @@ fn listed(local_app_data: Option<&OsStr>) -> Result<Vec<Builder>, String> {
             .filter(|entry| !hosts.iter().any(|host| host.eq_ignore_ascii_case(&entry.alias)))
             .cloned(),
     );
-    Ok(builders)
+    Ok((config, builders))
 }
 
 /// The way to the builders: the local transport `--test-remote-transport` names, else ssh found along the gate's own
@@ -642,7 +684,10 @@ mod tests {
     use std::os::windows::process::ExitStatusExt;
     use std::process::ExitStatus;
 
-    use super::{Answer, Listing, MOST_KEYS, Outcome, Outcomes, answer_of, box_key, calls_of, compared, drive_root, listing, merged, said_of};
+    use super::{
+        Answer, GitAt, Listing, MOST_KEYS, Outcome, Outcomes, answer_of, box_key, calls_of, compared, drive_root, listing, merged, said_of,
+        sweep_call,
+    };
     use crate::remote::git::ProgramOutput;
 
     fn keys(names: &[&str]) -> Vec<String> {
@@ -812,6 +857,28 @@ mod tests {
         );
         let usage = "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs|drain --stdin\n";
         assert_eq!(answer_of("builder-1", &keys(&["a-1"]), &output(2, usage)), Answer::TooOld);
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test with no git must fail loudly")]
+    fn the_sweep_s_git_is_given_no_git_location_of_its_parent_and_runs_no_hook() {
+        let folder = crate::test_support::temp_dir();
+        let git = crate::remote::git::Git::find(folder).expect("git is found");
+        let at = GitAt { folder, set: &[] };
+
+        let command = git.prepared(&sweep_call(&at, &["for-each-ref"], None));
+
+        let unset: Vec<String> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        for name in ["GIT_DIR", "GIT_COMMON_DIR"] {
+            assert!(unset.iter().any(|unset| unset == name), "{name} is not passed on: {unset:?}");
+        }
+        let args: Vec<String> = command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        assert!(args.iter().any(|arg| arg.starts_with("core.hooksPath=")), "{args:?}");
+        assert_eq!(args.last().map(String::as_str), Some("for-each-ref"), "{args:?}");
     }
 
     #[test]

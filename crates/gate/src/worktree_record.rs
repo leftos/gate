@@ -5,8 +5,10 @@ use std::fs::OpenOptions;
 use std::io::{self, Read};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
+use std::time::Duration;
 
-use gate_state::v1;
+use gate_state::{KernelObject, StateRoot, key_hash, v1};
+use gate_win32::{AcquireError, NamedMutex, OwnedMutexGuard};
 use jiff::Timestamp;
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT};
 
@@ -15,6 +17,19 @@ use crate::route;
 
 /// The most of a worktree record read: a record is a few hundred bytes.
 const RECORD_CAP: usize = 4096;
+
+/// The mutex of the work-folder `key` under the state root `root`, the one a routed run holds, taken without waiting:
+/// `None` when another gate holds it; else the line, after `gate: `, saying it cannot be opened or taken.
+pub(crate) fn try_hold_key(root: &StateRoot, key: &str) -> Result<Option<OwnedMutexGuard>, String> {
+    let name = root.object_name(KernelObject::Routed { hash: key_hash(key) });
+    let cannot = |error: String| format!("cannot take the mutex {name}: {error}");
+    let mutex = NamedMutex::open(&name).map_err(|error| cannot(error.to_string()))?;
+    match mutex.acquire_owned(Duration::ZERO) {
+        Ok(held) => Ok(Some(held)),
+        Err(AcquireError::Timeout) => Ok(None),
+        Err(AcquireError::Failed(error)) => Err(cannot(error.to_string())),
+    }
+}
 
 /// The worktree record at `path` ([`v1::worktree_record_path`]), opened as itself, at most [`RECORD_CAP`] bytes.
 /// `None` when there is none, or it cannot be read: a link, a junction, a folder, a longer file or one not of its
