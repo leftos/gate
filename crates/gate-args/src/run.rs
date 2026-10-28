@@ -75,6 +75,10 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     BesideClaimWait,
     #[cfg(feature = "test-seams")]
+    BuiltHereKeyReached,
+    #[cfg(feature = "test-seams")]
+    KeyWaits,
+    #[cfg(feature = "test-seams")]
     DotnetLimitMs,
     #[cfg(feature = "test-seams")]
     RemoteTransport,
@@ -375,6 +379,8 @@ impl RunBuilder {
             | ValueOption::GitDrainMs
             | ValueOption::RestoreLimitMs
             | ValueOption::BesideClaimWait
+            | ValueOption::BuiltHereKeyReached
+            | ValueOption::KeyWaits
             | ValueOption::DotnetLimitMs
             | ValueOption::RemoteTransport
             | ValueOption::RemoteSsh
@@ -435,6 +441,8 @@ impl RunBuilder {
             ValueOption::GitDrainMs => seams.git_drain_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::RestoreLimitMs => seams.restore_limit_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::BesideClaimWait => seams.beside_claim_wait = Some(PathBuf::from(value)),
+            ValueOption::BuiltHereKeyReached => seams.built_here_key_reached = Some(PathBuf::from(value)),
+            ValueOption::KeyWaits => seams.key_waits = Some(PathBuf::from(value)),
             ValueOption::DotnetLimitMs => seams.dotnet_limit_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::RemoteTransport => seams.remote_transport = Some(value.to_owned()),
             ValueOption::RemoteSsh => seams.remote_ssh = Some(PathBuf::from(value)),

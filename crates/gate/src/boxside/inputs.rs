@@ -13,6 +13,10 @@
 //! is gone, rewrites the tree's `.git\info\exclude` from the record, so no input is cleaned by the checkout or
 //! committed back, and writes the record's digest last, only once the work folder holds every file of the manifest.
 //!
+//! A sibling pair's request is taken only when it sends the PC's build (`SentBin`): its main repo's tree is
+//! `{Work}\{leaf}`, so each path of its `SentBin` and manifest is read as `{leaf}/{path}` below the work folder, the
+//! work folder is laid out as the pair's run lays it out, and the exclude file written is the main repo's.
+//!
 //! The box runs elevated while the command and any other process of the builder's user may write in the work folder,
 //! so every file and folder the box makes, moves, writes or deletes below it is reached through handles opened one name
 //! at a time beneath the held work folder, never through a link, and is acted on through the handle it was checked by.
@@ -30,7 +34,7 @@ use gate_args::BoxSeams;
 use gate_inputs::manifest::{read_sent, refused_path};
 use gate_router::escaped;
 use gate_win32::{Descriptor, Make, Share};
-use gate_wire::{OUTPUTS_NONCE_DIGITS, Payload, SHA256_DIGITS, grandparent, is_lower_hex, ordinal_upper};
+use gate_wire::{OUTPUTS_NONCE_DIGITS, Pair, Payload, SHA256_DIGITS, grandparent, is_lower_hex, ordinal_upper};
 use serde_json::{Map, Value, json};
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, READ_CONTROL,
@@ -61,7 +65,7 @@ const STAGED_FILES: &str = "files";
 const STAGES_ACCESS: u32 = READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY;
 /// How old a stage is before any put removes it: a put that left one ended a day ago.
 const STAGE_AGE: Duration = Duration::from_hours(24);
-/// The line refusing a request that names a sibling pair.
+/// The line refusing a request of the repo's inputs (no `SentBin`) that names a sibling pair.
 const PAIR_REFUSED: &str = "gate box: inputs for a sibling pair are not taken yet";
 /// The access a staged file is opened with to be moved into the work folder: its stamp read, its name moved, its DACL
 /// and label set.
@@ -118,13 +122,14 @@ pub(super) fn refused_line(nonce: &str) -> String {
 /// record `book` says: no record, one that cannot be read or of another digest, a recorded copy gone or not the one
 /// installed (its size, last write or file id differs), or a tree whose exclude file cannot be written from both
 /// records; `Ok` when it holds them, the exclude file written, with the line saying where a folder at the exclude
-/// file's name was moved aside, when one was ([`preflight::moved_aside_line`]), for the caller to say.
-pub(super) fn unmatched(book: Book, work: &str, held: &File, sent: &str) -> Result<Option<String>, String> {
+/// file's name was moved aside, when one was ([`preflight::moved_aside_line`]), for the caller to say. `leaf` is the
+/// main repo's folder on a sibling pair's run, whose exclude file is the one written ([`write_exclude`]).
+pub(super) fn unmatched(book: Book, work: &str, leaf: Option<&str>, held: &File, sent: &str) -> Result<Option<String>, String> {
     let record = matching_record(&book.path(work), sent)?;
     if let Some(why) = changed_copy(held, &record) {
         return Err(why);
     }
-    write_exclude(held, work, [&record, &other_record(work, book)])
+    write_exclude(held, work, leaf, [&record, &other_record(work, book)])
 }
 
 /// The work folder's record other than `book`'s, for the exclude file both share; empty when it is missing or cannot
@@ -250,12 +255,15 @@ struct Asked<'a> {
     root: &'a str,
     /// The project whose build the request sends, `None` for the repo's inputs.
     bin: Option<SentBin>,
+    /// The sibling pair whose main repo's tree, `{work}\{leaf}`, the sent build is installed in; `None` for one repo.
+    pair: Option<Pair>,
 }
 
 impl Asked<'_> {
-    /// The request `payload` holds; else the usage line. A request naming a sibling pair is refused first.
+    /// The request `payload` holds; else the usage line. A request of the repo's inputs naming a sibling pair is
+    /// refused first; a pair the payload reader refuses ([`Payload::pair`]) is refused with its line.
     fn read(payload: &Payload) -> Result<Asked<'_>, String> {
-        if payload.sets("Pair") {
+        if payload.sets("Pair") && !payload.sets("SentBin") {
             return Err(PAIR_REFUSED.to_owned());
         }
         let (key, work) = payload.work_folder()?;
@@ -270,6 +278,7 @@ impl Asked<'_> {
         let root =
             grandparent(work).ok_or_else(|| format!(r"gate: box payload Work must be <root>\work\<key> to stage inputs: {}", escaped(work)))?;
         let bin = SentBin::read(payload)?;
+        let pair = payload.pair()?;
         Ok(Asked {
             key,
             work,
@@ -279,7 +288,45 @@ impl Asked<'_> {
             step,
             root,
             bin,
+            pair,
         })
+    }
+
+    /// The main repo's folder below the work folder on a sibling pair's request; `None` for one repo.
+    fn leaf(&self) -> Option<&str> {
+        self.pair.as_ref().map(Pair::leaf)
+    }
+
+    /// The `/`-separated path below the work folder of the PC's `path`: `{leaf}/{path}` on a pair's request.
+    fn target(&self, path: &str) -> String {
+        match self.leaf() {
+            Some(leaf) => format!("{leaf}/{path}"),
+            None => path.to_owned(),
+        }
+    }
+
+    /// The PC's path of the `path` below the work folder that [`Asked::target`] gave.
+    fn pc_path<'p>(&self, path: &'p str) -> &'p str {
+        self.leaf()
+            .and_then(|leaf| path.strip_prefix(leaf))
+            .and_then(|rest| rest.strip_prefix('/'))
+            .unwrap_or(path)
+    }
+
+    /// `sent` with each path of its manifest read as the path below the work folder ([`Asked::target`]), its digest
+    /// the one of the line as received.
+    fn placed(&self, sent: Sent) -> Sent {
+        if self.leaf().is_none() {
+            return sent;
+        }
+        let mut manifest = Manifest::default();
+        for (path, held) in sent.manifest.files() {
+            manifest.insert(self.target(path), held.clone());
+        }
+        Sent {
+            manifest,
+            digest: sent.digest,
+        }
     }
 
     /// The record the request installs into.
@@ -317,18 +364,20 @@ impl Asked<'_> {
             bare: self.bare,
             lock: self.lock,
             nonce: self.nonce,
+            pair: self.pair.as_ref(),
         }
     }
 }
 
 /// The work folder a box verb holds while it works, as [`locked`] takes it: its key, its path, the bare repository it
-/// shares, its lock file, and the nonce a busy refusal names.
+/// shares, its lock file, the nonce a busy refusal names, and the sibling pair it is laid out for, `None` for one repo.
 pub(super) struct WorkLock<'a> {
     pub(super) key: &'a str,
     pub(super) work: &'a str,
     pub(super) bare: &'a str,
     pub(super) lock: &'a str,
     pub(super) nonce: &'a str,
+    pub(super) pair: Option<&'a Pair>,
 }
 
 /// The PC's inputs manifest, and the SHA-256 of its line as received, without its line end.
@@ -373,6 +422,7 @@ pub(super) fn inputs(payload: &Payload, seams: &BoxSeams, console: &mut Console)
     if let Some(why) = asked.out_of_scope(&sent.manifest) {
         return failed(&asked, &why, console);
     }
+    let sent = asked.placed(sent);
     match asked.step {
         Step::Diff => match locked(&asked.work_lock(), console, |work, console| diff(&asked, &sent, work, console)) {
             Ok(Ok(())) => 0,
@@ -694,7 +744,7 @@ fn diff(asked: &Asked<'_>, sent: &Sent, work: &File, console: &mut Console) -> R
     }
     stamping::out(console, &format!("gate-remote-inputs: need {}", needed.len()));
     for path in needed {
-        stamping::out(console, &format!("gate-remote-inputs: path {}", escaped(path)));
+        stamping::out(console, &format!("gate-remote-inputs: path {}", escaped(asked.pc_path(path))));
     }
     Ok(())
 }
@@ -1243,8 +1293,9 @@ fn installed(asked: &Asked<'_>, sent: &Sent, staged: (&File, &[Entry]), work: &F
     let book = asked.book().path(asked.work);
     let record = recorded(&book, console)?;
     for entry in entries {
-        in_manifest(entry, &sent.manifest)?;
-        free_target(asked.book(), work, &entry.path, &record, &sent.manifest)?;
+        let target = asked.target(&entry.path);
+        in_manifest(entry, &target, &sent.manifest)?;
+        free_target(asked.book(), work, &target, &record, &sent.manifest)?;
     }
     unsealed(&book, &record)?;
     let mut now = Record {
@@ -1252,13 +1303,16 @@ fn installed(asked: &Asked<'_>, sent: &Sent, staged: (&File, &[Entry]), work: &F
         ..Record::default()
     };
     for entry in entries {
-        let stamp = moved_in(asked.book(), files, work, &entry.path)?;
-        let copy = Copy {
-            path: entry.path.clone(),
-            sha256: entry.sha256.clone(),
-            stamp,
-        };
-        now.files.insert(ordinal_upper(&entry.path), copy);
+        let target = asked.target(&entry.path);
+        let stamp = moved_in(asked.book(), files, work, &entry.path, &target)?;
+        now.files.insert(
+            ordinal_upper(&target),
+            Copy {
+                path: target,
+                sha256: entry.sha256.clone(),
+                stamp,
+            },
+        );
     }
     for line in finished(asked, work, sent, &record, now)? {
         stamping::err(console, &line);
@@ -1312,10 +1366,10 @@ fn finished(asked: &Asked<'_>, work: &File, sent: &Sent, record: &Record, mut no
     }
     let other = other_record(asked.work, asked.book());
     let mut lines = match &asked.bin {
-        Some(bin) => leftovers_removed(work, &bin.bin, [&now, &other]),
+        Some(bin) => leftovers_removed(work, &asked.target(&bin.bin), [&now, &other]),
         None => Vec::new(),
     };
-    lines.extend(write_exclude(work, asked.work, [&now, &other])?);
+    lines.extend(write_exclude(work, asked.work, asked.leaf(), [&now, &other])?);
     now.digest.clone_from(&sent.digest);
     write_record(book, &now)?;
     Ok(lines)
@@ -1413,9 +1467,10 @@ fn leftover_line(path: &str, error: &io::Error) -> String {
     )
 }
 
-/// Whether the manifest holds the member `entry` with its size and SHA-256; else the refusal naming it.
-fn in_manifest(entry: &Entry, manifest: &Manifest) -> Result<(), String> {
-    match manifest.get(&entry.path) {
+/// Whether the manifest holds the member `entry`, installed at `path` below the work folder, with its size and SHA-256;
+/// else the refusal naming it.
+fn in_manifest(entry: &Entry, path: &str, manifest: &Manifest) -> Result<(), String> {
+    match manifest.get(path) {
         None => Err(format!("the archive's member '{}' is not in the manifest", escaped(&entry.path))),
         Some(held) if held.sha256 != entry.sha256 || held.stamp.size != entry.size => Err(format!(
             "the archive's member '{}' is {} bytes with SHA-256 {}, the manifest's {} bytes with SHA-256 {}",
@@ -1464,20 +1519,20 @@ fn is_stale_unchanged(file: &File, path: &str, record: &Record, manifest: &Manif
     Ok(sha256 == copy.sha256)
 }
 
-/// Moves the staged file `path` below the held folder `files` to the same path below the held work folder `work`,
+/// Moves the staged file `staged` below the held folder `files` to the path `path` below the held work folder `work`,
 /// replacing a file or a link there as itself: each folder on its way made when missing and refused when it is a
 /// link, a junction or not a folder ([`walk_making`]), the file renamed by its handle into the held folder
 /// ([`gate_win32::rename_beneath`]; for a sent build's restore file, [`Book::restores`], one that replaces nothing,
 /// [`gate_win32::rename_beneath_no_replace`]) and its DACL and label then set to what that folder hands down. The moved file's
 /// stamp, read through that handle; else why not.
-fn moved_in(book: Book, files: &File, work: &File, path: &str) -> Result<Stamp, String> {
+fn moved_in(book: Book, files: &File, work: &File, staged: &str, path: &str) -> Result<Stamp, String> {
     let failed = |why: String| format!("cannot install '{}': {why}", escaped(path));
     let (folder, leaf) = match walk_making(work, path, true).map_err(|error| failed(error.to_string()))? {
         Walked::Reached(folder, leaf) => (folder, leaf),
         Walked::Blocked(prefix, _) => return Err(failed(not_a_folder(prefix).to_string())),
         Walked::Missing => return Err(failed("a folder on its way could not be made".to_owned())),
     };
-    let Walked::Reached(staged_folder, staged_leaf) = walk(files, path).map_err(|error| failed(error.to_string()))? else {
+    let Walked::Reached(staged_folder, staged_leaf) = walk(files, staged).map_err(|error| failed(error.to_string()))? else {
         return Err(failed("its staged copy is not in the stage".to_owned()));
     };
     let source =
@@ -1564,19 +1619,36 @@ fn present(book: Book, work: &File, manifest: &Manifest, record: &Record, now: &
 /// in the order of their keys. The `.git` must be a folder of its own, opened beneath the held work folder `work`,
 /// whose path is `work_path`; `.git\info` is made a folder of its own beneath it ([`info_folder`]), and the file
 /// written beneath that ([`preflight::written_beneath`]), so no link there is followed; the line saying where a folder
-/// at the file's name was moved aside, when one was ([`preflight::moved_aside_line`]). Else why not.
-fn write_exclude(work: &File, work_path: &str, records: [&Record; 2]) -> Result<Option<String>, String> {
-    let git_path = Path::new(work_path).join(".git");
-    let not_own = || format!("{} is not a folder of its own", git_path.display());
-    let git = gate_win32::open_beneath(work, ".git", Share::NoDelete).map_err(|_| not_own())?;
+/// at the file's name was moved aside, when one was ([`preflight::moved_aside_line`]). Else why not. On a sibling
+/// pair's request or run, `leaf` names the main repo's tree `{work}\{leaf}`, a folder of its own opened beneath the
+/// work folder, whose `.git` is the one written: each path below `{leaf}/` named with that prefix cut, and any other
+/// left out.
+fn write_exclude(work: &File, work_path: &str, leaf: Option<&str>, records: [&Record; 2]) -> Result<Option<String>, String> {
+    let tree_path = leaf.map_or_else(|| PathBuf::from(work_path), |leaf| Path::new(work_path).join(leaf));
+    let git_path = tree_path.join(".git");
+    let not_own = |path: &Path| format!("{} is not a folder of its own", path.display());
+    let held_tree;
+    let tree = match leaf {
+        None => work,
+        Some(leaf) => {
+            held_tree = gate_win32::open_beneath(work, leaf, Share::NoDelete).map_err(|_| not_own(&tree_path))?;
+            if !is_folder_itself(&held_tree).map_err(|error| error.to_string())? {
+                return Err(not_own(&tree_path));
+            }
+            &held_tree
+        }
+    };
+    let git = gate_win32::open_beneath(tree, ".git", Share::NoDelete).map_err(|_| not_own(&git_path))?;
     if !is_folder_itself(&git).map_err(|error| error.to_string())? {
-        return Err(not_own());
+        return Err(not_own(&git_path));
     }
     let info_path = git_path.join("info");
     let info = info_folder(&git, &info_path)?;
+    let prefix = leaf.map(|leaf| format!("{leaf}/"));
     let paths: BTreeMap<String, &str> = records
         .iter()
         .flat_map(|record| record.paths())
+        .filter_map(|path| in_tree(path, prefix.as_deref()))
         .map(|path| (ordinal_upper(path), path))
         .collect();
     let mut text = String::new();
@@ -1588,6 +1660,16 @@ fn write_exclude(work: &File, work_path: &str, records: [&Record; 2]) -> Result<
     preflight::written_beneath(&info, "exclude", &text)
         .map(|moved| moved.map(|moved| preflight::moved_aside_line(&exclude, &moved)))
         .map_err(|why| format!("cannot write {}: {why}", exclude.display()))
+}
+
+/// The `/`-separated `path` below the work folder as a path of the tree whose `/`-ended `prefix` it is below: `path`
+/// itself without a prefix, `path` with the prefix cut when it is below it, without regard to ASCII case, else `None`.
+fn in_tree<'p>(path: &'p str, prefix: Option<&str>) -> Option<&'p str> {
+    match prefix {
+        None => Some(path),
+        Some(prefix) if starts_without_case(path, prefix) => path.get(prefix.len()..),
+        Some(_) => None,
+    }
 }
 
 /// The folder `info` beneath the held `.git` folder `git`, held without delete sharing: a link, a junction or a file
@@ -1683,6 +1765,7 @@ mod tests {
             step: Step::Put,
             root,
             bin: None,
+            pair: None,
         }
     }
 
@@ -2236,7 +2319,7 @@ mod tests {
         fs::rename(work.join("data"), work.join("data-away")).expect("the folder can be renamed away");
         junction(&work.join("data"), &outside);
 
-        let moved = moved_in(Book::Inputs, &files_held, &work_held, "data/b.txt");
+        let moved = moved_in(Book::Inputs, &files_held, &work_held, "data/b.txt", "data/b.txt");
 
         let why = moved.expect_err("the junction is refused");
         assert!(why.contains("'data' is a link, a junction or not a folder"), "{why}");
@@ -2373,7 +2456,7 @@ mod tests {
         fs::write(work.join(path), "the builder's").expect("the builder's restore file can be written");
         let (work_held, files_held) = (held(&work), held(&files));
 
-        let moved = moved_in(Book::SentBuild, &files_held, &work_held, path);
+        let moved = moved_in(Book::SentBuild, &files_held, &work_held, path, path);
 
         drop((work_held, files_held));
         let why = moved.expect_err("the builder's restore file is not replaced");

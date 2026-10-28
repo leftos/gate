@@ -3,6 +3,7 @@
 //! that needs it: a light or critical gate, `--local` or a covering parent read no routing file, and a machine with no
 //! routing file costs no git call.
 
+use std::cell::OnceCell;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -16,6 +17,9 @@ use crate::windows::{WINDOWS_NAME, WindowsChange};
 
 /// The line said when `--no-build` was dropped from the builder's words.
 pub const DROPPED_NO_BUILD_LINE: &str = "gate: dropped --no-build: the last build may have run on the other machine";
+/// The line said when `--no-build` was dropped from the builder's words because the send of the PC's build, planned for
+/// a run whose last build ran here ([`SendPlan::built_here`]), did not land.
+pub const DROPPED_UNSENT_LINE: &str = "gate: dropped --no-build: the PC's build could not be sent";
 /// The line said when a `--no-build` command brings no outputs back.
 pub const NO_OUTPUTS_LINE: &str = "gate: outputs: none brought back for a --no-build command";
 
@@ -294,9 +298,25 @@ pub trait Facts {
     /// `/`-ended, empty at the root) may move its build output out of its `bin\{configuration}` folder: the project
     /// file `file`, or each project file in `folder` when the command named the folder, and every
     /// `Directory.Build.props` and `Directory.Build.targets` from `folder` up to the root, any of them naming one of
-    /// [`OUTPUT_PROPERTIES`]; `true` too when such a file is there and cannot be read. Asked only of a routed
-    /// `dotnet test --no-build` that could keep its `--no-build` by a send ([`send_bin`]).
-    fn moves_build_output(&self, place: &Place, folder: &str, file: Option<&str>) -> bool;
+    /// [`OUTPUT_PROPERTIES`], or, when `default_configuration` (the command sets no configuration, so it builds
+    /// `Debug`), setting a `Configuration` property; `true` too when such a file is there and cannot be read. Asked
+    /// only of a routed dotnet `test` or `run --no-build` that could keep its `--no-build` by a send ([`send_bin`]).
+    fn moves_build_output(&self, place: &Place, folder: &str, file: Option<&str>, default_configuration: bool) -> bool;
+
+    /// The names of the project files ([`PROJECT_EXTENSIONS`]) in `folder` below the worktree root of `place`
+    /// (`/`-separated and `/`-ended, empty at the root); none when it cannot be listed. Asked only of a routed
+    /// `dotnet run --no-build`, or `test --no-build` whose last build ran here, that names no project and could keep
+    /// its `--no-build` by a send ([`send_bin`]).
+    fn project_files(&self, place: &Place, folder: &str) -> Vec<String>;
+
+    /// The name of what the dotnet command `words` builds when the built-here record of the worktree at `root` has an
+    /// entry of each of its projects under the configuration, framework and runtime they set: its project's key, or
+    /// its solution as named. `None` when no such entries stand. Asked at most once per pick, only of a routed dotnet
+    /// `test` or `run --no-build` the routing file's `sendBuild` rule sends nothing of: on a Windows builder, where a
+    /// `Some` sends the PC's build ([`RemoteRun::send`]) or, when it cannot be sent, runs the command here with its
+    /// word ([`LocalReason::BuiltHere`]), and on a macOS pick, which a `Some` steers off ([`macos_kept_off`]). Never
+    /// asked of a run pinned with `--builder`.
+    fn built_here(&self, root: &str, words: &[String]) -> Option<String>;
 
     /// Whether a test project the `dotnet test` command `words` would run is Windows-only, read from its project files:
     /// the project or solution the words name, else their folder argument, else the gate's folder at `place`, each read
@@ -528,6 +548,11 @@ pub enum LocalReason {
     /// A matched command's word names `path`, as the word wrote it, a gitignored project input
     /// ([`Facts::gitignored_inputs`]) whose files cannot all be carried, for the reason `why`.
     GitignoredUnsent { path: String, why: String },
+    /// A routed dotnet `--no-build` run whose last build ran here under its own settings ([`Facts::built_here`]) and
+    /// whose send of the PC's build cannot be made: words or build files the send cannot take ([`send_bin`]), or no
+    /// Windows builder left once a macOS pick is steered off. `project` names what the run builds: its project's key,
+    /// or its solution as named.
+    BuiltHere { project: String },
 }
 
 impl LocalReason {
@@ -568,6 +593,7 @@ impl LocalReason {
             ),
             Self::GitignoredPair { path } => format!("{} is gitignored, and a sibling pair does not send inputs yet", escaped(path)),
             Self::GitignoredUnsent { path, why } => format!("{} is gitignored and its files cannot be sent: {why}", escaped(path)),
+            Self::BuiltHere { project } => format!("the last build of {} ran here; --no-build kept", escaped(project)),
             Self::SiblingMissing { name } => format!("sibling {name} not found beside the worktree"),
             Self::SiblingRefused { name, reason } => format!("sibling {name} {reason}"),
             Self::SiblingsNotAllowed { names, problem } => not_allowed_reason(names, problem.as_deref()),
@@ -654,10 +680,10 @@ pub struct RemoteRun {
     pub inputs: Vec<String>,
     /// Whether `--no-build` was dropped from the builder's words.
     pub dropped_no_build: bool,
-    /// The send that lets the builder keep a routed `dotnet test`'s `--no-build` ([`send_bin`]), for a repo the routing
-    /// file's `sendBuild` lists ([`Config::send_build_allowed`]): the PC's build of its one project sent first, then the
-    /// kept words run. `None` for every other run; a send that does not land runs
-    /// [`RemoteRun::words`], `--no-build` dropped.
+    /// The send that lets a Windows builder keep a routed dotnet `test` or `run`'s `--no-build` ([`send_bin`]), for a
+    /// repo the routing file's `sendBuild` lists ([`Config::send_build_allowed`]) or a run whose last build ran here
+    /// ([`Facts::built_here`]): the PC's build of its one project sent first, then the kept words run. `None` for every
+    /// other run; a send that does not land runs [`RemoteRun::words`], `--no-build` dropped.
     pub send: Option<SendPlan>,
     /// Whether outputs were withheld from a `--no-build` command.
     pub outputs_withheld: bool,
@@ -700,7 +726,7 @@ pub struct LaterCandidate {
     pub alias: String,
 }
 
-/// How a routed `dotnet test --no-build` keeps its `--no-build` ([`RemoteRun::send`]).
+/// How a routed dotnet `test` or `run --no-build` keeps its `--no-build` ([`RemoteRun::send`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendPlan {
     /// The words the builder runs once the send lands: the rewritten words with `--no-build` kept and the bare first
@@ -709,6 +735,22 @@ pub struct SendPlan {
     /// The project's bin folder of the run's configuration below the worktree root, `/`-separated:
     /// `{project}/bin/{configuration}`, or `bin/{configuration}` for a project at the root.
     pub bin: String,
+    /// Whether the send was planned from the built-here record, as the run's last build ran here ([`Facts::built_here`]),
+    /// for a repo the routing file's `sendBuild` lists or not: a send that does not land then says
+    /// [`DROPPED_UNSENT_LINE`] in place of [`DROPPED_NO_BUILD_LINE`].
+    pub built_here: bool,
+    /// The key of the built-here entry the route matched ([`Facts::built_here`]), which the client reads again under
+    /// the key lock; empty for a send planned because `sendBuild` lists the repo.
+    pub project_key: String,
+}
+
+impl SendPlan {
+    /// The line a run says when this send does not land and the builder drops `--no-build`: [`DROPPED_UNSENT_LINE`]
+    /// for a send planned because the last build ran here, else [`DROPPED_NO_BUILD_LINE`].
+    #[must_use]
+    pub fn dropped_line(&self) -> &'static str {
+        if self.built_here { DROPPED_UNSENT_LINE } else { DROPPED_NO_BUILD_LINE }
+    }
 }
 
 impl RemoteRun {
@@ -769,7 +811,9 @@ impl RemoteRun {
 /// that folder or one with no git worktree beside the root; when its `.gate/desktop.toml` has a problem, or the first
 /// pattern it declares that the words match is not one the routing file's `desktop` allows the repo, listed exactly;
 /// when a word names a path outside the worktree and its siblings; or when the gate's folder holds nothing the snapshot
-/// sends; and so does one whose facts cannot be read.
+/// sends; and so does one whose facts cannot be read. Last, a dotnet `test` or `run --no-build` whose last build ran
+/// here under its own settings ([`Facts::built_here`]) and whose send of the PC's build cannot be made runs here
+/// keeping its word, saying why ([`LocalReason::BuiltHere`]).
 ///
 /// A run pinned to one builder ([`Inputs::pin`]) goes to that builder alone, with no later candidates, or is refused
 /// ([`pinned`]).
@@ -871,6 +915,8 @@ struct Matched {
     desktop: bool,
     /// The builders the run may try next, in try order ([`later_candidates`]).
     later: Vec<LaterCandidate>,
+    /// What the built-here record says of the command, carried from the pick ([`Opened::built_here`]).
+    built_here: BuiltHere,
 }
 
 fn route(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<RemoteRun, Here> {
@@ -972,6 +1018,16 @@ pub fn is_cargo(words: &[String]) -> bool {
 #[must_use]
 pub fn dotnet_builds(words: &[String]) -> bool {
     dotnet_own(words).is_some_and(|own| builds(&words[own.clone()]) && !words[own].iter().any(|word| word == NO_BUILD))
+}
+
+/// The dotnet verbs that take a solution.
+const SOLUTION_VERBS: [&str; 2] = ["build", "test"];
+
+/// Whether the words are a dotnet command ([`is_dotnet`]) whose verb takes a solution ([`SOLUTION_VERBS`]), ignoring
+/// letter case.
+#[must_use]
+pub fn dotnet_takes_solution(words: &[String]) -> bool {
+    dotnet_own(words).is_some_and(|own| verb_in(&words[own], &SOLUTION_VERBS))
 }
 
 /// The project or solution a dotnet command ([`is_dotnet`]) names among its own words: the value of `--project`
@@ -1324,7 +1380,8 @@ struct Kept {
 /// The matched command on the `kept` builder, from the opened worktree and the words `sent` rewritten for Windows: its
 /// target settled ([`settle`]) and whether it asks for the desktop ([`check_desktop`]), with no later candidates. What
 /// [`matched`] and [`later_run`] both build.
-fn built(config: &Config, opened: Opened, sent: Rewritten, kept: Kept, facts: &dyn Facts) -> Result<Matched, Here> {
+fn built(config: &Config, mut opened: Opened, sent: Rewritten, kept: Kept, facts: &dyn Facts) -> Result<Matched, Here> {
+    let built_here = std::mem::take(&mut opened.built_here);
     let target = settle(config, opened, kept.builder, facts)?;
     let desktop = check_desktop(config, &target, kept.found, &sent.words, facts)?;
     Ok(Matched {
@@ -1336,6 +1393,7 @@ fn built(config: &Config, opened: Opened, sent: Rewritten, kept: Kept, facts: &d
         program_named: sent.program_named,
         desktop,
         later: Vec::new(),
+        built_here,
     })
 }
 
@@ -1343,7 +1401,8 @@ fn built(config: &Config, opened: Opened, sent: Rewritten, kept: Kept, facts: &d
 /// the worktree ([`outside_reason`]), when the gate's folder below the root holds nothing the snapshot sends, or when a
 /// word names a gitignored project input the run cannot carry ([`carried_inputs`]); else the run on its builder
 /// ([`remote_run`]), for the command as `given`, its input globs followed by the exact paths of the gitignored files
-/// it carries. What [`route`] and [`later_run`] both end with.
+/// it carries, or here when its last build ran here and its send cannot be made ([`planned_send`]). What [`route`] and
+/// [`later_run`] both end with.
 fn ended(config: &Config, matched: Matched, given: &[String], facts: &dyn Facts) -> Result<RemoteRun, Here> {
     if let Some(word) = matched.outside.clone() {
         return Err(Some(outside_reason(config, word, &matched, facts)));
@@ -1354,7 +1413,7 @@ fn ended(config: &Config, matched: Matched, given: &[String], facts: &dyn Facts)
         return Err(Some(LocalReason::NothingSent { subfolder }));
     }
     let carried = carried_inputs(&matched, facts).map_err(Some)?;
-    let mut run = remote_run(config, matched, subfolder, given, facts);
+    let mut run = remote_run(config, matched, subfolder, given, facts)?;
     run.inputs.extend(carried.into_iter().map(|file| format!("{CARRIED_INPUT}{file}")));
     Ok(run)
 }
@@ -1608,7 +1667,8 @@ fn opened_and_sent(
         return Err(Unopened::HookNotAllowed);
     }
     let is_listed = listed(&repo);
-    let opened = open(place, facts, |_| is_listed).map_err(|_| Unopened::NotListed(repo))?;
+    let mut opened = open(place, facts, |_| is_listed).map_err(|_| Unopened::NotListed(repo))?;
+    opened.built_here = BuiltHere::of(words);
     let drives = subst_drives(&opened.place.root, words, facts);
     let sent = rewritten(&opened.place, declared_pairs(&opened.siblings), words, &drives, Separators::AsWritten);
     if sent.program_named && stays_local(&sent.words) {
@@ -1644,7 +1704,7 @@ pub fn later_run(inputs: &Inputs<'_>, facts: &dyn Facts, candidate: &LaterCandid
     let pattern = first_match(patterns, &sent.words).ok_or_else(|| Some("none of its patterns matches the command now".to_owned()))?;
     kept_run(&config, (opened, drives, sent), (builder, pattern), inputs.words, facts).map_err(|unkept| match unkept {
         Unkept::Here(here) => Some(kept_here(here)),
-        Unkept::Desktop | Unkept::WindowsOnly | Unkept::WindowsChange(_) | Unkept::Backslash => None,
+        Unkept::Desktop | Unkept::WindowsOnly | Unkept::WindowsChange(_) | Unkept::BuiltHere(_) | Unkept::Backslash => None,
     })
 }
 
@@ -1659,6 +1719,9 @@ enum Unkept {
     /// A macOS builder, and the change touches the paths of the worktree's `.gate/windows.toml`, or cannot be told to,
     /// for the reason given ([`macos_windows_change`]).
     WindowsChange(String),
+    /// A macOS builder, and the last build of the dotnet `test` or `run --no-build` ran here, under the key of the
+    /// built-here record's entry that says so ([`macos_built_here`]).
+    BuiltHere(String),
     /// A macOS builder, and a word of the command's Unix form still holds a `\` ([`Slashed::Backslash`]).
     Backslash,
 }
@@ -1705,7 +1768,7 @@ const PIN_HOOK: &str = "a gate started in a git hook routes only for a repo remo
 /// not. When its own listing names the repo ([`Config::own_patterns`]), one of those patterns must match the command;
 /// else the repo must be listed for some builder and one of its patterns, of any builder in [`Config::routes`] order,
 /// must match. That pattern is the run's. The worktree's `.gate/local.toml`, siblings and desktop files are read as for
-/// any routed run ([`kept_run`]).
+/// any routed run ([`kept_run`]); the built-here record is never asked ([`Facts::built_here`]).
 ///
 /// # Errors
 ///
@@ -1719,8 +1782,10 @@ fn pinned(inputs: &Inputs<'_>, host: &str, facts: &dyn Facts) -> Result<RemoteRu
     let here = |here: Here| cannot(&here_why(here));
     let (config, builder) = pinned_builder(inputs, host, facts)?;
     let listed = |repo: &str| config.own_patterns(&builder, repo).is_some() || config.is_routed(repo);
-    let (opened, drives, sent) =
+    let (mut opened, drives, sent) =
         opened_and_sent(&config, inputs.git_hook, inputs.words, facts, listed).map_err(|unopened| pin_unopened(host, unopened))?;
+    // The pin asks for this builder: a build that ran here neither keeps the run here nor sends the PC's build.
+    opened.built_here = BuiltHere::default();
     let pattern = match config.own_patterns(&builder, &opened.repo) {
         Some(patterns) => first_match(patterns, &sent.words),
         None => pick(&config, &opened.repo, &sent.words, |_| true).map(|(_, pattern)| pattern),
@@ -1734,6 +1799,7 @@ fn pinned(inputs: &Inputs<'_>, host: &str, facts: &dyn Facts) -> Result<RemoteRu
         Unkept::Desktop => cannot("it asks for a desktop, which a macOS builder does not have"),
         Unkept::WindowsOnly => cannot("it may test a Windows-only project, which a macOS builder cannot run"),
         Unkept::WindowsChange(reason) => cannot(&reason),
+        Unkept::BuiltHere(_) => unreachable!("a pinned run never asks the built-here record"),
         Unkept::Backslash => cannot(r"a word still holds a \, which a macOS builder reads another way"),
     })
 }
@@ -2045,9 +2111,10 @@ fn desktop_pattern(place: &Place, words: &[String], facts: &dyn Facts) -> Result
 /// The pick `first` of the opened worktree's command `words`, kept unless it is a macOS builder and a declared desktop
 /// pattern matches the command ([`desktop_pattern`]), as a macOS builder has no desktop to run it on, or the command is
 /// a `dotnet test` of a Windows-only test project ([`macos_windows_only`]), or the change touches the paths of the
-/// worktree's `.gate/windows.toml` or cannot be told to ([`macos_windows_change`]): the pick then goes on to the next
-/// builder that is no macOS one. Also what it read of the desktop file; `Err(None)` when no other builder's pattern
-/// matches.
+/// worktree's `.gate/windows.toml` or cannot be told to ([`macos_windows_change`]), or the last build of a dotnet
+/// `test` or `run --no-build` ran here ([`macos_built_here`]): the pick then goes on to the next builder that is no
+/// macOS one. Also what it read of the desktop file; `Err(None)` when no other builder's pattern matches, but for a run
+/// whose last build ran here, which runs here keeping its word ([`LocalReason::BuiltHere`]).
 fn steer_off_macos(
     config: &Config,
     opened: &Opened,
@@ -2056,10 +2123,14 @@ fn steer_off_macos(
     first: (Builder, String),
 ) -> Result<(Builder, String, DesktopRead), Here> {
     let (read, unkept) = macos_kept_off(config, &first.0, opened, words, facts)?;
-    if unkept.is_none() {
+    let Some(unkept) = unkept else {
         return Ok((first.0, first.1, read));
-    }
-    let (builder, pattern) = pick(config, &opened.repo, words, |builder| builder.os != BuilderOs::Macos).ok_or(None)?;
+    };
+    let unpicked = match unkept {
+        Unkept::BuiltHere(project) => Some(LocalReason::BuiltHere { project }),
+        _ => None,
+    };
+    let (builder, pattern) = pick(config, &opened.repo, words, |builder| builder.os != BuilderOs::Macos).ok_or(unpicked)?;
     Ok((builder, pattern, read))
 }
 
@@ -2127,8 +2198,9 @@ fn here_why(here: Here) -> String {
 }
 
 /// The first rule that keeps a pick of `builder` for the opened worktree's command `words` off it, as a macOS builder:
-/// a declared desktop pattern the command matches ([`macos_desktop`]), a Windows-only test ([`macos_windows_only`]) or
-/// the change ([`macos_windows_change`]), each asked only when no earlier one keeps it off; `None` when none does, or
+/// a declared desktop pattern the command matches ([`macos_desktop`]), a Windows-only test ([`macos_windows_only`]), the
+/// change ([`macos_windows_change`]) or a last build that ran here ([`macos_built_here`]), each asked only when no
+/// earlier one keeps it off; `None` when none does, or
 /// for any other builder. Also what it read of the desktop file. The one list of these rules that the first pick
 /// ([`steer_off_macos`]) and a later or pinned builder ([`kept_run`]) both follow.
 fn macos_kept_off(
@@ -2143,10 +2215,23 @@ fn macos_kept_off(
         Some(Unkept::Desktop)
     } else if macos_windows_only(builder, &opened.place, words, facts) {
         Some(Unkept::WindowsOnly)
+    } else if let Some(reason) = macos_windows_change(config, builder, opened, facts) {
+        Some(Unkept::WindowsChange(reason))
     } else {
-        macos_windows_change(config, builder, opened, facts).map(Unkept::WindowsChange)
+        macos_built_here(builder, opened, facts).map(Unkept::BuiltHere)
     };
     Ok((read, unkept))
+}
+
+/// The key of the built-here record's entry that says the last build of the opened worktree's dotnet `test` or
+/// `run --no-build` ran here ([`BuiltHere::entry`]), for a pick of a macOS builder, which cannot take the PC's Windows
+/// build, whatever the routing file's `sendBuild` lists, as the listed rule sends nothing to a macOS builder; `None`
+/// for any other builder.
+fn macos_built_here(builder: &Builder, opened: &Opened, facts: &dyn Facts) -> Option<String> {
+    if builder.os != BuilderOs::Macos {
+        return None;
+    }
+    opened.built_here.entry(&opened.place.root, facts)
 }
 
 /// What the pick read of the worktree's `.gate/desktop.toml` ([`steer_off_macos`]).
@@ -2201,6 +2286,38 @@ struct Opened {
     problem: Option<String>,
     /// How the lines name the siblings file, shown [`escaped`].
     file: String,
+    /// What the built-here record says of the command the worktree was opened for ([`opened_and_sent`]); never asked
+    /// for any other opening.
+    built_here: BuiltHere,
+}
+
+/// What the worktree's built-here record says of a dotnet `test` or `run --no-build` command ([`Facts::built_here`]):
+/// asked at most once, and only when a rule needs it. The default asks nothing and finds no build here.
+#[derive(Default)]
+struct BuiltHere {
+    /// The command's words as given; `None` for a command the record is never asked of.
+    words: Option<Vec<String>>,
+    /// The entry's key, once asked.
+    entry: OnceCell<Option<String>>,
+}
+
+impl BuiltHere {
+    /// The record's answer for the command `words`, to be asked when it is a dotnet `test` or `run` whose own words
+    /// hold `--no-build` ([`SEND_VERBS`]); any other command asks nothing.
+    fn of(words: &[String]) -> BuiltHere {
+        let asks = dotnet_own(words).is_some_and(|own| verb_in(&words[own.clone()], &SEND_VERBS) && words[own].iter().any(|word| word == NO_BUILD));
+        BuiltHere {
+            words: asks.then(|| words.to_vec()),
+            entry: OnceCell::new(),
+        }
+    }
+
+    /// The key of the entry that says the command's last build ran here in the worktree at `root`, asking the facts
+    /// the first time only.
+    fn entry(&self, root: &str, facts: &dyn Facts) -> Option<String> {
+        let words = self.words.as_deref()?;
+        self.entry.get_or_init(|| facts.built_here(root, words)).clone()
+    }
 }
 
 /// The worktree at `place` when `listed` says the routing file lists its repo, with its siblings file read; `Err(None)`
@@ -2223,6 +2340,7 @@ fn open(place: Place, facts: &dyn Facts, listed: impl FnOnce(&str) -> bool) -> R
         siblings,
         problem,
         file,
+        built_here: BuiltHere::default(),
     })
 }
 
@@ -2572,8 +2690,13 @@ fn bin_glob(subfolder: &str, folder: &str) -> Option<String> {
 
 /// The routed run of a matched command: its target, its rewritten words with `--no-build` dropped, then marked and
 /// stamped as [`builder_words`] marks and stamps them, the worktree's `HEAD` sha, asked once whatever the command, and
-/// the builders the run may try next ([`RemoteRun::later`]), which the config alone gives.
-fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[String], facts: &dyn Facts) -> RemoteRun {
+/// the builders the run may try next ([`RemoteRun::later`]), which the config alone gives, with the send of the PC's
+/// build it plans ([`planned_send`]).
+///
+/// # Errors
+///
+/// A run whose last build ran here and whose send cannot be made runs here ([`LocalReason::BuiltHere`]).
+fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[String], facts: &dyn Facts) -> Result<RemoteRun, Here> {
     let Matched {
         target,
         pattern,
@@ -2581,20 +2704,21 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         program_named,
         desktop,
         later,
+        built_here,
         ..
     } = matched;
     let sent_count = sent.len();
     let cargo = is_cargo(&sent);
-    // A macOS builder builds the project itself: the PC's Windows build is no use to it.
-    let listed = target.builder.os == BuilderOs::Windows && config.send_build_allowed(&target.repo) == Ok(true);
-    let send = listed
-        .then(|| send_bin(given, &target.place, |folder, file| facts.moves_build_output(&target.place, folder, file)))
-        .flatten()
-        .map(|bin| {
-            let mut kept = sent.clone();
-            mark_bare_first_word(&mut kept, facts, program_named);
-            SendPlan { words: kept, bin }
-        });
+    let send = planned_send(config, &target, &built_here, given, facts)?.map(|(bin, entry)| {
+        let mut kept = sent.clone();
+        mark_bare_first_word(&mut kept, facts, program_named);
+        SendPlan {
+            words: kept,
+            bin,
+            built_here: entry.is_some(),
+            project_key: entry.unwrap_or_default(),
+        }
+    });
     let fallback = without_no_build(given.to_vec());
     let own_outputs = config.own_outputs_on(&target.builder, &target.repo);
     let derives = target.builder.os == BuilderOs::Windows && own_outputs.as_ref().is_some_and(|globs| !globs.is_empty());
@@ -2627,7 +2751,7 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         Some(rid) => cross_plan(rid, &words),
         None => (None, None),
     };
-    RemoteRun {
+    Ok(RemoteRun {
         builder: target.builder,
         key: target.key,
         leaf: target.leaf,
@@ -2651,6 +2775,50 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         later,
         cross_build,
         cross_build_blocked,
+    })
+}
+
+/// The bin folder whose files the run of the command as `given` on `target` sends ([`send_bin`]), and whether the send
+/// was planned because its last build ran here, then the key of the entry it matched: only on a Windows builder, as a
+/// macOS one builds the project itself and the PC's Windows build is no use to it, and only for a repo the routing
+/// file's `sendBuild` lists ([`Config::send_build_allowed`]), whose record is not asked when the listed rule sends, or
+/// for a command whose last build ran here ([`BuiltHere::entry`]), listed or not. `None` for every other run, whose
+/// `--no-build` is dropped as before.
+///
+/// # Errors
+///
+/// A run whose last build ran here and whose send cannot be made runs here ([`LocalReason::BuiltHere`]).
+fn planned_send(
+    config: &Config,
+    target: &Target,
+    built_here: &BuiltHere,
+    given: &[String],
+    facts: &dyn Facts,
+) -> Result<Option<(String, Option<String>)>, Here> {
+    if target.builder.os != BuilderOs::Windows {
+        return Ok(None);
+    }
+    let place = &target.place;
+    let bin_of = |built_here: bool| {
+        send_bin(
+            given,
+            place,
+            built_here,
+            |folder| facts.project_files(place, folder),
+            |folder, file, default_configuration| facts.moves_build_output(place, folder, file, default_configuration),
+        )
+    };
+    if config.send_build_allowed(&target.repo) == Ok(true)
+        && let Some(bin) = bin_of(false)
+    {
+        return Ok(Some((bin, None)));
+    }
+    let Some(entry) = built_here.entry(&place.root, facts) else {
+        return Ok(None);
+    };
+    match bin_of(true) {
+        Some(bin) => Ok(Some((bin, Some(entry)))),
+        None => Err(Some(LocalReason::BuiltHere { project: entry })),
     }
 }
 
@@ -2893,8 +3061,17 @@ pub(crate) fn fold_lines(text: &str) -> String {
     pieces.join(" ")
 }
 
-/// The dotnet verb whose `--no-build` a send lets the builder keep.
-const SEND_VERB: [&str; 1] = ["test"];
+/// The dotnet verbs whose `--no-build` a send lets the builder keep.
+const SEND_VERBS: [&str; 2] = ["test", "run"];
+/// The dotnet verb whose `--no-build` a send planned only from the routing file's `sendBuild` lets the builder keep.
+const LISTED_SEND_VERB: [&str; 1] = ["test"];
+/// The dotnet verb that runs the one project of its folder when its words name none.
+const RUN_VERB: [&str; 1] = ["run"];
+/// The extension of a file-based app's source, which `dotnet run` runs without a project file.
+const FILE_APP_EXTENSIONS: [&str; 1] = [".cs"];
+/// What a build file holds when it sets the `Configuration` property, ignoring letter case: the element alone, or with
+/// its attributes. A `$(Configuration)` it only reads sets nothing.
+pub const CONFIGURATION_ELEMENTS: [&str; 2] = ["<Configuration>", "<Configuration "];
 /// The options that move a dotnet command's build output, whose `--no-build` no send keeps.
 const OUTPUT_OPTIONS: [&str; 3] = ["-o", "--output", "--artifacts-path"];
 /// The `MSBuild` properties that move a project's build output out of its `bin\{configuration}` folder, whose
@@ -2912,31 +3089,72 @@ const DEFAULT_CONFIGURATION: &str = "Debug";
 /// [`derived_outputs`] reads: `Platform` left out, whose build lands under `bin\{platform}\{configuration}` still.
 const DERIVED_OUTPUT_PROPERTIES: [&str; 4] = ["OutputPath", "BaseOutputPath", "UseArtifactsOutput", "OutDir"];
 
-/// The bin folder whose files a routed `dotnet test --no-build` sends so the builder keeps its `--no-build`
-/// ([`SendPlan::bin`]), read from the command `words` as given at `place`: the dotnet command's verb is `test`, its own
-/// words hold `--no-build`, name one project ([`DotnetTarget::Project`]) inside the worktree and set the configuration
-/// (`-c` or `--configuration`) to one plain name, and neither name an output option ([`OUTPUT_OPTIONS`]) nor set an
-/// output property ([`OUTPUT_PROPERTIES`]); `moves_output`, asked last of the project's folder below the root and the
-/// project file's name when one is named, says whether its build files may move it ([`Facts::moves_build_output`]).
-/// `None` for every other command, whose `--no-build` is dropped as before.
-fn send_bin(words: &[String], place: &Place, moves_output: impl FnOnce(&str, Option<&str>) -> bool) -> Option<String> {
+/// The bin folder whose files a routed dotnet `test` or `run --no-build` sends so the builder keeps its `--no-build`
+/// ([`SendPlan::bin`]), read from the command `words` as given at `place`: the dotnet command's verb is one of
+/// [`SEND_VERBS`], its own words hold `--no-build`, name one project inside the worktree ([`send_project`]), set the
+/// configuration (`-c` or `--configuration`) to one plain name or none, which builds `Debug`, and neither name an
+/// output option ([`OUTPUT_OPTIONS`]) nor set an output property ([`OUTPUT_PROPERTIES`]); `moves_output`, asked last of
+/// the project's folder below the root, the project file's name when one is known and whether the words set no
+/// configuration, says whether its build files may move it or set the configuration ([`Facts::moves_build_output`]).
+/// `project_files` lists a folder's project files ([`Facts::project_files`]). Unless `built_here` (the send is planned
+/// from a matching built-here entry, [`Facts::built_here`]), only a `dotnet test` ([`LISTED_SEND_VERB`]) naming its
+/// project and setting a configuration sends. `None` for every other command.
+fn send_bin(
+    words: &[String],
+    place: &Place,
+    built_here: bool,
+    project_files: impl FnOnce(&str) -> Vec<String>,
+    moves_output: impl FnOnce(&str, Option<&str>, bool) -> bool,
+) -> Option<String> {
     let own = &words[dotnet_own(words)?];
-    if !verb_in(own, &SEND_VERB) || !own.iter().any(|word| word == NO_BUILD) {
+    let verbs: &[&str] = if built_here { &SEND_VERBS } else { &LISTED_SEND_VERB };
+    if !verb_in(own, verbs) || !own.iter().any(|word| word == NO_BUILD) {
         return None;
     }
-    let Some(DotnetTarget::Project(project)) = dotnet_target(words) else {
+    let configuration = option_value(own, &CONFIGURATION_OPTIONS);
+    if configuration.as_deref().map_or(!built_here, |value| !is_plain_name(value)) {
         return None;
-    };
-    let configuration = option_value(own, &CONFIGURATION_OPTIONS).filter(|value| is_plain_name(value))?;
+    }
     if own.iter().any(|word| is_output_option(word)) || OUTPUT_PROPERTIES.iter().any(|name| sets_property(own, name)) {
         return None;
     }
-    let folder = project_folder(&project, place)?;
-    let file = has_extension(&project, &PROJECT_EXTENSIONS).then(|| project.rsplit(['/', '\\']).next().unwrap_or(&project));
-    if moves_output(&folder, file) {
+    let (folder, file) = send_project(words, own, place, built_here, project_files)?;
+    if moves_output(&folder, file.as_deref(), configuration.is_none()) {
         return None;
     }
-    Some(format!("{folder}bin/{configuration}"))
+    Some(format!("{folder}bin/{}", configuration.as_deref().unwrap_or(DEFAULT_CONFIGURATION)))
+}
+
+/// The folder below the worktree root of `place` of the one project the dotnet command `words`, its own words `own`,
+/// runs ([`project_folder`]), with the project file's name when one is known: the project it names
+/// ([`DotnetTarget::Project`]), or, for a `dotnet run` that names no project, solution or file-based app
+/// ([`FILE_APP_EXTENSIONS`]), or, when `built_here`, a `dotnet test` that names no project, solution or folder, the
+/// gate's folder when `project_files` finds exactly one project file in it. `None` for any other command.
+fn send_project(
+    words: &[String],
+    own: &[String],
+    place: &Place,
+    built_here: bool,
+    project_files: impl FnOnce(&str) -> Vec<String>,
+) -> Option<(String, Option<String>)> {
+    match dotnet_target(words) {
+        Some(DotnetTarget::Project(project)) => {
+            let folder = project_folder(&project, place)?;
+            let file = has_extension(&project, &PROJECT_EXTENSIONS).then(|| project.rsplit(['/', '\\']).next().unwrap_or(&project).to_owned());
+            Some((folder, file))
+        }
+        Some(DotnetTarget::Solution(_)) => None,
+        None => {
+            let runs = verb_in(own, &RUN_VERB) && !own.iter().any(|word| has_extension(word, &FILE_APP_EXTENSIONS));
+            let tests = built_here && verb_in(own, &LISTED_SEND_VERB) && positional_target(words).is_none();
+            if !runs && !tests {
+                return None;
+            }
+            let folder = project_folder("", place)?;
+            let [file] = <[String; 1]>::try_from(project_files(&folder)).ok()?;
+            Some((folder, Some(file)))
+        }
+    }
 }
 
 /// Whether `word` is one of [`OUTPUT_OPTIONS`], alone or with its value after `=` or `:`, ignoring letter case.
@@ -3018,7 +3236,12 @@ mod tests {
 
     /// The bin folder [`send_bin`] gives `text` at the root, the build files moving nothing.
     fn sent(text: &str) -> Option<String> {
-        send_bin(&words(text), &place(""), |_, _| false)
+        send_bin(&words(text), &place(""), false, |_| Vec::new(), |_, _, _| false)
+    }
+
+    /// The bin folder [`send_bin`] gives `text` at the root for a send planned from a matching built-here entry.
+    fn sent_built_here(text: &str) -> Option<String> {
+        send_bin(&words(text), &place(""), true, |_| Vec::new(), |_, _, _| false)
     }
 
     /// The glob [`derived_outputs`] adds for the command `text` at the subfolder `folder`.
@@ -3072,13 +3295,17 @@ mod tests {
         let relative = send_bin(
             &words(r"dotnet test ..\other\Other.csproj -c Release --no-build"),
             &place("tests/"),
-            |_, _| false,
+            false,
+            |_| Vec::new(),
+            |_, _, _| false,
         );
         assert_eq!(relative, Some("other/bin/Release".to_owned()));
         let absolute = send_bin(
             &words(r"dotnet test X:\dev\app\src\App.csproj -c Release --no-build"),
             &place("tests/"),
-            |_, _| false,
+            false,
+            |_| Vec::new(),
+            |_, _, _| false,
         );
         assert_eq!(absolute, Some("src/bin/Release".to_owned()));
         assert_eq!(
@@ -3146,27 +3373,44 @@ mod tests {
     fn the_build_files_are_asked_of_the_project_s_folder_and_file() {
         let asked = |text: &str| {
             let mut asked = None;
-            send_bin(&words(text), &place(""), |folder, file| {
-                asked = Some((folder.to_owned(), file.map(str::to_owned)));
-                false
-            });
+            send_bin(
+                &words(text),
+                &place(""),
+                true,
+                |_| Vec::new(),
+                |folder, file, default_configuration| {
+                    asked = Some((folder.to_owned(), file.map(str::to_owned), default_configuration));
+                    false
+                },
+            );
             asked
         };
         assert_eq!(
             asked(r"dotnet test tests\App.Tests\App.Tests.csproj -c Release --no-build"),
-            Some(("tests/App.Tests/".to_owned(), Some("App.Tests.csproj".to_owned())))
+            Some(("tests/App.Tests/".to_owned(), Some("App.Tests.csproj".to_owned()), false))
         );
         assert_eq!(
             asked("dotnet test --project tests/App.Tests -c Release --no-build"),
-            Some(("tests/App.Tests/".to_owned(), None)),
+            Some(("tests/App.Tests/".to_owned(), None, false)),
             "a folder named: its project files are read"
+        );
+        assert_eq!(
+            asked("dotnet test App.csproj --no-build"),
+            Some((String::new(), Some("App.csproj".to_owned()), true)),
+            "no configuration set: the build files are asked for one"
         );
     }
 
     #[test]
     fn build_files_that_move_the_output_keep_the_drop() {
         assert_eq!(
-            send_bin(&words("dotnet test App.csproj -c Release --no-build"), &place(""), |_, _| true),
+            send_bin(
+                &words("dotnet test App.csproj -c Release --no-build"),
+                &place(""),
+                false,
+                |_| Vec::new(),
+                |_, _, _| true
+            ),
             None
         );
     }
@@ -3177,8 +3421,55 @@ mod tests {
     }
 
     #[test]
+    fn a_built_here_run_with_no_build_sends_its_bin() {
+        assert_eq!(
+            sent_built_here("dotnet run --project App.csproj -c Release --no-build -- -o out"),
+            Some("bin/Release".to_owned()),
+            "the program's words are not the command's"
+        );
+    }
+
+    #[test]
+    fn a_run_naming_no_project_sends_the_one_project_of_the_gate_s_folder() {
+        let run = |text: &str, files: &[&str]| {
+            let files: Vec<String> = files.iter().map(|file| (*file).to_owned()).collect();
+            let mut asked = None;
+            let bin = send_bin(
+                &words(text),
+                &place("src/App/"),
+                true,
+                |folder| {
+                    asked = Some(folder.to_owned());
+                    files
+                },
+                |_, _, _| false,
+            );
+            (bin, asked)
+        };
+        assert_eq!(
+            run("dotnet run --no-build", &["App.csproj"]),
+            (Some("src/App/bin/Debug".to_owned()), Some("src/App/".to_owned()))
+        );
+        assert_eq!(run("dotnet run --no-build", &[]).0, None, "no project");
+        assert_eq!(run("dotnet run --no-build", &["A.csproj", "B.vbproj"]).0, None, "two projects");
+        assert_eq!(run("dotnet run app.cs --no-build", &["App.csproj"]), (None, None), "a file-based app");
+        // `send_bin` is passed `true` here, which its caller passes only for a send planned from a built-here entry:
+        // such a test naming no project sends its folder's one project too.
+        assert_eq!(
+            run("dotnet test --no-build", &["App.csproj"]),
+            (Some("src/App/bin/Debug".to_owned()), Some("src/App/".to_owned())),
+            "a test whose last build ran here"
+        );
+    }
+
+    #[test]
     fn a_test_without_a_configuration_keeps_the_drop() {
         assert_eq!(sent("dotnet test App.csproj --no-build"), None);
+    }
+
+    #[test]
+    fn a_built_here_test_without_a_configuration_sends_debug() {
+        assert_eq!(sent_built_here("dotnet test App.csproj --no-build"), Some("bin/Debug".to_owned()));
         assert_eq!(
             sent("dotnet test App.csproj -c ../x --no-build"),
             None,

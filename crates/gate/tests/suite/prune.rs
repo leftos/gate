@@ -168,6 +168,7 @@ fn pc_files(case: &Case) -> PcFiles {
             v1::warm_log_path(&state, KEY),
             v1::warm_lock_path(&state, KEY),
             v1::remote_dir(&state).join(format!("{KEY}.outputs-from")),
+            v1::remote_dir(&state).join(format!("{KEY}.built-here")),
         ],
     };
     for path in files.host.iter().chain(&files.other).chain(&files.shared) {

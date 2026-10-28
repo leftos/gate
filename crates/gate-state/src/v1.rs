@@ -181,6 +181,70 @@ pub fn write_outputs_from(path: &Path, alias: &str) -> io::Result<()> {
     write_replacing_once(path, alias)
 }
 
+/// The built-here record of the work folder `key`, `<root>\remote\<key>.built-here`: the JSON object
+/// `{"v": 1, "projects": {"<project key>": {"configuration": …, "framework": …, "runtime": …, "seq": …}}}`
+/// ([`BuiltHereRecord`]), whichever builder the worktree's runs go to. Each passing dotnet build here that builds in
+/// place writes the entry of each project it built under the settings its words set; every routed run whose words build
+/// on the builder removes the record before it is sent: a dotnet build, a dotnet `--no-build` run whose word the route
+/// dropped, and a send of the PC's build that falls back to the dropped words. So a routed dotnet `--no-build` run
+/// whose entries stand under its own settings keeps its word.
+#[must_use]
+pub fn built_here_path(root: &Path, key: &str) -> PathBuf {
+    remote_dir(root).join(format!("{key}.built-here"))
+}
+
+/// The body of a built-here record ([`built_here_path`]) after its `v`: each project built here, by its key, with the
+/// settings of its last build here; none when `projects` is absent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuiltHereRecord {
+    #[serde(default)]
+    pub projects: std::collections::BTreeMap<String, BuiltHereSettings>,
+}
+
+/// The configuration, framework and runtime a build here set, each left out when its words set none, and the entry's
+/// `seq`: one more than the largest the record held when the entry was last written, so the smallest is the oldest; an
+/// entry without one reads as 0.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuiltHereSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub framework: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    #[serde(default)]
+    pub seq: u64,
+}
+
+/// The text a built-here `record` is written as ([`write_built_here`]), whose length a write measures against its cap.
+///
+/// # Errors
+///
+/// A record that cannot be serialized.
+pub fn built_here_text(record: &BuiltHereRecord) -> io::Result<String> {
+    versioned_text(record)
+}
+
+/// Writes the built-here `record` at `path` ([`built_here_path`]) whole or not at all, as [`write_outputs_from`] writes:
+/// one move over the record and no retry, since a run writes it on its way.
+///
+/// # Errors
+///
+/// A record that cannot be serialized, or a folder, temp file or move that fails.
+pub fn write_built_here(path: &Path, record: &BuiltHereRecord) -> io::Result<()> {
+    write_replacing_once(path, &versioned_text(record)?)
+}
+
+/// The built-here record a file's bytes hold, read strictly as every file of this module is.
+///
+/// # Errors
+///
+/// Bytes that are not UTF-8 or not the record's format, its `v` missing or not 1 among them.
+pub fn built_here_record(bytes: &[u8]) -> Result<BuiltHereRecord, FormatError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| FormatError::Syntax("not UTF-8".to_owned()))?;
+    parse_strict(text)
+}
+
 /// The hash cache of the work folder `key` on the builder whose id is `id`, `<folder>\<key>.outputs-hashes` in its
 /// folder ([`builder_cache_dir`]): the outputs manifest line of the worktree's last built manifest, its files whose
 /// last write came well before that build, so the next build reuses the hash of each file whose size and last write
@@ -1199,7 +1263,57 @@ mod tests {
 
     use jiff::{SignedDuration, Timestamp};
 
-    use super::{WorktreeRecord, mark_gone, needs_write, read_listed_ticket, versioned_text, worktree_record};
+    use super::{
+        BuiltHereRecord, BuiltHereSettings, WorktreeRecord, built_here_path, built_here_record, mark_gone, needs_write, read_listed_ticket,
+        versioned_text, worktree_record, write_built_here,
+    };
+
+    /// A built-here record of the project `one` under `-c Release` and the project keyed `""` under
+    /// `-f net10.0 -r win-x64`: the format takes any key.
+    fn built_here() -> BuiltHereRecord {
+        let release = BuiltHereSettings {
+            configuration: Some("Release".to_owned()),
+            ..BuiltHereSettings::default()
+        };
+        let whole = BuiltHereSettings {
+            framework: Some("net10.0".to_owned()),
+            runtime: Some("win-x64".to_owned()),
+            ..BuiltHereSettings::default()
+        };
+        BuiltHereRecord {
+            projects: [("one".to_owned(), release), (String::new(), whole)].into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn a_built_here_record_round_trips_each_project_with_its_own_settings() {
+        let folder = crate::test_support::temp_dir().join(format!("gate-state-built-here-{}", std::process::id()));
+        let path = built_here_path(&folder, "app-1a2b3c4d");
+        assert_eq!(path, folder.join("remote").join("app-1a2b3c4d.built-here"));
+
+        write_built_here(&path, &built_here()).expect("the record can be written");
+        let text = std::fs::read_to_string(&path).expect("the record can be read");
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+
+        assert_eq!(
+            text,
+            r#"{"v":1,"projects":{"":{"framework":"net10.0","runtime":"win-x64","seq":0},"one":{"configuration":"Release","seq":0}}}"#
+        );
+        assert_eq!(built_here_record(text.as_bytes()).expect("the record reads"), built_here());
+    }
+
+    #[test]
+    fn a_built_here_record_of_another_shape_is_unreadable_and_one_without_projects_is_empty() {
+        for text in [
+            r#"{"projects":{}}"#,
+            r#"{"v":1,"projects":[]}"#,
+            r#"{"v":1,"projects":{"one":"Release"}}"#,
+            "not json",
+        ] {
+            assert!(built_here_record(text.as_bytes()).is_err(), "{text}");
+        }
+        assert_eq!(built_here_record(br#"{"v":1}"#).expect("the record reads"), BuiltHereRecord::default());
+    }
 
     #[test]
     fn a_ticket_deleted_between_list_and_read_is_dropped() {

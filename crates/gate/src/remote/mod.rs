@@ -219,7 +219,7 @@ pub(crate) struct RemoteCall<'a> {
     pub failure_outputs: &'a [String],
     /// Whether [`RemoteCall::words`] are a dotnet command's with `--no-build` dropped ([`gate_router::RemoteRun::dropped_no_build`]).
     pub dropped_no_build: bool,
-    /// The route's send of the PC's build, which lets the builder keep a `dotnet test`'s `--no-build`
+    /// The route's send of the PC's build, which lets the builder keep a dotnet `test` or `run`'s `--no-build`
     /// ([`gate_router::RemoteRun::send`]); `None` for every other run.
     pub send: Option<&'a SendPlan>,
     /// The route's cross build, which a macOS builder runs after the passing command so its outputs come back built for
@@ -793,12 +793,17 @@ mod scripted {
                 ..RemoteOutcome::default()
             };
             // No script sends the PC's build: a run with a send takes the drop, as the client's does when its send fails,
-            // the line kept among the outcome's so a fallback does not say it again.
-            if call.send.is_some() {
-                if let Err(why) = super::say(call.log, &[gate_router::DROPPED_NO_BUILD_LINE], io::stderr().lock()) {
+            // the line kept among the outcome's so a fallback does not say it again. The builder then builds, so the
+            // built-here record goes first, as the client's goes.
+            if let Some(plan) = call.send {
+                let record = gate_state::v1::built_here_path(call.state_dir, call.key);
+                if let Err(line) = crate::no_build::clear_built_here(&record) {
+                    return RemoteOutcome::not_started(line);
+                }
+                if let Err(why) = super::say(call.log, &[plan.dropped_line()], io::stderr().lock()) {
                     return RemoteOutcome::not_started(why);
                 }
-                outcome.lines.push(gate_router::DROPPED_NO_BUILD_LINE.to_owned());
+                outcome.lines.push(plan.dropped_line().to_owned());
             }
             for step in steps_for(&self.steps, call.host()) {
                 match perform(step, call, &mut outcome) {

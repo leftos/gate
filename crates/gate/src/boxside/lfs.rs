@@ -126,6 +126,7 @@ impl Asked<'_> {
             bare: self.bare,
             lock: self.lock,
             nonce: self.nonce,
+            pair: None,
         }
     }
 }

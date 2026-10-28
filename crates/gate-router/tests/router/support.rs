@@ -132,6 +132,14 @@ pub struct FakeFacts {
     pub gitignored: Vec<GitignoredInput>,
     /// Each gitignored-inputs question, its paths then `|` and the input globs, kept apart from [`FakeFacts::asked`].
     pub gitignored_asked: RefCell<Vec<String>>,
+    /// The entry of the built-here record that says the last build of the command's project ran here.
+    pub built_here: Option<String>,
+    /// How many times that was asked, kept apart from [`FakeFacts::asked`].
+    pub built_here_asked: Cell<u32>,
+    /// The project files every folder holds, by name.
+    pub project_files: Vec<String>,
+    /// Whether a build file names a `Configuration` property, which counts only for a command that sets none.
+    pub sets_configuration: bool,
 }
 
 impl FakeFacts {
@@ -174,6 +182,10 @@ impl FakeFacts {
             windows_change_asked: Cell::new(0),
             gitignored: Vec::new(),
             gitignored_asked: RefCell::new(Vec::new()),
+            built_here: None,
+            built_here_asked: Cell::new(0),
+            project_files: Vec::new(),
+            sets_configuration: false,
         }
     }
 
@@ -224,10 +236,22 @@ impl Facts for FakeFacts {
         self.head.clone()
     }
 
-    /// No build file moves the output.
-    fn moves_build_output(&self, _place: &Place, _folder: &str, _file: Option<&str>) -> bool {
+    /// No build file moves the output; one sets the configuration when [`FakeFacts::sets_configuration`] says so.
+    fn moves_build_output(&self, _place: &Place, _folder: &str, _file: Option<&str>, default_configuration: bool) -> bool {
         self.ask("moves_build_output".to_owned());
-        false
+        default_configuration && self.sets_configuration
+    }
+
+    /// What [`FakeFacts::project_files`] says, of any folder.
+    fn project_files(&self, _place: &Place, folder: &str) -> Vec<String> {
+        self.ask(format!("project_files {folder}"));
+        self.project_files.clone()
+    }
+
+    /// What [`FakeFacts::built_here`] says.
+    fn built_here(&self, _root: &str, _words: &[String]) -> Option<String> {
+        self.built_here_asked.set(self.built_here_asked.get() + 1);
+        self.built_here.clone()
     }
 
     /// What [`FakeFacts::windows_only`] says.

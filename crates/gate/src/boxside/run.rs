@@ -349,17 +349,32 @@ pub(super) fn layout_text(leaf: Option<&str>, mut siblings: Vec<&str>) -> String
     format!("pair {leaf} {}", siblings.join(" "))
 }
 
-/// Lays out the work folder `asked` holds for one repo, its bare repository, as a run does before its checkout
-/// ([`WorkGit::lay_out`]), under the work folder's lock file, which the caller holds; git's output is forwarded as a
-/// run's is. The held work folder; else `Err` with the status, its lines said: a failing git step's, or 75 for a work
-/// folder that could not be laid out, its `layout` tag and line said as a run says them.
+/// Lays out the work folder `asked` holds as a run of the same repos does before its checkout ([`WorkGit::lay_out`]):
+/// for one repo, its bare repository; for a sibling pair, the main repo in `{work}\{leaf}` and each sibling in
+/// `{work}\{name}` with its own bare repository, as [`repos`] lays them out. Under the work folder's lock file, which
+/// the caller holds; git's output is forwarded as a run's is. The held work folder; else `Err` with the status, its
+/// lines said: a failing git step's, or 75 for a work folder that could not be laid out, its `layout` tag and line said
+/// as a run says them.
 pub(super) fn lay_out_alone(asked: &inputs::WorkLock<'_>, console: &mut Console) -> Result<File, u32> {
-    let main = Repo::new(None, asked.work.to_owned(), asked.bare, "");
+    let (main, siblings) = match asked.pair {
+        None => (Repo::new(None, asked.work.to_owned(), asked.bare, ""), Vec::new()),
+        Some(pair) => {
+            let names: Vec<&str> = pair.siblings().iter().map(PairSibling::name).collect();
+            let (main_tree, sibling_trees) = trees(asked.work, Some((pair.leaf(), &names)), PathForm::Windows);
+            let siblings = pair
+                .siblings()
+                .iter()
+                .zip(sibling_trees)
+                .map(|(sibling, tree)| Repo::new(Some(sibling.name()), tree, sibling.bare(), ""))
+                .collect();
+            (Repo::new(Some(pair.leaf()), main_tree, asked.bare, ""), siblings)
+        }
+    };
     let laid = Laid {
         work: asked.work,
         key: asked.key,
         main: &main,
-        siblings: &[],
+        siblings: &siblings,
     };
     let laid_out = swept(&laid)
         .map_err(NotLaidOut::Refused)
@@ -462,7 +477,7 @@ fn inputs_matched(request: &Request<'_>, held: &File, beat: &Beat<'_>, console: 
     let Some(sent) = request.inputs_digest else {
         return Ok(());
     };
-    let why = match inputs::unmatched(inputs::Book::Inputs, request.work, held, sent) {
+    let why = match inputs::unmatched(inputs::Book::Inputs, request.work, request.main.name.as_deref(), held, sent) {
         Ok(moved_aside) => {
             if let Some(line) = moved_aside {
                 let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -489,13 +504,13 @@ fn inputs_matched(request: &Request<'_>, held: &File, beat: &Beat<'_>, console: 
 /// it holds, and rewrites the tree's exclude file from both records ([`inputs::unmatched`]), once the work folder is
 /// laid out and cleared and its inputs checked: a record missing, unreadable or of another digest, a copy changed or
 /// gone, or an exclude file that cannot be written refuses the run `sent`, its tag and line said under the box's
-/// output lock, so the PC runs it again without its `--no-build`; 75. A folder moved aside from the exclude file's
-/// name is said, under the lock too.
+/// output lock, so the PC runs it again without its `--no-build`; 75. On a sibling pair's run the exclude file is the
+/// main repo's, in `{work}\{leaf}`. A folder moved aside from the exclude file's name is said, under the lock too.
 fn sent_matched(request: &Request<'_>, held: &File, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
     let Some(sent) = request.sent_digest else {
         return Ok(());
     };
-    let why = match inputs::unmatched(inputs::Book::SentBuild, request.work, held, sent) {
+    let why = match inputs::unmatched(inputs::Book::SentBuild, request.work, request.main.name.as_deref(), held, sent) {
         Ok(moved_aside) => {
             if let Some(line) = moved_aside {
                 let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);

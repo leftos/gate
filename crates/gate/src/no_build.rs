@@ -9,7 +9,10 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use gate_router::{BuildSettings, DotnetTarget, OUTPUT_PROPERTIES, PROJECT_EXTENSIONS, dotnet_target, escaped, is_usable_host, positional_target};
+use gate_router::{
+    BuildSettings, CONFIGURATION_ELEMENTS, DotnetTarget, OUTPUT_PROPERTIES, PROJECT_EXTENSIONS, build_settings, dotnet_takes_solution, dotnet_target,
+    escaped, is_usable_host, positional_target, work_folder_key,
+};
 use gate_state::v1;
 use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 
@@ -29,6 +32,10 @@ const GIT_LOCALE: (&str, &str) = ("LC_ALL", "C");
 const GIT_LANGUAGE: [&str; 1] = ["LANGUAGE"];
 /// The most of a nothing-back record read: a record is a few dozen bytes.
 const RECORD_CAP: u64 = 4096;
+/// The most of a built-here record read: an entry is a few dozen bytes, one a project built here.
+const BUILT_HERE_CAP: u64 = 1 << 16;
+/// The solutions a dotnet command naming nothing builds when its folder holds exactly one and no project file.
+const FOLDER_SOLUTIONS: [&str; 2] = [".sln", ".slnx"];
 /// The most of a solution or a worktree's build file read; a larger one cannot be told.
 pub(crate) const FILE_CAP: usize = 1 << 20;
 /// The files at a worktree's root whose `MSBuild` properties apply to every project in it.
@@ -124,13 +131,205 @@ pub(crate) fn read_record(path: &Path) -> io::Result<Option<NothingBack>> {
 ///
 /// A record that is there but cannot be opened or read.
 fn record_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    capped_bytes(path, RECORD_CAP)
+}
+
+/// The bytes of the file at `path`, `None` when there is none: a link or junction at its name opened as itself, and
+/// at most `cap` bytes of it read.
+///
+/// # Errors
+///
+/// A file that is there but cannot be opened or read.
+fn capped_bytes(path: &Path, cap: u64) -> io::Result<Option<Vec<u8>>> {
     let file = match OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         opened => opened?,
     };
     let mut bytes = Vec::new();
-    file.take(RECORD_CAP).read_to_end(&mut bytes)?;
+    file.take(cap).read_to_end(&mut bytes)?;
     Ok(Some(bytes))
+}
+
+/// The built-here record at `path` ([`v1::built_here_path`]), read as itself through any link at its name and at most
+/// [`BUILT_HERE_CAP`] bytes of it; one that is missing, cannot be read or is not of its format reads as empty, so a
+/// `--no-build` run it would have kept drops its word as it would with no record.
+pub(crate) fn read_built_here(path: &Path) -> v1::BuiltHereRecord {
+    match capped_bytes(path, BUILT_HERE_CAP) {
+        Ok(Some(bytes)) => v1::built_here_record(&bytes).unwrap_or_default(),
+        Ok(None) | Err(_) => v1::BuiltHereRecord::default(),
+    }
+}
+
+/// Whether the built-here `record` has an entry of `project` ([`project_key`]) whose settings are `settings`
+/// ([`BuildSettings::same_as`]): the last build of the project under them ran here.
+pub(crate) fn entry_stands(record: &v1::BuiltHereRecord, project: &str, settings: &BuildSettings) -> bool {
+    record.projects.get(project).is_some_and(|entry| {
+        let built = BuildSettings {
+            configuration: entry.configuration.clone(),
+            framework: entry.framework.clone(),
+            runtime: entry.runtime.clone(),
+        };
+        built.same_as(settings)
+    })
+}
+
+/// What the dotnet command `words` builds in the worktree at `root`, read against the gate's working folder: the name a
+/// line gives it and the keys ([`project_key`]) of its projects inside the worktree, each once. A command naming a
+/// project ([`named_project_key`]) builds that project, named by its key; one naming a solution builds each project the
+/// solution lists inside the worktree ([`solution_keys`]), named as the words name the solution; one naming
+/// nothing builds the working folder's project when the folder holds exactly one project file ([`project_files`]),
+/// else the projects of its one `.sln` or `.slnx` when it holds exactly one solution and no project file, named by the
+/// solution file's name. `None` for any other command, a project outside the worktree, a solution that cannot be read
+/// or lists no project inside the worktree, and a working folder that cannot be read or listed.
+pub(crate) fn built_projects(words: &[String], root: &Path) -> Option<(String, Vec<String>)> {
+    let folder = std::env::current_dir().ok()?;
+    if let Some(project) = named_project(words, &folder) {
+        let key = project_key(&project, &folder, root)?;
+        return Some((key.clone(), vec![key]));
+    }
+    match dotnet_target(words) {
+        Some(DotnetTarget::Solution(solution)) => {
+            let projects = solution_keys(&folder.join(&solution), &folder, root)?;
+            Some((solution, projects))
+        }
+        None if positional_target(words).is_none() => folder_projects(&folder, root, dotnet_takes_solution(words)),
+        Some(DotnetTarget::Project(_)) | None => None,
+    }
+}
+
+/// What a dotnet command naming nothing builds in `folder` ([`built_projects`]): its one project file's project, else
+/// the projects of its one solution ([`FOLDER_SOLUTIONS`]) when it holds no project file and the command's verb takes a
+/// solution (`solutions`, [`dotnet_takes_solution`]).
+fn folder_projects(folder: &Path, root: &Path, solutions: bool) -> Option<(String, Vec<String>)> {
+    match project_files(folder).ok()?.as_slice() {
+        [_] => {
+            let key = project_key("", folder, root)?;
+            Some((key.clone(), vec![key]))
+        }
+        [] if solutions => {
+            let [solution] = <[PathBuf; 1]>::try_from(files_ending(folder, &FOLDER_SOLUTIONS).ok()?).ok()?;
+            let name = solution.file_name()?.to_string_lossy().into_owned();
+            Some((name, solution_keys(&solution, folder, root)?))
+        }
+        _ => None,
+    }
+}
+
+/// The keys ([`project_key`]) of the projects the solution at `solution` lists inside the worktree at `root`, read
+/// against `folder`, sorted and each once: every entry resolved against the folder its entries are relative to, a `..`
+/// part included ([`solution_entries`]), kept when it lands inside the worktree. `None` when the solution cannot be
+/// read or lists none inside.
+fn solution_keys(solution: &Path, folder: &Path, root: &Path) -> Option<Vec<String>> {
+    let bytes = read_regular(solution).ok()?;
+    let (base, entries) = solution_entries(solution, &String::from_utf8_lossy(&bytes));
+    let mut keys: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| project_key(&base.join(entry).to_string_lossy(), folder, root))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    (!keys.is_empty()).then_some(keys)
+}
+
+/// The name of what the dotnet command `words` builds ([`built_projects`]) when the worktree at `root`'s built-here
+/// record, under the state root `state`, has an entry of each of its projects under the settings the words set
+/// ([`entry_stands`]): the last build of each ran here. `None` when an entry is missing or of other settings, and for
+/// words whose projects cannot be told, which no build here records. The one rule a routed run is sent with the PC's
+/// build or kept here by, and a run here keeps its `--no-build` by.
+pub(crate) fn last_build_ran_here(state: &Path, root: &str, words: &[String]) -> Option<String> {
+    let (name, projects) = built_projects(words, Path::new(root))?;
+    let record = read_built_here(&v1::built_here_path(state, &work_folder_key(root)));
+    let settings = build_settings(words);
+    projects.iter().all(|project| entry_stands(&record, project, &settings)).then_some(name)
+}
+
+/// Writes an entry of each of `projects` ([`project_key`]) into the built-here record at `path` under `settings`, in
+/// place of any entry it had, each with the `seq` one more than the largest the record held, and rewrites the record
+/// whole ([`v1::write_built_here`]); a record that reads as empty ([`read_built_here`]) is written over. A record that
+/// would pass [`BUILT_HERE_CAP`] bytes drops its other entries oldest first ([`trimmed_to_cap`]). The entry count left
+/// when entries were dropped, `None` when none were.
+///
+/// # Errors
+///
+/// The line saying why the record cannot be written: the written entries alone pass the cap, or the write fails.
+pub(crate) fn record_built_here(path: &Path, projects: &[String], settings: &BuildSettings) -> Result<Option<usize>, String> {
+    record_built_here_capped(path, projects, settings, BUILT_HERE_CAP)
+}
+
+/// [`record_built_here`] against the cap `cap` in bytes.
+fn record_built_here_capped(path: &Path, projects: &[String], settings: &BuildSettings, cap: u64) -> Result<Option<usize>, String> {
+    let mut record = read_built_here(path);
+    let seq = record.projects.values().map(|entry| entry.seq).max().unwrap_or(0).saturating_add(1);
+    for project in projects {
+        let entry = v1::BuiltHereSettings {
+            configuration: settings.configuration.clone(),
+            framework: settings.framework.clone(),
+            runtime: settings.runtime.clone(),
+            seq,
+        };
+        record.projects.insert(project.clone(), entry);
+    }
+    let cannot_write = |error: io::Error| format!("gate: cannot write {}: {error}", path.display());
+    let trimmed = match trimmed_to_cap(&mut record, projects, cap).map_err(cannot_write)? {
+        Trim::Fits => None,
+        Trim::Trimmed(left) => Some(left),
+        Trim::Over => return Err(format!("gate: built-here record not written: entry over {cap} bytes")),
+    };
+    v1::write_built_here(path, &record).map_err(cannot_write)?;
+    Ok(trimmed)
+}
+
+/// What [`trimmed_to_cap`] did to a built-here record.
+enum Trim {
+    /// It fit as it was.
+    Fits,
+    /// Entries were dropped, leaving this many.
+    Trimmed(usize),
+    /// The written entries alone pass the cap.
+    Over,
+}
+
+/// Drops the entries of `record` but those of `written`, in ascending `seq` and then key order, until its text
+/// ([`v1::built_here_text`]) is at most `cap` bytes.
+///
+/// # Errors
+///
+/// A record that cannot be serialized.
+fn trimmed_to_cap(record: &mut v1::BuiltHereRecord, written: &[String], cap: u64) -> io::Result<Trim> {
+    let fits =
+        |record: &v1::BuiltHereRecord| -> io::Result<bool> { Ok(u64::try_from(v1::built_here_text(record)?.len()).unwrap_or(u64::MAX) <= cap) };
+    if fits(record)? {
+        return Ok(Trim::Fits);
+    }
+    let mut oldest: Vec<(u64, String)> = record
+        .projects
+        .iter()
+        .filter(|(key, _)| !written.contains(key))
+        .map(|(key, entry)| (entry.seq, key.clone()))
+        .collect();
+    oldest.sort();
+    for (_, key) in oldest {
+        record.projects.remove(&key);
+        if fits(record)? {
+            return Ok(Trim::Trimmed(record.projects.len()));
+        }
+    }
+    Ok(Trim::Over)
+}
+
+/// Removes the built-here record at `path`; one that is not there is left so.
+///
+/// # Errors
+///
+/// The line saying the routed build is not sent as the record cannot be removed, and why: its entries would outlast a
+/// build on the builder.
+pub(crate) fn clear_built_here(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            Err(format!("gate: remote build not sent: cannot remove the built-here record: {error}"))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The configuration, framework and runtime `record`'s build set.
@@ -241,15 +440,21 @@ pub(crate) fn moves_intermediates(root: &Path) -> Result<bool, String> {
 
 /// Whether a build file of the project in `folder` below the worktree root `root` (`/`-separated and `/`-ended, empty at
 /// the root) names one of the properties that move a project's build output ([`OUTPUT_PROPERTIES`]), ignoring letter
-/// case, as text anywhere in it (`IntermediateOutputPath` names `OutputPath` too): the project file `file`, or each
-/// project file `folder` holds when none is named, then each folder's [`BUILD_FILES`] from `folder` up to `root`. The
-/// PC's build of the project may then stand outside its `bin\{configuration}` folder, so no routed run sends it.
+/// case, as text anywhere in it (`IntermediateOutputPath` names `OutputPath` too), or, when `default_configuration`
+/// (the command sets no configuration, so it builds `Debug`), sets the `Configuration` property
+/// ([`CONFIGURATION_ELEMENTS`]): the project file `file`, or each project file `folder` holds when none is named, then
+/// each folder's [`BUILD_FILES`] from `folder` up to `root`. The PC's build of the project may then stand outside its
+/// `bin\{configuration}` folder, so no routed run sends it.
 ///
 /// # Errors
 ///
 /// Such a file that is there but cannot be read ([`read_regular`]), or a project folder that cannot be listed:
 /// `cannot read <path>: <error>`, the path escaped.
-pub(crate) fn moves_output(root: &Path, folder: &str, file: Option<&str>) -> Result<bool, String> {
+pub(crate) fn moves_output(root: &Path, folder: &str, file: Option<&str>, default_configuration: bool) -> Result<bool, String> {
+    let mut names = OUTPUT_PROPERTIES.to_vec();
+    if default_configuration {
+        names.extend(CONFIGURATION_ELEMENTS);
+    }
     let project = folder
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -260,13 +465,13 @@ pub(crate) fn moves_output(root: &Path, folder: &str, file: Option<&str>) -> Res
         None => project_files(&project).map_err(|error| cannot(&project, error))?,
     };
     for path in &files {
-        if names_any(path, &OUTPUT_PROPERTIES).map_err(|error| cannot(path, error))? {
+        if names_any(path, &names).map_err(|error| cannot(path, error))? {
             return Ok(true);
         }
     }
     let mut at = project.as_path();
     loop {
-        if build_files_name(at, &OUTPUT_PROPERTIES)? {
+        if build_files_name(at, &names)? {
             return Ok(true);
         }
         if at == root {
@@ -281,11 +486,16 @@ pub(crate) fn moves_output(root: &Path, folder: &str, file: Option<&str>) -> Res
 
 /// The files in `folder` whose name ends in a project extension ([`PROJECT_EXTENSIONS`]), ignoring letter case.
 pub(crate) fn project_files(folder: &Path) -> io::Result<Vec<PathBuf>> {
+    files_ending(folder, &PROJECT_EXTENSIONS)
+}
+
+/// The files in `folder` whose name ends in one of `extensions` (each with its `.`), ignoring letter case.
+fn files_ending(folder: &Path, extensions: &[&str]) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(folder)? {
         let path = entry?.path();
         let named = path.extension().is_some_and(|extension| {
-            PROJECT_EXTENSIONS
+            extensions
                 .iter()
                 .any(|known| extension.eq_ignore_ascii_case(known.trim_start_matches('.')))
         });
@@ -368,6 +578,18 @@ fn lexical(path: &Path) -> PathBuf {
 /// that is not a plain name (`..`, `.`, a root, a drive or a share), is left out, as is every entry of a `.slnf` whose
 /// `solution.path` has such a part.
 pub(crate) fn solution_projects(solution: &Path, text: &str) -> Vec<PathBuf> {
+    let (base, entries) = solution_entries(solution, text);
+    entries
+        .into_iter()
+        .filter(|entry| is_plain(Path::new(entry)))
+        .map(|entry| base.join(entry))
+        .collect()
+}
+
+/// The folder the entries of the solution at `solution` are relative to and each entry that is a project file, as
+/// written: the `.sln`'s `Project(` lines, the `.slnx`'s `<Project Path=` elements, or the `.slnf`'s
+/// `solution.projects` ([`solution_projects`]).
+fn solution_entries(solution: &Path, text: &str) -> (PathBuf, Vec<String>) {
     let folder = solution.parent().unwrap_or_else(|| Path::new(""));
     let extension = solution.extension().map(|extension| extension.to_string_lossy().to_lowercase());
     let (base, entries) = match extension.as_deref() {
@@ -375,11 +597,7 @@ pub(crate) fn solution_projects(solution: &Path, text: &str) -> Vec<PathBuf> {
         Some("slnf") => slnf_entries(folder, text),
         _ => (folder.to_owned(), sln_entries(text)),
     };
-    entries
-        .into_iter()
-        .filter(|entry| is_project_file(entry) && is_plain(Path::new(entry)))
-        .map(|entry| base.join(entry))
-        .collect()
+    (base, entries.into_iter().filter(|entry| is_project_file(entry)).collect())
 }
 
 /// Whether every part of `path` is a plain name: no `..`, `.`, root, drive or share.
@@ -551,8 +769,9 @@ mod tests {
     use gate_state::v1;
 
     use super::{
-        NothingBack, add_built, drop_reason, first_without_assets, moves_intermediates, moves_output, named_without_assets, parse_worktree,
-        project_key, read_record, solution_projects,
+        NothingBack, add_built, clear_built_here, drop_reason, entry_stands, first_without_assets, moves_intermediates, moves_output,
+        named_without_assets, parse_worktree, project_key, read_built_here, read_record, record_built_here, record_built_here_capped, solution_keys,
+        solution_projects,
     };
 
     /// A folder of this test process's own named `name`, empty.
@@ -707,6 +926,188 @@ mod tests {
         );
         assert_eq!(text(), before, "a full record is left as it is");
         fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    /// The settings `-c configuration`, `-f framework` and `-r runtime` set, each `None` for an empty one.
+    fn set(configuration: &str, framework: &str, runtime: &str) -> BuildSettings {
+        let value = |text: &str| Some(text.to_owned()).filter(|text| !text.is_empty());
+        BuildSettings {
+            configuration: value(configuration),
+            framework: value(framework),
+            runtime: value(runtime),
+        }
+    }
+
+    #[test]
+    fn a_missing_or_malformed_built_here_record_reads_as_empty() {
+        let folder = scratch("built-here-read");
+        let path = folder.join("app.built-here");
+
+        assert_eq!(read_built_here(&path), v1::BuiltHereRecord::default(), "missing");
+        for text in ["not json", r#"{"v":1,"projects":[]}"#, r#"{"projects":{"one":{}}}"#] {
+            fs::write(&path, text).expect("the record can be written");
+            assert_eq!(read_built_here(&path), v1::BuiltHereRecord::default(), "{text}");
+        }
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn two_projects_built_here_under_different_settings_are_both_kept() {
+        let folder = scratch("built-here-two");
+        let path = folder.join("remote").join("app.built-here");
+
+        assert_eq!(record_built_here(&path, &["one".to_owned()], &set("Release", "", "")), Ok(None));
+        assert_eq!(record_built_here(&path, &["two".to_owned()], &set("Debug", "net10.0", "")), Ok(None));
+        let record = read_built_here(&path);
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+
+        assert!(entry_stands(&record, "one", &set("release", "", "")));
+        assert!(entry_stands(&record, "two", &set("Debug", "net10.0", "")));
+        assert_eq!(record.projects.len(), 2, "{record:?}");
+    }
+
+    #[test]
+    fn a_project_built_here_again_takes_its_new_settings_and_a_malformed_record_is_written_over() {
+        let folder = scratch("built-here-again");
+        let path = folder.join("app.built-here");
+        fs::write(&path, "not json").expect("the record can be written");
+
+        assert_eq!(record_built_here(&path, &["one".to_owned()], &set("Release", "", "")), Ok(None));
+        assert_eq!(record_built_here(&path, &["one".to_owned()], &set("Debug", "", "")), Ok(None));
+        let text = fs::read_to_string(&path).expect("the record can be read");
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+
+        assert_eq!(text, r#"{"v":1,"projects":{"one":{"configuration":"Debug","seq":2}}}"#);
+    }
+
+    #[test]
+    fn clearing_removes_the_whole_record() {
+        let folder = scratch("built-here-clear");
+        let path = folder.join("app.built-here");
+        assert_eq!(
+            record_built_here(&path, &["one".to_owned(), "two".to_owned()], &set("", "", "")),
+            Ok(None)
+        );
+
+        assert_eq!(clear_built_here(&path), Ok(()));
+        let left = path.exists();
+        assert_eq!(clear_built_here(&path), Ok(()), "no record to remove");
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+
+        assert!(!left, "every entry goes with the record");
+    }
+
+    #[test]
+    fn a_solution_s_keys_count_parent_entries_inside_the_worktree_and_drop_those_outside() {
+        let root = scratch("solution-keys-parent");
+        let solution = root.join("src").join("All.sln");
+        fs::create_dir_all(solution.parent().expect("the solution has a folder")).expect("the folder can be made");
+        let line = |name: &str, path: &str| {
+            format!("Project(\"{{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}}\") = \"{name}\", \"{path}\", \"{{1}}\"\r\nEndProject\r\n")
+        };
+        let text = [
+            line("App", r"App\App.csproj"),
+            line("Lib", r"..\lib\Lib.csproj"),
+            line("Out", r"..\..\Out\Out.csproj"),
+        ]
+        .concat();
+        fs::write(&solution, text).expect("the solution can be written");
+
+        let keys = solution_keys(&solution, &root, &root);
+        fs::remove_dir_all(&root).expect("the folder can be removed");
+
+        assert_eq!(keys, Some(vec!["lib".to_owned(), "src/app".to_owned()]));
+    }
+
+    /// The length of the text of the built-here record at `path`.
+    fn record_length(path: &Path) -> u64 {
+        fs::metadata(path).expect("the record is there").len()
+    }
+
+    #[test]
+    fn a_record_past_its_cap_drops_the_entry_of_the_smallest_seq_not_the_smallest_key() {
+        let folder = scratch("built-here-trim-seq");
+        let path = folder.join("app.built-here");
+        fs::write(&path, r#"{"v":1,"projects":{"aaa":{"seq":2},"bbb":{"seq":3},"zzz":{"seq":1}}}"#).expect("the record can be written");
+        let cap = record_length(&path);
+
+        let trimmed = record_built_here_capped(&path, &["new".to_owned()], &set("", "", ""), cap);
+        let text = fs::read_to_string(&path).expect("the record can be read");
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+
+        assert_eq!(trimmed, Ok(Some(3)));
+        assert_eq!(text, r#"{"v":1,"projects":{"aaa":{"seq":2},"bbb":{"seq":3},"new":{"seq":4}}}"#);
+    }
+
+    #[test]
+    fn an_entry_written_again_takes_the_newest_seq_and_outlives_the_next_trim() {
+        let folder = scratch("built-here-trim-updated");
+        let path = folder.join("app.built-here");
+        fs::write(&path, r#"{"v":1,"projects":{"aaa":{"seq":1},"bbb":{"seq":2}}}"#).expect("the record can be written");
+        let cap = record_length(&path);
+
+        let again = record_built_here_capped(&path, &["aaa".to_owned()], &set("", "", ""), cap);
+        let trimmed = record_built_here_capped(&path, &["ccc".to_owned()], &set("", "", ""), cap);
+        let text = fs::read_to_string(&path).expect("the record can be read");
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+
+        assert_eq!(again, Ok(None), "the same length, so no trim");
+        assert_eq!(trimmed, Ok(Some(2)));
+        assert_eq!(text, r#"{"v":1,"projects":{"aaa":{"seq":3},"ccc":{"seq":4}}}"#);
+    }
+
+    #[test]
+    fn an_entry_without_a_seq_reads_as_the_oldest() {
+        let folder = scratch("built-here-trim-no-seq");
+        let path = folder.join("app.built-here");
+        fs::write(&path, r#"{"v":1,"projects":{"aaa":{"seq":1},"zzz":{}}}"#).expect("the record can be written");
+        // `,"bbb":{"seq":2}` adds 16 bytes and `,"zzz":{}` takes 9 away.
+        let cap = record_length(&path) + 7;
+
+        let trimmed = record_built_here_capped(&path, &["bbb".to_owned()], &set("", "", ""), cap);
+        let text = fs::read_to_string(&path).expect("the record can be read");
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+
+        assert_eq!(trimmed, Ok(Some(2)));
+        assert_eq!(text, r#"{"v":1,"projects":{"aaa":{"seq":1},"bbb":{"seq":2}}}"#);
+    }
+
+    #[test]
+    fn written_entries_that_alone_pass_the_cap_write_nothing() {
+        let folder = scratch("built-here-trim-over");
+        let path = folder.join("app.built-here");
+        fs::write(&path, r#"{"v":1,"projects":{"aaa":{"seq":1}}}"#).expect("the record can be written");
+
+        let over = record_built_here_capped(&path, &["a-long-project-key".to_owned()], &set("", "", ""), 20);
+        let text = fs::read_to_string(&path).expect("the record can be read");
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+
+        assert_eq!(over, Err("gate: built-here record not written: entry over 20 bytes".to_owned()));
+        assert_eq!(text, r#"{"v":1,"projects":{"aaa":{"seq":1}}}"#, "left as it was");
+    }
+
+    #[test]
+    fn the_last_build_ran_here_only_under_the_same_settings() {
+        let record = v1::BuiltHereRecord {
+            projects: [(
+                "one".to_owned(),
+                v1::BuiltHereSettings {
+                    configuration: Some("Release".to_owned()),
+                    framework: Some("net10.0".to_owned()),
+                    runtime: Some("win-x64".to_owned()),
+                    seq: 1,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let entry = |project: &str, settings: BuildSettings| entry_stands(&record, project, &settings);
+
+        assert!(entry("one", set("RELEASE", "net10.0", "win-x64")));
+        assert!(!entry("one", set("Debug", "net10.0", "win-x64")), "configuration");
+        assert!(!entry("one", set("Release", "net9.0", "win-x64")), "framework");
+        assert!(!entry("one", set("Release", "net10.0", "")), "runtime");
+        assert!(!entry("two", set("Release", "net10.0", "win-x64")), "a project with no entry");
     }
 
     #[test]
@@ -986,8 +1387,8 @@ mod tests {
     /// the named project file and of its folder alone.
     fn moved(root: &Path) -> (Result<bool, String>, Result<bool, String>) {
         (
-            moves_output(root, "tests/App/", Some("App.csproj")),
-            moves_output(root, "tests/App/", None),
+            moves_output(root, "tests/App/", Some("App.csproj"), false),
+            moves_output(root, "tests/App/", None, false),
         )
     }
 
@@ -1013,6 +1414,26 @@ mod tests {
         );
         assert_eq!(moved(&root), (Ok(true), Ok(true)));
         fs::remove_dir_all(&root).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_build_file_setting_the_configuration_moves_only_a_build_that_sets_none() {
+        let props = "Directory.Build.props";
+        let root = output_case(
+            "output-configuration",
+            props,
+            "<Project><PropertyGroup><Configuration>Release</Configuration></PropertyGroup></Project>",
+        );
+        let set = moves_output(&root, "tests/App/", Some("App.csproj"), true);
+        let named = moves_output(&root, "tests/App/", Some("App.csproj"), false);
+        let condition = "<Project><PropertyGroup Condition=\"'$(Configuration)' == 'Debug'\"><DebugType>full</DebugType></PropertyGroup></Project>";
+        fs::write(root.join(props), condition).expect("the build file can be rewritten");
+        let read = moves_output(&root, "tests/App/", Some("App.csproj"), true);
+        fs::remove_dir_all(&root).expect("the folder can be removed");
+
+        assert_eq!(set, Ok(true), "the build file sets the configuration a build setting none takes");
+        assert_eq!(named, Ok(false), "a configuration the words set is not looked for");
+        assert_eq!(read, Ok(false), "a condition only reads it");
     }
 
     #[test]

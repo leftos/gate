@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use gate_router::{DROPPED_NO_BUILD_LINE, repo_name, work_folder_key};
+use gate_router::{DROPPED_NO_BUILD_LINE, DROPPED_UNSENT_LINE, repo_name, work_folder_key};
 use gate_wire::stamp::{Tag, is_process_line, unstamped};
 use proc_table::{ProcessTable as _, ProcessTree, Win32ProcessTable};
 use regex::Regex;
@@ -9961,6 +9961,7 @@ fn dropped_lines(stderr: &str) -> usize {
     stderr.lines().filter(|line| *line == DROPPED_NO_BUILD_LINE).count()
 }
 
+/// A repo `sendBuild` does not list, with no built-here record: the route plans no send.
 #[test]
 fn a_repo_send_build_does_not_list_takes_the_drop_with_today_s_line() {
     let case = sent_build_case("client-sent-build-unlisted", None);
@@ -9972,8 +9973,279 @@ fn a_repo_send_build_does_not_list_takes_the_drop_with_today_s_line() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(calls(&steps), ["preflight", "run"], "no inputs call");
     assert_eq!(dropped_lines(&outcome.stderr), 1, "{outcome:?}");
+    assert!(!outcome.stderr.contains(DROPPED_UNSENT_LINE), "{outcome:?}");
     assert!(!outcome.stdout.lines().any(|line| line == "--no-build"), "{outcome:?}");
     assert!(!build_not_sent(&case, "out.log", ""), "no send was planned: {outcome:?}");
+}
+
+/// The built-here record of a [`sent_build_case`]'s worktree saying its project at the root was last built here in
+/// Release, as a passing local `dotnet build App.csproj -c Release` writes it.
+const BUILT_HERE_RELEASE: &str = r#"{"v":1,"projects":{".":{"configuration":"Release"}}}"#;
+
+/// A [`sent_build_case`] whose repo `sendBuild` does not list, whose project's last build ran here in Release.
+fn built_here_sent_case(name: &str) -> Case {
+    let case = sent_build_case(name, None);
+    sent_routing(&case, false);
+    planted_state(&case, "built-here", BUILT_HERE_RELEASE);
+    case
+}
+
+#[test]
+fn an_unlisted_repo_s_no_build_test_built_here_sends_the_pc_s_build_and_the_builder_keeps_no_build() {
+    let case = built_here_sent_case("client-sent-build-built-here");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(dotnet_gate(&case, "out.log", &steps, &SENT_TEST));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        calls(&steps),
+        ["preflight", "inputs", "inputs", "run"],
+        "the send's diff and put, then the run"
+    );
+    assert!(
+        outcome.stdout.lines().any(|line| line == "--no-build"),
+        "the builder kept it: {outcome:?}"
+    );
+    assert_eq!(dropped_lines(&outcome.stderr), 0, "{outcome:?}");
+    assert!(!outcome.stderr.contains(DROPPED_UNSENT_LINE), "{outcome:?}");
+    assert_eq!(
+        fs::read_to_string(work_folder(&case).join(SENT_DLL)).ok().as_deref(),
+        Some("the PC's build"),
+        "the work folder holds the PC's build"
+    );
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_built_here_send_the_box_fails_takes_the_drop_saying_the_build_could_not_be_sent() {
+    let case = built_here_sent_case("client-sent-build-built-here-fails");
+    let steps = ssh_steps(&case, "ssh", &["ok", "say-exit 1 gate: remote inputs diff failed: not today", "ok"]);
+
+    let outcome = finish(dotnet_gate(&case, "out.log", &steps, &SENT_TEST));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "inputs", "run"], "the send's diff, then the run");
+    assert_eq!(
+        outcome.stderr.lines().filter(|line| *line == DROPPED_UNSENT_LINE).count(),
+        1,
+        "{outcome:?}"
+    );
+    assert_eq!(dropped_lines(&outcome.stderr), 0, "not today's line: {outcome:?}");
+    assert!(
+        !outcome.stdout.lines().any(|line| line == "--no-build"),
+        "the builder dropped it: {outcome:?}"
+    );
+    assert!(build_not_sent(&case, "out.log", "not today"), "{outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "never a local run");
+    assert!(!built_here_record(&case).exists(), "the dropped words built on the builder: {outcome:?}");
+}
+
+/// The path of a case worktree's built-here record in its state root.
+fn built_here_record(case: &Case) -> PathBuf {
+    let key = work_folder_key(&git(case, &["rev-parse", "--show-toplevel"]));
+    case.root().join("remote").join(format!("{key}.built-here"))
+}
+
+/// The second run routes with the built-here entry standing and plans its send, then waits for the key the first
+/// holds; meanwhile the entry goes, as a routed build's removal takes it, and a nothing-back record of the run's
+/// configuration stands. Read again under the key, the entry no longer matches, so the record stops the send.
+#[test]
+fn a_built_here_send_whose_entry_is_gone_under_the_key_is_stopped_by_a_standing_nothing_back_record() {
+    let case = built_here_sent_case("client-sent-build-entry-gone");
+    let go = Go(case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
+    let first = start(dotnet_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    let second_steps = ssh_steps(&case, "second", &["ok"; 4]);
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "600000", "--test-remote-wait-ms", "3600000"],
+        ..Tuned::default()
+    };
+    let second = start(client_gate_tuned(&case, "second.log", &second_steps, &tuned, &SENT_TEST));
+    second.wait_for_stderr(KEY_WAITING);
+    fs::remove_file(built_here_record(&case)).expect("the built-here record can be removed");
+    plant_record(&case, r#"{"v":1,"host":"builder","configuration":"Release"}"#);
+
+    drop(go);
+    let first = first.finish();
+    let second = second.finish();
+
+    assert_eq!((first.code, second.code), (Some(0), Some(0)), "{first:?} {second:?}");
+    assert_eq!(calls(&second_steps), ["preflight", "run"], "nothing sent: {second:?}");
+    assert!(build_not_sent(&case, "second.log", "nothing-back"), "{second:?}");
+    assert_eq!(second.stderr.lines().filter(|line| *line == DROPPED_UNSENT_LINE).count(), 1, "{second:?}");
+    assert!(!second.stdout.lines().any(|line| line == "--no-build"), "{second:?}");
+}
+
+/// As above, but the entry is replaced by one of another configuration while the second run waits for the key: the
+/// standing nothing-back record stops the send, and the drop, which builds on the builder, removes the record.
+#[test]
+fn a_built_here_send_the_nothing_back_record_stops_removes_the_built_here_record() {
+    let case = built_here_sent_case("client-sent-build-veto-clears");
+    let go = Go(case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
+    let first = start(dotnet_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    let second_steps = ssh_steps(&case, "second", &["ok"; 4]);
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "600000", "--test-remote-wait-ms", "3600000"],
+        ..Tuned::default()
+    };
+    let second = start(client_gate_tuned(&case, "second.log", &second_steps, &tuned, &SENT_TEST));
+    second.wait_for_stderr(KEY_WAITING);
+    planted_state(&case, "built-here", r#"{"v":1,"projects":{".":{"configuration":"Debug"}}}"#);
+    plant_record(&case, r#"{"v":1,"host":"builder","configuration":"Release"}"#);
+
+    drop(go);
+    let first = first.finish();
+    let second = second.finish();
+
+    assert_eq!((first.code, second.code), (Some(0), Some(0)), "{first:?} {second:?}");
+    assert_eq!(calls(&second_steps), ["preflight", "run"], "nothing sent: {second:?}");
+    assert!(build_not_sent(&case, "second.log", "nothing-back"), "{second:?}");
+    assert!(!built_here_record(&case).exists(), "the dropped words built on the builder: {second:?}");
+}
+
+/// A built-here send the box refuses at the run call runs again with the drop, which builds on the builder, so the
+/// built-here record is removed.
+#[test]
+fn a_built_here_send_the_box_refuses_at_the_run_removes_the_built_here_record() {
+    let case = built_here_sent_case("client-sent-build-refused-clears");
+    let go = Go(case.folder().join("ssh").join("go"));
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", &format!("hold {}", shown(go.path())), "ok"]);
+    let running = start(dotnet_gate(&case, "out.log", &steps, &SENT_TEST));
+    running.wait_until("the run call", || calls(&steps).len() == 4);
+    fs::remove_file(work_folder(&case).join(SENT_DLL)).expect("the sent file can be removed");
+    drop(go);
+
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "inputs", "inputs", "run", "run"], "one run again");
+    assert!(
+        !outcome.stdout.lines().any(|line| line == "--no-build"),
+        "with --no-build dropped: {outcome:?}"
+    );
+    assert!(!built_here_record(&case).exists(), "the drop built on the builder: {outcome:?}");
+}
+
+/// A routed build setting no configuration leaves a nothing-back record of any configuration; a passing local build of
+/// the project in Debug then writes its built-here entry, but not to the record's `built` list, whose settings differ.
+/// The send a routed `-c Debug` test plans from that entry is not stopped by the standing record.
+#[test]
+fn a_send_planned_from_a_built_here_entry_is_not_stopped_by_a_standing_nothing_back_record() {
+    let case = build_case("client-sent-build-built-since");
+    write(&case, ".gitignore", &format!("{CLIENT_IGNORED}bin/\nobj/\n"));
+    write(&case, "dotnet.cmd", STAND_IN_DOTNET);
+    write(&case, "App.csproj", "<Project />\n");
+    passing_build(&case, &["ok", "ok"], &wrapped_build(&["out", "ran there"], &[]));
+    let record = nothing_back(&case);
+    let here = Tuned {
+        extra: &["--local", "--reason", "built here"],
+        ..Tuned::default()
+    };
+    let unused = ssh_steps(&case, "ssh-local", &[]);
+    let local = finish(client_gate_tuned(
+        &case,
+        "local.log",
+        &unused,
+        &here,
+        &[r".\dotnet.cmd", "build", "App.csproj", "-c", "Debug"],
+    ));
+    write(&case, r"bin\Debug\App.dll", "the PC's build");
+    for restore in ["App.csproj.nuget.g.props", "App.csproj.nuget.g.targets"] {
+        write(&case, &format!(r"obj\{restore}"), "<Project />\n");
+    }
+    let steps = ssh_steps(&case, "ssh-sent", &["ok"; 4]);
+
+    let outcome = finish(dotnet_gate(
+        &case,
+        "out.log",
+        &steps,
+        &[r".\dotnet.cmd", "test", "App.csproj", "-c", "Debug", "--no-build"],
+    ));
+
+    assert!(record.is_some(), "the routed build left its record");
+    assert_eq!(local.code, Some(0), "{local:?}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "inputs", "inputs", "run"], "the send landed: {outcome:?}");
+    assert!(outcome.stdout.contains("--no-build"), "the builder kept it: {outcome:?}");
+    assert!(!build_not_sent(&case, "out.log", "outputs are not back"), "{outcome:?}");
+    assert_eq!(
+        fs::read_to_string(work_folder(&case).join(r"bin\Debug\App.dll")).ok().as_deref(),
+        Some("the PC's build")
+    );
+}
+
+/// A sibling pair's main repo, unlisted, whose project's last build ran here: the real client sends the PC's build to
+/// the box, which lays it out in the main repo's leaf folder, and the builder keeps `--no-build`.
+#[test]
+fn a_pair_s_built_here_no_build_test_lands_its_send_in_the_leaf_folder() {
+    let (case, leaf, name, sibling) = pair_case("client-pair-sent-build", &BIN, sibling_repository);
+    let repo = repo_name(&leaf);
+    let routing = json!({
+        "host": HOST,
+        "slots": 2,
+        "repos": { &repo: ["*tool*", "*dotnet*"] },
+        "outputs": { &repo: BIN },
+        "siblings": { &repo: [&name] },
+    });
+    write_remote_json(&case, &routing.to_string());
+    copy_tool(&case, "dotnet.exe");
+    write(&case, ".gitignore", &format!("{CLIENT_IGNORED}bin/\nobj/\n"));
+    write(&case, "App.csproj", "<Project />\n");
+    write(&case, SENT_DLL, "the PC's build");
+    for restore in ["App.csproj.nuget.g.props", "App.csproj.nuget.g.targets"] {
+        write(&case, &format!(r"obj\{restore}"), "<Project />\n");
+    }
+    planted_state(&case, "built-here", BUILT_HERE_RELEASE);
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(dotnet_gate(&case, "out.log", &steps, &SENT_TEST));
+    let landed = fs::read_to_string(work_folder(&case).join(&leaf).join(SENT_DLL)).ok();
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        calls(&steps),
+        ["preflight", "inputs", "inputs", "run"],
+        "the send's diff and put, then the run"
+    );
+    assert!(
+        outcome.stdout.lines().any(|line| line == "--no-build"),
+        "the builder kept it: {outcome:?}"
+    );
+    assert_eq!(dropped_lines(&outcome.stderr), 0, "{outcome:?}");
+    assert!(!outcome.stderr.contains(DROPPED_UNSENT_LINE), "{outcome:?}");
+    assert_eq!(landed.as_deref(), Some("the PC's build"), "the copy is under the leaf folder");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_built_here_no_build_run_s_send_lands_and_the_builder_keeps_no_build() {
+    let case = built_here_sent_case("client-sent-build-run");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+    let command = [r".\dotnet.exe", "run", "argv", "--project", "App.csproj", "-c", "Release", "--no-build"];
+
+    let outcome = finish(dotnet_gate(&case, "out.log", &steps, &command));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        calls(&steps),
+        ["preflight", "inputs", "inputs", "run"],
+        "the send's diff and put, then the run"
+    );
+    assert!(
+        outcome.stdout.lines().any(|line| line == "--no-build"),
+        "the builder kept it: {outcome:?}"
+    );
+    assert_eq!(dropped_lines(&outcome.stderr), 0, "{outcome:?}");
+    assert_eq!(
+        fs::read_to_string(work_folder(&case).join(SENT_DLL)).ok().as_deref(),
+        Some("the PC's build"),
+        "the work folder holds the PC's build"
+    );
 }
 
 #[test]

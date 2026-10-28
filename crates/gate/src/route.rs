@@ -129,12 +129,16 @@ pub(crate) struct Decision {
     local_app_data: Option<OsString>,
     /// `--builder <host>`, the one builder the run is pinned to.
     pin: Option<String>,
+    /// The state root the run's records are under, the built-here record among them ([`Facts::built_here`]).
+    state: PathBuf,
 }
 
 impl Decision {
-    /// What the decision of a run with `request` sees under `covering_parent`, read from `environment`.
-    fn of(request: &RunRequest, environment: &Environment, covering_parent: bool) -> Decision {
+    /// What the decision of a run with `request` sees under `covering_parent`, read from `environment`, its records
+    /// under the state root `state`.
+    fn of(request: &RunRequest, environment: &Environment, covering_parent: bool, state: &Path) -> Decision {
         Decision {
+            state: state.to_owned(),
             covering_parent,
             local: request.local,
             git_hook: environment.git_index_file.as_deref().is_some_and(|value| !value.is_empty()),
@@ -165,9 +169,9 @@ impl Decision {
 /// is not valid Unicode runs here, saying so. A gate under a `covering_parent`'s slot runs here, saying nothing. With
 /// the route, what the decision learnt of the gate's place in its git worktree, and, for a routed run of a repo whose
 /// warm-up is set up, the hash of its warm-up file ([`consented_hash`]).
-pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_parent: bool, console: &mut Console) -> Decided {
-    let decision = Decision::of(request, environment, covering_parent);
-    let mut machine = Machine::new(environment, &request.test_seams);
+pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_parent: bool, state: &Path, console: &mut Console) -> Decided {
+    let decision = Decision::of(request, environment, covering_parent, state);
+    let mut machine = Machine::new(environment, &request.test_seams).with_state(&decision);
     machine.run_log = run_log(request);
     let route = match decide(&decision.inputs(slot(request.slot)), &machine) {
         Route::Routed(_) if !decision.unicode => match &decision.pin {
@@ -237,7 +241,7 @@ fn say_routed(request: &RunRequest, run: &RemoteRun, declared: Result<Vec<String
 /// decision would keep the run here or a word is not valid Unicode. With the run, the hash of its repo's warm-up file
 /// when its warm-up is set up ([`consented_hash`]).
 pub(crate) fn route_as_heavy(request: &RunRequest, decision: &Decision, by: u32, console: &mut Console) -> Option<(RemoteRun, Option<String>)> {
-    let machine = Machine::of(decision.local_app_data.as_deref(), &request.test_seams);
+    let machine = Machine::of(decision.local_app_data.as_deref(), &request.test_seams).with_state(decision);
     let routed = match decide(&decision.inputs(gate_router::Slot::Heavy), &machine) {
         Route::Routed(run) if decision.unicode => Some(run),
         Route::Routed(_) | Route::Local { .. } | Route::Refused(_) => None,
@@ -273,7 +277,7 @@ pub(crate) fn later_run(
     asked: Slot,
     console: &mut Console,
 ) -> Result<RemoteRun, Option<String>> {
-    let machine = Machine::of(decision.local_app_data.as_deref(), &request.test_seams);
+    let machine = Machine::of(decision.local_app_data.as_deref(), &request.test_seams).with_state(decision);
     let run = gate_router::later_run(&decision.inputs(slot(asked)), &machine, candidate);
     for line in machine.unsaid_notes() {
         console.note(&line);
@@ -288,7 +292,7 @@ pub(crate) fn later_run(
 /// decision would, and never reads the warm-up file ([`consented_hash`]) or says a line; nor does it look up the
 /// worktree an outside path lies in, which only changes the line of a run kept here.
 pub(crate) fn would_route_on_heavy(decision: &Decision, seams: &TestSeams) -> bool {
-    let machine = Machine::hint(decision.local_app_data.as_deref(), seams);
+    let machine = Machine::hint(decision.local_app_data.as_deref(), seams).with_state(decision);
     hint_holds(decision.unicode, &machine, |machine| {
         matches!(decide(&decision.inputs(gate_router::Slot::Heavy), machine), Route::Routed(_))
     })
@@ -604,6 +608,9 @@ pub(crate) struct Machine<'a> {
     /// The absolute path of the log the run writes, which a sweep leaves out ([`swept_folder`]); `None` for a decision
     /// that runs nothing (`gate warm`, the route hint).
     run_log: Option<PathBuf>,
+    /// The state root whose built-here record says which builds ran here ([`Facts::built_here`]); `None` for a
+    /// decision that routes no command (`gate warm`), which then finds no build here.
+    state: Option<PathBuf>,
 }
 
 impl<'a> Machine<'a> {
@@ -643,6 +650,15 @@ impl<'a> Machine<'a> {
             said: RefCell::new(Vec::new()),
             remote_transport: None,
             run_log: None,
+            state: None,
+        }
+    }
+
+    /// These facts with the built-here record read under the state root `decision` saw.
+    fn with_state(self, decision: &Decision) -> Machine<'a> {
+        Machine {
+            state: Some(decision.state.clone()),
+            ..self
         }
     }
 
@@ -1084,11 +1100,39 @@ impl Facts for Machine<'_> {
     }
 
     /// A build file that cannot be read counts as moving it, saying why in the log.
-    fn moves_build_output(&self, place: &Place, folder: &str, file: Option<&str>) -> bool {
-        no_build::moves_output(Path::new(&place.root), folder, file).unwrap_or_else(|why| {
+    fn moves_build_output(&self, place: &Place, folder: &str, file: Option<&str>, default_configuration: bool) -> bool {
+        no_build::moves_output(Path::new(&place.root), folder, file, default_configuration).unwrap_or_else(|why| {
             self.notes.borrow_mut().push(format!("gate: not sending the PC's build: {why}"));
             true
         })
+    }
+
+    /// A folder that cannot be listed holds none, saying why in the log.
+    fn project_files(&self, place: &Place, folder: &str) -> Vec<String> {
+        let path = folder
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .fold(PathBuf::from(&place.root), |path, segment| path.join(segment));
+        match no_build::project_files(&path) {
+            Ok(files) => files
+                .iter()
+                .filter_map(|file| file.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .collect(),
+            Err(error) => {
+                let line = format!(
+                    "gate: not sending the PC's build: cannot read {}: {error}",
+                    escaped(&path.to_string_lossy())
+                );
+                self.notes.borrow_mut().push(line);
+                Vec::new()
+            }
+        }
+    }
+
+    /// The rule a run here keeps `--no-build` by ([`no_build::last_build_ran_here`]); no state root finds no build.
+    fn built_here(&self, root: &str, words: &[String]) -> Option<String> {
+        no_build::last_build_ran_here(self.state.as_deref()?, root, words)
     }
 
     /// A project that cannot be read counts as Windows-only, saying why in the log.

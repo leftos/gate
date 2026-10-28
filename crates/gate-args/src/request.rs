@@ -364,7 +364,8 @@ pub struct TestSeams {
     /// How long a routed run waits for a remote slot before it falls back with reason `full`.
     pub remote_wait_ms: Option<u64>,
     /// How long a routed run waits for its work folder's key, held by another run of the same worktree, before it falls
-    /// back with reason `busy`.
+    /// back with reason `busy`; also the bounds a passing build here takes the key with to write its built-here record:
+    /// its brief retry and its wait to remove the outputs-from record.
     pub key_wait_ms: Option<u64>,
     /// How long each git call of the routing decision may take before git is killed and the run goes ahead here, and
     /// each git call the remote client's bounds give before that call fails, in place of their defaults.
@@ -380,6 +381,12 @@ pub struct TestSeams {
     /// its arrival written to `<file>.reached` before the wait: it writes the claim, then journals its take, once the file
     /// exists.
     pub beside_claim_wait: Option<PathBuf>,
+    /// The file a passing build here writes after the first slice of its brief take of the work folder's key times
+    /// out, so a case holding the key lets it go only once the take is retrying.
+    pub built_here_key_reached: Option<PathBuf>,
+    /// The file each wait of a build here for the work folder's key, bounded or held off by a drain marker, appends
+    /// one line to as it begins, so a case counts the waits a passing build makes.
+    pub key_waits: Option<PathBuf>,
     /// How long the remote client's `dotnet --list-sdks` of this PC may take before it is killed and the SDK list
     /// counts as unreadable, in place of 30 s.
     pub dotnet_limit_ms: Option<u64>,

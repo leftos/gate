@@ -748,6 +748,268 @@ fn a_dotnet_no_build_command_brings_no_outputs_back() {
     assert_eq!(NO_OUTPUTS_LINE, "gate: outputs: none brought back for a --no-build command");
 }
 
+/// The facts of [`send_facts`] whose built-here record says the last build of the project `one` ran here.
+fn built_here_facts(send: &str) -> FakeFacts {
+    FakeFacts {
+        built_here: Some("one".to_owned()),
+        ..send_facts(send)
+    }
+}
+
+/// The route of `command` under `facts`, which must run here because its last build ran here, with the line it says.
+fn assert_kept_here_by_the_record(command: &[String], facts: &FakeFacts) {
+    let route = decide(&heavy(command), facts);
+    assert_eq!(
+        route,
+        Route::Local {
+            reason: Some(LocalReason::BuiltHere { project: "one".to_owned() })
+        },
+        "{command:?}: {:?}",
+        local_line(&route)
+    );
+    assert_eq!(
+        local_line(&route).as_deref(),
+        Some("gate: not routed: the last build of one ran here; --no-build kept")
+    );
+}
+
+#[test]
+fn an_unlisted_repo_s_no_build_test_whose_last_build_ran_here_sends_the_pc_s_build_and_keeps_the_word() {
+    let command = words(&["dotnet", "test", "One/One.csproj", "-c", "Release", "--no-build"]);
+    let facts = built_here_facts("[]");
+
+    let run = routed(decide(&heavy(&command), &facts));
+
+    let send = run.send.as_ref().expect("the run has a send plan");
+    assert_eq!(send.words, command, "--no-build kept");
+    assert_eq!(send.bin, "One/bin/Release");
+    assert!(send.built_here, "planned from the built-here record");
+    assert!(run.dropped_no_build, "the fallback words drop it");
+    assert!(!run.lines().iter().any(|line| line == DROPPED_NO_BUILD_LINE), "{:?}", run.lines());
+    assert_eq!(facts.built_here_asked.get(), 1);
+}
+
+/// A routed `command` at `at` of a repo `sendBuild` lists, whose listed rule sends nothing, reads the built-here record
+/// once; with no entry it has no send plan and drops its `--no-build` with today's line.
+fn assert_listed_reads_the_record_and_drops_without_an_entry(command: &[&str], at: &str) {
+    let facts = FakeFacts {
+        project_files: words(&["App.csproj"]),
+        config: send_facts(r#"["yaat"]"#).config,
+        ..FakeFacts::at(at)
+    };
+
+    let run = routed(decide(&heavy(&words(command)), &facts));
+
+    assert_eq!(run.send, None, "{command:?}");
+    assert!(run.dropped_no_build, "{command:?}");
+    assert!(
+        run.lines().iter().any(|line| line == DROPPED_NO_BUILD_LINE),
+        "{command:?}: {:?}",
+        run.lines()
+    );
+    assert_eq!(
+        facts.built_here_asked.get(),
+        1,
+        "a listed repo whose rule sends nothing asks: {command:?}"
+    );
+}
+
+#[test]
+fn a_listed_repo_s_no_build_run_without_a_built_here_entry_reads_the_record_and_drops() {
+    assert_listed_reads_the_record_and_drops_without_an_entry(&["dotnet", "run", "--project", "App.csproj", "-c", "Release", "--no-build"], "");
+}
+
+#[test]
+fn a_listed_repo_s_no_build_test_setting_no_configuration_without_a_built_here_entry_reads_the_record_and_drops() {
+    assert_listed_reads_the_record_and_drops_without_an_entry(&["dotnet", "test", "App.csproj", "--no-build"], "");
+}
+
+#[test]
+fn a_listed_repo_s_no_build_run_of_its_folder_s_project_without_a_built_here_entry_reads_the_record_and_drops() {
+    assert_listed_reads_the_record_and_drops_without_an_entry(&["dotnet", "run", "-c", "Release", "--no-build"], "src/App/");
+}
+
+/// A listed repo built here steers off a macOS pick, as an unlisted one does, to the Windows builder, whose listed
+/// rule sends the PC's build.
+#[test]
+fn a_listed_repo_s_no_build_test_built_here_picked_by_a_macos_builder_goes_to_the_windows_builder_with_a_send() {
+    let command = words(&["dotnet", "test", "One/One.csproj", "-c", "Release", "--no-build"]);
+    let text = format!(r#"{{"host": "builder-1", "repos": {{"other": ["*"]}}, "builders": {MAC_THEN_WINDOWS_TEST}, "sendBuild": ["yaat"]}}"#);
+    let facts = FakeFacts {
+        built_here: Some("one".to_owned()),
+        ..FakeFacts::with_config(Config::parse(&text).expect("usable"))
+    };
+
+    let run = routed(decide(&heavy(&command), &facts));
+
+    assert_eq!(run.builder.alias, "win-2", "the Mac's pick is steered off");
+    assert!(run.send.is_some(), "the Windows builder plans the send: {:?}", run.lines());
+    assert_eq!(facts.built_here_asked.get(), 1);
+}
+
+#[test]
+fn a_pinned_macos_no_build_test_whose_last_build_ran_here_routes_to_the_mac_and_drops_the_word() {
+    let command = words(&["dotnet", "test", "One/One.csproj", "-c", "Release", "--no-build"]);
+    let facts = FakeFacts {
+        built_here: Some("one".to_owned()),
+        ..FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, MAC_THEN_WINDOWS_TEST))
+    };
+    let inputs = Inputs {
+        pin: Some("mac-1"),
+        ..heavy(&command)
+    };
+
+    let run = routed(decide(&inputs, &facts));
+
+    assert_eq!(run.builder.alias, "mac-1");
+    assert_eq!(run.send, None);
+    assert!(!run.words.iter().any(|word| word == "--no-build"), "{:?}", run.words);
+    assert_eq!(facts.built_here_asked.get(), 0, "a pin never asks the record");
+}
+
+#[test]
+fn a_no_build_test_whose_last_build_ran_here_still_sends_the_pc_s_build_where_send_build_lists_the_repo() {
+    let command = words(&["dotnet", "test", "App.csproj", "-c", "Release", "--no-build"]);
+    let facts = built_here_facts(r#"["yaat"]"#);
+
+    let run = routed(decide(&heavy(&command), &facts));
+
+    let send = run.send.as_ref().expect("the listed repo sends");
+    assert!(!send.built_here, "planned from sendBuild");
+    assert_eq!(facts.built_here_asked.get(), 0, "a listed repo never asks");
+}
+
+#[test]
+fn a_pinned_no_build_test_whose_last_build_ran_here_routes_and_drops_the_word() {
+    let command = words(&["dotnet", "test", "One/One.csproj", "-c", "Release", "--no-build"]);
+    let facts = built_here_facts("[]");
+    let inputs = Inputs {
+        pin: Some("builder-1"),
+        ..heavy(&command)
+    };
+
+    let run = routed(decide(&inputs, &facts));
+
+    assert_eq!(run.send, None);
+    assert!(run.dropped_no_build);
+    assert!(!run.words.iter().any(|word| word == "--no-build"), "{:?}", run.words);
+    assert_eq!(facts.built_here_asked.get(), 0, "a pin never asks the record");
+}
+
+#[test]
+fn a_build_whose_last_build_ran_here_routes_as_it_did() {
+    for command in [&["dotnet", "build", "One/One.csproj"][..], &["dotnet", "test", "One/One.csproj"]] {
+        let facts = built_here_facts("[]");
+
+        let run = routed(decide(&heavy(&words(command)), &facts));
+
+        assert_eq!(run.send, None, "{command:?}");
+        assert_eq!(facts.built_here_asked.get(), 0, "{command:?}");
+    }
+}
+
+#[test]
+fn a_no_build_run_of_a_project_whose_last_build_ran_here_sends_and_keeps_the_program_s_words() {
+    let command = words(&["dotnet", "run", "--project", "p/P.csproj", "-c", "Release", "--no-build", "--", "x"]);
+    let facts = built_here_facts("[]");
+
+    let run = routed(decide(&heavy(&command), &facts));
+
+    let send = run.send.as_ref().expect("the run has a send plan");
+    assert_eq!(send.words, command, "--no-build and the words after -- kept");
+    assert_eq!(send.bin, "p/bin/Release");
+    assert!(!run.words.iter().any(|word| word == "--no-build"), "{:?}", run.words);
+}
+
+#[test]
+fn a_no_build_run_naming_no_project_sends_the_one_project_of_its_folder_else_runs_here() {
+    let command = words(&["dotnet", "run", "--no-build"]);
+    let at_app = |files: &[&str]| FakeFacts {
+        built_here: Some("one".to_owned()),
+        project_files: words(files),
+        config: send_facts("[]").config,
+        ..FakeFacts::at("src/App/")
+    };
+
+    let run = routed(decide(&heavy(&command), &at_app(&["App.csproj"])));
+    let send = run.send.as_ref().expect("the folder's one project is sent");
+    assert_eq!(send.bin, "src/App/bin/Debug", "no -c builds Debug");
+    assert_eq!(send.words, command);
+
+    for files in [&[][..], &["App.csproj", "Other.fsproj"]] {
+        assert_kept_here_by_the_record(&command, &at_app(files));
+    }
+    assert_kept_here_by_the_record(&words(&["dotnet", "run", "app.cs", "--no-build"]), &at_app(&["App.csproj"]));
+}
+
+#[test]
+fn a_no_build_test_setting_no_configuration_sends_debug_unless_a_build_file_names_one() {
+    let command = words(&["dotnet", "test", "One/One.csproj", "--no-build"]);
+    let run = routed(decide(&heavy(&command), &built_here_facts("[]")));
+    assert_eq!(run.send.as_ref().map(|send| send.bin.as_str()), Some("One/bin/Debug"));
+
+    let named = FakeFacts {
+        sets_configuration: true,
+        ..built_here_facts("[]")
+    };
+    assert_kept_here_by_the_record(&command, &named);
+
+    let set = words(&["dotnet", "test", "One/One.csproj", "-c", "Release", "--no-build"]);
+    let named = FakeFacts {
+        sets_configuration: true,
+        ..built_here_facts("[]")
+    };
+    let run = routed(decide(&heavy(&set), &named));
+    assert_eq!(
+        run.send.as_ref().map(|send| send.bin.as_str()),
+        Some("One/bin/Release"),
+        "a configuration the words set is not looked for"
+    );
+}
+
+#[test]
+fn a_macos_pick_of_a_no_build_test_whose_last_build_ran_here_goes_on_to_a_windows_builder_with_the_send() {
+    let command = words(&["dotnet", "test", "One/One.csproj", "-c", "Release", "--no-build"]);
+    let facts = FakeFacts {
+        built_here: Some("one".to_owned()),
+        ..FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, MAC_THEN_WINDOWS_TEST))
+    };
+
+    let run = routed(decide(&heavy(&command), &facts));
+
+    assert_eq!(run.builder.alias, "win-2");
+    let send = run.send.as_ref().expect("the Windows builder gets the send");
+    assert_eq!(send.bin, "One/bin/Release");
+    assert!(send.built_here);
+    assert_eq!(facts.built_here_asked.get(), 1, "the record is read once");
+
+    let unbuilt = FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, MAC_THEN_WINDOWS_TEST));
+    let run = routed(decide(&heavy(&command), &unbuilt));
+    assert_eq!(run.builder.alias, "mac-1", "a run not built here stays on the Mac");
+    assert_eq!(run.send, None);
+}
+
+#[test]
+fn a_no_build_test_whose_last_build_ran_here_and_only_a_macos_builder_runs_stays_here() {
+    let mac = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["dotnet test*"]}}]"#;
+    let facts = FakeFacts {
+        built_here: Some("one".to_owned()),
+        ..FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, mac))
+    };
+    assert_kept_here_by_the_record(&words(&["dotnet", "test", "One/One.csproj", "-c", "Release", "--no-build"]), &facts);
+}
+
+#[test]
+fn a_no_build_test_whose_last_build_ran_here_and_whose_words_cannot_be_sent_stays_here() {
+    for command in [
+        &["dotnet", "test", "One/One.csproj", "-c", "Release", "--no-build", "-o", "out"][..],
+        &["dotnet", "test", "One/One.csproj", "-c", "Release", "--no-build", "-p:Platform=x64"],
+        &["dotnet", "test", "One/One.csproj", "-c", "a/b", "--no-build"],
+    ] {
+        assert_kept_here_by_the_record(&words(command), &built_here_facts("[]"));
+    }
+}
+
 /// The target and the words a worktree's [`target`] and [`builder_words`] give for `command`, each checked against the
 /// [`RemoteRun`] the same worktree's decision builds.
 fn assert_builder_words_match(command: &[String], facts: &FakeFacts) -> (Target, Vec<String>) {

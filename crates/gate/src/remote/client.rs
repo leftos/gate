@@ -42,7 +42,7 @@ use gate_wire::stamp::{self, Tag};
 use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
-use gate_router::{Config, DROPPED_NO_BUILD_LINE, SendPlan, escaped, repo_name};
+use gate_router::{Config, DROPPED_NO_BUILD_LINE, SendPlan, build_settings, escaped, repo_name};
 use gate_wire::{PairRefused, Payload, SHA256_DIGITS, is_cross_not_brought_back, is_lower_hex};
 
 use super::drain::{self, Drain, DrainLine};
@@ -1663,11 +1663,11 @@ impl Attempt<'_, '_> {
         };
         if let Some(why) = self.outputs_not_back(plan) {
             self.logged_kept(inputs::build_not_sent(&why));
-            self.say(DROPPED_NO_BUILD_LINE.to_owned());
+            self.takes_the_drop(plan.dropped_line())?;
             return Ok(None);
         }
         let Some(digest) = inputs::sent_build(self, location, &plan.bin)? else {
-            self.say(DROPPED_NO_BUILD_LINE.to_owned());
+            self.takes_the_drop(plan.dropped_line())?;
             return Ok(None);
         };
         self.dropped_no_build = false;
@@ -1680,9 +1680,14 @@ impl Attempt<'_, '_> {
     /// Why `plan`'s send is not made while the last build's outputs are not back here: the worktree's nothing-back record
     /// stands, read as a run here reads it ([`no_build::read_record`]), and names no configuration or the run's own,
     /// the last folder of [`SendPlan::bin`], in any letter case; a record that cannot be read counts as standing. The
-    /// PC's `bin` would then be older than the builder's build, and the run takes the drop. `None` with no record, or
-    /// one of another configuration.
+    /// PC's `bin` would then be older than the builder's build, and the run takes the drop. `None` with no record, one
+    /// of another configuration, and for a send planned because the run's last build ran here
+    /// ([`SendPlan::built_here`]) whose entry still stands ([`Attempt::built_here_stands`]): every routed build removes
+    /// the built-here record before it runs, so its standing entry says a build here came after the last routed one.
     fn outputs_not_back(&self, plan: &SendPlan) -> Option<String> {
+        if plan.built_here && self.built_here_stands(plan) {
+            return None;
+        }
         let path = v1::nothing_back_path(self.call.state_dir, self.call.key);
         let configuration = plan.bin.rsplit('/').next().unwrap_or_default().to_lowercase();
         let standing = || format!("the last build's outputs are not back: {} stands", path.display());
@@ -1695,6 +1700,31 @@ impl Attempt<'_, '_> {
                 .then(standing),
             Err(error) => Some(format!("cannot read {}: {error}", path.display())),
         }
+    }
+
+    /// Whether the built-here entry `plan` was planned from still stands, read again under the key lock the run holds:
+    /// the record's entry the route matched ([`SendPlan::project_key`]) under the settings [`SendPlan::words`] set
+    /// ([`no_build::entry_stands`]). A routed build removes the record under that lock between the route and here.
+    fn built_here_stands(&self, plan: &SendPlan) -> bool {
+        let record = no_build::read_built_here(&v1::built_here_path(self.call.state_dir, self.call.key));
+        no_build::entry_stands(&record, &plan.project_key, &build_settings(&plan.words))
+    }
+
+    /// Says `line`, the dropped line of a send that is not made or did not land, as the builder is about to run the
+    /// words whose `--no-build` the route dropped, which build there: the worktree's built-here record is removed first,
+    /// under the key lock the run holds ([`no_build::clear_built_here`]).
+    ///
+    /// # Errors
+    ///
+    /// A record that cannot be removed refuses the route `inputs`, as its entries would outlast the build there: the
+    /// run goes on here, the line saying why kept for its log.
+    fn takes_the_drop(&mut self, line: &'static str) -> Result<(), End> {
+        if let Err(cannot) = no_build::clear_built_here(&v1::built_here_path(self.call.state_dir, self.call.key)) {
+            self.logged_kept(cannot);
+            return Err(End::Refused(FallbackReason::Inputs));
+        }
+        self.say(line.to_owned());
+        Ok(())
     }
 
     /// The run call of `run` to `location`, fed `sent`'s manifest line, and the nonce of the call that counts. A call
@@ -1714,7 +1744,8 @@ impl Attempt<'_, '_> {
             return Ok((called, run.nonce.to_owned()));
         }
         self.dropped_no_build = true;
-        self.say(DROPPED_NO_BUILD_LINE.to_owned());
+        let dropped = self.call.send.map_or(DROPPED_NO_BUILD_LINE, SendPlan::dropped_line);
+        self.takes_the_drop(dropped)?;
         sent.withhold(withheld);
         outputs::marked(sent)?;
         let nonce = payload::run_nonce();

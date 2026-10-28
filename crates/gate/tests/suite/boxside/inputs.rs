@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL};
 
 use super::ReadBack;
-use super::{box_call, field, gate_box, git, lines, passed, payload, refused_line, run_box, snapshot};
+use super::{box_call, field, gate_box, git, lines, pair_payload, pair_snapshot, passed, payload, refused_line, run_box, snapshot};
 use crate::support::{Case, FAKE_TOOL, Outcome, box_payload, junction};
 
 /// The lower-case hex SHA-256 of `bytes`.
@@ -1202,6 +1202,128 @@ fn sent_build_run_with_its_digest_runs_and_a_changed_bin_file_is_refused_sent() 
     assert_eq!(changed.code, Some(75), "{changed:?}");
     assert_eq!(lines(&changed.stderr)[0], refused_line(&payload, "sent"), "{changed:?}");
     assert!(changed.stderr.contains(BUILT_DLL.0), "the line names the file: {changed:?}");
+}
+
+/// The leaf of the sibling pair [`pair_inputs_payload`] lays out: the main repo's tree is `{Work}\app`.
+const LEAF: &str = "app";
+
+/// The payload of an inputs call of `step` for the sibling pair of the main checkout [`LEAF`] and the sibling `lib`,
+/// which a run of it would run `fake-tool out ran`, readied by a preflight first.
+fn pair_inputs_payload(case: &Case, step: &str) -> Value {
+    let mut payload = pair_payload(case, &["lib"], &[FAKE_TOOL, "out", "ran"]);
+    payload["Step"] = json!(step);
+    passed(&gate_box(case, "preflight", &self::payload(&payload), None));
+    payload
+}
+
+/// The `/`-separated `path` of the main repo's tree as a path below a pair's work folder: `{LEAF}/{path}`.
+fn in_leaf(path: &str) -> String {
+    format!("{LEAF}/{path}")
+}
+
+/// The main repo's exclude file of the pair payload `payload`'s work folder.
+fn leaf_exclude_of(payload: &Value) -> String {
+    fs::read_to_string(work(payload).join(LEAF).join(r".git\info\exclude")).expect("the main repo's exclude file can be read")
+}
+
+/// The paths the sent-build record of `payload`'s work folder names.
+fn sent_record_paths(payload: &Value) -> Vec<String> {
+    let text = fs::read_to_string(format!("{}.sent-build", field(payload, "Work"))).expect("the sent-build record can be read");
+    let record: Value = serde_json::from_str(&text).expect("the record is JSON");
+    record["files"].as_object().expect("the record has files").keys().cloned().collect()
+}
+
+#[test]
+fn sent_build_of_a_pair_lands_below_the_leaf_and_its_record_names_leaf_paths() {
+    let case = Case::new("box_sent_pair_put");
+    let payload = pair_inputs_payload(&case, "put");
+    let files = [BUILT_DLL, RESTORE_PROPS, RESTORE_TARGETS];
+
+    let needed = diff(&case, &sent(&payload), &files);
+    assert_eq!(needed.code, Some(0), "{needed:?}");
+    assert_eq!(
+        needed.stdout,
+        needs(&[BUILT_DLL.0, RESTORE_PROPS.0, RESTORE_TARGETS.0]),
+        "the diff names the PC's paths: {needed:?}"
+    );
+
+    sent_all(&case, &payload, &files);
+
+    let leaf_paths: Vec<String> = files.iter().map(|(path, _)| in_leaf(path)).collect();
+    let left: Vec<String> = tree_files(work(&payload)).into_keys().collect();
+    assert_eq!(left, leaf_paths, "every file lands below the leaf and none below the work folder itself");
+    let tree = tree_files(&work(&payload).join(LEAF));
+    for (path, bytes) in files {
+        assert_eq!(tree.get(path).map(Vec::as_slice), Some(bytes), "{path} is the PC's");
+    }
+    assert_eq!(sent_record_paths(&payload), leaf_paths, "the record names the leaf's paths");
+    assert_eq!(
+        leaf_exclude_of(&payload),
+        format!("/{}\n/{}\n/{}\n", BUILT_DLL.0, RESTORE_PROPS.0, RESTORE_TARGETS.0),
+        "the main repo's exclude file names each copy relative to the leaf"
+    );
+    let again = diff(&case, &sent(&payload), &files);
+    assert_eq!(again.stdout, needs(&[]), "a second diff needs nothing: {again:?}");
+}
+
+#[test]
+fn sent_build_of_a_pair_deletes_the_copy_that_left_the_pc_s_build_below_the_leaf() {
+    let case = Case::new("box_sent_pair_leftover");
+    let payload = pair_inputs_payload(&case, "put");
+    sent_all(&case, &payload, &[BUILT_DLL, BUILT_PDB]);
+
+    sent_all(&case, &payload, &[BUILT_DLL]);
+
+    let left: Vec<String> = tree_files(work(&payload)).into_keys().collect();
+    assert_eq!(left, [in_leaf(BUILT_DLL.0)], "the copy that left the PC's build is deleted");
+    assert_eq!(sent_record_paths(&payload), [in_leaf(BUILT_DLL.0)]);
+}
+
+#[test]
+fn a_pair_s_inputs_request_without_a_sent_bin_is_still_refused() {
+    let case = Case::new("box_inputs_pair_no_sent_bin");
+    let payload = pair_inputs_payload(&case, "put");
+
+    let outcome = put_with(&case, &payload, &[], &[DATA], &[DATA]);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stderr, "gate box: inputs for a sibling pair are not taken yet\n");
+    assert!(!work(&payload).join(LEAF).exists(), "nothing is laid out");
+}
+
+#[test]
+fn sent_bin_of_a_pair_that_climbs_out_is_a_usage_error() {
+    let case = Case::new("box_sent_pair_climbs");
+    let payload = pair_inputs_payload(&case, "diff");
+
+    assert_malformed_sent_bin("a parent part", &sent_bin_diff(&case, &payload, "../x/bin/Debug"));
+    assert!(!work(&payload).join(LEAF).exists(), "nothing is laid out");
+}
+
+#[test]
+fn sent_build_run_of_a_pair_with_its_digest_keeps_no_build_and_a_changed_copy_below_the_leaf_is_refused_sent() {
+    let case = Case::new("box_sent_pair_run");
+    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "argv", "test", "--no-build"]);
+    pair_snapshot(&case, &mut payload, &[("tracked.txt", "tracked\n")], &[("lib", &[("lib.txt", "lib\n")])]);
+    let files = [BUILT_DLL, RESTORE_PROPS, RESTORE_TARGETS];
+    sent_all(&case, &payload, &files);
+    let digested = sent_digested(&payload, &manifest_line(&files));
+
+    let matched = run_box(&case, &digested);
+    assert_eq!(matched.code, Some(0), "{matched:?}");
+    assert_eq!(matched.stdout, "test\n--no-build\n", "the command runs with its --no-build: {matched:?}");
+    assert_eq!(
+        leaf_exclude_of(&payload),
+        format!("/{}\n/{}\n/{}\n", BUILT_DLL.0, RESTORE_PROPS.0, RESTORE_TARGETS.0),
+        "the main repo's exclude file names the sent copies relative to the leaf"
+    );
+
+    written(&payload, &in_leaf(BUILT_DLL.0), b"rebuilt on the box");
+    let changed = run_box(&case, &digested);
+    assert_eq!(changed.code, Some(75), "{changed:?}");
+    assert_eq!(lines(&changed.stderr)[0], refused_line(&payload, "sent"), "{changed:?}");
+    assert!(changed.stderr.contains(&in_leaf(BUILT_DLL.0)), "the line names the copy: {changed:?}");
+    assert_eq!(changed.stdout, "", "the command never ran: {changed:?}");
 }
 
 #[test]

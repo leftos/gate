@@ -120,13 +120,14 @@ fn own_files(state: &Path, id: Option<&str>, key: &str) -> [PathBuf; 5] {
 }
 
 /// The files of `key` every builder shares under the state root `state`, the warm-up lock and the worktree record aside.
-fn shared_files(state: &Path, key: &str) -> [PathBuf; 5] {
+fn shared_files(state: &Path, key: &str) -> [PathBuf; 6] {
     [
         v1::outputs_pending_path(state, key),
         v1::nothing_back_path(state, key),
         v1::warm_record_path(state, key),
         v1::warm_log_path(state, key),
         v1::outputs_from_path(state, key),
+        v1::built_here_path(state, key),
     ]
 }
 

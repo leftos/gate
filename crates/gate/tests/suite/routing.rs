@@ -4,13 +4,14 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use gate_router::{DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE, repo_name, work_folder_key};
+use gate_router::{DROPPED_NO_BUILD_LINE, DROPPED_UNSENT_LINE, NO_OUTPUTS_LINE, repo_name, work_folder_key};
 use gate_state::{KernelObject, StateRoot, key_hash};
 use gate_win32::NamedMutex;
 use serde_json::{Value, json};
@@ -2684,6 +2685,579 @@ fn a_routed_build_that_falls_back_here_writes_no_record_and_its_passing_build_cl
     assert_eq!(nothing_back(&case), None, "a passing fallback build clears the record: {passed:?}");
 }
 
+/// The path of the case worktree's built-here record, under the key of its root as git gives it.
+fn built_here_path(case: &Case) -> PathBuf {
+    let key = work_folder_key(&git(case, &["rev-parse", "--show-toplevel"]));
+    case.root().join("remote").join(format!("{key}.built-here"))
+}
+
+/// The text of the case worktree's built-here record; `None` when there is none.
+fn built_here(case: &Case) -> Option<String> {
+    let path = built_here_path(case);
+    path.exists().then(|| fs::read_to_string(&path).expect("the record can be read"))
+}
+
+/// Writes `text` as the case worktree's built-here record.
+fn seed_built_here(case: &Case, text: &str) {
+    let path = built_here_path(case);
+    fs::create_dir_all(path.parent().expect("the record has a folder")).expect("the record's folder can be made");
+    fs::write(path, text).expect("the record can be written");
+}
+
+/// A case with the stand-in dotnet and the restored projects `One` and `Two` tracked, and no record of any kind.
+fn built_here_case(name: &str) -> Case {
+    let case = routed_case(name);
+    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
+    tracked_project(&case, "One/One.csproj", true);
+    tracked_project(&case, "Two/Two.csproj", true);
+    case
+}
+
+#[test]
+fn a_passing_local_build_records_its_project_as_built_here() {
+    let case = built_here_case("routing-built-here-recorded");
+    let outputs_from = built_here_path(&case).with_extension("outputs-from");
+    fs::create_dir_all(outputs_from.parent().expect("the record has a folder")).expect("the record's folder can be made");
+    fs::write(&outputs_from, "builder").expect("the outputs-from record can be written");
+
+    let project = finish(case.gate(&run_words(
+        "project.log",
+        &[],
+        &[r".\dotnet.cmd", "build", r"One\One.csproj", "-c", "Release"],
+    )));
+    let after_project = built_here(&case);
+    let outputs_from_left = outputs_from.exists();
+    let unnamed = finish(case.gate(&run_words("unnamed.log", &[], &[r".\dotnet.cmd", "build"])));
+    let after_unnamed = built_here(&case);
+    fs::write(case.folder().join("App.sln"), APP_SLN).expect("the solution can be written");
+    let solution = finish(case.gate(&run_words("solution.log", &[], &[r".\dotnet.cmd", "build", "App.sln", "-c", "Debug"])));
+    let after_solution = built_here(&case);
+    let whole = finish(case.gate(&run_words("whole.log", &[], &[r".\dotnet.cmd", "build"])));
+
+    let codes = [project.code, unnamed.code, solution.code, whole.code];
+    assert_eq!(codes, [Some(0); 4], "{project:?} {unnamed:?} {solution:?} {whole:?}");
+    assert_eq!(
+        after_project.as_deref(),
+        Some(r#"{"v":1,"projects":{"one":{"configuration":"Release","seq":1}}}"#),
+        "{project:?}"
+    );
+    assert!(!outputs_from_left, "a passing build here removes the outputs-from record: {project:?}");
+    assert_eq!(
+        after_unnamed, after_project,
+        "a folder with no project or solution file records nothing: {unnamed:?}"
+    );
+    assert_eq!(
+        after_solution.as_deref(),
+        Some(r#"{"v":1,"projects":{"one":{"configuration":"Debug","seq":2},"two":{"configuration":"Debug","seq":2}}}"#),
+        "a solution build records each project it lists: {solution:?}"
+    );
+    assert_eq!(
+        built_here(&case).as_deref(),
+        Some(r#"{"v":1,"projects":{"one":{"seq":3},"two":{"seq":3}}}"#),
+        "a build naming nothing in the folder of one solution records its projects: {whole:?}"
+    );
+}
+
+/// A solution at the case root listing the projects `One` and `Two`.
+const APP_SLN: &str = "Microsoft Visual Studio Solution File, Format Version 12.00\r\n\
+                       Project(\"{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}\") = \"One\", \"One\\One.csproj\", \
+                       \"{11111111-1111-1111-1111-111111111111}\"\r\n\
+                       EndProject\r\n\
+                       Project(\"{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}\") = \"Two\", \"Two\\Two.csproj\", \
+                       \"{22222222-2222-2222-2222-222222222222}\"\r\n\
+                       EndProject\r\n";
+
+/// The case worktree's work-folder key and the name of its key lock's mutex.
+fn key_lock(case: &Case) -> (String, String) {
+    let key = work_folder_key(&git(case, &["rev-parse", "--show-toplevel"]));
+    let name = StateRoot::new(&shown(&case.root()), None).object_name(KernelObject::Routed { hash: key_hash(&key) });
+    (key, name)
+}
+
+/// The key stays held past the build's brief retry, so the build records nothing; it then waits for the key to remove
+/// the outputs-from record, which is still there until the case lets the key go.
+#[test]
+fn a_local_build_while_the_work_folder_key_is_held_records_nothing_and_removes_outputs_from_once_the_key_is_let_go() {
+    let case = built_here_case("routing-built-here-key-held");
+    fs::write(case.folder().join("App.sln"), APP_SLN).expect("the solution can be written");
+    let outputs_from = built_here_path(&case).with_extension("outputs-from");
+    fs::create_dir_all(outputs_from.parent().expect("the record has a folder")).expect("the record's folder can be made");
+    fs::write(&outputs_from, "builder").expect("the outputs-from record can be written");
+    let (key, name) = key_lock(&case);
+    let mutex = NamedMutex::open(&name).expect("the key's mutex opens");
+    let held = mutex.acquire(Duration::from_secs(5)).expect("the key's mutex is free");
+    let line = format!("gate: built-here record not written: work folder {key} is held");
+
+    let build = case.start(&run_words("build.log", &[], &[r".\dotnet.cmd", "build", "App.sln"]));
+    build.wait_until("the skipped write's line", || {
+        fs::read_to_string(case.folder().join("build.log")).is_ok_and(|text| text.contains(&line))
+    });
+    let left_while_held = outputs_from.exists();
+    drop(held);
+    let build = build.finish();
+
+    assert_eq!(build.code, Some(0), "{build:?}");
+    assert_eq!(built_here(&case), None, "{build:?}");
+    let logged = log_text(&case, "build.log");
+    assert!(logged.lines().any(|said| said.ends_with(&line)), "{logged}");
+    assert!(!build.stderr.contains(&line), "said in the log only: {build:?}");
+    assert!(left_while_held, "removed only under the key: {build:?}");
+    assert!(!outputs_from.exists(), "removed once the key was let go: {build:?}");
+}
+
+/// A holder that lets the key go while the build retries its take, as a local write does after milliseconds: the
+/// build's entry is written. The case lets the key go once the take has timed out a first slice and is retrying, which
+/// the reached seam says, and the key-wait seam stretches the retry past any delay of the case's.
+#[test]
+fn a_local_build_records_its_project_once_a_brief_holder_lets_the_work_folder_key_go() {
+    let case = built_here_case("routing-built-here-key-brief");
+    let (_, name) = key_lock(&case);
+    let mutex = NamedMutex::open(&name).expect("the key's mutex opens");
+    let held = mutex.acquire(Duration::from_secs(5)).expect("the key's mutex is free");
+    let reached = case.folder().join("key-reached");
+    let reached_arg = shown(&reached);
+
+    let build = case.start(&run_words(
+        "build.log",
+        &["--test-key-wait-ms", "600000", "--test-built-here-key-reached", &reached_arg],
+        &[r".\dotnet.cmd", "build", r"One\One.csproj"],
+    ));
+    // The skipped write's line ends the wait too, so a take that gave up fails the case at once.
+    build.wait_until("the take's first timed-out slice", || {
+        reached.exists() || fs::read_to_string(case.folder().join("build.log")).is_ok_and(|text| text.contains("built-here record not written"))
+    });
+    drop(held);
+    let build = build.finish();
+
+    assert_eq!(build.code, Some(0), "{build:?}");
+    assert_eq!(built_here(&case).as_deref(), Some(r#"{"v":1,"projects":{"one":{"seq":1}}}"#), "{build:?}");
+    assert!(!log_text(&case, "build.log").contains("built-here record not written"), "{build:?}");
+}
+
+/// The start of the line a passing build here says before it waits for the work folder's key to remove the
+/// outputs-from record.
+const KEY_WAIT_TO_REMOVE: &str = "gate: waiting for the work folder's key to remove ";
+
+/// Plants the case worktree's outputs-from record; its path.
+fn planted_outputs_from(case: &Case) -> PathBuf {
+    let outputs_from = built_here_path(case).with_extension("outputs-from");
+    fs::create_dir_all(outputs_from.parent().expect("the record has a folder")).expect("the record's folder can be made");
+    fs::write(&outputs_from, "builder").expect("the outputs-from record can be written");
+    outputs_from
+}
+
+/// The key stays held past both bounds, which the seam makes short, while a drain marker stands: the wait for the key
+/// still ends at its bound, and the outputs-from record is removed without the key.
+#[test]
+fn a_local_build_s_wait_for_a_held_key_ends_at_its_bound_with_a_drain_marker_standing_and_removes_outputs_from_without_it() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let case = built_here_case("routing-built-here-key-bound");
+    let outputs_from = planted_outputs_from(&case);
+    let marker = marker_folder(&case, None).join("1-0");
+    fs::create_dir_all(marker.parent().expect("the marker has a folder")).expect("the marker folder can be made");
+    let standing = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .share_mode(0)
+        .open(&marker)
+        .expect("the marker can be held");
+    let (_, name) = key_lock(&case);
+    let mutex = NamedMutex::open(&name).expect("the key's mutex opens");
+    let held = mutex.acquire(Duration::from_secs(5)).expect("the key's mutex is free");
+
+    let build = case.start(&run_words(
+        "build.log",
+        &["--test-key-wait-ms", "300"],
+        &[r".\dotnet.cmd", "build", r"One\One.csproj"],
+    ));
+    // A wait the marker holds off says so and goes on waiting: either line ends the case's wait.
+    build.wait_until("the wait for the key ending or being held off", || {
+        fs::read_to_string(case.folder().join("build.log"))
+            .is_ok_and(|text| text.contains("without the work folder's key") || text.contains("behind a builder drain"))
+    });
+    let held_off = fs::read_to_string(case.folder().join("build.log")).is_ok_and(|text| text.contains("behind a builder drain"));
+    drop(held);
+    drop(standing);
+    let build = build.finish();
+
+    assert!(!held_off, "the drain marker held the bound off: {build:?}");
+    let logged = log_text(&case, "build.log");
+    assert_eq!(build.code, Some(0), "{build:?}");
+    assert_eq!(built_here(&case), None, "{build:?}");
+    assert_eq!(logged.lines().filter(|line| line.contains(KEY_WAIT_TO_REMOVE)).count(), 1, "{logged}");
+    assert!(
+        logged
+            .lines()
+            .any(|line| line.contains("gate: removed ") && line.ends_with("outputs-from without the work folder's key: held for 300 ms")),
+        "{logged}"
+    );
+    assert!(!logged.contains("behind a builder drain"), "{logged}");
+    assert!(!build.stderr.contains(KEY_WAIT_TO_REMOVE), "said in the log only: {build:?}");
+    assert!(!outputs_from.exists(), "{build:?}");
+}
+
+/// One passing build of a project that removes the outputs-from record and adds the project to a standing nothing-back
+/// record waits for the held key once, for both.
+#[test]
+fn a_local_build_that_removes_outputs_from_and_adds_to_nothing_back_waits_for_the_held_key_once() {
+    let case = built_here_case("routing-built-here-key-once");
+    let outputs_from = planted_outputs_from(&case);
+    let record = built_here_path(&case).with_extension("nothing-back");
+    fs::write(&record, NOTHING_BACK_RECORD).expect("the nothing-back record can be written");
+    let (_, name) = key_lock(&case);
+    let mutex = NamedMutex::open(&name).expect("the key's mutex opens");
+    let held = mutex.acquire(Duration::from_secs(5)).expect("the key's mutex is free");
+    let waits = case.folder().join("key-waits");
+
+    let build = case.start(&run_words(
+        "build.log",
+        &["--test-key-waits", &shown(&waits)],
+        &[r".\dotnet.cmd", "build", r"One\One.csproj"],
+    ));
+    build.wait_until("the wait for the key", || {
+        fs::read_to_string(case.folder().join("build.log")).is_ok_and(|text| text.contains(KEY_WAIT_TO_REMOVE))
+    });
+    drop(held);
+    let build = build.finish();
+
+    let logged = log_text(&case, "build.log");
+    assert_eq!(build.code, Some(0), "{build:?}");
+    assert_eq!(logged.lines().filter(|line| line.contains(KEY_WAIT_TO_REMOVE)).count(), 1, "{logged}");
+    assert_eq!(
+        fs::read_to_string(&waits).ok().as_deref(),
+        Some("wait\n"),
+        "the key is waited for once: {logged}"
+    );
+    assert_eq!(
+        fs::read_to_string(&record).ok().as_deref(),
+        Some(r#"{"v":1,"host":"builder","built":["one"]}"#),
+        "{build:?}"
+    );
+    assert!(!outputs_from.exists(), "{build:?}");
+    assert!(!logged.contains("without the work folder's key"), "{logged}");
+}
+
+/// A routed `--no-build` run whose word the route drops builds on the builder, so it removes the record: the next
+/// routed `--no-build` run of a project built here earlier plans no send.
+#[test]
+fn a_routed_no_build_run_whose_word_is_dropped_removes_the_built_here_record() {
+    let case = built_here_case("routing-built-here-dropped-clears");
+
+    let build = finish(case.gate(&run_words("build.log", &[], &[r".\dotnet.cmd", "build", "One"])));
+    let recorded_here = built_here(&case);
+    let steps = shown(&stub(&case, &["status 0"]));
+    let other = finish(case.gate(&routed_words("other.log", &steps, &[], &[r".\dotnet.cmd", "test", "Two", "--no-build"])));
+    let after_other = built_here(&case);
+    let steps = shown(&stub(&case, &["status 0"]));
+    let again = finish(case.gate(&routed_words("again.log", &steps, &[], &[r".\dotnet.cmd", "test", "One", "--no-build"])));
+
+    assert_eq!([build.code, other.code, again.code], [Some(0); 3], "{build:?} {other:?} {again:?}");
+    assert!(recorded_here.is_some(), "{build:?}");
+    assert!(other.stderr.contains(DROPPED_NO_BUILD_LINE), "{other:?}");
+    assert_eq!(after_other, None, "the builder built: {other:?}");
+    assert!(again.stderr.contains(DROPPED_NO_BUILD_LINE), "no send planned: {again:?}");
+    assert!(!again.stderr.contains(DROPPED_UNSENT_LINE), "{again:?}");
+}
+
+/// A routed run that would build on the builder while its built-here record cannot be removed, held open without delete
+/// sharing, is not sent: it falls back here `inputs`, saying why first, and the builder is never called.
+#[test]
+fn a_routed_build_whose_built_here_record_cannot_be_removed_falls_back_here() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let case = built_here_case("routing-built-here-clear-fails");
+    seed_built_here(&case, r#"{"v":1,"projects":{"two":{}}}"#);
+    let open = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ_WRITE)
+        .open(built_here_path(&case))
+        .expect("the record can be held");
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let routed = case.start(&routed_words("routed.log", &steps, &[], &[r".\dotnet.cmd", "test", "One", "--no-build"]));
+    let pid = routed.id();
+    let routed = routed.finish();
+    drop(open);
+
+    let not_sent = "gate: remote build not sent: cannot remove the built-here record: ";
+    assert_eq!(routed.code, Some(0), "{routed:?}");
+    let said: Vec<&str> = routed.stderr.lines().collect();
+    let first = said.iter().position(|line| line.starts_with(not_sent));
+    let then = said
+        .iter()
+        .position(|line| line.starts_with("gate: remote ") && line.ends_with(" inputs; running here"));
+    assert!(matches!((first, then), (Some(first), Some(then)) if first < then), "{routed:?}");
+    assert!(!call.exists(), "the builder is never called: {routed:?}");
+    assert!(built_here(&case).is_some(), "{routed:?}");
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "fallback", "take", "release"], "{own:#?}");
+    assert_eq!(own[1]["reason"], "inputs", "{own:#?}");
+}
+
+/// The sharing of a handle that lets others read and write a file but not delete it.
+const FILE_SHARE_READ_WRITE: u32 = 0x1 | 0x2;
+
+/// A `--no-build` test of a solution keeps its word, here or routed, only when each project the solution lists has an
+/// entry; with one of them missing it drops the word.
+#[test]
+fn a_no_build_test_of_a_solution_keeps_the_word_only_when_every_project_it_lists_was_built_here() {
+    let case = built_here_case("routing-built-here-solution");
+    fs::write(case.folder().join("App.sln"), APP_SLN).expect("the solution can be written");
+    let record = built_here_path(&case).with_extension("nothing-back");
+    fs::create_dir_all(record.parent().expect("the record has a folder")).expect("the record's folder can be made");
+    fs::write(&record, NOTHING_BACK_RECORD).expect("the nothing-back record can be written");
+    let command = [r".\dotnet.cmd", "test", "App.sln", "--no-build"];
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let some = r#"{"v":1,"projects":{"one":{}}}"#;
+
+    seed_built_here(&case, some);
+    let some_here = finish(case.gate(&run_words("some-here.log", &[], &command)));
+    seed_built_here(&case, some);
+    let some_routed = finish(case.gate(&routed_words("some-routed.log", &steps, &[], &command)));
+    let some_routed_call = recorded(&call);
+    fs::remove_file(&call).expect("the recorded call can be removed");
+    seed_built_here(&case, r#"{"v":1,"projects":{"one":{},"two":{}}}"#);
+    let all_here = finish(case.gate(&run_words("all-here.log", &[], &command)));
+    let all_routed = finish(case.gate(&routed_words("all-routed.log", &steps, &[], &command)));
+
+    let codes = [some_here.code, some_routed.code, all_here.code, all_routed.code];
+    assert_eq!(codes, [Some(0); 4], "{some_here:?} {some_routed:?} {all_here:?} {all_routed:?}");
+    assert!(some_here.stderr.contains(DROPPED), "{some_here:?}");
+    assert_eq!(command_lines(&some_here.stdout), ["test App.sln"], "{some_here:?}");
+    assert!(some_routed.stderr.contains(DROPPED_NO_BUILD_LINE), "{some_routed:?}");
+    assert!(!recorded_words(&some_routed_call).contains(&"--no-build"), "{some_routed_call}");
+    assert!(!all_here.stderr.contains(DROPPED), "{all_here:?}");
+    assert_eq!(command_lines(&all_here.stdout), ["test App.sln --no-build"], "{all_here:?}");
+    assert!(
+        all_routed
+            .stderr
+            .contains("gate: not routed: the last build of App.sln ran here; --no-build kept"),
+        "{all_routed:?}"
+    );
+    assert!(!call.exists(), "the builder is never called: {all_routed:?}");
+    assert_eq!(command_lines(&all_routed.stdout), ["test App.sln --no-build"], "{all_routed:?}");
+}
+
+/// A local build naming nothing in a folder holding one project records that project, so a routed `dotnet run
+/// --no-build` there plans the send of the PC's build, which the scripted client never makes.
+#[test]
+fn a_routed_no_build_run_in_a_one_project_folder_built_here_plans_the_send() {
+    let case = built_here_case("routing-built-here-folder");
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+
+    let build = finish(case.gate_in("One", &run_words("build.log", &[], &[r"..\dotnet.cmd", "build"])));
+    let recorded_here = built_here(&case);
+    let sent = finish(case.gate_in("One", &routed_words("sent.log", &steps, &[], &[r"..\dotnet.cmd", "run", "--no-build"])));
+
+    assert_eq!((build.code, sent.code), (Some(0), Some(0)), "{build:?} {sent:?}");
+    assert_eq!(recorded_here.as_deref(), Some(r#"{"v":1,"projects":{"one":{"seq":1}}}"#), "{build:?}");
+    assert!(!sent.stderr.contains("gate: not routed"), "{sent:?}");
+    assert!(sent.stderr.contains(DROPPED_UNSENT_LINE), "a send was planned: {sent:?}");
+    assert!(!sent.stderr.contains(DROPPED_NO_BUILD_LINE), "{sent:?}");
+}
+
+/// A routed `dotnet test --no-build` naming no project, in a folder holding one project built here, plans the send of
+/// that project, as a `dotnet run` there does, and does not run here.
+#[test]
+fn a_routed_no_build_test_in_a_one_project_folder_built_here_plans_the_send() {
+    let case = built_here_case("routing-built-here-folder-test");
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+
+    let build = finish(case.gate_in("One", &run_words("build.log", &[], &[r"..\dotnet.cmd", "build"])));
+    let sent = finish(case.gate_in("One", &routed_words("sent.log", &steps, &[], &[r"..\dotnet.cmd", "test", "--no-build"])));
+
+    assert_eq!((build.code, sent.code), (Some(0), Some(0)), "{build:?} {sent:?}");
+    assert!(!sent.stderr.contains("gate: not routed"), "{sent:?}");
+    assert!(sent.stderr.contains(DROPPED_UNSENT_LINE), "a send was planned: {sent:?}");
+    assert!(call.exists(), "the builder runs it: {sent:?}");
+}
+
+/// A repo the routing file's `sendBuild` lists reads the built-here record too: its `dotnet run --no-build`, which the
+/// listed rule sends nothing of, plans the send of the PC's build after a build of its project here.
+#[test]
+fn a_listed_repo_s_no_build_run_built_here_plans_the_send() {
+    let case = built_here_case("routing-built-here-listed");
+    let routing = json!({
+        "host": HOST,
+        "repos": { repo(&case): ["*tool*", "*dotnet.exe*", "*dotnet.cmd*"] },
+        "sendBuild": [repo(&case)],
+    });
+    write_remote_json(&case, &routing.to_string());
+    let steps = shown(&stub(&case, &["status 0"]));
+
+    let build = finish(case.gate(&run_words("build.log", &[], &[r".\dotnet.cmd", "build", "One"])));
+    let sent = finish(case.gate(&routed_words(
+        "sent.log",
+        &steps,
+        &[],
+        &[r".\dotnet.cmd", "run", "--project", "One", "--no-build"],
+    )));
+
+    assert_eq!((build.code, sent.code), (Some(0), Some(0)), "{build:?} {sent:?}");
+    assert!(sent.stderr.contains(DROPPED_UNSENT_LINE), "a send was planned: {sent:?}");
+    assert!(!sent.stderr.contains(DROPPED_NO_BUILD_LINE), "{sent:?}");
+}
+
+/// A `dotnet run --no-build` in a folder holding only a solution, whose projects were built here, gets no built-here
+/// line: `dotnet run` takes no solution, so the record says nothing of it and the word is dropped.
+#[test]
+fn a_routed_no_build_run_in_a_folder_of_one_solution_reads_no_built_here_entry() {
+    let case = built_here_case("routing-built-here-run-solution");
+    fs::write(case.folder().join("App.sln"), APP_SLN).expect("the solution can be written");
+    seed_built_here(&case, r#"{"v":1,"projects":{"one":{},"two":{}}}"#);
+    let steps = shown(&stub(&case, &["status 0"]));
+
+    let routed = finish(case.gate(&routed_words("routed.log", &steps, &[], &[r".\dotnet.cmd", "run", "--no-build"])));
+
+    assert_eq!(routed.code, Some(0), "{routed:?}");
+    assert!(!routed.stderr.contains("the last build of App.sln"), "{routed:?}");
+    assert!(routed.stderr.contains(DROPPED_NO_BUILD_LINE), "{routed:?}");
+}
+
+#[test]
+fn a_failing_local_build_records_nothing() {
+    let case = built_here_case("routing-built-here-failed");
+    // The stand-in dotnet fails a command whose second word is `bad`, here the folder of a project.
+    tracked_project(&case, "bad/Bad.csproj", true);
+
+    let failed = finish(case.gate(&run_words("failed.log", &[], &[r".\dotnet.cmd", "build", "bad"])));
+
+    assert_eq!(failed.code, Some(1), "{failed:?}");
+    assert_eq!(built_here(&case), None, "{failed:?}");
+}
+
+#[test]
+fn an_out_of_place_local_build_records_nothing() {
+    let case = built_here_case("routing-built-here-out-of-place");
+    seed_built_here(&case, r#"{"v":1,"projects":{"two":{}}}"#);
+
+    let build = finish(case.gate(&run_words("build.log", &[], &[r".\dotnet.cmd", "build", "One", "-o", "out"])));
+
+    assert_eq!(build.code, Some(0), "{build:?}");
+    assert_eq!(
+        built_here(&case).as_deref(),
+        Some(r#"{"v":1,"projects":{"two":{}}}"#),
+        "an out-of-place build leaves the entries as they are: {build:?}"
+    );
+}
+
+#[test]
+fn a_routed_build_of_one_project_removes_the_whole_built_here_record() {
+    let case = built_here_case("routing-built-here-cleared");
+    seed_built_here(&case, r#"{"v":1,"projects":{"one":{},"two":{"configuration":"Release"}}}"#);
+
+    let steps = shown(&stub(&case, &["status 0"]));
+    let project = finish(case.gate(&routed_words("project.log", &steps, &[], &[r".\dotnet.exe", "build", r"One\One.csproj"])));
+
+    assert_eq!(project.code, Some(0), "{project:?}");
+    assert_eq!(
+        built_here(&case),
+        None,
+        "the builder may build and bring back the projects One references: {project:?}"
+    );
+}
+
+/// The line a routed `--no-build` run of the project `One` says as it runs here after a build of it here.
+const BUILT_HERE_ONE_LINE: &str = "gate: not routed: the last build of one ran here; --no-build kept";
+
+/// After a local build of `One`, a routed `--no-build` run of it plans the send of the PC's build, which the scripted
+/// client never makes, so it takes the drop saying the build could not be sent; one whose words the send cannot take
+/// runs here and keeps the word.
+#[test]
+fn a_routed_no_build_run_after_a_local_build_plans_the_send_or_runs_here_when_it_cannot() {
+    let case = built_here_case("routing-built-here-kept");
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+
+    let build = finish(case.gate(&run_words("build.log", &[], &[r".\dotnet.cmd", "build", "One"])));
+    let sent = finish(case.gate(&routed_words(
+        "sent.log",
+        &steps,
+        &[],
+        &[r".\dotnet.cmd", "run", "--project", "One", "--no-build"],
+    )));
+
+    assert_eq!((build.code, sent.code), (Some(0), Some(0)), "{build:?} {sent:?}");
+    assert!(!sent.stderr.contains("gate: not routed"), "{sent:?}");
+    assert!(sent.stderr.contains(DROPPED_UNSENT_LINE), "{sent:?}");
+    assert!(!sent.stderr.contains(DROPPED_NO_BUILD_LINE), "{sent:?}");
+    let recorded_call = recorded(&call);
+    assert!(!recorded_words(&recorded_call).contains(&"--no-build"), "{recorded_call}");
+
+    fs::remove_file(&call).expect("the recorded call can be removed");
+    // The drop removed One's entry, as the builder built: a build here records it again.
+    let rebuilt = finish(case.gate(&run_words("rebuilt.log", &[], &[r".\dotnet.cmd", "build", "One"])));
+    assert_eq!(rebuilt.code, Some(0), "{rebuilt:?}");
+    let kept = finish(case.gate(&routed_words(
+        "kept.log",
+        &steps,
+        &[],
+        &[r".\dotnet.cmd", "run", "--project", "One", "--no-build", "-o", "out"],
+    )));
+
+    assert_eq!(kept.code, Some(0), "{kept:?}");
+    assert!(kept.stderr.contains(BUILT_HERE_ONE_LINE), "{kept:?}");
+    assert!(!kept.stderr.contains(DROPPED), "{kept:?}");
+    assert!(!call.exists(), "the builder is never called: {kept:?}");
+    assert_eq!(command_lines(&kept.stdout), ["run --project One --no-build -o out"], "{kept:?}");
+}
+
+#[test]
+fn a_no_build_run_whose_settings_differ_from_the_local_build_routes() {
+    let case = built_here_case("routing-built-here-other-settings");
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+
+    let build = finish(case.gate(&run_words("build.log", &[], &[r".\dotnet.cmd", "build", "One", "-c", "Debug"])));
+    let routed = finish(case.gate(&routed_words(
+        "routed.log",
+        &steps,
+        &[],
+        &[r".\dotnet.cmd", "run", "--project", "One", "-c", "Release", "--no-build"],
+    )));
+
+    assert_eq!((build.code, routed.code), (Some(0), Some(0)), "{build:?} {routed:?}");
+    assert!(!routed.stderr.contains("gate: not routed"), "{routed:?}");
+    assert!(routed.stderr.contains(DROPPED_NO_BUILD_LINE), "{routed:?}");
+    let call = recorded(&call);
+    assert!(!recorded_words(&call).contains(&"--no-build"), "{call}");
+}
+
+#[test]
+fn a_local_flag_run_after_a_local_build_keeps_the_word_despite_a_nothing_back_record() {
+    let case = built_here_case("routing-built-here-local-flag");
+    let nothing_back_path = built_here_path(&case).with_extension("nothing-back");
+    fs::create_dir_all(nothing_back_path.parent().expect("the record has a folder")).expect("the record's folder can be made");
+    fs::write(&nothing_back_path, NOTHING_BACK_RECORD).expect("the record can be written");
+    seed_built_here(&case, r#"{"v":1,"projects":{"one":{}}}"#);
+
+    let local = ["--local", LOCAL_REASON[0], LOCAL_REASON[1]];
+    let kept = finish(case.gate(&heavy_words_with_limit(
+        "local.log",
+        &local,
+        &[r".\dotnet.cmd", "run", "--project", "One", "--no-build"],
+    )));
+    let dropped = finish(case.gate(&heavy_words_with_limit(
+        "dropped.log",
+        &local,
+        &[r".\dotnet.cmd", "run", "--project", "Two", "--no-build"],
+    )));
+
+    assert_eq!((kept.code, dropped.code), (Some(0), Some(0)), "{kept:?} {dropped:?}");
+    assert!(!kept.stderr.contains(DROPPED), "{kept:?}");
+    assert_eq!(command_lines(&kept.stdout), ["run --project One --no-build"], "{kept:?}");
+    assert!(
+        dropped.stderr.contains(NOTHING_BACK_LINE),
+        "a project with no entry drops as today: {dropped:?}"
+    );
+}
+
 #[test]
 fn a_failed_or_killed_routed_build_leaves_a_record() {
     let case = routed_case("routing-nothing-back-failed");
@@ -3001,6 +3575,10 @@ fn a_record_naming_no_usable_builder_or_that_cannot_be_read_names_the_builder() 
     let path = record_path(&case).expect("the case has a record");
     let unusable = finish(case.gate(&run_words("unusable.log", &[], &NO_BUILD_TEST)));
     assert_eq!(nothing_back(&case), None, "the passing dropped test cleared the record: {unusable:?}");
+    // A built-here entry the passing test wrote would keep the next word; at a root with no project it writes none.
+    if let Err(error) = fs::remove_file(built_here_path(&case)) {
+        assert_eq!(error.kind(), io::ErrorKind::NotFound, "the built-here record cannot be removed: {error}");
+    }
     fs::create_dir(&path).expect("a folder stands where the record would");
     let unreadable = finish(case.gate(&run_words("unreadable.log", &[], &NO_BUILD_TEST)));
 
@@ -3110,13 +3688,23 @@ fn a_named_project_or_solution_alone_is_checked_for_its_assets_file() {
 
     let project = run("project.log", &[r".\dotnet.cmd", "test", "lib/Lib.csproj", "--no-build"]);
     let solution = run("solution.log", &[r".\dotnet.cmd", "test", "Lib.sln", "--no-build"]);
+    // A passing dropped test builds in place and writes a built-here entry, which would keep the next run's word: each
+    // run sees no built-here record.
+    let forget_built_here = || {
+        if let Err(error) = fs::remove_file(built_here_path(&case)) {
+            assert_eq!(error.kind(), io::ErrorKind::NotFound, "the built-here record cannot be removed: {error}");
+        }
+    };
+    forget_built_here();
     let unrestored = run("unrestored.log", &[r".\dotnet.cmd", "test", "App.sln", "--no-build"]);
     assert!(
         unrestored.stderr.contains(line),
         "a solution listing an unrestored project drops it: {unrestored:?}"
     );
     assert_eq!(command_lines(&unrestored.stdout), ["test App.sln"], "{unrestored:?}");
+    forget_built_here();
     let named = run("named.log", &[r".\dotnet.cmd", "test", "app/App.csproj", "--no-build"]);
+    forget_built_here();
     let whole = run("whole.log", &NO_BUILD_TEST);
 
     assert!(!project.stderr.contains(DROPPED), "only the named project is checked: {project:?}");
@@ -4923,8 +5511,10 @@ fn a_key_wait_is_held_off_by_a_marker_of_another_builder() {
     );
 }
 
+/// A finished build's wait for the held key to add to the nothing-back record ends at its bound although a drain
+/// marker stands: the add is missed, said, and the record stands as it was, the conservative direction.
 #[test]
-fn a_finished_run_s_key_wait_held_by_a_marker_says_so() {
+fn a_finished_run_s_wait_to_add_to_nothing_back_ends_at_its_bound_with_a_drain_marker_standing() {
     let case = project_case("routing-nothing-back-key-marker");
     let path = record_path(&case).expect("the case has a record");
     let key = path.file_stem().expect("the record has a name").to_string_lossy().into_owned();
@@ -4933,20 +5523,26 @@ fn a_finished_run_s_key_wait_held_by_a_marker_says_so() {
     let held = mutex.acquire(Duration::from_secs(5)).expect("the key's mutex is free");
     let marker = hold_marker(&case, None);
 
-    let mut build = case.start(&run_words(
+    let build = case.start(&run_words(
         "build.log",
         &["--test-key-wait-ms", "200"],
         &[r".\dotnet.cmd", "build", "One", "-c", "Release"],
     ));
-    build.wait_for_stderr_while_running("the record's key wait past its bound", |said| said.contains(KEY_HELD_OFF));
-    drop(held);
     let build = build.finish();
+    drop(held);
     drop(marker);
 
     assert_eq!(build.code, Some(0), "{build:?}");
-    assert!(has_line_once(&build.stderr, KEY_HELD_OFF), "said once: {build:?}");
-    assert!(!build.stderr.contains("gate: cannot add to "), "{build:?}");
-    assert_ne!(nothing_back(&case).as_deref(), Some(RELEASE_RECORD), "the build was added: {build:?}");
+    assert!(
+        build
+            .stderr
+            .lines()
+            .any(|line| line.starts_with("gate: cannot add to ") && line.ends_with(".nothing-back: held for 200 ms")),
+        "{build:?}"
+    );
+    assert!(!build.stderr.contains(KEY_HELD_OFF), "{build:?}");
+    assert!(!log_text(&case, "build.log").contains("behind a builder drain"), "{build:?}");
+    assert_eq!(nothing_back(&case).as_deref(), Some(RELEASE_RECORD), "the add was missed: {build:?}");
 }
 
 #[test]

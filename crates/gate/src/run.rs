@@ -99,8 +99,44 @@ const HINT_MIN_WALL: Duration = Duration::from_secs(10);
 /// The unpaused wall time under which a passed light run is too short to ask whether its command would route on heavy.
 const ROUTE_HINT_MIN_WALL: Duration = Duration::from_secs(30);
 /// How long a routed run waits for its worktree's work folder while another of its runs holds it, before it falls back
-/// here as `busy` ([`Run::take_key`]).
+/// here as `busy` ([`Run::take_key`]); also the bound of a finished local build's one waiting take of the key, which no
+/// drain marker holds off ([`KeyTake::Bounded`]).
 const KEY_WAIT: Duration = Duration::from_secs(90);
+/// How long a passing build here retries the work folder's key to write its built-here record, as another write here
+/// holds it for milliseconds ([`Run::try_folder_key`]).
+const BRIEF_KEY_WAIT: Duration = Duration::from_secs(2);
+
+/// How long [`Run::try_folder_key`] waits for the work folder's key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyTake {
+    /// [`BRIEF_KEY_WAIT`], for a built-here write.
+    Brief,
+    /// [`KEY_WAIT`], bounded hard: a live drain marker does not hold it off.
+    Bounded,
+    /// [`KEY_WAIT`], which a live drain marker of any builder holds off.
+    HeldOff,
+}
+
+/// Why [`Run::try_folder_key`] did not take the work folder's key.
+enum Untaken {
+    /// Another holder kept it for the whole bound, this long.
+    Held(Duration),
+    /// A Ctrl+C ended the take.
+    Interrupted,
+    /// The lock could not be opened or taken, or the drain markers probed: the line's text.
+    Failed(String),
+}
+
+impl Untaken {
+    /// Why, as a log line's end says it: `held for {ms} ms`, `interrupted`, or the failure's text.
+    fn why(self) -> String {
+        match self {
+            Untaken::Held(bound) => format!("held for {} ms", bound.as_millis()),
+            Untaken::Interrupted => "interrupted".to_owned(),
+            Untaken::Failed(why) => why,
+        }
+    }
+}
 
 /// Runs `request`'s command, logging to `log` (absolute) under `root`, routing a heavy one by `environment`'s routing
 /// file and git hook, saying each line as it goes; returns the gate's exit status.
@@ -1624,7 +1660,7 @@ impl Run<'_> {
             placed: place,
             warm_hash,
             decision,
-        } = route::route(self.request, environment, covering, console);
+        } = route::route(self.request, environment, covering, &self.root.path, console);
         self.warm_hash = warm_hash;
         self.would = Some(decision);
         self.tag = match &route {
@@ -1980,8 +2016,9 @@ impl Run<'_> {
     }
 
     /// The attempts of [`Run::routed`], and the reason of the last builder's fallback when a builder's attempt fell back,
-    /// a walk over the later builders a Ctrl+C ended after it included; `None` when the run fell back before any
-    /// attempt, or an attempt ended it.
+    /// a walk over the later builders a Ctrl+C ended after it included, and `inputs` for a built-here record that cannot
+    /// be removed before an attempt ([`Run::clear_built_here`]); `None` when the run fell back before any attempt for
+    /// another reason, or an attempt ended it.
     fn try_builders(&mut self, remote: &RemoteRun, hold: &mut Hold, console: &mut Console) -> (Remotely, Option<FallbackReason>) {
         // Nothing is held until an attempt takes a remote slot: a pinned run that ends before then counts no time held,
         // and a run that falls back here sets it again at its local take.
@@ -2005,6 +2042,13 @@ impl Run<'_> {
         let mut later: Option<Box<RemoteRun>> = None;
         loop {
             let current = later.as_deref().unwrap_or(remote);
+            // Before each attempt, whose builder may plan another drop, so a run killed on the builder leaves its
+            // entries cleared. A record that cannot be removed would outlast the build there: the run falls back here.
+            if let Err(line) = self.clear_built_here(current) {
+                console.err(&line);
+                let reason = FallbackReason::Inputs;
+                return (self.fell_back(reason, &RemoteOutcome::not_started(line), console), Some(reason));
+            }
             let refusal = match self.attempt(current, hold, (&mut waited, &session), console) {
                 Attempt::Done(remotely) => return (remotely, None),
                 Attempt::Refused(refusal) => refusal,
@@ -2709,13 +2753,18 @@ impl Run<'_> {
         dropped_line(reason, parent, matches!(self.nesting, Nesting::InBox), self.request.slot)
     }
 
-    /// Why a dotnet `--no-build` run of `words` in the worktree at `root` drops the word, `None` when it keeps it: the
-    /// worktree has a nothing-back record that does not list the project the words name as built here
+    /// Why a dotnet `--no-build` run of `words` in the worktree at `root` drops the word, `None` when it keeps it: kept
+    /// when the worktree's built-here record says the last build of what the words build ran here under their settings
+    /// ([`no_build::last_build_ran_here`], the rule a routed run is kept here by); else dropped when the worktree has a
+    /// nothing-back record that does not list the project the words name as built here
     /// ([`no_build::named_project_key`]) under the configuration, framework and runtime the words set
     /// ([`BuildSettings::same_as`]), or a project it builds has no `obj\project.assets.json`
     /// ([`Run::without_assets`]), asked only without such a record ([`no_build::drop_reason`]). A record that cannot be
     /// read counts as there, said.
     fn no_build_reason(&self, root: &str, words: &[String], console: &mut Console) -> Option<String> {
+        if no_build::last_build_ran_here(&self.root.path, root, words).is_some() {
+            return None;
+        }
         let path = v1::nothing_back_path(&self.root.path, &work_folder_key(root));
         let record = no_build::read_record(&path).unwrap_or_else(|error| {
             console.err(&format!("gate: cannot read {}: {error}", path.display()));
@@ -2769,18 +2818,27 @@ impl Run<'_> {
         }
     }
 
-    /// Updates the worktree's nothing-back record after a run here that passed, once its slot is released: a dotnet
-    /// build of the whole worktree clears it ([`Run::clear_nothing_back`]), and a build of one project adds that project
-    /// to the record's `built` list ([`Run::record_change`], [`no_build::add_built`]). A key that cannot be added is
-    /// said.
-    fn settle_nothing_back(&self, here: HereWords, console: &mut Console) {
+    /// Updates the worktree's built-here and nothing-back records after a run here that passed, once its slot is
+    /// released: a dotnet build in place writes the built-here entries of the projects it built
+    /// ([`Run::built_here_entry`], [`Run::record_built_here`]); a dotnet build of the whole worktree clears the
+    /// nothing-back record ([`Run::clear_nothing_back`]), and a build of one project adds that project to the record's
+    /// `built` list ([`Run::record_change`], [`no_build::add_built`]) under the key lock the built-here write took,
+    /// never waiting for it a second time. A key that cannot be added is said.
+    fn settle_nothing_back(&self, mut here: HereWords, console: &mut Console) {
         let settings = build_settings(&here.words);
+        let mut taken = None;
+        if let Some((folder, projects)) = self.built_here_entry(&mut here, console) {
+            taken = Some((self.record_built_here(&folder, &projects, &settings, console), folder));
+        }
         match self.record_change(here, console) {
             Some(RecordChange::Clear(path)) => remove_record(&path, console),
             Some(RecordChange::Add { path, folder, project }) => {
                 // The key lock a routed run writes the record under, so a fresh record it writes meanwhile is kept.
-                let added = self
-                    .hold_folder_key(&folder, console)
+                let held = match taken {
+                    Some((held, taken_folder)) if taken_folder == folder => held,
+                    _ => self.hold_folder_key(&folder, console),
+                };
+                let added = held
                     .map_err(|reason| format!("gate: cannot add to {}: {reason}", path.display()))
                     .and_then(|_held| no_build::add_built(&path, &project, &settings));
                 if let Err(line) = added {
@@ -2791,50 +2849,179 @@ impl Run<'_> {
         }
     }
 
+    /// The work-folder key and the built-here entries ([`v1::built_here_path`]) a passing run here of `here`'s words
+    /// writes: for an SDK dotnet build other than `msbuild` ([`sdk_build_target`]) that builds in place
+    /// ([`builds_in_place`]), the keys of the projects inside the worktree it builds ([`no_build::built_projects`]).
+    /// `here`'s worktree is looked up when it has none and the words may have an entry, git that cannot be found or
+    /// started counting as none, unsaid, and kept for the nothing-back record's update. `None` for any other words.
+    fn built_here_entry(&self, here: &mut HereWords, console: &mut Console) -> Option<(String, Vec<String>)> {
+        let target = sdk_build_target(&here.words).filter(|_| builds_in_place(&here.words))?;
+        if target == BuildTarget::Other && !no_build::names_project(&here.words) {
+            return None;
+        }
+        if here.worktree.is_none() {
+            here.worktree = self.worktree(true, console);
+        }
+        let worktree = here.worktree.as_ref()?;
+        let (_, projects) = no_build::built_projects(&here.words, Path::new(&worktree.root))?;
+        Some((work_folder_key(&worktree.root), projects))
+    }
+
+    /// Writes the entries of `projects` under `settings` into the built-here record of the work-folder key `folder`
+    /// ([`no_build::record_built_here`]) and removes its outputs-from record ([`v1::outputs_from_path`]), since the PC's
+    /// outputs no longer are what a builder last sent, both under the key lock a routed run of the worktree holds. The
+    /// lock is taken with a brief retry ([`KeyTake::Brief`]), as a local write holds it for milliseconds: a lock still
+    /// held after it writes no entry, saying so in the log, and is then taken once more with a wait bounded hard at the
+    /// key-wait bound ([`KeyTake::Bounded`]), said in the log first, for the outputs-from record alone, which a routed
+    /// run's pull writes under that lock. A lock not taken either way, for any reason, still removes the outputs-from
+    /// record, without it, saying so in the log. A record trimmed to fit its cap is said in the log; a record that
+    /// cannot be written or removed, or a lock that cannot be opened or taken, is said.
+    ///
+    /// # Errors
+    ///
+    /// Why the lock is not held, so the caller does not wait for it again.
+    fn record_built_here(
+        &self,
+        folder: &str,
+        projects: &[String],
+        settings: &BuildSettings,
+        console: &mut Console,
+    ) -> Result<OwnedMutexGuard, String> {
+        let path = v1::built_here_path(&self.root.path, folder);
+        let outputs_from = v1::outputs_from_path(&self.root.path, folder);
+        let taken = match self.try_folder_key(folder, KeyTake::Brief, console) {
+            Ok(held) => {
+                match no_build::record_built_here(&path, projects, settings) {
+                    Ok(Some(left)) => console.note(&format!("gate: built-here record trimmed to {left} entries")),
+                    Ok(None) => {}
+                    Err(line) => console.err(&line),
+                }
+                Ok(held)
+            }
+            Err(Untaken::Held(_)) => {
+                console.note(&format!("gate: built-here record not written: work folder {folder} is held"));
+                console.note(&format!("gate: waiting for the work folder's key to remove {}", outputs_from.display()));
+                self.try_folder_key(folder, KeyTake::Bounded, console).map_err(Untaken::why)
+            }
+            Err(untaken) => {
+                let why = untaken.why();
+                console.err(&format!("gate: cannot write {}: {why}", path.display()));
+                Err(why)
+            }
+        };
+        remove_record(&outputs_from, console);
+        if let Err(why) = &taken {
+            console.note(&format!("gate: removed {} without the work folder's key: {why}", outputs_from.display()));
+        }
+        taken
+    }
+
+    /// Removes the built-here record of the routed run `remote`'s work-folder key before its attempt, under the key lock
+    /// the caller holds, when its words as sent build: its command as given is a dotnet build of any target
+    /// ([`dotnet_builds`]), or the route dropped its `--no-build` with no send planned, since the builder may build the
+    /// projects it references too and bring their outputs back ([`no_build::clear_built_here`]). A send that does not
+    /// land and runs the dropped words removes it in the client ([`remote::client`]).
+    ///
+    /// # Errors
+    ///
+    /// The line saying the record cannot be removed, so the attempt is not sent.
+    fn clear_built_here(&self, remote: &RemoteRun) -> Result<(), String> {
+        let dropped = remote.dropped_no_build && remote.send.is_none();
+        if !dropped && !unicode_words(&self.request.command).is_some_and(|words| dotnet_builds(&words)) {
+            return Ok(());
+        }
+        no_build::clear_built_here(&v1::built_here_path(&self.root.path, &remote.key))
+    }
+
     /// Holds the lock of the work-folder key `folder`, the one a routed run of the worktree holds while it writes the
-    /// worktree's nothing-back record ([`Run::take_key`]), waiting for another holder up to the run's key-wait bound in
-    /// slices, between which a Ctrl+C ends the wait. A live drain marker of any builder holds the bound off, said once;
-    /// an entry the marker probe skips is noted in the log once through `console`.
+    /// worktree's nothing-back record ([`Run::take_key`]), waiting for another holder up to the run's key-wait bound,
+    /// which a live drain marker holds off ([`KeyTake::HeldOff`]).
     ///
     /// # Errors
     ///
     /// Why the lock is not held: it cannot be opened or taken, another run held it for the whole bound, or a Ctrl+C
     /// ended the wait.
     fn hold_folder_key(&self, folder: &str, console: &mut Console) -> Result<OwnedMutexGuard, String> {
+        self.try_folder_key(folder, KeyTake::HeldOff, console).map_err(|untaken| match untaken {
+            Untaken::Held(bound) => format!("another run of the worktree held the work folder's key for {} ms", bound.as_millis()),
+            Untaken::Interrupted => "Ctrl+C ended the wait for the work folder's key".to_owned(),
+            Untaken::Failed(why) => why,
+        })
+    }
+
+    /// Appends one line to the key-waits test seam's file, when it is set, for a take of the work folder's key that
+    /// waits ([`KeyTake::Bounded`], [`KeyTake::HeldOff`]); a file that cannot be written is said.
+    fn count_key_wait(&self, console: &mut Console) {
+        let Some(path) = self.request.test_seams.key_waits.as_deref() else {
+            return;
+        };
+        let appended = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut file| io::Write::write_all(&mut file, b"wait\n"));
+        if let Err(error) = appended {
+            console.err(&format!("gate: cannot write {}: {error}", path.display()));
+        }
+    }
+
+    /// Takes the lock of the work-folder key `folder` in slices, between which a Ctrl+C ends the take, for up to the
+    /// bound `wait` sets ([`KeyTake`]); past a [`KeyTake::HeldOff`] bound, a live drain marker of any builder holds the
+    /// bound off, said once, an entry the marker probe skips noted in the log once through `console`. The key-wait test
+    /// seam sets every bound.
+    ///
+    /// # Errors
+    ///
+    /// Why the lock is not held ([`Untaken`]).
+    fn try_folder_key(&self, folder: &str, wait: KeyTake, console: &mut Console) -> Result<OwnedMutexGuard, Untaken> {
         let name = self.root.root.object_name(KernelObject::Routed { hash: key_hash(folder) });
-        let bound = self.request.test_seams.key_wait_ms.map_or(KEY_WAIT, Duration::from_millis);
+        let unseamed = if wait == KeyTake::Brief { BRIEF_KEY_WAIT } else { KEY_WAIT };
+        let bound = self.request.test_seams.key_wait_ms.map_or(unseamed, Duration::from_millis);
         let begun = Instant::now();
         let mut said = drain::ProbeSaid::default();
         let mut past_bound_said = false;
+        if wait != KeyTake::Brief {
+            self.count_key_wait(console);
+        }
+        let mut reached = self
+            .request
+            .test_seams
+            .built_here_key_reached
+            .as_deref()
+            .filter(|_| wait == KeyTake::Brief);
         loop {
             // A wait that times out gives its handle up, so each slice waits on one of its own.
-            let mutex = NamedMutex::open(&name).map_err(|error| format!("cannot open the mutex {name}: {error}"))?;
+            let mutex = NamedMutex::open(&name).map_err(|error| Untaken::Failed(format!("cannot open the mutex {name}: {error}")))?;
             match mutex.acquire_owned(KEY_WAIT_SLICE) {
                 Ok(held) => return Ok(held),
-                Err(AcquireError::Timeout) => {}
-                Err(AcquireError::Failed(error)) => return Err(format!("cannot take the mutex {name}: {error}")),
+                Err(AcquireError::Timeout) => {
+                    if let Some(path) = reached.take()
+                        && let Err(error) = fs::write(path, "")
+                    {
+                        console.err(&format!("gate: cannot write {}: {error}", path.display()));
+                    }
+                }
+                Err(AcquireError::Failed(error)) => return Err(Untaken::Failed(format!("cannot take the mutex {name}: {error}"))),
             }
             if self.host.interrupt.is_some_and(Interrupt::is_raised) {
-                return Err("Ctrl+C ended the wait for the work folder's key".to_owned());
+                return Err(Untaken::Interrupted);
             }
             if begun.elapsed() < bound {
                 continue;
+            }
+            if wait != KeyTake::HeldOff {
+                return Err(Untaken::Held(bound));
             }
             // The key is the worktree's on every builder: a live drain marker of any of them holds the bound off.
             let probed = drain::any_marker_stands(&self.root.path, &mut |path, error| said.skipped(console, path, error));
             match probed {
                 Ok(true) => say_once(console, &mut past_bound_said, KEY_HELD_OFF_LINE),
-                Ok(false) => {
-                    return Err(format!(
-                        "another run of the worktree held the work folder's key for {} ms",
-                        bound.as_millis()
-                    ));
-                }
+                Ok(false) => return Err(Untaken::Held(bound)),
                 Err(error) => {
-                    return Err(format!(
+                    return Err(Untaken::Failed(format!(
                         "another run of the worktree held the work folder's key for {} ms, and the drain markers cannot be probed: {error}",
                         bound.as_millis()
-                    ));
+                    )));
                 }
             }
         }
