@@ -122,8 +122,12 @@ pub enum JournalEvent {
         /// Where the run's time went, written after the verdict and before `cold`; an empty trace writes nothing.
         trace: RunTrace,
         /// Whether the run was routed to a work tree the builder's preflight found new, so its ceiling was raised:
-        /// written as `cold: true`, the last of the event's own fields, and left out when false.
+        /// written as `cold: true`, after the trace, and left out when false.
         cold: bool,
+        /// Tailscale's path to the builder of a routed run's call, read once the call returned: `direct`,
+        /// `derp:{region}`, `peer-relay` or `none`, written after `cold`, the last of the event's own fields; left out
+        /// when unknown, and for a run that made no builder call.
+        path: Option<String>,
     },
     /// The gate left the queue without taking a slot.
     Abandon {
@@ -513,6 +517,7 @@ fn insert_own_fields(line: &mut Map<String, Value>, event: &JournalEvent) {
             facts,
             trace,
             cold,
+            path,
         } => {
             line.insert("slots".to_owned(), Value::from(slots.clone()));
             line.insert("heldSeconds".to_owned(), seconds(*held_seconds));
@@ -537,6 +542,9 @@ fn insert_own_fields(line: &mut Map<String, Value>, event: &JournalEvent) {
             insert_trace(line, trace);
             if *cold {
                 line.insert("cold".to_owned(), Value::Bool(true));
+            }
+            if let Some(path) = path {
+                line.insert("path".to_owned(), Value::from(path.as_str()));
             }
         }
         JournalEvent::Abandon { waited_seconds } => {

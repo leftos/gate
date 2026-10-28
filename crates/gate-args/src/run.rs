@@ -113,6 +113,14 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     RemoteTamper,
     #[cfg(feature = "test-seams")]
+    TailscaleStatus,
+    #[cfg(feature = "test-seams")]
+    TailscaleDelayMs,
+    #[cfg(feature = "test-seams")]
+    TailscaleWaitMs,
+    #[cfg(feature = "test-seams")]
+    TailscaleHoldStartMs,
+    #[cfg(feature = "test-seams")]
     ConfirmMs,
     #[cfg(feature = "test-seams")]
     PushSsh,
@@ -386,6 +394,10 @@ impl RunBuilder {
             | ValueOption::RemoteLfsBudgetBytes
             | ValueOption::RemoteLogCapBytes
             | ValueOption::RemoteTamper
+            | ValueOption::TailscaleStatus
+            | ValueOption::TailscaleDelayMs
+            | ValueOption::TailscaleWaitMs
+            | ValueOption::TailscaleHoldStartMs
             | ValueOption::ConfirmMs
             | ValueOption::PushSsh
             | ValueOption::PushBoundMs
@@ -444,6 +456,10 @@ impl RunBuilder {
             ValueOption::RemoteLfsBudgetBytes => seams.remote_lfs_budget_bytes = Some(values::above_zero(spelled, value)?),
             ValueOption::RemoteLogCapBytes => seams.remote_log_cap_bytes = Some(values::above_zero(spelled, value)?),
             ValueOption::RemoteTamper => seams.remote_tamper = Some(values::remote_call(spelled, value, values::TAMPERS)?),
+            ValueOption::TailscaleStatus => seams.tailscale_status = Some(PathBuf::from(value)),
+            ValueOption::TailscaleDelayMs => seams.tailscale_delay_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::TailscaleWaitMs => seams.tailscale_wait_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::TailscaleHoldStartMs => seams.tailscale_hold_start_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::WarmWaitMs => seams.warm_wait_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::ConfirmMs => self.cutover_seams.confirm_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::PushSsh => self.push_seams.ssh = Some(PathBuf::from(value)),
@@ -832,6 +848,7 @@ impl RunBuilder {
                 remote_transport: self.test_seams.remote_transport,
                 remote_ssh: self.test_seams.remote_ssh,
                 remote_timeout_ms: self.test_seams.remote_timeout_ms,
+                tailscale_status: self.test_seams.tailscale_status,
                 ..self.check_seams
             },
         })
@@ -879,6 +896,7 @@ impl RunBuilder {
             (self.test_seams.remote_transport.is_some(), "--test-remote-transport"),
             (self.test_seams.remote_ssh.is_some(), "--test-remote-ssh"),
             (self.test_seams.remote_timeout_ms.is_some(), "--test-remote-timeout-ms"),
+            (self.test_seams.tailscale_status.is_some(), "--test-tailscale-status"),
         ] {
             if read && !builder {
                 self.problems.push(Problem::SeamNeeds {

@@ -155,6 +155,7 @@ fn check_builder_seams_parse_with_the_feature() {
                 remote_transport: Some(r"local:C:\builder".to_owned()),
                 remote_ssh: Some(PathBuf::from("fake-ssh.exe")),
                 remote_timeout_ms: Some(250),
+                tailscale_status: None,
             },
         })
     );
@@ -187,6 +188,22 @@ fn check_builder_seams_parse_with_the_feature() {
         problems(&["check", "--builder", "b", "--test-remote-bound-ms", "5"]),
         ["gate: unknown option --test-remote-bound-ms", "gate: unexpected argument 5"],
         "a run seam the check does not read is not a check seam"
+    );
+}
+
+/// `--test-tailscale-status` is read into the builder check's seams, and needs `--builder`.
+#[cfg(feature = "test-seams")]
+#[test]
+fn check_builder_takes_the_tailscale_status_seam() {
+    use std::path::PathBuf;
+
+    let Invocation::Check(request) = invocation(&["check", "--builder", "box-1", "--test-tailscale-status", r"C:\status.json"]) else {
+        unreachable!("a check request");
+    };
+    assert_eq!(request.seams.tailscale_status, Some(PathBuf::from(r"C:\status.json")));
+    assert_eq!(
+        problems(&["check", "--test-tailscale-status", r"C:\status.json"]),
+        ["gate: --test-tailscale-status needs --builder"]
     );
 }
 

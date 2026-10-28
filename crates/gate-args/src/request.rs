@@ -445,6 +445,18 @@ pub struct TestSeams {
     /// snapshot is taken (`after-first-snapshot`), `core.worktree` written into its first sibling's git config, naming
     /// the folder beside it whose name is the sibling's with `-canary` after it (`worktree`).
     pub remote_tamper: Option<String>,
+    /// The file a routed run reads Tailscale's status JSON from at its builder call, in place of running `tailscale
+    /// status --json`; a file that does not exist stands for a PC without Tailscale (`--test-tailscale-status`).
+    pub tailscale_status: Option<PathBuf>,
+    /// How long a routed run's Tailscale path read sleeps before it reads, in milliseconds, so the release line comes
+    /// first (`--test-tailscale-delay-ms`).
+    pub tailscale_delay_ms: Option<u64>,
+    /// How long a routed run's release line waits for its Tailscale path read, in milliseconds, in place of not waiting
+    /// at all (`--test-tailscale-wait-ms`).
+    pub tailscale_wait_ms: Option<u64>,
+    /// How long a routed run's Tailscale path read holds its launch guard, in milliseconds, between creating a program
+    /// suspended and putting it in its job (`--test-tailscale-hold-start-ms`).
+    pub tailscale_hold_start_ms: Option<u64>,
     /// Make this gate's own start unreadable both ways, so the run refuses before it writes anything.
     pub own_start_fails: bool,
     /// Count every live parent a slot marker names as one this gate runs inside the command of, so a marker naming the
@@ -594,6 +606,9 @@ pub struct CheckSeams {
     pub remote_ssh: Option<PathBuf>,
     /// How long the builder check's call may take, in milliseconds, in place of 120 s (`--test-remote-timeout-ms`).
     pub remote_timeout_ms: Option<u64>,
+    /// The file the builder check reads Tailscale's status JSON from, in place of running `tailscale status --json`; a
+    /// file that does not exist stands for a PC without Tailscale (`--test-tailscale-status`).
+    pub tailscale_status: Option<PathBuf>,
 }
 
 /// A valid `gate drain`, which takes no words: what it does to the builder's barrier, the builder it drains in place of

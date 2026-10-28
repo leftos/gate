@@ -334,6 +334,7 @@ fn check_seam_option(name: &str) -> Option<RunOption> {
         "test-remote-transport" => Some(RunOption::Value(ValueOption::RemoteTransport)),
         "test-remote-ssh" => Some(RunOption::Value(ValueOption::RemoteSsh)),
         "test-remote-timeout-ms" => Some(RunOption::Value(ValueOption::RemoteTimeoutMs)),
+        "test-tailscale-status" => Some(RunOption::Value(ValueOption::TailscaleStatus)),
         _ => None,
     }
 }
@@ -419,6 +420,10 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-remote-lfs-budget-bytes" => Some(RunOption::Value(ValueOption::RemoteLfsBudgetBytes)),
         "test-remote-log-cap-bytes" => Some(RunOption::Value(ValueOption::RemoteLogCapBytes)),
         "test-remote-tamper" => Some(RunOption::Value(ValueOption::RemoteTamper)),
+        "test-tailscale-status" => Some(RunOption::Value(ValueOption::TailscaleStatus)),
+        "test-tailscale-delay-ms" => Some(RunOption::Value(ValueOption::TailscaleDelayMs)),
+        "test-tailscale-wait-ms" => Some(RunOption::Value(ValueOption::TailscaleWaitMs)),
+        "test-tailscale-hold-start-ms" => Some(RunOption::Value(ValueOption::TailscaleHoldStartMs)),
         _ => None,
     }
 }

@@ -1427,7 +1427,8 @@ fn check_builder(case: &Case, host: &str, folders: &[PathBuf], steps: &Path) -> 
     finish(builder_check(case, host, folders, steps))
 }
 
-/// The command of a [`check_builder`] call, not yet run.
+/// The command of a [`check_builder`] call, not yet run, its Tailscale status read from the case's file
+/// ([`Case::tailscale_status`]) through the suite's variable, with no `--test-tailscale-status`.
 fn builder_check(case: &Case, host: &str, folders: &[PathBuf], steps: &Path) -> Command {
     let transport = format!("local:{}", builder_root(case).display());
     let args = [
@@ -1484,6 +1485,7 @@ fn check_builder_lists_every_item_and_exits_0_when_nothing_is_missing() {
             "check: builder-1: pnpm 10.0.0 ok",
             "check: builder-1: pwsh 7.6.6 ok (needs 7.4.0 or later)",
             "check: builder-1: ffmpeg 9.0.2 ok",
+            "check: builder-1: tailscale path: not checked: tailscale is not installed",
             "check: builder-1: nothing missing",
         ],
         "{outcome:?}"
@@ -1491,6 +1493,79 @@ fn check_builder_lists_every_item_and_exits_0_when_nothing_is_missing() {
     assert_eq!(outcome.stderr, "", "{outcome:?}");
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(calls(&steps), ["preflight"], "one call reached the builder");
+}
+
+/// Tailscale's status JSON with one peer, `builder-1` at an invented tailnet address, whose path fields are `path`.
+fn tailnet_with_builder(path: &str) -> String {
+    let names = r#""HostName": "builder-1", "DNSName": "builder-1.tail0000.ts.net.""#;
+    let peer = format!(r#"{names}, "TailscaleIPs": ["100.64.0.1"], "Online": true, {path}"#);
+    format!(r#"{{"BackendState": "Running", "Peer": {{"nodekey:1": {{{peer}}}}}}}"#)
+}
+
+/// `--test-tailscale-status` wins over the suite's variable: with the variable naming a file that is not there, the
+/// check reads the flag's file and says its path.
+#[test]
+fn check_builder_reads_the_tailscale_status_flag_over_the_variable() {
+    let case = builder_case("check_builder_tailscale_flag");
+    let flagged = case.folder().join("flagged-status.json");
+    fs::write(&flagged, tailnet_with_builder(r#""CurAddr": "192.0.2.10:41641""#)).expect("the status file can be written");
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+    let mut command = builder_check(&case, "builder-1", &[], &steps);
+    command.arg("--test-tailscale-status").arg(&flagged);
+
+    let outcome = finish(command);
+
+    assert!(!case.tailscale_status().exists(), "the variable's file is not there");
+    assert!(
+        lines(&outcome.stdout).contains(&"check: builder-1: tailscale path: direct"),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+/// A builder check's Tailscale path: a direct path says so and passes, a path relayed through DERP says its region and
+/// still exits 0, and a PC without Tailscale says the path was not checked.
+#[test]
+fn check_builder_says_the_tailscale_path_and_a_relayed_one_does_not_fail_it() {
+    for (name, status, line) in [
+        (
+            "direct",
+            Some(tailnet_with_builder(r#""CurAddr": "192.0.2.10:41641", "Relay": "fra""#)),
+            "check: builder-1: tailscale path: direct",
+        ),
+        (
+            "derp",
+            Some(tailnet_with_builder(r#""CurAddr": "", "Relay": "fra""#)),
+            "check: builder-1: tailscale path: relayed via DERP (fra)",
+        ),
+        (
+            "absent",
+            None,
+            "check: builder-1: tailscale path: not checked: tailscale is not installed",
+        ),
+    ] {
+        let case = builder_case(&format!("check_builder_tailscale_{name}"));
+        if let Some(status) = &status {
+            fs::write(case.tailscale_status(), status).expect("the status file can be written");
+        }
+        let steps = ssh_steps(&case, "ssh", &["ok"]);
+
+        let outcome = check_builder(&case, "builder-1", &[], &steps);
+
+        let [header, created] = first_lines(&case, "builder-1");
+        assert_eq!(
+            lines(&outcome.stdout),
+            [
+                header.as_str(),
+                created.as_str(),
+                "check: builder-1: app declares no toolchain",
+                line,
+                "check: builder-1: nothing missing"
+            ],
+            "{name}: {outcome:?}"
+        );
+        assert_eq!(outcome.code, Some(0), "{name}: {outcome:?}");
+    }
 }
 
 #[test]
@@ -1635,6 +1710,7 @@ fn check_builder_says_a_missing_tool_with_its_builder_hint_and_exits_1() {
             "check: builder-1: pnpm missing (needs 10.0.0 or later)",
             "check: builder-1: rust missing (needs 1.89.0 or later)",
             "check: builder-1: pwsh missing (needs it present)",
+            "check: builder-1: tailscale path: not checked: tailscale is not installed",
             "install: builder-1: cargo-nextest: cargo install cargo-nextest --locked",
             "install: builder-1: pnpm: npm install -g pnpm@10.0.0",
             "install: builder-1: rust: rustup toolchain install 1.89.0 && rustup default 1.89.0",
@@ -1672,6 +1748,7 @@ fn check_builder_reports_an_open_work_root_as_missing() {
             header.as_str(),
             "check: builder-1: node skipped: the builder gave no answer",
             item.as_str(),
+            "check: builder-1: tailscale path: not checked: tailscale is not installed",
             "check: builder-1: 1 missing, 0 too old, 1 skipped",
         ],
         "{outcome:?}"
@@ -1883,6 +1960,7 @@ fn check_builder_says_the_folders_its_preflight_created() {
             header.as_str(),
             created.as_str(),
             "check: builder-1: app declares no toolchain",
+            "check: builder-1: tailscale path: not checked: tailscale is not installed",
             "check: builder-1: nothing missing",
         ],
         "{first:?}"
@@ -1892,6 +1970,7 @@ fn check_builder_says_the_folders_its_preflight_created() {
         [
             header.as_str(),
             "check: builder-1: app declares no toolchain",
+            "check: builder-1: tailscale path: not checked: tailscale is not installed",
             "check: builder-1: nothing missing",
         ],
         "{second:?}"
@@ -1929,6 +2008,7 @@ fn check_builder_skips_declared_siblings() {
         [
             "check: builder-1: app declares no toolchain",
             "check: builder-1: siblings skipped: a routed run lays them out",
+            "check: builder-1: tailscale path: not checked: tailscale is not installed",
             "check: builder-1: nothing missing (1 skipped)",
         ],
         "{outcome:?}"
@@ -1975,6 +2055,7 @@ fn check_builder_an_unreadable_siblings_file_exits_1_and_says_so() {
         [
             "check: builder-1: app declares no toolchain",
             "check: builder-1: siblings skipped: a routed run lays them out",
+            "check: builder-1: tailscale path: not checked: tailscale is not installed",
             "check: builder-1: could not read .gate/siblings.toml; 0 missing, 0 too old, 1 skipped",
         ],
         "{outcome:?}"
@@ -2000,6 +2081,7 @@ fn check_builder_says_the_sdk_the_builder_has() {
         [
             "check: builder-2: app declares no toolchain",
             "check: builder-2: .NET SDK 10.0.401 (rollForward patch) missing (builder-2 has 8.0.404, 10.0.300)",
+            "check: builder-2: tailscale path: not checked: tailscale is not installed",
             "install: builder-2: .NET SDK: dotnet-install.ps1 -Version 10.0.401",
             "check: builder-2: 1 missing, 0 too old",
         ],
@@ -2027,6 +2109,7 @@ fn check_builder_says_a_work_folder_that_is_not_warm() {
         [
             "check: builder-1: app declares no toolchain",
             "check: builder-1: warm-up: the work folder is not warm",
+            "check: builder-1: tailscale path: not checked: tailscale is not installed",
             "check: builder-1: nothing missing",
         ],
         "{outcome:?}"
@@ -2062,6 +2145,7 @@ fn check_builder_says_an_unreadable_warm_record_and_exits_0() {
                 record.display()
             ),
             "check: builder-1: warm-up: the work folder is not warm".to_owned(),
+            "check: builder-1: tailscale path: not checked: tailscale is not installed".to_owned(),
             "check: builder-1: nothing missing".to_owned(),
         ],
         "{outcome:?}"
@@ -2093,7 +2177,7 @@ fn check_builder_says_a_warm_lock_that_cannot_be_probed_and_exits_0() {
 
     let said = lines(&outcome.stdout);
     let start = format!("check: builder-1: warm-up: the warm-up lock {} cannot be read: ", lock.display());
-    assert_eq!(said.len(), 6, "{outcome:?}");
+    assert_eq!(said.len(), 7, "{outcome:?}");
     assert!(said[3].starts_with(&start), "{outcome:?}");
     assert!(
         said[3].ends_with("; gate warm and a routed run waiting on the work folder read it"),
@@ -2103,6 +2187,7 @@ fn check_builder_says_a_warm_lock_that_cannot_be_probed_and_exits_0() {
         said[4..],
         [
             "check: builder-1: warm-up: the work folder is not warm",
+            "check: builder-1: tailscale path: not checked: tailscale is not installed",
             "check: builder-1: nothing missing"
         ],
         "{outcome:?}"
@@ -2124,6 +2209,7 @@ fn check_builder_says_an_unreadable_warmup_file_and_exits_1() {
         [
             "check: builder-1: app declares no toolchain",
             "check: builder-1: warm-up: .gate/warmup.toml has problems, so gate warm cannot prewarm a new worktree",
+            "check: builder-1: tailscale path: not checked: tailscale is not installed",
             "check: builder-1: could not read .gate/warmup.toml; 1 missing, 0 too old",
         ],
         "{outcome:?}"

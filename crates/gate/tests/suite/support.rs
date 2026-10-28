@@ -77,6 +77,9 @@ const INHERITED: [&str; 5] = ["GATE_STATE_DIR", "GATE_SLOT_HELD", "GATE_COMMIT_S
 /// Only guards against a stuck case; no case asserts how long anything took. Ten minutes, since a loaded machine
 /// (several heavy gates building at once) has kept a healthy case past a minute, and a real hang still ends.
 pub const HANG_GUARD: Duration = Duration::from_secs(600);
+/// The seam [`Case::prepare`] gives a routed run by default: its release line waits for its Tailscale path read up to
+/// the hang guard, so a read that finishes is always taken however loaded the machine.
+const PATH_WAIT: [&str; 2] = ["--test-tailscale-wait-ms", "600000"];
 /// How long the output readers get to end once the program has exited; a reader whose pipe a grandchild still holds
 /// would otherwise keep its case waiting the whole hang guard.
 const READER_GRACE: Duration = Duration::from_secs(60);
@@ -127,8 +130,11 @@ impl Case {
 
     /// Readies `command` for this case: the inherited gate variables removed, git pointed at the suite's git home
     /// (`HOME` and `XDG_CONFIG_HOME`, [`git_home_for`]), LOCALAPPDATA under the case folder
-    /// ([`Case::local_app_data`]), the working directory the case folder,
-    /// and `args` given with `--state-dir <root>` after a `run`, `stop-tree` or `expect` subcommand.
+    /// ([`Case::local_app_data`]), Tailscale's status read from the case folder ([`Case::tailscale_status`]), the
+    /// working directory the case folder,
+    /// and `args` given with `--state-dir <root>` after a `run`, `stop-tree` or `expect` subcommand. A routed `run`
+    /// (one given `--test-remote-client` or `--test-remote-transport`) that gives no `--test-tailscale-wait-ms` of its
+    /// own is also given [`PATH_WAIT`], so its release line never races its Tailscale path read.
     pub fn prepare(&self, command: &mut Command, args: &[&str]) {
         self.prepare_without_state_dir(command, &[]);
         let Some((first, rest)) = args.split_first() else {
@@ -137,6 +143,13 @@ impl Case {
         command.arg(first);
         if matches!(*first, "run" | "stop-tree" | "expect") {
             command.arg("--state-dir").arg(&self.state);
+        }
+        let options = rest.split(|word| *word == "--").next().unwrap_or_default();
+        let routed = options
+            .iter()
+            .any(|word| matches!(*word, "--test-remote-client" | "--test-remote-transport"));
+        if *first == "run" && routed && !options.contains(&PATH_WAIT[0]) {
+            command.args(PATH_WAIT);
         }
         command.args(rest);
     }
@@ -147,7 +160,18 @@ impl Case {
             command.env_remove(name);
         }
         git_home_for(command);
-        command.env("LOCALAPPDATA", self.local_app_data()).current_dir(&self.folder).args(args);
+        command
+            .env("LOCALAPPDATA", self.local_app_data())
+            .env(TAILSCALE_STATUS_VARIABLE, self.tailscale_status())
+            .current_dir(&self.folder)
+            .args(args);
+    }
+
+    /// The file every case's gate reads Tailscale's status from in place of running `tailscale`
+    /// ([`TAILSCALE_STATUS_VARIABLE`]): absent, it stands for a PC without Tailscale, so no case reaches this PC's
+    /// `tailscale` or `ssh -G` unless it writes the file.
+    pub fn tailscale_status(&self) -> PathBuf {
+        self.folder().join("tailscale-status.json")
     }
 
     /// The LOCALAPPDATA every case's gate sees, under the case folder, so no case reads the host's default root. The
@@ -1240,6 +1264,8 @@ pub fn git(case: &Case, args: &[&str]) -> String {
 pub const FAKE_SSH: &str = env!("CARGO_BIN_EXE_fake-ssh");
 /// The variable naming the stand-in's steps file; the stand-in logs each call's verb to `<steps>.log`.
 pub const STEPS_VARIABLE: &str = "GATE_FAKE_SSH_STEPS";
+/// The variable a test-seams gate reads Tailscale's status file from when `--test-tailscale-status` is not given.
+pub const TAILSCALE_STATUS_VARIABLE: &str = "GATE_TEST_TAILSCALE_STATUS";
 /// The variable naming the gate the stand-in runs `box <verb> --stdin` with, feeding it the request on standard input.
 pub const GATE_VARIABLE: &str = "GATE_FAKE_SSH_GATE";
 /// The variable whose words the stand-in gives the box's `preflight` before its verb.

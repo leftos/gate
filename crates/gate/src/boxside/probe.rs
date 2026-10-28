@@ -266,6 +266,7 @@ fn ran(program: &str, args: &[&str], place: &ProgramPlace, batch: Batch<'_>, rea
         worktrees: batch.worktrees,
         console: PipedConsole::Hidden,
         stdin: None,
+        launch_guard: None,
     };
     match git::program_output(&call, place) {
         Ok(None) => Probed::Missing,

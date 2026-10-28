@@ -5,19 +5,23 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
 use flate2::read::GzDecoder;
 use gate_args::command_text;
 use gate_state::{JOURNAL_CAP_BYTES, KernelObject, StateRoot};
-use gate_win32::NamedMutex;
+use gate_win32::{NamedMutex, RemoteProcess, image_path_of};
+use proc_table::Win32ProcessTable;
 use regex::Regex;
 use serde_json::Value;
 
+use crate::routing::{BUSY_LINE, HOST, routed_case, routed_words, stub};
 use crate::support::{
-    CORE_SECOND, Case, FAKE_TOOL, Outcome, assert_in_order, cpu_ticks, finish, none_words, run_words, shown, wait_for_journal_line, wait_until,
+    CORE_SECOND, Case, FAKE_TOOL, Outcome, TAILSCALE_STATUS_VARIABLE, assert_in_order, cpu_ticks, events, finish, log_texts, none_words, release,
+    run_words, shown, wait_for_journal_line, wait_until,
 };
 
 /// The words of a light run logging to `log` whose command exits with `status`.
@@ -343,6 +347,195 @@ fn journal_command_is_quoted_like_format_command_text() {
         ["queue", "take", "release"].map(|event| (Value::from(event), Value::from(expected.as_str()))),
         "every journal line carries the quoted command"
     );
+}
+
+/// Tailscale's status with the routed cases' builder as its one peer, relayed through DERP region `fra`.
+fn builder_relayed() -> String {
+    let names = format!(r#""HostName": "{HOST}", "DNSName": "{HOST}.tail0000.ts.net.""#);
+    let path = r#""TailscaleIPs": ["100.64.0.1"], "Online": true, "CurAddr": "", "Relay": "fra", "PeerRelay": """#;
+    format!(r#"{{"BackendState": "Running", "Peer": {{"nodekey:1": {{{names}, {path}}}}}}}"#)
+}
+
+/// The wait seam a routed run's gate gets from [`Case::gate`] by default: its release line waits for its Tailscale path
+/// read up to the suite's hang guard, so a read that finishes is always taken however loaded the machine.
+const DEFAULT_WAIT: &str = "600000";
+
+/// The values of every `--test-tailscale-wait-ms` among the words `command` is given.
+fn path_waits(command: &Command) -> Vec<String> {
+    let words: Vec<String> = command.get_args().map(|word| word.to_string_lossy().into_owned()).collect();
+    words
+        .windows(2)
+        .filter(|pair| pair[0] == "--test-tailscale-wait-ms")
+        .map(|pair| pair[1].clone())
+        .collect()
+}
+
+/// Every routed run of the suite has its release line wait for its path read up to the hang guard, so no case races its
+/// read against the line; a case that gives its own wait keeps it alone, and a run here is given none.
+#[test]
+fn a_routed_run_of_the_suite_waits_for_its_path_read_by_default() {
+    let case = routed_case("journal-tailscale-default-wait");
+    let steps = shown(&stub(&case, &["status 0"]));
+    let own_wait = ["--test-tailscale-wait-ms", "1"];
+
+    let routed = case.gate(&routed_words("routed.log", &steps, &[], &[r".\tool.exe", "out", "hi"]));
+    let own = case.gate(&routed_words("own.log", &steps, &own_wait, &[r".\tool.exe", "out", "hi"]));
+    let here = case.gate(&run_words("here.log", &[], &[FAKE_TOOL, "exit", "0"]));
+
+    assert_eq!(path_waits(&routed), [DEFAULT_WAIT], "{routed:?}");
+    assert_eq!(path_waits(&own), ["1"], "{own:?}");
+    assert!(path_waits(&here).is_empty(), "{here:?}");
+}
+
+/// A routed run journals Tailscale's path to its builder on its release line, read from the status file the seam names
+/// over the case's own file, which is absent, where the builder's peer is relayed through DERP; a run here given the
+/// same status journals no path.
+#[test]
+fn a_routed_run_journals_the_tailscale_path_and_a_run_here_none() {
+    let case = routed_case("journal-tailscale-path");
+    let status = case.folder().join("explicit-tailscale-status.json");
+    fs::write(&status, builder_relayed()).expect("the status file can be written");
+    let status_word = shown(&status);
+    let seam = ["--test-tailscale-status", status_word.as_str()];
+    let steps = shown(&stub(&case, &["status 0"]));
+
+    let routed = finish(case.gate(&routed_words("routed.log", &steps, &seam, &[r".\tool.exe", "out", "hi"])));
+    let here = finish(case.gate(&run_words("here.log", &seam, &[FAKE_TOOL, "exit", "0"])));
+
+    assert_eq!((routed.code, here.code), (Some(0), Some(0)), "{routed:?}\n{here:?}");
+    let releases: Vec<Value> = events(&case).into_iter().filter(|event| event["event"] == "release").collect();
+    assert_eq!(releases.len(), 2, "{releases:#?}");
+    assert_eq!(
+        (&releases[0]["remote"], &releases[0]["path"]),
+        (&Value::Bool(true), &Value::from("derp:fra")),
+        "{releases:#?}"
+    );
+    assert!(releases[1].get("remote").is_none() && releases[1].get("path").is_none(), "{releases:#?}");
+}
+
+/// With no `--test-tailscale-status`, a routed run reads the status from the file the suite's variable names, never this
+/// PC's `tailscale`: absent, it journals no path; written with the builder relayed, the next run journals that.
+#[test]
+fn a_routed_run_without_the_seam_reads_the_case_s_status_file() {
+    let case = routed_case("journal-tailscale-variable");
+    let steps = shown(&stub(&case, &["status 0"]));
+
+    let absent = finish(case.gate(&routed_words("absent.log", &steps, &[], &[r".\tool.exe", "out", "hi"])));
+    fs::write(case.tailscale_status(), builder_relayed()).expect("the status file can be written");
+    let written = finish(case.gate(&routed_words("written.log", &steps, &[], &[r".\tool.exe", "out", "hi"])));
+
+    assert_eq!((absent.code, written.code), (Some(0), Some(0)), "{absent:?}\n{written:?}");
+    let releases: Vec<Value> = events(&case).into_iter().filter(|event| event["event"] == "release").collect();
+    assert_eq!(releases.len(), 2, "{releases:#?}");
+    assert_eq!(releases[0]["remote"], true, "{releases:#?}");
+    assert!(releases[0].get("path").is_none(), "{releases:#?}");
+    assert_eq!(releases[1]["path"], "derp:fra", "{releases:#?}");
+}
+
+/// A path read that failed says why in the log of a routed run, and nothing on stderr; its release line has no path.
+#[test]
+fn a_routed_run_logs_why_its_path_read_failed() {
+    let case = routed_case("journal-tailscale-failed");
+    let stopped = builder_relayed().replace(r#""Running""#, r#""Stopped""#);
+    fs::write(case.tailscale_status(), stopped).expect("the status file can be written");
+    let steps = shown(&stub(&case, &["status 0"]));
+
+    let outcome = finish(case.gate(&routed_words("failed.log", &steps, &[], &[r".\tool.exe", "out", "hi"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let released = release(&case);
+    assert_eq!(released["remote"], true, "{released:#?}");
+    assert!(released.get("path").is_none(), "{released:#?}");
+    let log = log_texts(&case.folder().join("failed.log"));
+    assert!(log.contains("gate: tailscale path not read: tailscale is Stopped"), "{log}");
+    assert!(!outcome.stderr.contains("tailscale path"), "{outcome:?}");
+}
+
+/// A routed call the builder refused, which falls back here, journals the path of the builder call it made on the
+/// release line of its run here.
+#[test]
+fn a_refused_call_that_falls_back_journals_the_path_of_its_call() {
+    let case = routed_case("journal-tailscale-refused");
+    fs::write(case.tailscale_status(), builder_relayed()).expect("the status file can be written");
+    let steps = shown(&stub(&case, &["refuse busy"]));
+
+    let outcome = finish(case.gate(&routed_words("refused.log", &steps, &[], &[r".\tool.exe", "out", "ran here"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(BUSY_LINE), "{outcome:?}");
+    let released = release(&case);
+    assert!(released.get("remote").is_none(), "the run ran here: {released:#?}");
+    assert_eq!(released["path"], "derp:fra", "{released:#?}");
+}
+
+/// A path read still running when the release line is written is never waited on past its own wait: the line has no
+/// path, the log says so, the run's result is unchanged, and the gate exits with the read's thread still asleep.
+#[test]
+fn a_path_read_not_finished_by_the_release_line_journals_no_path() {
+    let case = routed_case("journal-tailscale-held");
+    fs::write(case.tailscale_status(), builder_relayed()).expect("the status file can be written");
+    let steps = shown(&stub(&case, &["status 0"]));
+    let held = ["--test-tailscale-delay-ms", "600000", "--test-tailscale-wait-ms", "1"];
+
+    let outcome = finish(case.gate(&routed_words("held.log", &steps, &held, &[r".\tool.exe", "out", "hi"])));
+
+    assert_eq!(outcome.code, Some(0), "the gate exited with its run's status: {outcome:?}");
+    let released = release(&case);
+    assert_eq!(released["remote"], true, "{released:#?}");
+    assert!(released.get("path").is_none(), "{released:#?}");
+    let log = log_texts(&case.folder().join("held.log"));
+    assert!(log.contains("gate: tailscale path not read in time for the release line"), "{log}");
+}
+
+/// The live processes whose image is the file `image`, each opened so it can be ended. A process that ends between the
+/// snapshot and its opening is not running, so it is left out.
+fn running_at(image: &Path) -> Vec<RemoteProcess> {
+    let file = image.file_name().expect("the stand-in has a file name").to_string_lossy().into_owned();
+    let image = image.to_string_lossy().into_owned();
+    Win32ProcessTable
+        .snapshot_without_command_lines()
+        .into_iter()
+        .filter(|process| process.name.eq_ignore_ascii_case(&file))
+        .filter_map(|process| RemoteProcess::open(process.pid).ok())
+        .filter(|process| image_path_of(process.handle()).is_ok_and(|path| path.to_string_lossy().eq_ignore_ascii_case(&image)))
+        .collect()
+}
+
+/// Ends, when dropped, every process still running from the file it names, so a case that fails leaves none behind.
+struct EndedAtDrop(PathBuf);
+
+impl Drop for EndedAtDrop {
+    fn drop(&mut self) {
+        for process in running_at(&self.0) {
+            // A stand-in that cannot be ended is already reported by the case's own assertion.
+            let _ended = process.terminate(1, Duration::from_secs(30));
+        }
+    }
+}
+
+/// A gate that reaches its exit while its path read holds its launch guard between creating `tailscale` suspended and
+/// putting it in its job exits with its run's status and leaves no `tailscale` behind: its exit waits out the hold, and
+/// the program then ends with the job the gate's end closes.
+#[test]
+fn a_gate_that_ends_while_its_path_read_is_starting_leaves_no_tailscale_behind() {
+    let case = routed_case("journal-tailscale-ending");
+    let outside = Case::new("journal-tailscale-ending-stand-in");
+    let stand_in = outside.folder().join("tailscale.exe");
+    fs::copy(FAKE_TOOL, &stand_in).expect("fake-tool can be copied as the tailscale stand-in");
+    let _ended = EndedAtDrop(stand_in.clone());
+    let steps = shown(&stub(&case, &["status 0"]));
+    let held = ["--test-tailscale-hold-start-ms", "1500", "--test-tailscale-wait-ms", "1"];
+    let mut command = case.gate(&routed_words("ending.log", &steps, &held, &[r".\tool.exe", "out", "hi"]));
+    let path = std::env::var_os("PATH").expect("PATH is set");
+    let folders = std::iter::once(outside.folder()).chain(std::env::split_paths(&path));
+    command
+        .env_remove(TAILSCALE_STATUS_VARIABLE)
+        .env("PATH", std::env::join_paths(folders).expect("the folders join into a PATH"));
+
+    let outcome = finish(command);
+
+    assert_eq!(outcome.code, Some(0), "the gate exited with its run's status: {outcome:?}");
+    wait_until("no tailscale stand-in is left running", || running_at(&stand_in).is_empty());
 }
 
 #[test]

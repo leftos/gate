@@ -238,6 +238,7 @@ fn called(program: &Program, input: &[u8], interrupt: Option<Interrupt>) -> Resu
         worktrees: &[],
         console: PipedConsole::Attached,
         stdin: Some(input),
+        launch_guard: None,
     };
     let place = ProgramPlace::new(Variables::from_process()).map_err(Unanswered::Unreachable)?;
     let late = call.late_line();

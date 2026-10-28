@@ -332,6 +332,7 @@ fn checked(place: &Place, seams: &CheckSeams) -> Checked {
         created: Vec::new(),
         siblings_skipped: false,
         warmup: warmed.items,
+        tailscale: None,
     }
 }
 

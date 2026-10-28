@@ -584,6 +584,7 @@ fn called(program: &Program, place: &ProgramPlace) -> Result<ProgramOutput, Stri
         worktrees: &[],
         console: PipedConsole::Attached,
         stdin: None,
+        launch_guard: None,
     };
     let late = call.late_line();
     let limit = git::spelled_limit(BOUND);

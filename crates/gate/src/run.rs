@@ -69,6 +69,7 @@ use crate::restore::{self, NotRestoring, RestorePlan};
 use crate::route::{self, Placed};
 use crate::slots::{self, BuilderPool, ClaimOf, LendMarker, Pool, Survey, Taken, Takes, ThisGate, epoch_ms};
 use crate::stopping::failure;
+use crate::tailscale;
 use crate::wait::{self, Arrival, Host, UnderParent, Wait, Waited};
 use crate::warm;
 use crate::watch::{Start, Watched, Watcher, Watching};
@@ -171,6 +172,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         tag: None,
         warm_hash: None,
         cold: false,
+        tailscale_read: None,
         would: None,
         arrived: epoch_ms(Timestamp::now()),
         queued_at: None,
@@ -766,6 +768,10 @@ struct Run<'a> {
     /// Whether the routed run's call ran in a work tree the builder found new, its ceiling raised, which its `release`
     /// line says; false for every other run, one that fell back among them.
     cold: bool,
+    /// The read of Tailscale's path to the builder a routed run's call went to, started once the call returned, which
+    /// its `release` line takes if it has finished ([`Run::tailscale_path`]); `None` for a run that made no builder
+    /// call.
+    tailscale_read: Option<tailscale::PendingPath>,
     /// What the routing decision saw of the run, kept for a passed light run's route line, which asks the decision again
     /// as a heavy gate would ([`route::would_route_on_heavy`]). `None` for a run whose light parent lent it its slot,
     /// which never asked.
@@ -1672,6 +1678,7 @@ impl Run<'_> {
             facts,
             trace: std::mem::take(&mut self.trace),
             cold: self.cold,
+            path: self.tailscale_path(console),
         };
         let remote = self.tag.as_ref();
         let filing = self
@@ -1684,6 +1691,38 @@ impl Run<'_> {
         if let (Some(durations), Some(Some(filed))) = (&mut self.durations, filed) {
             durations.filed(filed, console);
         }
+    }
+
+    /// Starts reading Tailscale's path to the builder of `remote`, whose call returned, on a thread of its own, ended by
+    /// the run's Ctrl+C; `None`, with a note in the log, when the thread cannot be started.
+    fn start_tailscale_read(&self, remote: &RemoteRun, console: &mut Console) -> Option<tailscale::PendingPath> {
+        let seams = &self.request.test_seams;
+        let read = tailscale::ReadOf {
+            alias: remote.builder.alias.clone(),
+            status_flag: seams.tailscale_status.clone(),
+            worktree: remote.root.clone(),
+            interrupt: self.host.interrupt,
+            delay: seams.tailscale_delay_ms.map(Duration::from_millis),
+            hold_start: seams.tailscale_hold_start_ms.map(Duration::from_millis),
+        };
+        tailscale::PendingPath::start(read)
+            .map_err(|why| console.note(&format!("gate: tailscale path not read: {why}")))
+            .ok()
+    }
+
+    /// Tailscale's path to the builder the routed run's call went to, as its `release` line says it: taken only when
+    /// its read has finished, never waited on (but for `--test-tailscale-wait-ms`); `None` when unknown and for a run
+    /// that made no builder call. The log alone notes `gate: tailscale path not read: <why>` for a read that failed,
+    /// timed out or was interrupted, `gate: tailscale path not read in time for the release line` for one not finished,
+    /// and `gate: tailscale path read failed` for one whose thread ended without an answer ([`tailscale::Taken::note`]).
+    fn tailscale_path(&mut self, console: &mut Console) -> Option<String> {
+        let pending = self.tailscale_read.take()?;
+        let wait = self.request.test_seams.tailscale_wait_ms.map(Duration::from_millis);
+        let taken = pending.taken(wait);
+        if let Some(note) = taken.note() {
+            console.note(&note);
+        }
+        taken.journal_word()
     }
 
     /// Rebuilds the durations store once the run has released, when a read of the run asked for it, unless a Ctrl+C
@@ -2154,9 +2193,15 @@ impl Run<'_> {
             started = admitted;
             hold.took = Some(admitted);
         }
+        let interrupted = self.host.interrupt.is_some_and(Interrupt::is_raised);
+        // The path is read for every builder call that returned, a refused one that falls back here included, but for
+        // one a Ctrl+C ended.
+        if !interrupted {
+            self.tailscale_read = self.start_tailscale_read(remote, console);
+        }
         let fallback = outcome.fallback();
         // A Ctrl+C during the call wins over a refusal: the command never runs here.
-        if fallback.is_some() && self.host.interrupt.is_some_and(Interrupt::is_raised) {
+        if fallback.is_some() && interrupted {
             return Attempt::Done(Remotely::Ended(self.interrupted_before_start(console)));
         }
         if let Some(reason) = fallback {

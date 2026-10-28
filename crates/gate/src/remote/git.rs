@@ -13,9 +13,9 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::{Command, ExitStatus};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -318,8 +318,8 @@ struct Spawn<'a> {
 /// A program other than git started, bounded and ended as the client's git calls are ([`program_output`]): its name,
 /// looked for along a `PATH`, its arguments, how long it may take, how long its readers get to end once it has exited,
 /// the console interrupt that ends it, the worktrees it must not be found inside, none for no such check, the console
-/// it is created on: this process's, or a hidden one of its own; and the bytes fed on its standard input, which is then
-/// closed, `None` for none.
+/// it is created on: this process's, or a hidden one of its own; the bytes fed on its standard input, which is then
+/// closed, `None` for none; and the launch guard its start is made under ([`Call::launch_guard`]), `None` for none.
 pub(crate) struct ProgramCall<'a> {
     pub program: &'a str,
     pub args: &'a [&'a str],
@@ -329,6 +329,56 @@ pub(crate) struct ProgramCall<'a> {
     pub worktrees: &'a [&'a Path],
     pub console: PipedConsole,
     pub stdin: Option<&'a [u8]>,
+    pub launch_guard: Option<&'a LaunchGuard>,
+}
+
+/// What a call whose caller does not wait for it starts under, so the process never ends between the call's creating
+/// its program suspended and putting it in its kill-on-close job, which would leave the program suspended outside any
+/// job: a closing flag behind a mutex the call holds from before the create through the resume, and the end of the
+/// process takes ([`LaunchGuard::close`]). Under the test seams it can hold that window open a while.
+pub(crate) struct LaunchGuard {
+    closing: Mutex<bool>,
+    hold: Option<Duration>,
+}
+
+/// A [`LaunchGuard`] held open by a call that may start its program, and how long it sleeps between the create and the
+/// assignment.
+struct Opening<'a> {
+    _held: MutexGuard<'a, bool>,
+    hold: Option<Duration>,
+}
+
+impl LaunchGuard {
+    /// A guard not yet closed, whose calls sleep `hold` between creating their program and putting it in its job.
+    pub(crate) fn new(hold: Option<Duration>) -> LaunchGuard {
+        LaunchGuard {
+            closing: Mutex::new(false),
+            hold,
+        }
+    }
+
+    /// Marks the guard closing once no call holds it, so no later call starts its program; waits out a call between
+    /// its create and its resume, which is a handful of system calls and never a wait on the program.
+    pub(crate) fn close(&self) {
+        *self.held() = true;
+    }
+
+    /// The guard held for a call of `name` about to start its program; else, when it is closing, why it starts none.
+    fn open(&self, name: &str) -> Result<Opening<'_>, GitError> {
+        let held = self.held();
+        if *held {
+            return Err(GitError::Failed(format!("cannot run {name}: the gate is ending")));
+        }
+        Ok(Opening {
+            _held: held,
+            hold: self.hold,
+        })
+    }
+
+    /// The closing flag, held; a call that panicked while holding it left the flag as it was.
+    fn held(&self) -> MutexGuard<'_, bool> {
+        self.closing.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// Where [`program_output`] runs a program: the system folder, and an environment with
@@ -417,6 +467,7 @@ fn program_call<'a>(folder: &'a Path, call: &ProgramCall<'a>) -> Call<'a> {
         interrupt: call.interrupt,
         console: call.console,
         stdin: call.stdin,
+        launch_guard: call.launch_guard,
         ..Call::plain(folder, call.args, call.limit)
     }
 }
@@ -441,6 +492,7 @@ pub(crate) fn sdk_listing(
         worktrees,
         console: PipedConsole::Attached,
         stdin: None,
+        launch_guard: None,
     };
     let place = ProgramPlace::new(variables).map_err(|why| GitError::Failed(format!("cannot run dotnet: {why}")))?;
     let Some(ProgramOutput {
@@ -577,8 +629,13 @@ where
     let cannot_run = |error: &dyn std::fmt::Display| GitError::Failed(format!("cannot run {name}: {error}"));
     let job = call_job(false).map_err(|error| cannot_run(&error))?;
     let launch = spawn.launch.as_ref().map_err(|error| cannot_run(error))?;
+    let opening = call.launch_guard.map(|guard| guard.open(name)).transpose()?;
     let (suspended, out_pipe, err_pipe, in_pipe) = launched(launch, &job, call.stdin.is_some()).map_err(|error| cannot_run(&error))?;
+    if let Some(hold) = opening.as_ref().and_then(|opening| opening.hold) {
+        thread::sleep(hold);
+    }
     let running = suspended.assign_and_resume(&job).map_err(|error| cannot_run(&error))?;
+    drop(opening);
     let output = reading(out_pipe, stdout);
     let errors = reading(err_pipe, stderr);
     // The feed writes on a thread of its own so this thread keeps watching the limit, the interrupt and the output
@@ -811,6 +868,9 @@ pub(crate) struct Call<'a> {
     /// What git reads on its standard input, written whole and then closed so git reaches its end; with none, its
     /// standard input is `NUL`.
     pub stdin: Option<&'a [u8]>,
+    /// The guard held from before git is created suspended until it is resumed in its job, for a call whose caller may
+    /// let the process end while it runs; `None` for every call whose caller waits for it.
+    pub launch_guard: Option<&'a LaunchGuard>,
 }
 
 impl<'a> Call<'a> {
@@ -834,6 +894,7 @@ impl<'a> Call<'a> {
             interrupt: None,
             console: PipedConsole::Attached,
             stdin: None,
+            launch_guard: None,
         }
     }
 
@@ -1058,9 +1119,9 @@ mod tests {
     use jiff::Timestamp;
 
     use super::{
-        Call, DRAIN, ERRORS_KEPT, FAILURE_BYTES, GIT_LIMIT, Git, GitError, NO_CURRENT_FOLDER, OUTPUT_CAP, ProgramCall, ProgramPlace, capped,
-        failed_line, failure_text, is_indexed_config, late_git_line, program_call, program_output, received_or_interrupted, sdk_listing, tail,
-        without_verbatim,
+        Call, DRAIN, ERRORS_KEPT, FAILURE_BYTES, GIT_LIMIT, Git, GitError, LaunchGuard, NO_CURRENT_FOLDER, OUTPUT_CAP, ProgramCall, ProgramPlace,
+        capped, failed_line, failure_text, is_indexed_config, late_git_line, program_call, program_output, received_or_interrupted, sdk_listing,
+        tail, without_verbatim,
     };
     use crate::environment::Variables;
     use crate::remote::snapshot::repository;
@@ -1633,6 +1694,7 @@ mod tests {
             worktrees: &[],
             console: PipedConsole::Hidden,
             stdin: None,
+            launch_guard: None,
         };
         let bounds = program_call(Path::new(r"C:\work\app"), &call);
         assert_eq!(bounds.drain, Duration::from_secs(600));
@@ -1641,6 +1703,27 @@ mod tests {
             Duration::from_secs(600),
             "a program call's readers keep the drain it was given once the program exits by itself"
         );
+    }
+
+    /// A call under a launch guard already closed starts no program: it fails saying the gate is ending.
+    #[test]
+    fn a_call_under_a_closed_launch_guard_starts_nothing() {
+        let guard = LaunchGuard::new(None);
+        guard.close();
+        let place = ProgramPlace::new(Variables::from_process()).expect("the system folder can be read");
+        let call = ProgramCall {
+            program: "cmd",
+            args: &["/d", "/c", "exit 0"],
+            limit: HANG_GUARD,
+            drain: DRAIN,
+            interrupt: None,
+            worktrees: &[],
+            console: PipedConsole::Hidden,
+            stdin: None,
+            launch_guard: Some(&guard),
+        };
+        let failed = program_output(&call, &place).err().map(String::from);
+        assert_eq!(failed.as_deref(), Some("cannot run cmd: the gate is ending"));
     }
 
     #[test]
@@ -1709,6 +1792,7 @@ mod tests {
             worktrees: &[Path::new(env!("CARGO_MANIFEST_DIR"))],
             console: PipedConsole::Hidden,
             stdin: None,
+            launch_guard: None,
         };
 
         let output = program_output(&call, &place).expect("the link runs").expect("the link is found");

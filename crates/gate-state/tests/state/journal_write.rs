@@ -161,6 +161,7 @@ fn release(facts: Option<RunFacts>) -> JournalEvent {
         facts,
         trace: RunTrace::default(),
         cold: false,
+        path: None,
     }
 }
 
@@ -394,6 +395,57 @@ fn a_critical_take_line_puts_its_snapshot_after_waited_seconds_and_before_abando
     assert_eq!(parsed(&failed)["snapshotError"], "cannot read the claims");
 }
 
+/// A routed release line's Tailscale path is written after `cold`, before the remote tag's fields, and a release whose
+/// path is unknown has no `path` key.
+#[test]
+fn a_routed_release_line_puts_the_tailscale_path_after_cold() {
+    let release = |path: Option<&str>| JournalEvent::Release {
+        slots: vec![REMOTE_SLOT.to_owned()],
+        held_seconds: 12.558,
+        status: Some(0),
+        facts: None,
+        trace: RunTrace::default(),
+        cold: true,
+        path: path.map(str::to_owned),
+    };
+    let relayed = journal_line(&identity(), ts(NOW), &release(Some("derp:fra")), Some(&tag()), None);
+    let unknown = journal_line(&identity(), ts(NOW), &release(None), Some(&tag()), None);
+
+    assert_eq!(
+        own_keys(&relayed),
+        [
+            "slots",
+            "heldSeconds",
+            "status",
+            "wallSeconds",
+            "adjustedSeconds",
+            "verdict",
+            "cold",
+            "path",
+            "remote",
+            "host",
+            "key"
+        ]
+    );
+    assert_eq!(parsed(&relayed)["path"], "derp:fra");
+    assert_eq!(
+        own_keys(&unknown),
+        [
+            "slots",
+            "heldSeconds",
+            "status",
+            "wallSeconds",
+            "adjustedSeconds",
+            "verdict",
+            "cold",
+            "remote",
+            "host",
+            "key"
+        ],
+        "an unknown path writes no key"
+    );
+}
+
 #[test]
 fn a_routed_release_line_puts_the_remote_fields_after_the_verdict() {
     let release = |cold: bool| JournalEvent::Release {
@@ -410,6 +462,7 @@ fn a_routed_release_line_puts_the_remote_fields_after_the_verdict() {
         }),
         trace: RunTrace::default(),
         cold,
+        path: None,
     };
     let line = journal_line(&identity(), ts(NOW), &release(false), Some(&tag()), None);
     let cold = journal_line(&identity(), ts(NOW), &release(true), Some(&tag()), None);
@@ -735,6 +788,7 @@ fn seconds_round_to_three_decimals() {
             }),
             trace: RunTrace::default(),
             cold: false,
+            path: None,
         },
         None,
         None,
@@ -864,6 +918,7 @@ fn a_release_s_trace_is_written_after_the_verdict_and_before_cold() {
         facts: Some(facts),
         trace: full_trace(),
         cold: true,
+        path: None,
     };
     let released = journal_line(&identity(), ts(NOW), &event, None, None);
 

@@ -54,6 +54,7 @@ mod run;
 mod slots;
 mod stop_tree;
 mod stopping;
+mod tailscale;
 #[cfg(test)]
 mod test_support;
 mod trace;

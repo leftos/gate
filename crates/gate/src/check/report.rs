@@ -1,16 +1,18 @@
 //! What `gate check` says, as a pure function of where it looked ([`At`]) and what it found ([`Checked`]): a header, a
 //! builder's created folders, each item's line in the order manifest tools, the .NET SDK, workloads, the routing file's
-//! `siblings` problem, siblings, the warm-up's items (`warm-up: ...`), an install hint per missing or too-old item, then
-//! a summary, all prefixed `check: <where>: ` (`install: <where>: ` for a hint), `<where>` being `here` for this PC and
-//! the host for a builder, and the problems of the `.gate` files on stderr as `check: .gate/<file>: <problem>`. A
-//! builder's hints are commands that work over ssh, and its SDK line names the builder. The exit status is 0 only when
-//! nothing is missing or too old: a skipped item, and a warm-up line that only informs, never fails the check.
+//! `siblings` problem, siblings, the warm-up's items (`warm-up: ...`), a builder's Tailscale path
+//! (`tailscale path: ...`), an install hint per missing or too-old item, then a summary, all prefixed `check: <where>: `
+//! (`install: <where>: ` for a hint), `<where>` being `here` for this PC and the host for a builder, and the problems of
+//! the `.gate` files on stderr as `check: .gate/<file>: <problem>`. A builder's hints are commands that work over ssh,
+//! and its SDK line names the builder. The exit status is 0 only when nothing is missing or too old: a skipped item, a
+//! warm-up line that only informs, and a Tailscale path that is not direct never fail the check.
 
 use gate_router::warm::{shown_value, warming_text};
 use gate_router::{SiblingFolder, escaped, spelled};
 
 use crate::answer::FAILED_STATUS;
 use crate::remote::toolchain::{Pin, Pinned, Reported, Standing, ToolNeed, Version, pinned, standing};
+use crate::tailscale::{self, PeerPath};
 
 /// Where the check looked: this PC, or the builder `host`, whose work folder for the repo is `key`.
 #[derive(Clone, Copy, Debug)]
@@ -184,6 +186,8 @@ pub(crate) struct Checked {
     pub siblings_skipped: bool,
     /// The warm-up's items, in order; none when the repo has neither a warm-up file nor `remote.json`'s consent.
     pub warmup: Vec<Warmup>,
+    /// Tailscale's path from this PC to a builder the check reached; `None` for this PC.
+    pub tailscale: Option<tailscale::Found>,
 }
 
 impl Checked {
@@ -356,7 +360,26 @@ fn items(at: At<'_>, checked: &Checked) -> Vec<Item> {
             .filter(|warmup| answered || !matches!(warmup, Warmup::Builder { .. }))
             .map(|warmup| warmup_item(checked, warmup)),
     );
+    if let (At::Builder { host, .. }, Some(found)) = (at, &checked.tailscale) {
+        items.push(tailscale_item(host, found));
+    }
     items
+}
+
+/// The line of Tailscale's path to the builder `host` as `found`: a direct path is ok, and every other path, or a path
+/// that could not be read, is said without counting.
+fn tailscale_item(host: &str, found: &tailscale::Found) -> Item {
+    let (text, kind) = match found {
+        tailscale::Found::Path(PeerPath::Direct) => ("direct".to_owned(), Kind::Ok),
+        tailscale::Found::Path(PeerPath::Derp(region)) => (format!("relayed via DERP ({})", escaped(region)), Kind::Unchecked),
+        tailscale::Found::Path(PeerPath::PeerRelay) => ("relayed via a peer relay".to_owned(), Kind::Unchecked),
+        tailscale::Found::Path(PeerPath::NoPath) => ("no path yet".to_owned(), Kind::Unchecked),
+        tailscale::Found::NotInstalled => ("not checked: tailscale is not installed".to_owned(), Kind::Unchecked),
+        tailscale::Found::NoPeer => (format!("not checked: no tailnet peer matches {}", escaped(host)), Kind::Unchecked),
+        tailscale::Found::Several(word) => (format!("not checked: several tailnet peers match {}", escaped(word)), Kind::Unchecked),
+        tailscale::Found::Failed(why) => (format!("not checked: {}", escaped(why)), Kind::Unchecked),
+    };
+    Item::new(format!("tailscale path: {text}"), kind)
 }
 
 /// The line of a warm-up item of the repo `checked` checks, its warm-up file named as its problem lines name it
@@ -603,8 +626,10 @@ mod tests {
     use gate_router::{FolderId, SiblingFolder};
     use gate_wire::{Probed, build_version};
 
+    use super::{Kind, items};
     use crate::check::local::record_item;
     use crate::remote::toolchain::{Pin, Reported, ToolNeed, Version};
+    use crate::tailscale::{Found as TailscaleFound, PeerPath};
 
     fn need(name: &str, min: Option<&str>) -> ToolNeed {
         ToolNeed {
@@ -653,6 +678,77 @@ mod tests {
             created: Vec::new(),
             siblings_skipped: false,
             warmup: Vec::new(),
+            tailscale: None,
+        }
+    }
+
+    /// Tailscale's path to a builder is said after the warm-up as one item of each wording, a direct path ok and every
+    /// other unchecked; none fails the check or counts in its summary, and this PC says none.
+    #[test]
+    fn the_tailscale_path_to_a_builder_is_one_item_that_never_fails_the_check() {
+        let at = At::Builder {
+            host: "builder-1",
+            key: "app-1a2b3c4d",
+        };
+        for (found, text, kind) in [
+            (TailscaleFound::Path(PeerPath::Direct), "tailscale path: direct", Kind::Ok),
+            (
+                TailscaleFound::Path(PeerPath::Derp("fra".to_owned())),
+                "tailscale path: relayed via DERP (fra)",
+                Kind::Unchecked,
+            ),
+            (
+                TailscaleFound::Path(PeerPath::PeerRelay),
+                "tailscale path: relayed via a peer relay",
+                Kind::Unchecked,
+            ),
+            (TailscaleFound::Path(PeerPath::NoPath), "tailscale path: no path yet", Kind::Unchecked),
+            (
+                TailscaleFound::NotInstalled,
+                "tailscale path: not checked: tailscale is not installed",
+                Kind::Unchecked,
+            ),
+            (
+                TailscaleFound::NoPeer,
+                "tailscale path: not checked: no tailnet peer matches builder-1",
+                Kind::Unchecked,
+            ),
+            (
+                TailscaleFound::Several("build-box.tail0000.ts.net".to_owned()),
+                "tailscale path: not checked: several tailnet peers match build-box.tail0000.ts.net",
+                Kind::Unchecked,
+            ),
+            (
+                TailscaleFound::Failed("tailscale is Stopped".to_owned()),
+                "tailscale path: not checked: tailscale is Stopped",
+                Kind::Unchecked,
+            ),
+            (
+                TailscaleFound::Failed("ssh -G builder-1 exited 255: ssh: bad configuration option".to_owned()),
+                "tailscale path: not checked: ssh -G builder-1 exited 255: ssh: bad configuration option",
+                Kind::Unchecked,
+            ),
+            (
+                TailscaleFound::Failed("tailscale status --json did not answer in 3 s".to_owned()),
+                "tailscale path: not checked: tailscale status --json did not answer in 3 s",
+                Kind::Unchecked,
+            ),
+        ] {
+            let checked = Checked {
+                warmup: vec![Warmup::Builder { warm: true }],
+                tailscale: Some(found),
+                ..checked(Vec::new())
+            };
+            let all = items(at, &checked);
+            let said_items: Vec<(&str, Kind)> = all.iter().map(|item| (item.text.as_str(), item.kind)).collect();
+            assert_eq!(said_items, [("warm-up: the work folder is warm", Kind::Ok), (text, kind)], "{text}");
+            let said = said(at, &checked);
+            assert_eq!(said.lines.last(), Some(&out("check: builder-1: nothing missing")), "{text}");
+            assert_eq!(said.status, 0, "{text}");
+            assert!(
+                items(HERE, &checked).iter().all(|item| !item.text.starts_with("tailscale path")),
+                "this PC says no path: {text}"
+            );
         }
     }
 

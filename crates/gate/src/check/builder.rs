@@ -31,6 +31,7 @@ use crate::remote::{
     CREATED, SSH_FAILED, Warm, install_why, no_box, other_build, root_busy_why, root_why, sdks_of, shell_said, their_version, warm_of,
 };
 use crate::route;
+use crate::tailscale;
 use gate_wire::build_version;
 
 /// How long the builder's call may take before it is ended: the box's tool probes and SDK list take up to 30 s, and
@@ -75,7 +76,14 @@ pub(crate) fn check(request: &CheckRequest, host: &str, console: &mut Console) -
     let bound = request.seams.remote_timeout_ms.map_or(BOUND, Duration::from_millis);
     let drain = request.seams.probe_drain_ms.map_or(launch::DRAIN, Duration::from_millis);
     match asked(&*transport, &builder, &place, bound, drain) {
-        Ok(asked) => {
+        Ok(mut asked) => {
+            // Read just after the preflight's ssh call, while the tailnet peer is active.
+            let reads = tailscale::Reads {
+                worktree: Path::new(&place.root),
+                interrupt: None,
+                launch_guard: None,
+            };
+            asked.checked.tailscale = Some(tailscale::path_to(host, request.seams.tailscale_status.as_deref(), reads));
             let at = At::Builder { host, key: &asked.key };
             super::say(&report::said(at, &asked.checked), console)
         }
@@ -254,6 +262,7 @@ fn called(program: &Program, bound: Duration, drain: Duration, input: &[u8]) -> 
         worktrees: &[],
         console: PipedConsole::Attached,
         stdin: Some(input),
+        launch_guard: None,
     };
     let place = ProgramPlace::new(Variables::from_process()).map_err(Failure::Other)?;
     match git::program_output(&call, &place) {
@@ -418,6 +427,7 @@ impl Answer<'_> {
             created,
             siblings_skipped: siblings.declares,
             warmup: Vec::new(),
+            tailscale: None,
         }
     }
 
