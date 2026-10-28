@@ -381,6 +381,7 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-stall-from-output" => Some(RunOption::Switch(SwitchOption::StallFromOutput)),
         "test-diagnostics-budget-ms" => Some(RunOption::Value(ValueOption::DiagnosticsBudgetMs)),
         "test-interrupt-after-samples" => Some(RunOption::Value(ValueOption::InterruptAfterSamples)),
+        "test-interrupt-from-output" => Some(RunOption::Switch(SwitchOption::InterruptFromOutput)),
         "test-print-request" => Some(RunOption::Switch(SwitchOption::PrintRequest)),
         "test-interrupt-queued" => Some(RunOption::Switch(SwitchOption::InterruptQueued)),
         "test-interrupt-before-key" => Some(RunOption::Switch(SwitchOption::InterruptBeforeKey)),

@@ -92,10 +92,14 @@ pub(crate) struct Watcher<'a> {
     /// The milliseconds a gathering of the kill's diagnostics may take before it is cut
     /// (`--test-diagnostics-budget-ms`), the gate's own budget unless the suite sets one.
     diagnostics_budget_ms: u128,
-    /// The samples taken so far, which `--test-interrupt-after-samples` counts.
+    /// The samples `--test-interrupt-after-samples` counts: every one taken so far, or under
+    /// `--test-interrupt-from-output` those from the first that saw the command's output on.
     samples: u64,
     /// After how many samples the gate raises the interrupt itself (`--test-interrupt-after-samples`).
     interrupt_after: Option<u64>,
+    /// Whether the samples the interrupt counts still wait for the command's first output byte
+    /// (`--test-interrupt-from-output`): cleared by the first sample that sees it.
+    interrupt_awaits_output: bool,
     vm: VmReader<VmRead>,
     /// The pause markers of the gates under this one: a gate under it waiting behind a critical request is the run's
     /// progress.
@@ -270,6 +274,7 @@ impl<'a> Watcher<'a> {
             diagnostics_budget_ms: request.test_seams.diagnostics_budget_ms.map_or(DIAGNOSTICS_BUDGET_MS, u128::from),
             samples: 0,
             interrupt_after: request.test_seams.interrupt_after_samples,
+            interrupt_awaits_output: request.test_seams.interrupt_from_output,
             vm,
             pause: PauseReader::new(root, gate, hands_on),
             late,
@@ -340,7 +345,9 @@ impl<'a> Watcher<'a> {
             }
             self.take_sample(console);
             self.sampled = Instant::now();
-            self.samples += 1;
+            if !self.interrupt_awaits_output {
+                self.samples += 1;
+            }
             if let Some(interrupt) = self.interrupt.filter(|_| self.interrupt_after == Some(self.samples)) {
                 interrupt.raise();
             }
@@ -462,6 +469,9 @@ impl<'a> Watcher<'a> {
                 // Only a sample that came back whole becomes the one the command's end reads again; one that failed
                 // part way leaves the last good sample's processes in place.
                 self.counted_escaped = sample.escaped.keys().copied().collect();
+                if sample.output_size > 0 {
+                    self.interrupt_awaits_output = false;
+                }
                 self.watch.sample(&sample);
                 self.record(&sample, out_bytes, err_bytes, vm_failed);
             }

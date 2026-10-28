@@ -357,6 +357,9 @@ pub struct TestSeams {
     pub diagnostics_budget_ms: Option<u64>,
     /// Raise the console interrupt after this many samples of the running command.
     pub interrupt_after_samples: Option<u64>,
+    /// Whether the samples `interrupt_after_samples` counts start at the first one that sees the command's output, so
+    /// the interrupt follows what the command wrote first.
+    pub interrupt_from_output: bool,
     /// Raise the console interrupt once the gate has said it is waiting for a slot.
     pub interrupt_queued: bool,
     /// Raise the console interrupt just before a routed run's zero-wait take of its work folder's key.
