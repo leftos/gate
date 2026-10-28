@@ -1,7 +1,8 @@
 //! The hidden `gate box <verb> --stdin`: the builder side of a routed run. Only the words are read here; the request
 //! is stdin's first line, which the binary reads and decodes. `gate box register-desktop` takes no `--stdin`: it reads
 //! no request; nor does `gate box prune --root <folder> [--keys <key>...]`, whose words are its root and the keys it
-//! removes. A `test-seams` build also reads the hidden
+//! removes, nor `gate box hold --root <root> --holder <text> --ceiling <seconds> [--wait <seconds>] -- <command>
+//! [args...]`, whose words are all it takes. A `test-seams` build also reads the hidden `--test-box-hold-poll-ms <n>`,
 //! `--test-heartbeat-ms <n>`, `--test-box-console fail-before`, `--test-box-token refused`, `--test-box-park-launch <path>`,
 //! `--test-outputs-budget-bytes <n>`, `--test-box-failure-cap-bytes <n>` (the Windows box's alone: the Unix box always
 //! holds failure outputs to the built-in caps), `--test-inputs-budget-bytes <n>`, `--test-lfs-budget-bytes <n>`,
@@ -20,7 +21,7 @@ use std::iter::Peekable;
 use std::path::PathBuf;
 
 use crate::problem::Problem;
-use crate::request::{BoxRequest, BoxSeams, BoxVerb};
+use crate::request::{BoxRequest, BoxSeams, BoxVerb, HoldRequest};
 
 /// The one word after the verb: the request is stdin's first line, never a word.
 const STDIN: &str = "--stdin";
@@ -30,6 +31,16 @@ const ROOT: &str = "--root";
 const KEYS: &str = "--keys";
 /// The most keys one keyed `prune` takes.
 const MOST_KEYS: usize = 50;
+/// The word before a `hold`'s holder text.
+const HOLDER: &str = "--holder";
+/// The word before a `hold`'s ceiling.
+const CEILING: &str = "--ceiling";
+/// The word before a `hold`'s wait for a slot.
+const WAIT: &str = "--wait";
+/// The word after a `hold`'s options, before its command.
+const COMMAND: &str = "--";
+/// The longest ceiling and wait a `hold` takes, in seconds: seven days.
+const MOST_HOLD_SECONDS: u64 = 604_800;
 
 /// The values `--test-box-register` takes: the registration succeeds, or fails as the seam refusing.
 #[cfg(feature = "test-seams")]
@@ -44,20 +55,30 @@ pub(crate) fn parse(words: impl Iterator<Item = OsString>) -> Result<BoxRequest,
     let mut problems = Vec::new();
     let seams = seams(&mut words, &mut problems);
     let verb = words.next().as_deref().and_then(OsStr::to_str).and_then(verb);
-    let (closed, root, keys) = match verb {
+    let (closed, root, keys, hold) = match verb {
         Some(BoxVerb::Prune) => match (words.next(), words.next()) {
             (Some(flag), Some(root)) if flag == ROOT => match prune_keys(&mut words) {
-                Some(keys) => (true, Some(PathBuf::from(root)), keys),
-                None => (false, None, Vec::new()),
+                Some(keys) => (true, Some(PathBuf::from(root)), keys, None),
+                None => (false, None, Vec::new(), None),
             },
-            _ => (false, None, Vec::new()),
+            _ => (false, None, Vec::new(), None),
+        },
+        Some(BoxVerb::Hold) => match hold_words(&mut words) {
+            Some((root, hold)) => (true, Some(root), Vec::new(), Some(hold)),
+            None => (false, None, Vec::new(), None),
         },
         // A verb that reads no request must have no word after it, which stands where `--stdin` stands for the others.
-        Some(verb) if !verb.takes_request() => (words.peek().is_none(), None, Vec::new()),
-        _ => (words.next().is_some_and(|word| word == STDIN), None, Vec::new()),
+        Some(verb) if !verb.takes_request() => (words.peek().is_none(), None, Vec::new(), None),
+        _ => (words.next().is_some_and(|word| word == STDIN), None, Vec::new(), None),
     };
     match (verb, closed, words.next()) {
-        (Some(verb), true, None) if problems.is_empty() => Ok(BoxRequest { verb, seams, root, keys }),
+        (Some(verb), true, None) if problems.is_empty() => Ok(BoxRequest {
+            verb,
+            seams,
+            root,
+            keys,
+            hold,
+        }),
         (Some(_), true, None) => Err(problems),
         _ => {
             problems.push(Problem::BoxUsage);
@@ -97,6 +118,52 @@ fn is_key_word(word: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
+/// The words of a `hold` after its verb: `--root`, `--holder` and `--ceiling`, each with its value, and `--wait` with
+/// its own, in any order and each once, then `--` and its command, at least one word, every word after `--` kept as
+/// given. The root is a word that is not empty, the holder any Unicode word (the box judges it), the ceiling whole
+/// seconds above 0 and the wait whole seconds, 0 when not given, both at most [`MOST_HOLD_SECONDS`]. `None` for any
+/// other words, which is the box usage.
+fn hold_words(words: &mut impl Iterator<Item = OsString>) -> Option<(PathBuf, HoldRequest)> {
+    let (mut root, mut holder, mut ceiling, mut wait) = (None, None, None, None);
+    loop {
+        let flag = words.next()?;
+        if flag == COMMAND {
+            break;
+        }
+        let value = words.next()?;
+        let first = match flag.to_str()? {
+            ROOT if !value.is_empty() => root.replace(PathBuf::from(value)).is_none(),
+            HOLDER => holder.replace(value.into_string().ok()?).is_none(),
+            CEILING => ceiling.replace(seconds(&value).filter(|seconds| *seconds > 0)?).is_none(),
+            WAIT => wait.replace(seconds(&value)?).is_none(),
+            _ => return None,
+        };
+        if !first {
+            return None;
+        }
+    }
+    let command: Vec<OsString> = words.collect();
+    if command.is_empty() {
+        return None;
+    }
+    let hold = HoldRequest {
+        holder: holder?,
+        ceiling: ceiling?,
+        wait: wait.unwrap_or(0),
+        command,
+    };
+    Some((root?, hold))
+}
+
+/// The whole seconds `word` gives: ASCII digits alone, at least one, at most [`MOST_HOLD_SECONDS`].
+fn seconds(word: &OsStr) -> Option<u64> {
+    let text = word.to_str()?;
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok().filter(|seconds| *seconds <= MOST_HOLD_SECONDS)
+}
+
 fn verb(text: &str) -> Option<BoxVerb> {
     match text {
         "preflight" => Some(BoxVerb::Preflight),
@@ -110,6 +177,7 @@ fn verb(text: &str) -> Option<BoxVerb> {
         "register-desktop" => Some(BoxVerb::RegisterDesktop),
         "prune" => Some(BoxVerb::Prune),
         "drain" => Some(BoxVerb::Drain),
+        "hold" => Some(BoxVerb::Hold),
         _ => None,
     }
 }
@@ -181,6 +249,8 @@ enum Seam {
     /// `--test-box-git-armed-by <path>`: the bound `--test-box-git-limit` gives its step starts only once this file
     /// exists.
     GitArmedBy,
+    /// `--test-box-hold-poll-ms <n>`: how long `hold` waits between its looks for a free slot, in milliseconds.
+    HoldPollMs,
 }
 
 #[cfg(feature = "test-seams")]
@@ -218,6 +288,7 @@ impl Seam {
             "--test-box-root-walk-stop" => Some(Seam::RootWalkStop),
             "--test-box-git-limit" => Some(Seam::GitLimit),
             "--test-box-git-armed-by" => Some(Seam::GitArmedBy),
+            "--test-box-hold-poll-ms" => Some(Seam::HoldPollMs),
             _ => None,
         }
     }
@@ -254,6 +325,7 @@ impl Seam {
             Seam::RootWalkStop => "--test-box-root-walk-stop",
             Seam::GitLimit => "--test-box-git-limit",
             Seam::GitArmedBy => "--test-box-git-armed-by",
+            Seam::HoldPollMs => "--test-box-hold-poll-ms",
         }
     }
 }
@@ -319,6 +391,7 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::FreePercent => seams.free_percent = Some(crate::values::in_range(name, &value, 1, 100)?),
         Seam::DrainLeaseMs => seams.drain_lease_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::DrainLapseMs => seams.drain_lapse_ms = Some(crate::values::above_zero(name, &value)?),
+        Seam::HoldPollMs => seams.hold_poll_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::Now => seams.now = Some(crate::values::above_zero(name, &value)?),
         Seam::DrainReadableOnly => {
             seams.drain_readable_only = if crate::values::true_or_false(name, &value)? {

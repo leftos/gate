@@ -241,7 +241,8 @@ impl fmt::Display for Problem {
             Problem::Unreadable(lossy) => write!(f, "gate: cannot read the argument {lossy}"),
             Problem::BoxUsage => f.write_str(concat!(
                 "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs|drain --stdin (the base64 JSON request as stdin's first line)\n",
-                "       gate box prune --root <folder> [--keys <key>...]",
+                "       gate box prune --root <folder> [--keys <key>...]\n",
+                "       gate box hold --root <root> --holder <text> --ceiling <seconds> [--wait <seconds>] -- <command> [args...]",
             )),
             Problem::SeamNeeds { option, needs } => write!(f, "gate: {option} needs {needs}"),
             Problem::AloneNeedsCritical(Spelling::Cli) => f.write_str("gate: --alone needs --slot critical"),

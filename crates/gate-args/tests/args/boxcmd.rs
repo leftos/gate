@@ -5,14 +5,171 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation, USAGE};
+use gate_args::{BoxRequest, BoxSeams, BoxVerb, HoldRequest, Invocation, USAGE};
 
 use crate::support::{invocation, os, problems, problems_of, unreadable_word};
 
 const BOX_USAGE: &str = concat!(
     "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs|drain --stdin (the base64 JSON request as stdin's first line)\n",
-    "       gate box prune --root <folder> [--keys <key>...]",
+    "       gate box prune --root <folder> [--keys <key>...]\n",
+    "       gate box hold --root <root> --holder <text> --ceiling <seconds> [--wait <seconds>] -- <command> [args...]",
 );
+
+/// The hold of a slot under `C:\x` by `ci 7` for a ceiling of 60 s and a wait of `wait` s, running `command`.
+fn held(wait: u64, command: &[&str]) -> Invocation {
+    held_with(BoxSeams::default(), wait, command.iter().map(OsString::from).collect())
+}
+
+/// [`held`] with the seams `seams` and the command words `command`.
+fn held_with(seams: BoxSeams, wait: u64, command: Vec<OsString>) -> Invocation {
+    Invocation::Box(BoxRequest {
+        verb: BoxVerb::Hold,
+        seams,
+        root: Some(PathBuf::from(r"C:\x")),
+        keys: Vec::new(),
+        hold: Some(HoldRequest {
+            holder: "ci 7".to_owned(),
+            ceiling: 60,
+            wait,
+            command,
+        }),
+    })
+}
+
+/// `gate box hold` with `options`, then `--` and `command`.
+fn hold_words<'a>(options: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
+    let mut words = vec!["box", "hold"];
+    words.extend_from_slice(options);
+    words.push("--");
+    words.extend_from_slice(command);
+    words
+}
+
+#[test]
+fn hold_parses_its_options_in_any_order_and_keeps_every_word_after_the_boundary() {
+    let options = ["--root", r"C:\x", "--holder", "ci 7", "--ceiling", "60"];
+    assert_eq!(
+        invocation(&hold_words(&options, &["pwsh", "-File", "run.ps1"])),
+        held(0, &["pwsh", "-File", "run.ps1"])
+    );
+    assert_eq!(
+        invocation(&hold_words(
+            &["--ceiling", "60", "--wait", "300", "--holder", "ci 7", "--root", r"C:\x"],
+            &["a"]
+        )),
+        held(300, &["a"]),
+        "any order, and the wait"
+    );
+    assert_eq!(
+        invocation(&hold_words(&options, &["--", "--root", "--stdin", "-x", ""])),
+        held(0, &["--", "--root", "--stdin", "-x", ""]),
+        "after the boundary every word is the command's, as given"
+    );
+    assert_eq!(
+        invocation(&hold_words(
+            &["--root", r"C:\x", "--holder", "ci 7", "--ceiling", "60", "--wait", "0"],
+            &["a"]
+        )),
+        held(0, &["a"]),
+        "a wait of 0 is no wait"
+    );
+    assert_eq!(
+        invocation(&hold_words(
+            &["--root", r"C:\x", "--holder", "ci 7", "--ceiling", "604800", "--wait", "604800"],
+            &["a"]
+        )),
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Hold,
+            seams: BoxSeams::default(),
+            root: Some(PathBuf::from(r"C:\x")),
+            keys: Vec::new(),
+            hold: Some(HoldRequest {
+                holder: "ci 7".to_owned(),
+                ceiling: 604_800,
+                wait: 604_800,
+                command: vec![OsString::from("a")],
+            }),
+        }),
+        "seven days is the longest ceiling and wait"
+    );
+    assert_eq!(BoxVerb::Hold.as_str(), "hold", "the verb as the CLI spells it");
+    assert!(!BoxVerb::Hold.takes_request(), "hold reads no request");
+}
+
+/// `parts` joined, in order.
+fn cat<'a>(parts: &[&[&'a str]]) -> Vec<&'a str> {
+    parts.concat()
+}
+
+#[test]
+fn hold_refuses_every_other_shape_as_the_box_usage() {
+    let root = ["--root", r"C:\x"];
+    let holder = ["--holder", "ci 7"];
+    let ceiling = ["--ceiling", "60"];
+    let all = cat(&[&root, &holder, &ceiling]);
+    let refused: Vec<Vec<&str>> = vec![
+        vec!["box", "hold"],
+        vec!["box", "hold", "--stdin"],
+        cat(&[&["box", "hold"], &all]),
+        hold_words(&all, &[]),
+        hold_words(&cat(&[&holder, &ceiling]), &["a"]),
+        hold_words(&cat(&[&root, &ceiling]), &["a"]),
+        hold_words(&cat(&[&root, &holder]), &["a"]),
+        hold_words(&cat(&[&all, &["--root", r"C:\y"]]), &["a"]),
+        hold_words(&cat(&[&all, &["--holder", "again"]]), &["a"]),
+        hold_words(&cat(&[&all, &["--wait", "1", "--wait", "2"]]), &["a"]),
+        hold_words(&cat(&[&root, &holder, &["--ceiling", "0"]]), &["a"]),
+        hold_words(&cat(&[&root, &holder, &["--ceiling", "-5"]]), &["a"]),
+        hold_words(&cat(&[&root, &holder, &["--ceiling", "1.5"]]), &["a"]),
+        hold_words(&cat(&[&root, &holder, &["--ceiling", ""]]), &["a"]),
+        hold_words(&cat(&[&root, &holder, &["--ceiling", "99999999999999999999999"]]), &["a"]),
+        hold_words(&cat(&[&all, &["--wait", "-1"]]), &["a"]),
+        hold_words(&cat(&[&all, &["--wait", "soon"]]), &["a"]),
+        hold_words(&cat(&[&all, &["--wait", "604801"]]), &["a"]),
+        hold_words(&cat(&[&all, &["--wait", "18446744073709551615"]]), &["a"]),
+        hold_words(&cat(&[&root, &holder, &["--ceiling", "604801"]]), &["a"]),
+        hold_words(&cat(&[&["--root", ""], &holder, &ceiling]), &["a"]),
+        hold_words(&cat(&[&all, &["--keys", "k"]]), &["a"]),
+        hold_words(&cat(&[&all, &["extra"]]), &["a"]),
+        hold_words(&[r"--root=C:\x", "--holder", "ci 7", "--ceiling", "60"], &["a"]),
+        hold_words(&["--ROOT", r"C:\x", "--holder", "ci 7", "--ceiling", "60"], &["a"]),
+        vec!["box", "hold", "--root", r"C:\x", "--holder", "ci 7", "--ceiling"],
+        vec!["box", "Hold", "--root", r"C:\x", "--holder", "ci 7", "--ceiling", "60", "--", "a"],
+    ];
+    for words in &refused {
+        assert_eq!(problems(words), [BOX_USAGE], "{words:?}");
+    }
+    let mut unreadable = os(&["box", "hold", "--root", r"C:\x", "--holder"]);
+    unreadable.push(unreadable_word());
+    unreadable.extend(os(&["--ceiling", "60", "--", "a"]));
+    assert_eq!(problems_of(unreadable), [BOX_USAGE], "a holder that is not Unicode");
+}
+
+#[test]
+fn hold_passes_a_command_word_that_is_not_unicode_as_given() {
+    let mut words = os(&hold_words(&["--root", r"C:\x", "--holder", "ci 7", "--ceiling", "60"], &["a"]));
+    words.push(unreadable_word());
+    assert_eq!(
+        gate_args::parse(words).expect("the hold parses"),
+        held_with(BoxSeams::default(), 0, vec![OsString::from("a"), unreadable_word()])
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn hold_takes_the_poll_seam_before_its_verb() {
+    let mut words = vec!["box", "--test-box-hold-poll-ms", "20"];
+    words.extend_from_slice(&hold_words(&["--root", r"C:\x", "--holder", "ci 7", "--ceiling", "60"], &["a"])[1..]);
+    let seams = BoxSeams {
+        hold_poll_ms: Some(20),
+        ..BoxSeams::default()
+    };
+    assert_eq!(invocation(&words), held_with(seams, 0, vec![OsString::from("a")]));
+    words[2] = "0";
+    let refused = problems(&words);
+    assert_eq!(refused.len(), 1, "a poll of 0 is refused: {refused:?}");
+    assert!(refused[0].contains("--test-box-hold-poll-ms"), "{refused:?}");
+}
 
 #[test]
 fn each_verb_parses_with_stdin() {
@@ -33,6 +190,7 @@ fn each_verb_parses_with_stdin() {
                 seams: BoxSeams::default(),
                 root: None,
                 keys: Vec::new(),
+                hold: None,
             }),
             "{word}"
         );
@@ -53,6 +211,7 @@ fn prune_parses_its_root_and_refuses_any_other_shape() {
             seams: BoxSeams::default(),
             root: Some(PathBuf::from(r"C:\x")),
             keys: Vec::new(),
+            hold: None,
         })
     );
     assert_eq!(BoxVerb::Prune.as_str(), "prune", "the verb as the CLI spells it");
@@ -84,6 +243,7 @@ fn keyed(keys: &[&str]) -> Invocation {
         seams: BoxSeams::default(),
         root: Some(PathBuf::from(r"C:\x")),
         keys: keys.iter().map(|key| (*key).to_owned()).collect(),
+        hold: None,
     })
 }
 
@@ -184,6 +344,7 @@ fn box_takes_the_inflight_verb() {
             seams: BoxSeams::default(),
             root: None,
             keys: Vec::new(),
+            hold: None,
         })
     );
     assert_eq!(BoxVerb::Inflight.as_str(), "inflight", "the verb as the CLI spells it");
@@ -199,6 +360,7 @@ fn register_desktop_parses_alone_and_refuses_stdin_or_another_word() {
             seams: BoxSeams::default(),
             root: None,
             keys: Vec::new(),
+            hold: None,
         })
     );
     assert_eq!(BoxVerb::RegisterDesktop.as_str(), "register-desktop", "the verb as the CLI spells it");

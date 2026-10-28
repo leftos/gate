@@ -48,11 +48,14 @@ pub enum Invocation {
 pub struct BoxRequest {
     pub verb: BoxVerb,
     pub seams: BoxSeams,
-    /// The builder root `prune` sweeps, the word after its `--root`; `None` for every other verb.
+    /// The builder root `prune` sweeps or `hold` takes a slot under, the word after its `--root`; `None` for every
+    /// other verb.
     pub root: Option<PathBuf>,
     /// The keys a keyed `prune` removes, the words after its `--keys`, each once in any case as first spelled, in the order given; empty for the
     /// age prune and every other verb.
     pub keys: Vec<String>,
+    /// What `hold` holds a slot for; `None` for every other verb.
+    pub hold: Option<HoldRequest>,
 }
 
 /// What the black-box suite sets on `gate box` through the hidden `--test-*` flags given before the verb; each field
@@ -144,6 +147,23 @@ pub struct BoxSeams {
     /// The file whose existence starts the bound of the git step `--test-box-git-limit` names; `None` without the
     /// feature, and every bound starts with its step.
     pub git_armed_by: Option<PathBuf>,
+    /// How long `gate box hold` waits between its looks for a free slot, in milliseconds, in place of the built-in
+    /// 5 s; `None` without the feature.
+    pub hold_poll_ms: Option<u64>,
+}
+
+/// What `gate box hold` holds a builder slot for: its holder's text, its ceiling and its wait for a slot, both in
+/// seconds, and the command it runs while it holds the slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HoldRequest {
+    /// The holder's text, the word after `--holder`, judged by the box.
+    pub holder: String,
+    /// The seconds after which the hold ends its command, above 0.
+    pub ceiling: u64,
+    /// The seconds the hold waits for a free slot; 0, the default, for none.
+    pub wait: u64,
+    /// The command and its arguments, every word after `--`, at least one.
+    pub command: Vec<OsString>,
 }
 
 /// A fault `--test-box-desktop` makes the box's desktop run take, in place of the real task start and helper.
@@ -242,6 +262,8 @@ pub enum BoxVerb {
     Prune,
     /// The builder's drain barrier: raised or raised again, read, or lifted, as the request's `Action` says.
     Drain,
+    /// One of the builder's own slots, held while a command runs; it takes no request, only its words.
+    Hold,
 }
 
 impl BoxVerb {
@@ -260,14 +282,15 @@ impl BoxVerb {
             BoxVerb::RegisterDesktop => "register-desktop",
             BoxVerb::Prune => "prune",
             BoxVerb::Drain => "drain",
+            BoxVerb::Hold => "hold",
         }
     }
 
     /// Whether the verb reads a request, as stdin's first line, after the word `--stdin`: every verb but
-    /// `register-desktop` and `prune`.
+    /// `register-desktop`, `prune` and `hold`.
     #[must_use]
     pub fn takes_request(self) -> bool {
-        !matches!(self, BoxVerb::RegisterDesktop | BoxVerb::Prune)
+        !matches!(self, BoxVerb::RegisterDesktop | BoxVerb::Prune | BoxVerb::Hold)
     }
 }
 

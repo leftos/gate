@@ -5235,11 +5235,18 @@ fn install_refused(host: &str, called: &Called) -> Option<String> {
 
 /// How the preflight call `called` to the builder `host` under `root` ends the attempt, a kill ruled out first by its
 /// caller: the drain's refusal, read before anything else the box said, its version line included; then a refusal
-/// of its install or work root, a failed connection, a builder with no `gate box`, any other status, and a builder of
+/// tag with the refusal's status, `full` a builder whose own slots are all held; then a refusal of its install or work
+/// root, a failed connection, a builder with no `gate box`, any other status, and a builder of
 /// another version, each with the line to say. `Ok` for a preflight that passed.
 fn preflight_ended(host: &str, root: &str, called: &Called) -> Result<(), (Option<String>, End)> {
     if let Some(drain) = called.draining() {
         return Err((None, End::Draining(drain)));
+    }
+    // A refusal tag, read as the run call reads one: the box said its own line after it.
+    if let Some(reason) = called.refusal()
+        && i64::from(called.status) == REFUSED
+    {
+        return Err((None, End::Refused(reason)));
     }
     if let Some((line, reason)) = preflight_refusal(host, called) {
         return Err((Some(line), End::Refused(reason)));
@@ -5362,7 +5369,7 @@ enum Protocol {
     Adjusted(f64),
 }
 
-/// The start marker, the nine refusal tags, the two kill tags and the adjusted line's prefix of one call, made once for
+/// The start marker, the ten refusal tags, the two kill tags and the adjusted line's prefix of one call, made once for
 /// its readers, and whether the call is the run call, whose readers mark its progress per line.
 struct ProtocolLines {
     run_call: bool,
@@ -5376,6 +5383,7 @@ struct ProtocolLines {
     desktop: String,
     install: String,
     lfs: String,
+    full: String,
     timed_out: String,
     backstop: String,
     adjusted: String,
@@ -5404,6 +5412,7 @@ impl ProtocolLines {
             desktop: refused_line(nonce, Refusal::Desktop),
             install: refused_line(nonce, Refusal::Install),
             lfs: refused_line(nonce, Refusal::Lfs),
+            full: refused_line(nonce, Refusal::Full),
             timed_out: killed_line(nonce, BoxKill::TimedOut),
             backstop: killed_line(nonce, BoxKill::Backstop),
             adjusted: adjusted_prefix(nonce),
@@ -5424,6 +5433,7 @@ impl ProtocolLines {
             (&self.desktop, Protocol::Refused(FallbackReason::Desktop)),
             (&self.install, Protocol::Refused(FallbackReason::Install)),
             (&self.lfs, Protocol::Refused(FallbackReason::Lfs)),
+            (&self.full, Protocol::Refused(FallbackReason::Full)),
             (&self.drain, Protocol::Drain),
             (&self.timed_out, Protocol::Killed(BoxKill::TimedOut)),
             (&self.backstop, Protocol::Killed(BoxKill::Backstop)),
@@ -7566,8 +7576,11 @@ mod tests {
         let tools_tag = refused_line(NONCE, Refusal::Tools);
         let marker = started_line(NONCE);
         let other = refused_line("fedcba9876543210fedcba9876543210", Refusal::Busy);
-        let cases: [(&str, String, String, Option<FallbackReason>); 10] = [
+        let full_tag = refused_line(NONCE, Refusal::Full);
+        let full = gate_wire::slots::full_line(2, 2);
+        let cases: [(&str, String, String, Option<FallbackReason>); 11] = [
             ("busy", String::new(), format!("{busy_tag}\n{busy}\n"), Some(FallbackReason::Busy)),
+            ("full", String::new(), format!("{full_tag}\n{full}\n"), Some(FallbackReason::Full)),
             (
                 "busy-crlf",
                 String::new(),
@@ -7683,6 +7696,26 @@ mod tests {
                 Err((Some(_), End::Refused(FallbackReason::Version)))
             ),
             "without the tag the version is refused"
+        );
+    }
+
+    #[test]
+    fn a_preflight_refused_full_ends_refused_full_so_the_run_goes_to_the_next_builder() {
+        let version = format!("{VERSION}{}\n", gate_wire::build_version());
+        let full = format!("{}\n{}\n", refused_line(NONCE, Refusal::Full), gate_wire::slots::full_line(1, 1));
+        let (refused, _) = run_call_ended(&version, &full, 75, "preflight-full");
+        assert!(
+            matches!(
+                preflight_ended("builder", r"C:\builder", &refused),
+                Err((None, End::Refused(FallbackReason::Full)))
+            ),
+            "a full builder's preflight is refused for its slots"
+        );
+
+        let (failed, _) = run_call_ended(&version, &full, 1, "preflight-full-status-1");
+        assert!(
+            matches!(preflight_ended("builder", r"C:\builder", &failed), Err((Some(_), End::Status(1)))),
+            "the tag counts only with the refusal's status"
         );
     }
 

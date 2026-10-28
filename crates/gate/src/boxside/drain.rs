@@ -155,7 +155,7 @@ fn open_lines() -> Vec<String> {
 /// The drain lock `path`: opened for reading and writing, made when missing, shared with no one, never through a link,
 /// and only as a plain disk file, as the work folder's lock is opened. An open another handle refuses is tried again
 /// every [`LOCK_STEP`] until [`LOCK_RETRY`] has passed; else why not.
-fn take_drain_lock(path: &Path) -> Result<File, String> {
+pub(super) fn take_drain_lock(path: &Path) -> Result<File, String> {
     let begun = Instant::now();
     loop {
         match lock_opened(path) {
@@ -187,8 +187,8 @@ fn lock_opened(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-/// Why the drain could not `what` the file or folder `path`.
-fn cannot(what: &str, path: &Path, error: &io::Error) -> String {
+/// Why the box could not `what` the file or folder `path`.
+pub(super) fn cannot(what: &str, path: &Path, error: &io::Error) -> String {
     format!("cannot {what} {}: {}", escaped(&path.to_string_lossy()), escaped(&error.to_string()))
 }
 
@@ -273,7 +273,7 @@ fn command_jobs(root: &Path, now: SystemTime) -> Result<CommandJobs, String> {
 }
 
 /// The entry `name` beneath `folder`, opened for reading, sharing everything; `None` when nothing has the name.
-fn existing(folder: &File, name: &str) -> io::Result<Option<File>> {
+pub(super) fn existing(folder: &File, name: &str) -> io::Result<Option<File>> {
     match gate_win32::open_beneath(folder, name, Share::All) {
         Ok(found) => Ok(Some(found)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -283,7 +283,7 @@ fn existing(folder: &File, name: &str) -> io::Result<Option<File>> {
 
 /// The text of the file `name` beneath `folder` and the Unix second of its last write; `None` when nothing has the
 /// name.
-fn read_text(folder: &File, name: &str) -> io::Result<Option<(String, u64)>> {
+pub(super) fn read_text(folder: &File, name: &str) -> io::Result<Option<(String, u64)>> {
     let Some(mut file) = existing(folder, name)? else {
         return Ok(None);
     };
@@ -295,7 +295,7 @@ fn read_text(folder: &File, name: &str) -> io::Result<Option<(String, u64)>> {
 
 /// Writes `text` as the whole of the file `name` beneath `folder`: into a new file of `security`, flushed to the disk,
 /// then renamed over `name`, so a reader sees the old text or the new and never part of one.
-fn write_text(folder: &File, name: &str, text: &str, security: &Descriptor) -> io::Result<()> {
+pub(super) fn write_text(folder: &File, name: &str, text: &str, security: &Descriptor) -> io::Result<()> {
     let temporary = format!("{name}.new-{}", std::process::id());
     removed(folder, &temporary)?;
     let access = FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE;
@@ -305,9 +305,29 @@ fn write_text(folder: &File, name: &str, text: &str, security: &Descriptor) -> i
     gate_win32::rename_beneath(&file, folder, name)
 }
 
+/// Whether the file `name` beneath `folder` is held open, shared with no one, by a live process: one that cannot be
+/// deleted for sharing. A dead one is removed.
+pub(super) fn held_open(folder: &File, name: &str) -> io::Result<bool> {
+    match removed(folder, name) {
+        Ok(_) => Ok(false),
+        Err(error) if matches!(error.raw_os_error(), Some(SHARING_VIOLATION | LOCK_VIOLATION)) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// The file `name` beneath `folder`, made with `security` or opened when it exists, for reading and deletion and
+/// shared with no one.
+pub(super) fn held_share_none(folder: &File, name: &str, security: &Descriptor) -> io::Result<File> {
+    let access = FILE_GENERIC_READ | DELETE;
+    match gate_win32::make_file_beneath(folder, name, access, Share::None, security) {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => gate_win32::open_beneath_as(folder, name, access, Share::None, Make::Open),
+        made => made,
+    }
+}
+
 /// Removes the entry `name` beneath `folder` as itself; whether there was one. A file another process holds open
 /// without delete sharing is the system's sharing violation.
-fn removed(folder: &File, name: &str) -> io::Result<bool> {
+pub(super) fn removed(folder: &File, name: &str) -> io::Result<bool> {
     match gate_win32::open_beneath_as(folder, name, DELETE | FILE_READ_ATTRIBUTES, Share::All, Make::Open) {
         Ok(found) => gate_win32::delete_opened(&found).map(|()| true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -470,11 +490,7 @@ impl State<'_> {
     /// Whether the holder `name` is held by a live process: one that cannot be deleted for sharing. A dead one is
     /// removed.
     fn holder_live(&self, folder: &File, name: &str) -> Result<bool, String> {
-        match removed(folder, name) {
-            Ok(_) => Ok(false),
-            Err(error) if matches!(error.raw_os_error(), Some(SHARING_VIOLATION | LOCK_VIOLATION)) => Ok(true),
-            Err(error) => Err(self.cannot("remove", name, &error)),
-        }
+        held_open(folder, name).map_err(|error| self.cannot("remove", name, &error))
     }
 
     /// The session `id` when it is live, judged in this order and the job listed only when nothing before made it live:
@@ -671,6 +687,44 @@ pub(crate) fn admit(
     if session.is_none() && existing(root.held, DRAIN).map_err(|error| cannot("read", &drain_path, &error))?.is_none() {
         return Ok(Ok(Admitted { holder: None }));
     }
+    locked(root, seams, console, |state| {
+        let standing = match state.barrier()? {
+            Barrier::Standing(raised) => Some(raised),
+            Barrier::None | Barrier::Lapsed(_) => None,
+        };
+        let tickets_folder = protected_folder(
+            state.drain,
+            &drain_path.join(TICKETS),
+            FILE_GENERIC_READ,
+            state.security,
+            Leftover::Refuse,
+        )?;
+        let tickets = state.live_tickets_in(&tickets_folder)?;
+        let older = older_live(&tickets, session.map(|session| session.id), |_| true);
+        let live = match session {
+            Some(session) => state.own_session_live(session.id)?,
+            None => false,
+        };
+        match decided(standing, older, session.map(|session| session.id), live) {
+            Ok(()) => registered(state, &tickets_folder, &tickets, session, seams.now).map(Ok),
+            Err(refused) => {
+                if let Some(session) = session
+                    && !no_ticket
+                {
+                    let name = ticket_name(ticket_seq(&tickets, session.id), session.id);
+                    let ticket = json!({ "Session": session.id, "Polled": state.clock.now_s() });
+                    write_text(&tickets_folder, &name, &ticket.to_string(), state.security).map_err(|error| state.cannot("write", &name, &error))?;
+                }
+                Ok(Err(refused))
+            }
+        }
+    })
+}
+
+/// Runs `under` with the drain's files under the root `root` ([`State`]), `drain\` readied ([`ready_drain`]) and its
+/// lock held for the whole of `under`. Else why the drain could not be readied or locked, or `under`'s own error.
+fn locked<T>(root: &HeldRoot<'_>, seams: &BoxSeams, console: &mut Console, under: impl FnOnce(&State<'_>) -> Result<T, String>) -> Result<T, String> {
+    let drain_path = root.path.join(DRAIN);
     let security = protected_security()?;
     let drain = ready_drain(root.held, &drain_path, &security, console)?;
     let _lock = take_drain_lock(&drain_path.join(LOCK))?;
@@ -682,30 +736,7 @@ pub(crate) fn admit(
         root: root.path,
         scanned_root: root_text(root.held)?,
     };
-    let standing = match state.barrier()? {
-        Barrier::Standing(raised) => Some(raised),
-        Barrier::None | Barrier::Lapsed(_) => None,
-    };
-    let tickets_folder = protected_folder(&drain, &drain_path.join(TICKETS), FILE_GENERIC_READ, &security, Leftover::Refuse)?;
-    let tickets = state.live_tickets_in(&tickets_folder)?;
-    let older = older_live(&tickets, session.map(|session| session.id), |_| true);
-    let live = match session {
-        Some(session) => state.own_session_live(session.id)?,
-        None => false,
-    };
-    match decided(standing, older, session.map(|session| session.id), live) {
-        Ok(()) => registered(&state, &tickets_folder, &tickets, session, seams.now).map(Ok),
-        Err(refused) => {
-            if let Some(session) = session
-                && !no_ticket
-            {
-                let name = ticket_name(ticket_seq(&tickets, session.id), session.id);
-                let ticket = json!({ "Session": session.id, "Polled": state.clock.now_s() });
-                write_text(&tickets_folder, &name, &ticket.to_string(), &security).map_err(|error| state.cannot("write", &name, &error))?;
-            }
-            Ok(Err(refused))
-        }
-    }
+    under(&state)
 }
 
 /// Registers the admitted call of `session`: its record, its holder, held from now on, its end stamped at
@@ -779,14 +810,7 @@ fn sessions_folder(state: &State<'_>) -> Result<File, String> {
 /// This process's holder of the session `id` in its sessions folder `folder`, made or opened, shared with no one.
 fn held_holder(state: &State<'_>, folder: &File, id: &str) -> Result<File, String> {
     let holder_name = format!("{id}.{}", std::process::id());
-    let access = FILE_GENERIC_READ | DELETE;
-    match gate_win32::make_file_beneath(folder, &holder_name, access, Share::None, state.security) {
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            gate_win32::open_beneath_as(folder, &holder_name, access, Share::None, Make::Open)
-        }
-        made => made,
-    }
-    .map_err(|error| state.cannot("hold", &holder_name, &error))
+    held_share_none(folder, &holder_name, state.security).map_err(|error| state.cannot("hold", &holder_name, &error))
 }
 
 /// What an `outputs` call may do under the drain: the hold of its session while it sends, when the session is live, and
@@ -809,28 +833,19 @@ pub(crate) fn renewed(root: &HeldRoot<'_>, session: Option<&str>, seams: &BoxSea
             may_delete: true,
         });
     }
-    let security = protected_security()?;
-    let drain = ready_drain(root.held, &drain_path, &security, console)?;
-    let _lock = take_drain_lock(&drain_path.join(LOCK))?;
-    let state = State {
-        drain: &drain,
-        security: &security,
-        clock: Clock::of(seams),
-        readable_only: seams.drain_readable_only == gate_args::ProcessScan::ReadableOnly,
-        root: root.path,
-        scanned_root: root_text(root.held)?,
-    };
-    let standing = matches!(state.barrier()?, Barrier::Standing(_));
-    match session {
-        Some(id) if state.own_session_live(id)? => Ok(Renewal {
-            held: Some(renew(&state, id, seams.now)?),
-            may_delete: true,
-        }),
-        _ => Ok(Renewal {
-            held: None,
-            may_delete: !standing,
-        }),
-    }
+    locked(root, seams, console, |state| {
+        let standing = matches!(state.barrier()?, Barrier::Standing(_));
+        match session {
+            Some(id) if state.own_session_live(id)? => Ok(Renewal {
+                held: Some(renew(state, id, seams.now)?),
+                may_delete: true,
+            }),
+            _ => Ok(Renewal {
+                held: None,
+                may_delete: !standing,
+            }),
+        }
+    })
 }
 
 /// Sets the live session `id`'s record's `Called` to now, keeping its other fields (none for a record that does not
@@ -843,6 +858,19 @@ fn renew(state: &State<'_>, id: &str, test_now: Option<u64>) -> Result<Admitted,
     Ok(Admitted {
         holder: Some(holding(state, folder, id, test_now)?),
     })
+}
+
+/// Runs `under` in one hold of the drain lock under the root `root`, `drain\` readied as an admission readies it, giving
+/// it the judge of whether a session is live for a call of its own ([`State::own_session_live`]): the one lock every
+/// take and judge of the builder's own slots runs under. Else why the drain could not be read or written, or `under`'s
+/// own error.
+pub(super) fn under_drain_lock<T>(
+    root: &HeldRoot<'_>,
+    seams: &BoxSeams,
+    console: &mut Console,
+    under: impl FnOnce(&dyn Fn(&str) -> Result<bool, String>) -> Result<T, String>,
+) -> Result<T, String> {
+    locked(root, seams, console, |state| under(&|id| state.own_session_live(id)))
 }
 
 /// The drain session `payload` names (`Session`, `Pc`, `Repo`, the last two empty when absent) for a call of `command`
@@ -863,16 +891,22 @@ pub(crate) fn session_of<'p>(payload: &'p Payload, command: &'p str, job: &'p st
 /// The root of the work folder `work` (`<root>\work\<key>`) and its folder, held as the preflight holds it: read
 /// access, no deletion shared. `None` when nothing is at the root's path, where no barrier can stand. Else why not: a
 /// link, a junction or anything but a folder there, or a work folder with no root above it.
-fn held_root_of(work: &str) -> Result<Option<(std::path::PathBuf, File)>, String> {
+pub(super) fn held_root_of(work: &str) -> Result<Option<(std::path::PathBuf, File)>, String> {
     let root = gate_wire::work_root(work, PathForm::Windows).ok_or_else(|| format!(r"the work folder {} is not <root>\work\<key>", escaped(work)))?;
     let root = std::path::PathBuf::from(root);
-    if fs::symlink_metadata(&root).is_err_and(|error| error.kind() == io::ErrorKind::NotFound) {
+    Ok(held_root_at(&root)?.map(|held| (root, held)))
+}
+
+/// The root `root`, held as the preflight holds it ([`held_root_of`]); `None` when nothing is at its path. Else why
+/// not: a link, a junction or anything but a folder there.
+pub(super) fn held_root_at(root: &Path) -> Result<Option<File>, String> {
+    if fs::symlink_metadata(root).is_err_and(|error| error.kind() == io::ErrorKind::NotFound) {
         return Ok(None);
     }
-    let held = preflight::held_folder_at(&root)
-        .map_err(|error| cannot("open", &root, &error))?
+    let held = preflight::held_folder_at(root)
+        .map_err(|error| cannot("open", root, &error))?
         .ok_or_else(|| format!("{} is a link, a junction or not a folder", escaped(&root.to_string_lossy())))?;
-    Ok(Some((root, held)))
+    Ok(Some(held))
 }
 
 /// Passes a call of `run`, `inputs` or `lfs` through the drain under the work folder `work`'s root as the session

@@ -50,6 +50,7 @@ use crate::boxside::preflight::{
     self, Failed, GIT_REDIRECTS, Git, GitClass, GitFailure, GitOutput, GitStep, GitStop, Pipe, Shared, Streams, Unready, git_failed,
 };
 use crate::boxside::probe;
+use crate::boxside::slots;
 use crate::boxside::stamping::{self, ProcessLines};
 use crate::boxside::stop::{Ending, STOPPED, stop_event_name, terminate_and_wait};
 use crate::boxside::tools;
@@ -605,6 +606,16 @@ pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) ->
             return status;
         }
     };
+    // A session whose slot lapsed and was taken takes a free one, else the run is refused as its preflight would be.
+    let claimed = match slots::run_taken(request.work, payload, (&run_command(&request), request.job), seams, console) {
+        Ok(claimed) => claimed,
+        Err(status) => {
+            if status == FAILED_STATUS {
+                no_back_commits(&request, console);
+            }
+            return status;
+        }
+    };
     // Held until the run returns; the command does not inherit it, so no process it leaves running keeps the work
     // folder busy.
     let _lock = match take_lock(request.lock, WORK_LOCK, Stamp::Use, console) {
@@ -620,6 +631,10 @@ pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) ->
             return FAILED_STATUS;
         }
     };
+    // Made once the lock is held and only when the session holds a claim, so a second call of the session refused busy
+    // leaves the live run's slot alone, and dropped at every later end of the run, before its admission and so while
+    // its session is held: the session's builder slot is let go.
+    let _slot = claimed.then(|| slots::Release::at_end(request.work, payload));
     // A run the console cannot take is refused before the checkout; the stage before the command reads it again.
     if request.desktop
         && let Err(status) = desktop_run::console_takes_it(&request, seams, console)
@@ -1650,8 +1665,13 @@ impl Drop for HeldWorkLock {
 /// its command text each command's words joined by spaces and a warm-up's commands by ` && `, its job the run's: the
 /// guard to hold until the run returns, or the status to exit with, its lines said.
 fn admitted(payload: &Payload, request: &Request<'_>, seams: &BoxSeams, console: &mut Console) -> Result<drain::Admitted, u32> {
-    let command = request.commands.iter().map(|words| words.join(" ")).collect::<Vec<_>>().join(" && ");
-    drain::passed(request.work, payload, Some((&command, request.job)), seams, console)
+    drain::passed(request.work, payload, Some((&run_command(request), request.job)), seams, console)
+}
+
+/// The run's command text as its drain session and builder slot record it: its commands' words, each command's joined
+/// by spaces, the commands by ` && `.
+fn run_command(request: &Request<'_>) -> String {
+    request.commands.iter().map(|words| words.join(" ")).collect::<Vec<_>>().join(" && ")
 }
 
 /// A lock file, the work folder's or a bare repository's: `path` opened for reading and writing, created when missing,

@@ -18,6 +18,7 @@ use gate_router::{is_layout_name, repo_name};
 use serde_json::{Map, Value};
 
 pub mod drain;
+pub mod slots;
 pub mod stamp;
 
 /// The start of the line a macOS box says on standard error when a run's cross build ended without bringing its
@@ -1282,6 +1283,8 @@ pub enum Refusal {
     /// A drain barrier stands on the builder, an older run waits in the drain's line, or the run's drain session has
     /// ended.
     Drain,
+    /// Every one of the builder's own slots is held.
+    Full,
 }
 
 impl Refusal {
@@ -1298,6 +1301,7 @@ impl Refusal {
             Refusal::Install => "install",
             Refusal::Lfs => "lfs",
             Refusal::Drain => "drain",
+            Refusal::Full => "full",
         }
     }
 }
@@ -1539,6 +1543,7 @@ mod tests {
                 (Refusal::Install, "install"),
                 (Refusal::Lfs, "lfs"),
                 (Refusal::Drain, "drain"),
+                (Refusal::Full, "full"),
             ] {
                 assert_eq!(refusal.word(), word);
                 assert_eq!(refused_line(NONCE, refusal), format!("gate-remote-refused: {NONCE} {word}"));

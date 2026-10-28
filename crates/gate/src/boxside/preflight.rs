@@ -35,6 +35,7 @@ use crate::boxside::helper_trusted;
 use crate::boxside::msys;
 use crate::boxside::probe;
 use crate::boxside::run::{self, FILE_FLAG_OPEN_REPARSE_POINT, LAYOUT_SINGLE, Stamp, StopSignal, WaitEnd, Watched, Watching};
+use crate::boxside::slots;
 use crate::boxside::stamping;
 use crate::boxside::stop::terminate_and_wait;
 use crate::console::Console;
@@ -108,9 +109,11 @@ pub(crate) fn git_failed(step: &str, code: i32) -> Failed {
 /// [`ROOT_STATUS`] ([`held_work_root`]), holding it until the folders are readied. Under that hold it passes the drain
 /// ([`drain::admit`]), the payload's `NoTicket` saying whether a refusal takes a place in line, and holds its session
 /// until it returns; a refusal or a drain that fails says the version line, then the drain's
-/// ([`drain::admission_said`]). It readies the bare repositories, then takes the key's work-folder lock `Lock` around
-/// its reads of the key's records and its writes in the work folder ([`ready`]), and lets it go before its version
-/// line, so the run right after it is never refused busy by it.
+/// ([`drain::admission_said`]). Right after its admission, before anything else is done for the run, it takes a builder
+/// slot for its session when the root has a count file ([`slots::taken`]), refused `full` when none is free, and lets
+/// it go again when a later step fails ([`slots::Release`]). It readies the bare repositories, then takes the key's
+/// work-folder lock `Lock` around its reads of the key's records and its writes in the work folder ([`ready`]), and
+/// lets it go before its version line, so the run right after it is never refused busy by it.
 pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
     if crate::boxside::judges_trust()
         && let Err(why) = gate_desktop::helper_path()
@@ -154,15 +157,27 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
         Ok(admitted) => admitted,
         Err(status) => return status,
     };
-    let readied = ready(bare, work, lock, pair.as_ref(), console);
-    drop(held_root);
-    let Readied { made, warm, cleared } = match readied {
+    // Before anything else is done for the run, so a builder whose own slots are all held refuses it with nothing made.
+    let root_held = HeldRoot {
+        held: &held_root,
+        path: Path::new(&root),
+    };
+    let claimed = match slots::taken(&root_held, session.as_ref(), payload, &version, seams, console) {
+        Ok(claimed) => claimed,
+        Err(status) => return status,
+    };
+    // Made only when the session holds a claim, and dropped at every failing end of the preflight, before its
+    // admission and so while its session is held: the slot it took is let go as a run's end lets it go. Kept once the
+    // preflight passes.
+    let slot = claimed.then(|| slots::Release::at_end(work, payload));
+    let Readied { made, warm, cleared } = match ready(bare, work, lock, pair.as_ref(), console) {
         Ok(readied) => readied,
         Err(failed) => {
             stamping::err(console, &failed.line);
             return failed.status;
         }
     };
+    drop(held_root);
     stamping::out(console, &version);
     stamping::out(console, &format!("gate: remote warm {}", warm.as_deref().unwrap_or("none")));
     if made || cleared {
@@ -177,6 +192,9 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
         stamping::out(console, msys::NO_GIT_BIN);
     }
     say_sdks_and_tools(payload, work, seams, console);
+    if let Some(slot) = slot {
+        slot.kept();
+    }
     0
 }
 

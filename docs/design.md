@@ -712,9 +712,9 @@ Test-seams builds accept hidden options on `prune` and no `--test-print-request`
 
 Hidden from the usage and from `--help`. It is the builder side of a routed run, run over ssh on the builder ([The box side](#the-box-side)).
 
-`gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs|drain --stdin` takes exactly one verb and the word `--stdin`, and no `--state-dir`: the request is the first line of stdin, and every path comes from it. Two exceptions take no request and no `--stdin`: `gate box register-desktop`, and `gate box prune --root <folder> [--keys <key>...]`, which takes the root and, optionally, the keys to remove.
+`gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs|drain --stdin` takes exactly one verb and the word `--stdin`, and no `--state-dir`: the request is the first line of stdin, and every path comes from it. Three exceptions take no request and no `--stdin`: `gate box register-desktop`, `gate box prune --root <folder> [--keys <key>...]`, which takes the root and, optionally, the keys to remove, and `gate box hold --root <root> --holder <text> --ceiling <seconds> [--wait <seconds>] -- <command> [args...]` ([The box side](#the-box-side), `hold`).
 
-Any other shape (no verb, no `--stdin`, any other word in its place, an unknown verb, an extra word) prints the box usage alone on stderr and exits 2. The usage is two lines: `usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs|drain --stdin (the base64 JSON request as stdin's first line)`, then the `       gate box prune --root <folder> [--keys <key>...]` line.
+Any other shape (no verb, no `--stdin`, any other word in its place, an unknown verb, an extra word) prints the box usage alone on stderr and exits 2. The usage is three lines: `usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs|drain --stdin (the base64 JSON request as stdin's first line)`, then the `       gate box prune --root <folder> [--keys <key>...]` line, then the `       gate box hold --root <root> --holder <text> --ceiling <seconds> [--wait <seconds>] -- <command> [args...]` line.
 
 ### Later subcommands
 
@@ -974,6 +974,8 @@ Except for a commit run ([Commit run](#critical-drain-and-nesting)), a `none` ru
 
 It still has its job, so `gate stop-tree` reaches it, and it runs at BelowNormal. A critical drain does not wait for it, it is not in the take's `otherClaims`, and the barrier never holds it.
 
+**Builder-side slots.** A Windows builder may count slots of its own, whatever PC the runs come from: the PC's pool of a builder counts only that PC's runs, and a GitHub Actions runner job on the builder takes none of them. A builder-side slot is no mutex. It is a claim file in `{root}\slots\`, counted against the count in `{root}\slots.json` ([Formats](#builder-side-slots)), and held by a routed run's drain session or by a [hold](#the-box-side) (`gate box hold`). A builder with no `slots.json` counts none: every routed run and every hold behaves as without this section, and a hold exits 2.
+
 ### Counts
 
 The default count of a pool is `max(1, floor((logical processors - 1) / threads))`, with threads 4 for heavy and 2 for light (kept, S2). `slot-counts.json` in the state root overrides either count with a whole number from 1 to 64. It is re-read on every pass of the wait loop, so a count changed while gates wait applies to them, and a gate holding a slot the new count leaves out keeps it.
@@ -1027,6 +1029,12 @@ A processor count the system will not give is taken as 1, with `gate: cannot rea
    A gate under a parent's slot says `gate: cannot write the covered marker <path>: <error>`, `gate: cannot rewrite the covered marker <path>: <error>` and `gate: cannot delete the covered marker <path>: <error>`, and the survey says `gate: cannot read the covered markers in <dir>: <error>` and `gate: cannot delete the dead gate's covered marker <path>: <error>`, each of the last two once; the run goes on after each.
 
    A gate that looks for a stand-in says the read line too ([Critical drain and nesting](#critical-drain-and-nesting)).
+
+A builder-side slot is taken by the box, not by a waiter's queue, always under the drain's lock ([`drain`](#the-box-side)), so two takers never get one slot:
+
+1. The slots as judged, every claim or lock file in `slots\` whatever its index. A session claim is live while its session is live for a call of its own; a hold claim is live while its `{n}.lock` is held open by its hold. A dead claim is removed by the taker that finds it.
+2. A session that already holds a live slot keeps it, at any index. Otherwise, while fewer claims are live than the count, the taker gets the lowest index below the count with no live claim. Every live claim counts, one past a count lowered since it was taken too, so a lowered count frees no slot early. With none, the take is refused `full`.
+3. A hold waits for a slot: `--wait <seconds>` (0 when not given) is the time it keeps looking, every 5 s, saying `gate: waiting for a builder slot: {held} of {slots} held` on stderr on its first look and every sixth after (each 30 s). A routed run's preflight and run never wait; they are refused `full` at once and the PC's run goes to its next builder.
 
 Ordering by ticket replaces the PowerShell gate's free-for-all among waiters of one kind (Q2), and the wake events replace its 2 s polling as the way a waiter learns of a release.
 
@@ -1274,7 +1282,13 @@ ops-tower's Gates tab writes through `gate-state` (`write_slot_counts`, `apply_s
 
 A missing file, or a missing key, gives the default silently. A file unreadable as a whole (including one without `v`, reason `missing key "v"`) gives both pools their default, each with its own ignore line. A value that is not a whole number from 1 to 64 gives that pool alone its default, with the reason `"<kind>" must be a whole number from 1 to 64`. Every line is `gate: ignored <path>: <reason>; using <n> <kind> slots`, built in one place for the `v1` and the PowerShell-era readers.
 
-### Journal
+### Builder-side slots
+
+The builder's own slots ([Slots](#slots)) are three kinds of file beneath the builder's work root `<root>`, which the box alone reads and writes (`gate_wire::slots` holds the formats; `gate-state` and ops-tower do not read them). The rules of the common formats apply: strict JSON, `v` 1, UTF-8, a file that does not read as below is unreadable.
+
+- `<root>\slots.json`: `{"v":1,"slots":<n>}`, `slots` a whole number from 1 to 64. A builder with no such file takes no slot. The gate does not write `slots.json` yet: GATE-874's second part makes `gate push` write it. A builder without the file enforces no count, as before. A file that cannot be read or does not parse counts as none, and the box says `gate box: the builder's slot count cannot be read, so it takes no slot: <why>` on stderr (a hold then also says its no-count line and exits 2).
+- `<root>\slots\<n>.json`, made as `drain\` is (a protected folder), one claim per held slot `n` from 0. A session claim is `{"v":1,"kind":"session","session":<id>,"pc":<text>,"repo":<text>,"command":<text>,"taken":<UTC text>}`, the session a drain session id, `pc` and `repo` capped at 100 characters and `command` at 300 as the drain's session record caps them. A holder claim is `{"v":1,"kind":"hold","holder":<text>,"ceiling":<seconds>,"pid":<pid>,"started":<UTC text>}`, `holder` the text of `--holder` (not empty, no control character, at most 300 characters), `ceiling` above 0 and `pid` the hold's process id above 0. A claim that does not read names no session and is live only while its lock is held.
+- `<root>\slots\<n>.lock`: the lock of a hold's slot, opened by the hold and shared with no one for its whole life, so a claim of kind `hold` is live exactly while the lock is held; a dead one is removed by the next taker.
 
 `events.jsonl` holds one JSON object per line, appended under the journal mutex (`Local\gate-journal`, [Kernel object names](#kernel-object-names)) with a 2 s wait (kept, J1). The events are `queue`, `take`, `release`, `abandon`, `covered`, `parent` and `fallback`. `kind` is `heavy`, `light`, `critical` or `none`.
 
@@ -1334,7 +1348,7 @@ Fields beyond J1's:
   `transfer-timed-out` is a routed run's fetch after the command cut at its transfer ceiling. `transfer-failed` is a routed command that exited 0 whose transfer after it failed every attempt as a connection fails; the verdict comes from the client's outcome, never from the log line.
 
   A routed run is a kill only when the gate killed it; a command that exits 124 on its own is `failed`.
-- `fallback`: `reason`, one of `full` (no remote slot within the run's 60 s remote wait), `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5), `layout` (the box could not clear or lay out its work folder), `version` ([The box side](#the-box-side)), `client` (the remote client could not start, as when it finds no usable ssh), `inputs` (the run's ignored inputs could not be sent, a sibling pair declared inputs, or the box refused the run because its work folder no longer held the inputs sent), `lfs` (the run's Git LFS content could not be listed or sent, or the box refused the run because its store does not hold the content the snapshot's pointers name or it could not make the run's LFS scratch folder), `desktop` (the builder could not give the run its desktop; the client reads the box's `desktop` refusal tag as this reason) `install` (the builder's gate is not installed where only administrators can change it; the client reads the box's install refusal on the preflight, inputs and run calls, and its `install` refusal tag, as this reason) and `root` (the builder's work root is not locked down or is busy; the client reads the box's root lines on the preflight, before the version check, as it reads `install`).
+- `fallback`: `reason`, one of `full` (no remote slot within the run's 60 s remote wait, or the box's `full` refusal tag, from the builder's own slot count), `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5), `layout` (the box could not clear or lay out its work folder), `version` ([The box side](#the-box-side)), `client` (the remote client could not start, as when it finds no usable ssh), `inputs` (the run's ignored inputs could not be sent, a sibling pair declared inputs, or the box refused the run because its work folder no longer held the inputs sent), `lfs` (the run's Git LFS content could not be listed or sent, or the box refused the run because its store does not hold the content the snapshot's pointers name or it could not make the run's LFS scratch folder), `desktop` (the builder could not give the run its desktop; the client reads the box's `desktop` refusal tag as this reason) `install` (the builder's gate is not installed where only administrators can change it; the client reads the box's install refusal on the preflight, inputs and run calls, and its `install` refusal tag, as this reason) and `root` (the builder's work root is not locked down or is busy; the client reads the box's root lines on the preflight, before the version check, as it reads `install`).
 
   A journal line with the reason `cold` is still read, but no run writes it.
 
@@ -2710,7 +2724,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     `-o RequestTTY=no` leads the options of every `gate box` call and `gate push`'s, so stdin never passes through a pseudo-terminal. The last option, `-o Compression=yes`, is the run call's alone: the preflight, stop, boot and outputs calls, git's ssh command and `gate push` ask for none. The run call's compression covers both directions of its connection: the command's output and protocol lines one way, the request and the outputs manifest the other.
 
-    The box's output passes through to the log and the console, except the box's heartbeats and its machine lines, which the client hides from both and keeps out of the lines it holds: the start marker `gate-remote-started: <nonce>` and the refusal tag `gate-remote-refused: <nonce> busy|tools|layout|inputs|sent|lfs|desktop|install|drain`, each naming this run's `Nonce` and read on stderr only, as a whole line, and the kill tag and the adjusted line below.
+    The box's output passes through to the log and the console, except the box's heartbeats and its machine lines, which the client hides from both and keeps out of the lines it holds: the start marker `gate-remote-started: <nonce>` and the refusal tag `gate-remote-refused: <nonce> busy|tools|layout|inputs|sent|lfs|desktop|install|drain|full`, each naming this run's `Nonce` and read on stderr only, as a whole line, and the kill tag and the adjusted line below.
 
     The client matches those protocol lines on the raw line, before any unstamping, so a command's own line, stamped by the box, never reads as one.
 
@@ -2720,7 +2734,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The adjusted line `gate-remote-adjusted: <nonce> <s.sss>` carries the load-adjusted seconds the box counted, said once the command's output has drained unless the sampler failed, read like the tag on stderr only and the last one winning; another run's, a malformed one or one whose seconds are not a finite number is a line like any other.
 
-    A status 75 is a refusal only when this run's refusal tag came on stderr before any start marker (`busy`, `tools`, `layout`, `inputs`, `lfs`, `desktop` or `install`, the fallback reason; `drain` is a refusal the run waits on, never a fallback reason, see Builder drain below); a tag after the marker is ignored, so a command that prints the human busy, tools, layout, inputs, lfs, desktop or install line, or a tag of its own, and exits 75 ends with status 75 and no fallback.
+    A status 75 is a refusal only when this run's refusal tag came on stderr before any start marker (`busy`, `tools`, `layout`, `inputs`, `lfs`, `desktop`, `install` or `full`, the fallback reason; `full` is a builder whose own slots are all held, the preflight's tag read as the run's is; `drain` is a refusal the run waits on, never a fallback reason, see Builder drain below); a tag after the marker is ignored, so a command that prints the human busy, tools, layout, inputs, lfs, desktop or install line, or a tag of its own, and exits 75 ends with status 75 and no fallback.
 
     The `sent` tag, read the same way, is no fallback: the client makes the run call once more with `--no-build` dropped ([Routing](#routing)).
 
@@ -3429,6 +3443,10 @@ Built verbs:
 
   Any other config, or one it cannot take, gets its lock deleted and the git steps run as before (`config --get remote.origin.url`, `remote add`, two `config` calls).
 
+  Right after its drain admission and before anything else it does for the run, a preflight with a `Session` on a root that has a `slots.json` takes a builder-side slot for its session ([Builder-side slots](#slots)): a session that already holds one keeps it, else it takes the lowest free one with a session claim. With every slot held it says `gate: remote version {v}` on stdout, then on stderr and unstamped `gate-remote-refused: {nonce} full` (when the payload has a `Nonce`) and `gate: remote builder is full: {held} of {slots} slots held`, and exits 75, having made no bare repository, work folder or record. A slot pool that cannot be read or written says the version line, then `gate: slots failed: {why}` on stderr, and exits 1.
+
+  A preflight that fails after its take lets the slot go before it returns, as a run's end does (`gate: slot release failed: {why}` on stderr when the claim could not be removed); one that passes keeps it for the run. A preflight with no `Session`, or on a root with no `slots.json`, takes nothing.
+
   The preflight takes the work-folder lock `{Work}.lock` (made when missing, its write time never stamped) around its reads of `.layout`, `.warm` and `.command` and its writes inside the work folder, and lets it go before its SDK and tool probes.
 
   A lock another process holds leaves the work folder alone: it writes nothing there, exits 0 and still prints `gate: remote new work tree` when `.git\HEAD` is missing, and the run that follows is refused `busy`. A lock that cannot be opened (a folder, a link) prints `gate: remote could not open the work folder lock <path>: <error>` on stderr and exits 0, with nothing written there either.
@@ -3528,6 +3546,10 @@ Built verbs:
 
   A payload whose `Needs` is not an object of texts prints `gate: box payload Needs is not an object of texts; probing nothing` on stderr, probes nothing and still exits 0.
 - **`run`** runs the payload's `Command` (a list of texts), or, for a warm-up, each of its `WarmCommands` in order (Warm-up, below), in `Work` (in `Work\{Leaf}` for a sibling pair), and exits with the command's own whole 32-bit status after a successful run. Its stdout is the command's stdout, LF-terminated; its stderr is the command's stderr plus the box's own lines.
+
+  A run with a `Session` under a root that has a `slots.json` holds a builder-side slot ([Builder-side slots](#slots)) from after its drain admission to its end: the slot its preflight took, kept; or, when that claim lapsed and was taken, a free one; or with every slot held it is refused as the preflight is, `gate-remote-refused: {nonce} full` and the full line on stderr, exit 75. A slot pool that cannot be read or written says `gate: slots failed: {why}` and exits 1, and a pair run also says `gate: remote back commits: failed`.
+
+  The run's slot is let go when the run returns, with `gate: slot release failed: {why}` on the box's stderr when its claim could not be removed. The release is armed only once the work-folder lock is taken, so a second call of a session refused `busy` leaves the live run's claim alone. A run refused `busy` because another session's run holds the same work folder, or whose work lock cannot be taken, keeps the slot it took until that slot's 120 s lease lapses; only a run that took the work lock releases its slot when it ends.
 
   Stamped lines: in `run` alone (every other verb says its lines as it did), every line but the protocol lines and the heartbeat is written `<stamp> <tag> <text>` as a local run's log holds it ([Log and tail](#log-and-tail)), so the PC writes it to its log as it came.
 
@@ -4237,6 +4259,18 @@ Built verbs:
 
   The barrier is files under a lock, not a Windows mutex, whose waiters are not served in arrival order, whose `Global\` names can be squatted and whose private namespace needs elevation.
 
+  The drain lock is also the one lock every take and judge of the builder-side slots runs under (`under_drain_lock` in `boxside/drain.rs`, which readies `drain\` as an admission does and gives the slot code the drain's judge of whether a session is live for a call of its own), so a session's liveness and its slot are decided in one order. A preflight's take comes after its admission has let the lock go, a run's release before its session's holder is let go.
+
+- **`hold`** (`boxside/slots.rs`) is `gate box hold --root <root> --holder <text> --ceiling <seconds> [--wait <seconds>] -- <command> [args...]`: it takes one of the builder's own slots ([Builder-side slots](#slots)) for a command that is not a routed run (a GitHub Actions runner job), runs the command while it holds it and lets it go. It reads no request and never reads stdin, takes its words in any order, each once, and any other shape is the box usage, which has a line for it ([`gate box`](#gate-box)).
+
+  `--ceiling` is whole seconds from 1, `--wait` whole seconds (0 when not given), both at most 604800 (seven days); the command is every word after `--`, at least one, kept as given. The command runs in a job of its own that ends every process in it when closed, with the hold's environment and working folder, its program found on the hold's `PATH`, its stdin `NUL`, and its stdout and stderr passed through to the hold's own as they come.
+
+  A root that is not there or has no `slots.json` that reads says (after the unreadable-count line, for one that does not read) `gate box: this builder has no slot count; run gate push` on stderr and exits 2. The gate does not write `slots.json` yet: GATE-874's second part makes `gate push` write it. A builder without the file enforces no count, as before. A holder that is empty, holds a control character or is over 300 characters says `gate box: the holder '{holder}' {why}` and exits 2. A root the work-root check refuses is `gate: hold failed: {why}`, exit 1.
+
+  It looks for a free slot under the drain lock: with none, it waits up to `--wait` seconds, looking every 5 s (`--test-box-hold-poll-ms <n>` in milliseconds in a `test-seams` build) and saying `gate: waiting for a builder slot: {held} of {slots} held` on its first look and every 30 s, else says on stderr and unstamped `gate-remote-refused: hold full` and `gate: remote builder is full: {held} of {slots} slots held` and exits 75. With a slot it writes its holder claim and keeps `slots\{n}.lock` open, shared with no one, for its whole life; a hold killed by any means frees its slot, since a claim whose lock is not held is dead.
+
+  Its exit status is the command's own. At the ceiling it ends the command's job, says `gate: hold ended at its ceiling of {s} s` on stderr and exits 124. A command it cannot start says `gate: hold could not start {program}: {why}` and exits 127. Any other failure is `gate: hold failed: {why}` on stderr and exit 1; a slot that cannot be let go says `gate: slot release failed: {why}`. The Unix box does not build it ([The Unix box](#the-unix-box)).
+
 **The outputs module** (GATE-44) is shared by both ends, this exe, in `crates/gate/src/outputs/`. The box's `run` packs with it and the box's `outputs` verb sends the archive. The PC's manifest, the pending marker, the reading of the box's `gate-remote-outputs: ` line, the fetch of the archive and its install are built in the Rust remote client ([The remote client's run](#routing)).
 
 - Globs: each is relative to the work folder's root and `/`-separated, matched without regard to case: `**/` is any number of folders (none included), `**` anything, `*` any run of characters within one name, `?` one character within one name.
@@ -4433,7 +4467,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
   The target is the first word that is no option and no option's value: `dotnet test --blame-hang-timeout 10m tests/A.Tests` cross-builds `tests/A.Tests`, and `dotnet build --property Bar=2` cross-builds with no target. After `--self-contained`, `--sc` or `--interactive`, a `true` or `false` next word is the switch's value. Words after the dotnet command's own `--` are never read.
   A command naming `-a`, `--arch`, `--os`, `--ucr`, `--use-current-runtime`, `-r`, `--runtime`, `-o`, `--output` or `--artifacts-path`, or an option word the router does not know (`--made-up-switch`, `-bl` and `-m` among them), gets no cross build, and its route says `gate: no cross build for this command: it names <word>` after the route's other lines.
 
-  A pair run brings back from its main tree only. `OutputsFull` with no globs is taken and does nothing. `--test-outputs-budget-bytes` reaches the run. Every other verb (`inflight`, `lfs`, `register-desktop`) says `gate: box <verb> is not built on this builder` and exits 2.
+  A pair run brings back from its main tree only. `OutputsFull` with no globs is taken and does nothing. `--test-outputs-budget-bytes` reaches the run. Every other verb (`inflight`, `lfs`, `register-desktop`, `hold`) says `gate: box <verb> is not built on this builder` and exits 2.
 
   The run checks a payload's `InputsDigest` as the Windows box does ([The box side](#the-box-side)), and refuses a `SentDigest` or `LfsDigest` as not built (`gate-remote-refused: <nonce> <tag>`, then `gate: remote <key> is not built on this builder`, status 75), so the PC runs such a run itself.
 

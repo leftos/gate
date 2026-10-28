@@ -31,8 +31,8 @@ pub use program::{ProgramSearch, is_godot_console, resolve_program};
 pub use request::WarmRequest;
 pub use request::{
     BoxRequest, BoxSeams, BoxVerb, BurnRequest, Ceiling, CheckRequest, CheckSeams, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS,
-    DEFAULT_TAIL_LINES, DesktopMode, DesktopSession, DrainAction, DrainRequest, DrainSeams, ExpectRequest, Invocation, ProcessScan, PruneRequest,
-    PruneSeams, PushRequest, PushSeams, RunRequest, Slot, StopRequest, TestSeams,
+    DEFAULT_TAIL_LINES, DesktopMode, DesktopSession, DrainAction, DrainRequest, DrainSeams, ExpectRequest, HoldRequest, Invocation, ProcessScan,
+    PruneRequest, PruneSeams, PushRequest, PushSeams, RunRequest, Slot, StopRequest, TestSeams,
 };
 pub use usage::USAGE;
 pub use values::{

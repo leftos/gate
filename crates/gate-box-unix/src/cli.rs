@@ -40,7 +40,9 @@ pub fn unbuilt(verb: BoxVerb) -> Option<String> {
         BoxVerb::Preflight | BoxVerb::Boot | BoxVerb::Stop | BoxVerb::Run | BoxVerb::Prune | BoxVerb::Inputs | BoxVerb::Outputs | BoxVerb::Drain => {
             None
         }
-        BoxVerb::Inflight | BoxVerb::Lfs | BoxVerb::RegisterDesktop => Some(format!("gate: box {} is not built on this builder", verb.as_str())),
+        BoxVerb::Inflight | BoxVerb::Lfs | BoxVerb::RegisterDesktop | BoxVerb::Hold => {
+            Some(format!("gate: box {} is not built on this builder", verb.as_str()))
+        }
     }
 }
 
@@ -147,6 +149,7 @@ mod tests {
             seams,
             root: root.map(PathBuf::from),
             keys: keys.iter().map(|key| (*key).to_owned()).collect(),
+            hold: None,
         }))
     }
 
