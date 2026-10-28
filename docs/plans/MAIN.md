@@ -7,10 +7,9 @@
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [!] GATE-828 Fix the flaky Unix box test a_clear_refuses_a_volume_mounted_in_the_work_folder_and_keeps_its_files — Urgent · Remote
 - [ ] GATE-871 Carry routed runs' bulk data on a TCP data channel instead of ssh to the Windows builder — Urgent · Remote
-- [ ] GATE-890 Fix the flaky suite case a_routed_run_logs_the_box_s_stamped_lines_and_its_process_lines_as_they_came — Urgent · Remote
+- [/] GATE-890 Fix the flaky suite case a_routed_run_logs_the_box_s_stamped_lines_and_its_process_lines_as_they_came — Urgent · Remote
 - [ ] GATE-878 Show builder-side slot holders on ops-tower through a PC cache of the builder's slots — High · Remote
-- [ ] GATE-869 Bring back no bin files from a Mac run of a crossBuild repo that carried no cross build — High · Remote
-- [ ] GATE-868 Send no cross build for a solution target, which the SDK refuses with NETSDK1134 — High · Remote
+- [/] GATE-893 Cache a builder's held slots on the PC for ops-tower from the box slots line (GATE-878 B) — High · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
@@ -29,6 +28,8 @@
 - [ ] GATE-844 Serve godot-mcp's parallel itest lanes on the builder desktop, and match any --filter-class — High · Remote
 - [!] GATE-864 Opt yaat in to cross builds on the Mac and run its trial (GATE-696 step C) — High · Remote
 - [ ] GATE-876 Carry the input put, the sent build and the LFS put on the data channel — High · Remote
+- [ ] GATE-900 Sync back every file a routed multi-file formatter run rewrites — High · Remote
+- [ ] GATE-901 Make a routed cargo run rebuild after a change the snapshot carries — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
@@ -311,6 +312,10 @@
 - [ ] GATE-880 Settle the box hold verb's drain barrier and fix its smaller review findings
 - [ ] GATE-877 Carry a routed run's git push and back fetch on the data channel
 - [ ] GATE-889 Push a Windows builders entry that has an alias of its own, with its own slots
+- [ ] GATE-894 Remove a pruned folder whose inputs-stage-medium the Windows box cannot delete (os error 5)
+- [ ] GATE-896 Name only the withheld bin folders stale after a Mac run whose bins were withheld
+- [ ] GATE-897 Make both boxes' slots look agree on links at slots and on read errors, and share its helpers
+- [ ] GATE-899 Report a job member that reuses a pid an assignment marked, after a lost join message
 
 ## Cutover sweep
 
