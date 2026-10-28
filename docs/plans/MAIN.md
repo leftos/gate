@@ -6,15 +6,16 @@
 
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [!] GATE-828 Fix the flaky Unix box test a_clear_refuses_a_volume_mounted_in_the_work_folder_and_keeps_its_files — Urgent · Remote
+- [ ] GATE-871 Carry routed runs' bulk data on a TCP data channel instead of ssh to the Windows builder — Urgent · Remote
+- [ ] GATE-869 Bring back no bin files from a Mac run of a crossBuild repo that carried no cross build — High · Remote
+- [ ] GATE-868 Send no cross build for a solution target, which the SDK refuses with NETSDK1134 — High · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
 - [/] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
-- [/] GATE-621 Ask for a full outputs send when a worktree's routed runs switch builder — High · Remote
 - [ ] GATE-682 Explain or track a stall when a gated command is plain ssh to another machine — High · Remote
 - [/] GATE-683 Prune a deleted worktree's folders from every builder, and prune the Mac by space — High · Remote
-- [/] GATE-689 Prune a gone worktree's keys from the Windows builders and the PC — High · Remote
 - [ ] GATE-745 Bring back the files a routed dotnet command's /flp and /getResultOutputFile switches name — High · Remote
 - [ ] GATE-751 Make a routed build's outputs pull fast enough for yaat's trees, or skip it for verdict-only runs — High · Remote
 - [ ] GATE-753 Log every step of a run in the gate's log: start, progress, end and duration — High · Remote
@@ -26,8 +27,9 @@
 - [ ] GATE-842 Route yaat's golden-file regeneration: an env-prefixed command and its golden outputs — High · Remote
 - [ ] GATE-843 Keep the routing facts a census needs past the journal's roll — High · Remote
 - [ ] GATE-844 Serve godot-mcp's parallel itest lanes on the builder desktop, and match any --filter-class — High · Remote
-- [ ] GATE-861 Keep --no-build after a build the gate ran here: record a local build and run its --no-build here — High · Remote
-- [ ] GATE-864 Opt yaat in to cross builds on the Mac and run its trial (GATE-696 step C) — High · Remote
+- [/] GATE-861 Keep --no-build after a build the gate ran here: record a local build and run its --no-build here — High · Remote
+- [!] GATE-864 Opt yaat in to cross builds on the Mac and run its trial (GATE-696 step C) — High · Remote
+- [ ] GATE-873 Report whether Tailscale's path to a builder is direct or relayed, in gate check and the journal — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
@@ -297,6 +299,10 @@
 - [ ] GATE-858 Share one transport choice, builder list and box call across gate drain, check and prune
 - [ ] GATE-862 Remove a pruned key's files under a builder that left remote.json
 - [ ] GATE-863 Pin --use-current-runtime in builds_in_place and widen the cross plan's known dotnet switches
+- [ ] GATE-865 Seed the win-x64 apphost pack in the Mac builder's installer
+- [ ] GATE-866 Restore here for a folder target that holds one project, so --no-build after a routed build keeps the word
+- [ ] GATE-870 Harden the detached prune sweep's tests and edges (GATE-689 brief 3 review)
+- [ ] GATE-872 Summarise the gone worktrees a push's prune sweep marks instead of one line each
 
 ## Cutover sweep
 
