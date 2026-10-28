@@ -85,10 +85,8 @@ pub(crate) struct Watcher<'a> {
     sampler_works: bool,
     /// Why the job's memory of its ended members failed, once a sample has said so.
     memory_said: Option<String>,
-    /// Whether every sample fails (`--test-sampler-fail`).
-    sampler_fail: bool,
-    /// Whether gathering a kill's diagnostics fails (`--test-diagnostics-fail`).
-    diagnostics_fail: bool,
+    /// The flags the run's `--test-*` seams set ([`WatchSeams`]).
+    seams: WatchSeams,
     /// The milliseconds a gathering of the kill's diagnostics may take before it is cut
     /// (`--test-diagnostics-budget-ms`), the gate's own budget unless the suite sets one.
     diagnostics_budget_ms: u128,
@@ -97,9 +95,6 @@ pub(crate) struct Watcher<'a> {
     samples: u64,
     /// After how many samples the gate raises the interrupt itself (`--test-interrupt-after-samples`).
     interrupt_after: Option<u64>,
-    /// Whether the samples the interrupt counts still wait for the command's first output byte
-    /// (`--test-interrupt-from-output`): cleared by the first sample that sees it.
-    interrupt_awaits_output: bool,
     vm: VmReader<VmRead>,
     /// The pause markers of the gates under this one: a gate under it waiting behind a critical request is the run's
     /// progress.
@@ -121,6 +116,18 @@ pub(crate) struct Watcher<'a> {
     peak: Option<u32>,
     /// The priority class the command started in, read as the watch began; `None` when it could not be read.
     priority: Option<Priority>,
+}
+
+/// The flags one run's watch takes from the request's `--test-*` seams, none of which an unflagged run sets.
+#[derive(Clone, Copy, Debug)]
+struct WatchSeams {
+    /// Whether every sample fails (`--test-sampler-fail`).
+    sampler_fail: bool,
+    /// Whether gathering a kill's diagnostics fails (`--test-diagnostics-fail`).
+    diagnostics_fail: bool,
+    /// Whether the samples the interrupt counts still wait for the command's first output byte
+    /// (`--test-interrupt-from-output`): cleared by the first sample that sees it.
+    interrupt_awaits_output: bool,
 }
 
 /// The usual p90 a run's hang hint compares with, and whether the hint was said.
@@ -269,12 +276,14 @@ impl<'a> Watcher<'a> {
             recorded,
             sampler_works: true,
             memory_said: None,
-            sampler_fail: request.test_seams.sampler_fail,
-            diagnostics_fail: request.test_seams.diagnostics_fail,
+            seams: WatchSeams {
+                sampler_fail: request.test_seams.sampler_fail,
+                diagnostics_fail: request.test_seams.diagnostics_fail,
+                interrupt_awaits_output: request.test_seams.interrupt_from_output,
+            },
             diagnostics_budget_ms: request.test_seams.diagnostics_budget_ms.map_or(DIAGNOSTICS_BUDGET_MS, u128::from),
             samples: 0,
             interrupt_after: request.test_seams.interrupt_after_samples,
-            interrupt_awaits_output: request.test_seams.interrupt_from_output,
             vm,
             pause: PauseReader::new(root, gate, hands_on),
             late,
@@ -345,7 +354,7 @@ impl<'a> Watcher<'a> {
             }
             self.take_sample(console);
             self.sampled = Instant::now();
-            if !self.interrupt_awaits_output {
+            if !self.seams.interrupt_awaits_output {
                 self.samples += 1;
             }
             if let Some(interrupt) = self.interrupt.filter(|_| self.interrupt_after == Some(self.samples)) {
@@ -470,7 +479,7 @@ impl<'a> Watcher<'a> {
                 // part way leaves the last good sample's processes in place.
                 self.counted_escaped = sample.escaped.keys().copied().collect();
                 if sample.output_size > 0 {
-                    self.interrupt_awaits_output = false;
+                    self.seams.interrupt_awaits_output = false;
                 }
                 self.watch.sample(&sample);
                 self.record(&sample, out_bytes, err_bytes, vm_failed);
@@ -541,7 +550,7 @@ impl<'a> Watcher<'a> {
 
     /// Everything the block shows, gathered now, or the message the block ends with when it failed.
     fn gather(&self) -> Result<Report, String> {
-        if self.diagnostics_fail {
+        if self.seams.diagnostics_fail {
             return Err(DIAGNOSTICS_FAIL.to_owned());
         }
         let started = Instant::now();
@@ -624,7 +633,7 @@ impl<'a> Watcher<'a> {
     /// interval the watch counts them over is exactly the stretch the end stamp closes. Under `--test-sampler-fail`
     /// every sample fails.
     fn sample(&mut self, console: &mut Console, began: Duration, paused: bool) -> io::Result<Gathered> {
-        if self.sampler_fail {
+        if self.seams.sampler_fail {
             return Err(io::Error::other(SAMPLER_FAIL));
         }
         let (out_bytes, err_bytes) = self.output.read();

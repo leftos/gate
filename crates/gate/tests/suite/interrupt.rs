@@ -19,7 +19,13 @@ const CONTROL_C_EXIT: i32 = 0xC000_013A_u32.cast_signed();
 fn a_command_still_running_5_s_after_a_ctrl_c_has_its_job_terminated() {
     let case = Case::new("a_command_still_running_5_s_after_a_ctrl_c_has_its_job_terminated");
     // The interrupt comes at the first sample that sees the command's output, so its `pid` line is written before it.
-    let seams = ["--test-sample-ms", "100", "--test-interrupt-after-samples", "1", "--test-interrupt-from-output"];
+    let seams = [
+        "--test-sample-ms",
+        "100",
+        "--test-interrupt-after-samples",
+        "1",
+        "--test-interrupt-from-output",
+    ];
 
     // The seam raises only the gate's own interrupt: the command never sees a Ctrl+C, so it is still running 5 s later.
     let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "pid", "out", "hi", "sleep", UNTIL_KILLED]));
