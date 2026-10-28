@@ -2733,10 +2733,10 @@ fn target_folder(words: &[String], subfolder: &str) -> Option<String> {
     })
 }
 
-/// The glob `folder`, built under `subfolder`, keeps its output in: their segments together, each kept unless empty or
-/// `.`, a `..` popping the last kept one, so the target climbs back to the repo root but not above it; `None` for an
-/// absolute folder or one that climbs above the root. The kept segments joined with `/`, then `/bin/**`.
-fn bin_glob(subfolder: &str, folder: &str) -> Option<String> {
+/// The segments of `folder`, written with `/` or `\`, built under `subfolder`: each kept unless empty or `.`, a `..`
+/// popping the last kept one, so the path climbs back to the repo root but not above it; `None` for an absolute folder
+/// or one that climbs above the root. The kept segments joined with `/` and a trailing `/`, empty at the root.
+fn joined_path(subfolder: &str, folder: &str) -> Option<String> {
     let folder = folder.replace('\\', "/");
     if folder.starts_with('/') || folder.as_bytes().get(1) == Some(&b':') {
         return None;
@@ -2751,12 +2751,91 @@ fn bin_glob(subfolder: &str, folder: &str) -> Option<String> {
             part => kept.push(part),
         }
     }
-    let prefix = if kept.is_empty() {
+    Some(if kept.is_empty() {
         String::new()
     } else {
         format!("{}/", kept.join("/"))
+    })
+}
+
+/// The glob `folder`, built under `subfolder`, keeps its output in ([`joined_path`]), then `/bin/**`.
+fn bin_glob(subfolder: &str, folder: &str) -> Option<String> {
+    joined_path(subfolder, folder).map(|prefix| format!("{prefix}bin/**"))
+}
+
+/// The output globs of the files a routed dotnet command's own switches name ([`SWITCH_FILES`]): one per file, joined
+/// under `subfolder` as [`switch_glob`] joins it, in the order the words name them. Empty for a command that is no
+/// dotnet command, one whose own words name a response file ([`dotnet_own`]), and one whose switches name no file.
+fn switch_outputs(words: &[String], subfolder: &str) -> Vec<String> {
+    let Some(own) = dotnet_own(words) else {
+        return Vec::new();
     };
-    Some(format!("{prefix}bin/**"))
+    words[own]
+        .iter()
+        .filter_map(|word| switch_file(word))
+        .filter_map(|file| switch_glob(subfolder, &file))
+        .collect()
+}
+
+/// The file a dotnet switch's value names ([`switch_rule`]): the file a file logger's `LogFile=` pair names, or for a
+/// binary logger a `LogFile=` pair or else its first `;`-separated piece when that piece is no `key=value` pair, or for
+/// the result file switch the whole value. `None` for any other word and for any value naming no file.
+fn switch_file(word: &str) -> Option<String> {
+    let (rule, value) = switch_rule(word)?;
+    match rule {
+        SwitchValue::LogFilePair => log_file(value),
+        SwitchValue::PathOrLogFile => log_file(value).or_else(|| value.split(';').next().filter(|first| !first.contains('=')).map(str::to_owned)),
+        SwitchValue::Path => Some(value.to_owned()),
+    }
+}
+
+/// The value of the [`LOG_FILE`] pair of a switch's `;`-separated value list, its key read in any letter case; `None`
+/// when the list holds no such pair.
+fn log_file(value: &str) -> Option<String> {
+    value.split(';').find_map(|piece| {
+        let (key, file) = piece.split_once('=')?;
+        eq_ignoring_case(key.trim(), LOG_FILE).then(|| file.to_owned())
+    })
+}
+
+/// The file rule ([`SWITCH_FILES`]) and value of the dotnet switch `word`: an optional `--`, `-` or `/` lead, then one
+/// of the table's names, then `:` (or `=` too, for the switch [`SwitchValue::Path`] takes) and the value. `None` for
+/// any other word, and for a word with no separator after its name.
+fn switch_rule(word: &str) -> Option<(SwitchValue, &str)> {
+    let rest = word.strip_prefix("--").or_else(|| word.strip_prefix(['-', '/']))?;
+    let at = rest.find([':', '='])?;
+    let (name, after) = rest.split_at(at);
+    let (separator, value) = after.split_at(1);
+    let (_, _, rule) = SWITCH_FILES.iter().find(|(stem, numbered, _)| names_switch(name, stem, *numbered))?;
+    (*rule == SwitchValue::Path || separator == ":").then_some((*rule, value))
+}
+
+/// Whether `name` is `stem` in any letter case, with `MSBuild`'s number after it when `numbered` allows one: `/flp1` to
+/// `/flp9`.
+fn names_switch(name: &str, stem: &str, numbered: Numbered) -> bool {
+    if eq_ignoring_case(name, stem) {
+        return true;
+    }
+    if numbered == Numbered::No {
+        return false;
+    }
+    let mut chars = name.char_indices();
+    let Some((at, digit)) = chars.next_back() else {
+        return false;
+    };
+    matches!(digit, '1'..='9') && eq_ignoring_case(&name[..at], stem)
+}
+
+/// The glob the file `value` a switch names comes back by, under `subfolder` ([`joined_path`]), one pair of surrounding
+/// `"` removed: `None` for an empty value, one holding a glob's `[`, `]`, `*` or `?` (skipped rather than refused, as
+/// the payload refuses the first two and the last two would widen a literal), a path starting with `/` or `\`, and one
+/// that names the root itself or climbs above it.
+fn switch_glob(subfolder: &str, value: &str) -> Option<String> {
+    let value = value.strip_prefix('"').and_then(|inner| inner.strip_suffix('"')).unwrap_or(value);
+    if value.is_empty() || value.starts_with(['/', '\\']) || value.contains(['[', ']', '*', '?']) {
+        return None;
+    }
+    joined_path(subfolder, value).and_then(|path| path.strip_suffix('/').map(str::to_owned))
 }
 
 /// The routed run of a matched command: its target, its rewritten words with `--no-build` dropped, then marked and
@@ -2793,15 +2872,24 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
     let fallback = without_no_build(given.to_vec());
     let own_outputs = config.own_outputs_on(&target.builder, &target.repo);
     let derives = target.builder.os == BuilderOs::Windows && own_outputs.as_ref().is_some_and(|globs| !globs.is_empty());
-    let derived = derives.then(|| derived_outputs(&sent, &subfolder)).flatten();
+    let derived: Vec<String> = if derives {
+        derived_outputs(&sent, &subfolder)
+            .into_iter()
+            .chain(switch_outputs(&sent, &subfolder))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut outputs = match own_outputs {
         Some(globs) => globs,
         None if target.builder.os == BuilderOs::Macos => Vec::new(),
         None if cargo => CARGO_OUTPUTS.iter().map(|glob| (*glob).to_owned()).collect(),
         None => DEFAULT_OUTPUTS.iter().map(|glob| (*glob).to_owned()).collect(),
     };
-    if let Some(glob) = derived.filter(|glob| !outputs.contains(glob)) {
-        outputs.push(glob);
+    for glob in derived {
+        if !outputs.contains(&glob) {
+            outputs.push(glob);
+        }
     }
     let outputs_withheld = fallback.len() != given.len() && !outputs.is_empty();
     if outputs_withheld {
@@ -3206,6 +3294,40 @@ const DEFAULT_CONFIGURATION: &str = "Debug";
 /// [`derived_outputs`] reads: `Platform` left out, whose build lands under `bin\{platform}\{configuration}` still.
 const DERIVED_OUTPUT_PROPERTIES: [&str; 4] = ["OutputPath", "BaseOutputPath", "UseArtifactsOutput", "OutDir"];
 
+/// The switches whose value names a file a routed dotnet command writes: the name after the switch's `--`, `-` or `/`
+/// lead, matched in any letter case; whether `MSBuild`'s number `1` to `9` may follow the name (the file logger's, one
+/// switch per numbered logger); and how the value reads ([`SwitchValue`], [`switch_file`]).
+const SWITCH_FILES: [(&str, Numbered, SwitchValue); 5] = [
+    ("flp", Numbered::ToNine, SwitchValue::LogFilePair),
+    ("fileLoggerParameters", Numbered::ToNine, SwitchValue::LogFilePair),
+    ("bl", Numbered::No, SwitchValue::PathOrLogFile),
+    ("binaryLogger", Numbered::No, SwitchValue::PathOrLogFile),
+    ("getResultOutputFile", Numbered::No, SwitchValue::Path),
+];
+
+/// The key of the pair a file logger's parameters name their log file by, matched in any letter case ([`log_file`]).
+const LOG_FILE: &str = "LogFile";
+
+/// How a switch's value names the file the switch writes ([`switch_file`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SwitchValue {
+    /// A `;`-separated list whose [`LOG_FILE`] pair names the file ([`log_file`]), and none when the list holds no such
+    /// pair.
+    LogFilePair,
+    /// A binary logger's `;`-separated list: a [`LOG_FILE`] pair's file, else the first piece when it is no `key=value`
+    /// pair.
+    PathOrLogFile,
+    /// The whole value.
+    Path,
+}
+
+/// Whether `MSBuild`'s number `1` to `9` may follow a switch's name, as it may the file logger's.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Numbered {
+    No,
+    ToNine,
+}
+
 /// The bin folder whose files a routed dotnet `test` or `run --no-build` sends so the builder keeps its `--no-build`
 /// ([`SendPlan::bin`]), read from the command `words` as given at `place`: the dotnet command's verb is one of
 /// [`SEND_VERBS`], its own words hold `--no-build`, name one project inside the worktree ([`send_project`]), set the
@@ -3335,7 +3457,7 @@ fn project_folder(project: &str, place: &Place) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Place, derived_outputs, names_bin_folder, send_bin};
+    use super::{Place, derived_outputs, names_bin_folder, send_bin, switch_outputs};
 
     #[test]
     fn a_glob_names_a_bin_folder_by_a_bin_segment_unless_it_names_test_results_too() {
@@ -3375,6 +3497,45 @@ mod tests {
     /// The glob [`derived_outputs`] adds for the command `text` at the subfolder `folder`.
     fn derived(text: &str, folder: &str) -> Option<String> {
         derived_outputs(&words(text), folder)
+    }
+
+    /// The switch output globs [`switch_outputs`] adds for the command `text` at the subfolder `folder`.
+    fn switch_globs(text: &str, folder: &str) -> Vec<String> {
+        switch_outputs(&words(text), folder)
+    }
+
+    #[test]
+    fn no_switch_file_is_derived_for_a_path_above_the_root() {
+        assert_eq!(switch_globs(r"dotnet build App.csproj -flp:LogFile=..\x.log", ""), Vec::<String>::new());
+        assert_eq!(
+            switch_globs(r"dotnet build App.csproj -flp:LogFile=..\..\..\x.log", "src/c"),
+            Vec::<String>::new()
+        );
+        assert_eq!(switch_globs(r"dotnet build App.csproj -flp:LogFile=..\x.log", "src/c"), ["src/x.log"]);
+    }
+
+    #[test]
+    fn no_switch_file_is_derived_for_a_path_outside_the_worktree() {
+        assert_eq!(
+            switch_globs(r"dotnet build App.csproj -flp:LogFile=C:\logs\x.log", ""),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            switch_globs("dotnet build App.csproj -flp:LogFile=D:/logs/x.log", ""),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            switch_globs(r"dotnet build App.csproj -flp:LogFile=\logs\x.log", ""),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn no_switch_file_is_derived_for_a_glob_or_an_empty_value() {
+        assert_eq!(switch_globs(r"dotnet build App.csproj -flp:LogFile=[x].log", ""), Vec::<String>::new());
+        assert_eq!(switch_globs(r"dotnet build App.csproj -flp:LogFile=*.log", ""), Vec::<String>::new());
+        assert_eq!(switch_globs(r"dotnet build App.csproj -flp:LogFile=?x.log", ""), Vec::<String>::new());
+        assert_eq!(switch_globs("dotnet build App.csproj -flp:LogFile=", ""), Vec::<String>::new());
     }
 
     #[test]

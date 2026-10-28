@@ -1509,11 +1509,19 @@ fn no_bin_is_derived_for_a_solution_or_an_output_folder() {
 }
 
 #[test]
-fn no_bin_is_derived_for_an_empty_outputs_list() {
+fn no_bin_or_switch_file_is_derived_for_an_empty_outputs_list() {
     let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": []}}"#).expect("usable");
-    let command = words(&["dotnet", "build", "src/App/App.csproj"]);
+    let command = words(&["dotnet", "build", "src/App/App.csproj", r"-flp:LogFile=x.log"]);
     let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
     assert_eq!(run.outputs, Vec::<String>::new());
+}
+
+#[test]
+fn no_switch_file_is_derived_for_a_repo_with_no_outputs_list() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}}"#).expect("usable");
+    let command = words(&["dotnet", "build", "src/App/App.csproj", r"-flp:LogFile=x.log"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["**/bin/**", "**/.godot/mono/temp/bin/**"]);
 }
 
 #[test]
@@ -1637,6 +1645,216 @@ fn no_bin_is_derived_for_an_empty_project_option() {
     let command = words(&["dotnet", "build", "--project", ""]);
     let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
     assert_eq!(run.outputs, ["tools/X/bin/**"]);
+}
+
+#[test]
+fn the_file_logger_log_is_brought_back_after_the_repo_s_own_outputs() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+    let command = words(&[
+        "dotnet",
+        "build",
+        "src/App/App.csproj",
+        "-fl",
+        r"/flp:LogFile=.godot\godot-mcp\build.diagnostics.log;Verbosity=quiet",
+    ]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(
+        run.outputs,
+        ["tools/X/bin/**", "src/App/bin/**", ".godot/godot-mcp/build.diagnostics.log"]
+    );
+}
+
+#[test]
+fn the_file_logger_parameter_is_read_in_every_spelling_and_case() {
+    for (switch, file) in [
+        (r"-flp:LogFile=out\a.log", "out/a.log"),
+        (r"-FLP1:verbosity=diag;logfile=out\b.log", "out/b.log"),
+        (r"-flp9:LogFile=out/c.log;Verbosity=quiet", "out/c.log"),
+        (r"/fileLoggerParameters:LogFile=out\d.log", "out/d.log"),
+        (r#"-flp:LogFile="out\e.log""#, "out/e.log"),
+        (r"--flp:LogFile=out\f.log", "out/f.log"),
+    ] {
+        let config =
+            Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+        let command = words(&["dotnet", "build", "src/App/App.csproj", switch]);
+        let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+        assert_eq!(run.outputs, ["tools/X/bin/**", "src/App/bin/**", file], "{switch}");
+    }
+}
+
+#[test]
+fn a_result_output_file_switch_brings_its_file_back_for_an_msbuild_verb() {
+    for (switch, file) in [
+        (
+            r"/getResultOutputFile:.godot\godot-mcp\compile-items-1a2b.json",
+            ".godot/godot-mcp/compile-items-1a2b.json",
+        ),
+        (
+            r"-getResultOutputFile=.godot\godot-mcp\compile-items-2c3d.json",
+            ".godot/godot-mcp/compile-items-2c3d.json",
+        ),
+    ] {
+        let config =
+            Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+        let command = words(&["dotnet", "msbuild", "src/App/App.csproj", switch]);
+        let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+        assert_eq!(run.outputs, ["tools/X/bin/**", file], "{switch}");
+    }
+}
+
+#[test]
+fn a_binary_logger_brings_back_the_binlog_its_switch_names() {
+    for (switch, file) in [
+        (r"-bl:logs\a.binlog", "logs/a.binlog"),
+        (r"-bl:logs\b.binlog;ProjectImports=None", "logs/b.binlog"),
+        (r"-bl:LogFile=logs\c.binlog", "logs/c.binlog"),
+        ("/binaryLogger:logs/d.binlog", "logs/d.binlog"),
+        (r"--bl:x.binlog", "x.binlog"),
+        (r"-bl:a.binlog;LogFile=b.binlog", "b.binlog"),
+    ] {
+        let config =
+            Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+        let command = words(&["dotnet", "build", "src/App/App.csproj", switch]);
+        let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+        assert_eq!(run.outputs, ["tools/X/bin/**", "src/App/bin/**", file], "{switch}");
+    }
+}
+
+#[test]
+fn a_switch_file_is_brought_back_under_the_subfolder() {
+    for (switch, file) in [
+        (r"/getResultOutputFile:.godot\x.json", "src/c/.godot/x.json"),
+        (r"-flp:LogFile=..\x.log", "src/x.log"),
+    ] {
+        let config =
+            Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+        let facts = FakeFacts {
+            config: Ok(Some(config)),
+            ..FakeFacts::at("src/c/")
+        };
+        let command = words(&["dotnet", "build", "App.csproj", switch]);
+        let run = routed(decide(&heavy(&command), &facts));
+        assert_eq!(run.outputs, ["tools/X/bin/**", "src/c/bin/**", file], "{switch}");
+    }
+}
+
+#[test]
+fn no_switch_file_is_derived_for_a_glob_and_the_run_still_routes() {
+    for switch in [r"-flp:LogFile=[x].log", r"-flp:LogFile=*.log", r"-flp:LogFile=?x.log", "-flp:LogFile="] {
+        let config =
+            Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+        let command = words(&["dotnet", "build", "src/App/App.csproj", switch]);
+        let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+        assert_eq!(run.outputs, ["tools/X/bin/**", "src/App/bin/**"], "{switch}");
+    }
+}
+
+#[test]
+fn a_switch_file_already_listed_adds_no_copy() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**", ".godot/x.log"]}}"#)
+        .expect("usable");
+    let command = words(&["dotnet", "build", "src/App/App.csproj", r"-flp:LogFile=.godot\x.log"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["tools/X/bin/**", ".godot/x.log", "src/App/bin/**"]);
+}
+
+#[test]
+fn no_switch_file_is_derived_for_a_command_naming_a_response_file() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+    let command = words(&["dotnet", "build", "@build.rsp", r"-flp:LogFile=x.log"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["tools/X/bin/**"]);
+}
+
+#[test]
+fn a_run_whose_no_build_is_dropped_brings_back_no_switch_file() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+    let command = words(&["dotnet", "test", "src/App/App.csproj", "--no-build", r"-bl:logs\b.binlog"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert!(run.outputs_withheld);
+    assert_eq!(run.outputs, Vec::<String>::new());
+}
+
+#[test]
+fn no_switch_file_is_derived_on_a_macos_builder() {
+    let mac = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["dotnet build*"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}]"#;
+    let config = with_builders(r#"{"yaat": ["*"]}"#, mac);
+    let command = words(&["dotnet", "build", "src/App/App.csproj", r"/flp:LogFile=x.log"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["tools/X/bin/**"]);
+}
+
+#[test]
+fn the_switch_file_is_derived_for_a_solution_or_an_output_folder() {
+    for command in [
+        words(&["dotnet", "build", "App.sln", r"/flp:LogFile=x.log"]),
+        words(&["dotnet", "build", "src/App/App.csproj", "-o", "out", r"/flp:LogFile=x.log"]),
+    ] {
+        let config =
+            Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+        let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+        assert_eq!(run.outputs, ["tools/X/bin/**", "x.log"], "{command:?}");
+    }
+}
+
+#[test]
+fn no_switch_file_is_derived_for_a_word_after_the_separator() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+    let command = words(&["dotnet", "test", "App.csproj", "--", "RunConfiguration.X=1", "-bl:x.binlog"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["tools/X/bin/**", "bin/**"]);
+
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+    let command = words(&["dotnet", "run", "--project", "src/App", "--", "-flp:LogFile=x.log"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["tools/X/bin/**"]);
+}
+
+#[test]
+fn a_switch_file_written_as_an_absolute_path_comes_back_repo_relative() {
+    let file_logger = format!(r"/flp:LogFile={ROOT}/.godot/godot-mcp/b.log;Verbosity=quiet");
+    let result_file = format!(r"/getResultOutputFile:{ROOT}\.godot\x.json");
+    let files = [(file_logger.as_str(), ".godot/godot-mcp/b.log"), (result_file.as_str(), ".godot/x.json")];
+    for (switch, file) in files {
+        let config =
+            Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+        let command = words(&["dotnet", "build", "App.csproj", switch]);
+        let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+        assert_eq!(run.outputs, ["tools/X/bin/**", "bin/**", file], "{switch}");
+    }
+    for (switch, file) in files {
+        let config =
+            Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+        let facts = FakeFacts {
+            config: Ok(Some(config)),
+            ..FakeFacts::at("src/c/")
+        };
+        let command = words(&["dotnet", "build", "App.csproj", switch]);
+        let run = routed(decide(&heavy(&command), &facts));
+        assert_eq!(run.outputs, ["tools/X/bin/**", "src/c/bin/**", file], "{switch}");
+    }
+}
+
+#[test]
+fn no_switch_file_is_derived_for_a_bare_or_unknown_switch() {
+    let switches = [
+        "-fl",
+        "-bl",
+        "/flp:Verbosity=quiet",
+        "-flp10:LogFile=x.log",
+        "-blah:x",
+        "/getItem:Compile",
+        "-bl:ProjectImports=None",
+        "-flp=LogFile=x.log",
+        "-bl=x.binlog",
+    ];
+    for switch in switches {
+        let config =
+            Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+        let command = words(&["dotnet", "build", "src/App/App.csproj", switch]);
+        let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+        assert_eq!(run.outputs, ["tools/X/bin/**", "src/App/bin/**"], "{switch}");
+    }
 }
 
 #[test]
