@@ -262,7 +262,7 @@ It makes no OS calls, builds and tests on any OS, and must never depend on `gate
   `counts.rs` also writes the counts files for ops-tower's Gates tab (`apply_slot_count`, `write_slot_counts`): the PowerShell layout's file, then `gate.exe`'s `v1\slot-counts.json` beside it. `apply_slot_count` keeps the other pool's valid count, replaces a missing, blank, invalid or non-object file, and fails with `ApplyError::Read` on a file that exists but cannot be read, leaving it untouched.
 - **`gate-watchdog`** (`crates/gate-watchdog/`, pure): owns the free-share, load-adjusted clock, stall, ceiling and backstop arithmetic over samples (`share.rs`, `watch.rs`, including `measure_cpu` and the progress the WSL VM adds).
 
-  It also owns the `wsl` command test over a command's first word (`watch.rs`: `is_wsl_command`) and the kill lines.
+  It also owns the `wsl` and `ssh` command tests over a command's first word (`watch.rs`: `is_wsl_command`, `is_ssh_command`), `SSH_STALL_LINE` and the kill lines.
 
   It also owns the pure formatting of the diagnostics block a kill writes (`diagnostics.rs`: `lines`, `failed_block`, `failed_line` and the caps `JOB_LINES` and `OUTSIDE_LINES`).
 

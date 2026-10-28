@@ -3704,11 +3704,15 @@ impl Run<'_> {
             }
             Watched::Killed {
                 line,
+                hint,
                 processes,
                 diagnostics,
             } => {
                 console.note_block(&diagnostics);
                 console.err(&line);
+                if let Some(hint) = hint {
+                    console.err(hint);
+                }
                 kill(&self.ender(job, running), recorded, processes, console);
                 console.err(&format!("gate: diagnostics written to {}", self.log.path().display()));
                 let exited = i64::from(STOPPED);
@@ -5077,6 +5081,7 @@ mod tests {
         let (recorded, terminated) = (recorded(), RefCell::new(Vec::new()));
         let killed = Watched::Killed {
             line: String::new(),
+            hint: None,
             processes: 1,
             diagnostics: Vec::new(),
         };
@@ -5101,6 +5106,7 @@ mod tests {
         let recorded = recorded();
         let killed = Watched::Killed {
             line: String::new(),
+            hint: None,
             processes: 1,
             diagnostics: Vec::new(),
         };

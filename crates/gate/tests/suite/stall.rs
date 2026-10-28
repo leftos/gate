@@ -15,8 +15,8 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::support::{
-    CORE_SECOND, Case, Escapee, FAKE_TOOL, UNTIL_KILLED, assert_in_order, cpu_ticks, exit_of, log_texts, process_lines, release, run_words, said_pid,
-    shown, start, tool, wait_until, wait_until_closed,
+    CORE_SECOND, Case, Escapee, FAKE_TOOL, UNTIL_KILLED, assert_in_order, copy_tool, cpu_ticks, exit_of, log_texts, process_lines, release,
+    run_words, said_pid, shown, start, tool, wait_until, wait_until_closed,
 };
 
 #[test]
@@ -112,6 +112,81 @@ fn a_command_whose_child_outside_its_job_idles_is_still_stalled() {
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     assert!(outcome.stderr.contains("gate: STALLED: "), "{outcome:?}");
     assert_eq!(release(&case)["verdict"], "stalled", "{outcome:?}");
+}
+
+/// The line a stalled ssh command says right after its STALLED line. A copy of the gate's own constant on purpose: it
+/// pins the wording independently.
+const SSH_STALL_LINE: &str = "gate: a command run over ssh shows no CPU on this machine, so it reads as stalled here; routed with gate run \
+                              --builder <host>, it is watched by the builder's own CPU";
+/// How the ssh line starts.
+const SSH_LINE_START: &str = "gate: a command run over ssh";
+
+/// The stderr line after the STALLED one of a run that stalled, `None` when the STALLED line is the last.
+fn line_after_stalled(stderr: &str) -> Option<&str> {
+    let mut lines = stderr.lines().skip_while(|line| !line.starts_with("gate: STALLED: "));
+    assert!(lines.next().is_some(), "the run says the STALLED line: {stderr}");
+    lines.next()
+}
+
+#[test]
+fn a_stalled_ssh_command_says_how_to_route_it() {
+    let case = Case::new("a_stalled_ssh_command_says_how_to_route_it");
+    copy_tool(&case, "ssh.exe");
+
+    let outcome = case.run(&run_words(
+        "out.log",
+        &["--test-stall-ms", "2000", "--test-sample-ms", "100"],
+        &[r".\ssh.exe", "sleep", UNTIL_KILLED],
+    ));
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert_eq!(line_after_stalled(&outcome.stderr), Some(SSH_STALL_LINE), "{outcome:?}");
+}
+
+#[test]
+fn a_timed_out_ssh_command_says_no_ssh_line() {
+    let case = Case::new("a_timed_out_ssh_command_says_no_ssh_line");
+    copy_tool(&case, "ssh.exe");
+    let words = [
+        "run",
+        "--slot",
+        "critical",
+        "--reason",
+        "the suite's critical run",
+        "--timeout",
+        "1",
+        "--log",
+        "out.log",
+        "--test-sample-ms",
+        "100",
+        "--",
+        r".\ssh.exe",
+        "sleep",
+        UNTIL_KILLED,
+    ];
+
+    // A critical run's load-adjusted clock is wall time, so the 1 s ceiling comes before the stall window and the backstop.
+    let outcome = case.run(&words);
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: TIMED OUT"), "{outcome:?}");
+    assert!(!outcome.stderr.lines().any(|line| line.starts_with(SSH_LINE_START)), "{outcome:?}");
+}
+
+#[test]
+fn a_stalled_command_not_named_ssh_says_no_ssh_line() {
+    let case = Case::new("a_stalled_command_not_named_ssh_says_no_ssh_line");
+    copy_tool(&case, "sshd.exe");
+
+    let outcome = case.run(&run_words(
+        "out.log",
+        &["--test-stall-ms", "2000", "--test-sample-ms", "100"],
+        &[r".\sshd.exe", "sleep", UNTIL_KILLED],
+    ));
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert_ne!(line_after_stalled(&outcome.stderr), Some(SSH_STALL_LINE), "{outcome:?}");
+    assert!(!outcome.stderr.lines().any(|line| line.starts_with(SSH_LINE_START)), "{outcome:?}");
 }
 
 #[test]

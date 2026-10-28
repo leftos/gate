@@ -564,6 +564,19 @@ pub fn is_wsl_command(first_word: &str) -> bool {
     strip_exe(file).eq_ignore_ascii_case("wsl")
 }
 
+/// The line a stalled ssh command says after its STALLED line: the work it waits on runs on the other machine, whose CPU
+/// this machine's watch cannot see.
+pub const SSH_STALL_LINE: &str = "gate: a command run over ssh shows no CPU on this machine, so it reads as stalled here; routed with gate run \
+                                  --builder <host>, it is watched by the builder's own CPU";
+
+/// Whether the command's first word `first_word` names `ssh`: its file name with a trailing `.exe` stripped is `ssh`,
+/// ignoring case, a path allowed, as [`is_wsl_command`] reads `wsl`.
+#[must_use]
+pub fn is_ssh_command(first_word: &str) -> bool {
+    let file = first_word.rsplit(['\\', '/', ':']).next().unwrap_or_default();
+    strip_exe(file).eq_ignore_ascii_case("ssh")
+}
+
 /// `file` without a trailing `.exe`, ignoring case.
 fn strip_exe(file: &str) -> &str {
     if file.len() >= 4 && file.as_bytes()[file.len() - 4..].eq_ignore_ascii_case(b".exe") {
@@ -592,6 +605,24 @@ mod tests {
         ];
         for (word, want) in rows {
             assert_eq!(is_wsl_command(word), want, "{word}");
+        }
+    }
+
+    /// The command's first word names `ssh` by its file name with a trailing `.exe` stripped, a path allowed.
+    #[test]
+    fn ssh_commands_are_read_from_the_file_name() {
+        let rows: [(&str, bool); 8] = [
+            ("ssh", true),
+            ("SSH.EXE", true),
+            (r"C:\Windows\System32\OpenSSH\ssh.exe", true),
+            ("/usr/bin/ssh", true),
+            ("sshd", false),
+            ("ssh-keygen", false),
+            ("git", false),
+            ("wsl", false),
+        ];
+        for (word, want) in rows {
+            assert_eq!(is_ssh_command(word), want, "{word}");
         }
     }
 

@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use gate_args::{RunRequest, Slot};
 use gate_state::{RunTrace, SlotKind};
 use gate_watchdog::{
-    Config, Cores, JOB_LINES, Machine, OUTSIDE_LINES, ProcessFacts, Report, Sample, SampleFacts, SampleHistory, SystemTimes, Ticks, Watch, WslVm,
-    failed_block, is_wsl_command, lines, wsl_unavailable_line,
+    Config, Cores, JOB_LINES, Kill, Machine, OUTSIDE_LINES, ProcessFacts, Report, SSH_STALL_LINE, Sample, SampleFacts, SampleHistory, SystemTimes,
+    Ticks, Watch, WslVm, failed_block, is_ssh_command, is_wsl_command, lines, wsl_unavailable_line,
 };
 use gate_win32::{Interrupt, Job, Priority, ProcessTimes, Running, Waited};
 use jiff::Timestamp;
@@ -46,10 +46,12 @@ const DIAGNOSTICS_FAIL: &str = "--test-diagnostics-fail makes the diagnostics fa
 pub(crate) enum Watched {
     /// The command exited with this code.
     Exited(u32),
-    /// The command was killed as stalled, timed out or past the backstop: the line that says so, the processes its
-    /// job held as the kill was found, and the diagnostics block gathered for it.
+    /// The command was killed as stalled, timed out or past the backstop: the line that says so, the line said right
+    /// after it on stderr and in the log but kept out of the kill's journal text (the routing hint of a stalled ssh
+    /// command), the processes its job held as the kill was found, and the diagnostics block gathered for it.
     Killed {
         line: String,
+        hint: Option<&'static str>,
         processes: u32,
         diagnostics: Vec<String>,
     },
@@ -70,6 +72,9 @@ pub(crate) struct Watcher<'a> {
     interrupt: Option<Interrupt>,
     /// The command's words joined by spaces, as the kill line names it.
     spoken: String,
+    /// The line a stalled kill says after its STALLED line: how to route an ssh command ([`is_ssh`]), `None` for any
+    /// other command.
+    stall_hint: Option<&'static str>,
     watch: Watch,
     /// The samples taken, as the diagnostics block lists them, oldest first.
     history: SampleHistory,
@@ -253,6 +258,7 @@ impl<'a> Watcher<'a> {
             period: request.test_seams.sample_ms.map_or(SAMPLE_PERIOD, Duration::from_millis),
             interrupt,
             spoken: spoken.join(" "),
+            stall_hint: is_ssh(request).then_some(SSH_STALL_LINE),
             watch: Watch::new(config, machine(runs_as, processors), system, job_cpu, vm_cpu),
             history: SampleHistory::default(),
             counted_escaped: Vec::new(),
@@ -497,8 +503,10 @@ impl<'a> Watcher<'a> {
             return Ok(Some(exited));
         }
         let processes = self.job.accounting()?.active_processes;
+        let stalled = matches!(kill, Kill::Stalled { .. });
         Ok(Some(Watched::Killed {
             line: kill.line(&self.spoken),
+            hint: self.stall_hint.filter(|_| stalled),
             processes,
             diagnostics,
         }))
@@ -716,6 +724,12 @@ fn config(request: &RunRequest, ceiling: u64) -> Config {
     }
 }
 
+/// Whether `request`'s command runs through ssh, as a command whose first word names `ssh` does: its work runs on the
+/// other machine, whose CPU this watch cannot see.
+fn is_ssh(request: &RunRequest) -> bool {
+    request.command.first().is_some_and(|word| is_ssh_command(&word.to_string_lossy()))
+}
+
 /// How long the watch waits for the command on this pass, `since` the last sample ended: what is left of the sample
 /// period, or while a late take waits for a slot (`polling`), its poll when that is shorter; rounded up to a whole
 /// millisecond, the wait's own unit, so a wait that ends a fraction of a millisecond early is not followed by one of 0.
@@ -890,7 +904,7 @@ mod tests {
     use gate_win32::Priority;
 
     use super::{
-        ACCESS_DENIED, VmReader, config, holds_nested_gate, lowered, machine, members, own_kind_after_take, sample_due, sample_facts, slice,
+        ACCESS_DENIED, VmReader, config, holds_nested_gate, is_ssh, lowered, machine, members, own_kind_after_take, sample_due, sample_facts, slice,
     };
 
     /// The test moment `second` seconds past 10:00 on the test day.
@@ -996,6 +1010,20 @@ mod tests {
             "wsl.exe by path"
         );
         assert!(!config(&request(&["cargo", "test"]), 60).wsl, "any other command is not a wsl one");
+    }
+
+    #[test]
+    fn a_command_run_through_ssh_is_watched_as_an_ssh_one() {
+        assert!(is_ssh(&request(&["ssh", "host", "make"])), "ssh by name");
+        assert!(
+            is_ssh(&request(&["C:\\Windows\\System32\\OpenSSH\\ssh.exe", "host", "make"])),
+            "ssh.exe by path"
+        );
+        assert!(
+            !is_ssh(&request(&["git", "fetch", "ssh"])),
+            "a later word naming ssh is not an ssh command"
+        );
+        assert!(!is_ssh(&request(&["wsl", "ssh", "host"])), "a wsl command running ssh is a wsl one");
     }
 
     /// A VM reader that reads `reads` in turn, then no VM.
