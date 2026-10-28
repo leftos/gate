@@ -29,6 +29,7 @@ use crate::support::{
     start_with_stdin, wait_until, wait_until_closed,
 };
 
+mod channel_pc;
 mod desktop;
 mod drain;
 mod inputs;

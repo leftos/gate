@@ -1056,6 +1056,21 @@ pub struct Channel {
     pub pc_proof: Proof,
 }
 
+/// The bytes of a SHA-256 digest, as the payload carries it in [`SHA256_DIGITS`] hex digits.
+pub const SHA256_BYTES: usize = 32;
+
+/// A put's data channel, the payload's `Channel` with what the PC declares it sends over it: the archive's byte count,
+/// `Length`, and its SHA-256, `Sha256`. Neither comes from the channel itself.
+#[derive(Debug)]
+pub struct PutChannel {
+    /// The channel's addresses and proofs.
+    pub channel: Channel,
+    /// The bytes of the archive the PC sends.
+    pub length: u64,
+    /// The SHA-256 of those bytes.
+    pub sha256: [u8; SHA256_BYTES],
+}
+
 /// The line the box says on stderr once its data channel listens on `port` for the call whose payload carries `nonce`:
 /// `gate-remote-channel: <nonce> <port>`. Nothing secret is in it.
 #[must_use]
@@ -1089,25 +1104,79 @@ impl Payload {
     /// without the `test-seams` feature, not loopback; whose `Peer` is an IPv4 address; and whose `BoxProof` and
     /// `PcProof` are each [`PROOF_DIGITS`] lower-case hex digits. A line refusing a proof never shows it.
     pub fn channel(&self) -> Result<Option<Channel>, String> {
-        let object = match self.object.get("Channel") {
-            None | Some(Value::Null) => return Ok(None),
-            Some(Value::Object(object)) => object,
-            Some(_) => return Err("gate: box payload Channel is not an object".to_owned()),
+        self.channel_object()?.map(channel_of).transpose()
+    }
+
+    /// A put's data channel: the request's `Channel` as [`Payload::channel`] reads it, which must also carry the
+    /// archive's `Length`, a whole number of bytes, and its `Sha256`, [`SHA256_DIGITS`] lower-case hex digits; `None`
+    /// when the key is absent or null. Else the usage line naming the field, which never shows a proof.
+    pub fn put_channel(&self) -> Result<Option<PutChannel>, String> {
+        let Some(object) = self.channel_object()? else {
+            return Ok(None);
         };
-        let address = channel_address(object, "Address")?;
-        if address.is_unspecified() {
-            return Err("gate: box payload Channel Address must not be the unspecified address 0.0.0.0".to_owned());
-        }
-        if address.is_loopback() && !cfg!(feature = "test-seams") {
-            return Err(format!("gate: box payload Channel Address must not be a loopback address: {address}"));
-        }
-        Ok(Some(Channel {
-            address,
-            peer: channel_address(object, "Peer")?,
-            box_proof: channel_proof(object, "BoxProof")?,
-            pc_proof: channel_proof(object, "PcProof")?,
+        Ok(Some(PutChannel {
+            channel: channel_of(object)?,
+            length: channel_length(object)?,
+            sha256: channel_sha256(object)?,
         }))
     }
+
+    /// The request's `Channel` object; `None` when the key is absent or null, else the usage line saying it is not an
+    /// object.
+    fn channel_object(&self) -> Result<Option<&Map<String, Value>>, String> {
+        match self.object.get("Channel") {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Object(object)) => Ok(Some(object)),
+            Some(_) => Err("gate: box payload Channel is not an object".to_owned()),
+        }
+    }
+}
+
+/// The data channel the `Channel` object `object` asks for, as [`Payload::channel`] reads it; else the usage line.
+fn channel_of(object: &Map<String, Value>) -> Result<Channel, String> {
+    let address = channel_address(object, "Address")?;
+    if address.is_unspecified() {
+        return Err("gate: box payload Channel Address must not be the unspecified address 0.0.0.0".to_owned());
+    }
+    if address.is_loopback() && !cfg!(feature = "test-seams") {
+        return Err(format!("gate: box payload Channel Address must not be a loopback address: {address}"));
+    }
+    Ok(Channel {
+        address,
+        peer: channel_address(object, "Peer")?,
+        box_proof: channel_proof(object, "BoxProof")?,
+        pc_proof: channel_proof(object, "PcProof")?,
+    })
+}
+
+/// The `Channel` field `Length`, a whole number of bytes; else the usage line saying the channel lacks it or that it is
+/// not one, which shows no value.
+fn channel_length(object: &Map<String, Value>) -> Result<u64, String> {
+    match object.get("Length") {
+        None | Some(Value::Null) => Err("gate: box payload Channel lacks Length".to_owned()),
+        Some(length) => length
+            .as_u64()
+            .ok_or_else(|| "gate: box payload Channel Length is not a whole number of bytes".to_owned()),
+    }
+}
+
+/// The `Channel` field `Sha256`, [`SHA256_DIGITS`] lower-case hex digits; else the usage line, which shows no value.
+fn channel_sha256(object: &Map<String, Value>) -> Result<[u8; SHA256_BYTES], String> {
+    let text = channel_text(object, "Sha256")?;
+    hex_array(text).ok_or_else(|| format!("gate: box payload Channel Sha256 is not {SHA256_DIGITS} lower-case hex digits"))
+}
+
+/// The `N` bytes `text` spells in `2 * N` lower-case hex digits; `None` for any other text.
+fn hex_array<const N: usize>(text: &str) -> Option<[u8; N]> {
+    if !is_lower_hex(text, 2 * N) {
+        return None;
+    }
+    let mut bytes = [0_u8; N];
+    let (pairs, _) = text.as_bytes().as_chunks::<2>();
+    for (byte, pair) in bytes.iter_mut().zip(pairs) {
+        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(bytes)
 }
 
 /// The text of the `Channel` field `key`; else the usage line saying the channel lacks it (absent, null or empty) or
@@ -1132,17 +1201,9 @@ fn channel_address(object: &Map<String, Value>, key: &str) -> Result<std::net::I
 /// show the value.
 fn channel_proof(object: &Map<String, Value>, key: &str) -> Result<Proof, String> {
     let text = channel_text(object, key)?;
-    let not_a_proof = || format!("gate: box payload Channel {key} is not {PROOF_DIGITS} lower-case hex digits");
-    if !is_lower_hex(text, PROOF_DIGITS) {
-        return Err(not_a_proof());
-    }
-    let mut bytes = [0_u8; PROOF_BYTES];
-    let (pairs, _) = text.as_bytes().as_chunks::<2>();
-    for (byte, pair) in bytes.iter_mut().zip(pairs) {
-        let pair = std::str::from_utf8(pair).map_err(|_| not_a_proof())?;
-        *byte = u8::from_str_radix(pair, 16).map_err(|_| not_a_proof())?;
-    }
-    Ok(Proof(bytes))
+    hex_array(text)
+        .map(Proof)
+        .ok_or_else(|| format!("gate: box payload Channel {key} is not {PROOF_DIGITS} lower-case hex digits"))
 }
 
 /// The most characters a drain session id, the payload's `Session`, may have.
@@ -1441,7 +1502,8 @@ pub enum Refusal {
     Drain,
     /// Every one of the builder's own slots is held.
     Full,
-    /// The data channel did not complete: nothing was installed, and the outputs archive is kept.
+    /// The data channel did not complete: nothing was installed. A pull's outputs archive is kept; a put's stage is
+    /// removed.
     Channel,
 }
 
@@ -1691,7 +1753,7 @@ mod tests {
         use base64::engine::general_purpose::STANDARD;
         use serde_json::{Value, json};
 
-        use crate::{Channel, PathForm, Payload};
+        use crate::{Channel, PathForm, Payload, PutChannel};
 
         const BOX_PROOF: &str = "00112233445566778899aabbccddeeff";
         const PC_PROOF: &str = "ffeeddccbbaa99887766554433221100";
@@ -1826,6 +1888,89 @@ mod tests {
                 assert!(!shown.to_ascii_lowercase().contains(&proof[..8]), "{shown}");
             }
             assert!(!shown.contains("17,"), "no proof byte is shown as a number: {shown}");
+        }
+
+        const DIGEST: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+        /// The `Channel` object of a put: every field well formed, the archive's length and digest included.
+        fn put_channel() -> Value {
+            let mut channel = channel_at("100.64.0.1");
+            channel["Length"] = json!(300_001);
+            channel["Sha256"] = json!(DIGEST);
+            channel
+        }
+
+        /// What the put's `Channel` reader makes of a payload whose `Channel` is `channel`.
+        fn read_put(channel: &Value) -> Result<Option<PutChannel>, String> {
+            let payload =
+                Payload::decode(&STANDARD.encode(json!({ "Channel": channel }).to_string()), PathForm::Windows).expect("the payload decodes");
+            payload.put_channel()
+        }
+
+        /// The usage line the put's `Channel` reader gives for `channel`, checked to show no proof.
+        fn put_refusal(channel: &Value) -> String {
+            let line = read_put(channel).expect_err("the put's channel is refused");
+            for proof in [BOX_PROOF, PC_PROOF] {
+                assert!(!line.contains(proof), "the line shows no proof: {line}");
+            }
+            line
+        }
+
+        #[test]
+        fn a_put_channel_carries_its_length_and_digest() {
+            let put = read_put(&put_channel()).expect("the channel is read").expect("a channel is asked for");
+
+            assert_eq!(put.length, 300_001);
+            let expected: Vec<u8> = (0..32).collect();
+            assert_eq!(put.sha256.to_vec(), expected);
+            assert_eq!(put.channel.address, Ipv4Addr::new(100, 64, 0, 1));
+            assert!(put.channel.pc_proof.matches(&[
+                0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00
+            ]));
+            assert!(read_put(&Value::Null).expect("a null channel is no error").is_none());
+        }
+
+        #[test]
+        fn a_put_channel_without_a_length_or_digest_is_a_usage_error_that_shows_no_proof() {
+            for key in ["Length", "Sha256"] {
+                let mut without = put_channel();
+                without.as_object_mut().expect("the channel is an object").remove(key);
+                assert_eq!(put_refusal(&without), format!("gate: box payload Channel lacks {key}"), "{key}");
+                let mut null = put_channel();
+                null[key] = Value::Null;
+                assert_eq!(put_refusal(&null), format!("gate: box payload Channel lacks {key}"), "{key}");
+            }
+            assert_eq!(put_refusal(&channel_at("100.64.0.1")), "gate: box payload Channel lacks Length");
+            for (bad, why) in [(json!("300001"), "a text"), (json!(-1), "negative"), (json!(1.5), "a fraction")] {
+                let mut channel = put_channel();
+                channel["Length"] = bad;
+                assert_eq!(
+                    put_refusal(&channel),
+                    "gate: box payload Channel Length is not a whole number of bytes",
+                    "{why}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_malformed_put_digest_is_a_usage_error() {
+            let upper = DIGEST.to_ascii_uppercase();
+            let short = &DIGEST[1..];
+            let long = format!("{DIGEST}0");
+            let not_hex = format!("{}g", &DIGEST[1..]);
+            for bad in [upper.as_str(), short, long.as_str(), not_hex.as_str()] {
+                let mut channel = put_channel();
+                channel["Sha256"] = json!(bad);
+                let line = put_refusal(&channel);
+                assert_eq!(line, "gate: box payload Channel Sha256 is not 64 lower-case hex digits", "{bad:?}");
+                assert!(!line.contains(bad), "the line shows no value: {line}");
+            }
+            let mut empty = put_channel();
+            empty["Sha256"] = json!("");
+            assert_eq!(put_refusal(&empty), "gate: box payload Channel lacks Sha256");
+            let mut number = put_channel();
+            number["Sha256"] = json!(7);
+            assert_eq!(put_refusal(&number), "gate: box payload Channel Sha256 is not a text");
         }
     }
 

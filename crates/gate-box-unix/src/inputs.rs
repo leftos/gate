@@ -49,7 +49,7 @@ use crate::console::Console;
 use crate::drain;
 use crate::files::{self, HeldLock, Locked};
 use crate::git::Git;
-use crate::lines::{FAILED_STATUS, USAGE_STATUS};
+use crate::lines::{FAILED_STATUS, USAGE_STATUS, channel_refusal};
 use crate::preflight::checked_root;
 use crate::request::{Unread, bounded_line};
 use crate::run::{self, Laying, NotLaidOut, REFUSED_STATUS, Repo, Unbuilt};
@@ -179,7 +179,8 @@ fn read_manifest(input: &mut impl BufRead) -> Result<Sent, String> {
     Ok(Sent { manifest, digest })
 }
 
-/// Answers `gate-box box inputs`: the request read; the work root, `<root>/work` and the bare repository judged as a run
+/// Answers `gate-box box inputs`: the request read, one asking for a data channel refused `channel` (75), as this
+/// builder has none ([`channel_refusal`]); the work root, `<root>/work` and the bare repository judged as a run
 /// judges them ([`root_checked`]), making nothing, before the drain beneath the root is touched; the call passed through
 /// the drain ([`drain::passed`]), refused `drain` (75) for a session the drain does not admit; then the manifest from
 /// stdin, before any lock is taken, so a client that stalls holds nothing; then the step. A payload refused is a usage
@@ -200,6 +201,19 @@ fn answered(payload: &Payload, seams: &BoxSeams, input: &mut impl BufRead, conso
             return USAGE_STATUS;
         }
     };
+    match channel_refusal(payload) {
+        Ok(None) => {}
+        Ok(Some(lines)) => {
+            for line in &lines {
+                console.err(line);
+            }
+            return REFUSED_STATUS;
+        }
+        Err(line) => {
+            console.err(&line);
+            return USAGE_STATUS;
+        }
+    }
     // The root is judged, making nothing, before the drain beneath it is touched.
     if let Err((line, status)) = root_checked(&asked) {
         console.err(&line);
@@ -1800,6 +1814,44 @@ mod tests {
     )]
     fn sleeping_group() -> Child {
         Command::new("sleep").arg("600").process_group(0).spawn().expect("sleep starts")
+    }
+
+    /// This builder has no data channel: a put or a diff asking for one is refused `channel` before stdin is read, so
+    /// the PC sends over ssh; a malformed one is the payload's usage line, which never shows a proof.
+    #[test]
+    fn a_request_asking_for_a_data_channel_is_refused_channel() {
+        let case = Case::new("channel");
+        let channel = json!({
+            "Address": "100.64.0.1",
+            "Peer": "100.64.0.2",
+            "BoxProof": "00112233445566778899aabbccddeeff",
+            "PcProof": "ffeeddccbbaa99887766554433221100",
+            "Length": 7,
+            "Sha256": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        });
+        for step in ["put", "diff"] {
+            let mut json = case.json(step);
+            json["Channel"] = channel.clone();
+
+            let (status, console) = answer(&json, b"not a manifest\n");
+
+            assert_eq!(status, REFUSED_STATUS, "{step}");
+            let nonce = json["Nonce"].as_str().expect("the request has a nonce");
+            assert_eq!(
+                console.err,
+                [
+                    format!("gate-remote-refused: {nonce} channel"),
+                    "gate: data channel not completed: this builder has no data channel".to_owned(),
+                ],
+                "{step}"
+            );
+        }
+        let mut bad = case.json("put");
+        bad["Channel"] = channel;
+        bad["Channel"]["PcProof"] = json!("not a proof");
+        let (status, console) = answer(&bad, b"not a manifest\n");
+        assert_eq!(status, USAGE_STATUS);
+        assert_eq!(console.err, ["gate: box payload Channel PcProof is not 32 lower-case hex digits"]);
     }
 
     #[test]

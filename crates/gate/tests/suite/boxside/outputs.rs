@@ -9,7 +9,6 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use gate_win32::socket::Stream;
@@ -18,6 +17,9 @@ use sha2::{Digest, Sha256};
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
 use super::ReadBack;
+use super::channel_pc::{
+    BOX_PROOF, PC_PROOF, assert_no_proof, channel_line, free_port, has_line, hex_bytes, listening, not_completed, pc_connected, proved, with_windows,
+};
 use super::{
     BoxCall, bare_box_call, box_call, ended_within, field, gate_box, git, git_folder, has_ref, path_for_run, payload, renamed, run_box,
     run_box_with_path, snapshot,
@@ -91,11 +93,6 @@ fn packed_line(payload: &Value, count: usize) -> String {
 fn size_line(payload: &Value) -> String {
     let size = fs::metadata(archive_path(payload)).expect("the archive the run packed is there").len();
     format!("gate-remote-outputs-size: {size}")
-}
-
-/// Whether `text` holds the whole line `line`.
-fn has_line(text: &str, line: &str) -> bool {
-    text.lines().any(|said| said == line)
 }
 
 /// One item of an outputs archive's list: a path it brings back, its size and SHA-256, and whether it is a copy, whose
@@ -1195,25 +1192,6 @@ fn box_outputs_says_an_archive_that_does_not_exist() {
     assert_eq!(outcome.stderr, format!("gate: remote outputs archive {name} does not exist\n"));
 }
 
-/// The proof the box sends first over a case's data channel.
-const BOX_PROOF: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
-/// The proof a case's PC sends back.
-const PC_PROOF: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
-
-/// The bytes the hex digits `hex` spell.
-fn hex_bytes(hex: &str) -> Vec<u8> {
-    (0..hex.len())
-        .step_by(2)
-        .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("the case's hex is hex"))
-        .collect()
-}
-
-/// A loopback port free a moment ago: the system's pick for a listener closed at once.
-fn free_port() -> u16 {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback listener binds");
-    listener.local_addr().expect("the listener's address is read").port()
-}
-
 /// The `outputs` payload of the work folder `k`'s archive, asking for a data channel on loopback from loopback with the
 /// case's proofs, and the archive's path, written with `bytes` unless `bytes` is `None`.
 fn channel_payload(case: &Case, bytes: Option<&[u8]>) -> (Value, PathBuf) {
@@ -1239,43 +1217,9 @@ fn channel_box(case: &Case, payload: &Value, port: u16, seams: &[&str]) -> Runni
 fn channel_call(case: &Case, payload: &Value, port: u16, seams: &[&str]) -> BoxCall {
     let ports = format!("{port}-{port}");
     let mut args = vec!["box", "--test-box-channel-ports", &ports];
-    args.extend_from_slice(seams);
+    args.extend(with_windows(seams));
     args.push("outputs");
     box_call(case, &args, &self::payload(payload))
-}
-
-/// The data channel line of the call of `payload` on `port`.
-fn channel_line(payload: &Value, port: u16) -> String {
-    format!("gate-remote-channel: {} {port}", field(payload, "Nonce"))
-}
-
-/// What a call of `payload` whose data channel did not complete for `why` says on stderr after anything before it.
-fn not_completed(payload: &Value, why: &str) -> String {
-    format!(
-        "gate-remote-refused: {} channel\ngate: data channel not completed: {why}\n",
-        field(payload, "Nonce")
-    )
-}
-
-/// Waits for the box to say its data channel line on `port`.
-fn listening(running: &Running, payload: &Value, port: u16) {
-    let line = channel_line(payload, port);
-    running.wait_for_stderr_where("the data channel line", |said| has_line(said, &line));
-}
-
-/// The PC's connection to the box's data channel on `port`, its reads ending at the hang guard.
-fn pc_connected(port: u16) -> TcpStream {
-    let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("the PC connects");
-    stream.set_read_timeout(Some(HANG_GUARD)).expect("the read guard is set");
-    stream
-}
-
-/// Reads the box's proof on `stream`, checks it and sends `proof` back, as the PC does.
-fn proved(stream: &mut TcpStream, proof: &str) {
-    let mut box_proof = [0_u8; 16];
-    stream.read_exact(&mut box_proof).expect("the box's proof comes");
-    assert_eq!(box_proof.to_vec(), hex_bytes(BOX_PROOF), "the box sends its proof first");
-    stream.write_all(&hex_bytes(proof)).expect("the PC's proof is sent");
 }
 
 /// Reads `size` bytes of archive on `stream`.
@@ -1293,17 +1237,6 @@ fn pc_pull(port: u16, size: usize) -> Vec<u8> {
     let bytes = pulled(&mut stream, size);
     stream.write_all(&Sha256::digest(&bytes)).expect("the ack is sent");
     bytes
-}
-
-/// Fails when a proof's hex shows in what the box said.
-fn assert_no_proof(outcome: &Outcome) {
-    let stdout = String::from_utf8_lossy(&outcome.raw_stdout);
-    for proof in [BOX_PROOF, PC_PROOF] {
-        assert!(
-            !outcome.stderr.contains(proof) && !stdout.contains(proof),
-            "a proof is shown: {outcome:?}"
-        );
-    }
 }
 
 /// The bytes of a case's archive: every byte value, cycled past a socket buffer's worth.
@@ -1514,26 +1447,21 @@ fn box_outputs_closes_a_connection_from_another_address_unread_and_serves_the_pc
     assert_no_proof(&outcome);
 }
 
-/// The proof's wait has one end, which no byte moves: a PC sending its proof a byte at a time, slower than the whole
-/// wait allows, is refused once that end passes, however short each gap.
+/// The proof's wait has one end, which no byte moves: a PC that sends part of its proof and then nothing is refused
+/// once that end passes, though the idle limit has not.
 #[test]
 fn box_outputs_refuses_a_proof_not_whole_by_its_fixed_end() {
     let case = Case::new("box_outputs_channel_slow_proof");
     let (payload, archive) = channel_payload(&case, Some(&channel_archive()));
     let port = free_port();
-    let running = channel_box(&case, &payload, port, &["--test-box-channel-idle-ms", "300"]);
+    let running = channel_box(&case, &payload, port, &["--test-box-channel-proof-ms", "300"]);
     listening(&running, &payload, port);
 
     let mut stream = pc_connected(port);
     let mut box_proof = [0_u8; 16];
     stream.read_exact(&mut box_proof).expect("the box's proof comes");
-    // Sixteen bytes 50 ms apart take at least 750 ms, past the 300 ms the whole proof has.
-    for byte in hex_bytes(PC_PROOF) {
-        if stream.write_all(&[byte]).is_err() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+    // One byte of the sixteen, then nothing: the idle limit is the built-in 10 s, so only the proof's end can end it.
+    stream.write_all(&hex_bytes(PC_PROOF)[..1]).expect("a byte of the proof is sent");
     let outcome = running.finish_read();
     drop(stream);
 

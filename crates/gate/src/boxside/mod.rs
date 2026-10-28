@@ -4,6 +4,7 @@
 
 mod boot;
 mod ceiling;
+mod channel;
 mod desktop;
 mod drain;
 pub(crate) mod forward;

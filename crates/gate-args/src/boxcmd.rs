@@ -14,7 +14,8 @@
 //! `--test-box-desktop-session <state>`, `--test-box-desktop-mutex <name>`, `--test-box-desktop-ms <n>`,
 //! `--test-box-desktop-message-ms <n>` and `--test-box-register ok|fail`, `--test-box-root-walk-stop <folder>`,
 //! `--test-box-git-limit <step>:<ms>`, `--test-box-git-armed-by <path>`, `--test-box-channel-ports <first>-<last>`,
-//! `--test-box-channel-accept-ms <n>`, `--test-box-channel-idle-ms <n>` and `--test-box-channel-send-buffer-bytes <n>`
+//! `--test-box-channel-accept-ms <n>`, `--test-box-channel-proof-ms <n>`, `--test-box-channel-idle-ms <n>` and
+//! `--test-box-channel-send-buffer-bytes <n>`
 //! (each also as `--<seam>=<value>`) before the
 //! verb; without the feature each is no verb, and so the box usage.
 
@@ -262,6 +263,8 @@ enum Seam {
     ChannelPorts,
     /// `--test-box-channel-accept-ms <n>`: how long a data channel waits for the PC's connection.
     ChannelAcceptMs,
+    /// `--test-box-channel-proof-ms <n>`: how long a data channel waits for the PC's whole proof once it connected.
+    ChannelProofMs,
     /// `--test-box-channel-idle-ms <n>`: how long each read and write of a data channel may wait.
     ChannelIdleMs,
     /// `--test-box-channel-send-buffer-bytes <n>`: the send buffer a data channel's connection gets.
@@ -306,6 +309,7 @@ impl Seam {
             "--test-box-hold-poll-ms" => Some(Seam::HoldPollMs),
             "--test-box-channel-ports" => Some(Seam::ChannelPorts),
             "--test-box-channel-accept-ms" => Some(Seam::ChannelAcceptMs),
+            "--test-box-channel-proof-ms" => Some(Seam::ChannelProofMs),
             "--test-box-channel-idle-ms" => Some(Seam::ChannelIdleMs),
             "--test-box-channel-send-buffer-bytes" => Some(Seam::ChannelSendBufferBytes),
             _ => None,
@@ -347,6 +351,7 @@ impl Seam {
             Seam::HoldPollMs => "--test-box-hold-poll-ms",
             Seam::ChannelPorts => "--test-box-channel-ports",
             Seam::ChannelAcceptMs => "--test-box-channel-accept-ms",
+            Seam::ChannelProofMs => "--test-box-channel-proof-ms",
             Seam::ChannelIdleMs => "--test-box-channel-idle-ms",
             Seam::ChannelSendBufferBytes => "--test-box-channel-send-buffer-bytes",
         }
@@ -436,6 +441,7 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::GitArmedBy => seams.git_armed_by = Some(PathBuf::from(value)),
         Seam::ChannelPorts => seams.channel_ports = Some(crate::values::port_range(name, &value)?),
         Seam::ChannelAcceptMs => seams.channel_accept_ms = Some(crate::values::above_zero(name, &value)?),
+        Seam::ChannelProofMs => seams.channel_proof_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::ChannelIdleMs => seams.channel_idle_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::ChannelSendBufferBytes => {
             seams.channel_send_buffer_bytes = Some(crate::values::in_range(name, &value, 1, CHANNEL_SEND_BUFFER_MOST)?);

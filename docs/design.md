@@ -3063,7 +3063,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The archive and the pending marker are kept for the install. The call's stderr goes to the log only.
 
-    **Data channel** (`remote/channel.rs`; the box's half is the `outputs` verb's, [The box side](#the-box-side)). A `windows` builder that names `data` (the top-level `host`'s own or an entry's, [remote.json](#remotejson)) has the pull carried on a [data channel](GLOSSARY.md) instead of the call's stdout, with the ssh call as the control.
+    **Data channel** (`remote/channel.rs`; the box's half is the `outputs` verb's, [The box side](#the-box-side); the box also takes an `inputs` put on a channel, which no PC code sends yet). A `windows` builder that names `data` (the top-level `host`'s own or an entry's, [remote.json](#remotejson)) has the pull carried on a [data channel](GLOSSARY.md) instead of the call's stdout, with the ssh call as the control.
 
     The outputs call's payload gains `Nonce`, drawn afresh for each attempt, and `Channel` (`Address` the builder's `data`, `Peer` this PC's own address toward it, found by a UDP connect to `data` that sends no packet, and `BoxProof` and `PcProof`, two 128-bit proofs drawn for the attempt from the same random source as the pipe names, as 32 lower-case hex digits each).
 
@@ -4184,7 +4184,7 @@ Built verbs:
 
   Any other end (no connection, a wrong proof, a stalled or gone peer, a wrong ack, a gone client, no free port) keeps the archive, says `gate-remote-refused: <nonce> channel` then `gate: data channel not completed: <why>` and exits 75, so the PC sends over ssh; the why never holds a proof.
 
-  The Windows box's seams are `--test-box-channel-ports <first>-<last>` (any ports within 1-65535 in place of the range), `--test-box-channel-accept-ms <n>` and `--test-box-channel-idle-ms <n>` (replacing the 10 s windows) and `--test-box-channel-send-buffer-bytes <n>` (1 B to 16 MiB), all test-seams only; the fake-ssh test bin hands the words of `GATE_FAKE_SSH_BOX_SEAMS` to an `outputs` call as to the other box verbs.
+  The Windows box's seams are `--test-box-channel-ports <first>-<last>` (any ports within 1-65535 in place of the range), `--test-box-channel-accept-ms <n>` and `--test-box-channel-idle-ms <n>` (replacing the 10 s windows; the idle one does not shorten the wait for the PC's whole proof) and `--test-box-channel-send-buffer-bytes <n>` (1 B to 16 MiB), plus `--test-box-channel-proof-ms <n>` (the 10 s the channel waits for the PC's whole proof), all test-seams only; the `inputs` put takes the ports, accept, idle and proof seams too; the fake-ssh test bin hands the words of `GATE_FAKE_SSH_BOX_SEAMS` to an `outputs` call as to the other box verbs.
 
   A sent archive that cannot be removed prints `gate: remote could not remove the outputs archive <name>: <error>` and still exits 0; a later run's prune takes it. An archive already gone at its removal (another run's trim took it after it was sent) says nothing and exits 0.
 
@@ -4237,6 +4237,14 @@ Built verbs:
   The root, the stages folder and the stage are held without delete sharing for the whole put, and the stage is removed beneath its handle on every way out; a stage older than a day (any work folder's) is removed by the next put, a stage that cannot be opened or removed says so and stays (`gate: remote kept the stage <path>: <why>`, `gate: remote could not remove the old stage <path>: <error>`).
 
   Caps: an archive of more than 50,000 members, or that decompresses to more than 4 GiB (`--test-inputs-budget-bytes` replaces it), is refused as the outputs archive's are, and the put fails (`gate: remote inputs put failed: <why>`, exit 1). The step is not watched on the box; the PC watches both calls ([The remote client's run](#routing), Inputs).
+
+  A `put` payload may carry a `Channel` (`Length`, the archive's whole number of bytes, and `Sha256`, 64 lower-case hex digits; both required, else `gate: box payload Channel lacks Length`, `... lacks Sha256`, `... Channel Length is not a whole number of bytes` or `... Channel Sha256 is not 64 lower-case hex digits`, exit 2; on a `diff` step `gate: box payload Channel is not taken on a diff step`, exit 2). The box then takes the archive over a [data channel](GLOSSARY.md) instead of stdin, which holds the request line and the manifest only. No PC code sends one yet.
+
+  A `Length` over the limit the stdin path holds a sent archive to (the unpack budget plus a 64th of it plus 1 MiB, `sent_limit`) is refused before any channel line, in the stdin path's own words: `gate: remote inputs put failed: the outputs archive holds more than <limit> bytes as sent`, exit 1. Otherwise, after the drain, the manifest, the scope check, the stage check and the budget, the box listens as `outputs` does and says `gate-remote-channel: <nonce> <port>`, reads exactly `Length` bytes from the PC, checks the count and the SHA-256, acks with the 32-byte SHA-256, waits for the PC's close, drops the socket and then installs.
+
+  A channel that did not complete removes the stage, installs nothing and says `gate-remote-refused: <nonce> channel` then `gate: data channel not completed: <why>`, exit 75; `<why>` is one of `the PC closed the channel after <n> of the <len> bytes declared`, `the bytes received do not have the SHA-256 declared`, `the PC sent nothing for <ms> ms`, `<why>, the acknowledgement unsent`, or a reason of the pull's (no connection, a wrong proof, no free port).
+
+  When the digest matched, an unpack or budget refusal says the stdin path's `gate: remote inputs put failed: <why>` (exit 1) with no ack and no channel tag; after the ack a busy lock or install failure speaks as without a channel.
 
   The Unix box answers `inputs` too, with descriptors for handles and its own stage, modes and record fields (Unix box differences: [The Unix box](#the-unix-box), `inputs`); it checks the run's `InputsDigest` too, and refuses `SentBin`.
 
@@ -4729,7 +4737,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
   A member spelt otherwise than the manifest, in letter case alone included, is `the archive's member '<path>' is not in the manifest`. A copy whose device and inode match a manifest file found at its own spelling is never swept, and every recorded file is opened again and its stamp checked just before the record is sealed.
 - **`outputs`** (`outputs.rs`) answers the Windows box's `outputs` ([The box side](#the-box-side)) with the same payload (`Key`, `Work`, `OutputFolder`, `Name`), lines and statuses, and takes no lock; this lists where the Unix box differs. The run calls the module, so a Mac route brings outputs back.
 
-  The Unix box has no data channel: a payload with a `Channel` is refused, after the work folder and session reads, with `gate-remote-refused: <nonce> channel` then `gate: data channel not completed: this builder has no data channel` and exit 75 (a malformed `Channel` or `Nonce` is the payload's usage line); the PC never sends one to a `macos` builder.
+  The Unix box has no data channel: an `outputs` payload with a `Channel` is refused, after the work folder and session reads (an `inputs` put's, before stdin is read), with `gate-remote-refused: <nonce> channel` then `gate: data channel not completed: this builder has no data channel` and exit 75 (a malformed `Channel` or `Nonce` is the payload's usage line); the PC never sends one to a `macos` builder.
 
   The output folder is `<root>/outputs`, made 0700 beneath the judged root, or adopted only when it is private (the box user's own, no mode letting another account in) and not a link; archives are `<key>-<32 hex digits>.tar.zst` with mode 0600, and a folder that cannot be made or adopted says `cannot make the output folder <folder>: it is not the box user's own or its mode lets another account in`. A work folder not below the work root is `the work folder is not below the work root`.
 

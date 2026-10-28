@@ -156,6 +156,9 @@ pub struct BoxSeams {
     /// How long a box's data channel waits for the PC's connection, in milliseconds, in place of the built-in 10 s;
     /// `None` without the feature.
     pub channel_accept_ms: Option<u64>,
+    /// How long a box's data channel waits for the PC's whole proof once it connected, in milliseconds, in place of
+    /// the built-in 10 s; `None` without the feature.
+    pub channel_proof_ms: Option<u64>,
     /// How long each read and write of a box's data channel may wait, in milliseconds, in place of the built-in 10 s;
     /// `None` without the feature.
     pub channel_idle_ms: Option<u64>,
