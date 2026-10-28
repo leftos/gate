@@ -2473,8 +2473,13 @@ mod unix {
         assert_eq!(held["session"], json!("s1"), "{held}");
         assert_eq!(held["pc"], json!("pc1"), "{held}");
         assert_eq!(refused.status, Some(75), "{:?}", refused.err);
-        assert_eq!(refused.out.len(), 1, "only the version line: {:?}", refused.out);
+        assert_eq!(refused.out.len(), 2, "the version line, then the box slots line: {:?}", refused.out);
         assert!(refused.out[0].starts_with("gate: remote version "), "{:?}", refused.out);
+        assert!(
+            refused.out[1].starts_with("gate: remote box slots ") && refused.out[1].contains(r#""session":"s1""#),
+            "{:?}",
+            refused.out
+        );
         assert_eq!(refused.err, full_lines(NONCE, 1));
         assert!(!made_work, "a refused preflight makes no work folder");
         assert!(!made_bare, "nor a bare repository");

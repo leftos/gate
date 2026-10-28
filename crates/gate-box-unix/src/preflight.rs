@@ -48,7 +48,8 @@ fn folder_refusal(flaw: FolderFlaw, private: bool) -> Refusal {
 /// before anything is made; a work root another account may write in is refused after the version line with the
 /// work-root line, as the Windows box refuses one. Once the root is trusted and before any record of the work folder is
 /// read, the call is admitted by the drain ([`drain::admit`]) or refused after the version line, as the Windows box
-/// refuses it, so a refused preflight writes nothing under the work folder.
+/// refuses it, so a refused preflight writes nothing under the work folder. Its last line is the builder's own slots as
+/// a look without the drain lock finds them ([`slots::looked`]), for a root with a count file or a `slots/` folder.
 pub fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u8 {
     let checked = folders(payload).and_then(|(bare, work, pair)| Ok((bare, work, checked_root(work, bare, pair.is_some())?, pair)));
     let drain_read = drain::session_of(payload, "", "").and_then(|session| Ok((session, payload.no_ticket()?)));
@@ -126,6 +127,8 @@ pub fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> 
     }
     boot::say(console);
     say_sdks_and_tools(payload, console);
+    // Said last, so every line before it keeps its place.
+    slots::look_said(slots::looked(Path::new(&root), seams), console);
     if let Some(slot) = slot {
         slot.kept();
     }
@@ -365,12 +368,13 @@ mod tests {
 
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
+    use gate_wire::slots::{BOX_SLOTS_LINE, BoxSlots, Claim, HoldClaim};
     use gate_wire::{PathForm, Payload, root_unsafe_line};
     use serde_json::{Value, json};
 
     use super::preflight;
     use crate::console::Console;
-    use crate::files::{effective_uid, user_name};
+    use crate::files::{HeldLock, Locked, effective_uid, take_lock, user_name};
     use crate::git::Git;
     use crate::lines::{NEW_WORK_TREE, WORK_ROOT_STEP, created_line, version_line, warm_line};
 
@@ -525,6 +529,156 @@ mod tests {
         fs::write(format!("{}.warm", case.work()), format!("{HASH}\n")).expect("the warm record is written");
         let (_, console) = preflighted(&payload);
         assert_eq!(console.out[1], warm_line(None), "a line end is not a hash's, as on the Windows box");
+    }
+
+    /// Readies `case`'s root and its `slots/` at mode 0700 with a count file of `count` slots and a hold's claim in slot
+    /// 0, its lock held by the returned open as a live hold holds it.
+    fn held_by_a_hold(case: &Case, count: u32) -> HeldLock {
+        let slots = format!("{}/slots", case.root());
+        private_folders(&slots);
+        fs::write(format!("{}/slots.json", case.root()), json!({ "v": 1, "slots": count }).to_string()).expect("the count file is written");
+        let hold = Claim::Hold(HoldClaim {
+            holder: "github-actions repo ci/test run 7".to_owned(),
+            ceiling: 600,
+            pid: 42,
+            started: "2026-10-27T10:00:00Z".to_owned(),
+        });
+        fs::write(format!("{slots}/0.json"), hold.text()).expect("the hold's claim is written");
+        match take_lock(Path::new(&format!("{slots}/0.lock"))).expect("the hold's lock is taken") {
+            Locked::Held(lock) => Some(lock),
+            Locked::Busy => None,
+        }
+        .expect("no one else holds the hold's lock")
+    }
+
+    /// `case`'s payload with the drain session `id`.
+    fn sessioned(case: &Case, id: &str) -> Payload {
+        case.payload(&json!({ "Session": id, "Pc": "pc1", "Repo": "repo" }))
+    }
+
+    /// The box slots lines of `lines`.
+    fn slots_lines(lines: &[String]) -> Vec<BoxSlots> {
+        lines
+            .iter()
+            .filter(|line| line.starts_with(BOX_SLOTS_LINE))
+            .map(|line| BoxSlots::of_line(line).expect("the box slots line reads"))
+            .collect()
+    }
+
+    #[test]
+    fn a_passing_preflight_says_the_builder_s_held_slots_after_its_sdks_and_tools_lines() {
+        let case = Case::new("slots-pass");
+        let _hold = held_by_a_hold(&case, 2);
+
+        let (status, console) = preflighted(&sessioned(&case, "s1"));
+
+        assert_eq!(status, 0, "{:?}", console.err);
+        let (last, before) = console.out.split_last().expect("the preflight says its lines");
+        assert!(slots_lines(before).is_empty(), "said last: {:?}", console.out);
+        let said = BoxSlots::of_line(last).expect("the last line is the box slots line");
+        assert_eq!(said.count, Some(2), "{last}");
+        assert_eq!(said.holders.iter().map(|holder| holder.slot).collect::<Vec<_>>(), [0, 1], "{last}");
+        assert!(
+            matches!(&said.holders[0].claim, Claim::Hold(hold) if hold.pid == 42 && hold.ceiling == 600),
+            "{last}"
+        );
+        assert_eq!(said.holders[1].claim.session(), Some("s1"), "{last}");
+    }
+
+    #[test]
+    fn a_full_refusal_says_the_builder_s_held_slots_after_the_version_line() {
+        let case = Case::new("slots-full");
+        let _hold = held_by_a_hold(&case, 1);
+
+        let (status, console) = preflighted(&sessioned(&case, "s1"));
+
+        assert_eq!(status, crate::run::REFUSED_STATUS, "{:?}", console.err);
+        assert_eq!(console.out.len(), 2, "{:?}", console.out);
+        assert_eq!(console.out[0], version_line());
+        let said = BoxSlots::of_line(&console.out[1]).expect("the box slots line reads");
+        assert_eq!((said.count, said.holders.len()), (Some(1), 1), "{:?}", console.out);
+        assert_eq!(
+            console.err.last().map(String::as_str),
+            Some("gate: remote builder is full: 1 of 1 slots held"),
+            "{:?}",
+            console.err
+        );
+    }
+
+    #[test]
+    fn a_sessionless_preflight_says_the_builder_s_held_slots_and_takes_none() {
+        let case = Case::new("slots-sessionless");
+        let _hold = held_by_a_hold(&case, 1);
+
+        let (status, console) = preflighted(&case.payload(&json!({})));
+
+        assert_eq!(
+            status, 0,
+            "a preflight with no session takes no slot, so a full builder passes it: {:?}",
+            console.err
+        );
+        let said = slots_lines(&console.out);
+        assert_eq!(said.len(), 1, "{:?}", console.out);
+        assert_eq!(said[0].holders.len(), 1, "only the hold: {:?}", console.out);
+        assert_eq!(console.out.last(), Some(&said[0].line()), "said last");
+    }
+
+    #[test]
+    fn a_stray_claim_name_beside_a_live_claim_is_no_holder_of_the_look() {
+        let case = Case::new("slots-stray");
+        let _hold = held_by_a_hold(&case, 1);
+        let slots = format!("{}/slots", case.root());
+        fs::copy(format!("{slots}/0.json"), format!("{slots}/00.json")).expect("the stray claim name is written");
+
+        let (status, console) = preflighted(&case.payload(&json!({})));
+
+        assert_eq!(status, 0, "{:?}", console.err);
+        let said = slots_lines(&console.out);
+        assert_eq!(said.len(), 1, "{:?}", console.out);
+        assert_eq!(
+            said[0].holders.iter().map(|holder| holder.slot).collect::<Vec<_>>(),
+            [0],
+            "{:?}",
+            console.out
+        );
+        assert_eq!(said[0].unreadable, 0, "{:?}", console.out);
+    }
+
+    #[test]
+    fn a_slots_link_or_file_fails_the_look_and_says_no_box_slots_line() {
+        for (name, made) in [("slots-link", true), ("slots-file", false)] {
+            let case = Case::new(name);
+            let root = case.root();
+            private_folders(&root);
+            fs::write(format!("{root}/slots.json"), json!({ "v": 1, "slots": 1 }).to_string()).expect("the count file is written");
+            if made {
+                let elsewhere = format!("{root}/elsewhere");
+                private_folders(&elsewhere);
+                symlink(&elsewhere, format!("{root}/slots")).expect("the link is made");
+            } else {
+                fs::write(format!("{root}/slots"), "").expect("the file is written");
+            }
+
+            let (status, console) = preflighted(&case.payload(&json!({})));
+
+            assert_eq!(status, 0, "{name}: {:?}", console.err);
+            assert!(slots_lines(&console.out).is_empty(), "{name}: {:?}", console.out);
+            assert!(
+                console.err.iter().any(|line| line.starts_with("gate: slots look failed: ")),
+                "{name}: {:?}",
+                console.err
+            );
+        }
+    }
+
+    #[test]
+    fn a_preflight_under_a_root_without_slots_says_no_box_slots_line() {
+        let case = Case::new("slots-none");
+
+        let (status, console) = preflighted(&sessioned(&case, "s1"));
+
+        assert_eq!(status, 0, "{:?}", console.err);
+        assert!(slots_lines(&console.out).is_empty(), "{:?}", console.out);
     }
 
     /// Runs git with `args` to set a case up, its output dropped; fails the case unless git exits 0.

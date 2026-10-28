@@ -20,8 +20,8 @@ use gate_args::{BoxRequest, BoxSeams, HoldRequest};
 use gate_win32::{Descriptor, Job, Launch, LaunchOutput, Running};
 use gate_wire::drain::{DRAIN, LOCK};
 use gate_wire::slots::{
-    COUNT_FILE, Claim, HOLD_LINE_POLLS, HOLD_POLL, HoldClaim, Judged, NO_COUNT_LINE, SLOTS, SessionClaim, Take, ceiling_line, chosen, claim_name,
-    count_of, full_line, holder_line, holder_refusal, lock_name, unread_count_line, waiting_line,
+    BoxSlots, COUNT_FILE, Claim, HOLD_LINE_POLLS, HOLD_POLL, HoldClaim, Judged, NO_COUNT_LINE, SLOTS, SessionClaim, Take, ceiling_line, chosen,
+    claim_index, claim_name, count_of, full_line, holder_line, holder_refusal, lock_name, unread_count_line, waiting_line,
 };
 use gate_wire::{Payload, Refusal, escaped, refused_line};
 use jiff::Timestamp;
@@ -187,9 +187,9 @@ fn slots_failed(why: &str, console: &mut Console) -> u32 {
 
 /// Takes a slot for the admitted preflight of `session` under the root `root` when it has a count file
 /// ([`session_took`]): whether the session now holds a claim, which is false with no session or no count file. With
-/// every slot held: `version` on stdout, then the `full` refusal tag and the full line ([`full_said`]), and
-/// [`REFUSED_STATUS`]. A slot pool that cannot be read or written fails the preflight: `version`, its line, and
-/// [`FAILED_STATUS`].
+/// every slot held: `version` and the box slots line ([`looked`]) on stdout, then the `full` refusal tag and the full
+/// line ([`full_said`]), and [`REFUSED_STATUS`]. A slot pool that cannot be read or written fails the preflight:
+/// `version`, its line, and [`FAILED_STATUS`].
 pub(super) fn taken(
     root: &HeldRoot<'_>,
     session: Option<&Session<'_>>,
@@ -205,7 +205,56 @@ pub(super) fn taken(
     if !matches!(took, Ok(SessionTake::Held | SessionTake::Unneeded)) {
         stamping::out(console, version);
     }
+    if matches!(took, Ok(SessionTake::Full { .. })) {
+        look_said(looked(root, seams), console);
+    }
     claim_held(took, payload, console)
+}
+
+/// The builder's own slots under the root `root` as a look without the drain lock finds them, at the box's clock
+/// (`--test-box-now`'s second): its count, or why its count file does not read, and every claim in `slots\` judged
+/// by nobody, none removed; one that does not read is counted unreadable. `None` for a root with neither a count file
+/// nor a `slots\` folder. Else why `slots\` could not be opened or listed.
+pub(super) fn looked(root: &HeldRoot<'_>, seams: &BoxSeams) -> Result<Option<BoxSlots>, String> {
+    let count = count_at(root.held, root.path);
+    let path = root.path.join(SLOTS);
+    let folder = drain::existing(root.held, SLOTS).map_err(|error| cannot("open", &path, &error))?;
+    let claims = match folder {
+        Some(folder) => claims_read(&folder, &path)?,
+        None if matches!(count, Ok(None)) => return Ok(None),
+        None => Vec::new(),
+    };
+    Ok(Some(BoxSlots::looked(&now_text(seams), count, claims)))
+}
+
+/// Each claim `{n}.json` in `folder` at `path`, its slot and its text, `None` for one that could not be read; one
+/// gone since the listing is left out. Else why the folder could not be listed.
+fn claims_read(folder: &File, path: &Path) -> Result<Vec<(usize, Option<String>)>, String> {
+    let names = gate_win32::names_beneath(folder).map_err(|error| cannot("list", path, &error))?;
+    let mut claims = Vec::new();
+    for name in names.iter().filter_map(|name| name.to_str()) {
+        // Only the name a claim is written under, in any case, as the judge reads it.
+        let Some(n) = claim_index(&name.to_ascii_lowercase()) else {
+            continue;
+        };
+        match drain::read_text(folder, name) {
+            Ok(Some((text, _))) => claims.push((n, Some(text))),
+            Ok(None) => {}
+            // Counted as unreadable in the line, which is all a look says of a claim it cannot read.
+            Err(_) => claims.push((n, None)),
+        }
+    }
+    Ok(claims)
+}
+
+/// Says the look `look` ([`looked`]): its box slots line on stdout, nothing for a root without slots, or
+/// `gate: slots look failed: {why}` on stderr.
+pub(super) fn look_said(look: Result<Option<BoxSlots>, String>, console: &mut Console) {
+    match look {
+        Ok(Some(slots)) => stamping::out(console, &slots.line()),
+        Ok(None) => {}
+        Err(why) => stamping::err(console, &format!("gate: slots look failed: {why}")),
+    }
 }
 
 /// Whether the look `took` left the session holding a claim; with every slot held, the `full` refusal ([`full_said`]);

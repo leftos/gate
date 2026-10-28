@@ -113,7 +113,9 @@ pub(crate) fn git_failed(step: &str, code: i32) -> Failed {
 /// slot for its session when the root has a count file ([`slots::taken`]), refused `full` when none is free, and lets
 /// it go again when a later step fails ([`slots::Release`]). It readies the bare repositories, then takes the key's
 /// work-folder lock `Lock` around its reads of the key's records and its writes in the work folder ([`ready`]), and
-/// lets it go before its version line, so the run right after it is never refused busy by it.
+/// lets it go before its version line, so the run right after it is never refused busy by it. Its last line is the
+/// builder's own slots as a look without the drain lock finds them ([`slots::looked`]), for a root with a count file or
+/// a `slots\` folder.
 pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
     if crate::boxside::judges_trust()
         && let Err(why) = gate_desktop::helper_path()
@@ -177,6 +179,8 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
             return failed.status;
         }
     };
+    // Looked at while the root is held, and said last, so every line before it keeps its place.
+    let slots_look = slots::looked(&root_held, seams);
     drop(held_root);
     stamping::out(console, &version);
     stamping::out(console, &format!("gate: remote warm {}", warm.as_deref().unwrap_or("none")));
@@ -192,6 +196,7 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
         stamping::out(console, msys::NO_GIT_BIN);
     }
     say_sdks_and_tools(payload, work, seams, console);
+    slots::look_said(slots_look, console);
     if let Some(slot) = slot {
         slot.kept();
     }

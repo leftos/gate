@@ -6,6 +6,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use gate_wire::slots::{BOX_SLOTS_LINE, BoxSlots, Claim};
+use jiff::Timestamp;
 use proc_table::{ProcessTable, Win32ProcessTable};
 use serde_json::{Value, json};
 
@@ -98,6 +100,155 @@ fn version_line(case: &Case) -> String {
     format!("gate: remote version {}\n", build_version(case))
 }
 
+/// The box slots line a preflight at the Unix second `now` says of the root `root` with the count `count` and the
+/// claims of `slots` as they are on disk now.
+fn slots_line(root: &Path, now: u64, count: Option<u32>, slots: &[usize]) -> String {
+    let now = Timestamp::from_second(i64::try_from(now).expect("a second")).expect("a time").to_string();
+    let claims = slots
+        .iter()
+        .map(|n| {
+            (
+                *n,
+                Some(fs::read_to_string(root.join("slots").join(format!("{n}.json"))).expect("the claim is there")),
+            )
+        })
+        .collect();
+    BoxSlots::looked(&now, Ok(count), claims).line()
+}
+
+/// The box slots line of `stdout`, the one line starting so; `None` when it has none.
+fn said_slots(stdout: &str) -> Option<&str> {
+    let mut said = stdout.lines().filter(|line| line.starts_with(BOX_SLOTS_LINE));
+    let first = said.next();
+    assert_eq!(said.next(), None, "one box slots line: {stdout}");
+    first
+}
+
+#[test]
+fn a_passing_preflight_says_the_builder_s_held_slots_naming_a_hold() {
+    let case = Case::new("a_passing_preflight_says_the_builder_s_held_slots_naming_a_hold");
+    let root = root_of(&case);
+    let base = rooted(&case);
+    counted(&root, 2);
+    let (running, stdin) = start_with_stdin(hold(&case, &root, T, &[], &OPTIONS, &[FAKE_TOOL, "sleep", UNTIL_KILLED]));
+    drop(stdin);
+    wait_until("the hold claims slot 0", || {
+        claim(&root, 0).is_some_and(|claim| claim["kind"] == json!("hold"))
+    });
+
+    let passed = verb_at(&case, "preflight", &sessioned(&base, "s1"), T + 1, &[]);
+    let expected = slots_line(&root, T + 1, Some(2), &[0, 1]);
+    let killed = running.kill();
+
+    assert!(killed.code != Some(0), "{killed:?}");
+    assert_eq!(passed.code, Some(0), "{passed:?}");
+    assert!(
+        passed.stdout.ends_with(&format!("\n{expected}\n")),
+        "said after every other line: {passed:?}"
+    );
+    let said = BoxSlots::of_line(&expected).expect("the line reads");
+    assert!(
+        matches!(&said.holders[0].claim, Claim::Hold(hold) if hold.holder == HOLDER && hold.ceiling == 600),
+        "{expected}"
+    );
+    assert_eq!(said.holders[1].claim.session(), Some("s1"), "{expected}");
+}
+
+#[test]
+fn a_full_refusal_says_the_builder_s_held_slots_before_the_refusal() {
+    let case = Case::new("a_full_refusal_says_the_builder_s_held_slots_before_the_refusal");
+    let root = root_of(&case);
+    let base = rooted(&case);
+    counted(&root, 1);
+    let first = verb_at(&case, "preflight", &sessioned(&base, "s1"), T, &[]);
+
+    let refused = verb_at(&case, "preflight", &sessioned(&base, "s2"), T + 1, &[]);
+
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(refused.code, Some(75), "{refused:?}");
+    assert_eq!(
+        refused.stdout,
+        format!("{}{}\n", version_line(&case), slots_line(&root, T + 1, Some(1), &[0])),
+        "{refused:?}"
+    );
+    assert_eq!(
+        refused.stderr,
+        format!("{}\ngate: remote builder is full: 1 of 1 slots held\n", refused_line(&base, "full")),
+        "{refused:?}"
+    );
+}
+
+#[test]
+fn a_sessionless_preflight_says_the_builder_s_held_slots_and_takes_none() {
+    let case = Case::new("a_sessionless_preflight_says_the_builder_s_held_slots_and_takes_none");
+    let root = root_of(&case);
+    let base = rooted(&case);
+    counted(&root, 1);
+
+    let checked = verb_at(&case, "preflight", &base, T, &[]);
+
+    assert_eq!(checked.code, Some(0), "{checked:?}");
+    assert_eq!(
+        said_slots(&checked.stdout),
+        Some(slots_line(&root, T, Some(1), &[]).as_str()),
+        "{checked:?}"
+    );
+    assert_eq!(claim(&root, 0), None, "a preflight with no session takes no slot");
+}
+
+#[test]
+fn a_stray_claim_name_beside_a_live_claim_is_no_holder_of_the_look() {
+    let case = Case::new("a_stray_claim_name_beside_a_live_claim_is_no_holder_of_the_look");
+    let root = root_of(&case);
+    let base = rooted(&case);
+    counted(&root, 1);
+    let first = verb_at(&case, "preflight", &sessioned(&base, "s1"), T, &[]);
+    let slots = root.join("slots");
+    fs::copy(slots.join("0.json"), slots.join("00.json")).expect("the stray claim name is written");
+
+    let checked = verb_at(&case, "preflight", &base, T + 1, &[]);
+
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(checked.code, Some(0), "{checked:?}");
+    assert_eq!(
+        said_slots(&checked.stdout),
+        Some(slots_line(&root, T + 1, Some(1), &[0]).as_str()),
+        "one holder: {checked:?}"
+    );
+}
+
+#[test]
+fn a_claim_named_in_upper_case_is_a_holder_of_the_look_as_the_judge_reads_it() {
+    let case = Case::new("a_claim_named_in_upper_case_is_a_holder_of_the_look_as_the_judge_reads_it");
+    let root = root_of(&case);
+    let base = rooted(&case);
+    counted(&root, 1);
+    let first = verb_at(&case, "preflight", &sessioned(&base, "s1"), T, &[]);
+    let slots = root.join("slots");
+    fs::rename(slots.join("0.json"), slots.join("0.JSON")).expect("the claim is renamed");
+
+    let checked = verb_at(&case, "preflight", &base, T + 1, &[]);
+
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(checked.code, Some(0), "{checked:?}");
+    assert_eq!(
+        said_slots(&checked.stdout),
+        Some(slots_line(&root, T + 1, Some(1), &[0]).as_str()),
+        "the claim is a holder: {checked:?}"
+    );
+}
+
+#[test]
+fn a_preflight_under_a_root_without_slots_says_no_box_slots_line() {
+    let case = Case::new("a_preflight_under_a_root_without_slots_says_no_box_slots_line");
+    let base = sessioned(&rooted(&case), "s1");
+
+    let passed = verb_at(&case, "preflight", &base, T, &[]);
+
+    assert_eq!(passed.code, Some(0), "{passed:?}");
+    assert_eq!(said_slots(&passed.stdout), None, "{passed:?}");
+}
+
 #[test]
 fn with_no_count_file_a_preflight_and_its_run_take_no_slot() {
     let case = Case::new("with_no_count_file_a_preflight_and_its_run_take_no_slot");
@@ -121,6 +272,7 @@ fn a_full_builder_refuses_a_second_session_until_the_first_run_ends() {
 
     let first = verb_at(&case, "preflight", &sessioned(&base, "s1"), T, &[]);
     let refused = verb_at(&case, "preflight", &sessioned(&base, "s2"), T + 1, &[]);
+    let refused_slots = slots_line(&root, T + 1, Some(1), &[0]);
     let claim_while_held = claim(&root, 0);
     let run = verb_at(&case, "run", &sessioned(&base, "s1"), T + 2, &[]);
     let after_run = claim(&root, 0);
@@ -131,7 +283,7 @@ fn a_full_builder_refuses_a_second_session_until_the_first_run_ends() {
     assert_eq!(held["kind"], json!("session"), "{held}");
     assert_eq!(held["session"], json!("s1"), "{held}");
     assert_eq!(refused.code, Some(75), "{refused:?}");
-    assert_eq!(refused.stdout, version_line(&case), "{refused:?}");
+    assert_eq!(refused.stdout, format!("{}{refused_slots}\n", version_line(&case)), "{refused:?}");
     assert_eq!(
         refused.stderr,
         format!("{}\ngate: remote builder is full: 1 of 1 slots held\n", refused_line(&base, "full")),
@@ -198,7 +350,11 @@ fn a_preflight_refused_full_leaves_no_work_tree_and_no_bare_repository() {
 
     assert_eq!(first.code, Some(0), "{first:?}");
     assert_eq!(refused.code, Some(75), "{refused:?}");
-    assert_eq!(refused.stdout, version_line(&case), "{refused:?}");
+    assert_eq!(
+        refused.stdout,
+        format!("{}{}\n", version_line(&case), slots_line(&root, T + 1, Some(1), &[0])),
+        "{refused:?}"
+    );
     assert!(!root.join("work").join("k2").exists(), "no work tree is made: {refused:?}");
     assert!(!root.join("k2.git").exists(), "no bare repository is made: {refused:?}");
     assert_eq!(claimed_by(&root, 0).as_deref(), Some("s1"), "s1 keeps its slot");
