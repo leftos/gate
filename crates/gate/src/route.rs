@@ -531,7 +531,7 @@ fn swept_folder(
 
 /// Whether `file` is the run's own `log` or its `.err` file, both `/`-separated below the root, compared without regard
 /// to ASCII letter case as the inputs compare it ([`relative`]); never when the log lies outside the worktree.
-fn is_run_log(file: &str, log: Option<&str>) -> bool {
+pub(crate) fn is_run_log(file: &str, log: Option<&str>) -> bool {
     log.is_some_and(|log| file.eq_ignore_ascii_case(log) || file.eq_ignore_ascii_case(&format!("{log}.err")))
 }
 

@@ -1413,6 +1413,37 @@ mod unix {
     }
 
     #[test]
+    fn a_failed_run_brings_back_only_the_tmp_dump_it_wrote_beside_an_old_one() {
+        let case = Case::new("outputs-old-dump");
+        let commit = case.snapshot_holding(&[(".gitignore", "bin/\n.tmp/\n")]);
+        let keys = |script: &str| json!({ "Command": ["/bin/sh", "-c", script], "Outputs": ["bin/**"], "FailureOutputs": [".tmp/dumps/**"] });
+        let first = keys("mkdir -p .tmp/dumps && echo old > .tmp/dumps/old.dmp");
+        let request = case.outputs_request(&commit, &first, &Manifest::default());
+        let ended = ran(&[], &request, Reading::All, &case.base.join("beaten-old"));
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(
+            outputs_said(&ended),
+            ["gate-remote-outputs: 0"],
+            "a passing run packs no dump: {:?}",
+            ended.err
+        );
+
+        let second = keys("mkdir -p .tmp/dumps && echo new > .tmp/dumps/new.dmp; exit 3");
+        let request = case.outputs_request(&commit, &second, &Manifest::default());
+        let ended = ran(&[], &request, Reading::All, &case.base.join("beaten-new"));
+
+        assert_eq!(ended.status, Some(3), "the command's own status: {:?}", ended.err);
+        assert_eq!(outputs_said(&ended), [packed_line(1)], "{:?}", ended.err);
+        let archive = fs::read(case.archive()).expect("the archive is read");
+        assert_eq!(
+            members_of(&archive),
+            [".tmp/dumps/new.dmp"],
+            "the dump the run wrote comes back; the one an earlier run left stays, though the PC lacks it"
+        );
+        case.ended_clean();
+    }
+
+    #[test]
     fn a_pair_run_brings_back_from_its_main_tree_only() {
         let case = Case::new("outputs-pair");
         let commit = case.snapshot_holding(&[(".gitignore", "bin/\n")]);

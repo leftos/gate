@@ -134,6 +134,27 @@ impl<'a> Asked<'a> {
     fn deduped(&self, found: Vec<Found>) -> Vec<Found> {
         if self.rid.is_some() { cross::crossed(found) } else { found }
     }
+
+    /// These outputs over the output globs and the failure output globs together: what the listing before the command
+    /// walks, so a failed command's outputs are judged by it as a passing one's are; under `OutputsFull` only those of
+    /// them that name a `.tmp` folder ([`Globs::tmp_only`]), the only files whose stamps then count. `None` when none is
+    /// left.
+    fn listed(&self) -> Option<Asked<'a>> {
+        let globs = self
+            .failure
+            .as_ref()
+            .map_or_else(|| self.globs.clone(), |failure| self.globs.joined(failure));
+        let globs = if self.full { globs.tmp_only()? } else { globs };
+        Some(Asked {
+            globs,
+            failure: None,
+            full: self.full,
+            capping: Capping::Uncapped,
+            rid: self.rid.clone(),
+            archive: self.archive.clone(),
+            folder: self.folder,
+        })
+    }
 }
 
 /// The PC's manifest, read from `input` up to its first newline or its end, never waiting past the newline and never
@@ -526,30 +547,34 @@ fn flock(file: &File, operation: libc::c_int) -> io::Result<()> {
     }
 }
 
-/// The stat listing of the files under `asked`'s globs in the folder `work`, taken before the command, and the line
-/// saying it could not be taken, when it could not: then it is empty, so every file counts as changed. `None` under
-/// `OutputsFull`.
+/// The stat listing of the files under [`Asked::listed`]'s globs in the folder `work`, taken before the command so a
+/// file below a `.tmp` folder comes back only from the run that wrote it, marked [`Listing::under_outputs_full`] under
+/// `OutputsFull`; or, when the walk fails, no listing and the line saying so ([`unlisted_line`]): then every file
+/// outside a `.tmp` folder counts as changed and none below one comes back ([`select`]).
 #[must_use]
 pub fn listing(asked: &Asked<'_>, work: &Path) -> (Option<Listing>, Option<String>) {
-    if asked.full {
-        return (None, None);
-    }
-    if asked.globs.is_empty() {
-        return (Some(Listing::default()), None);
-    }
-    let walked = tree_folder(asked, work)
-        .map_err(|error| in_context(work, &error))
-        .and_then(|top| walk(&top, work, asked, false));
-    match walked {
-        Ok(walked) => (Some(Listing::of(&asked.deduped(walked.found))), None),
-        Err(error) => (
-            Some(Listing::default()),
-            Some(format!(
-                "gate: remote could not list the outputs before the command: {}",
-                escaped(&error.to_string())
-            )),
-        ),
-    }
+    let found = match asked.listed() {
+        Some(listed) if !listed.globs.is_empty() => {
+            let walked = tree_folder(&listed, work)
+                .map_err(|error| in_context(work, &error))
+                .and_then(|top| walk(&top, work, &listed, false));
+            match walked {
+                Ok(walked) => listed.deduped(walked.found),
+                Err(error) => return (None, Some(unlisted_line(&error.to_string()))),
+            }
+        }
+        _ => Vec::new(),
+    };
+    let listing = Listing::of(&found);
+    (Some(if asked.full { listing.under_outputs_full() } else { listing }), None)
+}
+
+/// The line the box says when its listing before the command could not be taken for `error`.
+fn unlisted_line(error: &str) -> String {
+    format!(
+        "gate: remote could not list the outputs before the command: {}; outputs under .tmp are not brought back this run",
+        escaped(error)
+    )
 }
 
 /// A folder a walk reads: the names leading to it from the walk's top, its path relative to the top, and whether the
@@ -1914,6 +1939,98 @@ pub(crate) mod tests {
             Ok((None, NOTHING_PACKED.to_owned())),
             "a glob that does not name TestResults never reaches below it"
         );
+    }
+
+    #[test]
+    fn a_file_below_tmp_is_packed_when_a_glob_names_tmp() {
+        let case = Case::new("pack-tmp");
+        case.write(".tmp/taxi-coverage-1.json", b"coverage");
+        case.write(".tmp/sub/taxi-coverage-2.json", b"deeper");
+        case.write(".tmp/yaat-1a2b3c4d-0123456789abcdef0123456789abcdef.tar.zst", b"gate");
+        let asked = case.asked(&[".tmp/taxi-*.json", ".tmp/*.zst"], true, '1');
+        let created = Listing::default();
+
+        let brought = bring(&asked, &Ok(Manifest::default()), Some(&created), &case.work(), &[]);
+
+        assert_eq!(brought, Ok((None, packed_line(1, '1'))));
+        let (members, _) = read_back(&case, &archive('1'), &Manifest::default(), &[]);
+        assert_eq!(members, [(".tmp/taxi-coverage-1.json".to_owned(), b"coverage".to_vec())]);
+        let elsewhere = case.asked(&["**"], true, '2');
+        let brought = bring(&elsewhere, &Ok(Manifest::default()), None, &case.work(), &[]);
+        assert_eq!(
+            brought,
+            Ok((None, NOTHING_PACKED.to_owned())),
+            "a glob that does not name .tmp never reaches below it"
+        );
+    }
+
+    #[test]
+    fn a_symlinked_tmp_is_never_followed_though_a_glob_names_it() {
+        let case = Case::new("pack-tmp-link");
+        let outside = case.base.join("outside");
+        fs::create_dir(&outside).expect("a folder outside the work folder is made");
+        fs::write(outside.join("secret.json"), b"secret").expect("a file outside is written");
+        case.write("bin/a.txt", b"a");
+        symlink(&outside, case.work().join(".tmp")).expect("a link at .tmp is made");
+        let asked = case.asked(&[".tmp/*.json", "bin/**"], true, '1');
+        let created = Listing::default();
+
+        let brought = bring(&asked, &Ok(Manifest::default()), Some(&created), &case.work(), &[]);
+
+        assert_eq!(brought, Ok((None, packed_line(1, '1'))));
+        let (members, _) = read_back(&case, &archive('1'), &Manifest::default(), &[]);
+        assert_eq!(members, [("bin/a.txt".to_owned(), b"a".to_vec())], "nothing through the linked .tmp");
+    }
+
+    #[test]
+    fn a_listing_that_cannot_be_taken_brings_back_no_tmp_file_and_says_so() {
+        let case = Case::new("pack-unlisted");
+        case.write(".tmp/old.json", b"old");
+        case.write("bin/a.txt", b"a");
+        let locked = case.work().join("locked");
+        fs::create_dir(&locked).expect("the locked folder is made");
+        let asked = case.asked(&["bin/**", ".tmp/*.json", "locked/**"], false, '1');
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("the folder is locked");
+        let (before, line) = listing(&asked, &case.work());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("the folder is unlocked");
+
+        assert!(before.is_none(), "no listing when the walk fails");
+        let line = line.expect("the failed listing is said");
+        assert!(
+            line.starts_with("gate: remote could not list the outputs before the command: ")
+                && line.ends_with("; outputs under .tmp are not brought back this run"),
+            "{line}"
+        );
+        let brought = bring(&asked, &Ok(Manifest::default()), before.as_ref(), &case.work(), &[]);
+        assert_eq!(brought, Ok((None, packed_line(1, '1'))));
+        let (members, _) = read_back(&case, &archive('1'), &Manifest::default(), &[]);
+        assert_eq!(
+            members,
+            [("bin/a.txt".to_owned(), b"a".to_vec())],
+            "the file outside .tmp comes back, the old one below it does not"
+        );
+    }
+
+    #[test]
+    fn a_tmp_file_an_earlier_run_left_is_not_packed() {
+        let case = Case::new("pack-old-tmp");
+        case.write(".tmp/old.json", b"old");
+        let asked = case.asked(&[".tmp/*.json"], false, '1');
+        let (before, line) = listing(&asked, &case.work());
+        assert!(line.is_none(), "{line:?}");
+        case.write(".tmp/new.json", b"new");
+
+        let brought = bring(&asked, &Ok(Manifest::default()), before.as_ref(), &case.work(), &[]);
+
+        assert_eq!(brought, Ok((None, packed_line(1, '1'))), "though the PC lacks both");
+        let (members, _) = read_back(&case, &archive('1'), &Manifest::default(), &[]);
+        assert_eq!(members, [(".tmp/new.json".to_owned(), b"new".to_vec())], "only the file the run wrote");
+        let full = case.asked(&[".tmp/*.json"], true, '2');
+        let (before, _) = listing(&full, &case.work());
+        case.write(".tmp/newer.json", b"newer");
+        let brought = bring(&full, &Ok(Manifest::default()), before.as_ref(), &case.work(), &[]);
+        assert_eq!(brought, Ok((None, packed_line(1, '2'))), "nor under OutputsFull");
     }
 
     /// A reader of a file that, at its first read, appends to the file at `path`, as a command still writing it does.

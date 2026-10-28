@@ -108,6 +108,17 @@ impl<'a> Asked<'a> {
             folder: self.folder,
         })
     }
+
+    /// The globs the listing before the command walks: the output globs and the failure output globs together, so a
+    /// failed command's outputs are judged by it as a passing one's are; under `OutputsFull` only those of them that
+    /// name a `.tmp` folder ([`Globs::tmp_only`]), the only files whose stamps then count. `None` when none is left.
+    fn listed_globs(&self) -> Option<Globs> {
+        let globs = self
+            .failure
+            .as_ref()
+            .map_or_else(|| self.globs.clone(), |failure| self.globs.joined(failure));
+        if self.full { globs.tmp_only() } else { Some(globs) }
+    }
 }
 
 /// The caps a failed command's failure outputs are held to: the `--test-box-failure-cap-bytes` seam's when given, else
@@ -344,25 +355,28 @@ fn trim_to_fit(archives: &[Archive], mine: &Archive, mut total: u64, budget: u64
     }
 }
 
-/// The stat listing of the files under `asked`'s globs in `work`, taken before the command, and the line saying it could
-/// not be taken, when it could not: then it is empty, so every file counts as changed. `None` under `OutputsFull`.
+/// The stat listing of the files under [`Asked::listed_globs`] in `work`, taken before the command so a file below a
+/// `.tmp` folder comes back only from the run that wrote it, marked [`Listing::under_outputs_full`] under
+/// `OutputsFull`; or, when the walk fails, no listing and the line saying so ([`unlisted_line`]): then every file
+/// outside a `.tmp` folder counts as changed and none below one comes back ([`select`]).
 pub(super) fn listing(asked: &Asked<'_>, work: &Path) -> (Option<Listing>, Option<String>) {
-    if asked.full {
-        return (None, None);
-    }
-    if asked.globs.is_empty() {
-        return (Some(Listing::default()), None);
-    }
-    match walk(work, &asked.globs) {
-        Ok(found) => (Some(Listing::of(&found)), None),
-        Err(error) => (
-            Some(Listing::default()),
-            Some(format!(
-                "gate: remote could not list the outputs before the command: {}",
-                escaped(&error.to_string())
-            )),
-        ),
-    }
+    let found = match asked.listed_globs() {
+        Some(globs) if !globs.is_empty() => match walk(work, &globs) {
+            Ok(found) => found,
+            Err(error) => return (None, Some(unlisted_line(&error.to_string()))),
+        },
+        _ => Vec::new(),
+    };
+    let listing = Listing::of(&found);
+    (Some(if asked.full { listing.under_outputs_full() } else { listing }), None)
+}
+
+/// The line the box says when its listing before the command could not be taken for `error`.
+fn unlisted_line(error: &str) -> String {
+    format!(
+        "gate: remote could not list the outputs before the command: {}; outputs under .tmp are not brought back this run",
+        escaped(error)
+    )
 }
 
 /// Packs the files under `asked`'s globs in `work` to bring back after a passing command ([`select`]), or a failed one's
@@ -746,6 +760,50 @@ mod tests {
             Err("the outputs manifest reaches 64 MiB without a newline".to_owned())
         );
         assert_eq!(input.position(), MANIFEST_LIMIT, "nothing past the limit is read");
+    }
+
+    /// Runs icacls on `path` with `args`, which must succeed.
+    #[expect(clippy::disallowed_methods, reason = "a test's own icacls calls take no spawn lock")]
+    fn icacls(path: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("icacls").arg(path).args(args).output().expect("icacls starts");
+        assert!(output.status.success(), "icacls {} {args:?}: {output:?}", path.display());
+    }
+
+    #[test]
+    fn a_listing_that_cannot_be_taken_brings_back_no_tmp_file_and_says_so() {
+        let root = scratch("unlisted");
+        let work = root.join("work");
+        for (path, text) in [(".tmp/old.json", "old"), ("bin/a.txt", "a")] {
+            let file = work.join(path);
+            fs::create_dir_all(file.parent().expect("a file has a folder")).expect("the folder can be made");
+            fs::write(file, text).expect("the file can be written");
+        }
+        let locked = work.join("locked");
+        fs::create_dir_all(&locked).expect("the locked folder can be made");
+        let folder = root.join("outputs");
+        let folder = folder.to_str().expect("the scratch folder is Unicode");
+        let globs = ["bin/**".to_owned(), ".tmp/*.json".to_owned(), "locked/**".to_owned()];
+        let asked = Asked::new((&globs, &[]), false, "k", "n", folder)
+            .expect("the globs are fine")
+            .expect("globs ask");
+
+        icacls(&locked, &["/deny", "*S-1-1-0:(RD)", "/q"]);
+        let (taken, line) = super::listing(&asked, &work);
+        icacls(&locked, &["/remove:d", "*S-1-1-0", "/q"]);
+
+        assert!(taken.is_none(), "no listing when the walk fails");
+        let line = line.expect("the failed listing is said");
+        assert!(
+            line.starts_with("gate: remote could not list the outputs before the command: ")
+                && line.ends_with("; outputs under .tmp are not brought back this run"),
+            "{line}"
+        );
+        let brought = super::bring_back(&asked, &Ok(super::Manifest::default()), taken.as_ref(), &work, &[]).expect("the pack works");
+        assert_eq!(
+            brought.line,
+            format!("gate-remote-outputs: 1 {}", asked.archive),
+            "the file outside .tmp comes back, the old one below it does not"
+        );
     }
 
     #[test]

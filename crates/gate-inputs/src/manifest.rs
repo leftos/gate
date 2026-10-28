@@ -166,11 +166,13 @@ pub fn refused_path(path: &str) -> Option<&'static str> {
     (is_git_s(path) || is_lfs_config(path) || env).then_some("which inputs never carry")
 }
 
-/// The box's stat listing taken just before the command: the stamp of each file under the run's globs, by path found
-/// without regard to case.
+/// The box's stat listing taken just before the command: the stamp of each file under the run's output and failure
+/// globs, by path found without regard to case, and whether every file outside a `.tmp` folder counts as changed
+/// whatever its stamp (`OutputsFull`).
 #[derive(Debug, Default)]
 pub struct Listing {
     stamps: HashMap<String, Stamp>,
+    full: bool,
 }
 
 impl Listing {
@@ -178,12 +180,27 @@ impl Listing {
     #[must_use]
     pub fn of(found: &[Found]) -> Listing {
         let stamps = found.iter().map(|file| (ordinal_upper(&file.path), file.stamp)).collect();
-        Listing { stamps }
+        Listing { stamps, full: false }
     }
 
-    fn get(&self, path: &str) -> Option<Stamp> {
-        self.stamps.get(&ordinal_upper(path)).copied()
+    /// This listing under `OutputsFull` (the PC's last outputs step did not complete): every file outside a `.tmp`
+    /// folder counts as changed, and one below a `.tmp` folder still only when its stamp says so.
+    #[must_use]
+    pub fn under_outputs_full(self) -> Listing {
+        Listing { full: true, ..self }
     }
+
+    /// Whether the run created or changed `file`: this listing lacks it or holds another stamp, or, under
+    /// `OutputsFull`, it lies outside a `.tmp` folder (`below_tmp` false).
+    fn changed(&self, file: &Found, below_tmp: bool) -> bool {
+        (self.full && !below_tmp) || self.stamps.get(&ordinal_upper(&file.path)).copied() != Some(file.stamp)
+    }
+}
+
+/// Whether the `/`-separated relative `path` lies below a `.tmp` folder, in any letter case, at any depth.
+fn is_below_tmp(path: &str) -> bool {
+    path.rsplit_once('/')
+        .is_some_and(|(folders, _)| folders.split('/').any(|folder| folder.eq_ignore_ascii_case(".tmp")))
 }
 
 /// A file [`select`] chose to pack, with its SHA-256 when it was hashed before the pack.
@@ -202,12 +219,15 @@ impl<'found> From<&'found Found> for Chosen<'found> {
 
 /// The files of `found`, the box's walk after the command, to pack, in their order: each outside `skip` (the paths of
 /// the run's back commit, which the sync-back carries) that the PC's `manifest` lacks, and each it holds that the run
-/// created or changed (`listing` lacks it or holds another stamp) whose SHA-256 (`hash`) differs from the manifest's.
-/// Only a file the manifest holds and the run changed is hashed, and a chosen one keeps its hash.
+/// created or changed (`listing` lacks it or holds another stamp, [`Listing::changed`]) whose SHA-256 (`hash`) differs
+/// from the manifest's. Only a file the manifest holds and the run changed is hashed, and a chosen one keeps its hash.
 ///
-/// `listing` is `None` under `OutputsFull` (the PC's last outputs step did not complete): every file then counts as
-/// changed, so each that differs from the PC's comes back. Paths compare without regard to case. Else the error of the
-/// first hash that fails.
+/// A file below a `.tmp` folder comes back only from the run that wrote it: it is chosen only when `listing` shows the
+/// run created or changed it, whether or not the manifest holds it, so an old file the box kept is never sent again.
+///
+/// `listing` `None` counts every file outside a `.tmp` folder as changed (`OutputsFull` without a listing), so each
+/// that differs from the PC's comes back, and chooses no file below one. Paths compare without regard to case. Else
+/// the error of the first hash that fails.
 pub fn select<'found>(
     found: &'found [Found],
     manifest: &Manifest,
@@ -221,11 +241,14 @@ pub fn select<'found>(
         if skip.contains(&ordinal_upper(&file.path)) {
             continue;
         }
+        let below_tmp = is_below_tmp(&file.path);
+        let changed = listing.map_or(!below_tmp, |listing| listing.changed(file, below_tmp));
         let Some(held) = manifest.get(&file.path) else {
-            chosen.push(Chosen::from(file));
+            if changed || !below_tmp {
+                chosen.push(Chosen::from(file));
+            }
             continue;
         };
-        let changed = listing.is_none_or(|listing| listing.get(&file.path) != Some(file.stamp));
         if !changed {
             continue;
         }
@@ -547,6 +570,75 @@ mod tests {
         let (picked, hashed) = chosen(&files, &pc, None, &[], &hashes);
         assert_eq!(picked, ["bin/b.dll"], "the untouched file the PC holds with another hash");
         assert_eq!(hashed, ["bin/a.dll", "bin/b.dll"]);
+    }
+
+    #[test]
+    fn a_tmp_file_the_run_did_not_write_is_not_chosen_though_the_manifest_lacks_it() {
+        let files = [found(".tmp/old.json", stamp(1, 10)), found("src/.TMP/dumps/old.dmp", stamp(2, 10))];
+        let listing = Listing::of(&files);
+        assert_eq!(chosen(&files, &Manifest::default(), Some(&listing), &[], &[]), (vec![], vec![]));
+        let full = Listing::of(&files).under_outputs_full();
+        assert_eq!(
+            chosen(&files, &Manifest::default(), Some(&full), &[], &[]),
+            (vec![], vec![]),
+            "nor under OutputsFull"
+        );
+        assert_eq!(
+            chosen(&files, &Manifest::default(), None, &[], &[]),
+            (vec![], vec![]),
+            "nor without a listing"
+        );
+    }
+
+    #[test]
+    fn a_tmp_file_the_run_created_is_chosen() {
+        let files = [found(".tmp/new.json", stamp(1, 10)), found(".tmp/old.json", stamp(1, 10))];
+        let listing = Listing::of(&[found(".tmp/old.json", stamp(1, 10))]);
+        let picked = chosen(&files, &Manifest::default(), Some(&listing), &[], &[]);
+        assert_eq!(picked, (vec![".tmp/new.json".to_owned()], vec![]), "chosen without being hashed");
+    }
+
+    #[test]
+    fn a_tmp_file_the_run_changed_is_chosen_when_its_hash_differs() {
+        let before = Listing::of(&[
+            found(".tmp/other.json", stamp(1, 10)),
+            found(".tmp/same.json", stamp(1, 10)),
+            found(".tmp/lacked.json", stamp(1, 10)),
+        ]);
+        let files = [
+            found(".tmp/lacked.json", stamp(1, 11)),
+            found(".tmp/other.json", stamp(1, 11)),
+            found(".tmp/same.json", stamp(2, 10)),
+        ];
+        let pc = manifest(&[(".tmp/other.json", stamp(1, 1), 'o'), (".tmp/same.json", stamp(1, 1), 's')]);
+        let hashes = [(".tmp/other.json", 'b'), (".tmp/same.json", 's')];
+        let (picked, hashed) = chosen(&files, &pc, Some(&before), &[], &hashes);
+        assert_eq!(
+            picked,
+            [".tmp/lacked.json", ".tmp/other.json"],
+            "one the PC lacks, and one changed to another hash"
+        );
+        assert_eq!(hashed, [".tmp/other.json", ".tmp/same.json"], "only the files the PC holds");
+    }
+
+    #[test]
+    fn under_outputs_full_a_non_tmp_file_is_still_chosen_without_a_listing() {
+        let files = [
+            found("bin/a.dll", stamp(1, 10)),
+            found("bin/b.dll", stamp(1, 10)),
+            found(".tmp/c.json", stamp(1, 10)),
+        ];
+        let pc = manifest(&[("bin/a.dll", stamp(1, 10), 'x')]);
+        let (picked, hashed) = chosen(&files, &pc, None, &[], &[("bin/a.dll", 'a')]);
+        assert_eq!(
+            picked,
+            ["bin/a.dll", "bin/b.dll"],
+            "the untouched files outside .tmp, but not the one below it"
+        );
+        assert_eq!(hashed, ["bin/a.dll"]);
+        let full = Listing::of(&files).under_outputs_full();
+        let (picked, _) = chosen(&files, &pc, Some(&full), &[], &[("bin/a.dll", 'a')]);
+        assert_eq!(picked, ["bin/a.dll", "bin/b.dll"], "the same with a listing under OutputsFull");
     }
 
     #[test]

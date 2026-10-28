@@ -24,6 +24,7 @@ use gate_wire::stamp::{self, Tag};
 use gate_args::{
     Ceiling, ProgramSearch, RunRequest, Slot, Spelling, batch_command_line, batch_refusal, command_line, is_batch_target, resolve_program,
 };
+use gate_inputs::glob::names_tmp;
 use gate_router::warm::{RecordRead, RecordState};
 use gate_router::{
     BuildSettings, BuildTarget, DEFAULT_OUTPUTS, LaterCandidate, PinRefusal, Place, RemoteRun, Route, build_settings, builds_in_place, dotnet_builds,
@@ -4988,8 +4989,7 @@ fn restore_due(build: &RoutedBuild, console: &mut Console) -> Option<RestorePlan
 /// worktree the run's judging globs stop at that the run did not bring back. Only a dotnet build the gate treats as one
 /// ([`dotnet_builds`]) that ended on the builder has any, and the run's verdict decides whether it is said
 /// ([`Run::verdict`]), so a failed build, one whose log reports a failure among them, and a fallback (whose build ran
-/// here) say nothing. The judging globs are the run's own, the defaults beside them, even in a repo whose `outputs` list
-/// is empty ([`DEFAULT_OUTPUTS`]); a file the run brought back is no stale folder's. A pair's siblings are judged by
+/// here) say nothing. The judging globs are [`judging_globs`]; a file the run brought back is no stale folder's. A pair's siblings are judged by
 /// the same globs, and named after the main's on the same line, relative to the main worktree; a sibling's output is
 /// never brought back. A tree that cannot be listed says why it could not, on a line of its own ([`stale::stale_lines`]).
 fn stale_lines(remote: &RemoteRun, outcome: &RemoteOutcome, words: Option<&[String]>) -> Vec<String> {
@@ -4999,8 +4999,7 @@ fn stale_lines(remote: &RemoteRun, outcome: &RemoteOutcome, words: Option<&[Stri
     if outcome.status != 0 || !dotnet_builds(words) {
         return Vec::new();
     }
-    let mut judging = remote.outputs.clone();
-    judging.extend(DEFAULT_OUTPUTS.iter().map(|glob| (*glob).to_owned()));
+    let judging = judging_globs(&remote.outputs);
     let brought_back = if brought_everything_back(outcome) {
         remote.outputs.clone()
     } else {
@@ -5014,6 +5013,15 @@ fn stale_lines(remote: &RemoteRun, outcome: &RemoteOutcome, words: Option<&[Stri
     stale::stale_lines(&remote.root, &siblings, &judging, &brought_back, |root, globs| {
         walk(Path::new(root), globs).map(|found| found.into_iter().map(|file| file.path).collect())
     })
+}
+
+/// The globs [`stale_lines`] judges a tree's folders by: the run's `outputs` but those that name a `.tmp` folder
+/// ([`names_tmp`]), so no `.tmp` folder is ever judged stale, and the defaults beside them, even in a repo whose
+/// `outputs` list is empty ([`DEFAULT_OUTPUTS`]).
+fn judging_globs(outputs: &[String]) -> Vec<String> {
+    let mut judging: Vec<String> = outputs.iter().filter(|glob| !names_tmp(glob)).cloned().collect();
+    judging.extend(DEFAULT_OUTPUTS.iter().map(|glob| (*glob).to_owned()));
+    judging
 }
 
 /// The command's words as text, `None` when one of them is not valid Unicode.
@@ -5040,8 +5048,8 @@ mod tests {
 
     use super::{
         Ends, Judged, Pass, ROUTE_HINT_MIN_WALL, RouteJudged, Stopper, Timing, brought_everything_back, cores_hint_for, cores_line,
-        drain_waiting_line, dropped_line, earlier, holder_claim, interrupted, key_wait_left, key_wait_line, kill, log_in_state_root, passed_line,
-        records_after, route_hint_for, route_hint_line, routed_env, stop, takes_own_slot,
+        drain_waiting_line, dropped_line, earlier, holder_claim, interrupted, judging_globs, key_wait_left, key_wait_line, kill, log_in_state_root,
+        passed_line, records_after, route_hint_for, route_hint_line, routed_env, stop, takes_own_slot,
     };
     use crate::console::Console;
     use crate::escaped::{Found, Look, Reached, Recorded};
@@ -5049,9 +5057,26 @@ mod tests {
     use crate::remote::drain::Drain;
     use crate::remote::{RemoteOutcome, Split};
     use crate::watch::Watched;
+    use gate_router::DEFAULT_OUTPUTS;
     use gate_state::v1::{Claim, ClaimKind};
     use jiff::Timestamp;
     use serde_json::{Map, Value};
+
+    #[test]
+    fn stale_folders_are_not_judged_by_a_glob_naming_tmp() {
+        let outputs: Vec<String> = [".tmp/x.json", "bin/**", "**/.TMP/dumps/*.dmp", "src/.tmp/a.txt", "out/*.tmp"]
+            .iter()
+            .map(|glob| (*glob).to_owned())
+            .collect();
+        let mut expected = vec!["bin/**".to_owned(), "out/*.tmp".to_owned()];
+        expected.extend(DEFAULT_OUTPUTS.iter().map(|glob| (*glob).to_owned()));
+        assert_eq!(
+            judging_globs(&outputs),
+            expected,
+            "every glob naming a .tmp folder is left out; the rest, and the defaults, judge"
+        );
+        assert_eq!(judging_globs(&[]), expected[2..], "the defaults judge a repo with no outputs");
+    }
 
     #[test]
     fn a_drain_with_no_barrier_says_its_waiting_line_without_the_times() {

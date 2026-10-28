@@ -236,6 +236,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_walk_lists_a_tmp_file_a_glob_names_and_passes_over_the_gate_s_own() {
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let archive = format!(".tmp/yaat-1a2b3c4d-{nonce}.tar.zst");
+        let staged = format!(".tmp/yaat-1a2b3c4d-{nonce}/bin/a.json");
+        let root = tree(
+            "named-tmp",
+            &[
+                ".tmp/taxi-1.json",
+                ".tmp/sub/taxi-2.json",
+                ".tmp/other.log",
+                "src/.tmp/taxi-3.json",
+                archive.as_str(),
+                staged.as_str(),
+                "bin/a.dll",
+            ],
+        );
+        let named = walk(&root, &globs(&[".tmp/taxi-*.json", "**/bin/**"])).expect("the tree can be walked");
+        assert_eq!(paths_of(&named), [".tmp/taxi-1.json", "bin/a.dll"], "only the named .tmp's own files");
+        let all = walk(&root, &globs(&[".tmp/**"])).expect("the tree can be walked");
+        assert_eq!(
+            paths_of(&all),
+            [".tmp/other.log", ".tmp/sub/taxi-2.json", ".tmp/taxi-1.json"],
+            "the gate's own archive and stage are passed over"
+        );
+        let unnamed = walk(&root, &globs(&["**"])).expect("the tree can be walked");
+        assert_eq!(paths_of(&unnamed), ["bin/a.dll"], "a glob that names no .tmp finds nothing in one");
+    }
+
+    #[test]
     fn a_walk_with_no_globs_finds_nothing() {
         let root = tree("none", &["bin/a.dll"]);
         assert_eq!(walk(&root, &globs(&[])).expect("the tree can be walked"), []);

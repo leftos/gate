@@ -416,6 +416,121 @@ fn a_glob_naming_test_results_packs_the_trx_below_it() {
     );
 }
 
+/// The ignore file of a case whose outputs lie in `.tmp`: neither build output nor `.tmp` is committed.
+const IGNORE_TMP: (&str, &str) = (".gitignore", "bin/\n.tmp/\n");
+
+#[test]
+fn a_glob_naming_tmp_packs_the_file_below_it() {
+    let case = Case::new("box_outputs_named_tmp");
+    let command = [
+        FAKE_TOOL,
+        "write",
+        r".tmp\taxi-coverage-1.json",
+        "coverage",
+        "write",
+        r".tmp\sub\taxi-coverage-2.json",
+        "deeper",
+        "write",
+        r".tmp\other.json",
+        "other",
+        "write",
+        r"bin\app.dll",
+        "dll",
+    ];
+    let mut payload = outputs_payload(&case, &command, &["**/bin/**", ".tmp/taxi-*.json"]);
+    snapshot(&case, &mut payload, &[IGNORE_TMP]);
+
+    let outcome = run_with_manifest(&case, &payload, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(has_line(&outcome.stderr, &packed_line(&payload, 2)), "{outcome:?}");
+    assert_eq!(
+        archive_files(&archive_path(&payload)),
+        expected(&[(".tmp/taxi-coverage-1.json", "coverage"), ("bin/app.dll", "dll")]),
+        "the glob that names .tmp brings back its own file there, and nothing deeper or unmatched"
+    );
+}
+
+#[test]
+fn box_run_never_packs_the_gate_s_own_tmp_names() {
+    let case = Case::new("box_outputs_gate_tmp");
+    let nonce = "0123456789abcdef0123456789abcdef";
+    let archive = format!(r".tmp\yaat-1a2b3c4d-{nonce}.tar.zst");
+    let staged = format!(r".tmp\yaat-1a2b3c4d-{nonce}\bin\a.dll");
+    let inputs = format!(r".tmp\yaat-1a2b3c4d-{nonce}.inputs-diff");
+    let command = [
+        FAKE_TOOL,
+        "write",
+        archive.as_str(),
+        "archive",
+        "write",
+        staged.as_str(),
+        "staged",
+        "write",
+        inputs.as_str(),
+        "diff",
+        "write",
+        r".tmp\keep.txt",
+        "keep",
+    ];
+    let mut payload = outputs_payload(&case, &command, &[".tmp/**"]);
+    snapshot(&case, &mut payload, &[IGNORE_TMP]);
+
+    let outcome = run_with_manifest(&case, &payload, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(has_line(&outcome.stderr, &packed_line(&payload, 1)), "{outcome:?}");
+    assert_eq!(
+        archive_files(&archive_path(&payload)),
+        expected(&[(".tmp/keep.txt", "keep")]),
+        "the gate's own archive, stage and diff names are never packed"
+    );
+}
+
+#[test]
+fn box_run_does_not_pack_a_tmp_file_an_earlier_run_left() {
+    let case = Case::new("box_outputs_old_tmp");
+    let mut first = outputs_payload(&case, &[FAKE_TOOL, "write", r".tmp\old.json", "old"], &[".tmp/*.json"]);
+    snapshot(&case, &mut first, &[IGNORE_TMP]);
+    let built = run_with_manifest(&case, &first, &manifest(&[]));
+    assert!(has_line(&built.stderr, &packed_line(&first, 1)), "{built:?}");
+
+    let mut second = renamed(&first, 1);
+    second["Command"] = json!([FAKE_TOOL, "write", r".tmp\new.json", "new"]);
+    let outcome = run_with_manifest(&case, &second, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(has_line(&outcome.stderr, &packed_line(&second, 1)), "{outcome:?}");
+    assert_eq!(
+        archive_files(&archive_path(&second)),
+        expected(&[(".tmp/new.json", "new")]),
+        "the file the run wrote comes back; the one an earlier run left stays, though the PC lacks it"
+    );
+}
+
+#[test]
+fn box_run_under_outputs_full_still_leaves_an_earlier_tmp_file_behind() {
+    let case = Case::new("box_outputs_full_old_tmp");
+    let first_command = [FAKE_TOOL, "write", r".tmp\old.json", "old", "write", r"bin\a.txt", "a"];
+    let mut first = outputs_payload(&case, &first_command, &["bin/**", ".tmp/*.json"]);
+    snapshot(&case, &mut first, &[IGNORE_TMP]);
+    let built = run_with_manifest(&case, &first, &manifest(&[]));
+    assert!(has_line(&built.stderr, &packed_line(&first, 2)), "{built:?}");
+
+    let mut full = renamed(&first, 1);
+    full["Command"] = json!([FAKE_TOOL, "write", r".tmp\new.json", "new"]);
+    full["OutputsFull"] = json!(true);
+    let outcome = run_with_manifest(&case, &full, &manifest(&[("bin/a.txt", "pc-a")]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        archive_files(&archive_path(&full)),
+        expected(&[(".tmp/new.json", "new"), ("bin/a.txt", "a")]),
+        "OutputsFull still sends the untouched file outside .tmp the PC holds otherwise, and the .tmp file the run \
+         wrote, but not the one an earlier run left"
+    );
+}
+
 #[test]
 fn box_run_packs_identical_files_once_and_lists_every_path() {
     let case = Case::new("box_outputs_identical");
@@ -589,6 +704,59 @@ fn box_run_of_a_failed_command_with_a_failure_output_glob_packs_its_file() {
         archive_members(&archive_path(&payload)),
         ["dumps/a.dmp"],
         "the dump comes back, the build does not"
+    );
+}
+
+#[test]
+fn box_run_of_a_failed_command_packs_a_tmp_failure_output() {
+    let case = Case::new("box_outputs_failed_tmp_dump");
+    let command = [
+        FAKE_TOOL,
+        "write",
+        r"bin\a.txt",
+        "a",
+        "write",
+        r".tmp\dumps\r1\a.dmp",
+        "dmp",
+        "write",
+        r".tmp\other.dmp",
+        "other",
+        "exit",
+        "3",
+    ];
+    let mut payload = failure_payload(&case, &command, &["bin/**"], &[".tmp/dumps/**"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\n.tmp/\n")]);
+
+    let outcome = run_with_manifest(&case, &payload, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    assert!(has_line(&outcome.stderr, &packed_line(&payload, 1)), "{outcome:?}");
+    assert_eq!(
+        archive_members(&archive_path(&payload)),
+        [".tmp/dumps/r1/a.dmp"],
+        "the dump the failure glob names in .tmp comes back, nothing else does"
+    );
+}
+
+#[test]
+fn box_run_of_a_failed_command_packs_only_the_tmp_dumps_it_wrote() {
+    let case = Case::new("box_outputs_failed_old_tmp_dump");
+    let first_command = [FAKE_TOOL, "write", r".tmp\dumps\old.dmp", "old", "exit", "3"];
+    let mut first = failure_payload(&case, &first_command, &["bin/**"], &[".tmp/dumps/**"]);
+    snapshot(&case, &mut first, &[(".gitignore", "bin/\n.tmp/\n")]);
+    let failed = run_with_manifest(&case, &first, &manifest(&[]));
+    assert!(has_line(&failed.stderr, &packed_line(&first, 1)), "{failed:?}");
+
+    let mut second = renamed(&first, 1);
+    second["Command"] = json!([FAKE_TOOL, "write", r".tmp\dumps\new.dmp", "new", "exit", "3"]);
+    let outcome = run_with_manifest(&case, &second, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    assert!(has_line(&outcome.stderr, &packed_line(&second, 1)), "{outcome:?}");
+    assert_eq!(
+        archive_members(&archive_path(&second)),
+        [".tmp/dumps/new.dmp"],
+        "the dump this run wrote comes back; the one an earlier run left stays on the builder"
     );
 }
 

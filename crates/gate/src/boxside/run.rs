@@ -775,7 +775,7 @@ pub(super) struct Folders<'a> {
 }
 
 /// A run's outputs step as it goes: what the run asks for, the PC's manifest or why it could not be read, and the
-/// listing taken before the command, `None` until then and under `OutputsFull`.
+/// listing taken before the command, `None` until then and when it could not be taken.
 struct RunOutputs<'a> {
     asked: &'a Asked<'a>,
     manifest: Result<Manifest, String>,
@@ -797,7 +797,8 @@ impl<'a> RunOutputs<'a> {
         }
     }
 
-    /// Takes the listing of the files under the globs in `work` before the command, saying it could not be taken.
+    /// Takes the listing before the command in `work` ([`outputs::listing`]), under `OutputsFull` too, saying it could
+    /// not be taken.
     fn list(&mut self, work: &Path, beat: &Beat<'_>, console: &mut Console) {
         let (listing, line) = outputs::listing(self.asked, work);
         if let Some(line) = line {

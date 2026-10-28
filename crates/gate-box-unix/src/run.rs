@@ -357,11 +357,11 @@ pub struct Ready<'p> {
 
 /// A run's outputs as they stand before its command, as the Windows box's `RunOutputs` holds them: the PC's manifest
 /// or why it could not be read, said only once the command has passed, and the listing of the files under the globs
-/// taken before the command, `None` under `OutputsFull`.
+/// taken before the command, under `OutputsFull` too, `None` when it could not be taken.
 pub struct RunOutputs {
     /// The PC's manifest, or why it could not be read.
     pub manifest: Result<Manifest, String>,
-    /// The listing taken before the command; `None` until then and under `OutputsFull`.
+    /// The listing taken before the command; `None` until then and when it could not be taken.
     pub listing: Option<Listing>,
 }
 
@@ -1045,7 +1045,7 @@ pub(crate) enum Unready {
 /// else how the run ends, refused or with a status, its lines said. A run with output globs reads the PC's manifest
 /// from `sources`' `input` once the heartbeat has started and before the layout and the checkout, without waiting past
 /// its newline, and prunes the old archives ([`RunOutputs::read`]); after the tool restore it lists the files under
-/// the globs, unless `OutputsFull` ([`RunOutputs::list`]). A run without globs reads nothing past its request line.
+/// the globs, under `OutputsFull` too ([`RunOutputs::list`]). A run without globs reads nothing past its request line.
 fn locked<S: LineSink + 'static>(
     request: &Request<'_>,
     lock: &HeldLock,

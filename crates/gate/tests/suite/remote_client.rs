@@ -8159,6 +8159,81 @@ fn a_tracked_member_a_bring_tracked_glob_matches_is_installed() {
     assert!(!pending_marker(&case).exists(), "the marker is cleared: {outcome:?}");
 }
 
+/// The box's command writes a coverage file in its `.tmp`, which a glob names: the install moves it into the PC's
+/// `.tmp` while the fetched archive and the stage sit there, and removes both after.
+#[test]
+fn a_routed_run_brings_back_a_tmp_file_a_glob_names() {
+    let case = outputs_case("client-outputs-named-tmp", &["**/bin/**", ".tmp/taxi-*.json"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+    let command = [
+        r".\tool.exe",
+        "write",
+        r".tmp\taxi-coverage-1.json",
+        "coverage",
+        "write",
+        r"bin\new.txt",
+        "built",
+    ];
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &command));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs"]);
+    assert_eq!(
+        worktree_text(&case, r".tmp\taxi-coverage-1.json"),
+        "coverage",
+        "the file the glob names in .tmp is installed: {outcome:?}"
+    );
+    assert_eq!(worktree_text(&case, r"bin\new.txt"), "built", "beside the build");
+    assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
+    assert!(!pending_marker(&case).exists(), "the outputs step completed: {outcome:?}");
+    assert!(!outcome.stderr.contains("brought back"), "{outcome:?}");
+}
+
+/// A hostile builder's archive carries a member at one of the gate's own `.tmp` names: the install refuses it whatever
+/// the glob, nothing of it reaches the worktree, and the refusal, decided by the archive's own members, clears the marker.
+#[test]
+fn a_routed_run_never_installs_over_the_gate_s_own_tmp_files() {
+    let case = outputs_case("client-outputs-gate-tmp", &[".tmp/**", "**/bin/**"]);
+    let member = ".tmp/client-1a2b3c4d-0123456789abcdef0123456789abcdef.tar.zst";
+
+    let outcome = swapped_archive_run(&case, &[], member);
+
+    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
+    let line = format!("gate: remote outputs not brought back: the archive member {member} is not under the output globs");
+    assert!(outcome.stderr.contains(&line), "{outcome:?}");
+    assert!(!case.folder().join(member).exists(), "nothing of it is installed: {outcome:?}");
+    assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
+    assert!(
+        !pending_marker(&case).exists(),
+        "a refusal of the archive's own members clears the marker: {outcome:?}"
+    );
+}
+
+/// The run logs to `.tmp\gate-own.log`, and the box's command writes a file of that name, which a glob names: the
+/// install skips it, says so, keeps the pass and clears the marker, and the PC's log holds the run's own output.
+#[test]
+fn a_routed_run_never_installs_over_its_own_log() {
+    let case = outputs_case("client-outputs-own-log", &[".tmp/*.log", "**/bin/**"]);
+    fs::create_dir_all(case.folder().join(".tmp")).expect("the worktree's .tmp can be made");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+    let command = [r".\tool.exe", "write", r".tmp\gate-own.log", "box", "write", r"bin\new.txt", "built"];
+
+    let outcome = finish(client_gate(&case, ".tmp/gate-own.log", &steps, &command));
+
+    assert_eq!(outcome.code, Some(0), "the pass stands: {outcome:?}");
+    let skipped = "gate: remote outputs not fully brought back: .tmp/gate-own.log is this run's own log";
+    assert!(outcome.stderr.contains(skipped), "{outcome:?}");
+    assert_ne!(
+        worktree_text(&case, r".tmp\gate-own.log"),
+        "box",
+        "the log is not overwritten: {outcome:?}"
+    );
+    assert_eq!(worktree_text(&case, r"bin\new.txt"), "built", "the rest is installed");
+    assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
+    assert!(!pending_marker(&case).exists(), "the skip leaves the install whole: {outcome:?}");
+}
+
 /// The text of the case's worktree file `name`, which must be there.
 fn worktree_text(case: &Case, name: &str) -> String {
     fs::read_to_string(case.folder().join(name)).expect("the worktree file is there")

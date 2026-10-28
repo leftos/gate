@@ -158,7 +158,7 @@ fn size_text(bytes: u64) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{Capped, Caps, GIB, MIB, capped};
+    use super::{Capped, Capping, Caps, GIB, MIB, capped, failed_run_globs};
     use crate::glob::Globs;
     use crate::manifest::{Chosen, Stamp};
     use crate::walk::Found;
@@ -180,6 +180,19 @@ mod tests {
         });
         let Capped { kept, left } = capped(files.iter().map(Chosen::from).collect(), reports.as_ref(), caps);
         (kept.iter().map(|item| item.file.path.clone()).collect(), left)
+    }
+
+    #[test]
+    fn a_failed_run_brings_back_a_tmp_dump_its_failure_glob_names() {
+        let outputs = Globs::new(&["**/bin/**".to_owned(), "out/TestResults/*.trx".to_owned()]).expect("the globs can be matched");
+        let failure = Globs::new(&[".tmp/dumps/**".to_owned()]).expect("the glob can be matched");
+        let (globs, capping) = failed_run_globs(&outputs, Some(&failure), Caps::BUILT_IN).expect("the run has failure globs");
+        assert!(globs.matches(".tmp/dumps/r1/a.dmp"), "the failure glob naming .tmp brings the dump back");
+        assert!(globs.matches("out/TestResults/r.trx"), "beside the test reports");
+        for never in [".tmp/other/a.dmp", "bin/a.dll", ".tmp/dumps/x/.tmp/a.dmp"] {
+            assert!(!globs.matches(never), "{never} is not in the failed run's set");
+        }
+        assert!(matches!(capping, Capping::BesideReports { .. }), "the dump is held to the failure caps");
     }
 
     #[test]

@@ -43,6 +43,7 @@ use crate::outputs::glob::Globs;
 use crate::outputs::hash::file_sha256;
 use crate::outputs::manifest::Manifest;
 use crate::outputs::walk::{Stamp, in_context, stamp_of};
+use crate::route::is_run_log;
 
 /// The name of the ASP.NET test host's file of content roots, which records the box's work folder.
 const TEST_HOST_MANIFEST: &str = "MvcTestingAppManifest.json";
@@ -139,6 +140,8 @@ enum Skip {
     InUse,
     /// It records the box's work folder but is not text the install can rewrite ([`Unrewritable`]).
     Unrewritable(Unrewritable),
+    /// It is this run's own log, or the log's `.err` file, which the run is writing ([`own_logs`]).
+    OwnLog,
 }
 
 impl Skip {
@@ -149,16 +152,18 @@ impl Skip {
             Skip::InUse => "is in use or read-only".to_owned(),
             Skip::Unrewritable(Unrewritable::NotText) => "cannot be rewritten (it is not UTF-8 or UTF-16 with a byte order mark)".to_owned(),
             Skip::Unrewritable(Unrewritable::TooLarge(bytes)) => format!("cannot be rewritten ({bytes} bytes, over 16 MiB)"),
+            Skip::OwnLog => "is this run's own log".to_owned(),
         }
     }
 
     /// Whether this skip keeps the pending marker and makes the install incomplete, so a later run asks for every output
     /// again: a file git tracks, or one in use or read-only, differs from the PC's next run, while a file the install
-    /// cannot rewrite is the same on every run, so it needs no full send and does not stop an install counting whole.
+    /// cannot rewrite, or this run's own log, is skipped the same way on every run, so it needs no full send and does not
+    /// stop an install counting whole.
     fn keeps_marker(self) -> bool {
         match self {
             Skip::Tracked | Skip::InUse => true,
-            Skip::Unrewritable(_) => false,
+            Skip::Unrewritable(_) | Skip::OwnLog => false,
         }
     }
 }
@@ -383,10 +388,12 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
         all = Globs::new(fetched.globs).map_err(transient)?;
         &all
     };
+    let log = super::inputs::relative(Path::new(attempt.call.root), attempt.call.log);
+    let (entries, mut skipped) = own_logs(entries, log.as_deref());
     let checks = checked(&root, &entries, globs, fetched.manifest).map_err(Unmet::Refused)?;
     let in_place: HashSet<&str> = checks.in_place.iter().map(String::as_str).collect();
     let entries: Vec<Entry> = entries.into_iter().filter(|entry| !in_place.contains(entry.path.as_str())).collect();
-    let mut skipped = skips(attempt, &root, &entries, &checks.in_use)?;
+    skipped.extend(skips(attempt, &root, &entries, &checks.in_use)?);
     let skipped_paths: HashSet<&str> = skipped.iter().map(|(path, _)| path.as_str()).collect();
     let entries: Vec<Entry> = entries.into_iter().filter(|entry| !skipped_paths.contains(entry.path.as_str())).collect();
     let siblings = fetched.sibling_trees.iter().map(|(tree, pc_root)| {
@@ -429,6 +436,15 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
         },
         started,
     ))
+}
+
+/// `entries` split into those the install goes on with and those it skips as this run's own log ([`Skip::OwnLog`]): the
+/// member whose path is `log`, the run's log as a `/`-separated path relative to the worktree, or that path with `.err`
+/// after it, compared without regard to ASCII letter case ([`is_run_log`]). A log outside the worktree (`None`) skips
+/// nothing.
+fn own_logs(entries: Vec<Entry>, log: Option<&str>) -> (Vec<Entry>, Vec<(String, Skip)>) {
+    let (own, kept): (Vec<Entry>, Vec<Entry>) = entries.into_iter().partition(|entry| is_run_log(&entry.path, log));
+    (kept, own.into_iter().map(|entry| (entry.path, Skip::OwnLog)).collect())
 }
 
 /// What the install skips of `entries`, below the worktree `root`, `in_use` being the paths of those whose PC file is in
@@ -1140,8 +1156,8 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
     use super::{
-        Bringing, Checked, Index, Installed, Moved, Moves, Refused, Skip, Unmet, Unmoved, Unrewritable, cached, checked, ending, moved, reasons,
-        rewritten, said, stage_made, success_line, tracked, unmet_of, unpacked,
+        Bringing, Checked, Index, Installed, Moved, Moves, Refused, Skip, Unmet, Unmoved, Unrewritable, cached, checked, ending, moved, own_logs,
+        reasons, rewritten, said, stage_made, success_line, tracked, unmet_of, unpacked,
     };
     use crate::boxside::outputs::OUTPUTS_BUDGET;
     use crate::outputs::archive::{Entry, PcFiles, UnpackError, pack};
@@ -1152,6 +1168,7 @@ mod tests {
     use crate::outputs::walk::{Stamp, walk};
     use crate::remote::client::End;
     use crate::remote::git::GitError;
+    use crate::remote::inputs::Kind;
 
     const BOX_WORK: &str = r"D:\gate-remote\work\app-1a2b3c4d";
     const PC_ROOT: &str = r"C:\src\app";
@@ -1254,6 +1271,114 @@ mod tests {
             );
         }
         assert_eq!(checked(&root, &[entry("src/bin/a.dll")], &bin_globs(), &manifest), Ok(Checked::default()));
+    }
+
+    #[test]
+    fn a_member_under_tmp_a_glob_names_is_installed() {
+        let root = scratch("named-tmp");
+        let manifest = Manifest::default();
+        let naming = Globs::new(&["**/bin/**".to_owned(), ".tmp/taxi-*.json".to_owned()]).expect("the globs can be matched");
+        let report = ".tmp/taxi-coverage-1.json";
+        assert_eq!(
+            checked(&root, &[entry(report)], &naming, &manifest),
+            Ok(Checked::default()),
+            "the glob that names .tmp brings the file in"
+        );
+        for refused in [".tmp/sub/taxi-1.json", "bin/.tmp/taxi-1.json"] {
+            assert_eq!(
+                checked(&root, &[entry(refused)], &naming, &manifest),
+                Err(Refused::deterministic(format!(
+                    "the archive member {refused} is not under the output globs"
+                ))),
+                "{refused} lies where no glob names its .tmp"
+            );
+        }
+        assert_eq!(
+            checked(&root, &[entry(report)], &bin_globs(), &manifest),
+            Err(Refused::deterministic(format!(
+                "the archive member {report} is not under the output globs"
+            ))),
+            "the default globs bring in nothing under .tmp"
+        );
+    }
+
+    #[test]
+    fn a_gate_own_tmp_member_is_refused_whatever_the_glob() {
+        let root = scratch("own-tmp");
+        let manifest = Manifest::default();
+        let nonce = "0123456789abcdef0123456789abcdef";
+        for path in [
+            format!(".tmp/yaat-1a2b3c4d-{nonce}.tar.zst"),
+            format!(".tmp/yaat-1a2b3c4d-{nonce}/bin/a.dll"),
+            format!(".tmp/yaat-1a2b3c4d-{nonce}.inputs.tar.zst"),
+            format!(".TMP/YAAT-1A2B3C4D-{}.LFS-DIFF", nonce.to_uppercase()),
+        ] {
+            let globs = Globs::new(&[".tmp/**".to_owned(), path.clone()]).expect("the globs can be matched");
+            assert_eq!(
+                checked(&root, &[entry(&path)], &globs, &manifest),
+                Err(Refused::deterministic(format!("the archive member {path} is not under the output globs"))),
+                "{path} is the gate's own"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gate_s_own_tmp_names_as_its_makers_make_them_never_come_back() {
+        let nonce = crate::remote::payload::run_nonce();
+        for root in ["X:/dev/yaat", "X:/dev/gate.wt/841-tmp-outputs", "C:/Users/a b/.dotted repo"] {
+            let key = gate_router::work_folder_key(root);
+            let mut names = vec![gate_wire::archive_file_name(&key, &nonce), format!("{key}-{nonce}/bin/a.dll")];
+            for kind in [Kind::Inputs, Kind::Build("p/bin/Release")] {
+                names.push(format!("{key}-{nonce}.{}.tar.zst", kind.file()));
+                names.push(format!("{key}-{nonce}.{}-diff", kind.file()));
+            }
+            names.push(format!("{key}-{nonce}.lfs.tar.zst"));
+            names.push(format!("{key}-{nonce}.lfs-diff"));
+            for name in names {
+                let path = format!(".tmp/{name}");
+                let globs = Globs::new(&[".tmp/**".to_owned(), path.clone()]).expect("the globs can be matched");
+                assert!(!globs.matches(&path), "{path} is the gate's own");
+            }
+            let near = format!(".tmp/{key}.json");
+            let globs = Globs::new(&[".tmp/**".to_owned()]).expect("the glob can be matched");
+            assert!(globs.matches(&near), "{near} is not the gate's own shape, so the glob reaches it");
+        }
+    }
+
+    #[test]
+    fn a_member_that_is_this_run_s_own_log_is_skipped_not_installed() {
+        let entries = || {
+            [".tmp/gate-build.log", ".TMP/Gate-Build.LOG.err", ".tmp/gate-build.log.1", "bin/a.dll"]
+                .into_iter()
+                .map(entry)
+                .collect::<Vec<Entry>>()
+        };
+        let (kept, skipped) = own_logs(entries(), Some(".tmp/gate-build.log"));
+        let kept: Vec<&str> = kept.iter().map(|entry| entry.path.as_str()).collect();
+        assert_eq!(kept, [".tmp/gate-build.log.1", "bin/a.dll"], "every other member goes on");
+        assert_eq!(
+            skipped,
+            [
+                (".tmp/gate-build.log".to_owned(), Skip::OwnLog),
+                (".TMP/Gate-Build.LOG.err".to_owned(), Skip::OwnLog)
+            ],
+            "the log and its .err are skipped, in any letter case"
+        );
+        let (all, none) = own_logs(entries(), None);
+        assert_eq!((all.len(), none), (4, Vec::new()), "a log outside the worktree skips nothing");
+        let installed = Installed {
+            count: 0,
+            bytes: 0,
+            compressed: 0,
+            skipped,
+            moved: Vec::new(),
+        };
+        assert!(
+            installed.complete(),
+            "skipping the run's own log leaves the install whole, so the marker clears"
+        );
+        let line = "gate: remote outputs not fully brought back: .tmp/gate-build.log is this run's own log";
+        assert_eq!(said(Bringing::Outputs, &installed, 1.0, 0.5)[0], line, "the skip is said");
     }
 
     #[test]

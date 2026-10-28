@@ -44,7 +44,9 @@ A command whose files hold more than 64 MiB or 2000 files, that runs in a siblin
 
    A routed run copies back its `outputs` only after a passing command. A failed command (exit other than 0) copies back only its `TestResults` globs' files and the files under `failureOutputs`, an object of repo to globs beside `outputs` (the same glob rules and `[`/`]` ban; a `builders` entry's own list wins for a run on it; absent by default, no derived globs), such as `{"yaat": ["**/*.dmp"]}`.
 
-   A failure output over 256 MiB, or past 1 GiB in all, stays on the builder and the box says so (`gate: remote failure output left on the builder: ...`). A killed run brings nothing back.
+   An `outputs` or `failureOutputs` glob brings back a file below a `.tmp` folder only when its folder segment is exactly `.tmp` (`.tmp/dumps/**`, `**/.tmp/x.json`; `**` and `.t*p/x` do not reach), and only a file this run created or changed. The gate's own `.tmp` files never come back.
+
+  A failure output over 256 MiB, or past 1 GiB in all, stays on the builder and the box says so (`gate: remote failure output left on the builder: ...`). A killed run brings nothing back.
 4. Run one routing trial (below). The repo counts as routed once its trial passes.
 
 ## Builder setup
@@ -239,7 +241,7 @@ The engine is not in the worktree and not on the builder's `PATH`: the builder h
   A repo whose build reads another variable for the engine (ue-mcp's `UE_MCP_TEST_ENGINE_ROOT`) names it in the manifest's `[env]` table, `UE_MCP_TEST_ENGINE_ROOT = "unreal"`, and the box sets it to the same folder; a PC engine path passed with `--env` is not rewritten for the builder, and `UE_ROOT` itself is refused there. `gate check` shows an `[env]` entry the gate cannot use.
 - **The routed command is a tracked wrapper script.** It builds absolute `-project=` and `-archivedirectory=` paths itself, because `RunUAT.bat` `pushd`es into the engine and the router sends worktree paths as relative ones. It reads the engine from `UE_ROOT`, with its own fallback for the PC, where nothing sets it.
 - **The .NET Framework SDK.** A manifest naming `unreal` at any version also needs a `netfx-sdk` of 4.6.0 or later, the SDK `UnrealBuildTool` looks for, which the gate adds itself. The installer's step `.NET Framework 4.8 Developer Pack` provides it, and a builder without it keeps the run here with the mismatch line. `gate check` here judges it too, unless `GATE_UNREAL_ROOT` is unset on this PC, where it says it is not checked.
-- **The archive** goes to a gitignored folder outside `.tmp/`, named in the repo's `outputs`, because outputs never come back from `.tmp/`.
+- **The archive** goes to a gitignored folder outside `.tmp/`, named in the repo's `outputs`, so it is not left in `.tmp/`, whose files come back only when the run wrote them and a glob names `.tmp`.
 - **What stays local:** commandlets that write into ignored content, a packaged-game run that needs a GPU when the builder has none, and the editor.
 - **Git LFS.** A repo with LFS-tracked files routes with them: the PC sends the objects the snapshot's pointers name to the builder's per-repo LFS store, and the box checks them out with no download.
 

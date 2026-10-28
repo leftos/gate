@@ -663,7 +663,7 @@ fn cut_why(step: Step, cut: Cut) -> String {
 /// What an inputs call sends: the repo's inputs, or the PC's build of one project, its bin folder below the worktree
 /// root, `{project}/bin/{configuration}`, sent as `SentBin`.
 #[derive(Clone, Copy)]
-enum Kind<'k> {
+pub(crate) enum Kind<'k> {
     Inputs,
     Build(&'k str),
 }
@@ -679,7 +679,7 @@ impl<'k> Kind<'k> {
 
     /// The name of its files in `.tmp`, after `{key}-{nonce}.`: its diff answer `{name}-diff` and its archive
     /// `{name}.tar.zst`.
-    fn file(self) -> &'static str {
+    pub(crate) fn file(self) -> &'static str {
         match self {
             Kind::Inputs => "inputs",
             Kind::Build(_) => "sent-build",
