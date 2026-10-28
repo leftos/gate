@@ -7,29 +7,20 @@
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [!] GATE-828 Fix the flaky Unix box test a_clear_refuses_a_volume_mounted_in_the_work_folder_and_keeps_its_files — Urgent · Remote
 - [ ] GATE-871 Carry routed runs' bulk data on a TCP data channel instead of ssh to the Windows builder — Urgent · Remote
-- [/] GATE-890 Fix the flaky suite case a_routed_run_logs_the_box_s_stamped_lines_and_its_process_lines_as_they_came — Urgent · Remote
 - [ ] GATE-878 Show builder-side slot holders on ops-tower through a PC cache of the builder's slots — High · Remote
-- [/] GATE-893 Cache a builder's held slots on the PC for ops-tower from the box slots line (GATE-878 B) — High · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
 - [/] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
-- [ ] GATE-745 Bring back the files a routed dotnet command's /flp and /getResultOutputFile switches name — High · Remote
 - [ ] GATE-751 Make a routed build's outputs pull fast enough for yaat's trees, or skip it for verdict-only runs — High · Remote
 - [ ] GATE-753 Log every step of a run in the gate's log: start, progress, end and duration — High · Remote
 - [ ] GATE-759 Move the rest of the box's shared wire rules into gate-wire (GATE-616 slices 2, 3, 5, 6) — High · Remote
-- [ ] GATE-838 Find what keeps godot-mcp's itest build --local after GATE-557, and remove it — High · Remote
 - [ ] GATE-839 Route race-anywhere's Unreal editor and game runs: a desktop route with a GPU — High · Remote
-- [ ] GATE-840 Route towercab-3d's vite build with dist/ brought back as outputs — High · Remote
 - [ ] GATE-841 Route yaat's output-writing tools and probe tests: .tmp outputs and passing tests' output — High · Remote
-- [ ] GATE-842 Route yaat's golden-file regeneration: an env-prefixed command and its golden outputs — High · Remote
 - [ ] GATE-843 Keep the routing facts a census needs past the journal's roll — High · Remote
 - [ ] GATE-844 Serve godot-mcp's parallel itest lanes on the builder desktop, and match any --filter-class — High · Remote
-- [!] GATE-864 Opt yaat in to cross builds on the Mac and run its trial (GATE-696 step C) — High · Remote
 - [ ] GATE-876 Carry the input put, the sent build and the LFS put on the data channel — High · Remote
-- [ ] GATE-900 Sync back every file a routed multi-file formatter run rewrites — High · Remote
-- [ ] GATE-901 Make a routed cargo run rebuild after a change the snapshot carries — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
@@ -272,7 +263,6 @@
 - [ ] GATE-784 Fall back when a tcsh or csh login shell finds no gate box (status 1)
 - [ ] GATE-785 Say every Unix box protocol line through one standard-error call
 - [ ] GATE-793 Stamp the work lock and take it in the preflight on the Unix box, as the Windows box does
-- [ ] GATE-795 Find why a routed cargo clippy on the Mac passed without checking a changed file
 - [ ] GATE-796 Check for a gone client while the Windows box preflight waits for a bare lock
 - [ ] GATE-797 Drop the installing manager's own record line before a Windows box package install
 - [ ] GATE-808 Skip the gitignored-input check-ignore call for tracked candidates
@@ -316,6 +306,9 @@
 - [ ] GATE-896 Name only the withheld bin folders stale after a Mac run whose bins were withheld
 - [ ] GATE-897 Make both boxes' slots look agree on links at slots and on read errors, and share its helpers
 - [ ] GATE-899 Report a job member that reuses a pid an assignment marked, after a lost join message
+- [ ] GATE-902 Say when a routed run's command changed no file, instead of printing no sync-back line
+- [ ] GATE-904 Read more MSBuild file-writing switches and binlog forms for a routed run's outputs
+- [ ] GATE-905 Measure and polish the refusal of a routed run whose log is in another worktree
 
 ## Cutover sweep
 
