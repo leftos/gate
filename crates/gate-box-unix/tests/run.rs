@@ -1187,7 +1187,7 @@ mod unix {
         let texts = ended.err_texts();
         let start = format!("gate: cross build for win-x64: /bin/sh -c {cross}");
         let at = texts.iter().position(|said| *said == start.as_str());
-        let after = texts.iter().position(|said| then(*said));
+        let after = texts.iter().position(|said| then(said));
         assert!(
             matches!((at, after), (Some(at), Some(after)) if at < after),
             "{start} before {what}: {:?}",
@@ -2393,5 +2393,478 @@ mod unix {
             ended.out
         );
         assert!(!work.exists() && !leftover.exists(), "the sweep removes both");
+    }
+
+    /// Writes the root `root`'s count file, giving it `slots` builder slots.
+    fn counted(root: &str, slots: u32) {
+        fs::write(format!("{root}/slots.json"), json!({ "v": 1, "slots": slots }).to_string()).expect("the count file is written");
+    }
+
+    /// The JSON of slot `n`'s claim under the root `root`; `None` when it has none.
+    fn claim(root: &str, n: usize) -> Option<Value> {
+        let text = fs::read_to_string(format!("{root}/slots/{n}.json")).ok()?;
+        Some(serde_json::from_str(&text).expect("a claim is JSON"))
+    }
+
+    /// The session slot `n`'s claim under the root `root` names.
+    fn claimed_by(root: &str, n: usize) -> Option<String> {
+        claim(root, n).and_then(|claim| claim["session"].as_str().map(str::to_owned))
+    }
+
+    /// The lines a call of the nonce `nonce` (`hold` for a hold) refused by a builder whose `slots` slots are all held
+    /// says, a preflight's after its version line.
+    fn full_lines(nonce: &str, slots: u32) -> [String; 2] {
+        [
+            refused_line(nonce, Refusal::Full),
+            format!("gate: remote builder is full: {slots} of {slots} slots held"),
+        ]
+    }
+
+    /// The key of a second work folder, never made by a case.
+    const OTHER_KEY: &str = "other-0123abcd";
+
+    /// The payload keys of a call of the session `id` for the work folder [`OTHER_KEY`] of the bare repository
+    /// `<root>/other.git`, neither of them made.
+    fn other_keys(case: &Case, id: &str) -> Value {
+        let (root, work) = (case.root(), format!("{}/work/{OTHER_KEY}", case.root()));
+        json!({
+            "Session": id,
+            "Pc": "pc1",
+            "Repo": "other",
+            "Key": OTHER_KEY,
+            "Bare": format!("{root}/other.git"),
+            "Work": work,
+            "Lock": format!("{work}.lock"),
+            "Index": format!("{work}.index"),
+            "Job": format!("gate-remote-{OTHER_KEY}-0123456789ab"),
+        })
+    }
+
+    /// The run of the session `id` checking out `commit`, at [`DRAIN_NOW`], read to its end.
+    fn session_ran(case: &Case, commit: &str, id: &str) -> Ended {
+        let now = DRAIN_NOW.to_string();
+        ran(
+            &["--test-box-now", &now],
+            &case.request(commit, &session_keys(id)),
+            Reading::All,
+            &case.base.join("beaten"),
+        )
+    }
+
+    #[test]
+    fn a_full_builder_refuses_a_second_session_s_preflight_until_the_first_run_ends() {
+        let case = Case::new("slots-full");
+        let commit = case.snapshot();
+        let root = case.root();
+        counted(&root, 1);
+
+        let first = preflighted(&case, &session_keys("s1"));
+        let held = claim(&root, 0);
+        let refused = preflighted(&case, &other_keys(&case, "s2"));
+        let made_work = Path::new(&format!("{root}/work/{OTHER_KEY}")).exists();
+        let made_bare = Path::new(&format!("{root}/other.git")).exists();
+        let run = session_ran(&case, &commit, "s1");
+        let after_run = claim(&root, 0);
+        let second = preflighted(&case, &other_keys(&case, "s2"));
+
+        assert_eq!(first.status, Some(0), "{:?}", first.err);
+        let held = held.expect("the first session holds slot 0");
+        assert_eq!(held["kind"], json!("session"), "{held}");
+        assert_eq!(held["session"], json!("s1"), "{held}");
+        assert_eq!(held["pc"], json!("pc1"), "{held}");
+        assert_eq!(refused.status, Some(75), "{:?}", refused.err);
+        assert_eq!(refused.out.len(), 1, "only the version line: {:?}", refused.out);
+        assert!(refused.out[0].starts_with("gate: remote version "), "{:?}", refused.out);
+        assert_eq!(refused.err, full_lines(NONCE, 1));
+        assert!(!made_work, "a refused preflight makes no work folder");
+        assert!(!made_bare, "nor a bare repository");
+        assert_eq!(run.status, Some(0), "the run keeps its preflight's slot: {:?}", run.err);
+        assert_eq!(after_run, None, "the run's end lets its slot go");
+        assert_eq!(second.status, Some(0), "{:?}", second.err);
+        assert_eq!(claimed_by(&root, 0).as_deref(), Some("s2"));
+    }
+
+    #[test]
+    fn a_session_s_second_preflight_keeps_its_slot_and_takes_no_second() {
+        let case = Case::new("slots-kept");
+        let root = case.root();
+        counted(&root, 2);
+
+        let first = preflighted(&case, &session_keys("s1"));
+        let again = preflighted(&case, &session_keys("s1"));
+        let after_again = claim(&root, 1);
+        let other = preflighted(&case, &other_keys(&case, "s2"));
+
+        assert_eq!(first.status, Some(0), "{:?}", first.err);
+        assert_eq!(again.status, Some(0), "{:?}", again.err);
+        assert_eq!(after_again, None, "the second preflight takes no slot");
+        assert_eq!(other.status, Some(0), "a second session finds slot 1 free: {:?}", other.err);
+        assert_eq!(claimed_by(&root, 0).as_deref(), Some("s1"));
+        assert_eq!(claimed_by(&root, 1).as_deref(), Some("s2"));
+    }
+
+    #[test]
+    fn a_preflight_that_fails_after_its_slot_take_leaves_no_claim() {
+        let case = Case::new("slots-failed-preflight");
+        let root = case.root();
+        counted(&root, 1);
+        // A `.git` folder holding nothing is no repository, so the preflight's first git step in it fails.
+        std::os::unix::fs::DirBuilderExt::mode(fs::DirBuilder::new().recursive(true), 0o700)
+            .create(format!("{}/.git", case.work()))
+            .expect("an empty .git folder is made");
+
+        let failed = preflighted(&case, &session_keys("s1"));
+
+        assert!(failed.status.is_some_and(|status| status != 0 && status != 75), "{:?}", failed.err);
+        assert!(
+            failed.err.last().is_some_and(|line| line.starts_with("gate: remote git ")),
+            "the git step's line: {:?}",
+            failed.err
+        );
+        assert_eq!(claim(&root, 0), None, "the failed preflight's slot is let go");
+        assert!(!failed.err.iter().any(|line| line.contains("slot release failed")), "{:?}", failed.err);
+    }
+
+    #[test]
+    fn with_no_count_file_a_preflight_and_its_run_take_no_slot() {
+        let case = Case::new("slots-uncounted");
+        let commit = case.snapshot();
+        let root = case.root();
+
+        let preflight = preflighted(&case, &session_keys("s1"));
+        let run = session_ran(&case, &commit, "s1");
+
+        assert_eq!(preflight.status, Some(0), "{:?}", preflight.err);
+        assert_eq!(run.status, Some(0), "{:?}", run.err);
+        assert!(!Path::new(&format!("{root}/slots")).exists(), "no slot folder is made");
+    }
+
+    #[test]
+    fn an_unparsable_count_file_is_said_and_takes_no_slot() {
+        let case = Case::new("slots-unparsable");
+        let root = case.root();
+        fs::write(format!("{root}/slots.json"), "not a count").expect("the count file is written");
+
+        let first = preflighted(&case, &session_keys("s1"));
+        let other = preflighted(&case, &other_keys(&case, "s2"));
+
+        for ended in [&first, &other] {
+            assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+            assert_eq!(ended.err.len(), 1, "{:?}", ended.err);
+            assert!(
+                ended.err[0].starts_with("gate box: the builder's slot count cannot be read, so it takes no slot: ")
+                    && ended.err[0].contains("slots.json: it is not JSON"),
+                "{:?}",
+                ended.err
+            );
+        }
+        assert!(!Path::new(&format!("{root}/slots")).exists(), "no slot folder is made");
+    }
+
+    #[test]
+    fn a_second_run_call_of_a_session_refused_busy_keeps_the_live_run_s_claim() {
+        let case = Case::new("slots-busy");
+        let commit = case.snapshot();
+        let root = case.root();
+        counted(&root, 1);
+        let first = preflighted(&case, &session_keys("s1"));
+        assert_eq!(first.status, Some(0), "{:?}", first.err);
+        let (started, go) = (case.base.join("started"), case.base.join("go"));
+        let mut keys = session_keys("s1");
+        keys["Command"] = json!(["/bin/sh", "-c", waits_for_go(&started, &go)]);
+        let request = case.request(&commit, &keys);
+        let beaten = case.base.join("beaten");
+        let now = DRAIN_NOW.to_string();
+        let live = thread::spawn(move || ran(&["--test-box-now", &now], &request, Reading::All, &beaten));
+        waited_for("the live run's command", || started.exists() || live.is_finished());
+        assert!(started.exists(), "the live run's command started");
+
+        let second = session_ran(&case, &commit, "s1");
+        let while_live = claim(&root, 0);
+        fs::write(&go, "").expect("the go marker is made");
+        let ended = live.join().expect("the live run's reader ends");
+
+        assert_eq!(second.status, Some(75), "{:?}", second.err);
+        let tag = second.err.iter().position(|line| *line == refused_line(NONCE, Refusal::Busy));
+        assert!(
+            tag.is_some_and(|tag| second.err_texts().get(tag + 1) == Some(&busy_line(KEY).as_str())),
+            "the busy tag, then the busy line: {:?}",
+            second.err
+        );
+        assert_eq!(
+            while_live.as_ref().and_then(|claim| claim["session"].as_str()),
+            Some("s1"),
+            "the live run's claim is still there: {while_live:?}"
+        );
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(claim(&root, 0), None, "the live run's end lets the slot go");
+    }
+
+    /// The holder text of every hold of the suite.
+    const HOLDER: &str = "github-actions repo ci/test run 7";
+
+    /// The usual options of a hold: the suite's holder and a ceiling of 600 s.
+    const HOLD_OPTIONS: [&str; 4] = ["--holder", HOLDER, "--ceiling", "600"];
+
+    /// `gate-box box --test-box-now <DRAIN_NOW> <seams> hold --root <root> <options> -- <command>`, not started, its
+    /// stdin `/dev/null` and its output piped.
+    fn hold_command(root: &str, seams: &[&str], options: &[&str], command: &[&str]) -> Command {
+        let now = DRAIN_NOW.to_string();
+        let mut words = vec!["box", "--test-box-now", &now];
+        words.extend_from_slice(seams);
+        words.extend_from_slice(&["hold", "--root", root]);
+        words.extend_from_slice(options);
+        words.push("--");
+        words.extend_from_slice(command);
+        let mut hold = Command::new(env!("CARGO_BIN_EXE_gate-box"));
+        hold.args(&words).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        hold
+    }
+
+    /// The hold `command` run to its end.
+    fn held(mut command: Command) -> Ended {
+        ended_of(&command.output().expect("gate-box runs"))
+    }
+
+    /// A command that makes `started`, then waits until `go` is made.
+    fn waits_for_go(started: &Path, go: &Path) -> String {
+        format!(": > '{}'; while [ ! -e '{}' ]; do sleep 0.05; done", started.display(), go.display())
+    }
+
+    /// Waits until `done`, failing as hung after 120 s, a hang guard only.
+    fn waited_for(what: &str, done: impl Fn() -> bool) {
+        let guard = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !done() && std::time::Instant::now() < guard {
+            thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(done(), "hung waiting for {what}");
+    }
+
+    /// Whether slot 0's claim under the root `root` is a hold's.
+    fn hold_claims(root: &str) -> bool {
+        claim(root, 0).is_some_and(|claim| claim["kind"] == json!("hold"))
+    }
+
+    /// An argv word unique to the case `name` of this test process, which every lasting process of its command carries.
+    fn marker(name: &str) -> String {
+        format!("gate-hold-mark-{}-{name}", std::process::id())
+    }
+
+    /// The script of a command run as `/bin/sh -c <script> <marker>`: a shell carrying `marker` started in the
+    /// background, looping until it is killed, then `then`.
+    fn marked_script(marker: &str, then: &str) -> String {
+        format!("/bin/sh -c 'while :; do sleep 0.05; done' {marker} & {then}")
+    }
+
+    /// Whether a process whose command line holds `marker` runs (`pgrep -f`).
+    fn marked_running(marker: &str) -> bool {
+        Command::new("/usr/bin/pgrep")
+            .args(["-f", marker])
+            .stdout(Stdio::null())
+            .status()
+            .expect("pgrep runs")
+            .success()
+    }
+
+    /// Kills every process whose command line holds its marker when dropped, so a case that fails leaves none behind.
+    struct Marked(String);
+
+    impl Drop for Marked {
+        fn drop(&mut self) {
+            // Best effort: none is left when the case passed.
+            let _ = Command::new("/usr/bin/pkill").args(["-9", "-f", &self.0]).status();
+        }
+    }
+
+    /// [`hold_command`] of the command `/bin/sh -c <script> <marker>`, its stdout and stderr `/dev/null`, so a process
+    /// left holding them never keeps the case waiting for their end.
+    fn marked_hold(root: &str, options: &[&str], script: &str, marker: &str) -> Command {
+        let mut hold = hold_command(root, &[], options, &["/bin/sh", "-c", script, marker]);
+        hold.stdout(Stdio::null()).stderr(Stdio::null());
+        hold
+    }
+
+    #[test]
+    fn a_hold_runs_its_command_holding_its_claim_and_exits_with_its_status() {
+        let case = Case::new("hold-runs");
+        let root = case.root();
+        counted(&root, 1);
+        let seen = case.base.join("seen.json");
+        let script = format!("cat '{root}/slots/0.json' > '{}'; echo held; echo oops >&2; exit 3", seen.display());
+
+        let ended = held(hold_command(&root, &[], &HOLD_OPTIONS, &["/bin/sh", "-c", &script]));
+
+        assert_eq!(ended.status, Some(3), "{:?}", ended.err);
+        assert_eq!(ended.out, ["held"]);
+        assert_eq!(ended.err, ["oops"]);
+        let seen: Value = serde_json::from_str(&fs::read_to_string(&seen).expect("the command read the claim")).expect("a claim is JSON");
+        assert_eq!(seen["kind"], json!("hold"), "{seen}");
+        assert_eq!(seen["holder"], json!(HOLDER), "{seen}");
+        assert_eq!(seen["ceiling"], json!(600), "{seen}");
+        assert!(seen["pid"].as_u64().is_some_and(|pid| pid > 0), "{seen}");
+        assert_eq!(claim(&root, 0), None, "the hold's claim goes with it");
+        assert!(!Path::new(&format!("{root}/slots/0.lock")).exists(), "and its lock");
+    }
+
+    #[test]
+    fn a_hold_on_a_full_builder_refuses_at_once_and_with_a_wait_takes_the_slot_once_its_holder_ends() {
+        let case = Case::new("hold-full");
+        let root = case.root();
+        counted(&root, 1);
+        let (started, go) = (case.base.join("started"), case.base.join("go"));
+        let first = hold_command(&root, &[], &HOLD_OPTIONS, &["/bin/sh", "-c", &waits_for_go(&started, &go)]);
+        let first = thread::spawn(move || held(first));
+        waited_for("the first hold's command", || started.exists());
+        let poll = ["--test-box-hold-poll-ms", "50"];
+        let long = [&HOLD_OPTIONS[..], &["--wait", "600"]].concat();
+
+        let gave_up = held(hold_command(&root, &poll, &HOLD_OPTIONS, &["/bin/echo", "never"]));
+        let mut waiting = hold_command(&root, &poll, &long, &["/bin/echo", "took"])
+            .spawn()
+            .expect("gate-box starts");
+        let mut err = BufReader::new(waiting.stderr.take().expect("stderr is piped"));
+        let mut first_line = String::new();
+        err.read_line(&mut first_line).expect("the waiting hold says a line");
+        fs::write(&go, "").expect("the go marker is made");
+        let first = first.join().expect("the first hold's reader ends");
+        let mut rest = String::new();
+        err.read_to_string(&mut rest).expect("the waiting hold's stderr is read");
+        let took = waiting.wait_with_output().expect("the waiting hold is waited for");
+
+        assert_eq!(gave_up.status, Some(75), "{:?}", gave_up.err);
+        assert!(gave_up.out.is_empty(), "the command never ran: {:?}", gave_up.out);
+        assert_eq!(gave_up.err, full_lines("hold", 1), "no wait refuses at once");
+        assert_eq!(first_line, "gate: waiting for a builder slot: 1 of 1 held\n");
+        assert_eq!(first.status, Some(0), "{:?}", first.err);
+        assert_eq!(took.status.code(), Some(0), "{rest}");
+        assert_eq!(String::from_utf8_lossy(&took.stdout), "took\n", "{rest}");
+        assert_eq!(claim(&root, 0), None, "the slot is let go");
+    }
+
+    #[test]
+    fn a_hold_past_its_ceiling_ends_its_command_s_group_and_exits_124() {
+        let case = Case::new("hold-ceiling");
+        let root = case.root();
+        counted(&root, 1);
+        let mark = marker("ceiling");
+        let _marked = Marked(mark.clone());
+        // The background shell is of the command's group, and outlives its parent unless the group is ended. Nothing
+        // here needs the shell to get anywhere before the ceiling: a shell ended sooner leaves no process all the same.
+        let script = marked_script(&mark, "wait");
+
+        let ended = held(hold_command(
+            &root,
+            &[],
+            &["--holder", HOLDER, "--ceiling", "1"],
+            &["/bin/sh", "-c", &script, &mark],
+        ));
+
+        assert_eq!(ended.status, Some(124), "{:?}", ended.err);
+        assert_eq!(
+            ended.err.last().map(String::as_str),
+            Some("gate: hold ended at its ceiling of 1 s"),
+            "{:?}",
+            ended.err
+        );
+        waited_for("no process of the command", || !marked_running(&mark));
+        assert_eq!(claim(&root, 0), None, "the slot is let go");
+    }
+
+    #[test]
+    fn a_hold_sent_sigterm_ends_its_command_s_group_and_exits_143() {
+        let case = Case::new("hold-sigterm");
+        let root = case.root();
+        counted(&root, 1);
+        let mark = marker("sigterm");
+        let _marked = Marked(mark.clone());
+        let started = case.base.join("started");
+        let script = marked_script(&mark, &format!(": > '{}'; wait", started.display()));
+        let mut hold = marked_hold(&root, &HOLD_OPTIONS, &script, &mark).spawn().expect("gate-box starts");
+        waited_for("the hold's command", || started.exists());
+        let pid = libc::pid_t::try_from(hold.id()).expect("a pid is a pid_t");
+
+        // SAFETY: `kill` takes two integers and touches no memory; `pid` is the hold, not yet waited for.
+        let sent = unsafe { libc::kill(pid, libc::SIGTERM) };
+        let ended = hold.wait().expect("the hold is waited for");
+
+        assert_eq!(sent, 0, "the hold is sent SIGTERM");
+        assert_eq!(ended.code(), Some(143), "{ended:?}");
+        waited_for("no process of the command", || !marked_running(&mark));
+        assert_eq!(claim(&root, 0), None, "the slot is let go");
+    }
+
+    #[test]
+    fn a_hold_whose_command_s_leader_ends_ends_its_leftovers_and_exits_with_the_leader_s_status() {
+        let case = Case::new("hold-leftovers");
+        let root = case.root();
+        counted(&root, 1);
+        let mark = marker("leftovers");
+        let _marked = Marked(mark.clone());
+
+        let ended = marked_hold(&root, &HOLD_OPTIONS, &marked_script(&mark, "exit 5"), &mark)
+            .status()
+            .expect("the hold runs");
+
+        assert_eq!(ended.code(), Some(5), "{ended:?}");
+        waited_for("no process of the command", || !marked_running(&mark));
+        assert_eq!(claim(&root, 0), None, "the slot is let go");
+    }
+
+    #[test]
+    fn a_killed_hold_leaves_a_claim_the_next_taker_reclaims() {
+        let case = Case::new("hold-killed");
+        let root = case.root();
+        counted(&root, 1);
+        let (started, go) = (case.base.join("started"), case.base.join("go"));
+        let mut hold = hold_command(&root, &[], &HOLD_OPTIONS, &["/bin/sh", "-c", &waits_for_go(&started, &go)])
+            .spawn()
+            .expect("gate-box starts");
+        waited_for("the hold's command", || started.exists());
+        let holding = hold_claims(&root);
+
+        hold.kill().expect("the hold is killed");
+        let killed = hold.wait().expect("the killed hold is waited for");
+        let left = hold_claims(&root);
+        let next = preflighted(&case, &session_keys("s1"));
+        // The killed hold's command is in a group of its own, and runs on until it is let go.
+        fs::write(&go, "").expect("the go marker is made");
+
+        assert!(holding, "the hold claimed slot 0");
+        assert_eq!(killed.code(), None, "{killed:?}");
+        assert!(left, "the killed hold's claim is left behind");
+        assert_eq!(next.status, Some(0), "the killed hold's slot is free: {:?}", next.err);
+        assert_eq!(claimed_by(&root, 0).as_deref(), Some("s1"));
+        assert!(!Path::new(&format!("{root}/slots/0.lock")).exists(), "the dead lock is removed");
+    }
+
+    #[test]
+    fn a_hold_on_a_builder_with_no_count_file_exits_2_with_its_line() {
+        let case = Case::new("hold-uncounted");
+        let root = case.root();
+
+        let ended = held(hold_command(&root, &[], &HOLD_OPTIONS, &["/bin/echo", "never"]));
+
+        assert_eq!(ended.status, Some(2), "{:?}", ended.err);
+        assert!(ended.out.is_empty(), "{:?}", ended.out);
+        assert_eq!(ended.err, ["gate box: this builder has no slot count; run gate push"]);
+    }
+
+    #[test]
+    fn a_holder_with_a_control_character_is_a_usage_error() {
+        let case = Case::new("hold-holder");
+        let root = case.root();
+        counted(&root, 1);
+
+        let ended = held(hold_command(
+            &root,
+            &[],
+            &["--holder", "ci\u{1b}[2J", "--ceiling", "60"],
+            &["/bin/echo", "never"],
+        ));
+
+        assert_eq!(ended.status, Some(2), "{:?}", ended.err);
+        assert!(ended.out.is_empty(), "{:?}", ended.out);
+        assert_eq!(ended.err, [r"gate box: the holder 'ci\u{1b}[2J' holds a control character"]);
+        assert!(!Path::new(&format!("{root}/slots")).exists(), "no slot is taken");
     }
 }

@@ -255,7 +255,7 @@ fn moved_aside(drain: &Path, planted: Identity) -> Result<Option<String>, String
 
 /// The drain lock `path`, taken as the work lock is ([`files::take_lock`]); a lock another open holds is tried again
 /// every [`LOCK_STEP`] until `retry` has passed, [`LOCK_RETRY`] for every call but a test's. Else why not.
-fn take_drain_lock(path: &Path, retry: Duration) -> Result<HeldLock, String> {
+pub(crate) fn take_drain_lock(path: &Path, retry: Duration) -> Result<HeldLock, String> {
     let begun = Instant::now();
     loop {
         match files::take_lock(path) {
@@ -271,8 +271,8 @@ fn take_drain_lock(path: &Path, retry: Duration) -> Result<HeldLock, String> {
     }
 }
 
-/// Why the drain could not `what` the file or folder `path`.
-fn cannot(what: &str, path: &Path, error: &io::Error) -> String {
+/// Why the box could not `what` the file or folder `path`.
+pub(crate) fn cannot(what: &str, path: &Path, error: &io::Error) -> String {
     format!("cannot {what} {}: {}", escaped(&path.to_string_lossy()), escaped(&error.to_string()))
 }
 
@@ -746,7 +746,7 @@ fn holder_of(name: &str) -> Option<&str> {
 
 /// Whether the holder `path` is held by a live process: another open holds its `flock`. One whose `flock` this probe
 /// takes is dead and is removed. Else why it could not be looked at.
-fn holder_live(path: &Path) -> Result<bool, String> {
+pub(crate) fn holder_live(path: &Path) -> Result<bool, String> {
     match files::take_lock(path) {
         Ok(Locked::Busy) => Ok(true),
         Ok(Locked::Held(probe)) => {
@@ -765,6 +765,32 @@ pub(crate) struct Session<'p> {
     pub(crate) repo: &'p str,
     pub(crate) command: &'p str,
     pub(crate) job: &'p str,
+}
+
+/// Runs `under` in one hold of the drain lock under the work root `root`, `drain/` readied as an admission readies it,
+/// giving it the judge of whether a session is live for a call of its own ([`State::own_session_live`]): the one lock
+/// every take and judge of the builder's own slots runs under. Else why the drain could not be read or written, or
+/// `under`'s own error.
+pub(crate) fn under_drain_lock<T>(
+    root: &Path,
+    seams: &BoxSeams,
+    console: &mut Console,
+    under: impl FnOnce(&dyn Fn(&str) -> Result<bool, String>) -> Result<T, String>,
+) -> Result<T, String> {
+    let drain = root.join(DRAIN);
+    ready_drain(&drain, console)?;
+    let _lock = take_drain_lock(&drain.join(LOCK), LOCK_RETRY)?;
+    let state = State {
+        drain: &drain,
+        clock: Clock::of(seams),
+    };
+    under(&|id| state.own_session_live(id))
+}
+
+/// The folder `folder`, readied as one of the drain's own: made at mode 0700 when missing, and refused unless it is the
+/// box user's own folder at mode 0700, a link never followed ([`readied_folder`]). Else why not.
+pub(crate) fn private_folder(folder: &Path) -> Result<(), String> {
+    readied_folder(folder, &mut |_, _| {})
 }
 
 /// The drain session `payload` names (`Session`, `Pc`, `Repo`, the last two empty when absent) for a call of `command`
@@ -942,7 +968,7 @@ pub(crate) fn admission_of(admission: Result<Result<Admitted, Refused>, String>)
 
 /// Whether the work root `root` is there to hold a drain: false when nothing is at its name. Else why not: a link or
 /// anything but a folder there.
-fn root_there(root: &Path) -> Result<bool, String> {
+pub(crate) fn root_there(root: &Path) -> Result<bool, String> {
     if !files::exists(root) {
         return Ok(false);
     }
@@ -1036,7 +1062,7 @@ pub(crate) fn renewed_at(work: &str, session: Option<&str>, seams: &BoxSeams, co
 
 /// The text of the plain file `path` and the Unix second of its last write ([`files::read_plain_dated`]); `None` when
 /// nothing has the name. Else why it could not be read, a link or anything but a plain file included.
-fn read_text(path: &Path) -> Result<Option<(String, u64)>, String> {
+pub(crate) fn read_text(path: &Path) -> Result<Option<(String, u64)>, String> {
     match files::read_plain_dated(path, RECORD_LIMIT) {
         Ok((bytes, written)) => Ok(Some((String::from_utf8_lossy(&bytes).into_owned(), unix_s(written)))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -1045,12 +1071,12 @@ fn read_text(path: &Path) -> Result<Option<(String, u64)>, String> {
 }
 
 /// Removes the file `path`; a missing one is fine. Else why not.
-fn removed(path: &Path) -> Result<(), String> {
+pub(crate) fn removed(path: &Path) -> Result<(), String> {
     files::remove_if_there(path).map_err(|error| cannot("remove", path, &error))
 }
 
 /// The names in the folder `folder` that are UTF-8, in no order. Else why it could not be listed.
-fn names_in(folder: &Path) -> Result<Vec<String>, String> {
+pub(crate) fn names_in(folder: &Path) -> Result<Vec<String>, String> {
     let entries = fs::read_dir(folder).map_err(|error| cannot("list", folder, &error))?;
     let mut names = Vec::new();
     for entry in entries {

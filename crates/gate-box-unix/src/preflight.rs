@@ -19,7 +19,7 @@ use crate::lines::{
     work_layout, write_failure,
 };
 use crate::stop::open_folder_line;
-use crate::{boot, drain, files, probe, process, run};
+use crate::{boot, drain, files, probe, process, run, slots};
 
 /// The most bytes of the warm record read: one past a hash, so a longer record is seen as not one.
 const WARM_READ_LIMIT: u64 = 65;
@@ -87,6 +87,15 @@ pub fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> 
             return unpassed.said(payload, console);
         }
     };
+    // Before anything else is done for the run, so a builder whose own slots are all held refuses it with nothing made.
+    let claimed = match slots::taken(Path::new(&root), session.as_ref(), payload, seams, console) {
+        Ok(claimed) => claimed,
+        Err(status) => return status,
+    };
+    // Made only when the session holds a claim, and dropped at every failing end of the preflight, before its
+    // admission and so while its session is held: the slot it took is let go as a run's end lets it go. Kept once the
+    // preflight passes.
+    let slot = claimed.then(|| slots::Release::at_end(Path::new(&root), payload));
     // Read before the tree is readied, which would make a missing `.git`, and so a stale record, look current. A
     // record naming another layout than the run's, a pair's first run having none, has the run clear the whole folder
     // and lay its trees out again.
@@ -117,6 +126,9 @@ pub fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> 
     }
     boot::say(console);
     say_sdks_and_tools(payload, console);
+    if let Some(slot) = slot {
+        slot.kept();
+    }
     0
 }
 

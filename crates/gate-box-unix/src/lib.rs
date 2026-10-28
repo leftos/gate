@@ -51,6 +51,8 @@ pub mod prune;
 #[cfg(unix)]
 pub mod run;
 #[cfg(unix)]
+mod slots;
+#[cfg(unix)]
 pub mod stop;
 #[cfg(unix)]
 mod tools;

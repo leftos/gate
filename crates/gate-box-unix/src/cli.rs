@@ -37,12 +37,16 @@ pub fn action(args: Vec<OsString>) -> Action {
 #[must_use]
 pub fn unbuilt(verb: BoxVerb) -> Option<String> {
     match verb {
-        BoxVerb::Preflight | BoxVerb::Boot | BoxVerb::Stop | BoxVerb::Run | BoxVerb::Prune | BoxVerb::Inputs | BoxVerb::Outputs | BoxVerb::Drain => {
-            None
-        }
-        BoxVerb::Inflight | BoxVerb::Lfs | BoxVerb::RegisterDesktop | BoxVerb::Hold => {
-            Some(format!("gate: box {} is not built on this builder", verb.as_str()))
-        }
+        BoxVerb::Preflight
+        | BoxVerb::Boot
+        | BoxVerb::Stop
+        | BoxVerb::Run
+        | BoxVerb::Prune
+        | BoxVerb::Inputs
+        | BoxVerb::Outputs
+        | BoxVerb::Drain
+        | BoxVerb::Hold => None,
+        BoxVerb::Inflight | BoxVerb::Lfs | BoxVerb::RegisterDesktop => Some(format!("gate: box {} is not built on this builder", verb.as_str())),
     }
 }
 
@@ -74,8 +78,8 @@ pub fn main(args: Vec<OsString>) -> std::process::ExitCode {
     std::process::ExitCode::from(answer(action(args), &mut console))
 }
 
-/// Answers `action` through `console`, reading a verb's request from stdin, but `prune`'s, which reads none; the
-/// status.
+/// Answers `action` through `console`, reading a verb's request from stdin, but `prune`'s and `hold`'s, which read
+/// none; the status.
 #[cfg(unix)]
 fn answer(action: Action, console: &mut crate::console::Console) -> u8 {
     let request = match action {
@@ -104,6 +108,10 @@ fn answer(action: Action, console: &mut crate::console::Console) -> u8 {
             return crate::lines::USAGE_STATUS;
         };
         return crate::prune::prune(root, &request.keys, std::time::SystemTime::now(), &request.seams, console);
+    }
+    if verb == BoxVerb::Hold {
+        // Its words are all it takes; it reads no request, and its command gets no stdin (`/dev/null`).
+        return crate::slots::hold(&request, console);
     }
     let payload = match crate::request::read_request(std::io::stdin().lock()) {
         Ok(payload) => payload,

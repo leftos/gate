@@ -44,6 +44,7 @@ use crate::packages;
 use crate::preflight::{checked_root, layout_record};
 use crate::probe;
 use crate::process::{self, GroupRecord};
+use crate::slots::{self, Untaken};
 use crate::stop::{Record, own_group, record_current, records_folder, unusable_refusal};
 use crate::tools;
 
@@ -324,6 +325,11 @@ impl<'a> Laying<'a> {
 pub struct Ready<'p> {
     /// What the run read of its payload.
     pub request: Request<'p>,
+    /// The session's builder slot, let go once the run is done ([`slots::Release`]); `None` when it holds none.
+    /// Declared before [`Ready::lock`] and [`Ready::admitted`], so it is dropped first, an unwind's drop included: the
+    /// slot goes while the work lock and the session are still held, so no call of the session waiting on the lock
+    /// takes it while this run's claim is still to go.
+    pub(crate) slot: Option<slots::Release>,
     /// The work lock, held.
     pub lock: HeldLock,
     /// The folder the command runs in: the work folder, or its subfolder.
@@ -583,6 +589,8 @@ fn prepared<'p, S: LineSink + 'static>(
     })?;
     // Held until the run ends, its command and back commit done, so a drain counts the run as going.
     let admitted = admitted(payload, &request, &sources.drain.seams(), output)?;
+    // A session whose slot lapsed and was taken takes a free one, else the run is refused as its preflight would be.
+    let claimed = slot_taken(payload, &request, &sources.drain.seams(), output)?;
     let lock = match files::take_lock(Path::new(request.lock)) {
         Ok(Locked::Held(lock)) => lock,
         Ok(Locked::Busy) => return Err(refused(output, &request, Refusal::Busy, &busy_line(request.key))),
@@ -593,6 +601,10 @@ fn prepared<'p, S: LineSink + 'static>(
             });
         }
     };
+    // Made once the lock is held and only when the session holds a claim, so a second call of the session refused busy
+    // leaves the live run's slot alone, and dropped at every later end of the run, before its admission and so while
+    // its session is held: the session's builder slot is let go.
+    let slot = claimed.then(|| slots::Release::at_end(Path::new(&request.root), payload));
     match locked(&request, &lock, output, periods.heartbeat, sources) {
         Ok(Placed {
             place,
@@ -603,6 +615,7 @@ fn prepared<'p, S: LineSink + 'static>(
             outputs,
         }) => Ok(Ready {
             request,
+            slot,
             lock,
             place,
             pump,
@@ -770,13 +783,16 @@ fn run_reading<S: LineSink + 'static>(
         Err(status) => return status,
     };
     let status = commanded(&ready, output, watches);
-    let Ready { pump, lock, temp, .. } = ready;
+    let Ready { pump, lock, temp, slot, .. } = ready;
     if let Some(temp) = temp {
         temp_removed(temp, output);
     }
     if let Some(pump) = pump {
         heartbeat::stop(pump);
     }
+    // The slot goes while the work lock is still held, as the Windows box lets it go: a second call of the session
+    // that takes the lock next keeps a claim no end of this run removes.
+    drop(slot);
     drop(lock);
     status
 }
@@ -1211,6 +1227,28 @@ fn admitted<S: LineSink>(payload: &Payload, request: &Request<'_>, seams: &BoxSe
                 REFUSED_STATUS,
             )
         }
+    })
+}
+
+/// Holds the builder slot of the run of `request`, from `payload`, admitted as the session `payload` names
+/// ([`slots::run_taken`]), the drain's clock as `seams` set it: whether the session holds a claim. A line it said, a
+/// count file that cannot be read or a drain moved aside, is said stamped `gat`. Else the status the run ends on, its
+/// lines said: with every slot held the `full` tag and the full line, bare, and [`REFUSED_STATUS`]; a slot pool that
+/// could not be read or written fails the run as a drain that could not be, its back commits never made.
+fn slot_taken<S: LineSink>(payload: &Payload, request: &Request<'_>, seams: &BoxSeams, output: &Output<S>) -> Result<bool, u8> {
+    let command = request.command.join(" ");
+    let mut console = Console::captured();
+    let taken = slots::run_taken(&request.root, payload, (&command, request.job), seams, &mut console);
+    for line in &console.err {
+        // A note: the run goes on, and a client gone finds out at the next line.
+        let _ = output.say(Stream::Err, GAT, line);
+    }
+    taken.map_err(|untaken| match untaken {
+        Untaken::Full { held, count } => {
+            let [tag, full] = slots::full_lines(request.nonce, held, count);
+            said_as(output, &[(Stamp::Bare, &tag), (Stamp::Bare, &full)], REFUSED_STATUS)
+        }
+        Untaken::Failed(why) => back_commits_failed(output, request, said(output, &[&slots::failed_line(&why)], FAILED_STATUS)),
     })
 }
 

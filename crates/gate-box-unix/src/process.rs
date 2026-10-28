@@ -711,7 +711,7 @@ impl Group for Leader {
 
 /// Whether the child `pid` has exited, looked at with `waitid(P_PID, WEXITED | WNOWAIT | WNOHANG)`, which answers at
 /// once and leaves it unreaped.
-fn exit_seen(pid: i32) -> io::Result<bool> {
+pub(crate) fn exit_seen(pid: i32) -> io::Result<bool> {
     let id = libc::id_t::try_from(pid).map_err(io::Error::other)?;
     loop {
         // SAFETY: an all-zero `siginfo_t` is a valid value, which `waitid` fills when a child has changed state.
