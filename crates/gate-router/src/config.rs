@@ -1,4 +1,5 @@
-//! The routing file, `remote.json`, read from its text: the builder's `host`, the optional `hosts` (further builders,
+//! The routing file, `remote.json`, read from its text: the builder's `host` and its optional `data` (as a `builders`
+//! entry's), the optional `hosts` (further builders,
 //! which `gate push` reaches and routing neither reads nor refuses), the remote pool's `slots` (a whole
 //! number 1 to 16, 1 when missing), `repos` (each repo name's list of `-like` patterns for the commands that route) and
 //! the optional `outputs` (each repo name's globs for the files a routed run brings back), the optional `inputs` (each
@@ -173,6 +174,7 @@ impl Config {
         let outputs = read_table(&data, "outputs", false, "")?;
         let failure_outputs = read_table(&data, "failureOutputs", false, "")?;
         let inputs = read_table(&data, "inputs", false, "")?;
+        let host_data = read_data(&data, "")?;
         let entries = read_builder_entries(&data, &host)?;
         let (builders, hosts_problem) = match read_builders(&data, &host) {
             Ok(builders) => (builders, None),
@@ -187,7 +189,7 @@ impl Config {
                 root: None,
                 slots,
                 id: None,
-                data: None,
+                data: host_data,
             },
             entries,
             repos,
@@ -823,9 +825,10 @@ fn read_builder_entry(object: &Map<String, Value>, prefix: &str) -> Result<Build
     })
 }
 
-/// A `builders` entry's `data`, the builder's tailnet address in dotted IPv4 form; `None` when the key is missing. The
-/// unspecified address, the broadcast address and a multicast address, which no connection is made to, are refused.
-/// Its reasons start with `prefix` (`builders[0].`).
+/// The `data` of `host` (the top level) or of a `builders` entry, the builder's tailnet address in dotted IPv4 form;
+/// `None` when the key is missing. The unspecified address, the broadcast address and a multicast address, which no
+/// connection is made to, are refused. Its reasons start with `prefix` (empty at the top level, `builders[0].` for an
+/// entry).
 fn read_data(object: &Map<String, Value>, prefix: &str) -> Result<Option<std::net::Ipv4Addr>, String> {
     let address = match property(object, "data") {
         None => return Ok(None),

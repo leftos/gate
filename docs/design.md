@@ -1443,9 +1443,11 @@ Two rolls within one second collide on the archive name: the second archive fail
 
 ### remote.json
 
-`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos`, the optional `builders` and the optional per-repo `outputs`, `failureOutputs`, `inputs`, `siblings` and `desktop` and the optional `warmup`, `hooks`, `sendBuild` and `declarations`, read afresh by each routed gate and ignored as a whole with one line when unusable.
+`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos`, the optional `data`, the optional `builders` and the optional per-repo `outputs`, `failureOutputs`, `inputs`, `siblings` and `desktop` and the optional `warmup`, `hooks`, `sendBuild` and `declarations`, read afresh by each routed gate and ignored as a whole with one line when unusable.
 
 A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`).
+
+The optional top-level `data` is the `host` builder's tailnet IPv4 address, read exactly as a `builders` entry's `data` is below, with the reasons worded `data must be an IPv4 address` and `data must be a unicast IPv4 address`.
 
 The optional `hosts` is an array of strings naming further builders, which `gate push`, `gate check --builder` and `gate run --builder` reach; an unpinned routed run goes to `host` or a routed `builders` entry, never to a `hosts` entry. Each entry passes the checks `host` does, with the same reasons worded `hosts entries ...`.
 
@@ -1458,7 +1460,7 @@ The optional `builders` is an array of further builders that a routed run can go
 - `slots` is 1 to 16, default 1.
 - `data` is an optional string, the builder's tailnet IPv4 address in dotted form, the one address a [data channel](GLOSSARY.md) dials; a value that is not an IPv4 address makes the file unusable (`builders[N].data must be an IPv4 address`), and so does the unspecified address, the broadcast address or a multicast address (`builders[N].data must be a unicast IPv4 address`).
 
-  A builder with no `data`, `host` and every `hosts` entry send every byte over ssh, exactly as before. Only a `windows` entry's `data` is used: a `macos` entry with one still gets no channel.
+  A builder with no `data`, and every `hosts` entry, send every byte over ssh, exactly as before. Only a `windows` entry's `data` is used: a `macos` entry with one still gets no channel.
 - `routed` is an optional boolean, default `true`; a value that is not `true` or `false` makes the file unusable (`builders[N].routed must be true or false`). With `false` the entry is a not-routed builder: `repos` may be empty or missing and no unpinned run picks or tries it, while `gate push`, `gate check --builder` and `gate run --builder` reach it like any `builders` entry.
 - `repos`, `outputs` and `failureOutputs` are the entry's own, shaped like the top-level ones.
 
@@ -3024,7 +3026,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The archive and the pending marker are kept for the install. The call's stderr goes to the log only.
 
-    **Data channel** (`remote/channel.rs`; the box's half is the `outputs` verb's, [The box side](#the-box-side)). A `windows` builder whose entry names `data` ([remote.json](#remotejson)) has the pull carried on a [data channel](GLOSSARY.md) instead of the call's stdout, with the ssh call as the control.
+    **Data channel** (`remote/channel.rs`; the box's half is the `outputs` verb's, [The box side](#the-box-side)). A `windows` builder that names `data` (the top-level `host`'s own or an entry's, [remote.json](#remotejson)) has the pull carried on a [data channel](GLOSSARY.md) instead of the call's stdout, with the ssh call as the control.
 
     The outputs call's payload gains `Nonce`, drawn afresh for each attempt, and `Channel` (`Address` the builder's `data`, `Peer` this PC's own address toward it, found by a UDP connect to `data` that sends no packet, and `BoxProof` and `PcProof`, two 128-bit proofs drawn for the attempt from the same random source as the pipe names, as 32 lower-case hex digits each).
 

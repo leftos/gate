@@ -1031,6 +1031,43 @@ fn a_builders_entry_s_data_that_is_unspecified_broadcast_or_multicast_makes_the_
     }
 }
 
+/// The routing file whose `host` is `builder-1`, with `data` as the top-level key's JSON value, or no such key for `None`.
+fn host_data_file(data: Option<&str>) -> String {
+    let data = data.map_or_else(String::new, |data| format!(r#", "data": {data}"#));
+    format!(r#"{{"host": "builder-1", "slots": 2, "repos": {{"gate": ["x"]}}{data}}}"#)
+}
+
+#[test]
+fn a_top_level_data_is_the_host_s_tailnet_ipv4_address_and_none_without_the_key() {
+    let with = Config::parse(&host_data_file(Some(r#""100.64.0.5""#))).expect("usable");
+    let without = Config::parse(&host_data_file(None)).expect("usable");
+
+    assert_eq!(entry_builder(&with, "builder-1").data, Some(std::net::Ipv4Addr::new(100, 64, 0, 5)));
+    assert_eq!(entry_builder(&without, "builder-1").data, None, "no data key: no data channel");
+}
+
+#[test]
+fn a_top_level_data_that_is_no_ipv4_address_makes_the_whole_file_unusable() {
+    for data in [r#""nope""#, r#""100.64.0""#, "5", "null"] {
+        assert_eq!(
+            Config::parse(&host_data_file(Some(data))).map(|_| ()),
+            Err("data must be an IPv4 address".to_owned()),
+            "{data}"
+        );
+    }
+}
+
+#[test]
+fn a_top_level_data_that_is_unspecified_broadcast_or_multicast_makes_the_whole_file_unusable() {
+    for data in ["0.0.0.0", "255.255.255.255", "224.0.0.1"] {
+        assert_eq!(
+            Config::parse(&host_data_file(Some(&format!(r#""{data}""#)))).map(|_| ()),
+            Err("data must be a unicast IPv4 address".to_owned()),
+            "{data}"
+        );
+    }
+}
+
 /// The routing file with a macOS entry `mac-1` and a Windows entry `win-1`, each listing `g` and `h` with outputs for
 /// both, the macOS entry's `crossBuild` holding `mac_cross` and the Windows entry's none.
 fn cross_build_file(mac_cross: &str) -> Config {
