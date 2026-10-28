@@ -16,7 +16,9 @@ use gate_args::BoxSeams;
 use gate_inputs::failure::Caps;
 use gate_inputs::manifest::{Listing, Manifest};
 use gate_wire::drain::refused_lines;
-use gate_wire::{CrossBuild, PairSibling, PathForm, Payload, Refusal, bare_stem, busy_line, escaped, layout_line, refused_line, trees};
+use gate_wire::{
+    CROSS_STEP_START, CrossBuild, PairSibling, PathForm, Payload, Refusal, bare_stem, busy_line, escaped, layout_line, refused_line, trees,
+};
 
 use gate_watchdog::Pump;
 
@@ -894,6 +896,7 @@ fn cross_built<S: LineSink + 'static>(launch: &Launch<'_>, build: &CrossBuild, o
     if output.client_gone() {
         return Some(CLOSED_STATUS);
     }
+    noted(output, GAT, &cross_start_line(&build.rid, &build.words));
     let (cross_status, status) = match command::run_cross(launch, &build.words, output) {
         CrossEnd::Passed(took) => {
             noted(output, GAT, &cross::passed_line(&build.rid, took.as_secs_f64()));
@@ -906,6 +909,12 @@ fn cross_built<S: LineSink + 'static>(launch: &Launch<'_>, build: &CrossBuild, o
     };
     let not_brought = outputs::not_brought_back(cross::FAILED_REASON);
     Some(said(output, &[&cross::failed_line(&build.rid, cross_status), &not_brought], status))
+}
+
+/// The line the box says before it starts a cross build for `rid` with `words`, each word as it is run: the PC's
+/// failure scan counts no `out` or `err` line after it ([`gate_wire::is_cross_step_start`]).
+fn cross_start_line(rid: &str, words: &[String]) -> String {
+    format!("{CROSS_STEP_START}{rid}: {}", words.join(" "))
 }
 
 /// The status of the run `ready` once its outputs `asked`, a passing command's or a failed one's test reports, read

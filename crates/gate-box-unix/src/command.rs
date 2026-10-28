@@ -435,8 +435,9 @@ pub enum CrossEnd {
 /// Runs a passing command's cross build, `words`, as `launch` started the command: in its place, with its
 /// environment, its group written to `<work>.pgid` from the child so `box stop` ends it, its streams forwarded as the
 /// command's, ended `SIGTERM` first on a gone client; under a ceiling of its own of the payload's `Timeout`
-/// ([`Ceiling`]) and watched by the heartbeat while it runs. No start marker, interrupted-command record, kill tag or
-/// load-adjusted line is said or written for it: the run's are the command's.
+/// ([`Ceiling`]) and watched by the heartbeat while it runs. No interrupted-command record, kill tag or load-adjusted
+/// line is said or written for it: the run's are the command's. Its own start line is the caller's
+/// ([`gate_wire::CROSS_STEP_START`]), said before this is called.
 pub fn run_cross<S: LineSink + 'static>(launch: &Launch<'_>, words: &[String], output: &Arc<Output<S>>) -> CrossEnd {
     let Some((program, rest)) = words.split_first() else {
         return CrossEnd::Ended(command_status(CommandEnd::NotStarted));

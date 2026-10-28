@@ -1181,6 +1181,20 @@ mod unix {
     const CROSS_FAILED: &str = "the cross build failed";
     const CROSS_REFUSED: &str = "the cross build left a non-Windows file";
 
+    /// `ended` said, on stderr, the start line of a cross build for `win-x64` running `cross`, before the first line
+    /// `then` holds.
+    fn assert_started_cross_build(ended: &Ended, cross: &str, then: impl Fn(&str) -> bool, what: &str) {
+        let texts = ended.err_texts();
+        let start = format!("gate: cross build for win-x64: /bin/sh -c {cross}");
+        let at = texts.iter().position(|said| *said == start.as_str());
+        let after = texts.iter().position(|said| then(*said));
+        assert!(
+            matches!((at, after), (Some(at), Some(after)) if at < after),
+            "{start} before {what}: {:?}",
+            ended.err
+        );
+    }
+
     /// `ended` said `line` and, right after it, that the outputs were not brought back for `reason`, and said no
     /// `gate-remote-outputs:` line.
     fn assert_said_then_not_brought_back(ended: &Ended, line: &str, reason: &str) {
@@ -1208,6 +1222,12 @@ mod unix {
         let ended = ran(&[], &request, Reading::All, &case.base.join("beaten"));
 
         assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_started_cross_build(
+            &ended,
+            &cross,
+            |said: &str| said.starts_with("gate: the cross build for win-x64 took "),
+            "the passed line",
+        );
         assert!(
             ended
                 .err_texts()
@@ -1246,6 +1266,12 @@ mod unix {
 
         assert_eq!(ended.status, Some(0), "the command's own status: {:?}", ended.err);
         assert_said_then_not_brought_back(&ended, &cross_failed_line(3), CROSS_FAILED);
+        assert_started_cross_build(
+            &ended,
+            "echo cross said; exit 3",
+            |said: &str| cross_failed_line(3) == said,
+            "the failure line",
+        );
         assert!(texts(&ended.out).contains(&"cross said"), "its output is forwarded: {:?}", ended.out);
         assert!(outputs_said(&ended).is_empty(), "{:?}", ended.err);
         assert!(!case.archive().exists(), "nothing is packed");

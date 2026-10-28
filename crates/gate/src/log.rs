@@ -9,6 +9,7 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+use gate_wire::is_cross_step_start;
 use gate_wire::stamp::{Tag, is_process_line, unstamped};
 use regex::Regex;
 
@@ -245,19 +246,30 @@ impl LineState {
 }
 
 /// The first `limit` lines of `reader` holding a failure marker in their unstamped text ([`unstamped`]; a plain line
-/// whole), numbered from 1, each kept as that text cut for printing; the scan stops once it has them.
+/// whole), numbered from 1, each kept as that text cut for printing; the scan stops once it has them. A `gat` line that
+/// starts a cross build ([`is_cross_step_start`]) turns the scan away from every later `out` or `err` line: a failed
+/// cross build keeps the command's status, so its own `error …` lines are not the run's, while the gate's own lines are
+/// still scanned.
 fn markers_in(reader: impl BufRead, limit: usize) -> io::Result<Vec<(usize, String)>> {
     let mut lines = LineReader::new(reader, SCAN_LINE_BYTES);
     let mut found = Vec::new();
     let mut number = 0;
+    let mut in_cross_step = false;
     while found.len() < limit
         && let Some(line) = lines.next_line()?
     {
         number += 1;
         let line = String::from_utf8_lossy(&line);
-        let text = unstamped(&line).text;
-        if !text.starts_with(TRANSFER_RETRY_PREFIX) && MARKER_SCAN.is_match(text) {
-            found.push((number, shown(text)));
+        let parts = unstamped(&line);
+        let gate_line = parts.tag == Some(Tag::Gat);
+        if gate_line && is_cross_step_start(parts.text) {
+            in_cross_step = true;
+        }
+        if in_cross_step && matches!(parts.tag, Some(Tag::Out | Tag::Err)) {
+            continue;
+        }
+        if !parts.text.starts_with(TRANSFER_RETRY_PREFIX) && MARKER_SCAN.is_match(parts.text) {
+            found.push((number, shown(parts.text)));
         }
     }
     Ok(found)
@@ -537,6 +549,55 @@ mod tests {
             markers(&text),
             numbered(&[(2, "Build FAILED."), (3, "   failed: 3")]),
             "each anchored marker matches the text after the tag"
+        );
+    }
+
+    /// The start line of a cross build for `win-x64`.
+    const CROSS_START: &str = "gate: cross build for win-x64: dotnet build -r win-x64";
+
+    #[test]
+    fn a_cross_step_s_failure_lines_after_its_start_line_do_not_fail_a_passing_command() {
+        let text = format!(
+            "{STAMP} out Passed!  - Failed: 0, Passed: 42\n\
+             {STAMP} gat {CROSS_START}\n\
+             {STAMP} out error NETSDK1134: Building a solution with a specific RuntimeIdentifier is not supported.\n\
+             {STAMP} out Build FAILED.\n\
+             {STAMP} gat gate: the cross build for win-x64 failed with exit 1; the Windows outputs were not brought back\n"
+        );
+
+        assert_eq!(markers(&text), Vec::new(), "the cross step's own failure is not the run's");
+    }
+
+    #[test]
+    fn failure_lines_before_the_cross_start_line_still_count() {
+        let text = format!("{STAMP} out Build FAILED.\n{STAMP} err main.rs: error : boom\n{STAMP} gat {CROSS_START}\n{STAMP} out ok\n");
+
+        assert_eq!(
+            markers(&text),
+            numbered(&[(1, "Build FAILED."), (2, "main.rs: error : boom")]),
+            "the scan reads every line before the start"
+        );
+    }
+
+    #[test]
+    fn a_gate_line_after_the_cross_start_line_still_counts() {
+        let text = format!("{STAMP} gat {CROSS_START}\n{STAMP} gat gate: TIMED OUT after 900 s\n");
+
+        assert_eq!(
+            markers(&text),
+            numbered(&[(2, "gate: TIMED OUT after 900 s")]),
+            "a box kill in the cross step still fails the run"
+        );
+    }
+
+    #[test]
+    fn a_command_s_own_text_that_looks_like_the_start_line_starts_no_skip() {
+        let text = format!("{STAMP} out gate: cross build for win-x64: dotnet build\n{STAMP} out Build FAILED.\n");
+
+        assert_eq!(
+            markers(&text),
+            numbered(&[(2, "Build FAILED.")]),
+            "only the gate's own line opens the cross step"
         );
     }
 

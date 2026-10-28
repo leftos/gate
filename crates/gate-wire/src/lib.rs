@@ -33,6 +33,17 @@ pub fn is_cross_not_brought_back(line: &str) -> bool {
     line.starts_with(CROSS_BUILD_START) && line.ends_with(CROSS_NOT_BROUGHT_BACK)
 }
 
+/// The start of the line a macOS box says on its `gat` stream just before a run's cross build starts: the runtime the
+/// build is for follows, then `: ` and the words the build runs.
+pub const CROSS_STEP_START: &str = "gate: cross build for ";
+
+/// Whether `line` is the line a box says just before a run's cross build starts ([`CROSS_STEP_START`]); the PC's
+/// failure scan counts no `out` or `err` line after it, since a failed cross build keeps the command's status.
+#[must_use]
+pub fn is_cross_step_start(line: &str) -> bool {
+    line.starts_with(CROSS_STEP_START)
+}
+
 /// The commit this build was made from, from `GATE_BUILD_ID` at compile time; `None` for a build made without one, or
 /// with an empty one.
 const BUILD_ID: Option<&str> = option_env!("GATE_BUILD_ID");
@@ -1493,8 +1504,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CrossBuild, PathForm, Payload, Probed, escaped, first_version, probed, root_busy_line, root_unsafe_line, runs_probe, sdk_list, tool_line,
-        version_of, version_text, work_root,
+        CROSS_BUILD_START, CROSS_NOT_BROUGHT_BACK, CROSS_STEP_START, CrossBuild, PathForm, Payload, Probed, escaped, first_version,
+        is_cross_not_brought_back, is_cross_step_start, probed, root_busy_line, root_unsafe_line, runs_probe, sdk_list, tool_line, version_of,
+        version_text, work_root,
     };
 
     #[expect(clippy::expect_used, reason = "a payload a case cannot build must fail the case loudly")]
@@ -2311,6 +2323,23 @@ mod tests {
             json["Outputs"] = json!(["**/bin/**"]);
         }
         decoded(&json.to_string()).and_then(|payload| payload.cross_build())
+    }
+
+    #[test]
+    fn a_cross_step_s_start_line_is_told_from_the_lines_that_carry_its_outcome() {
+        let start = format!("{CROSS_STEP_START}win-x64: dotnet build -r win-x64");
+        let passed = format!("{CROSS_BUILD_START}win-x64 took 12.3 s");
+        let failed = format!("{CROSS_BUILD_START}win-x64 failed with exit 3{CROSS_NOT_BROUGHT_BACK}");
+        let refused = format!("{CROSS_BUILD_START}win-x64 left a non-Windows file bin/A{CROSS_NOT_BROUGHT_BACK}");
+
+        assert!(is_cross_step_start(&start), "{start}");
+        assert!(!is_cross_not_brought_back(&start), "a start is no outcome: {start}");
+        for (line, what) in [(&passed, "passed"), (&failed, "failed"), (&refused, "refused")] {
+            assert!(!is_cross_step_start(line), "the {what} line is no start: {line}");
+        }
+        assert!(is_cross_not_brought_back(&failed), "{failed}");
+        assert!(is_cross_not_brought_back(&refused), "{refused}");
+        assert!(!is_cross_not_brought_back(&passed), "{passed}");
     }
 
     #[test]
