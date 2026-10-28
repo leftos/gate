@@ -1352,12 +1352,15 @@ impl Git {
 
     /// git with `args`, reading no standard input, none of the variables that would point it elsewhere and no
     /// system-wide attributes file ([`crate::remote::lfs::NO_SYSTEM_ATTRIBUTES`]); else why it cannot be started.
+    /// A git started with a caller's `MSYSTEM` and no `usr\bin` on its PATH cannot find `sh` and crashes (0xC0000005),
+    /// so the box never passes `MSYSTEM` on to its git.
     pub(crate) fn command(&self, args: &[&str]) -> Result<Command, String> {
         let program = self.program.as_ref().map_err(Clone::clone)?;
         let mut command = Command::new(program);
         for name in GIT_REDIRECTS {
             command.env_remove(name);
         }
+        command.env_remove("MSYSTEM");
         command.env(crate::remote::lfs::NO_SYSTEM_ATTRIBUTES, "1");
         command.args(args).stdin(Stdio::null());
         Ok(command)

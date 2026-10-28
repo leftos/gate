@@ -302,9 +302,9 @@ fn path_with_git(folders: &[PathBuf]) -> OsString {
 }
 
 /// A PATH of `folders` first, then the suite's own PATH less every folder holding a `dotnet`: the box finds the stub's
-/// dotnet and no real one behind it, and git keeps everything its helpers need. A PATH of git's folder alone is not
-/// enough for a run: git's local transport spawns a helper that needs the folder holding its runtime on PATH, so
-/// `git fetch` fails with an access violation without it, though the steps a preflight runs do not.
+/// dotnet and no real one behind it, and git keeps everything its helpers need. A git with its own bin folder alone on
+/// PATH, under a caller's `MSYSTEM`, cannot find `sh` and crashes with an access violation at its first shell start,
+/// which a run's `git fetch` reaches, though the steps a preflight runs do not.
 fn path_for_run(folders: &[PathBuf]) -> OsString {
     let own = std::env::var_os("PATH").expect("PATH is set");
     let without_dotnet = std::env::split_paths(&own).filter(|folder| !holds_dotnet(folder));
@@ -3373,6 +3373,45 @@ fn box_run_leaves_path_alone_when_git_s_bin_is_not_trusted() {
         !outcome.stdout.contains(NO_GIT_BIN) && !outcome.stderr.contains(NO_GIT_BIN),
         "a run says nothing about the PATH; its preflight does: {outcome:?}"
     );
+}
+
+/// Git for Windows' own git.exe folder (`<root>\ucrt64\bin` or `<root>\mingw64\bin`), not the `cmd\git.exe` wrapper,
+/// which puts `usr\bin` on PATH itself; None where Git's install has no such git.exe.
+fn inner_git_folder() -> Option<PathBuf> {
+    let folder = git_folder();
+    let root = if folder.ends_with("cmd") {
+        folder.parent()
+    } else {
+        folder.parent().and_then(Path::parent)
+    }
+    .expect("git's folder lies inside Git's install")
+    .to_path_buf();
+    ["ucrt64", "mingw64", "clangarm64"]
+        .iter()
+        .map(|environment| root.join(environment).join("bin"))
+        .find(|bin| bin.join("git.exe").is_file())
+}
+
+/// Proves the fault only where Git for Windows' inner git is installed, which is this PC; elsewhere it skips.
+#[test]
+#[expect(clippy::print_stderr, reason = "a case this machine cannot test says so in its output")]
+fn box_run_fetches_when_the_caller_s_msystem_is_set_and_only_git_s_own_folder_is_on_path() {
+    let Some(inner) = inner_git_folder() else {
+        eprintln!("skipped: no Git for Windows inner git.exe beside {}", git_folder().display());
+        return;
+    };
+    let case = Case::new("box_run_msystem_inner_git");
+    let path = std::env::join_paths([inner]).expect("one folder joins into a PATH");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let mut call = box_call(&case, &["box", "run"], &self::payload(&payload));
+    call.env("PATH", &path);
+    call.env("MSYSTEM", "UCRT64");
+
+    let outcome = call.finish_read();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
 }
 
 #[test]
