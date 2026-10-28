@@ -4,12 +4,10 @@
 
 ## Do first
 
-- [ ] GATE-884 Enforce builder-side slots and gate box hold on the Mac's Unix box — Urgent · Remote
-- [ ] GATE-883 Write slots.json at gate push and wait on a builder's full refusal on the PC — Urgent · Remote
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [!] GATE-828 Fix the flaky Unix box test a_clear_refuses_a_volume_mounted_in_the_work_folder_and_keeps_its_files — Urgent · Remote
 - [ ] GATE-871 Carry routed runs' bulk data on a TCP data channel instead of ssh to the Windows builder — Urgent · Remote
-- [/] GATE-875 Build the data channel and carry the outputs pull on it — Urgent · Remote
+- [ ] GATE-890 Fix the flaky suite case a_routed_run_logs_the_box_s_stamped_lines_and_its_process_lines_as_they_came — Urgent · Remote
 - [ ] GATE-878 Show builder-side slot holders on ops-tower through a PC cache of the builder's slots — High · Remote
 - [ ] GATE-869 Bring back no bin files from a Mac run of a crossBuild repo that carried no cross build — High · Remote
 - [ ] GATE-868 Send no cross build for a solution target, which the SDK refuses with NETSDK1134 — High · Remote
@@ -18,7 +16,6 @@
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
 - [/] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
-- [ ] GATE-682 Explain or track a stall when a gated command is plain ssh to another machine — High · Remote
 - [ ] GATE-745 Bring back the files a routed dotnet command's /flp and /getResultOutputFile switches name — High · Remote
 - [ ] GATE-751 Make a routed build's outputs pull fast enough for yaat's trees, or skip it for verdict-only runs — High · Remote
 - [ ] GATE-753 Log every step of a run in the gate's log: start, progress, end and duration — High · Remote
@@ -309,9 +306,11 @@
 - [ ] GATE-870 Harden the detached prune sweep's tests and edges (GATE-689 brief 3 review)
 - [ ] GATE-881 Cover the data channel's wildcard bind, test port race and archive share mode (sub-issue of GATE-871)
 - [ ] GATE-882 Probe a builder's data channel in gate check --builder (sub-issue of GATE-871)
+- [ ] GATE-888 Let a channel pull's ack wait outlast the box's 16 MiB send buffer on a slow path (sub-issue of GATE-871)
 - [ ] GATE-872 Summarise the gone worktrees a push's prune sweep marks instead of one line each
 - [ ] GATE-880 Settle the box hold verb's drain barrier and fix its smaller review findings
 - [ ] GATE-877 Carry a routed run's git push and back fetch on the data channel
+- [ ] GATE-889 Push a Windows builders entry that has an alias of its own, with its own slots
 
 ## Cutover sweep
 
