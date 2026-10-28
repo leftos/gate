@@ -153,6 +153,10 @@ A suite guard clocked from a call's start times the whole run, which a loaded fu
 
 A gated command run in a worktree from elsewhere takes an absolute `-Log`: the launcher reads a relative one against the caller's folder before `-Cd` (design.md P5), so it lands in the main checkout's `.tmp`, where two agents' logs of one name overwrite each other. Every brief that names `-Cd` names its logs by absolute path under that worktree.
 
+A log under a worktree does not move the run there: a gate snapshots the worktree of the folder it runs in, so every gated command for a worktree takes `-Cd <worktree>` (a routed run logging into another worktree of its repo is refused since GATE-901). A routed push of about 200 bytes (two commit objects) carried no tree change.
+
+A routed cargo run builds only the targets its features enable: a suite or test file behind `required-features = ["test-seams"]` (gate's `suite`, gate-box-unix's `tests/run.rs`) is skipped silently without `--all-features` or `--features test-seams` (GATE-795).
+
 A rig that reads `SystemProcessInformation` back to back holds a lock every `CreateProcess` on the PC waits on (a reused start went from 4 ms to 590 ms): sample at 100 ms or slower, or the rig measures itself. ESET's CPU (`ekrn`, 12-35% of a core with other sessions active) is never evidence about one job.
 
 nextest's default profile ends a case after 15 periods of 60 s (`.config/nextest.toml`). A case that needs longer gets its own override there.
