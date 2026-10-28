@@ -4,11 +4,13 @@
 
 ## Do first
 
+- [ ] GATE-884 Enforce builder-side slots and gate box hold on the Mac's Unix box — Urgent · Remote
+- [ ] GATE-883 Write slots.json at gate push and wait on a builder's full refusal on the PC — Urgent · Remote
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [!] GATE-828 Fix the flaky Unix box test a_clear_refuses_a_volume_mounted_in_the_work_folder_and_keeps_its_files — Urgent · Remote
 - [ ] GATE-871 Carry routed runs' bulk data on a TCP data channel instead of ssh to the Windows builder — Urgent · Remote
 - [/] GATE-875 Build the data channel and carry the outputs pull on it — Urgent · Remote
-- [/] GATE-874 Enforce a builder's slots on the builder, with a hold verb for GitHub Actions runner jobs — Urgent · Remote
+- [ ] GATE-878 Show builder-side slot holders on ops-tower through a PC cache of the builder's slots — High · Remote
 - [ ] GATE-869 Bring back no bin files from a Mac run of a crossBuild repo that carried no cross build — High · Remote
 - [ ] GATE-868 Send no cross build for a solution target, which the SDK refuses with NETSDK1134 — High · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
@@ -29,11 +31,8 @@
 - [ ] GATE-842 Route yaat's golden-file regeneration: an env-prefixed command and its golden outputs — High · Remote
 - [ ] GATE-843 Keep the routing facts a census needs past the journal's roll — High · Remote
 - [ ] GATE-844 Serve godot-mcp's parallel itest lanes on the builder desktop, and match any --filter-class — High · Remote
-- [/] GATE-861 Keep --no-build after a build the gate ran here: record a local build and run its --no-build here — High · Remote
 - [!] GATE-864 Opt yaat in to cross builds on the Mac and run its trial (GATE-696 step C) — High · Remote
 - [ ] GATE-876 Carry the input put, the sent build and the LFS put on the data channel — High · Remote
-- [/] GATE-873 Report whether Tailscale's path to a builder is direct or relayed, in gate check and the journal — High · Remote
-- [ ] GATE-878 Show builder-side slot holders on ops-tower through a PC cache of the builder's slots — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
@@ -53,6 +52,9 @@
 
 ## Remote
 
+- [ ] GATE-887 Close GATE-861's remaining built-here gaps: a listed repo's nothing-back built list, add-only waits, client clear lines
+- [ ] GATE-885 Close GATE-873's remaining launch-window and path-read gaps
+- [ ] GATE-879 Release a builder slot a passing preflight took when the PC falls back on its own judgement
 - [ ] GATE-792 Read a work folder's idleness from its stamped lock alone in the Windows box prune
 - [ ] GATE-804 Refuse or flag a timing or burn run whose local build is missing
 - [ ] GATE-614 Lock the Unix box's work root down: held open, ACLs, the folders above it, a pinned root
@@ -306,8 +308,10 @@
 - [ ] GATE-865 Seed the win-x64 apphost pack in the Mac builder's installer
 - [ ] GATE-866 Restore here for a folder target that holds one project, so --no-build after a routed build keeps the word
 - [ ] GATE-870 Harden the detached prune sweep's tests and edges (GATE-689 brief 3 review)
+- [ ] GATE-881 Cover the data channel's wildcard bind, test port race and archive share mode (sub-issue of GATE-871)
+- [ ] GATE-882 Probe a builder's data channel in gate check --builder (sub-issue of GATE-871)
 - [ ] GATE-872 Summarise the gone worktrees a push's prune sweep marks instead of one line each
-- [ ] GATE-879 Release a builder slot a passing preflight took when the PC falls back on its own judgement (sub-issue of GATE-874)
+- [ ] GATE-880 Settle the box hold verb's drain barrier and fix its smaller review findings
 - [ ] GATE-877 Carry a routed run's git push and back fetch on the data channel
 
 ## Cutover sweep
