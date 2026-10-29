@@ -41,7 +41,7 @@ pub use durations::{
 pub use journal::{CommandSummary, History, HistoryRun, JournalCache, RemoteTake, RunState, normalize_command, split_words};
 pub use journal_writer::{
     Appended, FallbackReason, HeavyLight, Held, JOURNAL_CAP_BYTES, JOURNAL_FILE, JOURNAL_WAIT, JournalEvent, JournalIdentity, JournalLock,
-    JournalNote, LockError, MachineSnapshot, OtherClaim, ROLLED_JOURNAL_FILE, RemoteTag, RunFacts, RunTrace, TracedChild, append_line,
+    JournalNote, LockError, MachineSnapshot, OtherClaim, ROLLED_JOURNAL_FILE, RemoteTag, RoutingFacts, RunFacts, RunTrace, TracedChild, append_line,
     append_line_then, journal_line,
 };
 pub use model::{

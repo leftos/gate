@@ -809,6 +809,7 @@ impl Release<'_> {
             trace: RunTrace::default(),
             cold: false,
             path: None,
+            routing: None,
         };
         let tag = self.host.map(|host| RemoteTag {
             host: host.to_owned(),
@@ -953,6 +954,7 @@ fn a_release_s_trace_fields_neither_fail_its_parse_nor_change_what_is_filed() {
         trace: crate::journal_write::full_trace(),
         cold: false,
         path: None,
+        routing: None,
     };
     let line = journal_line(&identity, ts("2026-10-03T01:00:00Z"), &traced, None, None);
     assert!(line.contains(r#""children":"#), "the line carries the trace: {line}");

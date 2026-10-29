@@ -125,9 +125,12 @@ pub enum JournalEvent {
         /// written as `cold: true`, after the trace, and left out when false.
         cold: bool,
         /// Tailscale's path to the builder of a routed run's call, read once the call returned: `direct`,
-        /// `derp:{region}`, `peer-relay` or `none`, written after `cold`, the last of the event's own fields; left out
-        /// when unknown, and for a run that made no builder call.
+        /// `derp:{region}`, `peer-relay` or `none`, written after `cold`; left out when unknown, and for a run that
+        /// made no builder call.
         path: Option<String>,
+        /// The run's routing facts, which its `queue`, `fallback` and `take` lines said, written after `path`; `None`
+        /// when the run has none of them, so the line gains no key of theirs.
+        routing: Option<Box<RoutingFacts>>,
     },
     /// The gate left the queue without taking a slot.
     Abandon {
@@ -150,6 +153,32 @@ pub enum JournalEvent {
         /// The parent gate's process id.
         parent_pid: u32,
     },
+}
+
+/// The routing facts of a run, which its `release` line copies from its `queue`, `fallback` and `take` lines, so that
+/// the archive, which keeps only release lines, keeps them too.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RoutingFacts {
+    /// Why a gate that could have been routed was kept on this machine, such as `--local`, as the run's `queue` line
+    /// says it: written as `notRouted`, and left out when `None`.
+    pub not_routed: Option<String>,
+    /// The free text the run gave `--reason`, as its `queue` line says it: written as `reason`, after `notRouted`, and
+    /// left out when `None`.
+    pub reason: Option<String>,
+    /// Why the run gave up each remote attempt, in the order it did, as its `fallback` lines say them: written as
+    /// `fellBack`, one reason per attempt, after `reason`, and left out when empty.
+    pub fell_back: Vec<FallbackReason>,
+    /// The pid of the parent gate whose slot did not cover the run, as its `take` line says it: written as
+    /// `parentPid`, after `fellBack`, and left out when `None`.
+    pub parent_pid: Option<u32>,
+}
+
+impl RoutingFacts {
+    /// Whether the run carries none of the four facts, so its release line gains no key of theirs.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.not_routed.is_none() && self.reason.is_none() && self.fell_back.is_empty() && self.parent_pid.is_none()
+    }
 }
 
 /// What a critical gate found as it took the machine, which its `take` line carries after `waitedSeconds`: the counts
@@ -422,6 +451,10 @@ impl fmt::Display for JournalNote {
 /// decimals. A `release` without facts writes null times and the verdict
 /// `unknown`.
 ///
+/// A `release` also carries the run's routing facts, `notRouted`, `reason`, `fellBack` and `parentPid`, as the run's
+/// `queue`, `fallback` and `take` lines said them, so that the archive keeps them once the journal rolls: each field
+/// is left out when the run has none of it.
+///
 /// `remote` is the tag of a routed run up to its fallback: when it is `Some`, the event's own fields are followed by
 /// `remote: true`, `host` and `key`, and, when the tag names a critical request, `routedFor: critical` and `criticalPid`;
 /// when it is `None`, the line has none of them.
@@ -518,6 +551,7 @@ fn insert_own_fields(line: &mut Map<String, Value>, event: &JournalEvent) {
             trace,
             cold,
             path,
+            routing,
         } => {
             line.insert("slots".to_owned(), Value::from(slots.clone()));
             line.insert("heldSeconds".to_owned(), seconds(*held_seconds));
@@ -545,6 +579,21 @@ fn insert_own_fields(line: &mut Map<String, Value>, event: &JournalEvent) {
             }
             if let Some(path) = path {
                 line.insert("path".to_owned(), Value::from(path.as_str()));
+            }
+            if let Some(routing) = routing {
+                if let Some(not_routed) = &routing.not_routed {
+                    line.insert("notRouted".to_owned(), Value::from(not_routed.as_str()));
+                }
+                if let Some(reason) = &routing.reason {
+                    line.insert("reason".to_owned(), Value::from(reason.as_str()));
+                }
+                if !routing.fell_back.is_empty() {
+                    let reasons: Vec<Value> = routing.fell_back.iter().map(|reason| Value::from(reason.as_str())).collect();
+                    line.insert("fellBack".to_owned(), Value::Array(reasons));
+                }
+                if let Some(parent_pid) = routing.parent_pid {
+                    line.insert("parentPid".to_owned(), Value::from(parent_pid));
+                }
             }
         }
         JournalEvent::Abandon { waited_seconds } => {

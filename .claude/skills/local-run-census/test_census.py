@@ -308,6 +308,132 @@ class JournalTests(unittest.TestCase):
         self.assertIn(999, [event["pid"] for event in journal.events])
 
 
+class ReleaseFactsTests(unittest.TestCase):
+    """The routing facts a run's ``release`` line keeps once the archive rolled its other lines away."""
+
+    @staticmethod
+    def census_of(*events: dict[str, object]) -> dict[str, object]:
+        return census.census_data(journal_of(*events), START, END, census.RepoNamer())
+
+    @staticmethod
+    def rows(data: dict) -> dict[tuple[str, str], dict]:
+        return {(row["repo"], row["family"]): row for row in data["heavy"]}
+
+    def test_archive_day_reads_not_routed_and_reason_from_release(self) -> None:
+        at = START + timedelta(hours=2)
+        data = self.census_of(
+            line(
+                "release",
+                30,
+                at,
+                notRouted="--local",
+                reason="built here",
+                wallSeconds=10.0,
+                verdict="passed",
+            )
+        )
+        self.assertEqual(
+            self.rows(data)[("demo", "cargo test")]["notRouted"], {"--local": 1}
+        )
+        self.assertEqual(
+            data["local"],
+            [{"repo": "demo", "family": "cargo test", "reason": "built here", "runs": 1}],
+        )
+
+    def test_archive_day_counts_fallbacks_from_release_fell_back(self) -> None:
+        at = START + timedelta(hours=2)
+        data = self.census_of(
+            line(
+                "release",
+                31,
+                at,
+                fellBack=["full", "busy"],
+                wallSeconds=10.0,
+                verdict="passed",
+            )
+        )
+        self.assertEqual(
+            self.rows(data)[("demo", "cargo test")]["fallbacks"],
+            {"full": 1, "busy": 1},
+        )
+
+    def test_archive_day_links_a_nested_gate_by_release_parent_pid(self) -> None:
+        at = START + timedelta(hours=2)
+        data = self.census_of(
+            line(
+                "release",
+                40,
+                at - timedelta(seconds=10),
+                commit=True,
+                wallSeconds=100.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "release",
+                41,
+                at - timedelta(seconds=20),
+                parentPid=40,
+                wallSeconds=60.0,
+                verdict="passed",
+                command=BUILD_COMMAND,
+            ),
+        )
+        self.assertEqual(
+            self.rows(data)[("demo", "dotnet build")]["local"],
+            1,
+        )
+        self.assertEqual(data["commitSplit"]["demo"]["linkedByParentPid"], 1)
+
+    def test_straddling_run_counts_its_fallbacks_from_release(self) -> None:
+        at = START + timedelta(hours=2)
+        data = self.census_of(
+            line("take", 32, at - timedelta(seconds=30)),
+            line(
+                "release",
+                32,
+                at,
+                fellBack=["full", "busy"],
+                wallSeconds=10.0,
+                verdict="passed",
+            ),
+        )
+        self.assertEqual(
+            self.rows(data)[("demo", "cargo test")]["fallbacks"],
+            {"full": 1, "busy": 1},
+        )
+
+    def test_live_day_with_queue_line_is_unchanged_by_release_facts(self) -> None:
+        at = START + timedelta(hours=2)
+        data = self.census_of(
+            line(
+                "queue",
+                50,
+                at - timedelta(seconds=30),
+                notRouted="--local",
+                reason="from the queue",
+            ),
+            line("fallback", 50, at - timedelta(seconds=20), reason="full"),
+            line(
+                "release",
+                50,
+                at,
+                notRouted="from the release",
+                reason="from the release",
+                fellBack=["full"],
+                wallSeconds=10.0,
+                verdict="passed",
+            ),
+        )
+        build = self.rows(data)[("demo", "cargo test")]
+        self.assertEqual(build["notRouted"], {"--local": 1})
+        self.assertEqual(build["fallbacks"], {"full": 1})
+        self.assertEqual(
+            data["local"],
+            [{"repo": "demo", "family": "cargo test", "reason": "from the queue", "runs": 1}],
+        )
+
+
 class RunTests(unittest.TestCase):
     """Runs, the window and the figures."""
 

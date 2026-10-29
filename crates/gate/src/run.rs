@@ -31,7 +31,8 @@ use gate_router::{
     dotnet_target, sdk_build_target, without_no_build, work_folder_key,
 };
 use gate_state::{
-    Estimate, FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RunFacts, RunTrace, StateRoot, Verdict, key_hash, log_hash, v1,
+    Estimate, FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RoutingFacts, RunFacts, RunTrace, StateRoot, Verdict, key_hash,
+    log_hash, v1,
 };
 use gate_watchdog::{Cores, Hint, SlotKind, hint};
 use gate_win32::{
@@ -207,6 +208,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         host: host(console),
         client,
         tag: None,
+        routing: RoutingFacts::default(),
         warm_hash: None,
         cold: false,
         tailscale_read: None,
@@ -242,8 +244,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
     say_nesting(run.nesting, run.request, console);
     run.queue(&route, console);
     let mut hold = Hold::nothing();
-    let watched = panic::catch_unwind(AssertUnwindSafe(|| run.through(&route, plan, local, &mut hold, console)));
-    let status = match watched {
+    let status = match panic::catch_unwind(AssertUnwindSafe(|| run.through(&route, plan, local, &mut hold, console))) {
         Ok(Some((ended, here))) => run.ended_through(hold, &ended, here, console),
         Ok(None) => CONTROL_C_EXIT,
         Err(payload) => {
@@ -799,6 +800,9 @@ struct Run<'a> {
     client: Box<dyn RemoteClient>,
     /// The remote tag of a routed run, which its journal lines and remote claim carry until its fallback.
     tag: Option<RemoteTag>,
+    /// The routing facts the run's `queue`, `fallback` and `take` lines say, which its `release` line copies so the
+    /// archive keeps them ([`Run::queue`], [`Run::give_up`]).
+    routing: RoutingFacts,
     /// The hash of the warm-up file a routed run's work folder must be warm with, which its call asks the builder for;
     /// `None` when the route asks no warmth. Set once, by [`Run::route`].
     warm_hash: Option<String>,
@@ -1832,6 +1836,11 @@ impl Run<'_> {
     /// and reached a verdict.
     fn write_release(&mut self, slots: Vec<String>, held_seconds: f64, ended: Option<&Ended>, console: &mut Console) {
         let facts = ended.and_then(|ended| ended.facts);
+        let routing = if self.routing.is_empty() {
+            None
+        } else {
+            Some(Box::new(std::mem::take(&mut self.routing)))
+        };
         let release = JournalEvent::Release {
             slots,
             held_seconds,
@@ -1840,6 +1849,7 @@ impl Run<'_> {
             trace: std::mem::take(&mut self.trace),
             cold: self.cold,
             path: self.tailscale_path(console),
+            routing,
         };
         let remote = self.tag.as_ref();
         let filing = self
@@ -1948,10 +1958,12 @@ impl Run<'_> {
             self.cover(parent.pid, console);
             return;
         }
+        self.routing.not_routed = route::not_routed(route);
+        self.routing.reason = self.request.reason.clone();
         let event = JournalEvent::Queue {
             log: self.log.path().to_string_lossy().into_owned(),
-            not_routed: route::not_routed(route),
-            reason: self.request.reason.clone(),
+            not_routed: self.routing.not_routed.clone(),
+            reason: self.routing.reason.clone(),
             pinned: self.request.builder.is_some(),
         };
         self.journal.write(&event, self.tag.as_ref(), console);
@@ -2088,6 +2100,7 @@ impl Run<'_> {
     fn take_nothing(&mut self, console: &mut Console) -> Taking {
         let took = Instant::now();
         let parent_pid = self.nesting.uncovering().map(|parent| parent.pid);
+        self.routing.parent_pid = parent_pid;
         self.journal
             .write(&take_event(Vec::new(), 0.0, Vec::new(), parent_pid), self.tag.as_ref(), console);
         Taking::Took(took, Figures::floor(self.request.timeout))
@@ -2761,6 +2774,7 @@ impl Run<'_> {
     /// log so the client's own bytes do not stand beside the notes that say them, and gathers the attempt's lines into
     /// the log's notes unsaid. The host the tag named, which the fallback line names.
     fn give_up(&mut self, reason: FallbackReason, outcome: &RemoteOutcome, held: Option<Taken>, console: &mut Console) -> String {
+        self.routing.fell_back.push(reason);
         let tag = self.tag.take();
         self.journal.write(&JournalEvent::Fallback { reason }, tag.as_ref(), console);
         if let Some(taken) = held {
@@ -3429,6 +3443,7 @@ impl Run<'_> {
         wait.end(console);
         let took = Instant::now();
         let parent_pid = self.nesting.uncovering().map(|parent| parent.pid);
+        self.routing.parent_pid = parent_pid;
         let (figures, resolved) = Figures::resolved(self.request.timeout, estimate.as_ref());
         let (mut taker, survey) = self.taker(parent_pid, expected.as_ref(), figures.ceiling);
         taker.took(taken, pool, waited, survey, console);
@@ -3491,6 +3506,8 @@ impl Run<'_> {
         };
         let waited = queued.elapsed().as_secs_f64();
         let line = machine::holds_line(Timestamp::now(), waited, &snapshot, machine);
+        let parent_pid = self.nesting.uncovering().map(|parent| parent.pid);
+        self.routing.parent_pid = parent_pid;
         let take = JournalEvent::Take {
             slots: machine.names(),
             waited_seconds: waited,
@@ -3498,7 +3515,7 @@ impl Run<'_> {
             machine: Some(snapshot),
             // A critical gate under a parent whose slot does not cover it is refused, so only a parent that holds no
             // slot is named here.
-            parent_pid: self.nesting.uncovering().map(|parent| parent.pid),
+            parent_pid,
         };
         console.err(&line);
         let took = Instant::now();
@@ -3665,8 +3682,9 @@ impl Run<'_> {
     /// ([`Run::write_release`]), and lets the slot go, then wakes the waiters. A critical gate journals the release of every
     /// slot it held first, then lets the machine go ([`Machine::release`]). A gate a parent's slot covers deletes its
     /// covered marker, then lets go the slot it took when that parent ended as its command ran ([`Late`]), as any slot
-    /// is let go; it took no other slot, and journals no release when it took none. A gate a light parent lent its slot
-    /// took no slot and journals no release; it deletes its lend marker and wakes the waiters.
+    /// is let go, its release naming the parent its late `take` named; it took no other slot, and journals no release
+    /// when it took none. A gate a light parent lent its slot took no slot and journals no release; it deletes its lend
+    /// marker and wakes the waiters.
     fn release(&mut self, hold: Hold, ended: Option<&Ended>, console: &mut Console) {
         if let Some(lend) = self.lend.take() {
             lend.end(self.root, &mut self.survey, console);
@@ -3674,7 +3692,8 @@ impl Run<'_> {
         if let Some(mut covered) = self.covered.take() {
             covered.end(console);
         }
-        if let Some(LateSlot { taken, took }) = self.late.take() {
+        if let Some(LateSlot { taken, took, parent_pid }) = self.late.take() {
+            self.routing.parent_pid = parent_pid;
             self.let_go(Some(taken), took.elapsed().as_secs_f64(), ended, console);
         }
         if self.nesting.covering().is_some() || self.lent {

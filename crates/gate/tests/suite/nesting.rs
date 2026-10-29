@@ -1044,6 +1044,35 @@ fn a_gate_started_after_the_parent_ended_runs_covered_by_the_late_gate() {
     assert_eq!(events_of(&case, late.pid), ["covered", "take", "release"]);
 }
 
+/// A covered gate that takes its own slot once its parent ends names that parent on its `take`, and its `release`
+/// carries the same `parentPid`, so the archive keeps the link.
+#[test]
+fn a_late_take_s_release_line_carries_the_parent_pid_its_take_named() {
+    let case = Case::new("a_late_take_s_release_line_carries_the_parent_pid_its_take_named");
+    write_counts(&case.root(), ONE_HEAVY);
+    let started = case.folder().join("started");
+    let go = case.folder().join("go");
+    let release = case.folder().join("outer.release");
+    let (started_text, go_text) = (shown(&started), shown(&go));
+    let inner = heavy_words("inner.log", &LOOK_OFTEN, &[FAKE_TOOL, "mark", &started_text, "wait", &go_text]);
+    let (outer, late) = orphaned(&case, &inner, &release);
+    wait_for_file(&started);
+    let outer_pid = end_parent(outer, &release);
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, late.pid));
+
+    let take = take_of(&case, late.pid);
+    assert_eq!(take["parentPid"], Value::from(outer_pid), "{take}");
+
+    let_go(&go);
+    assert_eq!(late.ended(), 0);
+    assert_eq!(events_of(&case, late.pid), ["covered", "take", "release"]);
+    let released = events(&case)
+        .into_iter()
+        .find(|event| event["event"] == "release" && event["pid"] == late.pid)
+        .expect("the late gate journalled its release");
+    assert_eq!(released["parentPid"], take["parentPid"], "{released}");
+}
+
 #[test]
 fn a_nested_chain_whose_parent_ended_holds_one_slot() {
     let case = Case::new("a_nested_chain_whose_parent_ended_holds_one_slot");

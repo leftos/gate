@@ -954,6 +954,7 @@ fn a_light_gate_finds_no_spare_remote_slot_and_waits_here_in_its_place() {
     assert_passed(&outcome);
     let events = own(&case, pid);
     assert_eq!(names(&events), ["queue", "fallback", "take", "release"], "{events:#?}");
+    assert_eq!(events[3]["fellBack"], json!(["full"]), "{events:#?}");
     assert!(events[2..].iter().all(has_no_remote_fields), "{events:#?}");
     assert!(!call.exists(), "the builder ran nothing: {outcome:?}");
     held.finish();
@@ -981,6 +982,7 @@ fn a_light_gate_the_builder_refuses_waits_here_and_never_routes_again() {
     assert_eq!(outcome.stderr.matches(&sent_to_builder(critical_pid)).count(), 1, "{outcome:?}");
     let events = own(&case, pid);
     assert_eq!(names(&events), ["queue", "take", "fallback", "take", "release"], "{events:#?}");
+    assert_eq!(events[4]["fellBack"], json!(["busy"]), "{events:#?}");
     assert!(has_no_remote_fields(&events[0]), "{events:#?}");
     for event in &events[1..3] {
         assert!(has_remote_tag(event), "{events:#?}");

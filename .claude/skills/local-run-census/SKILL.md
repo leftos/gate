@@ -23,11 +23,11 @@ The default window is the last 7 days; `--journal` defaults to `%LOCALAPPDATA%\g
 
 What the script counts:
 
-- **A run** is the lines sharing one `(pid, processStart)`. Its kind, repo and command come from its `queue` line, else from its `release` (every line carries the common fields, and the archive keeps only `release` lines), else, for a gate covered by its parent and never queued, from its first line.
+- **A run** is the lines sharing one `(pid, processStart)`. Its kind, repo, command and routing facts come from its `queue` line, else from its `release` (every line carries the common fields, the archive keeps only `release` lines, and a release carries the run's routing facts too), else, for a gate covered by its parent and never queued, from its first line.
 
   A run is **routed** when its `release` has `remote: true`, **local** when its `release` has no `remote`, and **unfinished** when it has no `release`; unfinished runs are left out of the time figures. A `fallback` reason counts against the run's family.
 
-  **Nested**: a run whose `take`, `covered` or `parent` line carries a `parentPid` belongs to the latest run with that `pid` that started before it. That run must be a commit run, and the child must have started before it released (a commit with no release yet counts).
+  **Nested**: a run whose `take`, `covered`, `parent` or `release` line carries a `parentPid` belongs to the latest run with that `pid` that started before it. That run must be a commit run, and the child must have started before it released (a commit with no release yet counts).
 
   A run the archive kept as a bare `release` belongs to the commit run whose folder is its own or one above it, once both are normalized (lower case, `/` turned into `\`, no trailing `\`), with a `processStart` at or after the commit's and a release at most 1 s past the commit's.
 - **The repo**: a `<repo>.wt` segment of `cwd` names `<repo>`, and a `.claude-wt` segment names `claude-config`; else the main checkout's folder name from `git rev-parse --git-common-dir` (a submodule's names its superproject, and `.claude` is `claude-config`). A folder git names no repo for is `(no repo)`, and a folder that is gone is `(gone)`: a folder's own name is never printed.
@@ -49,7 +49,7 @@ What the script counts:
 
 The report names repos and families only: it never prints a `cwd`, `log`, `host` or `key`, and free-text reasons have absolute paths replaced by `<path>`. The repo is public, so keep it that way in the note.
 
-**The archive keeps only `release` lines.** `notRouted`, the fallback reasons and the `--local` table cover only the runs whose `queue` is still in `events.jsonl` or `events.1.jsonl`; the report's last line gives that start. A family's older local runs therefore show no reason: judge them from their commands, not from an empty `notRouted` cell.
+**The archive keeps only `release` lines, and a release carries the run's routing facts**: `notRouted` and `reason` as its `queue` says them, `fellBack` with one reason per fallback attempt, and `parentPid` as its `take` says it. So the `notRouted` cells, the fallback reasons and the `--local` table cover every run journalled since, archived or not. A run released before the gate wrote them onto its release keeps none: judge its family from its commands, not from an empty `notRouted` cell.
 
 ## Sort every heavy family with local runs
 
@@ -82,7 +82,7 @@ A reason work can remove never makes a family truly local: it is a blocker to bo
 
 ## Common mistakes
 
-- Reading an empty `notRouted` cell as "no reason": for runs older than the live journal the reason is not kept.
+- Reading an empty `notRouted` cell as "no reason": a run released before the gate copied its routing facts onto its `release` keeps none.
 - Comparing a local median with the routed median of a different repo: routing overhead differs per repo (push size, outputs, builder).
 - Sorting a whole family by its routed runs: a family that routes can still hold a local sub-command (a `--no-run` rig build, a Windows-only project) that needs its own state.
 - Sorting a `git commit` as one local family when a gate is nested in it: the nested gate is its own family, and the commit keeps only the share no gate covers.

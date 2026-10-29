@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{self, Command};
 use std::thread;
 use std::time::Duration;
 
@@ -18,10 +18,11 @@ use proc_table::Win32ProcessTable;
 use regex::Regex;
 use serde_json::Value;
 
+use crate::nesting::{marked, test_marker};
 use crate::routing::{BUSY_LINE, HOST, routed_case, routed_words, stub};
 use crate::support::{
-    CORE_SECOND, Case, FAKE_TOOL, Outcome, TAILSCALE_STATUS_VARIABLE, assert_in_order, cpu_ticks, events, finish, log_texts, none_words, release,
-    run_words, shown, wait_for_journal_line, wait_until,
+    CORE_SECOND, Case, FAKE_TOOL, LOCAL_REASON, Outcome, TAILSCALE_STATUS_VARIABLE, assert_in_order, cpu_ticks, events, finish, heavy_words,
+    log_texts, none_words, release, run_words, shown, wait_for_journal_line, wait_until,
 };
 
 /// The words of a light run logging to `log` whose command exits with `status`.
@@ -536,6 +537,52 @@ fn a_gate_that_ends_while_its_path_read_is_starting_leaves_no_tailscale_behind()
 
     assert_eq!(outcome.code, Some(0), "the gate exited with its run's status: {outcome:?}");
     wait_until("no tailscale stand-in is left running", || running_at(&stand_in).is_empty());
+}
+
+/// A `--local` run's release line carries the `notRouted` and `reason` its queue line does, so the archive keeps them.
+#[test]
+fn a_local_run_s_release_line_carries_its_not_routed_and_reason() {
+    let case = Case::new("a_local_run_s_release_line_carries_its_not_routed_and_reason");
+    let mut extra = vec!["--local"];
+    extra.extend(LOCAL_REASON);
+    let outcome = case.run(&heavy_words("out.log", &extra, &[FAKE_TOOL, "exit", "0"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let events = events(&case);
+    let queue = events.iter().find(|event| event["event"] == "queue").expect("the run queued");
+    let released = events
+        .iter()
+        .find(|event| event["event"] == "release")
+        .expect("the run journalled its release");
+    assert_eq!(queue["notRouted"], "--local", "{queue}");
+    assert_eq!(released["notRouted"], queue["notRouted"], "{released}");
+    assert_eq!(queue["reason"], LOCAL_REASON[1], "{queue}");
+    assert_eq!(released["reason"], queue["reason"], "{released}");
+    assert!(
+        released.get("fellBack").is_none() && released.get("parentPid").is_none(),
+        "the run never fell back and ran under no parent: {released}"
+    );
+}
+
+/// A gate nested under a parent whose slot does not cover it names that parent on its release line as its take does.
+#[test]
+fn a_nested_gate_s_release_line_carries_its_parent_pid() {
+    let case = Case::new("a_nested_gate_s_release_line_carries_its_parent_pid");
+    let words = heavy_words("out.log", &[], &[FAKE_TOOL, "exit", "0"]);
+    let outcome = finish(marked(&case, &words, &test_marker(&case, "none")));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let events = events(&case);
+    let take = events
+        .iter()
+        .find(|event| event["event"] == "take")
+        .expect("the gate took its heavy slot");
+    let released = events
+        .iter()
+        .find(|event| event["event"] == "release")
+        .expect("the gate journalled its release");
+    assert_eq!(take["parentPid"], Value::from(process::id()), "{take}");
+    assert_eq!(released["parentPid"], take["parentPid"], "{released}");
 }
 
 #[test]

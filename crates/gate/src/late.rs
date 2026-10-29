@@ -18,10 +18,14 @@ use crate::run::Taker;
 use crate::slots::{self, Liveness, Pool, Survey, Taken, epoch_ms};
 use crate::wait::{Arrival, Host, Wait, Waited};
 
-/// The slot a covered gate took once its parent ended, and when it took it, held until the run's release.
+/// The slot a covered gate took once its parent ended, when it took it, and the parent its `take` named, held until the
+/// run's release.
 pub(crate) struct LateSlot {
     pub taken: Taken,
     pub took: Instant,
+    /// The parent gate whose end sent the run to a slot of its own, or the gate standing in for it, which the late
+    /// `take` names and the `release` the run writes afterwards copies; `None` for a run under no parent.
+    pub parent_pid: Option<u32>,
 }
 
 /// What a covered run's late take is made of: the parent gate whose slot covers it, the pool of the run's own kind,
@@ -231,7 +235,12 @@ impl<'a> Late<'a> {
         };
         let waited = since.elapsed().as_secs_f64();
         wait.end(console);
-        let slot = self.of.held.insert(LateSlot { taken, took: Instant::now() });
+        let parent_pid = self.of.taker.parent_pid;
+        let slot = self.of.held.insert(LateSlot {
+            taken,
+            took: Instant::now(),
+            parent_pid,
+        });
         self.of.taker.took(&mut slot.taken, self.of.pool, waited, &mut self.survey, console);
         true
     }

@@ -11,7 +11,7 @@ use std::time::Duration;
 use flate2::read::GzDecoder;
 use gate_state::{
     FallbackReason, HeavyLight, Held, JOURNAL_CAP_BYTES, JournalEvent, JournalIdentity, JournalLock, JournalNote, LockError, MachineSnapshot,
-    OtherClaim, RemoteTag, RunFacts, RunTrace, TracedChild, Verdict, append_line, journal_line,
+    OtherClaim, RemoteTag, RoutingFacts, RunFacts, RunTrace, TracedChild, Verdict, append_line, journal_line,
 };
 use serde_json::{Value, json};
 
@@ -162,6 +162,7 @@ fn release(facts: Option<RunFacts>) -> JournalEvent {
         trace: RunTrace::default(),
         cold: false,
         path: None,
+        routing: None,
     }
 }
 
@@ -407,6 +408,7 @@ fn a_routed_release_line_puts_the_tailscale_path_after_cold() {
         trace: RunTrace::default(),
         cold: true,
         path: path.map(str::to_owned),
+        routing: None,
     };
     let relayed = journal_line(&identity(), ts(NOW), &release(Some("derp:fra")), Some(&tag()), None);
     let unknown = journal_line(&identity(), ts(NOW), &release(None), Some(&tag()), None);
@@ -463,6 +465,7 @@ fn a_routed_release_line_puts_the_remote_fields_after_the_verdict() {
         trace: RunTrace::default(),
         cold,
         path: None,
+        routing: None,
     };
     let line = journal_line(&identity(), ts(NOW), &release(false), Some(&tag()), None);
     let cold = journal_line(&identity(), ts(NOW), &release(true), Some(&tag()), None);
@@ -742,6 +745,58 @@ fn time_has_seven_fractional_digits_and_z() {
     assert_eq!(parsed(&exact)["processStart"], "2026-10-03T05:04:38.7424554Z");
 }
 
+/// A release line carries the run's routing facts after `path`, each field only when the run has one.
+#[test]
+fn a_release_line_carries_not_routed_reason_fell_back_and_parent_pid_when_given() {
+    let event = JournalEvent::Release {
+        slots: vec![r"Local\gate-light-slot-0".to_owned()],
+        held_seconds: 0.105,
+        status: Some(0),
+        facts: None,
+        trace: RunTrace::default(),
+        cold: false,
+        path: None,
+        routing: Some(Box::new(RoutingFacts {
+            not_routed: Some("--local".to_owned()),
+            reason: Some("built here".to_owned()),
+            fell_back: vec![FallbackReason::Full, FallbackReason::Busy],
+            parent_pid: Some(40267),
+        })),
+    };
+    let line = journal_line(&identity(), ts(NOW), &event, None, None);
+
+    assert_eq!(
+        own_keys(&line),
+        [
+            "slots",
+            "heldSeconds",
+            "status",
+            "wallSeconds",
+            "adjustedSeconds",
+            "verdict",
+            "notRouted",
+            "reason",
+            "fellBack",
+            "parentPid"
+        ]
+    );
+    assert!(
+        line.ends_with(r#""notRouted":"--local","reason":"built here","fellBack":["full","busy"],"parentPid":40267}"#),
+        "{line}"
+    );
+}
+
+/// A release line of a run with no routing facts has none of their keys.
+#[test]
+fn a_release_line_without_routing_facts_has_none_of_their_keys() {
+    let line = journal_line(&identity(), ts(NOW), &release(None), None, None);
+
+    assert_eq!(
+        own_keys(&line),
+        ["slots", "heldSeconds", "status", "wallSeconds", "adjustedSeconds", "verdict"]
+    );
+}
+
 #[test]
 fn release_without_run_facts_writes_nulls_and_unknown() {
     let mut event = release(None);
@@ -789,6 +844,7 @@ fn seconds_round_to_three_decimals() {
             trace: RunTrace::default(),
             cold: false,
             path: None,
+            routing: None,
         },
         None,
         None,
@@ -919,6 +975,7 @@ fn a_release_s_trace_is_written_after_the_verdict_and_before_cold() {
         trace: full_trace(),
         cold: true,
         path: None,
+        routing: None,
     };
     let released = journal_line(&identity(), ts(NOW), &event, None, None);
 

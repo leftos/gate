@@ -456,8 +456,9 @@ class Run:
     def head(self) -> dict[str, Any]:
         """The line the run's kind, ``cwd`` and ``command`` are read from: its ``queue``, else its ``release``, else its first.
 
-        The archive keeps only ``release`` lines, and every line carries the common fields,
-        so a gate that was covered by its parent and never queued still has a head.
+        The archive keeps only ``release`` lines, every line carries the common fields, and a
+        release carries the run's routing facts, so a run read from its release alone still
+        says where it ran and why it stayed here.
         """
         head = self.queue or self.release or self.first
         assert head is not None
@@ -487,6 +488,30 @@ def _keep_last(run: Run, event: dict[str, Any]) -> None:
     moment = parse_time(event.get("time"))
     if moment is not None and (run.last is None or moment > run.last):
         run.last = moment
+
+
+def _release_facts(run: Run) -> None:
+    """Keeps the routing facts off a run's ``release`` line once the other lines of the run may be gone.
+
+    The gate copies the run's ``notRouted`` and ``reason`` from its ``queue`` line, why it gave up
+    each remote attempt on ``fellBack``, and its ``take`` line's ``parentPid`` onto its release, the
+    one line the archive keeps. ``fellBack`` is the run's whole list of fallbacks, so it is read
+    whatever lines survive: a run whose ``queue`` and ``fallback`` lines rolled away while its
+    ``take`` and release stayed keeps its fallback reasons. ``notRouted``, ``reason`` and
+    ``parentPid`` are read from the release only when no ``queue``, ``fallback``, ``take`` or lent
+    line of the run is left, so a live day's figures are unchanged.
+    """
+    release = run.release
+    if release is None:
+        return
+    had_lines = run.queue is not None or bool(run.fallbacks) or run.taken or run.lent
+    fell_back = release.get("fellBack")
+    if isinstance(fell_back, list):
+        run.fallbacks = [str(reason) for reason in fell_back]
+    if had_lines:
+        return
+    if run.parent_pid is None and isinstance(release.get("parentPid"), int):
+        run.parent_pid = release["parentPid"]
 
 
 def _add_line(run: Run, event: dict[str, Any]) -> None:
@@ -566,7 +591,7 @@ def _parent_by_pid(
 
 
 def _link_by_parent_pid(runs: list[Run]) -> None:
-    """Links a run whose ``take``, ``covered`` or ``parent`` line names a pid to that pid's run.
+    """Links a run whose ``take``, ``covered``, ``parent`` or ``release`` line names a pid to that pid's run.
 
     The candidate is the latest run with that pid that started before the child, so a
     reused pid names the process that held it then. The link is made only when that run
@@ -682,8 +707,8 @@ def _contained(run: Run, folders: dict[str, _Folder]) -> Run | None:
 def _link_by_containment(runs: list[Run]) -> None:
     """Links a gate the archive kept as a bare ``release`` to the commit it released under.
 
-    The archive keeps only ``release`` lines, so a gate nested in a commit's hooks is
-    read from what is left: a folder that is the commit's or inside it, once both are
+    The archive keeps only ``release`` lines, so a gate nested in a commit's hooks that names
+    no parent is read from what is left: a folder that is the commit's or inside it, once both are
     normalized, a ``processStart`` at or after the commit's, and a release at most a
     second past the commit's. Only a run the archive kept as a release alone is read
     this way: a live run says for itself whether it is nested, and a run that names a
@@ -715,6 +740,7 @@ def _group_lines(events: Iterable[dict[str, Any]]) -> list[Run]:
     for (pid, started), run in runs.items():
         run.pid = pid if isinstance(pid, int) else None
         run.process_start = parse_time(started)
+        _release_facts(run)
     return list(runs.values())
 
 
@@ -780,7 +806,7 @@ class Family:
             self.local += 1
             self.covered += 1
             return
-        not_routed = run.queue.get("notRouted") if run.queue else None
+        not_routed = (run.queue or run.release or {}).get("notRouted")
         if not_routed:
             self.not_routed[str(not_routed)] += 1
         self.fallbacks.update(run.fallbacks)
@@ -1065,11 +1091,11 @@ def _footer(data: dict[str, Any]) -> list[str]:
     live = [name for name in data["files"] if not name.startswith("archive/")]
     queues_from = data["queuesFrom"]
     if queues_from is None:
-        coverage = "cover no run: no queue line is left in the journal."
+        coverage = "no live queue line is left in the journal."
     elif queues_from <= window["start"]:
-        coverage = "cover the whole window."
+        coverage = "the live queue lines cover the whole window."
     else:
-        coverage = f"cover only the runs queued from {queues_from}."
+        coverage = f"the live queue lines cover only the runs queued from {queues_from}."
     split = data["commitSplit"]
     by_parent_pid = sum(entry["linkedByParentPid"] for entry in split.values())
     by_containment = sum(entry["linkedByContainment"] for entry in split.values())
@@ -1085,7 +1111,10 @@ def _footer(data: dict[str, Any]) -> list[str]:
             f"- Runs with neither a queue nor a release line in the window: {data['headless']}; "
             f"heavy runs lent or covered, with no release of their own, left out: {data['lent']}."
         ),
-        f"- The archive keeps only release lines, so notRouted, the fallbacks and the --local table {coverage}",
+        (
+            "- The archive keeps only release lines: a release carries notRouted, reason, fellBack "
+            f"and parentPid, and one journalled before the gate wrote them keeps none; {coverage}"
+        ),
         f"- nested gates linked by parentPid: {by_parent_pid}; by containment: {by_containment}.",
         f"- commits with covered hook gates, share not split: {unsplit}.",
     ]
