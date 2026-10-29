@@ -270,7 +270,7 @@ impl Forwarders {
 
     /// [`Forwarders::drain`] with a `guard` in place of [`HANG_GUARD`], so a case can watch a reader that is kept
     /// behind stopped by it.
-    fn drain_within(self, limit: Duration, guard: Duration) -> Drained {
+    pub(crate) fn drain_within(self, limit: Duration, guard: Duration) -> Drained {
         let start = Instant::now();
         let limit_end = start + limit;
         let guard_end = start + guard;

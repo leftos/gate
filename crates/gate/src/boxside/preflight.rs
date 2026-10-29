@@ -34,7 +34,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use crate::answer::USAGE_STATUS;
 use crate::boxside::boot;
 use crate::boxside::drain::{self, HeldRoot};
-use crate::boxside::forward::{ClientGone, DRAIN, Forwarders, OutputLock};
+use crate::boxside::forward::{ClientGone, DRAIN, Drained, Forwarders, OutputLock};
 use crate::boxside::heartbeat;
 use crate::boxside::helper_trusted;
 use crate::boxside::msys;
@@ -1473,6 +1473,28 @@ pub(crate) fn run_git(
     Ok(ran)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The drain guard a unit test of this module keeps in place of [`HANG_GUARD`]: a reader the test itself keeps
+    /// behind by holding the output lock then ends in the seconds it sets rather than in thirty.
+    static DRAIN_GUARD: Cell<Option<Duration>> = const { Cell::new(None) };
+}
+
+/// The drain of the git step `forwarders` just ended: [`DRAIN`], and [`HANG_GUARD`] after it.
+#[cfg(not(test))]
+fn drained(forwarders: Forwarders) -> Drained {
+    forwarders.drain(DRAIN)
+}
+
+/// [`drained`] with the guard [`DRAIN_GUARD`] holds in place of [`HANG_GUARD`].
+#[cfg(test)]
+fn drained(forwarders: Forwarders) -> Drained {
+    match DRAIN_GUARD.with(Cell::get) {
+        Some(guard) => forwarders.drain_within(DRAIN, guard),
+        None => forwarders.drain(DRAIN),
+    }
+}
+
 /// [`run_git`] up to the drain: what git gave, and whether every forwarder reached the end of its pipe.
 fn git_ran(
     command: &Command,
@@ -1515,7 +1537,7 @@ fn git_ran(
     let bounded = matches!(end, WaitEnd::Killed(GitEnd::Bound));
     let failure = match end {
         WaitEnd::Exited { code, stopped: false } => {
-            let drained = forwarders.drain(DRAIN);
+            let ended = drained(forwarders);
             // Whatever git left running ends with its job, so the readers of the other streams reach their ends.
             drop(job);
             let ran = GitOutput {
@@ -1524,7 +1546,7 @@ fn git_ran(
                 stderr: joined(readers.stderr)?,
             };
             fed_whole(&ran, readers.fed)?;
-            return Ok((ran, drained.all_ended));
+            return Ok((ran, ended.all_ended));
         }
         // Only a wait given the run's stop signal sees a stop, and only when it ended the job.
         WaitEnd::Exited { stopped: true, .. } => stop.map_or_else(|| GitFailure::Failed("its job was stopped".to_owned()), |stop| stop.stopped()),
@@ -1617,7 +1639,7 @@ fn waited(watched: &Watched<'_>, bound: &mut Bound, signal: Option<&StopSignal<'
 /// ([`crate::boxside::stop::Ending::say`]).
 fn ended(job: &Job, forwarders: Forwarders, failure: GitFailure, step: GitStep<'_>, lock: &OutputLock, console: &mut Console) -> GitFailure {
     let ending = terminate_and_wait(job);
-    forwarders.drain(DRAIN);
+    drained(forwarders);
     let name = job_name(step);
     let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
     match ending {
@@ -1826,8 +1848,9 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 
     use super::{
-        Bound, Git, GitClass, GitFailure, GitStep, NAMED_AT_BOUND, Shared, Streams, TreeAt, could_not_list, fresh_config, fresh_config_written,
-        git_failed, git_launch, git_ran, lock_waited, readers, ready_tree, refused_folders, replace_config, still_ran_lines, waited,
+        Bound, DRAIN_GUARD, Git, GitClass, GitFailure, GitStep, NAMED_AT_BOUND, Shared, Streams, TreeAt, could_not_list, fresh_config,
+        fresh_config_written, git_failed, git_launch, git_ran, lock_waited, readers, ready_tree, refused_folders, replace_config, still_ran_lines,
+        waited,
     };
     use crate::boxside::forward::{ClientGone, OutputLock};
     use crate::boxside::helper_trusted;
@@ -2028,8 +2051,11 @@ mod tests {
             class: GitClass::Short,
         };
 
-        // git says on stderr that the repository does not exist, then exits.
+        // git says on stderr that the repository does not exist, then exits. The drain's own guard is thirty seconds;
+        // this test's guard ends it in three, its stderr reader still behind on the output lock held here.
+        DRAIN_GUARD.with(|guard| guard.set(Some(Duration::from_secs(3))));
         let ran = git_ran(&command, step, &Streams::FORWARDED, Shared::alone(&output, &gone), &mut Console::new());
+        DRAIN_GUARD.with(|guard| guard.set(None));
         drop(held);
 
         let (ran, all_ended) = ran.expect("git starts and runs to its end");

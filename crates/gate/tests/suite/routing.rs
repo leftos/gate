@@ -4857,7 +4857,11 @@ fn every_retried_reason_from_the_first_builder_tries_the_next() {
         let refuse = format!("refuse {reason}");
         let steps = shown(&stub(&case, &["on mac-1", &refuse, "on builder", "status 0"]));
         let log = format!("{reason}.log");
-        let running = case.start(&routed_words(&log, &steps, &[], &[r".\tool.exe", "out", "ran here"]));
+        // A `full` builder is waited for, not gone on from, so a 1 ms budget spends that wait at once. What the wait,
+        // its spent budget and the next builder's take prove is
+        // `a_builder_slot_wait_that_spends_the_budget_hands_the_run_to_the_next_builder`.
+        let waited: &[&str] = if reason == "full" { &["--test-remote-wait-ms", "1"] } else { &[] };
+        let running = case.start(&routed_words(&log, &steps, waited, &[r".\tool.exe", "out", "ran here"]));
         let pid = running.id();
         let outcome = running.finish();
 
@@ -5947,6 +5951,16 @@ fn a_builder_slot_wait_that_spends_the_budget_hands_the_run_to_the_next_builder(
     let own = own(&case, pid);
     let took = |host: &str| own.iter().filter(|event| event["event"] == "take" && event["host"] == host).count();
     assert_eq!((took(SLOT_FIRST), took(HOST)), (1, 1), "{own:#?}");
+    assert_eq!(fallbacks(&own), ["full"], "the spent wait is a `full` fallback: {own:#?}");
+    let at = |event: &str, host: Option<&str>| match host {
+        Some(host) => own.iter().position(|line| line["event"] == event && line["host"] == host),
+        None => own.iter().position(|line| line["event"] == event),
+    };
+    let found = (at("take", Some(SLOT_FIRST)), at("fallback", None), at("take", Some(HOST)));
+    assert!(
+        matches!(found, (Some(first), Some(fell), Some(next)) if first < fell && fell < next),
+        "the first builder is taken, refused `full`, and only then is the next taken: {found:?} {own:#?}"
+    );
 }
 
 /// A [`routed_case`] whose routing file sends its `*tool*` commands to the `builders` entry [`SLOT_FIRST`], a Windows
