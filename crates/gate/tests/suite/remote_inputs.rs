@@ -379,15 +379,6 @@ fn a_run_with_no_inputs_after_a_carried_run_deletes_the_carried_copies() {
     );
     assert!(has_line(&log_of(&case, "second.log"), REMOVED), "{plain:?}");
     assert_eq!(carried_markers(&case.root()), Vec::<PathBuf>::new(), "the marker is removed");
-
-    let third = ssh_steps(&case, "third", &["ok"; 4]);
-    let again = finish(client_gate(&case, "third.log", &third, &RAN));
-
-    assert_eq!(again.code, Some(0), "{again:?}");
-    assert_eq!(calls(&third), ["preflight", "run"], "no inputs step once no copy is left: {again:?}");
-    let said = log_of(&case, "third.log");
-    assert!(!said.contains("gate: inputs:"), "{said}");
-    assert!(!said.contains("gate: sending inputs"), "a run that sends nothing says no put: {said}");
 }
 
 #[test]

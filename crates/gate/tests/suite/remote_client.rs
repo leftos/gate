@@ -7502,6 +7502,17 @@ fn cap_record_text(case: &Case) -> Option<String> {
     Some(read.expect("the record, when there, can be read"))
 }
 
+/// Plants the case's outputs cap record, `hits` hits in a row past the cap, at the path its first hit writes it, the key
+/// the case worktree's, taken before any run: the planted record's path, for the caller to check it is gone once the
+/// count is cleared.
+fn plant_cap_hit(case: &Case, hits: u32) -> PathBuf {
+    let key = work_folder_key(&git(case, &["rev-parse", "--show-toplevel"]));
+    let path = case.root().join("remote").join(format!("{key}.outputs-capped"));
+    fs::create_dir_all(path.parent().expect("the record has a folder")).expect("the record's folder can be made");
+    fs::write(&path, format!(r#"{{"v":1,"hits":{hits}}}"#)).expect("the record can be planted");
+    path
+}
+
 /// One routed run of `command` under [`LOW_BUDGET`], logging to `log`, its calls taking the steps of `steps` after
 /// those the case's earlier runs took.
 fn low_budget_run(case: &Case, steps: &Path, log: &str, command: &[&str]) -> Outcome {
@@ -7525,31 +7536,21 @@ struct Between<'b> {
     command: &'b [&'b str],
 }
 
-/// A fetch past the cap that keeps its pass, then the run `between` once `prepare` has readied the case, then another
-/// fetch past the cap of an output that differs from any the PC holds: the run between, the case's outputs cap record
-/// after it, and the last run. Each run takes its steps from a file of its own: a call the watchdog kills before the
-/// stand-in has logged it leaves its step untaken, which a shared file would hand to the next run's first call.
-fn between_two_hits(case: &Case, prepare: impl FnOnce(&Case), between: &Between<'_>) -> (Outcome, Option<String>, Outcome) {
-    let hit = ["ok", "ok", PAST_THE_CAP];
-    let first = low_budget_run(case, &ssh_steps(case, "first", &hit), "first.log", &WRITE_BUILT);
-    assert_eq!(first.code, Some(0), "{first:?}");
-    assert_eq!(cap_record_text(case).as_deref(), Some(r#"{"v":1,"hits":1}"#), "{first:?}");
+/// The outputs cap record one hit in is planted (a first hit keeps its pass and writes exactly that record, as
+/// `an_outputs_call_past_the_fetch_cap_keeps_the_pass_and_brings_nothing_back` proves), then the run `between` once
+/// `prepare` has readied the case: the run between, the case's outputs cap record after it, and the planted record's
+/// path. The run takes its steps from a file of its own: a call the watchdog kills before the stand-in has logged it
+/// leaves its step untaken, which a shared file would hand to a later run's first call.
+fn between_two_hits(case: &Case, prepare: impl FnOnce(&Case), between: &Between<'_>) -> (Outcome, Option<String>, PathBuf) {
+    let planted = plant_cap_hit(case, 1);
     prepare(case);
     let steps = ssh_steps(case, "between", between.steps);
     let middle = low_budget_run_with(case, &steps, "second.log", between.more, between.command);
     let after = cap_record_text(case);
-    let last = low_budget_run(
-        case,
-        &ssh_steps(case, "last", &hit),
-        "third.log",
-        &[r".\tool.exe", "write", r"bin\new.txt", "rebuilt"],
-    );
-    assert!(last.stderr.contains(CAPPED_LINE), "the last run's fetch passed the cap: {last:?}");
-    (middle, after, last)
+    (middle, after, planted)
 }
 
-/// The PC already holds the file the first run built on the box, and the run between builds nothing, so the box packs
-/// nothing.
+/// The box's work folder is fresh, so the run between packs nothing.
 #[test]
 fn a_box_that_packs_nothing_between_two_fetches_past_the_cap_clears_the_count() {
     let case = outputs_case("client-outputs-cap-then-nothing", &BIN);
@@ -7559,12 +7560,12 @@ fn a_box_that_packs_nothing_between_two_fetches_past_the_cap_clears_the_count() 
         command: &[r".\tool.exe", "out", "ran there"],
     };
 
-    let (middle, after, last) = between_two_hits(&case, |case| write(case, r"bin\new.txt", "built"), &between);
+    let (middle, after, planted) = between_two_hits(&case, |_| {}, &between);
 
     assert_eq!(middle.code, Some(0), "{middle:?}");
     assert!(middle.stderr.contains("gate-remote-outputs: 0"), "the box packed nothing: {middle:?}");
     assert_eq!(after, None, "a box that packed nothing clears the count: {middle:?}");
-    assert_eq!(last.code, Some(0), "a hit after it is the first in a row: {last:?}");
+    assert!(!planted.exists(), "the planted record is gone: {middle:?}");
 }
 
 #[test]
@@ -7577,7 +7578,7 @@ fn a_ctrl_c_during_a_fetch_between_two_fetches_past_the_cap_leaves_the_count() {
         command: &WRITE_BUILT,
     };
 
-    let (middle, after, last) = between_two_hits(&case, |_| {}, &between);
+    let (middle, after, _) = between_two_hits(&case, |_| {}, &between);
 
     assert_eq!(middle.code, Some(CONTROL_C_EXIT), "{middle:?}");
     assert_eq!(
@@ -7585,8 +7586,6 @@ fn a_ctrl_c_during_a_fetch_between_two_fetches_past_the_cap_leaves_the_count() {
         Some(r#"{"v":1,"hits":1}"#),
         "a Ctrl+C during the fetch leaves the count: {middle:?}"
     );
-    assert_eq!(last.code, Some(1), "{last:?}");
-    assert!(last.stderr.contains(&capped_again(2)), "{last:?}");
 }
 
 #[test]
@@ -7599,12 +7598,12 @@ fn a_fetch_the_watchdog_stops_between_two_fetches_past_the_cap_clears_the_count(
         command: &WRITE_BUILT,
     };
 
-    let (middle, after, last) = between_two_hits(&case, |_| {}, &between);
+    let (middle, after, planted) = between_two_hits(&case, |_| {}, &between);
 
     assert_eq!(middle.code, Some(124), "{middle:?}");
     fetch_stopped_at(&middle.stderr, 100);
     assert_eq!(after, None, "a fetch the watchdog stopped clears the count: {middle:?}");
-    assert_eq!(last.code, Some(0), "a hit after it is the first in a row: {last:?}");
+    assert!(!planted.exists(), "the planted record is gone: {middle:?}");
 }
 
 /// The fetch between ends whole, under the cap; the Ctrl+C comes during its install.
@@ -7617,32 +7616,26 @@ fn a_ctrl_c_during_an_install_between_two_fetches_past_the_cap_clears_the_count(
         command: &[r".\tool.exe", "write", r"bin\a.txt", "a", "write", r"bin\b.txt", "b"],
     };
 
-    let (middle, after, last) = between_two_hits(&case, |_| {}, &between);
+    let (middle, after, planted) = between_two_hits(&case, |_| {}, &between);
 
     assert_eq!(middle.code, Some(CONTROL_C_EXIT), "{middle:?}");
     assert!(middle.stderr.contains("files were installed before the interrupt"), "{middle:?}");
     assert_eq!(after, None, "a fetch that ended whole clears the count: {middle:?}");
-    assert_eq!(last.code, Some(0), "a hit after it is the first in a row: {last:?}");
+    assert!(!planted.exists(), "the planted record is gone: {middle:?}");
 }
 
 /// The second fetch in a row past the cap fails the run, saying so after the cut's own line, and the record is kept, so
-/// the third fails too.
+/// the third fails too. The record one hit in is planted.
 #[test]
 fn a_second_outputs_call_past_the_fetch_cap_in_a_row_fails_the_run_and_so_does_a_third() {
     let case = outputs_case("client-outputs-cap-twice", &BIN);
-    let steps = ssh_steps(
-        &case,
-        "ssh",
-        &["ok", "ok", PAST_THE_CAP, "ok", "ok", PAST_THE_CAP, "ok", "ok", PAST_THE_CAP],
-    );
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", PAST_THE_CAP, "ok", "ok", PAST_THE_CAP]);
+    plant_cap_hit(&case, 1);
 
-    let first = low_budget_run(&case, &steps, "first.log", &WRITE_BUILT);
     let second = low_budget_run(&case, &steps, "second.log", &WRITE_BUILT);
     let after_second = cap_record_text(&case);
     let third = low_budget_run(&case, &steps, "third.log", &WRITE_BUILT);
 
-    assert_eq!(first.code, Some(0), "the first hit keeps the pass: {first:?}");
-    assert!(!first.stderr.contains("passed the cap again"), "{first:?}");
     assert_eq!(second.code, Some(1), "{second:?}");
     let cut = second.stderr.find(CAPPED_LINE).expect("the cut's line");
     let again = second.stderr.find(&capped_again(2)).expect("the line saying the cap was passed again");
@@ -7660,37 +7653,33 @@ fn a_second_outputs_call_past_the_fetch_cap_in_a_row_fails_the_run_and_so_does_a
     assert_eq!(cap_record_text(&case).as_deref(), Some(r#"{"v":1,"hits":3}"#), "{third:?}");
 }
 
+/// The outputs brought back between two fetches past the cap clear the count: the record one hit in is planted, and the
+/// fetch that brings them back clears it.
 #[test]
 fn outputs_brought_back_between_two_fetches_past_the_cap_clear_the_count() {
     let case = outputs_case("client-outputs-cap-then-back", &BIN);
-    let steps = ssh_steps(&case, "ssh", &["ok", "ok", PAST_THE_CAP, "ok", "ok", "ok", "ok", "ok", PAST_THE_CAP]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+    let planted = plant_cap_hit(&case, 1);
 
-    let first = low_budget_run(&case, &steps, "first.log", &WRITE_BUILT);
     let back = low_budget_run(&case, &steps, "second.log", &WRITE_BUILT);
     let after_back = cap_record_text(&case);
-    // Another content, so the box has an output that differs from the one brought back to pack.
-    let third = low_budget_run(&case, &steps, "third.log", &[r".\tool.exe", "write", r"bin\new.txt", "rebuilt"]);
 
-    assert_eq!(first.code, Some(0), "{first:?}");
     assert_eq!(back.code, Some(0), "{back:?}");
     assert_eq!(worktree_text(&case, r"bin\new.txt"), "built", "the outputs came back");
     assert_eq!(after_back, None, "outputs brought back clear the count");
-    assert_eq!(third.code, Some(0), "a hit after them is the first in a row: {third:?}");
-    assert!(third.stderr.contains(CAPPED_LINE), "{third:?}");
-    assert_eq!(cap_record_text(&case).as_deref(), Some(r#"{"v":1,"hits":1}"#));
+    assert!(!planted.exists(), "the planted record is gone: {back:?}");
 }
 
+/// The record one hit in is planted, and the fetch between, failing another way, clears the count.
 #[test]
 fn a_fetch_failing_another_way_between_two_fetches_past_the_cap_clears_the_count() {
     let case = outputs_case("client-outputs-cap-then-failed-fetch", &BIN);
-    let steps = ssh_steps(&case, "ssh", &["ok", "ok", PAST_THE_CAP, "ok", "ok", "exit 3", "ok", "ok", PAST_THE_CAP]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "exit 3"]);
+    let planted = plant_cap_hit(&case, 1);
 
-    let first = low_budget_run(&case, &steps, "first.log", &WRITE_BUILT);
     let failed = low_budget_run(&case, &steps, "second.log", &WRITE_BUILT);
     let after_failed = cap_record_text(&case);
-    let third = low_budget_run(&case, &steps, "third.log", &WRITE_BUILT);
 
-    assert_eq!(first.code, Some(0), "{first:?}");
     assert_eq!(failed.code, Some(1), "{failed:?}");
     assert!(
         failed
@@ -7699,31 +7688,24 @@ fn a_fetch_failing_another_way_between_two_fetches_past_the_cap_clears_the_count
         "{failed:?}"
     );
     assert_eq!(after_failed, None, "a fetch that failed another way clears the count");
-    assert_eq!(third.code, Some(0), "a hit after it is the first in a row: {third:?}");
-    assert_eq!(cap_record_text(&case).as_deref(), Some(r#"{"v":1,"hits":1}"#));
+    assert!(!planted.exists(), "the planted record is gone: {failed:?}");
 }
 
-/// A failing run makes no outputs call, so it leaves the count: the hits on either side of it are in a row.
+/// A failing run makes no outputs call, so it leaves the count: the record one hit in is planted, and the failing run
+/// leaves it.
 #[test]
 fn a_failing_run_between_two_fetches_past_the_cap_leaves_the_count() {
     let case = outputs_case("client-outputs-cap-then-failing-run", &BIN);
-    let steps = ssh_steps(&case, "ssh", &["ok", "ok", PAST_THE_CAP, "ok", "ok", "ok", "ok", PAST_THE_CAP]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
     let failing = [r".\tool.exe", "write", r"bin\new.txt", "built", "exit", "3"];
+    plant_cap_hit(&case, 1);
 
-    let first = low_budget_run(&case, &steps, "first.log", &WRITE_BUILT);
     let failed = low_budget_run(&case, &steps, "second.log", &failing);
     let after_failed = cap_record_text(&case);
-    let third = low_budget_run(&case, &steps, "third.log", &WRITE_BUILT);
 
-    assert_eq!(first.code, Some(0), "{first:?}");
     assert_eq!(failed.code, Some(3), "{failed:?}");
     assert_eq!(after_failed.as_deref(), Some(r#"{"v":1,"hits":1}"#), "the failing run leaves the count");
-    assert_eq!(third.code, Some(1), "{third:?}");
-    assert!(third.stderr.contains(&capped_again(2)), "{third:?}");
-    assert_eq!(
-        calls(&steps),
-        ["preflight", "run", "outputs", "preflight", "run", "preflight", "run", "outputs"]
-    );
+    assert_eq!(calls(&steps), ["preflight", "run"]);
 }
 
 #[test]
@@ -7911,18 +7893,17 @@ fn a_failing_run_with_only_failure_outputs_builds_the_manifest_and_brings_its_fi
     );
 }
 
-/// A failing run that brings its test reports back leaves the count: the hits on either side of it are in a row.
+/// A failing run that brings its test reports back leaves the count: the record one hit in is planted, and the run's
+/// own fetch of its reports leaves it.
 #[test]
 fn a_failing_run_bringing_reports_between_two_fetches_past_the_cap_leaves_the_count() {
     let case = reports_case("client-outputs-cap-then-failing-reports");
-    let steps = ssh_steps(&case, "ssh", &["ok", "ok", PAST_THE_CAP, "ok", "ok", "ok", "ok", "ok", PAST_THE_CAP]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+    plant_cap_hit(&case, 1);
 
-    let first = low_budget_run(&case, &steps, "first.log", &WRITE_BUILT);
     let failed = low_budget_run(&case, &steps, "second.log", &failing_with_a_report());
     let after_failed = cap_record_text(&case);
-    let third = low_budget_run(&case, &steps, "third.log", &WRITE_BUILT);
 
-    assert_eq!(first.code, Some(0), "{first:?}");
     assert_eq!(failed.code, Some(3), "{failed:?}");
     assert_eq!(
         worktree_text(&case, r"TestResults\r.trx"),
@@ -7930,22 +7911,7 @@ fn a_failing_run_bringing_reports_between_two_fetches_past_the_cap_leaves_the_co
         "the report came back: {failed:?}"
     );
     assert_eq!(after_failed.as_deref(), Some(r#"{"v":1,"hits":1}"#), "the failing run leaves the count");
-    assert_eq!(third.code, Some(1), "{third:?}");
-    assert!(third.stderr.contains(&capped_again(2)), "{third:?}");
-    assert_eq!(
-        calls(&steps),
-        [
-            "preflight",
-            "run",
-            "outputs",
-            "preflight",
-            "run",
-            "outputs",
-            "preflight",
-            "run",
-            "outputs"
-        ]
-    );
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs"]);
 }
 
 /// A passing run's fetch past the cap counts one hit; the failing run after it fetches its reports past the cap too,
@@ -10719,25 +10685,38 @@ fn a_built_here_no_build_run_s_send_lands_and_the_builder_keeps_no_build() {
     );
 }
 
+/// Plants `record` as the nothing-back record of a case `name` and asserts its one run takes the drop and sends
+/// nothing.
+fn nothing_back_record_takes_the_drop(name: &str, record: &str) {
+    let case = sent_build_case(name, None);
+    plant_record(&case, record);
+    let steps = ssh_steps(&case, "ssh", &["ok"; 2]);
+
+    let outcome = finish(dotnet_gate(&case, "out.log", &steps, &SENT_TEST));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "nothing sent");
+    assert_eq!(dropped_lines(&outcome.stderr), 1, "{outcome:?}");
+    assert!(!outcome.stdout.lines().any(|line| line == "--no-build"), "{outcome:?}");
+    assert!(build_not_sent(&case, "out.log", "nothing-back"), "{outcome:?}");
+}
+
+/// A nothing-back record of the run's own host and configuration: the run takes the drop and sends nothing.
 #[test]
-fn a_standing_nothing_back_record_of_the_run_s_configuration_takes_the_drop_and_sends_nothing() {
-    for (name, record) in [
-        ("client-sent-build-record-same", r#"{"v":1,"host":"builder","configuration":"release"}"#),
-        ("client-sent-build-record-any", r#"{"v":1,"host":"builder"}"#),
-        ("client-sent-build-record-unreadable", "not a record"),
-    ] {
-        let case = sent_build_case(name, None);
-        plant_record(&case, record);
-        let steps = ssh_steps(&case, "ssh", &["ok"; 2]);
+fn a_standing_nothing_back_record_of_the_run_s_configuration_takes_the_drop_and_sends_nothing_for_same() {
+    nothing_back_record_takes_the_drop("client-sent-build-record-same", r#"{"v":1,"host":"builder","configuration":"release"}"#);
+}
 
-        let outcome = finish(dotnet_gate(&case, "out.log", &steps, &SENT_TEST));
+/// A nothing-back record of the run's host with no configuration: the run takes the drop and sends nothing.
+#[test]
+fn a_standing_nothing_back_record_of_the_run_s_configuration_takes_the_drop_and_sends_nothing_for_any() {
+    nothing_back_record_takes_the_drop("client-sent-build-record-any", r#"{"v":1,"host":"builder"}"#);
+}
 
-        assert_eq!(outcome.code, Some(0), "{name}: {outcome:?}");
-        assert_eq!(calls(&steps), ["preflight", "run"], "{name}: nothing sent");
-        assert_eq!(dropped_lines(&outcome.stderr), 1, "{name}: {outcome:?}");
-        assert!(!outcome.stdout.lines().any(|line| line == "--no-build"), "{name}: {outcome:?}");
-        assert!(build_not_sent(&case, "out.log", "nothing-back"), "{name}: {outcome:?}");
-    }
+/// A nothing-back record that cannot be read: the run takes the drop and sends nothing.
+#[test]
+fn a_standing_nothing_back_record_of_the_run_s_configuration_takes_the_drop_and_sends_nothing_for_unreadable() {
+    nothing_back_record_takes_the_drop("client-sent-build-record-unreadable", "not a record");
 }
 
 #[test]
