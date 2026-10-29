@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
-use crate::durations::seed;
+use crate::durations::{seed, seed_warm};
 use crate::remote_inputs::inputs_case;
 use crate::support::{
     ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, GIT_REDIRECTS, Go, Junction, NetfxKey, Outcome, PREFLIGHT_SEAMS_VARIABLE, Running,
@@ -1490,19 +1490,18 @@ fn alternating_builders_each_bridge_on_their_own_last_snapshot() {
 #[test]
 fn a_routed_run_past_3x_its_usual_p90_is_hinted_once() {
     let case = client_case("client-hang-hint");
-    // The command waits for `go` in the folder it runs in: the snapshot of the first six runs sends it, so they pass
-    // at once; the held run's snapshot has none, and the case writes it into the builder's work folder.
+    // The command waits for `go` in the folder it runs in: the history run's snapshot sends it, so it passes at once;
+    // the held run's snapshot has none, and the case writes it into the builder's work folder.
     let command = [r".\tool.exe", "wait", "go", "out", "ran"];
     let steps = ssh_steps(&case, "ssh", &["ok"; 15]);
     write(&case, "go", "");
-    // The first routed run of a fresh case is cold and files no sample, so six runs make five.
-    for _ in 0..6 {
-        let outcome = finish(client_gate(&case, "history.log", &steps, &command));
-        assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    }
+    // The one routed run is cold and warms the builder's work folder, and `seed_warm` makes the five warm samples from
+    // its cold sample.
+    let outcome = finish(client_gate(&case, "history.log", &steps, &command));
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
     fs::remove_file(case.folder().join("go")).expect("the go file can be removed");
-    // The builder key's six runs, rewritten to a wall p90 of 1 s.
-    seed(&case, " out ran", 1.0, None);
+    // The builder key's five warm samples, rewritten to a wall p90 of 1 s.
+    seed_warm(&case, " out ran", 1.0, None);
     // Each span in seconds or, for a hint a starved watch says 90 s or more into the run, in minutes.
     let hint = Regex::new(r"gate: still running after (\d+ (?:s|min)), \d+x its usual p90 of 1 s; running on builder for (\d+ (?:s|min))\n")
         .expect("the pattern is valid");
@@ -1615,17 +1614,15 @@ fn a_second_routed_run_of_one_worktree_waits_for_its_holder_and_routes() {
 
 #[test]
 fn a_second_routed_run_of_one_worktree_says_the_holders_time_left() {
-    // Six runs file the command's duration and `seed` makes its usual 600 s, so the holder's remote claim carries that
-    // expected time and the wait's line says what is left of it.
+    // The one routed run is cold and warms the builder's work folder, and `seed_warm` makes the command's usual 600 s
+    // from its cold sample, so the holder's remote claim carries that expected time and the wait's line says what is
+    // left of it.
     let case = client_case_of("client-key-eta", 1);
     let steps = ssh_steps(&case, "seed", &["ok"; 12]);
     let command = [r".\tool.exe", "out", "ran"];
-    // The first routed run of a fresh case is cold and files no sample, so six runs make five.
-    for _ in 0..6 {
-        let outcome = finish(client_gate(&case, "history.log", &steps, &command));
-        assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    }
-    seed(&case, " out ran", 600.0, None);
+    let outcome = finish(client_gate(&case, "history.log", &steps, &command));
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    seed_warm(&case, " out ran", 600.0, None);
     let go = Go(case.folder().join("ssh").join("go"));
     let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
     let mut first = start(client_gate(&case, "first.log", &first_steps, &command));
@@ -7193,8 +7190,8 @@ fn start_held_pull(case: &Case, log: &str, release: &Go, command: &[&str], seams
     start(client_gate_tuned(case, log, &steps, &tuned, command))
 }
 
-/// The command waits for `go` in the folder it runs in, then writes an output: the first six runs' snapshots send `go`,
-/// so they pass at once. The first held run keeps `go` and, under `--test-remote-hint-from-pull`, can be hinted only
+/// The command waits for `go` in the folder it runs in, then writes an output: the history run's snapshot sends `go`,
+/// so it passes at once. The first held run keeps `go` and, under `--test-remote-hint-from-pull`, can be hinted only
 /// during its held pull; the second has none, so it is hinted during its run call, which it holds until the hint, and,
 /// let go, says no second hint during its pull, which outlasts 3x the p90 too.
 #[test]
@@ -7203,11 +7200,10 @@ fn a_routed_run_hinted_during_its_pull_names_the_pull_once() {
     let command = [r".\tool.exe", "wait", "go", "write", r"bin\new.txt", "hinted"];
     let history = ssh_steps(&case, "history", &["ok"; 15]);
     write(&case, "go", "");
-    // The first routed run of a fresh case is cold and files no sample, so six runs make five.
-    for _ in 0..6 {
-        let outcome = finish(client_gate(&case, "history.log", &history, &command));
-        assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    }
+    // The one routed run is cold and warms the builder's work folder, and `seed_warm` makes the five warm samples from
+    // its cold sample.
+    let outcome = finish(client_gate(&case, "history.log", &history, &command));
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let hint = Regex::new(ANY_HINT).expect("the pattern is valid");
     // Each span in seconds or, for a hint a starved watch says 90 s or more into its phase, in minutes.
     let pulling = Regex::new(r"gate: still running after \d+ (?:s|min), \d+x its usual p90 of 1 s; pulling outputs from builder for \d+ (?:s|min)\n")
@@ -7222,7 +7218,7 @@ fn a_routed_run_hinted_during_its_pull_names_the_pull_once() {
         }
     };
 
-    seed(&case, " hinted", 1.0, None);
+    seed_warm(&case, " hinted", 1.0, None);
     take_output(&case);
     let release = Go(case.folder().join("release-pull"));
     let mut running = start_held_pull(&case, "pull.log", &release, &command, &PULL_HINTED);
@@ -7256,24 +7252,23 @@ fn a_routed_run_hinted_during_its_pull_names_the_pull_once() {
 
 /// The pause before the retried outputs call of [`a_pull_retried_names_its_phase_time_from_the_pull_s_start`], in
 /// milliseconds and in whole seconds.
-const PULL_RETRY_PAUSE: (&str, u64) = ("8000", 8);
+const PULL_RETRY_PAUSE: (&str, u64) = ("2000", 2);
 
 /// The pull's first outputs call fails before the banner and the retry waits [`PULL_RETRY_PAUSE`]. Under
-/// `--test-remote-hint-from-pull` the hint is due only during the pull, 9 s after its start against a p90 of 3 s; the
+/// `--test-remote-hint-from-pull` the hint is due only during the pull, 3 s after its start against a p90 of 1 s; the
 /// retried call is held until the hint is said, by either call's watch, so the case asks no order of the retry and the
-/// hint. Due 9 s into the pull, the hint names a phase of at least the pause either way; that the phase counts from the
+/// hint. Due 3 s into the pull, the hint names a phase of at least the pause either way; that the phase counts from the
 /// pull's start, never the call's, is the client's unit test of the hint's times.
 #[test]
 fn a_pull_retried_names_its_phase_time_from_the_pull_s_start() {
     let case = outputs_case("client-outputs-pull-retried", &BIN);
     let command = [r".\tool.exe", "write", r"bin\new.txt", "retried"];
     let history = ssh_steps(&case, "history", &["ok"; 15]);
-    // The first routed run of a fresh case is cold and files no sample, so six runs make five.
-    for _ in 0..6 {
-        let outcome = finish(client_gate(&case, "history.log", &history, &command));
-        assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    }
-    seed(&case, " retried", 3.0, None);
+    // The one routed run is cold and warms the builder's work folder, and `seed_warm` makes the five warm samples from
+    // its cold sample.
+    let outcome = finish(client_gate(&case, "history.log", &history, &command));
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    seed_warm(&case, " retried", 1.0, None);
     // The PC must lack the output, or the box packs nothing and no pull is made.
     fs::remove_file(case.folder().join("bin").join("new.txt")).expect("the output can be removed");
     let release = Go(case.folder().join("release"));
@@ -7289,7 +7284,7 @@ fn a_pull_retried_names_its_phase_time_from_the_pull_s_start() {
     };
     // In seconds or, for a hint a starved watch says 90 s or more into the pull, in minutes.
     let pulling =
-        Regex::new(r"gate: still running after \d+ (?:s|min), \d+x its usual p90 of 3 s; pulling outputs from builder for (\d+) (s|min)\r?\n")
+        Regex::new(r"gate: still running after \d+ (?:s|min), \d+x its usual p90 of 1 s; pulling outputs from builder for (\d+) (s|min)\r?\n")
             .expect("the pattern is valid");
 
     let mut running = start(client_gate_tuned(&case, "out.log", &steps, &tuned, &command));
@@ -7311,7 +7306,7 @@ fn a_pull_retried_names_its_phase_time_from_the_pull_s_start() {
     let phase = if &found[2] == "min" { figure * 60 } else { figure };
     assert!(
         phase >= PULL_RETRY_PAUSE.1,
-        "the pull's phase is at least the pause, due 9 s into the pull: {phase} s: {outcome:?}"
+        "the pull's phase is at least the pause, due 3 s into the pull: {phase} s: {outcome:?}"
     );
 }
 
@@ -9170,19 +9165,19 @@ fn a_routed_build_of_a_folder_says_it_is_not_restored_here() {
     assert!(!case.folder().join(r"tests\X\obj\project.assets.json").exists(), "{outcome:?}");
 }
 
-/// Six routed builds make the key's history, seeded to a load-adjusted 100 s, so `auto:10` resolves to a 300 s
-/// ceiling on the sixth, a warm run. Counted from the run's arrival against the floor, under 10 s would be left and
-/// the restore skipped; counted from the routed call's start against the ceiling, nearly 300 s are.
+/// One cold routed build makes the key, `seed_warm` making its five warm samples a load-adjusted 100 s, so `auto:10`
+/// resolves to a 300 s ceiling on the run under test, a warm one. Counted from the run's arrival against the floor,
+/// under 10 s would be left and the restore skipped; counted from the routed call's start against the ceiling, nearly
+/// 300 s are.
 #[test]
 fn a_restore_after_an_auto_ceiling_raised_by_history_gets_the_time_left() {
     let case = restore_case("client-restore-here-auto", false);
     let steps = ssh_steps(&case, "ssh", &["ok"; 30]);
-    // The first routed run of a fresh case is cold and files no sample, so six runs make five.
-    for run in 0..6 {
-        let outcome = finish(client_gate(&case, &format!("history-{run}.log"), &steps, &direct_build(RESTORED_PROJECT)));
-        assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    }
-    crate::durations::seed(&case, "App.csproj", 1.0, Some(100.0));
+    // The one routed build is cold and warms the builder's work folder, and `seed_warm` makes the five warm samples
+    // from its cold sample.
+    let outcome = finish(client_gate(&case, "history.log", &steps, &direct_build(RESTORED_PROJECT)));
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    crate::durations::seed_warm(&case, "App.csproj", 1.0, Some(100.0));
     fs::remove_file(case.folder().join(r"app\obj\project.assets.json")).expect("the first run's restore wrote the assets file");
     let tuned = Tuned {
         timeout: "auto:10",

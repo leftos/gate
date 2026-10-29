@@ -1074,6 +1074,45 @@ pub(crate) fn seed(case: &Case, ending: &str, wall: f64, adjusted: Option<f64>) 
     fs::write(case.root().join("durations.json"), seeded.to_string()).expect("the store can be seeded");
 }
 
+/// The warm samples an estimate needs, gate-state's `MIN_RUNS`, which is private to that crate: a case's one cold run
+/// stands in for the rest.
+const WARM_SAMPLES: usize = 5;
+
+/// Rewrites the history of the one key of `case`'s store ending with `ending`: its samples become the five warm samples
+/// an estimate needs, each a copy of its first cold run's sample at `wall` wall seconds and `adjusted` load-adjusted
+/// seconds, none when `adjusted` is `None`, keeping the sample's every other field. A fresh case's first routed run is
+/// cold and files its sample there, so one routed run makes the history an estimate needs.
+pub(crate) fn seed_warm(case: &Case, ending: &str, wall: f64, adjusted: Option<f64>) {
+    let mut seeded = store(case).expect("the store was written");
+    let keys = seeded["keys"].as_object_mut().expect("the store holds its keys");
+    let matching: Vec<&mut Value> = keys
+        .iter_mut()
+        .filter(|(key, _)| key.ends_with(ending))
+        .map(|(_, history)| history)
+        .collect();
+    assert_eq!(matching.len(), 1, "one key ends with {ending:?}");
+    let warm = |sample: &Value| {
+        let mut sample = sample.clone();
+        let fields = sample.as_object_mut().expect("a sample is an object");
+        fields.insert("wall".to_owned(), Value::from(wall));
+        match adjusted {
+            Some(adjusted) => fields.insert("adjusted".to_owned(), Value::from(adjusted)),
+            None => fields.remove("adjusted"),
+        };
+        sample
+    };
+    for history in matching {
+        let cold = history["cold"]
+            .as_array()
+            .and_then(|cold| cold.first())
+            .cloned()
+            .expect("the one cold run filed a sample");
+        let samples: Vec<Value> = (0..WARM_SAMPLES).map(|_| warm(&cold)).collect();
+        *history["samples"].as_array_mut().expect("a history holds its samples") = samples;
+    }
+    fs::write(case.root().join("durations.json"), seeded.to_string()).expect("the store can be seeded");
+}
+
 /// The command [`held_run`] runs, held on the go file `go`, and the ending of its key.
 const HELD_KEY: &str = " out ran";
 
