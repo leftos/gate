@@ -195,9 +195,9 @@ pub(crate) fn inputs_word(location: &Location, nonce: &str, step: InputsStep, se
     word(&inputs_object(location, nonce, step, sent_bin))
 }
 
-/// The payload word of an inputs put, the [`inputs_word`] of the step `put`; with `channel`, the data channel its
-/// archive goes over, `Channel`: the builder's `Address`, the PC's own `Peer`, the two proofs as lower-case hex, and
-/// the archive's `Length` in bytes and `Sha256` as lower-case hex, which this word alone carries, on the call's
+/// The payload word of an inputs or LFS put, the [`inputs_word`] of the step `put`; with `channel`, the data channel
+/// its archive goes over, `Channel`: the builder's `Address`, the PC's own `Peer`, the two proofs as lower-case hex,
+/// and the archive's `Length` in bytes and `Sha256` as lower-case hex, which this word alone carries, on the call's
 /// standard input. A diff carries no channel, so only a put's word has one.
 pub(crate) fn put_word(location: &Location, nonce: &str, sent_bin: Option<&str>, channel: Option<(&Asked, u64, &[u8; 32])>) -> String {
     let mut object = inputs_object(location, nonce, InputsStep::Put, sent_bin);

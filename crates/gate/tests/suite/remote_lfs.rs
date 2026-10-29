@@ -134,6 +134,14 @@ fn run_kept(case: &Case, count: usize) -> PathBuf {
     kept_steps(case, count, count - 1)
 }
 
+/// The request the stand-in of the steps file `steps` kept of a put, whose input carries the archive after its request
+/// line and the manifest: its first line, read as bytes and decoded.
+fn kept_put_request(steps: &Path) -> Value {
+    let input = fs::read(format!("{}.input", steps.display())).expect("the stand-in kept the call's input");
+    let word = input.split(|byte| *byte == b'\n').next().expect("the input has a request line");
+    serde_json::from_slice(&STANDARD.decode(word.trim_ascii()).expect("the request is base64")).expect("the request is JSON")
+}
+
 /// The steps of a run of `count` calls whose call at `kept`, counted from 0, the stand-in keeps the input of, its go
 /// file made first.
 fn kept_steps(case: &Case, count: usize, kept: usize) -> PathBuf {
@@ -573,4 +581,137 @@ fn an_lfs_fallback_is_journalled_lfs_and_the_run_released_here() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_refused(&events(&case), "lfs");
+}
+
+/// The line a routed run's log gets once a put moved its archive over the data channel.
+const CHANNEL_PUT: &str = r"(?m)^gate: data channel: put (\d+) in \d+\.\d s\r?$";
+
+/// The box's line saying why its data channel did not complete, as the run's log holds it.
+const NOT_COMPLETED: &str = "gate: data channel not completed: ";
+
+/// A client case whose repo keeps `a.bin` in Git LFS, its builder given the loopback `data` address when `data`.
+fn channel_lfs_case(name: &str, data: bool) -> Case {
+    let case = client_case(name);
+    with_lfs_file(&case);
+    let repo = repo_name(&leaf(&case));
+    let mut routing = json!({
+        "host": "builder",
+        "slots": 2,
+        "repos": { &repo: ["*tool*", "cmd *"] },
+        "outputs": { &repo: [] },
+    });
+    if data {
+        routing["data"] = json!("127.0.0.1");
+    }
+    crate::support::write_remote_json(&case, &routing.to_string());
+    case
+}
+
+/// The routed run of `case` logging to `log` through the steps file `steps`, given the options `extra`: every box call
+/// is given a data channel on one free loopback port, with accept and idle windows an hour long, so no case here ends
+/// on a box-side window.
+fn channel_gate(case: &Case, log: &str, steps: &Path, extra: &[&str]) -> std::process::Command {
+    let tuned = Tuned { extra, ..Tuned::default() };
+    let mut gate = client_gate_tuned(case, log, steps, &tuned, &PRINT);
+    let port = crate::remote_client::free_channel_port();
+    gate.env(
+        BOX_SEAMS_VARIABLE,
+        format!("--test-box-channel-ports {port}-{port} --test-box-channel-accept-ms 3600000 --test-box-channel-idle-ms 3600000"),
+    );
+    gate
+}
+
+/// With `data`, the put goes over the data channel: its request declares the archive's length and SHA-256 beside the
+/// channel, the log says the bytes put, which are that length, and the object lands on the builder.
+#[test]
+fn an_lfs_put_with_data_goes_over_the_data_channel_and_installs_what_was_sent() {
+    let case = channel_lfs_case("client-lfs-channel-put", true);
+    let steps = kept_steps(&case, 4, 2);
+
+    let outcome = finish(channel_gate(&case, "out.log", &steps, &[]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "lfs", "lfs", "run"], "the diff, then the put");
+    assert!(outcome.stdout.contains(CONTENT.trim_end()), "the object's bytes: {outcome:?}");
+    let log = log_of(&case, "out.log");
+    let put = Regex::new(CHANNEL_PUT).expect("the pattern compiles").captures(&log);
+    let bytes = put.map(|found| found[1].to_owned());
+    let sent = kept_put_request(&steps);
+    assert_eq!(sent["Step"], json!("put"), "{sent}");
+    assert_eq!(sent["Channel"]["Address"], json!("127.0.0.1"), "{sent}");
+    assert_eq!(
+        bytes.as_deref().map(str::parse::<u64>),
+        Some(Ok(sent["Channel"]["Length"].as_u64().expect("the put declares its length"))),
+        "the log says the length declared: {log}"
+    );
+    let sha256 = sent["Channel"]["Sha256"].as_str().expect("the put declares its SHA-256");
+    assert!(
+        sha256.len() == 64 && sha256.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "{sha256}"
+    );
+    assert!(!log.contains("gate: data channel not used"), "{log}");
+    assert!(sent_line().is_match(&outcome.stderr), "{outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+/// With no `data`, the put is today's: its request asks for no channel and the log says nothing of one.
+#[test]
+fn an_lfs_put_without_data_asks_for_no_channel_and_logs_none() {
+    let case = channel_lfs_case("client-lfs-channel-none", false);
+    let steps = kept_steps(&case, 4, 2);
+
+    let outcome = finish(channel_gate(&case, "out.log", &steps, &[]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "lfs", "lfs", "run"]);
+    let sent = kept_put_request(&steps);
+    assert!(sent.get("Channel").is_none(), "{sent}");
+    assert!(!log_of(&case, "out.log").contains("gate: data channel"), "{}", log_of(&case, "out.log"));
+    assert!(outcome.stdout.contains(CONTENT.trim_end()), "the object's bytes: {outcome:?}");
+}
+
+/// A put whose PC side takes `fault`: the box refuses its channel, saying why as `box_why` starts; the PC logs its
+/// not-used line, saying why as `why` starts, and puts again over ssh, which installs the object once, and the run goes
+/// on with no fallback.
+fn assert_lfs_put_again_over_ssh(name: &str, fault: &str, (why, box_why): (&str, &str)) {
+    let case = channel_lfs_case(name, true);
+    let steps = ssh_steps(&case, "ssh", &["ok"; 5]);
+
+    let outcome = finish(channel_gate(&case, "out.log", &steps, &["--test-remote-channel-fault", fault]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        calls(&steps),
+        ["preflight", "lfs", "lfs", "lfs", "run"],
+        "the diff, the channel put, the ssh put"
+    );
+    let log = log_of(&case, "out.log");
+    let not_used = format!("gate: data channel not used: {why}");
+    assert!(
+        log.lines().any(|line| line.starts_with(&not_used) && line.ends_with("; sent over ssh")),
+        "{log}"
+    );
+    assert!(log.contains(&format!("{NOT_COMPLETED}{box_why}")), "the box refused the channel: {log}");
+    assert!(!Regex::new(CHANNEL_PUT).expect("the pattern compiles").is_match(&log), "{log}");
+    assert!(outcome.stdout.contains(CONTENT.trim_end()), "the run ran on the builder: {outcome:?}");
+    assert!(sent_line().is_match(&outcome.stderr), "{outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn an_lfs_put_whose_box_proof_the_pc_refuses_falls_back_over_ssh_and_installs_once() {
+    assert_lfs_put_again_over_ssh(
+        "client-lfs-channel-box-proof",
+        "box-proof",
+        ("the box's proof does not match", "the PC closed the channel before its proof"),
+    );
+}
+
+#[test]
+fn an_lfs_put_whose_channel_is_truncated_falls_back_over_ssh_and_installs_once() {
+    assert_lfs_put_again_over_ssh(
+        "client-lfs-channel-truncate",
+        "truncate",
+        ("the test seam stopped the put after ", "the PC closed the channel after "),
+    );
 }

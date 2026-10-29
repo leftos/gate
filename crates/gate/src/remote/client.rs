@@ -3393,19 +3393,18 @@ impl Attempt<'_, '_> {
         self.archive_call(BoxVerb::Inputs, raise, (head, archive), sink, watch)
     }
 
-    /// One LFS call, `gate box lfs`, fed `head`, whose word carries the call's `nonce`, made as
-    /// [`Attempt::inputs_call`] makes an inputs call over ssh alone, but for the console interrupt, which
-    /// `--test-remote-interrupt-at lfs` raises at the LFS phase's start instead.
+    /// One LFS call, `gate box lfs`, made as [`Attempt::inputs_call`] makes an inputs call but for the verb and the
+    /// console interrupt, which `--test-remote-interrupt-at lfs` raises at the LFS phase's start instead: each attempt
+    /// is fed the head `head` makes for it and, when an archive is given, its bytes on standard input or, for a put
+    /// whose builder has a data channel, over that channel.
     pub(super) fn lfs_call(
         &mut self,
-        (head, nonce): (&Arc<str>, &str),
-        archive: Option<(&File, u64)>,
+        head: Head<'_>,
+        archive: Option<Sent<'_>>,
         sink: Option<&dyn Fn() -> Result<RawSink, String>>,
         watch: Watch,
     ) -> Result<Called, End> {
-        let made = |_: Option<&channel::Asked>| (nonce.to_owned(), Arc::clone(head));
-        let archive = archive.map(|(file, length)| Sent { file, length, sha256: None });
-        self.archive_call(BoxVerb::Lfs, false, (&made, archive), sink, watch)
+        self.archive_call(BoxVerb::Lfs, false, (head, archive), sink, watch)
     }
 
     /// One call of `gate box <verb>` fed the head `head` makes for each attempt and, when given, an archive

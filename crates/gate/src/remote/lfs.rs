@@ -13,15 +13,19 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::num::NonZeroU64;
+use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gate_router::escaped;
 use gate_state::FallbackReason;
 use gate_win32::Interrupt;
 use gate_wire::{SHA256_DIGITS, is_lower_hex};
+use sha2::{Digest, Sha256};
 
-use super::client::{Attempt, End, RawSink, Watch};
+use super::channel;
+use super::client::{Attempt, End, RawSink, Sent, Watch};
 use super::git::{Call, Git, GitBounds, GitError, OUTPUT_CAP};
 use super::inputs::{Asking, MB, Step, TMP, Unsent, judged, tmp_file, unexpected};
 use super::outputs::{Archive, Unbuilt};
@@ -558,8 +562,15 @@ fn found_object(folder: &Path, object: &Object) -> Result<Found, String> {
 /// format, each member named by its oid, `go_on` asked before the pack and before each write. Each object is hashed as
 /// it is read and its size and SHA-256 checked against its pointer; one missing, of another size or hash, or that
 /// changes while it is packed is refused, naming its pointer's path and saying to fetch it. The archive's compressed
-/// size; else the interrupt, or why not.
-pub(super) fn packed(archive: &File, folder: &Path, needed: &[&Object], go_on: &dyn Fn() -> bool) -> Result<u64, Unbuilt> {
+/// size and, when `hashed`, the SHA-256 of its bytes, read back from the file once it is packed; else the interrupt, or
+/// why not.
+pub(super) fn packed(
+    archive: &File,
+    folder: &Path,
+    needed: &[&Object],
+    go_on: &dyn Fn() -> bool,
+    hashed: bool,
+) -> Result<(u64, Option<[u8; 32]>), Unbuilt> {
     let found = needed
         .iter()
         .map(|object| found_object(folder, object))
@@ -591,7 +602,37 @@ pub(super) fn packed(archive: &File, folder: &Path, needed: &[&Object], go_on: &
             )));
         }
     }
-    Ok(packed.compressed)
+    let sha256 = if hashed {
+        Some(archive_sha256(archive, packed.compressed, go_on)?)
+    } else {
+        None
+    };
+    Ok((packed.compressed, sha256))
+}
+
+/// The SHA-256 of the first `length` bytes of `archive`, `go_on` asked before each read, as the pack asks it before each
+/// write; else the interrupt, or why not, a file shorter than `length` included. Each read names its own offset, counted
+/// from the file's start, so where the handle's position stands does not matter.
+fn archive_sha256(archive: &File, length: u64, go_on: &dyn Fn() -> bool) -> Result<[u8; 32], Unbuilt> {
+    let cannot = |why: String| Unbuilt::Failed(format!("cannot read the LFS archive back: {why}"));
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut offset = 0_u64;
+    while offset < length {
+        if !go_on() {
+            return Err(Unbuilt::Interrupted);
+        }
+        let want = usize::try_from(length - offset).unwrap_or(usize::MAX).min(buffer.len());
+        let read = archive
+            .seek_read(&mut buffer[..want], offset)
+            .map_err(|error| cannot(error.to_string()))?;
+        if read == 0 {
+            return Err(cannot(format!("the archive ends after {offset} of its {length} bytes")));
+        }
+        hasher.update(&buffer[..read]);
+        offset += read as u64;
+    }
+    Ok(hasher.finalize().into())
 }
 
 /// The objects of `objects` the diff's standard output `said` names: `need <n>`, then `n` oids, each an object of the
@@ -744,8 +785,10 @@ fn sent_to(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, send
     let objects = objects_folder(alone, attempt.git, attempt.call.interrupt).map_err(unsent)?;
     let path = folder.join(format!("{}-{nonce}.lfs.tar.zst", attempt.call.key));
     let archive = tmp_file(root, &path, "the LFS archive").map_err(Unsent::Refused)?;
-    let compressed = packed(&archive, &objects, &needed, &|| attempt.go_on().is_ok()).map_err(unsent)?;
-    put(attempt, location, sending, (&archive, compressed, needed.len()))?;
+    // The archive's SHA-256 is read back only for a put that asks for the builder's data channel, which declares it.
+    let hashed = matches!(channel::planned(attempt.call.builder), Ok(Some(_)));
+    let (compressed, sha256) = packed(&archive, &objects, &needed, &|| attempt.go_on().is_ok(), hashed).map_err(unsent)?;
+    put(attempt, location, sending, (&archive, (compressed, sha256.as_ref()), needed.len()))?;
     drop(archive);
     drop(held);
     attempt.say(sent_line(needed.len(), bytes, started.elapsed()));
@@ -797,7 +840,9 @@ fn diffed<'s>(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, s
         })
     };
     let watch = Watch::Fetch(attempt.limits_for("lfs-diff"), None);
-    let called = attempt.lfs_call((&head, &call_nonce), None, Some(&make), watch).map_err(Unsent::Ended)?;
+    // A diff asks for no data channel and keeps the head and nonce it made: the maker is the same every attempt.
+    let maker = |_: Option<&channel::Asked>| (call_nonce.clone(), Arc::clone(&head));
+    let called = attempt.lfs_call(&maker, None, Some(&make), watch).map_err(Unsent::Ended)?;
     judged(attempt, &called, Step::LfsDiff)?;
     let mut text = Vec::new();
     (&answer)
@@ -807,18 +852,26 @@ fn diffed<'s>(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, s
     needed(&String::from_utf8_lossy(&text), &sending.objects).map_err(Unsent::Refused)
 }
 
-/// The put call of the `sent` objects packed into the open archive, its compressed length and their count: the
-/// request, the manifest and then the archive, watched as a put; else why not, a builder that installed another count
-/// than was sent included.
-fn put(attempt: &mut Attempt<'_, '_>, location: &Location, sending: &Sending, sent: (&File, u64, usize)) -> Result<(), Unsent> {
-    let (archive, length, count) = sent;
-    // Each call's word carries a nonce new to it, which the box's refusal tags for the call name.
-    let call_nonce = payload::run_nonce();
-    let head = payload::input(&payload::inputs_word(location, &call_nonce, InputsStep::Put, None), Some(&sending.line));
+/// The put call of the `sent` objects packed into the open archive, its compressed length and SHA-256, and their count:
+/// the request, the manifest and then the archive, over ssh or the builder's data channel, watched as a put; else why
+/// not, a builder that installed another count than was sent included.
+fn put(attempt: &mut Attempt<'_, '_>, location: &Location, sending: &Sending, sent: (&File, (u64, Option<&[u8; 32]>), usize)) -> Result<(), Unsent> {
+    let (archive, (length, sha256), count) = sent;
+    // Each attempt's word carries a nonce new to it, which the box's refusal tags for the call name and the box's
+    // stage is named by, and the data channel the attempt asks for, with proofs of its own.
+    let head = |asked: Option<&channel::Asked>| {
+        let nonce = payload::run_nonce();
+        let channel = asked.zip(sha256).map(|(asked, sha256)| (asked, length, sha256));
+        let word = payload::put_word(location, &nonce, None, channel);
+        (nonce, payload::input(&word, Some(&sending.line)))
+    };
     let watch = Watch::Put(attempt.limits_for("lfs"));
-    let called = attempt
-        .lfs_call((&head, &call_nonce), Some((archive, length)), None, watch)
-        .map_err(Unsent::Ended)?;
+    let archive = Sent {
+        file: archive,
+        length,
+        sha256,
+    };
+    let called = attempt.lfs_call(&head, Some(archive), None, watch).map_err(Unsent::Ended)?;
     judged(attempt, &called, Step::LfsPut)?;
     installed_all(&called.lines, count).map_err(Unsent::Refused)
 }
@@ -953,7 +1006,7 @@ mod tests {
             .open(&path)
             .expect("the archive can be made");
         let needed: Vec<&Object> = listed.objects.iter().collect();
-        packed(&archive, &objects, &needed, &|| true)
+        packed(&archive, &objects, &needed, &|| true, false).map(|(length, _)| length)
     }
 
     /// Why `result` failed, which it must have.

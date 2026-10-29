@@ -3,21 +3,26 @@
 
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpStream};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use gate_inputs::archive::sent_limit;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, READ_CONTROL};
 
 use super::ReadBack;
+use super::channel_pc::{
+    BOX_PROOF, PC_PROOF, assert_no_proof, channel_line, free_port, listening, not_completed, pc_connected, proved, with_windows,
+};
 use super::{
     Does, box_call, field, gate_box, git, has_ref, lines, pair_payload, pair_snapshot, passed, path_for_run, payload, refused_line, renamed, run_box,
     run_box_with_env, run_box_with_path, snapshot, started_line, stub_git_doing,
 };
-use crate::support::{Case, FAKE_TOOL, Outcome, box_payload};
+use crate::support::{Case, FAKE_TOOL, Outcome, Running, box_payload, shown};
 
 /// The lower-case hex SHA-256 of `bytes`.
 fn sha256(bytes: &[u8]) -> String {
@@ -1457,4 +1462,343 @@ fn a_run_with_no_pointers_runs_as_before() {
     assert_eq!(outcome.stderr, format!("{}\n", started_line(&payload)), "only the marker: {outcome:?}");
     assert!(!store(&payload).exists(), "no store is touched: {outcome:?}");
     assert!(scratch_left(&payload).is_empty(), "the scratch folder is removed: {outcome:?}");
+}
+
+/// `payload` asking for a put whose archive comes over a data channel on loopback from loopback with the case's
+/// proofs, its length and SHA-256 declared as `length` and `sha256`.
+fn channel_put_declaring(payload: &Value, length: usize, sha256: &str) -> Value {
+    let mut put = stepped(payload, "put");
+    put["Channel"] = json!({
+        "Address": "127.0.0.1",
+        "Peer": "127.0.0.1",
+        "BoxProof": BOX_PROOF,
+        "PcProof": PC_PROOF,
+        "Length": length,
+        "Sha256": sha256,
+    });
+    put
+}
+
+/// `payload` asking for a put of `archive` over a data channel, its length and SHA-256 declared as they are.
+fn channel_put(payload: &Value, archive: &[u8]) -> Value {
+    channel_put_declaring(payload, archive.len(), &sha256(archive))
+}
+
+/// `gate box lfs` of `payload` started with its data channel's ports narrowed to `port` alone and the seams `seams`
+/// before the verb, its request and the manifest line `manifest` written and its stdin then closed, as the PC closes
+/// it after the head of a put over a data channel.
+fn channel_lfs(case: &Case, payload: &Value, port: u16, seams: &[&str], manifest: &str) -> Running {
+    channel_lfs_env(case, payload, port, seams, manifest, &[])
+}
+
+/// [`channel_lfs`] with `env` set on the box call.
+fn channel_lfs_env(case: &Case, payload: &Value, port: u16, seams: &[&str], manifest: &str, env: &[(&str, &str)]) -> Running {
+    let ports = format!("{port}-{port}");
+    let mut args = vec!["box", "--test-box-channel-ports", &ports];
+    args.extend(with_windows(seams));
+    args.push("lfs");
+    let mut call = box_call(case, &args, &self::payload(payload));
+    for (name, value) in env {
+        call.env(name, value);
+    }
+    let (running, mut stdin) = call.start_with_stdin();
+    // A box that refuses before it reads the manifest may close its end first; what it said is the case's to assert.
+    drop(stdin.write_all(format!("{manifest}\n").as_bytes()));
+    drop(stdin);
+    running
+}
+
+/// The PC's connection on `port` once it proved itself and sent `bytes`.
+fn pc_sent(port: u16, bytes: &[u8]) -> TcpStream {
+    let mut stream = pc_connected(port);
+    proved(&mut stream, PC_PROOF);
+    stream.write_all(bytes).expect("the archive's bytes are sent");
+    stream
+}
+
+/// A whole put over the box's data channel on `port`: proofs, then `bytes`, then the box's ack read; then the PC
+/// closes first. The ack.
+fn pc_put(port: u16, bytes: &[u8]) -> Vec<u8> {
+    let mut stream = pc_sent(port, bytes);
+    let mut ack = [0_u8; 32];
+    stream.read_exact(&mut ack).expect("the box's ack comes");
+    ack.to_vec()
+}
+
+/// What the PC reads on `stream` after it sent all it had, to the box's close: none when the box acked nothing.
+fn rest_of(stream: &mut TcpStream) -> Vec<u8> {
+    let mut rest = Vec::new();
+    // A box that closed with bytes unread may reset the connection; then nothing more came.
+    drop(stream.read_to_end(&mut rest));
+    rest
+}
+
+/// Fails unless the put of `payload` installed none of `objects` and left no stage.
+fn assert_nothing_installed(payload: &Value, objects: &[&[u8]]) {
+    for bytes in objects {
+        let path = object_path(payload, bytes);
+        assert!(!path.exists(), "nothing is installed at {}", path.display());
+    }
+    assert!(stages_left(payload).is_empty(), "the stage is removed: {:?}", stages_left(payload));
+}
+
+#[test]
+fn box_lfs_put_unpacks_the_archive_from_the_data_channel_and_installs_it_once_the_digest_matched() {
+    let case = Case::new("box_lfs_channel_whole");
+    let payload = lfs_payload(&case);
+    let bytes = objects_archive(&[A, B]);
+    let put = channel_put(&payload, &bytes);
+    let port = free_port();
+    let running = channel_lfs(&case, &put, port, &[], &manifest_line(&[A, B]));
+    listening(&running, &put, port);
+
+    let ack = pc_put(port, &bytes);
+    let outcome = running.finish_read();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "gate-remote-lfs: installed 2\n", "{outcome:?}");
+    assert_eq!(outcome.stderr, format!("{}\n", channel_line(&put, port)), "{outcome:?}");
+    assert_eq!(ack, Sha256::digest(&bytes).to_vec(), "the ack is the SHA-256 of what was sent");
+    assert_eq!(fs::read(object_path(&put, A)).expect("the object is installed"), A);
+    assert_eq!(fs::read(object_path(&put, B)).expect("the object is installed"), B);
+    assert!(stages_left(&put).is_empty(), "the stage is removed: {:?}", stages_left(&put));
+    assert_no_proof(&outcome);
+}
+
+#[test]
+fn box_lfs_put_refuses_a_digest_that_differs_and_installs_nothing_with_the_channel_tag() {
+    let case = Case::new("box_lfs_channel_digest");
+    let payload = lfs_payload(&case);
+    let bytes = objects_archive(&[A]);
+    let put = channel_put_declaring(&payload, bytes.len(), &sha256(b"another archive"));
+    let port = free_port();
+    let running = channel_lfs(&case, &put, port, &[], &manifest_line(&[A]));
+    listening(&running, &put, port);
+
+    let mut stream = pc_sent(port, &bytes);
+    let rest = rest_of(&mut stream);
+    let outcome = running.finish_read();
+
+    assert!(rest.is_empty(), "no ack follows a refused archive: {} came", rest.len());
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!(
+            "{}\n{}",
+            channel_line(&put, port),
+            not_completed(&put, "the bytes received do not have the SHA-256 declared")
+        ),
+        "{outcome:?}"
+    );
+    assert_nothing_installed(&put, &[A]);
+}
+
+#[test]
+fn box_lfs_put_refuses_a_stream_shorter_than_the_declared_length_with_the_channel_tag() {
+    let case = Case::new("box_lfs_channel_short");
+    let payload = lfs_payload(&case);
+    let bytes = objects_archive(&[A]);
+    let declared = bytes.len() + 10;
+    let put = channel_put_declaring(&payload, declared, &sha256(&bytes));
+    let port = free_port();
+    let running = channel_lfs(&case, &put, port, &[], &manifest_line(&[A]));
+    listening(&running, &put, port);
+
+    let stream = pc_sent(port, &bytes);
+    stream.shutdown(Shutdown::Write).expect("the PC closes its side");
+    let outcome = running.finish_read();
+    drop(stream);
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    let why = format!("the PC closed the channel after {} of the {declared} bytes declared", bytes.len());
+    assert_eq!(outcome.stderr, format!("{}\n{}", channel_line(&put, port), not_completed(&put, &why)));
+    assert_nothing_installed(&put, &[A]);
+}
+
+#[test]
+fn box_lfs_put_refuses_a_wrong_pc_proof_with_the_channel_tag_and_removes_the_stage() {
+    let case = Case::new("box_lfs_channel_wrong_proof");
+    let payload = lfs_payload(&case);
+    let bytes = objects_archive(&[A]);
+    let put = channel_put(&payload, &bytes);
+    let port = free_port();
+    let running = channel_lfs(&case, &put, port, &[], &manifest_line(&[A]));
+    listening(&running, &put, port);
+
+    let mut stream = pc_connected(port);
+    proved(&mut stream, "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f");
+    let outcome = running.finish_read();
+    drop(stream);
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!("{}\n{}", channel_line(&put, port), not_completed(&put, "the PC's proof does not match")),
+        "{outcome:?}"
+    );
+    assert_nothing_installed(&put, &[A]);
+}
+
+/// The channel decides nothing: an archive declaring more bytes than a sent stream may carry is refused before any
+/// listener opens and in the step's own failure line, not with the `channel` tag.
+#[test]
+fn box_lfs_put_over_the_budget_is_refused_before_any_channel_line() {
+    let case = Case::new("box_lfs_channel_over_budget");
+    let payload = lfs_payload(&case);
+    let bytes = objects_archive(&[A]);
+    let budget = bytes.len() - 1;
+    let limit = sent_limit(u64::try_from(budget).expect("the budget fits a u64")).get();
+    let length = usize::try_from(limit).expect("the limit fits a usize") + 1;
+    let put = channel_put_declaring(&payload, length, &sha256(&bytes));
+    let budget = budget.to_string();
+
+    let outcome = channel_lfs(&case, &put, free_port(), &["--test-lfs-budget-bytes", &budget], &manifest_line(&[A])).finish_read();
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!(
+            "{}\ngate: remote lfs put failed: the archive's {length} bytes are over the put's {limit}-byte limit\n",
+            refused_line(&put, "lfs")
+        ),
+        "no channel line: {outcome:?}"
+    );
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_nothing_installed(&put, &[A]);
+}
+
+/// An archive declaring exactly what a sent stream may carry opens the channel and is judged by what it unpacks to, not
+/// refused for its length: the same band the inputs put takes.
+#[test]
+fn box_lfs_put_at_the_sent_limit_opens_the_channel() {
+    let case = Case::new("box_lfs_channel_sent_limit");
+    let payload = lfs_payload(&case);
+    let bytes = objects_archive(&[A]);
+    let budget = bytes.len() - 1;
+    let limit = sent_limit(u64::try_from(budget).expect("the budget fits a u64")).get();
+    let length = usize::try_from(limit).expect("the limit fits a usize");
+    let put = channel_put_declaring(&payload, length, &sha256(&bytes));
+    let budget = budget.to_string();
+    let port = free_port();
+    let running = channel_lfs(&case, &put, port, &["--test-lfs-budget-bytes", &budget], &manifest_line(&[A]));
+    listening(&running, &put, port);
+
+    let stream = pc_sent(port, &bytes);
+    stream.shutdown(Shutdown::Write).expect("the PC closes its side");
+    let outcome = running.finish_read();
+    drop(stream);
+
+    assert!(
+        outcome.stderr.starts_with(&format!("{}\n", channel_line(&put, port))),
+        "the channel opened: {outcome:?}"
+    );
+    assert!(
+        !outcome.stderr.contains("bytes are over the put's"),
+        "not refused for its length: {outcome:?}"
+    );
+    assert_nothing_installed(&put, &[A]);
+}
+
+/// The drain is passed before the step runs, so a drained box refuses the put before any listener opens.
+#[test]
+fn box_lfs_put_with_a_drained_box_is_refused_before_any_channel_line() {
+    const T: u64 = 1_800_000_000;
+    let case = Case::new("box_lfs_channel_drained");
+    let payload = lfs_payload(&case);
+    let bytes = objects_archive(&[A]);
+    let mut put = channel_put(&payload, &bytes);
+    put["Session"] = json!("s9");
+    let root = shown(&case.folder().join("remote"));
+    let now = T.to_string();
+    let raised = box_call(
+        &case,
+        &["box", "--test-box-now", &now, "--test-box-drain-readable-only", "true", "drain"],
+        &self::payload(&json!({ "Root": root, "Action": "raise" })),
+    )
+    .finish();
+    assert_eq!(raised.code, Some(0), "{raised:?}");
+    let later = (T + 1).to_string();
+    let seams = ["--test-box-now", later.as_str(), "--test-box-drain-readable-only", "true"];
+
+    let outcome = channel_lfs(&case, &put, free_port(), &seams, &manifest_line(&[A])).finish_read();
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    assert_eq!(
+        lines(&outcome.stderr).first().copied(),
+        Some(refused_line(&put, "drain").as_str()),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("gate-remote-channel:"), "no channel line: {outcome:?}");
+    assert_nothing_installed(&put, &[A]);
+}
+
+/// An unelevated box refuses to write the store, before any listener opens.
+#[test]
+fn box_lfs_put_on_an_unelevated_box_is_refused_before_any_channel_line() {
+    let case = Case::new("box_lfs_channel_unelevated");
+    let payload = lfs_payload(&case);
+    let bytes = objects_archive(&[A]);
+    let put = channel_put(&payload, &bytes);
+
+    let outcome = channel_lfs_env(
+        &case,
+        &put,
+        free_port(),
+        &[],
+        &manifest_line(&[A]),
+        &[("GATE_TEST_BOX_ELEVATION", "check")],
+    )
+    .finish_read();
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(
+        lines(&outcome.stderr).first().copied(),
+        Some(refused_line(&put, "lfs").as_str()),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("gate-remote-channel:"), "no channel line: {outcome:?}");
+    assert_nothing_installed(&put, &[A]);
+}
+
+#[test]
+fn box_lfs_diff_with_a_channel_is_refused() {
+    let case = Case::new("box_lfs_channel_diff");
+    let payload = lfs_payload(&case);
+    let bytes = objects_archive(&[A]);
+    let asked = stepped(&channel_put(&payload, &bytes), "diff");
+
+    let outcome = lfs_call_with(&case, &asked, &[], &[], (&manifest_line(&[A]), &[]));
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stderr, "gate: box payload Channel is not taken on a diff step\n", "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+}
+
+/// The bytes arrived verified, so a member the manifest does not match is the stdin path's refusal, not the channel's:
+/// the box acks the whole archive and then says the `lfs` tag and its member line, as it does over stdin.
+#[test]
+fn box_lfs_put_whose_member_differs_from_its_pointer_after_a_whole_stream_says_the_stdin_refusal_not_the_channel_tag() {
+    let case = Case::new("box_lfs_channel_member");
+    let payload = lfs_payload(&case);
+    let bytes = archive(&[(&sha256(B), A)]);
+    let put = channel_put(&payload, &bytes);
+    let port = free_port();
+    let running = channel_lfs(&case, &put, port, &[], &manifest_line(&[B]));
+    listening(&running, &put, port);
+
+    let ack = pc_put(port, &bytes);
+    let outcome = running.finish_read();
+    let mut plain = put.clone();
+    plain.as_object_mut().expect("the payload is an object").remove("Channel");
+    let over_stdin = put_with(&case, &plain, &[], &[B], &bytes);
+
+    assert_eq!(ack, Sha256::digest(&bytes).to_vec(), "the box verified and acked the whole archive");
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let after = outcome
+        .stderr
+        .strip_prefix(&format!("{}\n", channel_line(&put, port)))
+        .expect("the channel line comes first");
+    assert_eq!(after, over_stdin.stderr, "the refusal is the stdin path's");
+    assert!(!after.contains(" channel"), "never the channel tag: {after}");
+    assert_nothing_installed(&put, &[B]);
 }

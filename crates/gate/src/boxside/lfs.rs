@@ -2,7 +2,8 @@
 //! bare repository, `{Bare}\lfs\objects\{oid[0..2]}\{oid[2..4]}\{oid}`, which every work folder of the repo reads
 //! through its alternates. Its request names the `Step`: `diff` reads the PC's manifest line of `<oid> <size>` entries
 //! and says which objects the store lacks or holds at another size, and `put` reads the manifest and then an archive of
-//! those objects, each member named by its oid, in the outputs archive's format, to the end of stdin, and installs them.
+//! those objects, each member named by its oid, in the outputs archive's format, to the end of stdin or over the
+//! request's data channel, and installs them.
 //!
 //! Every folder of the store is made with the box's protected security and an existing one is adopted only when it
 //! holds that security, so no other account and no lower process writes the store; an unelevated box, whose folders are
@@ -22,15 +23,17 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gate_args::BoxSeams;
+use gate_inputs::archive::sent_limit;
 use gate_router::escaped;
 use gate_win32::{Descriptor, Make, Share};
-use gate_wire::{Payload, SHA256_DIGITS, grandparent, is_lower_hex};
+use gate_wire::{Payload, PutChannel, SHA256_DIGITS, channel_not_completed_line, grandparent, is_lower_hex};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
     READ_CONTROL,
 };
 
 use crate::answer::USAGE_STATUS;
+use crate::boxside::channel;
 use crate::boxside::drain;
 use crate::boxside::inputs::{
     Leftover, SCRATCH_SUFFIX_DIGITS, STAGED_ACCESS, Stage, StageNamed, WorkLock, locked, made_stage_named, not_the_box_s, plain_copy,
@@ -57,6 +60,8 @@ const STAGES: &str = "lfs-stage";
 const STAGED_FILES: &str = "files";
 /// The line refusing a request that names a sibling pair.
 const PAIR_REFUSED: &str = "gate box: lfs for a sibling pair is not taken yet";
+/// The line refusing a diff that carries a data channel, which only a put has.
+const DIFF_CHANNEL: &str = "gate: box payload Channel is not taken on a diff step";
 /// The test seam that makes a build with the `test-seams` feature refuse an unelevated box, when it is `check`.
 const ELEVATION_SEAM: &str = "GATE_TEST_BOX_ELEVATION";
 /// The store's lock beside the store, `{Bare}\lfs.lock`.
@@ -88,10 +93,13 @@ struct Asked<'a> {
     step: Step,
     /// The box's root, `{root}\work\{key}` being the work folder, which the stages folder sits in.
     root: &'a str,
+    /// The data channel a put's archive comes over instead of stdin, `None` for stdin.
+    channel: Option<PutChannel>,
 }
 
 impl Asked<'_> {
-    /// The request `payload` holds; else the usage line. A request naming a sibling pair is refused first.
+    /// The request `payload` holds; else the usage line. A request naming a sibling pair is refused first. A put's
+    /// `Channel` is read as [`Payload::put_channel`] reads it; a diff's is refused, as the PC never sends one.
     fn read(payload: &Payload) -> Result<Asked<'_>, String> {
         if payload.sets("Pair") {
             return Err(PAIR_REFUSED.to_owned());
@@ -107,6 +115,11 @@ impl Asked<'_> {
         };
         let root =
             grandparent(work).ok_or_else(|| format!(r"gate: box payload Work must be <root>\work\<key> to stage objects: {}", escaped(work)))?;
+        let channel = match &step {
+            Step::Put => payload.put_channel()?,
+            Step::Diff if payload.sets("Channel") => return Err(DIFF_CHANNEL.to_owned()),
+            Step::Diff => None,
+        };
         Ok(Asked {
             key,
             work,
@@ -115,6 +128,7 @@ impl Asked<'_> {
             nonce,
             step,
             root,
+            channel,
         })
     }
 
@@ -413,10 +427,12 @@ fn diff(asked: &Asked<'_>, wanted: &[Wanted], console: &mut Console) -> u32 {
     }
 }
 
-/// The put: the store readied under its lock, then its stage made, the archive on stdin unpacked into it and checked
-/// against the manifest `wanted`, then under the work folder's lock and the store's each object installed
-/// ([`installed`]); the stage removed beneath its held handles on every way out once made, and `gate-remote-lfs:
-/// installed <n>` said; 0. Else the status, its lines said.
+/// The put: the store readied under its lock, then its stage made, the archive on stdin, or over the request's data
+/// channel, unpacked into it and checked against the manifest `wanted`, then under the work folder's lock and the
+/// store's each object installed ([`installed`]); the stage removed beneath its held handles on every way out once
+/// made, and `gate-remote-lfs: installed <n>` said; 0. Else the status, its lines said: a data channel that did not
+/// complete says the `channel` refusal tag and why once the stage is removed, with the refusal status, and nothing is
+/// installed.
 fn put(asked: &Asked<'_>, wanted: &[Wanted], seams: &BoxSeams, console: &mut Console) -> u32 {
     if let Err(why) = Store::opened(asked.bare, console) {
         return refused(asked, &why, console);
@@ -439,22 +455,43 @@ fn put(asked: &Asked<'_>, wanted: &[Wanted], seams: &BoxSeams, console: &mut Con
             stamping::out(console, &format!("gate-remote-lfs: installed {count}"));
             0
         }
-        (Err(status), Ok(())) => unlocked(asked, status, console),
-        (Err(status), Err(why)) => {
+        (Err(Unstaged::Said(status)), Ok(())) => unlocked(asked, status, console),
+        (Err(Unstaged::Said(status)), Err(why)) => {
             let status = unlocked(asked, status, console);
             stamping::err(console, &format!("gate: remote lfs {} failed: {}", asked.step.word(), escaped(&why)));
             status
         }
+        (Err(Unstaged::Channel(why)), removal) => channel_refused(asked, &why, removal, console),
         (Ok(Err(why)), Ok(())) | (Ok(Ok(_)), Err(why)) => refused(asked, &why, console),
         (Ok(Err(why)), Err(removal)) => refused(asked, &format!("{why}; and {removal}"), console),
     }
 }
 
-/// The archive on stdin unpacked into the held stage `stage` within the budget, once its path is shown to name the
-/// held folder, each member checked against the manifest `wanted` ([`checked`]), then installed under the work folder's
-/// lock ([`locked`], [`installed`]): the count installed or kept, or why not; `Err` with the status when the install
-/// never ran, its lines said.
-fn staged(asked: &Asked<'_>, wanted: &[Wanted], seams: &BoxSeams, stage: &Stage, console: &mut Console) -> Result<Result<usize, String>, u32> {
+/// Why a put installed nothing without a line of its own to say: the install never ran, with the status its lines
+/// already said, or the data channel did not complete, for the reason given, which never holds a proof.
+enum Unstaged {
+    Said(u32),
+    Channel(String),
+}
+
+/// Says a put's data channel did not complete for `why`, after the stage's `removal` failure when there was one: the
+/// `channel` refusal tag and why; the refusal status.
+fn channel_refused(asked: &Asked<'_>, why: &str, removal: Result<(), String>, console: &mut Console) -> u32 {
+    if let Err(removal) = removal {
+        stamping::err(console, &format!("gate: remote lfs {} failed: {}", asked.step.word(), escaped(&removal)));
+    }
+    stamping::protocol(console, &tagged_line(asked.nonce, Refusal::Channel));
+    stamping::err(console, &channel_not_completed_line(why));
+    REFUSED_STATUS
+}
+
+/// The archive, on stdin or over the request's data channel ([`channel::received`]), unpacked into the held stage
+/// `stage` by its path, once that path is shown to name the held folder ([`same_stage`]), within the budget, each
+/// member checked against the manifest `wanted` ([`checked`]), then installed under the work folder's lock ([`locked`],
+/// [`installed`]): the count installed or kept, or why not. The data channel opens only once the stage is shown, and is
+/// closed before the lock is taken; a put declaring more bytes than the budget is refused before any listener opens.
+/// `Err` when the install never ran: with the status, its lines said, or why the data channel did not complete.
+fn staged(asked: &Asked<'_>, wanted: &[Wanted], seams: &BoxSeams, stage: &Stage, console: &mut Console) -> Result<Result<usize, String>, Unstaged> {
     if let Err(why) = same_stage(stage) {
         return Ok(Err(why));
     }
@@ -467,7 +504,21 @@ fn staged(asked: &Asked<'_>, wanted: &[Wanted], seams: &BoxSeams, stage: &Stage,
         manifest: &none,
         go_on: &go_on,
     };
-    let entries = match unpack(io::stdin().lock(), &stage.path.join(STAGED_FILES), budget, &pc) {
+    let into = stage.path.join(STAGED_FILES);
+    let unpacked = match &asked.channel {
+        None => unpack(io::stdin().lock(), &into, budget, &pc),
+        // A put declaring more bytes than a sent stream may carry is refused before any listener, in the step's own
+        // words, as the stdin path refuses one.
+        Some(put) if put.length > sent_limit(budget).get() => {
+            return Ok(Err(format!(
+                "the archive's {} bytes are over the put's {}-byte limit",
+                put.length,
+                sent_limit(budget)
+            )));
+        }
+        Some(put) => channel::received(put, asked.nonce, seams, console, |source| unpack(source, &into, budget, &pc)).map_err(Unstaged::Channel)?,
+    };
+    let entries = match unpacked {
         Ok(entries) => entries,
         Err(error) => return Ok(Err(error.to_string())),
     };
@@ -478,7 +529,7 @@ fn staged(asked: &Asked<'_>, wanted: &[Wanted], seams: &BoxSeams, stage: &Stage,
         Ok(files) => files,
         Err(why) => return Ok(Err(why)),
     };
-    locked(&asked.work_lock(), console, |_, console| installed(asked.bare, &files, &entries, console))
+    locked(&asked.work_lock(), console, |_, console| installed(asked.bare, &files, &entries, console)).map_err(Unstaged::Said)
 }
 
 /// Whether each member of `entries` is an object of the manifest `wanted`, at most once, whose SHA-256 is its name and
