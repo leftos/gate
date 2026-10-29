@@ -735,6 +735,7 @@ fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced
                         marker: kept.marker,
                         manifest: kept.files,
                         globs: kept.globs,
+                        count: kept.count,
                         main_tree,
                         sibling_trees,
                         started,

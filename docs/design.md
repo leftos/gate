@@ -940,6 +940,7 @@ The lines of a run that starts its command:
 
   A pair's sibling whose walk fails says `gate: routed build may have left stale output in ../<sibling>; could not list it: <reason>` on a line of its own, after the folders line and after the main's failure line; the folders of the trees that could be listed are still named. A run of one repo says the same lines as without siblings.
 - The restore lines, on stderr and in the log, after a routed dotnet build that passed and brought everything back restores its target here ([Routing](#routing), The restore here), after the command's tail and before the stale, cores, route and passed lines, which stay the run's last. Each line that is not a success ends `; a --no-build run here builds first`, and the target and the side file's path are escaped.
+  - `gate: restoring here`, directly before the dotnet restore starts and after every skip check (a `gate: not restoring ...` run says no start line).
   - `gate: restored <target> here in <n.n> s, so a --no-build run here can use the routed build's outputs`.
   - `gate: dotnet restore of <target> here failed with exit <code> (<log>.restore.log); a --no-build run here builds first`.
   - `gate: dotnet restore of <target> here ran past <limit> and was stopped (<log>.restore.log); a --no-build run here builds first`, and `gate: dotnet restore of <target> here was interrupted (<log>.restore.log); a --no-build run here builds first` when Ctrl+C was pressed during it, whatever its exit code.
@@ -2983,6 +2984,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   - **Sync-back.** In `remote/syncback.rs`, after a run call that ended with the command's own status (a refusal, an interrupt or a failed call never syncs back).
 
+    A single repository's sync-back says `gate: syncing back from <builder>` as soon as the builder holds a back commit (after the check that one exists), and `gate: sync-back from <builder> ended in <s.s> s` on every end after that: a worktree lock timeout or Ctrl+C, an unreadable gate start, a quarantine that cannot be made, a refusal, a stopped fetch and success. The seconds run from the start line, the lock wait, fetch and apply included. A run with no back commit says neither line.
+
     The sync-back runs no `git rev-parse --git-path objects`: the real object store's path comes from the snapshot, whose `rev-parse --git-path` call also asks for `objects`. It reads it even when there turns out to be no back commit, and sweeps the quarantines of earlier gates (below).
 
     Then `git ls-remote -- <url> refs/gate-back/<key>` then `git -c fetch.fsckObjects=true -c maintenance.auto=false -c gc.auto=0 fetch --progress --no-recurse-submodules --no-tags -- <url> <ref>` run with the push's `GIT_SSH_COMMAND` and `--upload-pack=pwsh -NoProfile -NonInteractive -Command git-upload-pack`; a bare repository on this machine names no pack command.
@@ -3071,6 +3074,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
       The locks are taken in the order of the folders' ids, one per folder. One another run holds is waited for, up to the attempt's lock wait (the 60 s git limit, counted from the first lock asked for), saying once `gate: remote waiting for the worktree <name>: another run holds it`; a wait past it fails the run with `another run held the worktree <name> for more than <n> s`, and a Ctrl+C ends the wait as an interrupt. A lock left by a holder that ended is taken.
     - **A pair's sync-back** (a run that carries siblings, built in `remote/syncback.rs` and the box) is all or nothing across its repos. It applies only the back commits of the box's last stderr line `gate: remote back commits: <name> <sha|none>, ...` (a standard output line never counts), which must name exactly the pair's repos, the main one first, in order.
+
+      A pair says one `gate: syncing back from <builder>` before its first named repository's work (its lock wait included) and one `gate: sync-back from <builder> ended in <s.s> s` after the last, whatever happened, so every `gate: remote changes not applied: ...` line naming a repository falls between them. A back-commits line naming no repository says neither.
 
       A line that is missing, malformed or names other repos says `gate: remote changes not applied: the builder did not say which commits it made`; a pair whose sibling snapshots do not match its siblings says `gate: remote changes not applied: the run's sibling snapshots do not match its siblings`. Either applies nothing and a passing run becomes 1; its outputs are then not brought back, `gate: remote outputs not brought back: the pair's remote changes were not applied`.
 
@@ -3224,6 +3229,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     No end of it clears the pending marker, never touches the cap record, and the run is never marked as outputs back; the hash cache keeps the hashes of the files it placed. A set holding a failure output glob says `the failed run's outputs` in place of `the failed run's test reports` in each of these lines.
 
+    The install says `gate: installing outputs: <n> file(s)` before it moves anything (`<n>` is the count the pull's start line gave); a failed run's reports say `gate: installing the failed run's test reports: <n> file(s)`, or `the failed run's outputs` for a set holding a failure output glob.
+
     The success line is `gate: outputs: <n> file(s), <X.X> MB (<Y.Y> MB compressed) in <Z.Z> s (pulled in <F.F> s, <rate>/s)`: `<n>` counts installed files only (a file left in place is not counted), the seconds run from the start of the fetch to the end of the install, `<F.F>` is the fetch alone, from its start to the archive's last byte (to the call's end when it received none), and `<rate>` the compressed size over it in the same MB (`<x.x> MB/s`), and each decimal rounds a half away from zero.
 
     A fully installed run clears the pending marker.
@@ -3240,7 +3247,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
       The same holds for the git runner's line when the `git ls-files -z -s` of the tracked check failed or wrote past its 16 MiB cap, and for a `--bring-tracked` glob that cannot be compiled.
     - A move that fails after others were made says `gate: remote outputs not brought back: <n> of <m> files were installed before <path> failed: <detail>` (a file that changed between the checks and its move gives `<path> changed during the run`, unless it is then in place, which leaves it); the files already moved stay and the status is 1. `<m>` counts the files to be moved, and `<n>` the files done, those left in place or skipped as in use at their move included.
-    - A Ctrl+C during the moves says `gate: remote outputs not brought back: <n> of <m> files were installed before the interrupt`, then the interrupt ending, with the marker kept and no `stop` call; one before the first move says nothing extra.
+    - A Ctrl+C during the moves says `gate: remote outputs not brought back: <n> of <m> files were installed before the interrupt`, then the interrupt ending, with the marker kept and no `stop` call. One before the first move says `0 of <total> files were installed before the interrupt` (`0 of 0` when the unpack itself was stopped), so every `installing` line has an ending line.
     - The archive and the stage are removed on every end; a failure says `gate: cannot remove the outputs stage <path>: <error>` or, after a whole fetch, `gate: cannot remove the fetched outputs archive <path>: <error>` (a cut fetch still says "partial").
 
     **Tracked members** (GATE-148): the box skips the back commit's paths, but that is no control against a broken or hostile builder, which can send a file git tracks that sits under the globs (a checked-in file under `**/bin/**`), and the install would overwrite it. A member that counts as tracked is therefore not installed: `gate: remote outputs not fully brought back: {path} is tracked by git`, and the run keeps its status, as an output in use does.

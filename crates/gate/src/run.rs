@@ -2611,6 +2611,7 @@ impl Run<'_> {
             }
         };
         let side = restore::side_log(self.log.path());
+        console.err("gate: restoring here");
         let started = Instant::now();
         let ran = self
             .restore_launch(&plan, console)

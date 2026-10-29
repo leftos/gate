@@ -77,6 +77,8 @@ pub(super) struct Fetched<'f> {
     pub(super) marker: Option<&'f Path>,
     pub(super) manifest: &'f Manifest,
     pub(super) globs: &'f [String],
+    /// The files the pull's start line said the archive brings, which the install's start line says again.
+    pub(super) count: u64,
     /// The main repo's tree on the box, which stands for the worktree: the work folder for a run of one repo,
     /// `{work}\{leaf}` for a pair.
     pub(super) main_tree: String,
@@ -288,6 +290,7 @@ pub(super) fn pc_spelling(root: &str) -> io::Result<PathBuf> {
 pub(super) fn installed(attempt: &mut Attempt<'_, '_>, fetched: &Fetched<'_>) -> (End, bool) {
     let staged = Cell::new(false);
     let bringing = fetched.bringing();
+    attempt.say(install_start_line(bringing, fetched.count));
     let (end, lines, complete, clear) = match install(attempt, fetched, &staged) {
         Ok((done, started)) => {
             cached(
@@ -339,10 +342,10 @@ pub(super) fn installed(attempt: &mut Attempt<'_, '_>, fetched: &Fetched<'_>) ->
 }
 
 /// The end of an install of what `bringing` names that did not complete as `unmet` says, and the lines it says: one for
-/// each reason of a refusal, none for a Ctrl+C before any file was moved, which the run's own interrupt handling says.
+/// each reason of a refusal, and for a Ctrl+C one count of the files installed before it, `0 of {total}` when it moved
+/// none, so the install's start line always has an end.
 fn ending(bringing: Bringing, unmet: Unmet) -> (End, Vec<String>) {
     match unmet {
-        Unmet::Interrupted { done: 0, .. } => (End::Interrupted, Vec::new()),
         Unmet::Interrupted { done, total } => {
             let reason = format!("{done} of {total} files were installed before the interrupt");
             (End::Interrupted, vec![outputs::not_brought_back(bringing, &reason)])
@@ -603,6 +606,11 @@ fn reasons(entries: &[Entry], tracked: &HashSet<&str>, in_use: &HashSet<&str>) -
             Some((entry.path.clone(), skip))
         })
         .collect()
+}
+
+/// The line an install of what `bringing` names says as it starts, for the `count` files its pull said it was bringing.
+fn install_start_line(bringing: Bringing, count: u64) -> String {
+    format!("gate: installing {}: {count} file(s)", bringing.pulled())
 }
 
 /// The lines an install of what `bringing` names that put `installed` into the worktree says, `seconds` after its fetch
@@ -1155,9 +1163,10 @@ mod tests {
 
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
+    use super::outputs::Narrowed;
     use super::{
-        Bringing, Checked, Index, Installed, Moved, Moves, Refused, Skip, Unmet, Unmoved, Unrewritable, cached, checked, ending, moved, own_logs,
-        reasons, rewritten, said, stage_made, success_line, tracked, unmet_of, unpacked,
+        Bringing, Checked, Index, Installed, Moved, Moves, Refused, Skip, Unmet, Unmoved, Unrewritable, cached, checked, ending, install_start_line,
+        moved, own_logs, reasons, rewritten, said, stage_made, success_line, tracked, unmet_of, unpacked,
     };
     use crate::boxside::outputs::OUTPUTS_BUDGET;
     use crate::outputs::archive::{Entry, PcFiles, UnpackError, pack};
@@ -1965,7 +1974,9 @@ mod tests {
         }
         assert_eq!(unmet_of(GitError::Interrupted), Unmet::Interrupted { done: 0, total: 0 });
         let (end, line) = ending(Bringing::Outputs, unmet_of(GitError::Interrupted));
-        assert!(matches!(end, End::Interrupted) && line.is_empty(), "{end:?} {line:?}");
+        assert!(matches!(end, End::Interrupted), "{end:?}");
+        let counted = "gate: remote outputs not brought back: 0 of 0 files were installed before the interrupt";
+        assert_eq!(line, [counted], "an interrupt before any file moved still closes the install's step");
     }
 
     /// The reason of a move that failed; else what stopped it, which no failure's reason starts with.
@@ -2245,6 +2256,7 @@ mod tests {
                 marker: Some(marker.as_path()),
                 manifest: &manifest,
                 globs: &globs,
+                count: 1,
                 main_tree: r"D:\gate-remote\work\app-1a2b3c4d".to_owned(),
                 sibling_trees: Vec::new(),
                 started: Instant::now(),
@@ -2313,6 +2325,7 @@ mod tests {
                 marker: Some(marker.as_path()),
                 manifest: &manifest,
                 globs: &globs,
+                count: 1,
                 main_tree: r"D:\gate-remote\work\app-1a2b3c4d".to_owned(),
                 sibling_trees: Vec::new(),
                 started: Instant::now(),
@@ -2367,6 +2380,7 @@ mod tests {
                 marker: Some(marker.as_path()),
                 manifest: &manifest,
                 globs: &globs,
+                count: 1,
                 main_tree: r"D:\gate-remote\work\app-1a2b3c4d".to_owned(),
                 sibling_trees: Vec::new(),
                 started: Instant::now(),
@@ -2421,6 +2435,7 @@ mod tests {
                 marker: Some(marker.as_path()),
                 manifest: &manifest,
                 globs: &globs,
+                count: 1,
                 main_tree: r"D:\gate-remote\work\app-1a2b3c4d".to_owned(),
                 sibling_trees: Vec::new(),
                 started: Instant::now(),
@@ -2664,7 +2679,9 @@ mod tests {
     #[test]
     fn an_interrupt_before_the_first_move_says_no_count() {
         let (end, line) = ending(Bringing::Outputs, Unmet::Interrupted { done: 0, total: 3 });
-        assert!(matches!(end, End::Interrupted) && line.is_empty(), "{end:?} {line:?}");
+        assert!(matches!(end, End::Interrupted), "{end:?}");
+        let counted = "gate: remote outputs not brought back: 0 of 3 files were installed before the interrupt";
+        assert_eq!(line, [counted]);
 
         let (end, line) = ending(Bringing::Outputs, Unmet::Interrupted { done: 1, total: 3 });
         assert!(matches!(end, End::Interrupted), "{end:?}");
@@ -2678,6 +2695,16 @@ mod tests {
         assert!(matches!(end, End::Status(1)), "{end:?}");
         let refused = "gate: remote outputs not brought back: bin/a.dll changed during the run";
         assert_eq!(line, [refused]);
+    }
+
+    /// The install's start line says what the pull's said it brings, for the files it said were coming.
+    #[test]
+    fn the_install_s_start_line_says_what_the_pull_brings() {
+        assert_eq!(install_start_line(Bringing::Outputs, 3), "gate: installing outputs: 3 file(s)");
+        assert_eq!(
+            install_start_line(Bringing::Reports(Narrowed::TestReports), 2),
+            "gate: installing the failed run's test reports: 2 file(s)"
+        );
     }
 
     #[test]

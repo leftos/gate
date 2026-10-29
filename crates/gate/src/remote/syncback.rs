@@ -36,6 +36,7 @@ use gate_router::{FolderId, escaped, repo_name};
 use super::RemoteCall;
 use super::client::{Attempt, Called, End, Watch};
 use super::git::{self, Git, GitError};
+use super::install;
 use super::launch::KILL_WAIT;
 use super::payload;
 use super::retry::GIT_SSH_FAILED;
@@ -197,7 +198,9 @@ pub(super) fn sync_back(
     }
 }
 
-/// The sync-back of a single repository, `target`, as [`sync_back`] ends it.
+/// The sync-back of a single repository, `target`, as [`sync_back`] ends it: its step's start line said once a back
+/// commit is known, and its end line said however every step after that ends, the lock's refusal, the gate's own start
+/// or the quarantine's failure, a refusal, an interrupted fetch and success among them.
 fn one(attempt: &mut Attempt<'_, '_>, target: &Target<'_>, status: i64) -> Result<End, End> {
     attempt.go_on()?;
     let profile = attempt.profile();
@@ -221,25 +224,31 @@ fn one(attempt: &mut Attempt<'_, '_>, target: &Target<'_>, status: i64) -> Resul
     let Some(advertised) = has_back(attempt, &worktree, &remote)? else {
         return Ok(End::Status(status));
     };
-    let call = attempt.call;
-    let _lock = worktree_lock::held(call.state, &[target.folder()], attempt.lock_wait, call.interrupt, |line| {
-        attempt.say(line);
-    })?;
-    let name = incoming_name(std::process::id(), own_start(attempt.own_start_fails)?, &payload::job_nonce());
-    let quarantine = Quarantine::made(objects, &name).map_err(End::Failed)?;
-    let back = Back {
-        commit: &advertised,
-        quarantine: &quarantine,
-    };
-    let end = fetch(attempt, &worktree, &remote, &quarantine, status).and_then(|stopped| match stopped {
-        Some(stopped) => Ok(stopped),
-        None => taken(attempt, &worktree, &back, status),
-    });
-    // However the sync-back ended, the quarantine goes, unless a move that failed kept it; the end stands as it would
-    // without the removal, and its lines come before the removal's.
-    if let Some(line) = quarantine.removed(KILL_WAIT, || {}) {
-        attempt.say(line);
-    }
+    attempt.say(syncing_line(attempt.call.host()));
+    let started = Instant::now();
+    let end = (|| -> Result<End, End> {
+        let call = attempt.call;
+        let _lock = worktree_lock::held(call.state, &[target.folder()], attempt.lock_wait, call.interrupt, |line| {
+            attempt.say(line);
+        })?;
+        let name = incoming_name(std::process::id(), own_start(attempt.own_start_fails)?, &payload::job_nonce());
+        let quarantine = Quarantine::made(objects, &name).map_err(End::Failed)?;
+        let back = Back {
+            commit: &advertised,
+            quarantine: &quarantine,
+        };
+        let end = fetch(attempt, &worktree, &remote, &quarantine, status).and_then(|stopped| match stopped {
+            Some(stopped) => Ok(stopped),
+            None => taken(attempt, &worktree, &back, status),
+        });
+        // However the sync-back ended, the quarantine goes, unless a move that failed kept it; the end stands as it
+        // would without the removal, and its lines come before the removal's.
+        if let Some(line) = quarantine.removed(KILL_WAIT, || {}) {
+            attempt.say(line);
+        }
+        end
+    })();
+    attempt.say(sync_back_ended_line(attempt.call.host(), started.elapsed()));
     end
 }
 
@@ -301,6 +310,8 @@ impl Fetched<'_> {
 /// back commit, and ends a passing run as 1. Otherwise every worktree is checked again, every patch is written and
 /// checked, and only then, the interrupt looked at once, each is applied in pair order. The locks of the worktrees with
 /// a back commit ([`worktree_lock::held`]) are held throughout, and each quarantine and any patch left goes at the end.
+/// Its step's start line is said before the first named repository's work and its end line after the last, whatever
+/// happened; a line naming no repository says neither.
 fn pair(attempt: &mut Attempt<'_, '_>, targets: &[Target<'_>], back_commits: Option<&[BackCommit]>, status: i64) -> Result<Synced, End> {
     attempt.go_on()?;
     let unchanged = Synced {
@@ -323,20 +334,26 @@ fn pair(attempt: &mut Attempt<'_, '_>, targets: &[Target<'_>], back_commits: Opt
     if backed.is_empty() {
         return Ok(unchanged);
     }
-    let call = attempt.call;
-    let worktrees: Vec<Folder<'_>> = backed.iter().map(|repo| repo.target.folder()).collect();
-    let _locks = worktree_lock::held(call.state, &worktrees, attempt.lock_wait, call.interrupt, |line| attempt.say(line))?;
-    let mut fetched = Vec::with_capacity(backed.len());
-    let end = pair_phases(attempt, &backed, &mut fetched, status);
-    for repo in &mut fetched {
-        if let Some(patch) = repo.patch.take() {
-            // The end stands; a patch that cannot be removed after it is the lesser problem.
-            drop(remove(&patch));
+    attempt.say(syncing_line(attempt.call.host()));
+    let started = Instant::now();
+    let end = (|| -> Result<Synced, End> {
+        let call = attempt.call;
+        let worktrees: Vec<Folder<'_>> = backed.iter().map(|repo| repo.target.folder()).collect();
+        let _locks = worktree_lock::held(call.state, &worktrees, attempt.lock_wait, call.interrupt, |line| attempt.say(line))?;
+        let mut fetched = Vec::with_capacity(backed.len());
+        let end = pair_phases(attempt, &backed, &mut fetched, status);
+        for repo in &mut fetched {
+            if let Some(patch) = repo.patch.take() {
+                // The end stands; a patch that cannot be removed after it is the lesser problem.
+                drop(remove(&patch));
+            }
+            if let Some(line) = repo.quarantine.removed(KILL_WAIT, || {}) {
+                attempt.say(line);
+            }
         }
-        if let Some(line) = repo.quarantine.removed(KILL_WAIT, || {}) {
-            attempt.say(line);
-        }
-    }
+        end
+    })();
+    attempt.say(sync_back_ended_line(attempt.call.host(), started.elapsed()));
     end
 }
 
@@ -1869,6 +1886,17 @@ fn filtered_line(path: &str, attribute: &str, snapshot: &str, back: &str) -> Str
     )
 }
 
+/// The line a sync-back says as it starts, from the builder `builder` that made the back commit it brings.
+fn syncing_line(builder: &str) -> String {
+    format!("gate: syncing back from {builder}")
+}
+
+/// The line a sync-back from `builder` says once it ended, `took` after its start line: the fetch and every file it
+/// wrote, applied or refused, included.
+fn sync_back_ended_line(builder: &str, took: Duration) -> String {
+    format!("gate: sync-back from {builder} ended in {} s", install::one_decimal(took.as_secs_f64()))
+}
+
 /// The line said for the changes applied to the worktree, saying `0 file(s)` and nothing after the colon when the back
 /// commit changed none, as PowerShell joins no names.
 pub(super) fn synced_line(names: &[String]) -> String {
@@ -2106,7 +2134,8 @@ mod tests {
         ATTRIBUTE_ROOM, ATTRIBUTES, Attributes, AutoCrlf, Back, BackCommit, FETCH_WORDS, LineEnds, Quarantine, Remote, Synced, Target, Worktree,
         advertised, after_keep, alternates, attribute_slices, auto_crlf, converts_to_crlf, entries, fetch, filtered, forbidden, from_snapshot,
         has_back, ignored_line, incoming_name, incoming_owner, listed_paths, move_plan, names_odd_driver, not_applied_line, read_attributes, receive,
-        refused_end, see_diff, swept, sync_back, synced_line, total, touched_line, tree_removed, unmoved_line, weight, written_blobs, written_line,
+        refused_end, see_diff, swept, sync_back, sync_back_ended_line, synced_line, syncing_line, total, touched_line, tree_removed, unmoved_line,
+        weight, written_blobs, written_line,
     };
     use crate::remote::RemoteCall;
     use crate::remote::client::{Attempt, End};
@@ -2132,6 +2161,16 @@ mod tests {
             "{end:?}"
         );
         assert_eq!(said, None, "the failure's own line says it");
+    }
+
+    /// The two lines a sync-back says around its work, the builder that made the back commit named in each.
+    #[test]
+    fn a_sync_back_says_its_start_and_end() {
+        assert_eq!(syncing_line("mac-1"), "gate: syncing back from mac-1");
+        assert_eq!(
+            sync_back_ended_line("mac-1", Duration::from_millis(1240)),
+            "gate: sync-back from mac-1 ended in 1.2 s"
+        );
     }
 
     #[test]
@@ -3397,6 +3436,23 @@ mod tests {
         )
     }
 
+    /// The start line of every sync-back a pair makes from the tests' builder, [`crate::test_support::HOST`].
+    const SYNCING: &str = "gate: syncing back from builder";
+
+    /// The lines `case` said, less the sync-back's start line and its end line: a pair that fetched a back commit says
+    /// one of each, first and last, and the end line's figure is any.
+    fn without_sync_back(case: &PairCase) -> Vec<String> {
+        let mut said = case.said();
+        assert!(said.len() >= 2, "a fetched pair says a start line and an end line: {said:?}");
+        assert_eq!(said.remove(0), SYNCING, "the pair's one start line comes first");
+        let end = said.pop().expect("the pair's one end line comes last");
+        assert!(
+            end.starts_with("gate: sync-back from builder ended in ") && end.ends_with(" s"),
+            "the end line ends the sync-back, its figure any: {end}"
+        );
+        said
+    }
+
     #[test]
     fn a_pair_syncs_back_every_changed_repo_main_first() {
         let case = PairCase::new("synced");
@@ -3417,12 +3473,14 @@ mod tests {
         );
         assert!(case.root(0).join("b.txt").exists(), "app's change is applied");
         assert!(case.root(1).join("c.txt").exists() && case.root(1).join("e.txt").exists(), "lib's are");
-        assert_eq!(
-            case.said(),
-            [
-                "gate: synced back 1 file(s) in app: b.txt",
-                "gate: synced back 2 file(s) in lib: c.txt, e.txt"
-            ]
+        let said = case.said();
+        assert_eq!(said.len(), 4, "one start line, two synced lines and one end line: {said:?}");
+        assert_eq!(said[0], SYNCING, "the pair's one start line comes before every fetch");
+        assert_eq!(said[1], "gate: synced back 1 file(s) in app: b.txt");
+        assert_eq!(said[2], "gate: synced back 2 file(s) in lib: c.txt, e.txt");
+        assert!(
+            said[3].starts_with("gate: sync-back from builder ended in ") && said[3].ends_with(" s"),
+            "the pair's one end line comes after every repo, its figure any: {said:?}"
         );
         case.remove();
     }
@@ -3443,7 +3501,7 @@ mod tests {
         assert!(!case.root(0).join("b.txt").exists(), "nothing is applied to app");
         assert!(!case.root(1).join(".gitmodules").exists(), "nor to lib");
         assert_eq!(
-            case.said(),
+            without_sync_back(&case),
             [
                 touched_in(&case, 1, &lib),
                 "gate: remote changes not applied to app either: a sync-back of a pair is all or nothing".to_owned()
@@ -3464,7 +3522,7 @@ mod tests {
 
         assert!(matches!(&ended, Ok(Synced { end: End::Status(1), .. })), "{ended:?}");
         assert_eq!(
-            case.said(),
+            without_sync_back(&case),
             [touched_in(&case, 0, &app), touched_in(&case, 1, &lib)],
             "no repo is left untouched"
         );
@@ -3675,7 +3733,7 @@ mod tests {
             &app[..8]
         );
         assert_eq!(
-            case.said(),
+            without_sync_back(&case),
             [
                 refused,
                 "gate: remote changes not applied to lib either: a sync-back of a pair is all or nothing".to_owned()
@@ -3783,7 +3841,7 @@ mod tests {
         assert!(matches!(&ended, Ok(Synced { end: End::Status(1), .. })), "{ended:?}");
         assert!(!case.root(0).join("b.txt").exists(), "nothing is applied to app");
         assert_eq!(
-            case.said(),
+            without_sync_back(&case),
             [
                 format!(
                     "gate: remote changes not applied: lib: the builder does not have the commit it named ({})",
@@ -3804,7 +3862,7 @@ mod tests {
         let ended = case.synced_with(Some(&line_of([Some(&app), Some(&lib)])), &case.local(), |attempt| attempt.fetch_cap = 1);
 
         assert!(matches!(&ended, Ok(Synced { end: End::Status(1), .. })), "{ended:?}");
-        let said = case.said();
+        let said = without_sync_back(&case);
         for (at, repo) in PAIR.iter().enumerate() {
             let named = format!("gate: remote sync-back stopped: {repo}: the fetch wrote more than ");
             assert!(said.get(at).is_some_and(|line| line.starts_with(&named)), "{said:?}");
@@ -3840,7 +3898,7 @@ mod tests {
         );
         assert_eq!((case.kept(0), case.kept(1)), (Some(app), Some(lib)), "both back commits are kept");
         assert_eq!(
-            case.said(),
+            without_sync_back(&case),
             [format!(
                 "gate: the run was interrupted; the changes are kept: see git diff in each repo at {KEPT}"
             )]
@@ -3873,7 +3931,7 @@ mod tests {
         );
         assert_eq!(case.kept(0), Some(app), "app's taken back commit is kept");
         assert_eq!(
-            case.said(),
+            without_sync_back(&case),
             [format!(
                 "gate: the run was interrupted; the changes are kept: see git diff in each repo at {KEPT}"
             )]
@@ -3917,7 +3975,87 @@ mod tests {
         );
         // A fetch writes FETCH_HEAD even when its objects go only into a quarantine that is then removed.
         assert!(!case.root(0).join(".git").join("FETCH_HEAD").exists(), "no fetch ran");
-        assert_eq!(case.said(), [APP_WAITED]);
+        let said = case.said();
+        assert_eq!(said.len(), 3, "the start line, the lock's line and the end line: {said:?}");
+        assert_eq!(
+            said[0], SYNCING,
+            "the step opens once the back commit is known, before the lock is waited for"
+        );
+        assert_eq!(said[1], APP_WAITED);
+        assert!(
+            said[2].starts_with("gate: sync-back from builder ended in ") && said[2].ends_with(" s"),
+            "the end line closes the step, its figure any: {said:?}"
+        );
+        case.remove();
+    }
+
+    /// The back commit a single repository's sync-back refuses closes the step it opened: its end line comes after the
+    /// refusal.
+    #[test]
+    fn a_single_sync_back_refused_after_its_start_says_its_end() {
+        let case = PairCase::new("single-refused");
+        case.plant(0, &[(".gitmodules", "x\n")]);
+        let target = Target::new(routed(PAIR[0], &case.roots[0]), PAIR[0], &case.snapshots[0], KEY);
+
+        let ended = case.with_attempt(&case.local(), None, |attempt| sync_back(attempt, &[target], None, 0));
+
+        assert!(
+            matches!(
+                &ended,
+                Ok(Synced {
+                    end: End::Status(1),
+                    reason: None
+                })
+            ),
+            "{ended:?}"
+        );
+        let said = case.said();
+        assert_eq!(said.len(), 3, "the start line, the refusal and the end line: {said:?}");
+        assert_eq!(said[0], SYNCING);
+        assert!(said[1].starts_with("gate: remote changes not applied:"), "{said:?}");
+        assert!(
+            said[2].starts_with("gate: sync-back from builder ended in ") && said[2].ends_with(" s"),
+            "the refusal is inside the step, its figure any: {said:?}"
+        );
+        case.remove();
+    }
+
+    /// A pair whose first named repository the builder does not advertise opens its step all the same, and closes it
+    /// after the line saying the commit was not applied.
+    #[test]
+    fn a_pair_whose_first_named_repo_is_unadvertised_opens_and_closes_its_step() {
+        let case = PairCase::new("first-unadvertised");
+        case.plant(0, &[("b.txt", "b\n")]);
+        let lib = case.plant(1, &[("c.txt", "c\n")]);
+
+        // app is named with lib's commit, which the builder advertises for lib alone.
+        let ended = case.synced(Some(&line_of([Some(&lib), None])));
+
+        assert!(
+            matches!(
+                &ended,
+                Ok(Synced {
+                    end: End::Status(1),
+                    reason: Some(_)
+                })
+            ),
+            "{ended:?}"
+        );
+        let said = case.said();
+        assert_eq!(
+            said.len(),
+            3,
+            "the start line, the line saying the commit was not applied, and the end line: {said:?}"
+        );
+        assert_eq!(said[0], SYNCING, "the step opens before the first named repo's work");
+        assert!(
+            said[1].starts_with("gate: remote changes not applied: app: the builder does not have the commit it named"),
+            "{said:?}"
+        );
+        assert!(
+            said[2].starts_with("gate: sync-back from builder ended in ") && said[2].ends_with(" s"),
+            "the end line closes the step, its figure any: {said:?}"
+        );
         case.remove();
     }
 
@@ -3955,7 +4093,22 @@ mod tests {
         assert!(case.root(0).join("b.txt").exists(), "app's change is applied once its lock is free");
         assert!(!case.root(1).join("c.txt").exists(), "lib's advertised ref is not fetched");
         assert_eq!(case.quarantines(1), 0);
-        assert_eq!(case.said(), [APP_WAITED, "gate: synced back 1 file(s) in app: b.txt"]);
+        let said = case.said();
+        assert_eq!(
+            said.len(),
+            6,
+            "each attempt opens and closes a step of its own, the refused one's around the lock's line: {said:?}"
+        );
+        assert_eq!(said[0], SYNCING, "the refused attempt opens its step before its lock is waited for");
+        assert_eq!(said[1], APP_WAITED);
+        assert_eq!(said[3], SYNCING);
+        assert_eq!(said[4], "gate: synced back 1 file(s) in app: b.txt");
+        for end in [&said[2], &said[5]] {
+            assert!(
+                end.starts_with("gate: sync-back from builder ended in ") && end.ends_with(" s"),
+                "each attempt's step ends after its own lines, its figure any: {said:?}"
+            );
+        }
         case.remove();
     }
 
@@ -3980,7 +4133,7 @@ mod tests {
         assert!(case.root(0).join("b.txt").exists(), "app's change is applied");
         assert!(!case.root(1).join("c.txt").exists(), "lib's advertised ref is not fetched");
         assert_eq!(case.quarantines(1), 0);
-        assert_eq!(case.said(), ["gate: synced back 1 file(s) in app: b.txt"]);
+        assert_eq!(without_sync_back(&case), ["gate: synced back 1 file(s) in app: b.txt"]);
         case.remove();
     }
 

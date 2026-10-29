@@ -4567,6 +4567,30 @@ fn a_file_the_command_changes_on_the_box_is_synced_back() {
     assert_eq!(calls(&steps), ["preflight", "run"]);
 }
 
+/// A run whose command leaves a file on the box says the sync-back's start before its own lines and its end after them,
+/// every figure any.
+#[test]
+fn a_routed_run_with_a_back_commit_says_the_sync_back_s_start_and_end() {
+    let case = client_case("client-sync-back-lines");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", "made-on-box.txt"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let started = outcome.stderr.lines().position(|line| line == "gate: syncing back from builder");
+    let synced = outcome
+        .stderr
+        .lines()
+        .position(|line| line == "gate: synced back 1 file(s): made-on-box.txt");
+    let ended_line = Regex::new(r"^gate: sync-back from \S+ ended in \d+\.\d s\r?$").expect("the line's pattern");
+    let ended = outcome.stderr.lines().position(|line| ended_line.is_match(line));
+    assert!(
+        started.is_some() && started < synced && synced < ended,
+        "the start line, then the synced one, then the end line: {outcome:?}"
+    );
+    assert_eq!(outcome.stderr.matches("gate: syncing back from ").count(), 1, "said once: {outcome:?}");
+}
+
 /// The bytes of the file a fetch-cap case's command writes on the box, which no compression shrinks: 1 MiB.
 const NOISE_BYTES: &str = "1048576";
 
@@ -4730,6 +4754,10 @@ fn a_command_that_changes_nothing_syncs_nothing_back() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(!outcome.stderr.contains("gate: synced back "), "{outcome:?}");
+    assert!(
+        !outcome.stderr.contains("gate: syncing back"),
+        "a run with nothing to sync back says no start line: {outcome:?}"
+    );
     let key = key_of(&events(&case));
     assert_eq!(builder_ref(&case, &format!("refs/gate-back/{key}")), "", "the box wrote no back commit");
     assert_eq!(calls(&steps), ["preflight", "run"]);
@@ -7342,6 +7370,12 @@ fn a_passing_pull_s_end_line_says_the_fetch_alone() {
         !outcome.stderr.contains("gate: pulling outputs ended"),
         "a passing pull says no early end: {outcome:?}"
     );
+    let installing = outcome.stderr.find("gate: installing outputs: 1 file(s)");
+    let installed = line.find(&outcome.stderr).map(|found| found.start());
+    assert!(
+        matches!((installing, installed), (Some(start), Some(end)) if start < end),
+        "the install says its start before its end line: {outcome:?}"
+    );
 }
 
 #[test]
@@ -8953,6 +8987,13 @@ fn restore_here_after_a_routed_build_that_brought_everything_back_keeps_a_later_
     assert!(case.folder().join(r"bin\new.txt").is_file(), "{outcome:?}");
     let said = outcome.stderr.lines().find(|line| line.starts_with(RESTORED_LINE));
     assert!(said.is_some_and(|line| line.ends_with(RESTORED_END)), "{outcome:?}");
+    let lines: Vec<&str> = outcome.stderr.lines().collect();
+    let restoring = lines.iter().position(|line| *line == "gate: restoring here");
+    let restored = lines.iter().position(|line| line.starts_with(RESTORED_LINE));
+    assert!(
+        matches!((restoring, restored), (Some(restoring), Some(restored)) if restoring < restored),
+        "the restore says its start before it ends: {outcome:?}"
+    );
     assert!(restore_log(&case).is_file(), "{outcome:?}");
     assert!(case.folder().join(r"app\obj\project.assets.json").is_file(), "{outcome:?}");
     assert_eq!(here.code, Some(0), "{here:?}");
@@ -9121,6 +9162,10 @@ fn a_routed_build_of_a_folder_says_it_is_not_restored_here() {
 
     let line = "gate: not restoring tests/X here: it is not a project or solution file; a --no-build run here builds first";
     assert!(outcome.stderr.lines().any(|said| said == line), "{outcome:?}");
+    assert!(
+        !outcome.stderr.contains("gate: restoring here"),
+        "a skipped restore says no start line: {outcome:?}"
+    );
     assert!(!restore_log(&case).exists(), "{outcome:?}");
     assert!(!case.folder().join(r"tests\X\obj\project.assets.json").exists(), "{outcome:?}");
 }
