@@ -94,6 +94,10 @@ fn a_ctrl_c_in_the_queue_abandons_the_wait() {
         &outcome.stderr,
         &["gate: waiting for a light slot", "gate: interrupted while waiting for a light slot"],
     );
+    assert!(
+        !outcome.stderr.contains("gate: took a"),
+        "an interrupted wait says no took line: {outcome:?}"
+    );
     let own: Vec<Value> = events(&case).into_iter().filter(|event| event["pid"] == pid).collect();
     let names: Vec<&str> = own.iter().map(|event| event["event"].as_str().expect("an event has a name")).collect();
     assert_eq!(names, ["queue", "abandon"], "{own:?}");

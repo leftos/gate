@@ -3410,7 +3410,8 @@ impl Run<'_> {
     /// to what is left of the run's remote budget, `None` waiting for the whole budget ([`Wait::limit_to`]).
     /// When the slot was taken; else a Ctrl+C ended the wait, which deletes the ticket at once, wakes the waiters and
     /// journals the abandon, or a remote pool stayed full past the wait's limit, which deletes the ticket, or a light
-    /// parent lent the run its slot, which deletes the ticket and wakes the waiters.
+    /// parent lent the run its slot, which deletes the ticket and wakes the waiters. A wait that said its waiting line
+    /// makes the take say how long it waited, after the claim and its journal line and before the expected-time line.
     fn take(&mut self, pool: Pool, since: Option<Instant>, left: Option<Duration>, held: &mut Option<Taken>, console: &mut Console) -> Taking {
         let queued = since.unwrap_or_else(Instant::now);
         let estimate = self.estimate(console);
@@ -3477,6 +3478,7 @@ impl Run<'_> {
             }
         };
         let waited = queued.elapsed().as_secs_f64();
+        let took_line = wait.took_line(waited);
         wait.end(console);
         let took = Instant::now();
         let parent_pid = self.nesting.uncovering().map(|parent| parent.pid);
@@ -3484,6 +3486,9 @@ impl Run<'_> {
         let (figures, resolved) = Figures::resolved(self.request.timeout, estimate.as_ref());
         let (mut taker, survey) = self.taker(parent_pid, expected.as_ref(), figures.ceiling);
         taker.took(taken, pool, waited, survey, console);
+        if let Some(line) = took_line {
+            console.err(&line);
+        }
         say_expected(estimate.as_ref(), resolved, console);
         Taking::Took(took, figures)
     }

@@ -845,6 +845,38 @@ fn the_claim_and_the_ticket_carry_what_the_store_expects() {
 }
 
 #[test]
+fn a_waited_take_says_the_took_line_before_the_expected_time() {
+    let case = Case::new("durations-took-line");
+    let (go_held, go_ran) = (case.folder().join("go-held"), case.folder().join("go-ran"));
+    let (held_word, ran_word) = (shown(&go_held), shown(&go_ran));
+    let held: [&str; 5] = [FAKE_TOOL, "wait", &held_word, "out", "held"];
+    let ran: [&str; 5] = [FAKE_TOOL, "wait", &ran_word, "out", "ran"];
+    let (holder, waiter) = (
+        Waiting {
+            command: &held,
+            go: &go_held,
+        },
+        Waiting { command: &ran, go: &go_ran },
+    );
+    five_runs(&case, &waiter);
+
+    hold_and_queue(&case, &holder, &waiter);
+
+    // The waiter's stderr is read inside `hold_and_queue`, so its lines are read from the log it writes as it says them.
+    let log = log_texts(&case.folder().join("waiter.log"));
+    let took = Regex::new(r"(?m)^gate: took a light slot after \d+\.\d s\r?$").expect("the pattern is valid");
+    assert!(took.is_match(&log), "the waiter says how long it waited: {log}");
+    assert_in_order(
+        &log,
+        &[
+            "gate: waiting for a light slot (1 busy)",
+            "gate: took a light slot after ",
+            "gate: expected about ",
+        ],
+    );
+}
+
+#[test]
 fn without_history_neither_the_claim_nor_the_ticket_has_expected() {
     let case = Case::new("durations-no-expected-field");
     let (go_held, go_ran) = (case.folder().join("go-held"), case.folder().join("go-ran"));

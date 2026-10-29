@@ -436,6 +436,12 @@ impl<'a> Wait<'a> {
         self.waiter.poll
     }
 
+    /// The line this wait's take says once the slot comes, `Some` only when the wait said its waiting line: the place
+    /// that line named and how long the gate waited for it ([`took_line`]). A gate that took its slot at once says none.
+    pub(crate) fn took_line(&self, waited: f64) -> Option<String> {
+        self.said_waiting.then(|| took_line(&self.place, waited))
+    }
+
     /// Whether this pass ended the wait, and how. The console is read first, so a Ctrl+C raised by this pass's own
     /// still-waiting line is the interrupt, and never a remote pool read as full at the wait's limit. A pass past a
     /// limit above zero that finds a live drain marker of the pool's builder ([`drain::marker_stands`]) ends nothing: a
@@ -678,6 +684,12 @@ impl<'a> Wait<'a> {
         let busy = format!("{seconds}; {} busy", probe.len());
         with_eta(busy, self.eta(&probe, range, survey, console))
     }
+}
+
+/// The line a take of a slot says when the wait for it said its waiting line: the place that line named and how long the
+/// gate waited for it, in seconds with one decimal. A gate that took its slot at once says none.
+fn took_line(place: &str, waited: f64) -> String {
+    format!("gate: took a {place} after {waited:.1} s")
 }
 
 /// Whether some gate has each of the slots `indices` of `pool` under the state root `root` open, by the existence of
@@ -1300,10 +1312,20 @@ mod tests {
     use super::{
         Arrival, Barrier, Beside, Host, LendFacts, Wait, Waited, Which, barrier, beside_of, beside_place, beside_room, first_frees_in,
         first_heartbeat, held_back, holder_eta, lends, light_barrier, may_take, pool_eta, queue_wait, queued_ahead, slot_range, spare_left,
+        took_line,
     };
     use crate::console::Console;
     use crate::slots::BesideTry;
     use crate::slots::{self, BuilderPool, Pool, Survey, ThisGate};
+
+    #[test]
+    fn the_took_line_names_the_place_and_the_wait_in_tenths() {
+        assert_eq!(
+            took_line("light slot", 2.34),
+            "gate: took a light slot after 2.3 s",
+            "the line names the place the waiting line named, and the wait to one decimal"
+        );
+    }
 
     #[test]
     fn an_idle_pool_with_one_ticket_ahead_waits_one_duration() {

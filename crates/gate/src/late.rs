@@ -216,8 +216,8 @@ impl<'a> Late<'a> {
     }
 
     /// One pass of the wait, its still-waiting line first when due; a slot taken ends the wait, is kept for the run's
-    /// release before anything else, then claimed and journalled with the parent's pid ([`Taker::took`]). Whether this
-    /// pass took it.
+    /// release before anything else, then claimed and journalled with the parent's pid ([`Taker::took`]). A wait that
+    /// said its waiting line then says how long it waited. Whether this pass took it.
     fn pass(&mut self, console: &mut Console) -> bool {
         let State::Waiting { wait, since } = &mut self.state else {
             return false;
@@ -234,6 +234,7 @@ impl<'a> Late<'a> {
             unreachable!("a late wait is under no parent, has no limit and reads no Ctrl+C, so only a take ends it")
         };
         let waited = since.elapsed().as_secs_f64();
+        let took_line = wait.took_line(waited);
         wait.end(console);
         let parent_pid = self.of.taker.parent_pid;
         let slot = self.of.held.insert(LateSlot {
@@ -242,6 +243,9 @@ impl<'a> Late<'a> {
             parent_pid,
         });
         self.of.taker.took(&mut slot.taken, self.of.pool, waited, &mut self.survey, console);
+        if let Some(line) = took_line {
+            console.err(&line);
+        }
         true
     }
 }
@@ -303,6 +307,7 @@ mod tests {
     use gate_state::{KernelObject, SlotKind};
     use jiff::Timestamp;
     use proc_table::Win32ProcessTable;
+    use regex::Regex;
     use serde_json::Value;
 
     use super::{Late, LateOf, LateSlot, Opened, Opener, opened};
@@ -609,13 +614,15 @@ mod tests {
         assert!(late.step(&mut console), "the freed slot is taken");
         assert_eq!(late.polling(), None, "nothing waits once the slot is taken");
         drop(late);
+        let notes = console.take_notes();
+        assert_eq!(notes.len(), 3, "the ended parent, the waiting line, then the took line: {notes:?}");
         assert_eq!(
-            console.take_notes(),
-            [
-                format!("gate: the parent gate {GONE} ended; taking a light slot for the rest of this run"),
-                "gate: waiting for a light slot (1 busy)".to_owned()
-            ]
+            notes[0],
+            format!("gate: the parent gate {GONE} ended; taking a light slot for the rest of this run")
         );
+        assert_eq!(notes[1], "gate: waiting for a light slot (1 busy)");
+        let took = Regex::new(r"\Agate: took a light slot after \d+\.\d s\z").expect("the pattern is valid");
+        assert!(took.is_match(&notes[2]), "the took line says the wait to one decimal: {:?}", notes[2]);
         assert!(covered.held.is_some());
         let ticket = v1::ticket_path(scratch.path(), covered.gate.pid, covered.gate.start_ms);
         assert!(!ticket.exists(), "the take deletes the ticket");

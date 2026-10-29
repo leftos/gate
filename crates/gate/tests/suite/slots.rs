@@ -8,6 +8,7 @@ use std::time::Duration;
 use gate_state::v1::{Ticket, TicketKind, read_claim, ticket_path, write_ticket};
 use gate_state::{KernelObject, StateRoot};
 use gate_win32::{NamedMutex, mutex_exists};
+use regex::Regex;
 use serde_json::Value;
 
 use crate::support::{
@@ -205,6 +206,40 @@ fn waiters_of_one_kind_take_a_freed_slot_in_ticket_order() {
         assert_passed(running);
     }
     assert_in_order(&journal(&case), &[&order[0], &order[1]]);
+}
+
+#[test]
+fn a_gate_that_waited_says_how_long_it_waited_when_it_takes_its_slot() {
+    let case = Case::new("a_gate_that_waited_says_how_long_it_waited_when_it_takes_its_slot");
+    write_counts(&case.root(), ONE_LIGHT);
+    let go_h = case.folder().join("go-h");
+    let holding = holder(&case, "holder.log", &go_h);
+    let waiting = start(&case, "waiting.log", None, &[]);
+    waiting.wait_for_stderr("gate: waiting for a light slot (");
+
+    let_go(&go_h);
+    let outcome = waiting.finish();
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_passed(holding);
+
+    let took = Regex::new(r"(?m)^gate: took a light slot after \d+\.\d s\r?$").expect("the pattern is valid");
+    let said = &outcome.stderr;
+    let took_at = took.find(said).expect("the waited gate says how long it waited").start();
+    let waiting_at = said.find("gate: waiting for a light slot (").expect("it said its waiting line");
+    assert!(waiting_at < took_at, "the took line follows the waiting line: {said}");
+}
+
+#[test]
+fn a_gate_that_takes_its_slot_at_once_says_no_took_line() {
+    let case = Case::new("a_gate_that_takes_its_slot_at_once_says_no_took_line");
+    write_counts(&case.root(), ONE_LIGHT);
+    let outcome = run_once(&case);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        !outcome.stderr.contains("gate: took a"),
+        "a gate that waited for nothing says no took line: {outcome:?}"
+    );
 }
 
 #[test]

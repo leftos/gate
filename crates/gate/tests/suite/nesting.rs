@@ -18,6 +18,7 @@ use gate_state::{KernelObject, StateRoot};
 use gate_win32::{Job, Priority, StoppableProcess, priority_of};
 use gate_wire::stamp::{Tag, unstamped};
 use jiff::Timestamp;
+use regex::Regex;
 use serde_json::Value;
 
 use crate::support::{
@@ -1299,6 +1300,9 @@ fn a_covered_gate_waits_for_a_slot_without_pausing_its_command() {
     let order: Vec<&str> = order.iter().map(String::as_str).collect();
     let said = fs::read_to_string(&stderr).expect("the covered gate's stderr can be read");
     assert_in_order(&said, &order);
+    let took = Regex::new(r"(?m)^gate: took a light slot after \d+\.\d s\r?$").expect("the pattern is valid");
+    assert!(took.is_match(&said), "the covered gate says how long it waited: {said}");
+    assert_in_order(&said, &[WAITING_FOR_THE_LIGHT_SLOT, "gate: took a light slot after "]);
     let inner_log = log_texts(&log);
     assert_in_order(&inner_log, &order);
 }
