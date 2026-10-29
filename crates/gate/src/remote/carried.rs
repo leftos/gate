@@ -106,6 +106,7 @@ mod tests {
             desktop: false,
             source_revision: None,
             later: Vec::new(),
+            balanced: None,
             cross_build: None,
             cross_build_blocked: None,
             bins_withheld: false,

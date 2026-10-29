@@ -975,6 +975,42 @@ fn a_light_run_rerouted_by_a_critical_request_keeps_file_order() {
     assert_eq!(recorded["host"], HOST, "{recorded}");
 }
 
+/// A light run a critical request sends to a builder is not scored, so it says no balanced pick and journals none,
+/// though two builders could take it.
+#[test]
+fn a_light_run_rerouted_by_a_critical_request_says_no_balanced_line() {
+    const FIRST: &str = "builder-a";
+    let case = balance_case("a_light_run_rerouted_by_a_critical_request_says_no_balanced_line");
+    let routing = json!({
+        "host": HOST,
+        "slots": 2,
+        "repos": { repo(&case): ["*tool*"] },
+        "builders": [{ "host": FIRST, "os": "windows", "slots": 2, "repos": { repo(&case): ["*tool*"] } }],
+    });
+    write_remote_json(&case, &routing.to_string());
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+    let held = HeldBack::start(&case, false, 2);
+    let critical_pid = held.critical_pid();
+    let call = case.folder().join("call.json");
+    let steps = recording_stub(&case, &call);
+
+    let light = light_with_client(&case, "light.log", &steps, &POLL, &ROUTED_COMMAND);
+    let pid = light.id();
+    let outcome = light.finish();
+    held.finish();
+
+    assert_passed(&outcome);
+    let sent = format!("gate: held back by the critical request of gate {critical_pid}; sending this light run to {FIRST}");
+    assert!(outcome.stderr.contains(&sent), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: balanced to"), "{outcome:?}");
+    let events = own(&case, pid);
+    let release = events
+        .iter()
+        .find(|event| event["event"] == "release")
+        .expect("the run journaled its release");
+    assert!(release.get("balanced").is_none(), "{release}");
+}
+
 #[test]
 fn a_light_gate_finds_no_spare_remote_slot_and_waits_here_in_its_place() {
     let case = reroute_case("a_light_gate_finds_no_spare_remote_slot_and_waits_here_in_its_place", 1);

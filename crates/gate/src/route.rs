@@ -13,7 +13,7 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use gate_args::{GATE_SET_NAMES, RunRequest, Slot, TestSeams, env_refusal};
-use gate_router::balance::{self, BuilderFigures};
+use gate_router::balance::{Balanced, BalancedEntry, BuilderFigures};
 use gate_router::warm::FileRead;
 use gate_router::windows::{self, WindowsChange};
 use gate_router::{
@@ -291,9 +291,13 @@ fn folded(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/").to_lowercase()
 }
 
-/// Says the lines of `request`'s routed `run`: its route lines, the problem of its repo's `.gate/env.toml` when
-/// `declared` is one ([`declared_prefixes`]), and the line of the watched variables it does not send ([`dropped_line`]).
+/// Says the lines of `request`'s routed `run`: the line of the builders its decision scored when it scored two or more
+/// ([`balanced_line`]), its route lines, the problem of its repo's `.gate/env.toml` when `declared` is one
+/// ([`declared_prefixes`]), and the line of the watched variables it does not send ([`dropped_line`]).
 fn say_routed(request: &RunRequest, run: &RemoteRun, declared: Result<Vec<String>, String>, console: &mut Console) {
+    if let Some(line) = run.balanced.as_ref().and_then(balanced_line) {
+        console.err(&line);
+    }
     run.lines().iter().for_each(|line| console.err(line));
     let prefixes = declared.unwrap_or_else(|line| {
         console.err(&line);
@@ -302,6 +306,34 @@ fn say_routed(request: &RunRequest, run: &RemoteRun, declared: Result<Vec<String
     if let Some(line) = dropped_line(request, &prefixes) {
         console.err(&line);
     }
+}
+
+/// The line of a run whose decision scored two or more builders, `balanced` the pick first ([`RemoteRun::balanced`]):
+/// `gate: balanced to {alias}: {figures} ({alias} {figures}; …)`, each builder's figures by [`balanced_figures`]. `None`
+/// when it holds no builder.
+fn balanced_line(balanced: &Balanced) -> Option<String> {
+    let (pick, others) = balanced.entries.split_first()?;
+    let shown = |entry: &BalancedEntry| balanced_figures(entry, balanced.has_duration);
+    let others: Vec<String> = others.iter().map(|entry| format!("{} {}", entry.alias, shown(entry))).collect();
+    Some(format!("gate: balanced to {}: {} ({})", pick.alias, shown(pick), others.join("; ")))
+}
+
+/// A scored builder's figures as the balanced line says them: `about {score}` (a span by [`durations::span_text`])
+/// when the decision's scores include a duration (`has_duration`), else `no history`; then `, {n} free`, or `, full`
+/// with no free slot; then `, cold` when it is not known to hold the worktree's work folder.
+fn balanced_figures(entry: &BalancedEntry, has_duration: bool) -> String {
+    let expected = if has_duration {
+        format!("about {}", durations::span_text(entry.seconds()))
+    } else {
+        "no history".to_owned()
+    };
+    let free = if entry.free > 0 {
+        format!(", {} free", entry.free)
+    } else {
+        ", full".to_owned()
+    };
+    let cold = if entry.cold { ", cold" } else { "" };
+    format!("{expected}{free}{cold}")
 }
 
 /// The routed run a light gate held back behind a critical request gets when its command would route on heavy: the
@@ -696,11 +728,11 @@ pub(crate) struct Machine<'a> {
     figures: Figures<'a>,
 }
 
-/// What a machine tells of each builder a decision scores: the same figures for every builder ([`balance::ALIKE`]),
-/// as the route hint, a light run's reroute by a critical request and `gate warm` have them, or the figures this PC
-/// reads for the run of a routing decision ([`FigureReader`]).
+/// What a machine tells of each builder a decision scores: nothing, as the route hint, a light run's reroute by a
+/// critical request and `gate warm` have it, so file order decides, or the figures this PC reads for the run of a
+/// routing decision ([`FigureReader`]).
 enum Figures<'a> {
-    Alike,
+    Unread,
     Read(FigureReader<'a>),
 }
 
@@ -801,12 +833,12 @@ impl<'a> Machine<'a> {
             remote_transport: None,
             run_log: None,
             state: None,
-            figures: Figures::Alike,
+            figures: Figures::Unread,
         }
     }
 
     /// These facts reading each scored builder's figures through `reader`, as the machine of a run's routing decision
-    /// reads them, in place of [`balance::ALIKE`] for every builder.
+    /// reads them, in place of none.
     fn reading_figures(self, reader: FigureReader<'a>) -> Machine<'a> {
         Machine {
             figures: Figures::Read(reader),
@@ -1427,12 +1459,12 @@ impl Facts for Machine<'_> {
         checkout_of(tree)
     }
 
-    /// The figures this PC reads of each builder for the run of a routing decision ([`FigureReader::figures`]); the
-    /// same figures for every builder ([`balance::ALIKE`]) for any other machine, so file order decides.
-    fn builder_figures(&self, place: &Place, _words: &[String], builders: &[&Builder]) -> Vec<BuilderFigures> {
+    /// The figures this PC reads of each builder for the run of a routing decision ([`FigureReader::figures`]); none for
+    /// any other machine, so file order decides and no pick is balanced.
+    fn builder_figures(&self, place: &Place, _words: &[String], builders: &[&Builder]) -> Option<Vec<BuilderFigures>> {
         match &self.figures {
-            Figures::Alike => builders.iter().map(|_| balance::ALIKE).collect(),
-            Figures::Read(reader) => reader.figures(place, builders, &self.notes),
+            Figures::Unread => None,
+            Figures::Read(reader) => Some(reader.figures(place, builders, &self.notes)),
         }
     }
 }
@@ -2105,6 +2137,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
+    use gate_router::balance::{Balanced, BalancedEntry};
     use gate_router::windows::WindowsChange;
     use gate_router::{
         CarriedSibling, Config, CrossBlocked, CrossTarget, Facts, FolderId, GitignoredInput, LocalReason, Place, Route, SiblingFolder, SiblingRoot,
@@ -2116,9 +2149,9 @@ mod tests {
 
     use super::{
         CHANGE_DEADLINE, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, GATE_FILE_NOT_A_FILE, HINT_GIT_LIMIT, Machine, Origin, SIBLING_GIT_LINK,
-        SIBLING_LINK, SIBLING_NOT_A_FOLDER, Source, change_error, change_limit, checkout_of, hint_holds, holds_existing_path, is_fixed_local,
-        is_share_target, judge_declarations, not_routed, nul_separated, parse_head, parse_place, read_declaration, read_siblings, same_folder,
-        sibling_folder, worktree_of,
+        SIBLING_LINK, SIBLING_NOT_A_FOLDER, Source, balanced_line, change_error, change_limit, checkout_of, hint_holds, holds_existing_path,
+        is_fixed_local, is_share_target, judge_declarations, not_routed, nul_separated, parse_head, parse_place, read_declaration, read_siblings,
+        same_folder, sibling_folder, worktree_of,
     };
     use crate::remote::box_trees;
     use crate::remote::git;
@@ -2128,6 +2161,66 @@ mod tests {
 
     /// The folder the place cases are asked of, spelled on a subst drive as a gate started there spells it.
     const FOLDER: &str = r"S:\src";
+
+    /// A scored builder `alias` with its score in `tenths` of a second, `free` slots and `cold`.
+    fn entry(alias: &str, tenths: u64, free: u32, cold: bool) -> BalancedEntry {
+        BalancedEntry {
+            alias: alias.to_owned(),
+            tenths,
+            free,
+            cold,
+        }
+    }
+
+    /// The balanced value of `entries`, their scores including a duration when `has_duration`.
+    fn balanced(has_duration: bool, entries: Vec<BalancedEntry>) -> Balanced {
+        Balanced { entries, has_duration }
+    }
+
+    #[test]
+    fn the_balanced_line_names_the_pick_then_every_other_builder() {
+        let two = balanced(true, vec![entry("mac-1", 400, 1, false), entry("host", 1800, 2, true)]);
+        assert_eq!(
+            balanced_line(&two).as_deref(),
+            Some("gate: balanced to mac-1: about 40 s, 1 free (host about 3 min, 2 free, cold)")
+        );
+        let three = balanced(
+            true,
+            vec![entry("a", 100, 1, false), entry("b", 200, 1, false), entry("c", 300, 1, false)],
+        );
+        assert_eq!(
+            balanced_line(&three).as_deref(),
+            Some("gate: balanced to a: about 10 s, 1 free (b about 20 s, 1 free; c about 30 s, 1 free)")
+        );
+        assert_eq!(balanced_line(&balanced(true, Vec::new())), None, "no line when nothing was scored");
+    }
+
+    #[test]
+    fn a_balanced_line_without_durations_says_no_history() {
+        let entries = balanced(false, vec![entry("win-2", 0, 1, false), entry("host", 300, 0, true)]);
+        assert_eq!(
+            balanced_line(&entries).as_deref(),
+            Some("gate: balanced to win-2: no history, 1 free (host no history, full, cold)")
+        );
+    }
+
+    #[test]
+    fn a_balanced_line_says_minutes_from_90_seconds() {
+        let entries = balanced(true, vec![entry("win-2", 1250, 1, false), entry("host", 894, 1, false)]);
+        assert_eq!(
+            balanced_line(&entries).as_deref(),
+            Some("gate: balanced to win-2: about 2 min, 1 free (host about 89 s, 1 free)")
+        );
+    }
+
+    #[test]
+    fn a_balanced_line_says_full_for_a_builder_with_no_free_slot() {
+        let entries = balanced(true, vec![entry("win-2", 500, 0, false), entry("host", 600, 3, false)]);
+        assert_eq!(
+            balanced_line(&entries).as_deref(),
+            Some("gate: balanced to win-2: about 50 s, full (host about 60 s, 3 free)")
+        );
+    }
 
     /// A target of the worktree at `root`, its folder named `leaf`, in the work folder `k`, carrying each of
     /// `siblings`, a folder name and its root.

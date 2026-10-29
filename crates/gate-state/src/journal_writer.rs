@@ -10,6 +10,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use gate_router::balance::{Balanced, BalancedEntry};
 use jiff::Timestamp;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Map, Value};
@@ -128,8 +129,8 @@ pub enum JournalEvent {
         /// `derp:{region}`, `peer-relay` or `none`, written after `cold`; left out when unknown, and for a run that
         /// made no builder call.
         path: Option<String>,
-        /// The run's routing facts, which its `queue`, `fallback` and `take` lines said, written after `path`; `None`
-        /// when the run has none of them, so the line gains no key of theirs.
+        /// The run's routing facts, which its `queue`, `fallback` and `take` lines and its routing decision said,
+        /// written after `path`; `None` when the run has none of them, so the line gains no key of theirs.
         routing: Option<Box<RoutingFacts>>,
     },
     /// The gate left the queue without taking a slot.
@@ -155,8 +156,8 @@ pub enum JournalEvent {
     },
 }
 
-/// The routing facts of a run, which its `release` line copies from its `queue`, `fallback` and `take` lines, so that
-/// the archive, which keeps only release lines, keeps them too.
+/// The routing facts of a run, which its `release` line copies from its `queue`, `fallback` and `take` lines and, for
+/// `balanced`, from its routing decision, so that the archive, which keeps only release lines, keeps them too.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RoutingFacts {
     /// Why a gate that could have been routed was kept on this machine, such as `--local`, as the run's `queue` line
@@ -168,16 +169,21 @@ pub struct RoutingFacts {
     /// Why the run gave up each remote attempt, in the order it did, as its `fallback` lines say them: written as
     /// `fellBack`, one reason per attempt, after `reason`, and left out when empty.
     pub fell_back: Vec<FallbackReason>,
+    /// Every builder the run's routing decision scored when it scored two or more from the figures this PC read, the
+    /// pick first, then every other in score order, as its `balanced to` line says them: written as `balanced`, after
+    /// `fellBack`, one `{"builder", "expectedSeconds", "free", "cold"}` object each, `expectedSeconds` the score to one
+    /// decimal or `null` when the scores include no duration, and left out when `None`.
+    pub balanced: Option<Balanced>,
     /// The pid of the parent gate whose slot did not cover the run, as its `take` line says it: written as
-    /// `parentPid`, after `fellBack`, and left out when `None`.
+    /// `parentPid`, after `balanced`, and left out when `None`.
     pub parent_pid: Option<u32>,
 }
 
 impl RoutingFacts {
-    /// Whether the run carries none of the four facts, so its release line gains no key of theirs.
+    /// Whether the run carries none of the five facts, so its release line gains no key of theirs.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.not_routed.is_none() && self.reason.is_none() && self.fell_back.is_empty() && self.parent_pid.is_none()
+        self.not_routed.is_none() && self.reason.is_none() && self.fell_back.is_empty() && self.balanced.is_none() && self.parent_pid.is_none()
     }
 }
 
@@ -330,7 +336,7 @@ impl FallbackReason {
 /// request's barrier sent a light run to the builder, the optional `routedFor` and `criticalPid`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteTag {
-    /// The build box the run was routed to, as `user@host`.
+    /// The builder the run was routed to, by its alias in the routing file.
     pub host: String,
     /// The run's key on the build box.
     pub key: String,
@@ -451,9 +457,10 @@ impl fmt::Display for JournalNote {
 /// decimals. A `release` without facts writes null times and the verdict
 /// `unknown`.
 ///
-/// A `release` also carries the run's routing facts, `notRouted`, `reason`, `fellBack` and `parentPid`, as the run's
-/// `queue`, `fallback` and `take` lines said them, so that the archive keeps them once the journal rolls: each field
-/// is left out when the run has none of it.
+/// A `release` also carries the run's routing facts, `notRouted`, `reason`, `fellBack`, `balanced` and `parentPid`, as
+/// the run's `queue`, `fallback` and `take` lines said them and, for `balanced`, as its routing decision scored its
+/// builders, so that the archive keeps them once the journal rolls: each field is left out when the run has none of
+/// it.
 ///
 /// `remote` is the tag of a routed run up to its fallback: when it is `Some`, the event's own fields are followed by
 /// `remote: true`, `host` and `key`, and, when the tag names a critical request, `routedFor: critical` and `criticalPid`;
@@ -581,19 +588,7 @@ fn insert_own_fields(line: &mut Map<String, Value>, event: &JournalEvent) {
                 line.insert("path".to_owned(), Value::from(path.as_str()));
             }
             if let Some(routing) = routing {
-                if let Some(not_routed) = &routing.not_routed {
-                    line.insert("notRouted".to_owned(), Value::from(not_routed.as_str()));
-                }
-                if let Some(reason) = &routing.reason {
-                    line.insert("reason".to_owned(), Value::from(reason.as_str()));
-                }
-                if !routing.fell_back.is_empty() {
-                    let reasons: Vec<Value> = routing.fell_back.iter().map(|reason| Value::from(reason.as_str())).collect();
-                    line.insert("fellBack".to_owned(), Value::Array(reasons));
-                }
-                if let Some(parent_pid) = routing.parent_pid {
-                    line.insert("parentPid".to_owned(), Value::from(parent_pid));
-                }
+                insert_routing(line, routing);
             }
         }
         JournalEvent::Abandon { waited_seconds } => {
@@ -677,6 +672,40 @@ fn seconds(value: f64) -> Value {
 /// Cores rounded to one decimal, a midpoint to the even digit.
 fn tenths(value: f64) -> Value {
     Value::from((value * 10.0).round_ties_even() / 10.0)
+}
+
+/// Inserts a release line's `routing` facts ([`RoutingFacts`]), each only when the run has it: `notRouted`, `reason`,
+/// `fellBack`, `balanced`, then `parentPid`.
+fn insert_routing(line: &mut Map<String, Value>, routing: &RoutingFacts) {
+    if let Some(not_routed) = &routing.not_routed {
+        line.insert("notRouted".to_owned(), Value::from(not_routed.as_str()));
+    }
+    if let Some(reason) = &routing.reason {
+        line.insert("reason".to_owned(), Value::from(reason.as_str()));
+    }
+    if !routing.fell_back.is_empty() {
+        let reasons: Vec<Value> = routing.fell_back.iter().map(|reason| Value::from(reason.as_str())).collect();
+        line.insert("fellBack".to_owned(), Value::Array(reasons));
+    }
+    if let Some(balanced) = &routing.balanced {
+        let entries = balanced.entries.iter().map(|entry| balanced_entry(entry, balanced.has_duration));
+        line.insert("balanced".to_owned(), Value::Array(entries.collect()));
+    }
+    if let Some(parent_pid) = routing.parent_pid {
+        line.insert("parentPid".to_owned(), Value::from(parent_pid));
+    }
+}
+
+/// A scored builder as a release line's `balanced` field writes it: `{"builder", "expectedSeconds", "free", "cold"}`,
+/// the score to the one decimal it keeps, or `null` when the decision's scores include no duration (`has_duration`).
+fn balanced_entry(entry: &BalancedEntry, has_duration: bool) -> Value {
+    let mut object = Map::new();
+    object.insert("builder".to_owned(), Value::from(entry.alias.as_str()));
+    let expected = if has_duration { Value::from(entry.seconds()) } else { Value::Null };
+    object.insert("expectedSeconds".to_owned(), expected);
+    object.insert("free".to_owned(), Value::from(entry.free));
+    object.insert("cold".to_owned(), Value::Bool(entry.cold));
+    Value::Object(object)
 }
 
 /// Appends the line `build` returns and a line feed to `root`'s journal while holding `lock`, waiting [`JOURNAL_WAIT`]

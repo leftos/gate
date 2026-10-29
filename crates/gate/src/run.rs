@@ -1796,7 +1796,7 @@ impl Run<'_> {
         // is asked as one under no parent, so a build in the commit's hooks still routes.
         let covering = self.nesting.routes_as_covered();
         let route::Decided {
-            route,
+            mut route,
             placed: place,
             warm_hash,
             decision,
@@ -1811,6 +1811,10 @@ impl Run<'_> {
             }),
             Route::Local { .. } | Route::Refused(_) => None,
         };
+        // The balanced pick was said with the route lines; nothing reads it off the run again.
+        if let Route::Routed(remote) = &mut route {
+            self.routing.balanced = remote.balanced.take();
+        }
         (route, place)
     }
 

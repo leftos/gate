@@ -49,7 +49,7 @@ What the script counts:
 
 The report names repos and families only: it never prints a `cwd`, `log`, `host` or `key`, and free-text reasons have absolute paths replaced by `<path>`. The repo is public, so keep it that way in the note.
 
-**The archive keeps only `release` lines, and a release carries the run's routing facts**: `notRouted` and `reason` as its `queue` says them, `fellBack` with one reason per fallback attempt, and `parentPid` as its `take` says it. So the `notRouted` cells, the fallback reasons and the `--local` table cover every run journalled since, archived or not. A run released before the gate wrote them onto its release keeps none: judge its family from its commands, not from an empty `notRouted` cell.
+**The archive keeps only `release` lines, and a release carries the run's routing facts**: `notRouted` and `reason` as its `queue` says them, `fellBack` with one reason per fallback attempt, `balanced` (the builders a routed run's decision scored, which the census does not read), and `parentPid` as its `take` says it. So the `notRouted` cells, the fallback reasons and the `--local` table cover every run journalled since, archived or not. A run released before the gate wrote them onto its release keeps none: judge its family from its commands, not from an empty `notRouted` cell.
 
 ## Sort every heavy family with local runs
 

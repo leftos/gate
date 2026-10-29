@@ -31,6 +31,33 @@ pub const ALIKE: BuilderFigures = BuilderFigures {
 /// sort is stable. Every queue wait and duration is non-negative and finite.
 #[must_use]
 pub fn order(figures: &[BuilderFigures]) -> Vec<usize> {
+    ranked(figures).ranks.into_iter().map(|rank| rank.index).collect()
+}
+
+/// One builder's place in the order [`ranked`] gives: its index among the figures and its score.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rank {
+    /// The builder's index among the figures given.
+    pub index: usize,
+    /// Its expected finish in seconds: the queue wait, plus the duration and, without a held work folder, the duration
+    /// once more; the queue wait alone when no builder has a duration ([`Ranking::has_duration`]).
+    pub seconds: f64,
+}
+
+/// The builders of one decision's figures, best first, each with its score ([`ranked`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ranking {
+    /// Each builder's place, best first.
+    pub ranks: Vec<Rank>,
+    /// Whether every score includes a duration, the builder's own or the median of the others': `true` when any
+    /// builder has one, as then every builder without one is given that median; `false` when none has one, as the queue
+    /// wait alone then scores each.
+    pub has_duration: bool,
+}
+
+/// The builders of `figures`, best first, each with its score: the order [`order`] gives, by the same rule.
+#[must_use]
+pub fn ranked(figures: &[BuilderFigures]) -> Ranking {
     let usable = |seconds: f64| seconds.is_finite() && seconds >= 0.0;
     debug_assert!(
         figures
@@ -46,7 +73,64 @@ pub fn order(figures: &[BuilderFigures]) -> Vec<usize> {
         let warm_first = figures[right].holds_folder.cmp(&figures[left].holds_folder);
         scores[left].total_cmp(&scores[right]).then(warm_first)
     });
-    indexes
+    let ranks = indexes
+        .into_iter()
+        .map(|index| Rank {
+            index,
+            seconds: scores[index],
+        })
+        .collect();
+    Ranking {
+        ranks,
+        has_duration: fill.is_some(),
+    }
+}
+
+/// The builders a routed run's decision scored from the figures this PC read, two or more, as the run's `balanced to`
+/// line and its journal's `balanced` field tell them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Balanced {
+    /// The builder the run goes to first, then every other in score order.
+    pub entries: Vec<BalancedEntry>,
+    /// Whether the scores include a duration ([`Ranking::has_duration`]); the same for every builder of a decision.
+    pub has_duration: bool,
+}
+
+/// One builder a routed run's decision scored ([`Balanced`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BalancedEntry {
+    /// The builder's alias.
+    pub alias: String,
+    /// Its score ([`Rank::seconds`]) in whole tenths of a second, rounded ([`tenths`]).
+    pub tenths: u64,
+    /// How many of the builder's remote slots on this PC were free.
+    pub free: u32,
+    /// Whether the builder is not known to hold a work folder for the worktree.
+    pub cold: bool,
+}
+
+impl BalancedEntry {
+    /// Its score in seconds, to the tenth it keeps.
+    #[must_use]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a score in tenths of a second stays far below 2^53, where an f64 holds every whole number"
+    )]
+    pub fn seconds(&self) -> f64 {
+        self.tenths as f64 / 10.0
+    }
+}
+
+/// `seconds` in whole tenths of a second, rounded to the nearest; 0 for a negative or NaN span and `u64::MAX` past it,
+/// as the cast saturates.
+#[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the float-to-integer cast saturates, which is the rule this function states"
+)]
+pub fn tenths(seconds: f64) -> u64 {
+    (seconds * 10.0).round() as u64
 }
 
 /// The builder's expected finish: its queue wait, plus its duration (`fill` for a builder without one) and, when it

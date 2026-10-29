@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use gate_router::balance::BuilderFigures;
+use gate_router::balance::{Balanced, BalancedEntry, BuilderFigures};
 use gate_router::windows::WindowsChange;
 use gate_router::{
     BuildSettings, BuildTarget, Builder, BuilderOs, CARRIED_INPUT, Config, ConfigProblem, CrossBlocked, CrossTarget, DROPPED_NO_BUILD_LINE,
@@ -103,6 +103,7 @@ fn the_control_command_routes_from_the_root() {
             desktop: false,
             source_revision: Some(HEAD.to_owned()),
             later: Vec::new(),
+            balanced: None,
             cross_build: None,
             cross_build_blocked: None,
             bins_withheld: false,
@@ -3611,6 +3612,109 @@ fn a_run_pinned_with_builder_asks_no_figures() {
     let run = routed(decide(&pinned_to(&command, "win-2"), &facts));
     assert_eq!(run.builder.alias, "win-2", "the pin is not scored");
     assert_eq!(facts.figures_asked.get(), 0);
+}
+
+/// The entry [`RemoteRun::balanced`] holds for the builder `alias`, its score in `tenths` of a second.
+fn entry(alias: &str, tenths: u64, free: u32, cold: bool) -> BalancedEntry {
+    BalancedEntry {
+        alias: alias.to_owned(),
+        tenths,
+        free,
+        cold,
+    }
+}
+
+/// The balanced value of `entries`, each score including a duration.
+fn with_durations(entries: Vec<BalancedEntry>) -> Balanced {
+    Balanced { entries, has_duration: true }
+}
+
+#[test]
+fn the_balanced_value_lists_the_pick_then_the_others_in_score_order() {
+    let builders = r#"[{"host": "win-1", "os": "windows", "repos": {"yaat": ["*"]}},
+        {"host": "win-2", "os": "windows", "repos": {"yaat": ["*"]}},
+        {"host": "win-3", "os": "windows", "repos": {"yaat": ["*"]}}]"#;
+    let cold = BuilderFigures {
+        free_slots: 2,
+        queue_wait: 0.0,
+        duration: Some(100.0),
+        holds_folder: false,
+    };
+    let facts = FakeFacts::with_config(with_builders(r#"{"yaat": ["dotnet *"]}"#, builders))
+        .with_figures("win-1", figures(0.0, Some(300.0)))
+        .with_figures("win-2", figures(60.0, Some(100.0)))
+        .with_figures("win-3", cold);
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(run.builder.alias, "builder-1", "host scores the median 100 s of the others");
+    assert_eq!(
+        run.balanced,
+        Some(with_durations(vec![
+            entry("builder-1", 1000, 1, false),
+            entry("win-2", 1600, 0, false),
+            entry("win-3", 2000, 2, true),
+            entry("win-1", 3000, 1, false),
+        ]))
+    );
+}
+
+#[test]
+fn a_balanced_value_without_any_duration_says_so_once() {
+    let facts = FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, TWO_WINDOWS))
+        .with_figures("win-2", figures(12.34, None))
+        .with_figures("win-3", figures(0.0, None));
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(
+        run.balanced,
+        Some(Balanced {
+            entries: vec![entry("win-3", 0, 1, false), entry("win-2", 123, 0, false)],
+            has_duration: false,
+        }),
+        "the queue wait alone scores each, kept in whole tenths"
+    );
+}
+
+#[test]
+fn facts_that_read_no_figures_give_no_balanced_value() {
+    let facts = FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, TWO_WINDOWS));
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(run.builder.alias, "win-2", "file order decides");
+    assert_eq!(later_aliases(&run), ["win-3"]);
+    assert_eq!(facts.figures_asked.get(), 1);
+    assert_eq!(run.balanced, None);
+}
+
+#[test]
+fn a_single_capable_builder_gives_no_balanced_value() {
+    let facts = FakeFacts::with_config(routing_all()).with_figures("builder-1", figures(0.0, None));
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(run.builder.alias, "builder-1");
+    assert_eq!(run.balanced, None);
+}
+
+#[test]
+fn a_pinned_run_gives_no_balanced_value() {
+    let facts = FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, TWO_WINDOWS))
+        .with_figures("win-2", figures(60.0, None))
+        .with_figures("win-3", figures(0.0, None));
+    let run = routed(decide(&pinned_to(&words(&["dotnet", "build"]), "win-2"), &facts));
+    assert_eq!(run.builder.alias, "win-2");
+    assert_eq!(run.balanced, None);
+}
+
+#[test]
+fn a_filter_skipped_best_score_is_listed_after_the_pick() {
+    let facts = mac_best_win_3_next("dotnet test*", true);
+    let run = routed(decide(&heavy(&words(&["dotnet", "test", "tests/X"])), &facts));
+    assert_eq!(run.builder.alias, "win-3", "the Windows-only test leaves the Mac");
+    assert_eq!(
+        run.balanced,
+        Some(with_durations(vec![
+            entry("win-3", 900, 0, false),
+            entry("mac-1", 600, 1, false),
+            entry("win-2", 1800, 0, false),
+        ])),
+        "the real pick first, then the others in score order"
+    );
 }
 
 #[test]

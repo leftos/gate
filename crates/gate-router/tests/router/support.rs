@@ -148,7 +148,8 @@ pub struct FakeFacts {
     pub project_files: Vec<String>,
     /// Whether a build file names a `Configuration` property, which counts only for a command that sets none.
     pub sets_configuration: bool,
-    /// The figures of these builders, by alias; every other builder gets [`balance::ALIKE`], so file order decides.
+    /// The figures of these builders, by alias; every other builder gets [`balance::ALIKE`]. With none named, the facts
+    /// read no figures, so file order decides and no pick is balanced.
     pub figures: Vec<(String, BuilderFigures)>,
     /// How many times the builders' figures were asked, kept apart from [`FakeFacts::asked`].
     pub figures_asked: Cell<usize>,
@@ -417,10 +418,14 @@ impl Facts for FakeFacts {
             .map(|(_, checkout)| checkout.clone())
     }
 
-    /// What [`FakeFacts::figures`] says of each builder, [`balance::ALIKE`] for one it does not name.
-    fn builder_figures(&self, _place: &Place, _words: &[String], builders: &[&Builder]) -> Vec<BuilderFigures> {
+    /// What [`FakeFacts::figures`] says of each builder, [`balance::ALIKE`] for one it does not name; `None`, no figures
+    /// read, when it names none, as the machine of a route hint answers.
+    fn builder_figures(&self, _place: &Place, _words: &[String], builders: &[&Builder]) -> Option<Vec<BuilderFigures>> {
         self.figures_asked.set(self.figures_asked.get() + 1);
-        builders
+        if self.figures.is_empty() {
+            return None;
+        }
+        let figures = builders
             .iter()
             .map(|builder| {
                 self.figures
@@ -428,7 +433,8 @@ impl Facts for FakeFacts {
                     .find(|(alias, _)| *alias == builder.alias)
                     .map_or(balance::ALIKE, |(_, figures)| *figures)
             })
-            .collect()
+            .collect();
+        Some(figures)
     }
 }
 

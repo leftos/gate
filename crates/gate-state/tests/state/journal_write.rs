@@ -9,6 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use flate2::read::GzDecoder;
+use gate_router::balance::{Balanced, BalancedEntry};
 use gate_state::{
     FallbackReason, HeavyLight, Held, JOURNAL_CAP_BYTES, JournalEvent, JournalIdentity, JournalLock, JournalNote, LockError, MachineSnapshot,
     OtherClaim, RemoteTag, RoutingFacts, RunFacts, RunTrace, TracedChild, Verdict, append_line, journal_line,
@@ -745,10 +746,31 @@ fn time_has_seven_fractional_digits_and_z() {
     assert_eq!(parsed(&exact)["processStart"], "2026-10-03T05:04:38.7424554Z");
 }
 
-/// A release line carries the run's routing facts after `path`, each field only when the run has one.
-#[test]
-fn a_release_line_carries_not_routed_reason_fell_back_and_parent_pid_when_given() {
-    let event = JournalEvent::Release {
+/// The scored builders of a balanced run, its scores including a duration when `has_duration`: `mac-1` picked at
+/// 40.4 s with a free slot, then `host` at 125 s, full and cold.
+fn two_balanced(has_duration: bool) -> Balanced {
+    Balanced {
+        entries: vec![
+            BalancedEntry {
+                alias: "mac-1".to_owned(),
+                tenths: 404,
+                free: 1,
+                cold: false,
+            },
+            BalancedEntry {
+                alias: "host".to_owned(),
+                tenths: 1250,
+                free: 0,
+                cold: true,
+            },
+        ],
+        has_duration,
+    }
+}
+
+/// A release line of `routing` facts.
+fn release_routed(routing: RoutingFacts) -> JournalEvent {
+    JournalEvent::Release {
         slots: vec![r"Local\gate-light-slot-0".to_owned()],
         held_seconds: 0.105,
         status: Some(0),
@@ -756,13 +778,20 @@ fn a_release_line_carries_not_routed_reason_fell_back_and_parent_pid_when_given(
         trace: RunTrace::default(),
         cold: false,
         path: None,
-        routing: Some(Box::new(RoutingFacts {
-            not_routed: Some("--local".to_owned()),
-            reason: Some("built here".to_owned()),
-            fell_back: vec![FallbackReason::Full, FallbackReason::Busy],
-            parent_pid: Some(40267),
-        })),
-    };
+        routing: Some(Box::new(routing)),
+    }
+}
+
+/// A release line carries the run's routing facts after `path`, each field only when the run has one.
+#[test]
+fn a_release_line_carries_not_routed_reason_fell_back_balanced_and_parent_pid_when_given() {
+    let event = release_routed(RoutingFacts {
+        not_routed: Some("--local".to_owned()),
+        reason: Some("built here".to_owned()),
+        fell_back: vec![FallbackReason::Full, FallbackReason::Busy],
+        balanced: Some(two_balanced(true)),
+        parent_pid: Some(40267),
+    });
     let line = journal_line(&identity(), ts(NOW), &event, None, None);
 
     assert_eq!(
@@ -777,11 +806,40 @@ fn a_release_line_carries_not_routed_reason_fell_back_and_parent_pid_when_given(
             "notRouted",
             "reason",
             "fellBack",
+            "balanced",
             "parentPid"
         ]
     );
     assert!(
-        line.ends_with(r#""notRouted":"--local","reason":"built here","fellBack":["full","busy"],"parentPid":40267}"#),
+        line.ends_with(concat!(
+            r#""notRouted":"--local","reason":"built here","fellBack":["full","busy"],"#,
+            r#""balanced":[{"builder":"mac-1","expectedSeconds":40.4,"free":1,"cold":false},"#,
+            r#"{"builder":"host","expectedSeconds":125.0,"free":0,"cold":true}],"parentPid":40267}"#
+        )),
+        "{line}"
+    );
+}
+
+/// A run whose only routing fact is its balanced pick still journals it, each expected time `null` when the scores
+/// include no duration.
+#[test]
+fn a_release_line_with_only_balanced_routing_facts_carries_them() {
+    let routing = RoutingFacts {
+        balanced: Some(two_balanced(false)),
+        ..RoutingFacts::default()
+    };
+    assert!(!routing.is_empty(), "the balanced builders are a routing fact");
+    let line = journal_line(&identity(), ts(NOW), &release_routed(routing), None, None);
+
+    assert_eq!(
+        own_keys(&line),
+        ["slots", "heldSeconds", "status", "wallSeconds", "adjustedSeconds", "verdict", "balanced"]
+    );
+    assert!(
+        line.ends_with(concat!(
+            r#""balanced":[{"builder":"mac-1","expectedSeconds":null,"free":1,"cold":false},"#,
+            r#"{"builder":"host","expectedSeconds":null,"free":0,"cold":true}]}"#
+        )),
         "{line}"
     );
 }

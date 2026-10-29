@@ -22,7 +22,7 @@ Each part is a sub-issue of CC-178 and lands on `feat/gate-durations`. Part 1 co
 
 ### Part 2: the durations summary, `gate expect` and the expected-time line
 
-- **Key.** `<place>:<class>:<repo>[/<sub>] | <normalised command>`. `place` is `local` or `remote:<host>`; `class` is `crit` for a critical gate, else empty. Repo and subfolder are derived from git, so no machine path is configured or hard-coded:
+- **Key.** `<place>:<class>:<repo>[/<sub>] | <normalised command>`. `place` is `local` or `remote:<alias>`; `class` is `crit` for a critical gate, else empty. Repo and subfolder are derived from git, so no machine path is configured or hard-coded:
   - The repo is the main checkout's folder name, taken from `git rev-parse --git-common-dir`, so every worktree of a repo shares one key.
   - The subfolder is the `cwd` relative to the worktree root.
   - A folder git cannot place falls back to its path's shape (a `{repo}.wt/{slug}/…` path is repo `{repo}` at the folders after the slug); any other folder is keyed as outside git, on its full path in lower case with `/` separators.

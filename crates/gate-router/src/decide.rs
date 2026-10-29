@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use crate::balance::{self, BuilderFigures};
+use crate::balance::{self, Balanced, BalancedEntry, BuilderFigures};
 use crate::config::{Builder, BuilderOs, CARGO_OUTPUTS, Config, ConfigProblem, DEFAULT_OUTPUTS, ignored_line};
 use crate::escape::escaped;
 use crate::key::{is_layout_name, repo_name, work_folder_key};
@@ -432,11 +432,12 @@ pub trait Facts {
     fn checkout_of(&self, tree: &Path) -> Option<String>;
 
     /// What the PC knows of each of `builders` for the command `words`, rewritten for Windows, of the worktree at
-    /// `place` ([`BuilderFigures`]): one entry per builder, in the order given, which [`balance::order`] scores. Asked
-    /// once per decision, with every builder one of whose own patterns matches the command, of a matched command whose
-    /// worktree opened and that its `.gate/local.toml` does not keep here, only when two or more builders match; never
-    /// asked of a run pinned with `--builder`.
-    fn builder_figures(&self, place: &Place, words: &[String], builders: &[&Builder]) -> Vec<BuilderFigures>;
+    /// `place` ([`BuilderFigures`]): one entry per builder, in the order given, which [`balance::ranked`] scores; `None`
+    /// when these facts read no figures, which keeps the builders in file order and the run without a balanced pick
+    /// ([`RemoteRun::balanced`]). Asked once per decision, with every builder one of whose own patterns matches the
+    /// command, of a matched command whose worktree opened and that its `.gate/local.toml` does not keep here, only when
+    /// two or more builders match; never asked of a run pinned with `--builder`.
+    fn builder_figures(&self, place: &Place, words: &[String], builders: &[&Builder]) -> Option<Vec<BuilderFigures>>;
 }
 
 /// The id of an open folder: its volume's serial number and its 128-bit file id. Two handles give one id only when they
@@ -738,6 +739,12 @@ pub struct RemoteRun {
     /// by its alias alone. A caller that falls back builds a candidate's run when it tries it ([`later_run`]); nothing is
     /// built here.
     pub later: Vec<LaterCandidate>,
+    /// Every builder the decision scored, when it scored two or more from figures the facts read
+    /// ([`Facts::builder_figures`], [`balance::ranked`]): the builder this run goes to first, then every other in score
+    /// order, each with its score and figures. `None` for a run pinned with `--builder`, a command only one builder may
+    /// run, a decision whose facts read no figures (the route hint, a light run's reroute by a critical request, `gate
+    /// warm`), and a later candidate's run ([`later_run`]).
+    pub balanced: Option<Balanced>,
     /// The cross build the macOS builder runs after the passing command, so its outputs come back built for Windows:
     /// set only for a direct `dotnet build`, or `dotnet test` without `--no-build`, of a repo the builder's entry
     /// cross-builds ([`Config::cross_build_rid`]) with outputs to bring back, that builds in place and names no runtime.
@@ -1036,6 +1043,8 @@ struct Matched {
     desktop: bool,
     /// The builders the run may try next, in try order ([`later_candidates`]).
     later: Vec<LaterCandidate>,
+    /// The scored builders, the pick first ([`RemoteRun::balanced`]).
+    balanced: Option<Balanced>,
     /// What the built-here record says of the command, carried from the pick ([`Opened::built_here`]).
     built_here: BuiltHere,
 }
@@ -1475,12 +1484,13 @@ fn matched(config: &Config, git_hook: bool, words: &[String], facts: &dyn Facts)
         return Err(None);
     }
     check_local(&opened.place, &sent.words, facts)?;
-    let order = scored(matching, &opened.place, &sent.words, facts);
+    let Scored { order, balanced } = scored(matching, &opened.place, &sent.words, facts);
     let first = pick(&order, |_| true).ok_or(None)?;
     let (builder, pattern, found) = steer_off_macos((config, &order), &opened, &sent.words, facts, first)?;
     let unix = slashed(&builder, &opened, words, &drives, facts);
     let (builder, pattern, unix) = steer_off_backslashes(&order, (builder, pattern, unix))?;
     let later = later_candidates(&order, &builder);
+    let balanced = balanced.map(|balanced| picked_first(balanced, &builder));
     let kept = Kept {
         builder,
         pattern,
@@ -1489,6 +1499,7 @@ fn matched(config: &Config, git_hook: bool, words: &[String], facts: &dyn Facts)
     };
     let mut matched = built(config, opened, sent, kept, facts)?;
     matched.later = later;
+    matched.balanced = balanced;
     Ok(matched)
 }
 
@@ -1519,6 +1530,7 @@ fn built(config: &Config, mut opened: Opened, sent: Rewritten, kept: Kept, facts
         program_named: sent.program_named,
         desktop,
         later: Vec::new(),
+        balanced: None,
         built_here,
     })
 }
@@ -2535,25 +2547,69 @@ fn matching(config: &Config, repo: &str, words: &[String]) -> Vec<(Builder, Stri
         .collect()
 }
 
-/// The `matching` builders of the command `words` of the worktree at `place`, best first: ordered by the figures the
-/// facts give for them ([`Facts::builder_figures`], asked once) as [`balance::order`] scores them. Fewer than two are
-/// not scored, and nothing is asked; they keep their file order.
+/// The `matching` builders of the command `words` of the worktree at `place`, best first, and what their scores were
+/// ([`Scored`]). Two or more are ordered by the figures the facts read for them ([`Facts::builder_figures`], asked
+/// once) as [`balance::ranked`] scores them, each scored builder kept in that order with its score, free slots and
+/// warmth ([`Scored::balanced`]); when the facts read none, they keep their file order and nothing is kept. Fewer than
+/// two are not scored, and nothing is asked; they keep their file order.
 ///
 /// # Panics
 ///
 /// When the facts give a figure count other than one per builder, which breaks [`Facts::builder_figures`]'s contract.
-fn scored(matching: Vec<(Builder, String)>, place: &Place, words: &[String], facts: &dyn Facts) -> Vec<(Builder, String)> {
+fn scored(matching: Vec<(Builder, String)>, place: &Place, words: &[String], facts: &dyn Facts) -> Scored {
     if matching.len() < 2 {
-        return matching;
+        return Scored {
+            order: matching,
+            balanced: None,
+        };
     }
-    let order = {
-        let builders: Vec<&Builder> = matching.iter().map(|(builder, _)| builder).collect();
-        let figures = facts.builder_figures(place, words, &builders);
-        assert_eq!(figures.len(), builders.len(), "the facts give one figure per builder");
-        balance::order(&figures)
+    let builders: Vec<&Builder> = matching.iter().map(|(builder, _)| builder).collect();
+    let Some(figures) = facts.builder_figures(place, words, &builders) else {
+        return Scored {
+            order: matching,
+            balanced: None,
+        };
+    };
+    assert_eq!(figures.len(), builders.len(), "the facts give one figure per builder");
+    let ranking = balance::ranked(&figures);
+    let entries = ranking
+        .ranks
+        .iter()
+        .map(|rank| BalancedEntry {
+            alias: builders[rank.index].alias.clone(),
+            tenths: balance::tenths(rank.seconds),
+            free: figures[rank.index].free_slots,
+            cold: !figures[rank.index].holds_folder,
+        })
+        .collect();
+    let balanced = Balanced {
+        entries,
+        has_duration: ranking.has_duration,
     };
     let mut unplaced: Vec<Option<(Builder, String)>> = matching.into_iter().map(Some).collect();
-    order.into_iter().filter_map(|at| unplaced[at].take()).collect()
+    let order = ranking.ranks.into_iter().filter_map(|rank| unplaced[rank.index].take()).collect();
+    Scored {
+        order,
+        balanced: Some(balanced),
+    }
+}
+
+/// The `matching` builders as [`scored`] ordered them.
+struct Scored {
+    /// The builders, best first.
+    order: Vec<(Builder, String)>,
+    /// Each scored builder in score order, when two or more were scored from figures the facts read; `None` otherwise.
+    balanced: Option<Balanced>,
+}
+
+/// The scored builders as the run that goes to `chosen` tells them ([`RemoteRun::balanced`]): the chosen builder first,
+/// then every other in score order.
+fn picked_first(mut balanced: Balanced, chosen: &Builder) -> Balanced {
+    if let Some(at) = balanced.entries.iter().position(|entry| entry.alias == chosen.alias) {
+        let pick = balanced.entries.remove(at);
+        balanced.entries.insert(0, pick);
+    }
+    balanced
 }
 
 /// The builder that runs the command and the pattern that chose it: the first of `order` that `eligible` lets run it.
@@ -2999,6 +3055,7 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         program_named,
         desktop,
         later,
+        balanced,
         built_here,
         ..
     } = matched;
@@ -3088,6 +3145,7 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         desktop,
         source_revision,
         later,
+        balanced,
         cross_build,
         cross_build_blocked,
         bins_withheld,

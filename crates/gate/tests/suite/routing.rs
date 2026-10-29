@@ -6059,6 +6059,63 @@ fn with_nothing_known_the_first_builder_in_file_order_takes_the_run() {
     assert_eq!(call["host"], SLOT_FIRST, "{call}");
 }
 
+/// The lines of `outcome`'s stderr that say a balanced pick.
+fn balanced_lines(outcome: &Outcome) -> Vec<&str> {
+    outcome.stderr.lines().filter(|line| line.starts_with("gate: balanced to ")).collect()
+}
+
+/// The `release` line of the gate `pid`.
+fn release_of(case: &Case, pid: u32) -> Value {
+    own(case, pid)
+        .into_iter()
+        .find(|event| event["event"] == "release")
+        .expect("the run journaled its release")
+}
+
+#[test]
+fn a_balanced_run_says_the_pick_and_journals_every_candidate() {
+    let case = balance_case("routing-balance-line");
+    seed_both(&case, 100.0, 40.0);
+    plant_worktree_record(&case, &[SLOT_FIRST, HOST]);
+
+    let (pid, outcome, call) = balanced_run(&case, "out.log");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(call["host"], HOST, "{call}");
+    assert_eq!(
+        balanced_lines(&outcome),
+        [format!("gate: balanced to {HOST}: about 40 s, 1 free ({SLOT_FIRST} about 2 min, 1 free)")],
+        "{outcome:?}"
+    );
+    assert_eq!(
+        release_of(&case, pid)["balanced"],
+        json!([
+            { "builder": HOST, "expectedSeconds": 40.0, "free": 1, "cold": false },
+            { "builder": SLOT_FIRST, "expectedSeconds": 100.0, "free": 1, "cold": false },
+        ])
+    );
+}
+
+#[test]
+fn a_pinned_two_builder_run_says_no_balanced_line() {
+    let case = balance_case("routing-balance-pinned");
+    let steps = shown(&stub(&case, &["status 0"]));
+    let running = case.start(&routed_words(
+        "out.log",
+        &steps,
+        &["--builder", SLOT_FIRST],
+        &[r".\tool.exe", "out", "ran there"],
+    ));
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(took_on(&case, pid), [SLOT_FIRST], "{outcome:?}");
+    assert!(balanced_lines(&outcome).is_empty(), "{outcome:?}");
+    let release = release_of(&case, pid);
+    assert!(release.get("balanced").is_none(), "{release}");
+}
+
 /// A [`client_case`] whose routing file lists [`SLOT_FIRST`] before [`HOST`], both taking its `*tool*` commands, each
 /// builder laying its work folder out under a folder of its own; with the folders part of the run's transport.
 fn two_folder_case(name: &str) -> (Case, String) {
