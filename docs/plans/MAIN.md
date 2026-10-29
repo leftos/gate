@@ -7,6 +7,8 @@
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [!] GATE-828 Fix the flaky Unix box test a_clear_refuses_a_volume_mounted_in_the_work_folder_and_keeps_its_files — Urgent · Remote
 - [ ] GATE-871 Carry routed runs' bulk data on a TCP data channel instead of ssh to the Windows builder — Urgent · Remote
+- [ ] GATE-920 Fix the flaky box test box_run_undoes_its_pushes_when_the_client_went_during_a_failed_push — Urgent · Remote
+- [ ] GATE-921 Fix the flaky durations test no_ceiling_hint_at_or_above_the_load_adjusted_p90_or_without_history_or_without_a_slot — Urgent · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
@@ -15,10 +17,7 @@
 - [ ] GATE-753 Log every step of a run in the gate's log: start, progress, end and duration — High · Remote
 - [ ] GATE-759 Move the rest of the box's shared wire rules into gate-wire (GATE-616 slices 2, 3, 5, 6) — High · Remote
 - [!] GATE-839 Route race-anywhere's Unreal editor and game runs: a desktop route with a GPU — High · Remote
-- [ ] GATE-843 Keep the routing facts a census needs past the journal's roll — High · Remote
 - [/] GATE-844 Serve godot-mcp's parallel itest lanes on the builder desktop, and match any --filter-class — High · Remote
-- [/] GATE-876 Carry the input put, the sent build and the LFS put on the data channel — High · Remote
-- [ ] GATE-910 Route yaat's tools one by one after a trial each, with .tmp outputs globs (GATE-841 ruling 2) — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
@@ -252,9 +251,9 @@
 - [ ] GATE-748 Let a --builder pin use the repo's other routes when the pinned entry's listing misses
 - [ ] GATE-750 Harden the Unix box's cross build: one read for check and pack, a command record, the stop window
 - [ ] GATE-769 Say how long a gate waited when it takes its slot (sub-issue of GATE-753)
-- [ ] GATE-770 Say a routed run's builder preflight and snapshot push as they start, and the preflight's duration (sub-issue of GATE-753)
-- [ ] GATE-771 Say a routed run's inputs, LFS and cross-build puts as they start (sub-issue of GATE-753)
-- [ ] GATE-772 Say the box's checkout, with its duration, on both boxes (sub-issue of GATE-753)
+- [/] GATE-770 Say a routed run's builder preflight and snapshot push as they start, and the preflight's duration (sub-issue of GATE-753)
+- [/] GATE-771 Say a routed run's inputs, LFS and cross-build puts as they start (sub-issue of GATE-753)
+- [/] GATE-772 Say the box's checkout, with its duration, on both boxes (sub-issue of GATE-753)
 - [ ] GATE-773 Say the sync-back's start, the outputs install's end and the restore here, with durations (sub-issue of GATE-753)
 - [ ] GATE-758 Say the hang hint in every phase of a routed run, not only while a call is watched
 - [ ] GATE-783 Check which ssh a gate under Git Bash runs, and its exit-status width
@@ -313,6 +312,8 @@
 - [ ] GATE-913 Install gate.exe on Windows builders entries in gate push, so a not-routed trial works
 - [ ] GATE-914 Say the routed-without-sibling line from gate warm
 - [ ] GATE-916 Look at no sibling folder before consent and the leaf check pass
+- [ ] GATE-918 Give an output brought back from .tmp a modified time no earlier than its run wrote it
+- [ ] GATE-919 Hash a put's archive as it is packed instead of reading it back
 
 ## Cutover sweep
 
