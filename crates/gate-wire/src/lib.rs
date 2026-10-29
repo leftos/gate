@@ -1817,6 +1817,70 @@ pub fn sdk_list(listing: &str) -> String {
     if versions.is_empty() { "none".to_owned() } else { versions.join(",") }
 }
 
+/// What the preflight's version line starts with; the client reads the build version the box says after it.
+pub const VERSION_PREFIX: &str = "gate: remote version ";
+
+/// The preflight's version line, `gate: remote version <v>`, the version as `gate --version` says it after `gate `
+/// ([`build_version`]).
+#[must_use]
+pub fn version_line() -> String {
+    format!("{VERSION_PREFIX}{}", build_version())
+}
+
+/// What the warm line starts with: the trailing space keeps the client from reading a `gate: remote warm-up` line as one.
+pub const WARM_PREFIX: &str = "gate: remote warm ";
+
+/// The warm line, `gate: remote warm <hash>`, or `gate: remote warm none` without a warm record's hash.
+#[must_use]
+pub fn warm_line(hash: Option<&str>) -> String {
+    format!("{WARM_PREFIX}{}", hash.unwrap_or("none"))
+}
+
+/// What the line saying a bare repository was created starts with.
+pub const CREATED_PREFIX: &str = "gate: remote created ";
+
+/// The line saying the preflight creates the bare repository `bare`, `gate: remote created <bare>`, the path escaped.
+#[must_use]
+pub fn created_line(bare: &str) -> String {
+    format!("{CREATED_PREFIX}{}", escaped(bare))
+}
+
+/// What the preflight's SDK list line starts with.
+pub const SDKS_PREFIX: &str = "gate: remote sdks ";
+
+/// The preflight's SDK list line, `gate: remote sdks <list>`, the list ([`sdk_list`]) escaped, as `dotnet` wrote it.
+#[must_use]
+pub fn sdks_line(list: &str) -> String {
+    format!("{SDKS_PREFIX}{}", escaped(list))
+}
+
+/// The line saying why the preflight could not read the SDK list: `gate: remote could not read the SDK list: <message>`.
+#[must_use]
+pub fn sdks_failure(message: &str) -> String {
+    format!("gate: remote could not read the SDK list: {message}")
+}
+
+/// The line saying the work folder's tree is new, which the client raises a run's ceiling for.
+pub const NEW_WORK_TREE: &str = "gate: remote new work tree";
+
+/// What a pair run's back commits line starts with.
+pub const BACK_COMMITS_PREFIX: &str = "gate: remote back commits: ";
+
+/// What a pair run says when its back commits were not all pushed, or were never made because the run ended before
+/// them: the PC applies nothing.
+pub const BACK_COMMITS_FAILED: &str = "gate: remote back commits: failed";
+
+/// The line a pair run says once every back commit is pushed: [`BACK_COMMITS_PREFIX`] and, for each repo of `commits`,
+/// the main one first, its name and its back commit, or `none` for a repo whose tree is unchanged, comma-separated.
+#[must_use]
+pub fn back_commits_line(commits: &[(&str, Option<&str>)]) -> String {
+    let named: Vec<String> = commits
+        .iter()
+        .map(|(name, commit)| format!("{name} {}", commit.unwrap_or("none")))
+        .collect();
+    format!("{BACK_COMMITS_PREFIX}{}", named.join(", "))
+}
+
 #[cfg(test)]
 mod tests {
     use base64::Engine;
@@ -1824,9 +1888,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CROSS_BUILD_START, CROSS_NOT_BROUGHT_BACK, CROSS_STEP_START, CrossBuild, PathForm, Payload, Probed, escaped, first_version,
-        is_cross_not_brought_back, is_cross_step_start, probed, root_busy_line, root_unsafe_line, runs_probe, sdk_list, tool_line, version_of,
-        version_text, work_root,
+        BACK_COMMITS_FAILED, CROSS_BUILD_START, CROSS_NOT_BROUGHT_BACK, CROSS_STEP_START, CrossBuild, NEW_WORK_TREE, PathForm, Payload, Probed,
+        back_commits_line, created_line, escaped, first_version, is_cross_not_brought_back, is_cross_step_start, probed, root_busy_line,
+        root_unsafe_line, runs_probe, sdk_list, sdks_line, tool_line, version_line, version_of, version_text, warm_line, work_root,
     };
 
     #[test]
@@ -3809,6 +3873,50 @@ mod tests {
         let crlf = "8.0.404 [C:\\Program Files\\dotnet\\sdk]\r\n\r\n  9.0.100 [C:\\Program Files\\dotnet\\sdk]\r\n";
         assert_eq!(sdk_list(crlf), "8.0.404,9.0.100");
         assert_eq!(sdk_list("\r\n  \n"), "none");
+    }
+
+    #[test]
+    fn the_version_line_names_the_build_version() {
+        assert_eq!(version_line(), format!("gate: remote version {}", super::build_version()));
+    }
+
+    #[test]
+    fn the_created_and_sdks_lines_escape_outside_text() {
+        assert_eq!(created_line("/r/a\nb.git"), r"gate: remote created /r/a\nb.git");
+        assert_eq!(sdks_line("8.0.415,9\u{1b}"), r"gate: remote sdks 8.0.415,9\u{1b}");
+        assert_eq!(created_line(r"D:\gate-remote\app.git"), r"gate: remote created D:\gate-remote\app.git");
+        let bidi = "D:\\gate-remote\\a\u{202e}b.git";
+        assert_eq!(created_line(bidi), format!("gate: remote created {}", escaped(bidi)));
+        assert!(!created_line(bidi).contains('\u{202e}'), "the mark is escaped: {}", created_line(bidi));
+    }
+
+    #[test]
+    fn the_back_commits_line_names_each_repo_and_its_commit() {
+        let (main, lib) = ("a".repeat(40), "b".repeat(40));
+        assert_eq!(
+            back_commits_line(&[("app", Some(&main)), ("lib", Some(&lib)), ("tools", None)]),
+            format!("gate: remote back commits: app {main}, lib {lib}, tools none")
+        );
+        assert_eq!(
+            back_commits_line(&[("app", None), ("lib", None)]),
+            "gate: remote back commits: app none, lib none"
+        );
+        assert_eq!(BACK_COMMITS_FAILED, "gate: remote back commits: failed");
+    }
+
+    #[test]
+    fn the_preflight_lines_are_the_bytes_both_boxes_say() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(version_line(), format!("gate: remote version {}", super::build_version()));
+        assert_eq!(
+            warm_line(Some(hash)),
+            "gate: remote warm 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(warm_line(None), "gate: remote warm none");
+        assert_eq!(created_line(r"D:\gate-remote\app.git"), r"gate: remote created D:\gate-remote\app.git");
+        assert_eq!(sdks_line("8.0.415,9.0.100"), "gate: remote sdks 8.0.415,9.0.100");
+        assert_eq!(NEW_WORK_TREE, "gate: remote new work tree");
+        assert_eq!(BACK_COMMITS_FAILED, "gate: remote back commits: failed");
     }
 
     #[test]

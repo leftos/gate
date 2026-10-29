@@ -1,16 +1,13 @@
-//! The lines the Unix box says and the pure rules behind them: each line byte for byte as the Windows box says it where
-//! the PC parses it, and the judgements (the work root's trust, the warm record, the layout record, the job record)
-//! as functions of facts the verbs read, so they are tested on every target.
+//! The Unix box's own lines and the pure rules behind them: the judgements (the work root's trust, the warm record, the
+//! layout record, the job record) as functions of facts the verbs read, so they are tested on every target. The
+//! preflight lines the PC parses, which both boxes say byte for byte, come from `gate_wire`.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use gate_wire::{BoxKill, PathForm, Payload, Refusal, build_version, channel_not_completed_line, escaped, refused_line, work_root};
-
-/// The line saying the work folder's tree is new, which the client raises a run's ceiling for.
-pub const NEW_WORK_TREE: &str = "gate: remote new work tree";
+use gate_wire::{BoxKill, PathForm, Payload, Refusal, channel_not_completed_line, escaped, refused_line, work_root};
 
 /// The line a payload whose `Needs` is not an object of texts gets; nothing is probed.
 pub const NEEDS_REFUSED: &str = "gate: box payload Needs is not an object of texts; probing nothing";
@@ -24,24 +21,6 @@ pub const USAGE_STATUS: u8 = 2;
 
 /// The status of a step that failed with no status of its own.
 pub const FAILED_STATUS: u8 = 1;
-
-/// `gate: remote version <v>`, the version as `gate --version` says it after `gate `.
-#[must_use]
-pub fn version_line() -> String {
-    format!("gate: remote version {}", build_version())
-}
-
-/// `gate: remote warm <hash>`, or `gate: remote warm none` without one.
-#[must_use]
-pub fn warm_line(hash: Option<&str>) -> String {
-    format!("gate: remote warm {}", hash.unwrap_or("none"))
-}
-
-/// `gate: remote created <bare>`, said before the bare repository is made, the path escaped.
-#[must_use]
-pub fn created_line(bare: &str) -> String {
-    format!("gate: remote created {}", escaped(bare))
-}
 
 /// A marker for one print of the login shell: `__GATE_LOGIN_<16 hex>__`, the hex from the box's process id and the
 /// time, so no fixed text a login profile prints can be taken for it. The login shell prints it between two NULs, then
@@ -145,12 +124,6 @@ pub fn boot_failure(message: &str) -> String {
     format!("gate: remote could not read the boot time: {message}")
 }
 
-/// `gate: remote sdks <list>`, the list escaped, as `dotnet` wrote it.
-#[must_use]
-pub fn sdks_line(list: &str) -> String {
-    format!("gate: remote sdks {}", escaped(list))
-}
-
 /// Whether the environment variable `name` is git's own, `GIT_` in any ASCII case: none is passed on to a git step,
 /// so no inherited one points git at another repository, config, template or program.
 #[must_use]
@@ -162,12 +135,6 @@ pub fn is_git_variable(name: &OsStr) -> bool {
 
 /// What every git variable's name starts with, in some ASCII case.
 const GIT_PREFIX: &[u8] = b"GIT_";
-
-/// `gate: remote could not read the SDK list: <message>`.
-#[must_use]
-pub fn sdks_failure(message: &str) -> String {
-    format!("gate: remote could not read the SDK list: {message}")
-}
 
 /// Why a probe cut by its deadline `limit` was skipped: `no answer in <n> s`, or `<n> ms` when the limit is not whole
 /// seconds.
@@ -351,22 +318,6 @@ pub fn record_unread(record: &str, error: &str) -> String {
 #[must_use]
 pub fn record_without_group(record: &str) -> String {
     format!("{} names no process group", escaped(record))
-}
-
-/// What a pair run says when its back commits were not all pushed, or were never made because the run ended before
-/// them: the PC applies nothing, as the Windows box's line tells it.
-pub const BACK_COMMITS_FAILED: &str = "gate: remote back commits: failed";
-
-/// The line a pair run says once every back commit is pushed, as the Windows box builds it: `gate: remote back commits: `
-/// and, for each repo of `commits`, the main one first, its name and its back commit, or `none` for a repo whose tree is
-/// unchanged, comma-separated.
-#[must_use]
-pub fn back_commits_line(commits: &[(&str, Option<&str>)]) -> String {
-    let named: Vec<String> = commits
-        .iter()
-        .map(|(name, commit)| format!("{name} {}", commit.unwrap_or("none")))
-        .collect();
-    format!("gate: remote back commits: {}", named.join(", "))
 }
 
 /// What a job record, `<Work>.pgid`, says of the job a stop names.
@@ -680,13 +631,13 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Along, BACK_COMMITS_FAILED, BOX_JOB_VARIABLE, CommandEnd, GODOT_PATH, Godot, ROSETTA_LINE, Translation, back_commits_line,
-        command_environment, command_status, rosetta_lines, round_trip, translation,
+        Along, BOX_JOB_VARIABLE, CommandEnd, GODOT_PATH, Godot, ROSETTA_LINE, Translation, command_environment, command_status, rosetta_lines,
+        round_trip, translation,
     };
     use super::{
-        FolderFlaw, JobRecord, Login, Recorded, RootFacts, WORK_ROOT_STEP, boot_line, created_line, folder_failure, folder_flaw, is_git_variable,
-        job_record, job_record_text, login_marker, marked_login, no_answer, record_unread, record_without_group, recorded_group, root_flaw,
-        sdks_line, signal_guard, step_unran, version_line, work_layout, write_failure,
+        FolderFlaw, JobRecord, Login, Recorded, RootFacts, WORK_ROOT_STEP, boot_line, folder_failure, folder_flaw, is_git_variable, job_record,
+        job_record_text, login_marker, marked_login, no_answer, record_unread, record_without_group, recorded_group, root_flaw, signal_guard,
+        step_unran, work_layout, write_failure,
     };
     use gate_wire::{BoxKill, is_lower_hex};
 
@@ -969,11 +920,6 @@ mod tests {
     }
 
     #[test]
-    fn the_version_line_names_the_build_version() {
-        assert_eq!(version_line(), format!("gate: remote version {}", gate_wire::build_version()));
-    }
-
-    #[test]
     fn every_git_variable_is_scrubbed_in_any_case_and_nothing_else() {
         let environment = [
             "GIT_CONFIG",
@@ -991,9 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn the_created_and_sdks_lines_escape_outside_text() {
-        assert_eq!(created_line("/r/a\nb.git"), r"gate: remote created /r/a\nb.git");
-        assert_eq!(sdks_line("8.0.415,9\u{1b}"), r"gate: remote sdks 8.0.415,9\u{1b}");
+    fn the_failure_lines_escape_outside_text() {
         assert_eq!(
             write_failure("/w/k\n/.git/objects/info/alternates", "Is a\u{1b} FIFO"),
             r"gate: remote could not write /w/k\n/.git/objects/info/alternates: Is a\u{1b} FIFO"
@@ -1106,21 +1050,6 @@ mod tests {
                 r#"run the installer's "Gate work root" step (install-macos.sh --only "Gate work root")"#
             )
         );
-    }
-
-    #[test]
-    fn the_back_commits_line_is_the_windows_box_s() {
-        let (main, lib) = ("a".repeat(40), "b".repeat(40));
-        // The Windows box's own test of its line (`box_run_with_a_pair_names_each_repo_s_back_commit`) pins this form.
-        assert_eq!(
-            back_commits_line(&[("app", Some(&main)), ("lib", Some(&lib)), ("tools", None)]),
-            format!("gate: remote back commits: app {main}, lib {lib}, tools none")
-        );
-        assert_eq!(
-            back_commits_line(&[("app", None), ("lib", None)]),
-            "gate: remote back commits: app none, lib none"
-        );
-        assert_eq!(BACK_COMMITS_FAILED, "gate: remote back commits: failed");
     }
 
     const JOB: &str = "gate-remote-repo-0123abcd-0123456789ab";

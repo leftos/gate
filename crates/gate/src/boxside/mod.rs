@@ -34,8 +34,7 @@ use std::time::SystemTime;
 pub(crate) use preflight::WORK_ROOT_STEP;
 
 use gate_args::{BoxRequest, BoxVerb, Problem};
-use gate_wire::build_version;
-use gate_wire::{PathForm, Payload};
+use gate_wire::{PathForm, Payload, version_line};
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
 use crate::console::Console;
@@ -59,7 +58,7 @@ pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
         // The preflight says its version line first, so a PC client of another version falls back on the version rather
         // than a bare status 1.
         if matches!(request.verb, BoxVerb::Preflight) {
-            stamping::out(console, &format!("gate: remote version {}", build_version()));
+            stamping::out(console, &version_line());
         }
         stamping::err(console, &install_untrusted_line(&why));
         return u32::from(INSTALL_STATUS);

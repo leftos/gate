@@ -389,6 +389,30 @@ fn preflight_creates_the_bare_repo_and_work_folder() {
     assert_eq!(case.folder_entries(), ["remote"], "the box writes only where the payload says");
 }
 
+/// The created line shows the bare repository's path escaped, as the Unix box says it, so a bidi mark in the folder
+/// holding it can neither reorder the line nor reach the PC raw.
+#[test]
+fn preflight_says_a_bare_holding_a_bidi_mark_escaped() {
+    let case = Case::new("preflight_says_a_bare_holding_a_bidi_mark_escaped");
+    let remote = case.folder().join("re\u{202e}mote");
+    let text = |path: PathBuf| path.to_str().expect("the case folder is Unicode").to_owned();
+    let folders = Folders {
+        bare: text(remote.join("k.git")),
+        work: text(remote.join("work").join("k")),
+    };
+
+    let outcome = preflight_with_git_bin(&case, &folders.payload(), &case.folder().join("fake-git").join("bin"));
+
+    let printed = passed(&outcome);
+    assert_eq!(
+        printed[0],
+        format!("gate: remote created {}", folders.bare.replace('\u{202e}', r"\u{202e}")),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stdout.contains('\u{202e}'), "no mark of the path reaches the line: {outcome:?}");
+    assert!(Path::new(&folders.bare).is_dir(), "the bare repository is made where the payload says");
+}
+
 #[test]
 fn preflight_of_a_trusted_git_bin_says_no_path_line() {
     let case = Case::new("preflight_git_bin_trusted");

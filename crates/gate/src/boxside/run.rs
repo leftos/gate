@@ -34,8 +34,8 @@ use gate_win32::{
 };
 use gate_wire::stamp::Tag;
 use gate_wire::{
-    LAYOUT_CHANGING, PairSibling, PathForm, Payload, bare_stem, checkout_done_line, checkout_start_line, layout_text, names_another_layout,
-    ordinal_upper, trees,
+    BACK_COMMITS_FAILED, LAYOUT_CHANGING, PairSibling, PathForm, Payload, bare_stem, checkout_done_line, checkout_start_line, layout_text,
+    names_another_layout, ordinal_upper, trees, warm_line,
 };
 
 use crate::answer::USAGE_STATUS;
@@ -1048,7 +1048,7 @@ fn warm_up(request: &Request<'_>, hash: &str, place: &Path, beat: &Beat<'_>, con
         other => other,
     };
     if ended == Ok(0) {
-        beat.say(console, &format!("gate: remote warm {hash}"));
+        beat.say(console, &warm_line(Some(hash)));
     } else {
         // Said when it fails; the warm-up's own status stands.
         let _ = record_step(preflight::remove_entry(Path::new(&record)), "remove", &record, beat, console);
@@ -1541,7 +1541,7 @@ fn back_commits_failed(request: &Request<'_>, beat: &Beat<'_>, console: &mut Con
 fn no_back_commits(request: &Request<'_>, console: &mut Console) {
     // A warm-up brings nothing back, so it never says how its back commits went.
     if !request.siblings.is_empty() && request.warm_hash.is_none() {
-        stamping::err(console, "gate: remote back commits: failed");
+        stamping::err(console, BACK_COMMITS_FAILED);
     }
 }
 
@@ -1560,15 +1560,15 @@ fn layout_refused(request: &Request<'_>, why: &str, beat: &Beat<'_>, console: &m
     REFUSED_STATUS
 }
 
-/// The line a pair run says once every back commit is pushed: `gate: remote back commits: ` and, for each repo, the
-/// main one first, its name and its back commit, or `none` for a repo whose tree is unchanged, comma-separated.
+/// The line a pair run says once every back commit is pushed ([`gate_wire::back_commits_line`]): for each of
+/// `request`'s repos, the main one first, its name and its back commit of `commits`.
 fn back_commits_line(request: &Request<'_>, commits: &[Option<String>]) -> String {
-    let named: Vec<String> = request
+    let named: Vec<(&str, Option<&str>)> = request
         .repos()
         .zip(commits)
-        .map(|(repo, commit)| format!("{} {}", repo.name.as_deref().unwrap_or_default(), commit.as_deref().unwrap_or("none")))
+        .map(|(repo, commit)| (repo.name.as_deref().unwrap_or_default(), commit.as_deref()))
         .collect();
-    format!("gate: remote back commits: {}", named.join(", "))
+    gate_wire::back_commits_line(&named)
 }
 
 /// Why the work folder could not be laid out for a run ([`WorkGit::lay_out`]).

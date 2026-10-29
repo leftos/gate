@@ -45,7 +45,10 @@ use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
 use gate_router::{Config, DROPPED_NO_BUILD_LINE, SendPlan, build_settings, escaped, repo_name};
-use gate_wire::{PairRefused, Payload, SHA256_DIGITS, channel_prefix, checkout_prefix, is_cross_not_brought_back, is_lower_hex};
+use gate_wire::{
+    CREATED_PREFIX, NEW_WORK_TREE, PairRefused, Payload, SDKS_PREFIX, SHA256_DIGITS, VERSION_PREFIX, WARM_PREFIX, channel_prefix, checkout_prefix,
+    is_cross_not_brought_back, is_lower_hex, warm_line,
+};
 
 use super::channel;
 use super::drain::{self, Drain, DrainLine};
@@ -129,19 +132,8 @@ const RETRY_WRITTEN: u64 = 1 << 20;
 const PAUSE_STEP: Duration = Duration::from_millis(20);
 /// The box's heartbeat, `gate-remote-heartbeat: <digits>` on standard error: progress, kept out of the log.
 const HEARTBEAT: &str = "gate-remote-heartbeat: ";
-/// The preflight's lines the client reads.
-const VERSION: &str = "gate: remote version ";
-/// The work folder's warm-up, `gate: remote warm <hash|none>`, said right after the version line; the space keeps the
-/// box's `gate: remote warm-up …` lines from matching.
-const WARM: &str = "gate: remote warm ";
-/// The preflight's line, right after the warm line, when it found the work folder's tree new: nothing had the name
-/// `.git` there.
-pub(crate) const NEW_WORK_TREE: &str = "gate: remote new work tree";
-pub(crate) const CREATED: &str = "gate: remote created ";
 /// The builder's boot time, which the preflight and the `boot` call say.
 const BOOT: &str = "gate: remote boot ";
-/// The builder's SDK list, which the preflight says: `gate: remote sdks <v1,v2|none>`.
-const SDKS: &str = "gate: remote sdks ";
 /// How far apart two boot times of one builder may be and still be one boot.
 const BOOT_SLACK: SignedDuration = SignedDuration::from_secs(30);
 /// The line said when `--test-remote-interrupt-at` is given but the console handler that would carry the interrupt
@@ -2346,12 +2338,7 @@ impl Attempt<'_, '_> {
         })?;
         let at = Timestamp::now();
         let new_tree = new_work_tree(&called.lines);
-        let created = called
-            .lines
-            .iter()
-            .filter_map(|line| line.strip_prefix(CREATED))
-            .map(str::to_owned)
-            .collect();
+        let created = created_of(&called.lines).map(str::to_owned).collect();
         let boot = boot_time(&called.lines).map(str::to_owned);
         let sdks = sdks_of(&called.lines);
         let tools = toolchain::reported(&called.lines, &sent);
@@ -2804,7 +2791,7 @@ impl Attempt<'_, '_> {
                 at,
                 repo,
                 snapshot,
-                created: created.contains(&repo.bare),
+                created: said_created(created, &repo.bare),
             };
             push_one(self, &push, watch)?;
         }
@@ -5583,13 +5570,26 @@ pub(crate) enum Warm {
     Unseen,
 }
 
+/// The paths of the preflight's `gate: remote created <bare>` lines among `lines`, in order, as the box said them:
+/// escaped ([`gate_wire::created_line`]), the rest of each line untrimmed.
+pub(crate) fn created_of(lines: &[String]) -> impl Iterator<Item = &str> {
+    lines.iter().filter_map(|line| line.strip_prefix(CREATED_PREFIX))
+}
+
+/// Whether the preflight said it created the bare repository `bare`: one of the `created` lines' paths is `bare` as the
+/// box says it, escaped ([`gate_wire::created_line`]). `escaped` leaves `\` alone, so a folder named with the text
+/// `\u{202e}` and one holding the real mark at that spot compare equal; accepted, as it needs two such bares in one pair.
+fn said_created(created: &[String], bare: &str) -> bool {
+    created.contains(&escaped(bare))
+}
+
 /// The work folder's warm-up, from the line right after the preflight's last `gate: remote version` line alone, when it
 /// is exactly `gate: remote warm none` or `gate: remote warm ` and 64 lower-case hex digits.
 pub(crate) fn warm_of(lines: &[String]) -> Warm {
-    let Some(version) = lines.iter().rposition(|line| line.starts_with(VERSION)) else {
+    let Some(version) = lines.iter().rposition(|line| line.starts_with(VERSION_PREFIX)) else {
         return Warm::Unseen;
     };
-    match lines.get(version + 1).and_then(|line| line.strip_prefix(WARM)) {
+    match lines.get(version + 1).and_then(|line| line.strip_prefix(WARM_PREFIX)) {
         Some("none") => Warm::NoHash,
         Some(hash) if is_lower_hex(hash, SHA256_DIGITS) => Warm::Hash(hash.to_owned()),
         _ => Warm::Unseen,
@@ -5599,10 +5599,10 @@ pub(crate) fn warm_of(lines: &[String]) -> Warm {
 /// Whether the preflight said the work folder's tree is new: [`NEW_WORK_TREE`] exactly, right after the warm line that
 /// follows its last `gate: remote version` line. A box that never says it reads as not new.
 fn new_work_tree(lines: &[String]) -> bool {
-    let Some(version) = lines.iter().rposition(|line| line.starts_with(VERSION)) else {
+    let Some(version) = lines.iter().rposition(|line| line.starts_with(VERSION_PREFIX)) else {
         return false;
     };
-    let warm_said = lines.get(version + 1).is_some_and(|line| line.starts_with(WARM));
+    let warm_said = lines.get(version + 1).is_some_and(|line| line.starts_with(WARM_PREFIX));
     warm_said && lines.get(version + 2).is_some_and(|line| line == NEW_WORK_TREE)
 }
 
@@ -5630,7 +5630,7 @@ const UNCONFIRMED: &str = "the box did not confirm the warm hash";
 fn warm_end(hash: &str, started: bool, end: &End, last_error: Option<&str>) -> WarmEnd {
     let failure = match end {
         End::Interrupted => return WarmEnd::Deleted,
-        End::Status(0) if started && last_error == Some(format!("{WARM}{hash}").as_str()) => return WarmEnd::Warm,
+        End::Status(0) if started && last_error == Some(warm_line(Some(hash)).as_str()) => return WarmEnd::Warm,
         End::Refused(_) | End::NotRouted(_) => WarmFailure::Refused,
         _ if started => WarmFailure::Commands,
         _ => WarmFailure::Refused,
@@ -5710,7 +5710,7 @@ fn box_slots_kept(lines: &[String], ended: &Result<(), (Option<String>, End)>, p
 
 /// The builder's version, from the last `gate: remote version <v>` line of its preflight; `None` when it said none.
 pub(crate) fn their_version(lines: &[String]) -> Option<&str> {
-    lines.iter().rev().find_map(|line| line.strip_prefix(VERSION)).map(str::trim)
+    lines.iter().rev().find_map(|line| line.strip_prefix(VERSION_PREFIX)).map(str::trim)
 }
 
 /// The SDKs the builder lists, from the last `gate: remote sdks <v1,v2|none>` line of its preflight, without `none`;
@@ -5719,7 +5719,7 @@ pub(crate) fn sdks_of(lines: &[String]) -> Option<Vec<String>> {
     lines
         .iter()
         .rev()
-        .find_map(|line| line.strip_prefix(SDKS))
+        .find_map(|line| line.strip_prefix(SDKS_PREFIX))
         .map(str::trim)
         .filter(|listing| !listing.is_empty())
         .map(parity::listed)
@@ -6151,7 +6151,7 @@ mod tests {
         sdks_of, seconds, their_version, version_refusal,
     };
     use super::{CSPROJ_BYTES, CSPROJ_FILES, Entry, csproj_pins, entries_of, manifest_entry, small_blobs_of};
-    use super::{Carried, VERSION, box_slots_kept, preflight_ended};
+    use super::{Carried, box_slots_kept, created_of, preflight_ended, said_created};
     use super::{DRAIN, KILLED, Received};
     use super::{KeyHold, RunEnd, Warm, cold_line, hold_key, hold_key_waiting, new_work_tree, status_end, warm_end, warm_of};
     use crate::boxside::WORK_ROOT_STEP;
@@ -6173,6 +6173,7 @@ mod tests {
     use gate_router::{BuilderOs, escaped};
     use gate_state::v1::{self, WarmFailure};
     use gate_wire::slots::{BoxSlots, Claim, HoldClaim, Holder};
+    use gate_wire::{VERSION_PREFIX, created_line};
     use gate_wire::{build_version, checkout_done_line, checkout_prefix, checkout_start_line};
     use jiff::Timestamp;
 
@@ -8459,7 +8460,7 @@ mod tests {
 
     #[test]
     fn the_drain_tag_is_read_before_the_version_refusal() {
-        let other = format!("{VERSION}9.9.9\n");
+        let other = format!("{VERSION_PREFIX}9.9.9\n");
         let (drained, _) = run_call_said(&other, &drain_refusal("1", "100 1900"), "drain-before-version");
         assert!(
             matches!(preflight_ended("builder", r"C:\builder", &drained), Err((None, End::Draining(_)))),
@@ -8478,7 +8479,7 @@ mod tests {
 
     #[test]
     fn a_preflight_refused_full_ends_refused_full_so_the_run_goes_to_the_next_builder() {
-        let version = format!("{VERSION}{}\n", gate_wire::build_version());
+        let version = format!("{VERSION_PREFIX}{}\n", gate_wire::build_version());
         let full = format!("{}\n{}\n", refused_line(NONCE, Refusal::Full), gate_wire::slots::full_line(1, 1));
         let (refused, _) = run_call_ended(&version, &full, 75, "preflight-full");
         assert!(
@@ -8616,7 +8617,7 @@ mod tests {
     /// A preflight's lines holding [`box_slots_line`] among others.
     fn lines_with_box_slots() -> Vec<String> {
         vec![
-            format!("{VERSION}{}", build_version()),
+            format!("{VERSION_PREFIX}{}", build_version()),
             "gate: remote boot 2026-10-28T08:00:00Z".to_owned(),
             box_slots_line(),
         ]
@@ -8684,7 +8685,7 @@ mod tests {
         );
         assert!(!path.exists(), "a version refusal caches nothing");
         stale_cache(&path);
-        let without = vec![format!("{VERSION}{}", build_version())];
+        let without = vec![format!("{VERSION_PREFIX}{}", build_version())];
         let root = Err((Some("gate: not routed: root".to_owned()), End::Refused(FallbackReason::Root)));
         assert_eq!(box_slots_kept(&without, &root, &path, Timestamp::UNIX_EPOCH), NOTHING_SAID);
         assert!(path.exists(), "a refusal other than full, by a box of this build, removes nothing");
@@ -8693,7 +8694,7 @@ mod tests {
     #[test]
     fn a_full_refusal_from_a_box_of_another_build_caches_nothing() {
         let path = box_slots_cache("other-build");
-        let lines = vec![format!("{VERSION}0.0.0-another-build"), box_slots_line()];
+        let lines = vec![format!("{VERSION_PREFIX}0.0.0-another-build"), box_slots_line()];
         let full = Err((None, End::Refused(FallbackReason::Full)));
 
         assert_eq!(box_slots_kept(&lines, &full, &path, Timestamp::UNIX_EPOCH), NOTHING_SAID);
@@ -8711,7 +8712,7 @@ mod tests {
     fn a_passing_preflight_with_no_box_slots_line_removes_the_cache() {
         let path = box_slots_cache("no-line");
         stale_cache(&path);
-        let without = vec![format!("{VERSION}{}", build_version())];
+        let without = vec![format!("{VERSION_PREFIX}{}", build_version())];
 
         assert_eq!(box_slots_kept(&without, &Ok(()), &path, Timestamp::UNIX_EPOCH), NOTHING_SAID);
 
@@ -8728,7 +8729,7 @@ mod tests {
         let path = box_slots_cache("malformed");
         stale_cache(&path);
         let lines = vec![
-            format!("{VERSION}{}", build_version()),
+            format!("{VERSION_PREFIX}{}", build_version()),
             r#"gate: remote box slots {"v":2,"now":"t","count":1,"holders":[]}"#.to_owned(),
         ];
 
@@ -8984,6 +8985,22 @@ mod tests {
         assert_eq!(
             version_refusal("builder", None, "0.1.0"),
             Some("gate: not routed: builder runs gate unknown, this PC 0.1.0; run gate push".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_bare_holding_a_bidi_mark_reads_as_created_from_its_escaped_line() {
+        let bare = "D:\\gate-remote\\a\u{202e}b.git";
+        let said = lines(&[&created_line(bare), "gate: remote version 0.1.0"]);
+        let created: Vec<String> = created_of(&said).map(str::to_owned).collect();
+        assert!(said_created(&created, bare), "the box's escaped line names the bare: {created:?}");
+        assert!(
+            said_created(&lines(&[r"D:\gate-remote\app.git"]), r"D:\gate-remote\app.git"),
+            "a plain bare"
+        );
+        assert!(
+            !said_created(&lines(&[r"D:\gate-remote\lib.git"]), r"D:\gate-remote\app.git"),
+            "another bare"
         );
     }
 

@@ -39,7 +39,7 @@ use crate::remote::toolchain::{self, Reported};
 use crate::remote::transport::ssh::Ssh;
 use crate::remote::transport::{Program, Transport, Wire};
 use crate::remote::{
-    CREATED, SSH_FAILED, Warm, box_slots_cached, box_slots_of, install_why, no_box, other_build, root_busy_why, root_why, sdks_of, shell_said,
+    SSH_FAILED, Warm, box_slots_cached, box_slots_of, created_of, install_why, no_box, other_build, root_busy_why, root_why, sdks_of, shell_said,
     their_version, warm_of,
 };
 use crate::route;
@@ -624,12 +624,7 @@ impl Answer<'_> {
             Some(sdks) => Ok(sdks.iter().map(|sdk| escaped(&shown(sdk))).collect()),
             None => Err(self.no_sdk_list()),
         });
-        let created = self
-            .lines
-            .iter()
-            .filter_map(|line| line.strip_prefix(CREATED))
-            .map(|folder| shown(folder.trim()))
-            .collect();
+        let created = created_of(self.lines).map(|folder| shown(folder.trim())).collect();
         Checked {
             repo,
             root,

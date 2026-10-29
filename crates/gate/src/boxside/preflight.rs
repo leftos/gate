@@ -19,10 +19,9 @@ use std::time::{Duration, Instant};
 use gate_args::BoxSeams;
 use gate_router::escaped;
 use gate_win32::{Job, LaunchError, Make, NamedEvent, PipedConsole, PipedLaunch, Share};
-use gate_wire::build_version;
 use gate_wire::{
-    Pair, PathForm, Payload, ROOT_STATUS, WARM_READ_LIMIT, bare_stem, layout_text_for, names_another_layout, readies_single, root_busy_line,
-    root_unsafe_line, trees, warm_record_hash, work_root,
+    NEW_WORK_TREE, Pair, PathForm, Payload, ROOT_STATUS, WARM_READ_LIMIT, bare_stem, created_line, layout_text_for, names_another_layout,
+    readies_single, root_busy_line, root_unsafe_line, sdks_failure, sdks_line, trees, version_line, warm_line, warm_record_hash, work_root,
 };
 use jiff::Timestamp;
 use proc_table::{ProcessTree, Win32ProcessTable};
@@ -45,7 +44,7 @@ use crate::boxside::stamping;
 use crate::boxside::stop::terminate_and_wait;
 use crate::console::Console;
 use crate::environment::Variables;
-use crate::remote::{INSTALL_STATUS, NEW_WORK_TREE, git, install_untrusted_line, launch};
+use crate::remote::{INSTALL_STATUS, git, install_untrusted_line, launch};
 use crate::run::{ERROR_FILE_NOT_FOUND, Written, find_program};
 
 /// The Windows installer step that locks the builder's work root down, as the work-root refusal names it
@@ -128,7 +127,7 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
             .map_err(|error| format!("the desktop helper's path cannot be read: {error}"))
             .and_then(|helper| helper_trusted(&helper))
     {
-        stamping::out(console, &format!("gate: remote version {}", build_version()));
+        stamping::out(console, &version_line());
         stamping::err(console, &install_untrusted_line(&why));
         return u32::from(INSTALL_STATUS);
     }
@@ -160,7 +159,7 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
         seams,
         console,
     );
-    let version = format!("gate: remote version {}", build_version());
+    let version = version_line();
     let _admitted = match drain::admission_said(admission, payload, Some(&version), console) {
         Ok(admitted) => admitted,
         Err(status) => return status,
@@ -189,7 +188,7 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
     let slots_look = slots::looked(&root_held, seams);
     drop(held_root);
     stamping::out(console, &version);
-    stamping::out(console, &format!("gate: remote warm {}", warm.as_deref().unwrap_or("none")));
+    stamping::out(console, &warm_line(warm.as_deref()));
     if made || cleared || !ran {
         stamping::out(console, NEW_WORK_TREE);
     }
@@ -240,7 +239,7 @@ fn held_work_root(work: &str, bare: &str, paired: bool, seams: &BoxSeams, consol
         return Err(u32::from(USAGE_STATUS));
     }
     let held = gate_win32::check_work_root(Path::new(&root), seams.root_walk_stop.as_deref()).map_err(|why| {
-        stamping::out(console, &format!("gate: remote version {}", build_version()));
+        stamping::out(console, &version_line());
         let line = if why.is_busy() {
             root_busy_line(&why.to_string())
         } else {
@@ -518,7 +517,7 @@ fn create_bare(git: &Git, bare: &str, name: Option<&str>, console: &mut Console)
         .map_err(|why| failed_for(Failed::without_status(format!("gate: remote {step} failed: {why}")), step, name))?;
     git.step(&for_repo(step, name), &["init", "--bare", "-q", "--", bare], GitClass::ShortBare, console)
         .map_err(|failed| failed_for(failed, step, name))?;
-    stamping::out(console, &format!("gate: remote created {bare}"));
+    stamping::out(console, &created_line(bare));
     Ok(())
 }
 
@@ -1818,8 +1817,8 @@ pub(crate) fn locate(word: &str) -> Result<Option<PathBuf>, String> {
 /// that cannot be read is said on stderr instead, and fails nothing.
 fn say_sdks(limit: Duration, drain: Duration, console: &mut Console) {
     match sdks(limit, drain) {
-        Ok(list) => stamping::out(console, &format!("gate: remote sdks {list}")),
-        Err(message) => stamping::err(console, &format!("gate: remote could not read the SDK list: {message}")),
+        Ok(list) => stamping::out(console, &sdks_line(&list)),
+        Err(message) => stamping::err(console, &sdks_failure(&message)),
     }
 }
 

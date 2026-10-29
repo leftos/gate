@@ -10,15 +10,15 @@ use std::thread;
 
 use gate_args::BoxSeams;
 use gate_wire::{
-    Pair, PairSibling, PathForm, Payload, ROOT_STATUS, WARM_READ_LIMIT, bare_stem, escaped, layout_text_for, names_another_layout, readies_single,
-    root_unsafe_line, tool_line, trees, warm_record_hash,
+    NEW_WORK_TREE, Pair, PairSibling, PathForm, Payload, ROOT_STATUS, WARM_READ_LIMIT, bare_stem, created_line, escaped, layout_text_for,
+    names_another_layout, readies_single, root_unsafe_line, sdks_failure, sdks_line, tool_line, trees, version_line, warm_line, warm_record_hash,
 };
 
 use crate::console::Console;
 use crate::git::{self, AlternatesFailure, Failed, Git, Steps, Tree, failed_for, for_repo, line_ends_set, origin_set};
 use crate::lines::{
-    FAILED_STATUS, FolderFlaw, NEEDS_REFUSED, NEW_WORK_TREE, USAGE_STATUS, WORK_ROOT_STEP, created_line, folder_failure, login_path_line, root_flaw,
-    sdks_failure, sdks_line, unsynced_failure, version_line, warm_line, work_layout, write_failure,
+    FAILED_STATUS, FolderFlaw, NEEDS_REFUSED, USAGE_STATUS, WORK_ROOT_STEP, folder_failure, login_path_line, root_flaw, unsynced_failure,
+    work_layout, write_failure,
 };
 use crate::stop::open_folder_line;
 use crate::{boot, drain, files, probe, process, run, slots};
@@ -382,7 +382,8 @@ mod tests {
     use crate::console::Console;
     use crate::files::{HeldLock, Locked, effective_uid, take_lock, user_name};
     use crate::git::Git;
-    use crate::lines::{NEW_WORK_TREE, WORK_ROOT_STEP, created_line, version_line, warm_line};
+    use crate::lines::WORK_ROOT_STEP;
+    use gate_wire::{NEW_WORK_TREE, created_line, version_line, warm_line};
 
     const KEY: &str = "repo-0123abcd";
     const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";

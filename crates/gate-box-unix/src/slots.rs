@@ -25,13 +25,13 @@ use gate_wire::slots::{
     BoxSlots, COUNT_FILE, Claim, HOLD_LINE_POLLS, HOLD_POLL, HoldClaim, Judged, NO_COUNT_LINE, SLOTS, SessionClaim, Take, ceiling_line, chosen,
     claim_index, claim_name, count_of, full_line, holder_line, holder_refusal, lock_name, unread_count_line, waiting_line,
 };
-use gate_wire::{Payload, Refusal, escaped, refused_line};
+use gate_wire::{Payload, Refusal, escaped, refused_line, version_line};
 use jiff::Timestamp;
 
 use crate::console::Console;
 use crate::drain::{self, Session, cannot};
 use crate::files::{self, HeldLock, Locked};
-use crate::lines::{FAILED_STATUS, USAGE_STATUS, version_line};
+use crate::lines::{FAILED_STATUS, USAGE_STATUS};
 use crate::preflight;
 use crate::run::REFUSED_STATUS;
 

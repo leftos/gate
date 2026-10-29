@@ -17,8 +17,8 @@ use gate_inputs::failure::Caps;
 use gate_inputs::manifest::{Listing, Manifest};
 use gate_wire::drain::refused_lines;
 use gate_wire::{
-    CROSS_STEP_START, CrossBuild, LAYOUT_CHANGING, PairSibling, PathForm, Payload, Refusal, bare_stem, busy_line, checkout_done_line,
-    checkout_start_line, escaped, layout_line, layout_text, names_another_layout, refused_line, trees,
+    BACK_COMMITS_FAILED, CROSS_STEP_START, CrossBuild, LAYOUT_CHANGING, PairSibling, PathForm, Payload, Refusal, back_commits_line, bare_stem,
+    busy_line, checkout_done_line, checkout_start_line, escaped, layout_line, layout_text, names_another_layout, refused_line, trees,
 };
 
 use gate_watchdog::Pump;
@@ -36,8 +36,8 @@ use crate::git::{
 use crate::heartbeat::{self, Periods};
 use crate::inputs::{self, Unmatched};
 use crate::lines::{
-    Along, BACK_COMMITS_FAILED, CommandEnd, FAILED_STATUS, FolderFlaw, Godot, Login, OwnerFlaw, Translation, USAGE_STATUS, WRITABLE_BY_OTHERS,
-    back_commits_line, command_status, login_path_line, owner_flaw, recorded_group, rosetta_lines, signal_guard, translation, work_layout,
+    Along, CommandEnd, FAILED_STATUS, FolderFlaw, Godot, Login, OwnerFlaw, Translation, USAGE_STATUS, WRITABLE_BY_OTHERS, command_status,
+    login_path_line, owner_flaw, recorded_group, rosetta_lines, signal_guard, translation, work_layout,
 };
 use crate::outputs::{self, Asked};
 use crate::packages;
@@ -3467,11 +3467,7 @@ mod tests {
         let mut from_last = said.iter().rev();
         let (last, fetch) = (from_last.next().expect("a line is said"), from_last.next().expect("two lines are said"));
         assert!(fetch.starts_with("gate: remote fetch lib failed"), "{said:?}");
-        assert_eq!(
-            last,
-            crate::lines::BACK_COMMITS_FAILED,
-            "a pair run ending before its command says so last"
-        );
+        assert_eq!(last, gate_wire::BACK_COMMITS_FAILED, "a pair run ending before its command says so last");
         assert_eq!(back_commits_said(said.iter().map(String::as_str)), 1, "{said:?}");
     }
 
@@ -3491,7 +3487,7 @@ mod tests {
                 .is_some_and(|line| line.starts_with("gate: remote could not open the work folder lock ")),
             "{said:?}"
         );
-        assert_eq!(said.last().map(String::as_str), Some(crate::lines::BACK_COMMITS_FAILED), "{said:?}");
+        assert_eq!(said.last().map(String::as_str), Some(gate_wire::BACK_COMMITS_FAILED), "{said:?}");
         assert_eq!(back_commits_said(said.iter().map(String::as_str)), 1, "{said:?}");
     }
 
@@ -3503,7 +3499,7 @@ mod tests {
         let (status, said) = ran(&case.pair_json(&"a".repeat(40), &"b".repeat(40), &json!({})));
         assert_eq!(status, 1, "{said:?}");
         assert_eq!(said.len(), 2, "the bare's line, then the failed line: {said:?}");
-        assert_eq!(said.last().map(String::as_str), Some(crate::lines::BACK_COMMITS_FAILED), "{said:?}");
+        assert_eq!(said.last().map(String::as_str), Some(gate_wire::BACK_COMMITS_FAILED), "{said:?}");
     }
 
     #[test]
@@ -3534,7 +3530,7 @@ mod tests {
         let (status, said) = ran(&case.pair_json(&main, &lib, &json!({})));
         assert_eq!(status, REFUSED_STATUS, "the git step's status ends the run: {said:?}");
         assert!(said.iter().any(|line| line.contains("(status 75)")), "{said:?}");
-        assert_eq!(said.last().map(String::as_str), Some(crate::lines::BACK_COMMITS_FAILED), "{said:?}");
+        assert_eq!(said.last().map(String::as_str), Some(gate_wire::BACK_COMMITS_FAILED), "{said:?}");
         assert_eq!(back_commits_said(said.iter().map(String::as_str)), 1, "{said:?}");
     }
 
@@ -3552,7 +3548,7 @@ mod tests {
             said,
             [
                 "gate: remote subfolder ../lib is not a folder inside the work folder".to_owned(),
-                crate::lines::BACK_COMMITS_FAILED.to_owned()
+                gate_wire::BACK_COMMITS_FAILED.to_owned()
             ]
         );
         for bare in [case.bare(), case.lib_bare()] {
@@ -3573,7 +3569,7 @@ mod tests {
             .filter(|(stream, _)| *stream == Stream::Err)
             .map(|(_, line)| line.as_str())
             .collect();
-        assert_eq!(err.last().copied(), Some(crate::lines::BACK_COMMITS_FAILED), "{said:?}");
+        assert_eq!(err.last().copied(), Some(gate_wire::BACK_COMMITS_FAILED), "{said:?}");
         assert_eq!(back_commits_said(err.iter().copied()), 1, "{said:?}");
         assert!(!Case::has_back_ref_in(&case.bare()), "no back ref in the main repo");
         assert!(!Case::has_back_ref_in(&case.lib_bare()), "no back ref in the sibling");
@@ -3671,7 +3667,7 @@ mod tests {
         );
         let mut from_last = err.iter().rev();
         let (sync_back, failed) = (from_last.next().expect("a line is said"), from_last.next().expect("two lines are said"));
-        assert_eq!(failed, crate::lines::BACK_COMMITS_FAILED, "{err:?}");
+        assert_eq!(failed, gate_wire::BACK_COMMITS_FAILED, "{err:?}");
         assert!(sync_back.starts_with("gate: remote sync-back failed: push lib failed"), "{err:?}");
         assert_eq!(back_commits_said(err.iter().map(String::as_str)), 1, "{err:?}");
     }
@@ -3708,7 +3704,7 @@ mod tests {
         );
         let mut from_last = err.iter().rev();
         let (sync_back, failed) = (from_last.next().expect("a line is said"), from_last.next().expect("two lines are said"));
-        assert_eq!(failed, crate::lines::BACK_COMMITS_FAILED, "{err:?}");
+        assert_eq!(failed, gate_wire::BACK_COMMITS_FAILED, "{err:?}");
         assert_eq!(
             sync_back,
             &format!(
@@ -4450,7 +4446,7 @@ mod tests {
         let mut console = Console::captured();
         let status = crate::preflight::preflight(&decoded(json), &gate_args::BoxSeams::default(), &mut console);
         assert_eq!(status, 0, "{:?}", console.err);
-        console.out.iter().any(|line| line == crate::lines::NEW_WORK_TREE)
+        console.out.iter().any(|line| line == gate_wire::NEW_WORK_TREE)
     }
 
     #[test]

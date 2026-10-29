@@ -287,7 +287,7 @@ fn godot_leading(line: &str) -> Option<Vec<&str>> {
 }
 
 /// The SDK list of `dotnet --list-sdks` run along `path` within [`DOTNET_LIMIT`] ([`sdk_list`]); `none` when no
-/// dotnet is found. Else why it could not be read, for [`crate::lines::sdks_failure`].
+/// dotnet is found. Else why it could not be read, for [`gate_wire::sdks_failure`].
 ///
 /// # Errors
 ///

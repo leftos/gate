@@ -32,6 +32,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use gate_router::{FolderId, escaped, repo_name};
+use gate_wire::{BACK_COMMITS_FAILED, BACK_COMMITS_PREFIX};
 
 use super::RemoteCall;
 use super::client::{Attempt, Called, End, Watch};
@@ -1909,9 +1910,6 @@ fn short(sha: &str) -> &str {
     sha.get(..8).unwrap_or(sha)
 }
 
-/// What the line a pair run's box says on standard error once every back commit is pushed starts with.
-const BACK_COMMITS: &str = "gate: remote back commits: ";
-
 /// One entry of the box's back commits line: a repository's name and its back commit, `None` for a repository whose
 /// tree the run left unchanged.
 pub(super) type BackCommit = (String, Option<String>);
@@ -1919,25 +1917,22 @@ pub(super) type BackCommit = (String, Option<String>);
 /// Keeps `line` as `kept`, a call's last back commits line, when it came on standard error (`stderr`) and starts
 /// `gate: remote back commits: `: a line on standard output never counts, and a later line replaces an earlier one.
 pub(super) fn keep_back_commits_line(kept: &mut Option<String>, line: &str, stderr: bool) {
-    if stderr && line.starts_with(BACK_COMMITS) {
+    if stderr && line.starts_with(BACK_COMMITS_PREFIX) {
         *kept = Some(line.to_owned());
     }
 }
 
 /// What the back commits line `line` names: after `gate: remote back commits: `, `<name> <commit>` for each repository,
 /// comma-separated, its commit 40 lowercase hex digits or `none`. `None` for a line that does not read so, whole: a
-/// line with one entry that is not a name and a commit names nothing.
+/// line with one entry that is not a name and a commit names nothing. The line a box says when a pair run's back commits
+/// failed or were never made after its command ended, [`BACK_COMMITS_FAILED`], names none, so nothing is applied.
 pub(super) fn back_commits(line: &str) -> Option<Vec<BackCommit>> {
-    let named = line.strip_prefix(BACK_COMMITS)?;
-    if named == BACK_COMMITS_FAILED {
+    let named = line.strip_prefix(BACK_COMMITS_PREFIX)?;
+    if line == BACK_COMMITS_FAILED {
         return Some(Vec::new());
     }
     named.split(", ").map(back_commit).collect()
 }
-
-/// What the box's back commits line says in place of the commits when a pair run's back commits failed or were never
-/// made after its command ended: [`back_commits`] reads it as naming none, so nothing is applied.
-const BACK_COMMITS_FAILED: &str = "failed";
 
 /// One entry of the back commits line, `<name> <commit>`, as [`back_commits`] reads it; `None` for one with no name, or
 /// whose commit is neither a sha nor `none`.
