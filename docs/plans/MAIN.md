@@ -7,7 +7,6 @@
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [!] GATE-828 Fix the flaky Unix box test a_clear_refuses_a_volume_mounted_in_the_work_folder_and_keeps_its_files — Urgent · Remote
 - [ ] GATE-871 Carry routed runs' bulk data on a TCP data channel instead of ssh to the Windows builder — Urgent · Remote
-- [ ] GATE-926 Fix the warm-up drain case that GATE-770's preflight line turned red — Urgent · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
@@ -15,7 +14,7 @@
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
 - [/] GATE-461 Make the cold-run raise hold for every first run and keep cold runs out of learned durations — High · Remote
 - [ ] GATE-753 Log every step of a run in the gate's log: start, progress, end and duration — High · Remote
-- [ ] GATE-759 Move the rest of the box's shared wire rules into gate-wire (GATE-616 slices 2, 3, 5, 6) — High · Remote
+- [/] GATE-759 Move the rest of the box's shared wire rules into gate-wire (GATE-616 slices 2, 3, 5, 6) — High · Remote
 - [/] GATE-821 Balance routed runs across every builder that can take them, not first-in-file-order — High · Remote
 - [!] GATE-839 Route race-anywhere's Unreal editor and game runs: a desktop route with a GPU — High · Remote
 - [/] GATE-844 Serve godot-mcp's parallel itest lanes on the builder desktop, and match any --filter-class — High · Remote
@@ -290,7 +289,6 @@
 - [ ] GATE-866 Restore here for a folder target that holds one project, so --no-build after a routed build keeps the word
 - [ ] GATE-870 Harden the detached prune sweep's tests and edges (GATE-689 brief 3 review)
 - [ ] GATE-881 Cover the data channel's wildcard bind, test port race and archive share mode (sub-issue of GATE-871)
-- [ ] GATE-882 Probe a builder's data channel in gate check --builder (sub-issue of GATE-871)
 - [ ] GATE-888 Let a channel pull's ack wait outlast the box's 16 MiB send buffer on a slow path (sub-issue of GATE-871)
 - [ ] GATE-872 Summarise the gone worktrees a push's prune sweep marks instead of one line each
 - [ ] GATE-880 Settle the box hold verb's drain barrier and fix its smaller review findings
@@ -314,6 +312,12 @@
 - [ ] GATE-922 Free a box slot whose session claim's lease has lapsed, after a box reboot too
 - [ ] GATE-923 Say how to recover in the desktop refusal lines a person can fix
 - [ ] GATE-924 Rewrite a cold routed run's remote claim with its raised ceiling
+- [ ] GATE-927 Take the key lock around gate prune's worktree record rewrite
+- [ ] GATE-929 List channel-check in the box usage line without breaking prune's old-box match
+- [ ] GATE-931 Make both boxes judge a relaid work folder's warm state alike
+- [ ] GATE-932 Simplify how balancing's run_called flag and record writes are carried
+- [ ] GATE-933 Order the probe's exit-during-dial test on an event and share its launch with the preflight
+- [ ] GATE-934 Share the layout record's reader and one escaping rule for refused payload names
 
 ## Cutover sweep
 
@@ -438,3 +442,4 @@
 - [ ] GATE-907 Count a TestResults glob segment only when no fused ** precedes it
 - [ ] GATE-909 Name the archive's kind in the shared reader's over-limit refusal, not always "outputs"
 - [ ] GATE-915 Fix the docs' dead anchors and the Bare lock glossary order
+- [ ] GATE-930 Accept -Builder in the launcher's PowerShell form
