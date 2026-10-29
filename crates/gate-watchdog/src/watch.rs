@@ -490,6 +490,18 @@ pub enum Kill {
 }
 
 impl Kill {
+    /// Whether this kill is the backstop, five ceilings of wall time: the only kill a box tags `backstop`.
+    #[must_use]
+    pub fn is_backstop(&self) -> bool {
+        matches!(self, Kill::Backstop { .. })
+    }
+
+    /// The word a box's note names this kill by: `backstop` for the backstop, `ceiling` for a ceiling or a stall.
+    #[must_use]
+    pub fn note_word(&self) -> &'static str {
+        if self.is_backstop() { "backstop" } else { "ceiling" }
+    }
+
     /// The line the gate says for this kill, with `spoken` the command's words joined by single spaces.
     #[must_use]
     pub fn line(&self, spoken: &str) -> String {
@@ -501,6 +513,18 @@ impl Kill {
     #[must_use]
     pub fn line_on(&self, spoken: &str, host: &str) -> String {
         self.said(spoken, &format!(" on {host}"))
+    }
+
+    /// The line a builder says for this kill of the command `spoken` it ran for the PC that calls it `host`, or the
+    /// gate's own line for a PC that gave no name: `host` and `spoken` are the text the line carries, already escaped,
+    /// as for [`line`](Kill::line) and [`line_on`](Kill::line_on).
+    #[must_use]
+    pub fn line_for(&self, spoken: &str, host: &str) -> String {
+        if host.is_empty() {
+            self.line(spoken)
+        } else {
+            self.line_on(spoken, host)
+        }
     }
 
     /// The line for this kill, `place` right after its verdict words.
@@ -1256,6 +1280,56 @@ mod tests {
         watch.sample(&tick(5000, 0, 0, &[], true));
         watch.exited(Duration::from_millis(6000));
         assert_eq!(watch.free_share(), None, "only a paused sample");
+    }
+
+    #[test]
+    fn line_for_chooses_line_or_line_on_by_empty_host() {
+        const SPOKEN: &str = "cargo test -p gate-watchdog";
+        let timed_out = Kill::TimedOut {
+            timeout: 5,
+            wall: Duration::from_millis(123_456),
+            free_percent: 88.0,
+        };
+        assert_eq!(
+            timed_out.line_for(SPOKEN, ""),
+            timed_out.line(SPOKEN),
+            "a PC with no name gets the gate's own line"
+        );
+        assert_eq!(
+            timed_out.line_for(SPOKEN, "builder"),
+            timed_out.line_on(SPOKEN, "builder"),
+            "a named PC gets the line that names it"
+        );
+        assert_eq!(
+            timed_out.line_for(SPOKEN, "builder"),
+            "gate: TIMED OUT on builder after 5 s of load-adjusted time (wall 123 s, machine free 88% on \
+             average); killed cargo test -p gate-watchdog and its children"
+        );
+    }
+
+    #[test]
+    fn is_backstop_and_note_word_name_each_kill() {
+        let backstop = Kill::Backstop {
+            timeout: 5,
+            wall: Duration::from_secs(30),
+            adjusted: 12.0,
+            free_percent: Some(50.0),
+        };
+        let timed_out = Kill::TimedOut {
+            timeout: 5,
+            wall: Duration::from_millis(123_456),
+            free_percent: 88.0,
+        };
+        let stalled = Kill::Stalled {
+            quiet: Duration::from_millis(2500),
+            free_percent: 37.0,
+        };
+        assert!(backstop.is_backstop(), "a backstop is a backstop");
+        assert_eq!(backstop.note_word(), "backstop");
+        assert!(!timed_out.is_backstop(), "a ceiling is no backstop");
+        assert_eq!(timed_out.note_word(), "ceiling");
+        assert!(!stalled.is_backstop(), "a stall is no backstop");
+        assert_eq!(stalled.note_word(), "ceiling");
     }
 
     #[test]

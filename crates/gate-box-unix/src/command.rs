@@ -241,7 +241,7 @@ impl Ceiling {
         }
         let kill = watching.watch.kill_check(watching.started.elapsed())?;
         self.kill.set(Some(kill));
-        Some(Halt(tag_of(kill).1.to_owned()))
+        Some(Halt(kill.note_word().to_owned()))
     }
 
     /// The watch is over, the runner having stopped watching the leader: the stretch since the last sample is counted,
@@ -299,15 +299,6 @@ impl Watching {
             escaped: BTreeMap::new(),
             vm_cpu: None,
         })
-    }
-}
-
-/// The kill tag of `kill` and the word its note names it by.
-fn tag_of(kill: Kill) -> (BoxKill, &'static str) {
-    match kill {
-        Kill::Backstop { .. } => (BoxKill::Backstop, "backstop"),
-        // The box's watch has no stall window, so a ceiling is the only other kill it can find.
-        Kill::TimedOut { .. } | Kill::Stalled { .. } => (BoxKill::TimedOut, "ceiling"),
     }
 }
 
@@ -650,17 +641,14 @@ fn killed<S: LineSink>(launch: &Launch<'_>, kill: Kill, ran: Result<Ran, NotRan>
     if output.client_gone() {
         return CommandEnd::Gone;
     }
-    let (tag, what) = tag_of(kill);
+    let tag = BoxKill::of(kill.is_backstop());
+    let what = kill.note_word();
     let note = ran.err().map(|not| match not {
         NotRan::Failed(why) if is_still_there(&why) => format!("gate: note: the box's {what} kill could not end job {}: {why}", launch.job),
         not => format!("gate: note: after the box's {what} kill: {}", unran(not)),
     });
     let spoken = escaped(&launch.words.join(" "));
-    let line = if launch.host.is_empty() {
-        kill.line(&spoken)
-    } else {
-        kill.line_on(&spoken, &escaped(launch.host))
-    };
+    let line = kill.line_for(&spoken, &escaped(launch.host));
     let tagged = killed_line(launch.nonce, tag);
     let adjusted = verdict.adjusted.map(|seconds| (Stamp::Bare, adjusted_line(launch.nonce, seconds)));
     let lines: Vec<(Stamp, String)> = verdict

@@ -13,7 +13,7 @@ mod watch;
 
 pub use cores::{Cores, Hint, SlotKind, hint};
 pub use diagnostics::{JOB_LINES, OUTSIDE_LINES, ProcessFacts, Report, SampleFacts, SampleHistory, WslVm, failed_block, failed_line, lines};
-pub use heartbeat::{BeatClock, CpuSource, Pump, Ticker};
+pub use heartbeat::{BeatClock, CpuSource, Pump, Ticker, start_failed_line};
 pub use share::{Machine, SystemTimes, Ticks};
 pub use watch::{
     Config, CpuMove, Kill, SSH_STALL_LINE, Sample, Watch, is_ssh_command, is_wsl_command, measure_cpu, sampler_failed_line, wsl_unavailable_line,

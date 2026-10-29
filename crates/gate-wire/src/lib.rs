@@ -1654,6 +1654,12 @@ pub enum BoxKill {
 }
 
 impl BoxKill {
+    /// The kill a box's `is_backstop` says: the backstop, else its ceiling.
+    #[must_use]
+    pub fn of(is_backstop: bool) -> BoxKill {
+        if is_backstop { BoxKill::Backstop } else { BoxKill::TimedOut }
+    }
+
     /// The word the kill tag names it by, the verdict it gives the run.
     #[must_use]
     pub fn word(self) -> &'static str {
@@ -2180,6 +2186,14 @@ mod tests {
         fn the_kill_tags_name_each_kill_by_its_verdict_word() {
             assert_eq!(killed_line(NONCE, BoxKill::TimedOut), format!("gate-remote-killed: {NONCE} timed-out"));
             assert_eq!(killed_line(NONCE, BoxKill::Backstop), format!("gate-remote-killed: {NONCE} backstop"));
+        }
+
+        #[test]
+        fn box_kill_of_names_backstop_only_for_a_backstop() {
+            assert_eq!(BoxKill::of(true), BoxKill::Backstop);
+            assert_eq!(BoxKill::of(true).word(), "backstop");
+            assert_eq!(BoxKill::of(false), BoxKill::TimedOut);
+            assert_eq!(BoxKill::of(false).word(), "timed-out");
         }
 
         #[test]

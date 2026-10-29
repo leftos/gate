@@ -1072,11 +1072,7 @@ fn locked<S: LineSink + 'static>(
     let pump = start(Arc::clone(output) as Arc<dyn Forwarding>, heartbeat)
         .inspect_err(|error| {
             // A note: the run goes on, and a client gone finds out at the next line.
-            let _ = output.say(
-                Stream::Err,
-                GAT,
-                &format!("gate: remote heartbeat stopped: cannot start the heartbeat: {error}"),
-            );
+            let _ = output.say(Stream::Err, GAT, &gate_watchdog::start_failed_line(&error));
         })
         .ok();
     // Read while the heartbeat beats and before the layout and the checkout, so the client can take its time hashing

@@ -884,7 +884,7 @@ fn in_work_folder(request: &Request<'_>, stop: &Rc<NamedEvent>, seams: &BoxSeams
     };
     // A heartbeat that cannot start ends the heartbeats, never the run.
     let pump = heartbeat::start(&lock, &gone, heartbeat::period(seams))
-        .inspect_err(|error| stamping::err(console, &format!("gate: remote heartbeat stopped: cannot start the heartbeat: {error}")))
+        .inspect_err(|error| stamping::err(console, &gate_watchdog::start_failed_line(&error)))
         .ok();
     let beat = Beat {
         lock: &lock,

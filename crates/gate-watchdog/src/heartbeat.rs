@@ -400,6 +400,12 @@ fn stopped_line(message: &str) -> String {
     format!("{STOPPED_PREFIX} {message}")
 }
 
+/// The line a box says once its heartbeats cannot start at all, with the reason the start failed.
+#[must_use]
+pub fn start_failed_line(error: &dyn std::fmt::Display) -> String {
+    format!("{STOPPED_PREFIX} cannot start the heartbeat: {error}")
+}
+
 /// What a panic payload says, or that it said nothing readable.
 #[must_use]
 fn panic_message(payload: &(dyn Any + Send)) -> String {
@@ -538,6 +544,14 @@ mod tests {
 
     /// The line a failed read of the WSL VM's CPU is said with, in the VM cases.
     const VM_UNREAD_LINE: &str = "gate: remote heartbeat cannot read the WSL VM's CPU: the list is gone";
+
+    #[test]
+    fn start_failed_line_is_the_stopped_prefix_plus_why() {
+        assert_eq!(
+            start_failed_line(&"no thread"),
+            "gate: remote heartbeat stopped: cannot start the heartbeat: no thread"
+        );
+    }
 
     #[test]
     fn a_tenth_of_a_core_in_the_wsl_vm_beats_while_the_job_is_under_one_percent() {

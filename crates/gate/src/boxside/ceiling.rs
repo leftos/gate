@@ -169,11 +169,8 @@ impl<'a> Ceiling<'a> {
     pub(super) fn killed(&self, kill: Kill, ending: &io::Result<Ending>, console: &mut Console) {
         let name = self.job.name();
         let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
-        let (tag, what) = match kill {
-            Kill::Backstop { .. } => (BoxKill::Backstop, "backstop"),
-            // The box's watch has no stall window, so a ceiling is the only other kill it can find.
-            Kill::TimedOut { .. } | Kill::Stalled { .. } => (BoxKill::TimedOut, "ceiling"),
-        };
+        let tag = BoxKill::of(kill.is_backstop());
+        let what = kill.note_word();
         match ending {
             Ok(ending) if ending.left == 0 => ending.say_late(name, console),
             Ok(ending) => {
@@ -185,7 +182,7 @@ impl<'a> Ceiling<'a> {
             }
             Err(error) => stamping::err(console, &format!("gate: note: the box's {what} kill could not end job {name}: {error}")),
         }
-        stamping::err(console, &self.kill_line(kill));
+        stamping::err(console, &kill.line_for(&self.spoken, &self.host));
         stamping::protocol(console, &killed_line(self.nonce, tag));
         if let Some(line) = self.adjusted() {
             stamping::protocol(console, &line);
@@ -198,15 +195,6 @@ impl<'a> Ceiling<'a> {
         if let Some(line) = self.adjusted() {
             let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
             stamping::protocol(console, &line);
-        }
-    }
-
-    /// The line for `kill` of the command, naming the PC's name for the builder when the payload gave one.
-    fn kill_line(&self, kill: Kill) -> String {
-        if self.host.is_empty() {
-            kill.line(&self.spoken)
-        } else {
-            kill.line_on(&self.spoken, &self.host)
         }
     }
 
