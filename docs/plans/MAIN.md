@@ -7,17 +7,19 @@
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [!] GATE-828 Fix the flaky Unix box test a_clear_refuses_a_volume_mounted_in_the_work_folder_and_keeps_its_files — Urgent · Remote
 - [ ] GATE-871 Carry routed runs' bulk data on a TCP data channel instead of ssh to the Windows builder — Urgent · Remote
-- [ ] GATE-920 Fix the flaky box test box_run_undoes_its_pushes_when_the_client_went_during_a_failed_push — Urgent · Remote
-- [ ] GATE-921 Fix the flaky durations test no_ceiling_hint_at_or_above_the_load_adjusted_p90_or_without_history_or_without_a_slot — Urgent · Remote
+- [ ] GATE-926 Fix the warm-up drain case that GATE-770's preflight line turned red — Urgent · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
 - [/] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
+- [/] GATE-461 Make the cold-run raise hold for every first run and keep cold runs out of learned durations — High · Remote
 - [ ] GATE-753 Log every step of a run in the gate's log: start, progress, end and duration — High · Remote
 - [ ] GATE-759 Move the rest of the box's shared wire rules into gate-wire (GATE-616 slices 2, 3, 5, 6) — High · Remote
+- [/] GATE-821 Balance routed runs across every builder that can take them, not first-in-file-order — High · Remote
 - [!] GATE-839 Route race-anywhere's Unreal editor and game runs: a desktop route with a GPU — High · Remote
 - [/] GATE-844 Serve godot-mcp's parallel itest lanes on the builder desktop, and match any --filter-class — High · Remote
+- [ ] GATE-925 Route light gates too, keeping one here only when it is provably faster here — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
@@ -159,7 +161,6 @@
 - [ ] GATE-455 Escape the command word in the outside-the-worktree line
 - [ ] GATE-456 End or re-slot a gate that outlives its box run
 - [ ] GATE-460 Judge the --cd tree lookup by final paths, not spellings
-- [ ] GATE-461 Make the cold-run raise hold for every first run and keep cold runs out of learned durations
 - [ ] GATE-462 Pin the in-box gate's wiring with tests that fail on revert
 - [ ] GATE-464 End a routed WSL command's VM processes when the box kills its run
 - [ ] GATE-465 Route a run's --env value that names a path inside the worktree to the builder's work folder
@@ -251,9 +252,6 @@
 - [ ] GATE-748 Let a --builder pin use the repo's other routes when the pinned entry's listing misses
 - [ ] GATE-750 Harden the Unix box's cross build: one read for check and pack, a command record, the stop window
 - [ ] GATE-769 Say how long a gate waited when it takes its slot (sub-issue of GATE-753)
-- [/] GATE-770 Say a routed run's builder preflight and snapshot push as they start, and the preflight's duration (sub-issue of GATE-753)
-- [/] GATE-771 Say a routed run's inputs, LFS and cross-build puts as they start (sub-issue of GATE-753)
-- [/] GATE-772 Say the box's checkout, with its duration, on both boxes (sub-issue of GATE-753)
 - [ ] GATE-773 Say the sync-back's start, the outputs install's end and the restore here, with durations (sub-issue of GATE-753)
 - [ ] GATE-758 Say the hang hint in every phase of a routed run, not only while a call is watched
 - [ ] GATE-783 Check which ssh a gate under Git Bash runs, and its exit-status width
@@ -268,7 +266,6 @@
 - [ ] GATE-811 Close the gitignored-input rule's edge cases: nested repos, unreadable metadata, spelled case, one check-ignore helper
 - [ ] GATE-816 Check the drain folder's protection before the prune trusts a barrier
 - [ ] GATE-818 Run the box prune's gc in a root with bares but no work folder
-- [ ] GATE-821 Balance routed runs across every builder that can take them, not first-in-file-order
 - [ ] GATE-822 Remove a dead drain ticket by its listed name, not a rebuilt one, on both boxes
 - [ ] GATE-823 Settle GATE-806's carried inputs: the exact-path match cost and what the sweep skips
 - [ ] GATE-825 Leave the drain wait out of the slot claim's start and a pinned run's held seconds
@@ -314,6 +311,9 @@
 - [ ] GATE-916 Look at no sibling folder before consent and the leaf check pass
 - [ ] GATE-918 Give an output brought back from .tmp a modified time no earlier than its run wrote it
 - [ ] GATE-919 Hash a put's archive as it is packed instead of reading it back
+- [ ] GATE-922 Free a box slot whose session claim's lease has lapsed, after a box reboot too
+- [ ] GATE-923 Say how to recover in the desktop refusal lines a person can fix
+- [ ] GATE-924 Rewrite a cold routed run's remote claim with its raised ceiling
 
 ## Cutover sweep
 
