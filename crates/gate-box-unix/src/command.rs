@@ -9,6 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(target_os = "macos")]
 use std::ffi::c_int;
+use std::fs;
 use std::io;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -316,6 +317,39 @@ pub fn command_record(work: &str) -> String {
     format!("{work}.command")
 }
 
+/// The ran record of the work folder `work`, `<work>.ran`: the UTC start of the first command started in the folder
+/// since it was laid out, written once it started and removed when a run clears the folder for another layout or a
+/// tree in it is made anew ([`ran_removed`]). The preflight says the folder new unless a plain file is there, so a
+/// folder a preflight laid out for a run that never came stays new until a command starts in it.
+#[must_use]
+pub fn ran_record(work: &str) -> String {
+    format!("{work}.ran")
+}
+
+/// Whether a plain file is at the ran record of the work folder `work` ([`ran_record`]), looked at as itself: a folder,
+/// a link or a name that cannot be looked at is no record.
+#[must_use]
+pub fn has_run(work: &str) -> bool {
+    fs::symlink_metadata(ran_record(work)).is_ok_and(|metadata| metadata.is_file())
+}
+
+/// Removes whatever is at the ran record of the work folder `work` ([`ran_record`]) as itself, as the Windows box
+/// removes one: a folder with all it holds, anything else, a link included, never followed; nothing when nothing is
+/// there.
+///
+/// # Errors
+///
+/// The look or the removal.
+pub fn ran_removed(work: &str) -> io::Result<()> {
+    let record = ran_record(work);
+    match fs::symlink_metadata(&record) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&record),
+        Ok(_) => files::remove_if_there(Path::new(&record)),
+    }
+}
+
 /// Runs the run's command as `launch` says, saying its lines through `output`, and gives how it ended, whose status
 /// ([`crate::lines::command_status`]) the run ends on: a command that exits 127 itself is [`CommandEnd::Exited`], one
 /// that never started [`CommandEnd::NotStarted`], both status 127.
@@ -325,7 +359,9 @@ pub fn command_record(work: &str) -> String {
 /// ends the run as [`CommandEnd::Gone`] and nothing started; then the command runs ([`run_watched`]) with standard input
 /// null, its group written to `<work>.pgid` from the child, ended `SIGTERM` first on a gone client. The record is kept
 /// unless the command exited of itself, the client still there and no leftover holding its output; it is removed for a
-/// command that never started. Every removal looks first that the work lock is still held.
+/// command that never started. Every removal looks first that the work lock is still held. Once the command started,
+/// its ran record is written unless a plain file is there already ([`ran_record`]), a failure said and the command
+/// left to run.
 ///
 /// Once the command's readers start, the heartbeat watches its group's CPU ([`GroupCpu`]) and the box's ceiling begins
 /// ([`Ceiling`]), reading the same source; the heartbeat stops watching, and the ceiling's clock stops, once the runner
@@ -376,11 +412,16 @@ fn run_with<S: LineSink + 'static>(launch: &Launch<'_>, output: &Arc<Output<S>>,
     let forwarding: Arc<dyn Forwarding> = Arc::clone(output) as Arc<dyn Forwarding>;
     let processes = ProcessLines::new(Arc::clone(&forwarding));
     let ceiling = Ceiling::new(launch.timeout, launch.sample, launch.sampler);
+    let ran = ran_record(launch.work);
     let started = |group: i32| {
         let cpu = (beat.cpu_of)(group);
         ceiling.begin(Arc::clone(&cpu));
         if let Some(pump) = launch.pump {
             pump.watch(cpu);
+        }
+        // Written once: a folder that has run keeps its record, so a warm folder's runs cost no write.
+        if !has_run(launch.work) {
+            ran_written(&ran, output);
         }
     };
     let leader_exited = || {
@@ -666,10 +707,26 @@ fn failed_line(problem: &str) -> String {
 /// The interrupted-command record's text for a command of the job `job` starting now: `{UTC start} {job}`, the start in
 /// .NET's round-trip format.
 fn record_text(job: &str) -> String {
+    format!("{} {job}", now_round_trip())
+}
+
+/// Now, UTC, in .NET's round-trip format, an RFC 3339 time.
+fn now_round_trip() -> String {
     // A clock before 1970 writes 1970: a later run reads any start as the command's own, as the clear only needs the job.
     let since = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let seconds = i64::try_from(since.as_secs()).unwrap_or(i64::MAX);
-    format!("{} {job}", round_trip(seconds, i64::from(since.subsec_nanos() / 100)))
+    round_trip(seconds, i64::from(since.subsec_nanos() / 100))
+}
+
+/// Writes the ran record `record` ([`ran_record`]) for a command that just started, holding its UTC start
+/// ([`files::replace_plain`]). A write that fails is said and changes nothing else: the command runs on, and the next
+/// preflight says the folder new once more.
+fn ran_written<S: LineSink + 'static>(record: &str, output: &Output<S>) {
+    if let Err(failure) = files::replace_plain(Path::new(record), now_round_trip().as_bytes()) {
+        let (files::ReplaceFailure::NotWritten(error) | files::ReplaceFailure::Unsynced(error)) = &failure;
+        // A client gone meanwhile has no one left to tell; the command's own end says it.
+        let _ = output.say(Stream::Err, GAT, &write_failure(record, &error.to_string()));
+    }
 }
 
 /// Removes the record `record` and syncs its folder while the work lock `lock` is still held, so a record another run

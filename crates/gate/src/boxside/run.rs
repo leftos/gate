@@ -133,6 +133,8 @@ pub(super) fn warm_record(work: &str) -> String {
 const WARM_SUFFIX: &str = ".warm";
 /// What follows the work folder's path in its interrupted-command record's ([`command_record`]).
 const COMMAND_SUFFIX: &str = ".command";
+/// What follows the work folder's path in its ran record's ([`ran_record`]).
+const RAN_SUFFIX: &str = ".ran";
 /// What follows the interrupted-command record's name in the empty record made beside it to replace one that cannot
 /// be read ([`renewed_empty`]).
 const RENEWING_SUFFIX: &str = ".new";
@@ -1194,6 +1196,32 @@ fn written_command_record(record: &str, job: &str) -> io::Result<()> {
     retried(|| tools::write_record_synced(record, &text), || thread::sleep(WARM_WRITE_WAIT))
 }
 
+/// The ran record of the work folder `work`, `{work}.ran`: the UTC start, in RFC 3339, of the first command of a run or
+/// a warm-up started in the folder since it was laid out, written once it started ([`ran_written`]) and removed with
+/// the warm record when a run lays the folder out again or a tree in it is made anew ([`WorkGit::lay_out`],
+/// [`preflight::ready_tree`]). The preflight says the folder new while it is missing, so a
+/// folder a preflight laid out for a run that never came stays new until a command starts in it.
+pub(super) fn ran_record(work: &str) -> String {
+    format!("{work}{RAN_SUFFIX}")
+}
+
+/// Writes the ran record of the work folder `work` ([`ran_record`]) for a command that just started, unless a plain
+/// file is there already, as the warm record
+/// is written ([`tools::write_record_file`]), tried again while another process holds it ([`retried`]). A write that
+/// fails is said under the box's output lock and changes nothing else: the command runs on, and the next preflight
+/// says the folder new once more.
+fn ran_written(work: &str, beat: &Beat<'_>, console: &mut Console) {
+    let record = ran_record(work);
+    // Written once: a folder that has run keeps its record, so a warm folder's runs cost no write.
+    if fs::symlink_metadata(&record).is_ok_and(|metadata| metadata.is_file()) {
+        return;
+    }
+    let start = boot::round_trip(jiff::Timestamp::now());
+    let written = retried(|| tools::write_record_file(&record, &start), || thread::sleep(WARM_WRITE_WAIT));
+    // Said when it fails; the command's run stands.
+    let _ = record_step(written, "write", &record, beat, console);
+}
+
 /// Whether the command whose wait just ended with an exit ended clean: the run's stop signal unset when read now, as a
 /// stop ends the command with an exit of its own, and the client still there. A signal that cannot be read is no clean
 /// end.
@@ -1799,6 +1827,7 @@ fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut 
         Ok(launched) => launched,
         Err(answer) => return answer.map(Ran::Exited),
     };
+    ran_written(request.work, beat, console);
     let mut stopper = Stopper { job: &job, armed: true };
     let keep: Vec<u32> = donor.as_ref().map(Donor::pid).into_iter().collect();
     let spec = Spec {
@@ -3061,19 +3090,21 @@ impl WorkGit {
     /// and the run's layout recorded after a clear. A clear removes the inputs record `{Work}.inputs` and the
     /// sent-build record `{Work}.sent-build` too, before the work folder's children, so no record outlives the files it
     /// lists, and the warm record `{Work}.warm` before it writes [`LAYOUT_CHANGING`], as it is removed too when the
-    /// work folder is missing and made here, so no warm record outlives the folder state it describes. A run of one
-    /// repo in a work folder of that
-    /// layout whose `.git` is plain readies nothing here: the preflight readied its tree. The interrupted-command record
-    /// `{Work}.command` is removed with a missing work folder and after a clear, each once the job it names is ended
-    /// ([`WorkGit::job_emptied`]) before anything is removed; a work folder of the run's layout that
-    /// holds one has what the interrupted command left cleared before any tree is readied
-    /// ([`WorkGit::cleared_interrupted`]). The held folder, which the caller keeps through the checkouts.
+    /// work folder is missing and made here, so no warm record outlives the folder state it describes; the ran record
+    /// `{Work}.ran` ([`ran_record`]) goes with it in both cases, so the folder is new again until a command starts in
+    /// it. A run of one repo in a work folder of that layout whose `.git` is plain readies nothing here: the preflight
+    /// readied its tree. The interrupted-command record `{Work}.command` is removed with a missing work folder and
+    /// after a clear, each once the job it names is ended ([`WorkGit::job_emptied`]) before anything is removed; a
+    /// work folder of the run's layout that holds one has what the interrupted command left cleared before any tree is
+    /// readied ([`WorkGit::cleared_interrupted`]). The held folder, which the caller keeps through the checkouts.
     fn lay_out(&self, laid: &Laid<'_>, console: &mut Console) -> Result<File, NotLaidOut> {
         let work = Path::new(laid.work);
         let warm = warm_record(laid.work);
+        let ran = ran_record(laid.work);
         let command = command_record(laid.work);
         if fs::symlink_metadata(work).is_err() {
             removed(Path::new(&warm))?;
+            removed(Path::new(&ran))?;
             // A command its record names may still run, though its folder is gone: it is ended before the record goes.
             self.recorded_command_ended(laid, console)?;
             removed(Path::new(&command))?;
@@ -3087,6 +3118,7 @@ impl WorkGit {
             // Ended before anything is cleared, so no command its record names writes into the folder after the clear.
             self.recorded_command_ended(laid, console)?;
             removed(Path::new(&warm))?;
+            removed(Path::new(&ran))?;
             write_layout(&record, LAYOUT_CHANGING)?;
             removed(Path::new(&inputs::record_path(laid.work)))?;
             removed(Path::new(&inputs::sent_record_path(laid.work)))?;
@@ -3253,10 +3285,11 @@ impl WorkGit {
     /// a run of one repo's ([`preflight::ready_tree`]), under the lock, so a link at `.git\objects` or
     /// `.git\objects\info` is replaced by a folder too.
     fn ready_trees(&self, laid: &Laid<'_>, console: &mut Console) -> Result<(), NotLaidOut> {
-        let warm = warm_record(laid.work);
-        // A tree whose `.git` is made or repaired here is no longer the one the warm record was written for.
+        let (warm, ran) = (warm_record(laid.work), ran_record(laid.work));
+        // A tree whose `.git` is made or repaired here is no longer the one the warm and ran records were written for.
         if laid.repos().any(|repo| !preflight::git_is_plain(Path::new(&repo.tree))) {
             removed(Path::new(&warm))?;
+            removed(Path::new(&ran))?;
         }
         for repo in laid.repos() {
             plain_tree(&repo.tree)?;
@@ -3264,6 +3297,7 @@ impl WorkGit {
                 tree: &repo.tree,
                 bare: &repo.bare,
                 warm: &warm,
+                ran: &ran,
             };
             preflight::ready_tree(self, &at, repo.name.as_deref(), console).map_err(NotLaidOut::from)?;
         }

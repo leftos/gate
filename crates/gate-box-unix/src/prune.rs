@@ -47,7 +47,7 @@ use crate::stop::{Record, own_group, record_current, records_folder, unusable_re
 /// How long a work folder goes unused before a sweep removes it.
 const IDLE_AGE: Duration = Duration::from_hours(24);
 /// The extensions of the files beside a work folder `<key>` named `<key>.<extension>`: its lock and its records.
-const KEY_FILES: [&str; 13] = [
+const KEY_FILES: [&str; 14] = [
     "lock",
     "warm",
     "layout",
@@ -57,6 +57,7 @@ const KEY_FILES: [&str; 13] = [
     "packages",
     "index",
     "command",
+    "ran",
     "pgid",
     "tools.pgid",
     "packages.pgid",
@@ -71,9 +72,11 @@ pub(crate) fn group_current(recorded: Recorded, written: SystemTime) -> bool {
     signal_guard(recorded.group, own_group()).is_ok() && record_current(recorded, written) == Record::Current
 }
 /// The records a sweep removes before it renames the work folder aside, in the order the box clears them, then the
-/// group records; `command` is the interrupted-command record, cleared like the others.
-const RECORDS_BEFORE: [&str; 9] = [
+/// group records; `command` is the interrupted-command record, cleared like the others, and `ran` the record of a
+/// command started there.
+const RECORDS_BEFORE: [&str; 10] = [
     "warm",
+    "ran",
     "packages",
     "tools",
     "inputs",
@@ -1286,7 +1289,14 @@ mod tests {
     fn an_idle_folder_goes_with_its_records_and_the_sweep_says_so() {
         let case = Case::new("idle");
         case.folder(TWO_DAYS);
-        for (extension, text) in [("warm", "w"), ("layout", "single"), ("index", "i"), ("index.lock", "l"), ("command", "c")] {
+        for (extension, text) in [
+            ("warm", "w"),
+            ("layout", "single"),
+            ("index", "i"),
+            ("index.lock", "l"),
+            ("command", "c"),
+            ("ran", "r"),
+        ] {
             case.record(extension, text, TWO_DAYS);
         }
         case.record("layout.gate-new-1-0", "single", TWO_DAYS);
@@ -1511,6 +1521,7 @@ mod tests {
         for (extension, text) in [
             ("warm", "w"),
             ("command", "c"),
+            ("ran", "r"),
             ("layout", "single"),
             ("tools.pgid", "x"),
             ("packages.pgid", "x"),

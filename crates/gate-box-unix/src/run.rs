@@ -1484,7 +1484,8 @@ pub(crate) struct Checked {
 /// `.git/objects` and `.git/objects/info` refused unless each is missing or a folder itself, and `.git/config` and
 /// `.git/HEAD` unless each is missing or a file itself, none followed, and each there the box user's own and writable by
 /// no group or other ([`plain_or_missing`]); a tree with anything at `.git/commondir` refused; and, when a tree has no `.git/HEAD` or no
-/// `.git/objects`, which [`laid_out`] makes anew, the warm record removed. No git step runs.
+/// `.git/objects`, which [`laid_out`] makes anew, the warm record removed, and the ran record with whatever is at its
+/// name ([`command::ran_removed`]). No git step runs.
 pub(crate) fn layout_checked(laying: &Laying<'_>) -> Result<Checked, NotLaidOut> {
     let work = laying.work;
     let command = command_record(work);
@@ -1506,6 +1507,7 @@ pub(crate) fn layout_checked(laying: &Laying<'_>) -> Result<Checked, NotLaidOut>
         .collect::<Result<Vec<bool>, NotLaidOut>>()?;
     if fresh.contains(&true) {
         removed(&format!("{work}.warm"))?;
+        ran_cleared(work)?;
     }
     Ok(Checked { fresh, relaid })
 }
@@ -1534,7 +1536,8 @@ pub(crate) fn tree_checked(tree: &Path, paired: bool) -> Result<bool, NotLaidOut
 }
 
 /// Clears the work folder of `laying` when its layout record `<work>.layout` names another layout than the run's
-/// ([`names_another_layout`]), a pair's first run having none, as the Windows box clears it: the warm record removed;
+/// ([`names_another_layout`]), a pair's first run having none, as the Windows box clears it: the warm record and the
+/// ran record ([`command::ran_record`]) removed, so the folder is new again until a command starts in it;
 /// the inputs record `<work>.inputs` removed, whether or not the work folder is there, so no record names copies the
 /// clear takes away; the layout record saying [`LAYOUT_CHANGING`], so a clear cut short still finds another layout
 /// and clears again; every child of the work folder removed as itself, a link never followed ([`work_cleared`]); then
@@ -1545,6 +1548,7 @@ fn work_relaid(laying: &Laying<'_>) -> Result<bool, NotLaidOut> {
         return Ok(false);
     }
     removed(&format!("{work}.warm"))?;
+    ran_cleared(work)?;
     removed(&format!("{work}.inputs"))?;
     layout_written(work, LAYOUT_CHANGING)?;
     if files::exists(Path::new(work)) {
@@ -1625,6 +1629,12 @@ fn tree_laid_out(git: &impl Steps, repo: &Repo<'_>, fresh: bool) -> Result<(), N
 /// Removes the file `path`; a missing one is fine. Else why not, refusing the run `layout`.
 fn removed(path: &str) -> Result<(), NotLaidOut> {
     files::remove_if_there(Path::new(path)).map_err(|error| NotLaidOut::Refused(format!("cannot remove {path}: {error}")))
+}
+
+/// Removes whatever is at the ran record of the work folder `work` as itself ([`command::ran_removed`]), a folder
+/// there included; else why it could not be, refusing the run `layout`.
+fn ran_cleared(work: &str) -> Result<(), NotLaidOut> {
+    command::ran_removed(work).map_err(|error| NotLaidOut::Refused(format!("cannot remove {}: {error}", command::ran_record(work))))
 }
 
 /// Whether `path` is missing or, looked at without following a link, a folder itself (`folder`) or a file itself, the
@@ -4437,6 +4447,69 @@ mod tests {
         assert!(!Path::new(&warm).exists(), "the warm record is removed");
         assert!(!Path::new(&tools).exists(), "the tools record is removed");
         assert!(!Path::new(&packages).exists(), "the packages record is removed");
+    }
+
+    /// The preflight of `json`, a run payload: whether it says the work folder's tree is new.
+    fn preflight_says_new(json: &Value) -> bool {
+        let mut console = Console::captured();
+        let status = crate::preflight::preflight(&decoded(json), &gate_args::BoxSeams::default(), &mut console);
+        assert_eq!(status, 0, "{:?}", console.err);
+        console.out.iter().any(|line| line == crate::lines::NEW_WORK_TREE)
+    }
+
+    #[test]
+    fn a_preflight_after_a_run_started_in_the_folder_says_it_is_warm() {
+        let case = Case::new("ran-warm");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let json = case.json(&commit, &json!({}));
+        assert!(preflight_says_new(&json), "no command has started in the folder yet");
+
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+
+        assert_eq!(status, 0, "{said:?}");
+        let text = fs::read_to_string(crate::command::ran_record(&case.work())).expect("the run wrote the ran record");
+        assert!(
+            text.ends_with('Z') && text.len() == "2026-01-01T00:00:00.0000000Z".len(),
+            "the UTC start: {text:?}"
+        );
+        assert!(!preflight_says_new(&json), "a command started in the folder");
+    }
+
+    #[test]
+    fn a_folder_at_the_ran_record_s_name_reads_as_new() {
+        let case = Case::new("ran-folder");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let json = case.json(&commit, &json!({}));
+        case.laid_out(&commit);
+        let record = crate::command::ran_record(&case.work());
+        fs::create_dir(&record).expect("a folder takes the record's name");
+
+        assert!(preflight_says_new(&json), "only a plain file counts as ran");
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+        assert_eq!(status, 0, "the folder refuses no run: {said:?}");
+        fs::write(format!("{}.layout", case.work()), "changing").expect("the layout record is written");
+        let (status, said) = ran(&json);
+        assert_eq!(status, 0, "nor a run that clears the work folder: {said:?}");
+        assert!(!Path::new(&record).exists(), "the clear removed the folder");
+    }
+
+    #[test]
+    fn a_relaid_folder_loses_its_ran_record() {
+        let case = Case::new("relaid-ran");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let json = case.json(&commit, &json!({}));
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+        assert_eq!(status, 0, "{said:?}");
+        let record = crate::command::ran_record(&case.work());
+        assert!(Path::new(&record).is_file(), "{said:?}");
+        fs::write(format!("{}.layout", case.work()), "changing").expect("the layout record is written");
+
+        // Laid out again with no command run, so nothing writes the record after the clear.
+        let (status, said) = ran(&json);
+
+        assert_eq!(status, 0, "{said:?}");
+        assert!(!Path::new(&record).exists(), "the clear removed the ran record");
+        assert!(preflight_says_new(&json), "no command has started in the cleared folder");
     }
 
     #[test]

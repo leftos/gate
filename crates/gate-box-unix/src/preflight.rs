@@ -47,8 +47,12 @@ fn folder_refusal(flaw: FolderFlaw, private: bool) -> Refusal {
 /// before anything is made; a work root another account may write in is refused after the version line with the
 /// work-root line, as the Windows box refuses one. Once the root is trusted and before any record of the work folder is
 /// read, the call is admitted by the drain ([`drain::admit`]) or refused after the version line, as the Windows box
-/// refuses it, so a refused preflight writes nothing under the work folder. Its last line is the builder's own slots as
-/// a look without the drain lock finds them ([`slots::looked`]), for a root with a count file or a `slots/` folder.
+/// refuses it, so a refused preflight writes nothing under the work folder. It says [`NEW_WORK_TREE`] after the warm
+/// line when a run of one repo's tree was made now ([`ready`]), when anything is at the interrupted-command record
+/// `<work>.command`, when the layout record names another layout than the run's, a pair's first run having none, and
+/// when no plain file is at the ran record ([`crate::command::has_run`]), as no command has started in the folder since
+/// it was laid out. Its last line is the builder's own slots as a look without the drain lock finds them
+/// ([`slots::looked`]), for a root with a count file or a `slots/` folder.
 pub fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u8 {
     let checked = folders(payload).and_then(|(bare, work, pair)| Ok((bare, work, checked_root(work, bare, pair.is_some())?, pair)));
     let drain_read = drain::session_of(payload, "", "").and_then(|session| Ok((session, payload.no_ticket()?)));
@@ -103,6 +107,8 @@ pub fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> 
     let relaid = names_another_layout(&layout, &layout_text_for(pair.as_ref()));
     let warm = warm_state(work, pair.as_ref(), relaid);
     let interrupted = files::exists(Path::new(&format!("{work}.command")));
+    // Only a command started in the folder makes it warm: a tree laid out by a preflight whose run never came is new.
+    let ran = crate::command::has_run(work);
     let git = Git::of(&root, parent);
     // A pair's trees are laid out by its run, under the work lock.
     let readied = match &pair {
@@ -121,7 +127,7 @@ pub fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> 
     };
     console.out(&version_line());
     console.out(&warm_line(warm.as_deref()));
-    if made || interrupted || relaid {
+    if made || interrupted || relaid || !ran {
         console.out(NEW_WORK_TREE);
     }
     boot::say(console);
@@ -279,18 +285,24 @@ fn bare_made(git: &Git<'_>, bare: &str, name: Option<&str>, console: &mut Consol
         .map_err(|failed| failed_for(failed, step, name))
 }
 
-/// Removes the warm record `<work>.warm` of a tree that is gone, so the tree made in its place is not taken as warm;
-/// a record already missing is fine.
+/// Removes the warm record `<work>.warm` of a tree that is gone, so the tree made in its place is not taken as warm,
+/// and its ran record ([`crate::command::ran_removed`]), so it is new until a command starts in it; a record already
+/// missing is fine.
 fn warm_removed(work: &str) -> Result<(), Failed> {
     let warm = format!("{work}.warm");
-    match fs::remove_file(&warm) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(Failed::line(format!(
+    let unremoved = |record: &str, error: &io::Error| {
+        Failed::line(format!(
             "gate: remote could not remove {}: {}",
-            escaped(&warm),
+            escaped(record),
             escaped(&error.to_string())
-        ))),
-        _ => Ok(()),
+        ))
+    };
+    if let Err(error) = fs::remove_file(&warm)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        return Err(unremoved(&warm, &error));
     }
+    crate::command::ran_removed(work).map_err(|error| unremoved(&crate::command::ran_record(work), &error))
 }
 
 /// Writes `<work>/.git/objects/info/alternates` as `<bare>/objects` and a line feed unless it already holds exactly
@@ -504,12 +516,78 @@ mod tests {
         assert_eq!(fs::read(&commondir).expect("the file is read"), b"../elsewhere\n");
     }
 
+    /// Writes `case`'s ran record, as a command started in its work folder does.
+    fn ran_written(case: &Case) {
+        fs::write(crate::command::ran_record(&case.work()), "2026-01-01T00:00:00.0000000Z").expect("the ran record is written");
+    }
+
+    #[test]
+    fn a_second_preflight_with_no_run_between_still_says_new_work_tree() {
+        let case = Case::new("new-until-a-run");
+        let payload = case.payload(&json!({}));
+        let (status, first) = preflighted(&payload);
+        assert_eq!(status, 0, "{:?}", first.err);
+        assert_eq!(first.out[3], NEW_WORK_TREE, "{:?}", first.out);
+
+        let (status, second) = preflighted(&payload);
+
+        assert_eq!(status, 0, "{:?}", second.err);
+        assert_eq!(
+            second.out[..3],
+            [version_line(), warm_line(None), NEW_WORK_TREE.to_owned()],
+            "{:?}",
+            second.out
+        );
+    }
+
+    #[test]
+    fn a_remade_tree_with_a_stale_ran_record_says_new_until_a_run_starts() {
+        let case = Case::new("remade-stale-ran");
+        let payload = case.payload(&json!({}));
+        assert_eq!(preflighted(&payload).0, 0);
+        ran_written(&case);
+        fs::remove_dir_all(Path::new(&case.work()).join(".git")).expect("the tree's .git is removed");
+
+        for _ in 0..2 {
+            let (status, console) = preflighted(&payload);
+            assert_eq!(status, 0, "{:?}", console.err);
+            assert_eq!(
+                console.out[2], NEW_WORK_TREE,
+                "no command has started in the remade tree: {:?}",
+                console.out
+            );
+        }
+        assert!(
+            !Path::new(&crate::command::ran_record(&case.work())).exists(),
+            "the remade tree's record is gone"
+        );
+    }
+
+    #[test]
+    fn a_single_payload_against_a_pair_recorded_folder_gets_the_cold_raise() {
+        let case = Case::new("single-on-pair");
+        let payload = case.payload(&json!({}));
+        assert_eq!(preflighted(&payload).0, 0);
+        ran_written(&case);
+        case.layout_written("pair repo lib");
+
+        let (status, console) = preflighted(&payload);
+
+        assert_eq!(status, 0, "{:?}", console.err);
+        assert_eq!(
+            console.out[2], NEW_WORK_TREE,
+            "a run of one repo clears a pair's folder: {:?}",
+            console.out
+        );
+    }
+
     #[test]
     fn a_second_preflight_is_idempotent_and_reads_the_warm_record() {
         let case = Case::new("again");
         let payload = case.payload(&json!({}));
         assert_eq!(preflighted(&payload).0, 0);
 
+        ran_written(&case);
         let (status, console) = preflighted(&payload);
         assert_eq!(status, 0, "{:?}", console.err);
         assert_eq!(console.out[..2], [version_line(), warm_line(None)], "no created, {:?}", console.out);
@@ -1000,6 +1078,7 @@ mod tests {
         let payload = case.payload(&pair());
         assert_eq!(preflighted(&payload).0, 0);
         case.layout_written("pair repo lib");
+        ran_written(&case);
 
         let (status, console) = preflighted(&payload);
         assert_eq!(status, 0, "{:?}", console.err);
@@ -1013,6 +1092,7 @@ mod tests {
         let payload = case.payload(&pair());
         assert_eq!(preflighted(&payload).0, 0);
         case.layout_written("pair repo lib");
+        ran_written(&case);
         let hash = "a".repeat(64);
         fs::write(format!("{}.warm", case.work()), &hash).expect("the warm record is written");
         for name in ["repo", "lib"] {

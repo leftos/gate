@@ -53,10 +53,21 @@ use crate::console::Console;
 /// How long a work folder goes unused before a sweep removes it.
 const IDLE_AGE: Duration = Duration::from_hours(24);
 /// The extensions of the files beside a work folder `<key>` named `<key>.<extension>`: its lock and its records.
-const KEY_FILES: [&str; 9] = ["lock", "warm", "layout", "inputs", "sent-build", "tools", "packages", "index", "command"];
+const KEY_FILES: [&str; 10] = [
+    "lock",
+    "warm",
+    "layout",
+    "inputs",
+    "sent-build",
+    "tools",
+    "packages",
+    "index",
+    "command",
+    "ran",
+];
 /// The records a sweep removes before it renames the work folder aside, in the order the box clears them; `command`
-/// is the interrupted-command record, cleared like the others.
-const RECORDS_BEFORE: [&str; 6] = ["warm", "packages", "tools", "inputs", "sent-build", "command"];
+/// is the interrupted-command record, cleared like the others, and `ran` the record of a command started there.
+const RECORDS_BEFORE: [&str; 7] = ["warm", "ran", "packages", "tools", "inputs", "sent-build", "command"];
 /// The access a sweep looks at a work folder with before it knows the folder is idle: its attributes, and its listing
 /// for the trees in it. No open's sharing refuses the first, and any open that shares reading allows the second, so a
 /// folder in use, held without delete sharing, is looked at without a failure.

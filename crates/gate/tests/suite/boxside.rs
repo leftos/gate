@@ -772,24 +772,21 @@ fn preflight_twice_creates_nothing_the_second_time() {
     assert_eq!(folders.alternates(), alternates);
 }
 
+/// The preflight lays the tree out, but only a command started in the folder makes it warm: a second preflight with
+/// no run between, as after a client that fell back before its run call, still says the tree is new.
 #[test]
-fn preflight_of_a_new_work_tree_says_so_once() {
-    let case = Case::new("preflight_of_a_new_work_tree_says_so_once");
+fn a_second_preflight_with_no_run_between_still_says_new_work_tree() {
+    let case = Case::new("preflight_new_until_a_run");
     let folders = Folders::new(&case);
     let new_tree = |printed: &[&str]| printed.iter().filter(|line| **line == "gate: remote new work tree").count();
 
     let first = gate_box(&case, "preflight", &folders.payload(), None);
     let second = gate_box(&case, "preflight", &folders.payload(), None);
 
-    let printed = passed(&first);
-    assert_eq!(new_tree(&printed), 1, "the first preflight of the key lays its tree out: {first:?}");
-    let warm = printed.iter().position(|line| *line == "gate: remote warm none");
-    assert_eq!(
-        warm.and_then(|at| printed.get(at + 1)).copied(),
-        Some("gate: remote new work tree"),
-        "right after the warm line: {first:?}"
-    );
-    assert_eq!(new_tree(&passed(&second)), 0, "the tree is there the second time: {second:?}");
+    for outcome in [&first, &second] {
+        assert_eq!(new_tree(&passed(outcome)), 1, "said once: {outcome:?}");
+        assert!(said_cold(outcome), "right after the warm line: {outcome:?}");
+    }
 }
 
 /// The folder `remote\work` of `folders`, where the key's lock `k.lock` lies, made.
@@ -944,6 +941,115 @@ fn a_folder_at_the_command_record_s_name_gets_the_cold_raise() {
     let cold = gate_box(&case, "preflight", &self::payload(&payload), None);
 
     assert!(said_cold(&cold), "a folder at the record's name has the run clear: {cold:?}");
+}
+
+#[test]
+fn a_preflight_after_a_run_started_in_the_folder_says_it_is_warm() {
+    let case = Case::new("preflight_after_a_run_warm");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let before = gate_box(&case, "preflight", &self::payload(&payload), None);
+    assert!(said_cold(&before), "no command has started in the folder yet: {before:?}");
+
+    let ran = run_box(&case, &payload);
+
+    assert_eq!(ran.code, Some(0), "{ran:?}");
+    let text = fs::read_to_string(ran_record(&payload)).expect("the run wrote the ran record");
+    assert!(text.parse::<Timestamp>().is_ok(), "the record holds the start's UTC time: {text:?}");
+    let after = gate_box(&case, "preflight", &self::payload(&payload), None);
+    assert!(!said_cold(&after), "a command started in the folder: {after:?}");
+}
+
+#[test]
+fn a_warm_up_leaves_the_folder_ran() {
+    let case = Case::new("warm_up_leaves_ran");
+    let mut payload = box_payload(&case, "k", &[]);
+    payload.as_object_mut().expect("the payload is an object").remove("Command");
+    payload["WarmCommands"] = json!([[FAKE_TOOL, "out", "warm"]]);
+    payload["WarmHash"] = json!("5f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0");
+    payload["Timeout"] = json!(600);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let warmed = run_box(&case, &payload);
+
+    assert_eq!(warmed.code, Some(0), "{warmed:?}");
+    assert!(ran_record(&payload).is_file(), "the warm-up's command wrote the ran record: {warmed:?}");
+    let after = gate_box(&case, "preflight", &self::payload(&payload), None);
+    assert!(!said_cold(&after), "the run after a warm-up is not raised: {after:?}");
+}
+
+#[test]
+fn a_single_payload_against_a_pair_recorded_folder_gets_the_cold_raise() {
+    let case = Case::new("preflight_single_on_pair_cold");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let ran = run_box(&case, &payload);
+    assert_eq!(ran.code, Some(0), "{ran:?}");
+    fs::write(format!("{}.layout", field(&payload, "Work")), "pair app lib").expect("the layout record can be written");
+
+    let cold = gate_box(&case, "preflight", &self::payload(&payload), None);
+
+    assert!(said_cold(&cold), "a run of one repo clears a pair's folder: {cold:?}");
+}
+
+#[test]
+fn a_remade_tree_with_a_stale_ran_record_says_new_until_a_run_starts() {
+    let case = Case::new("remade_tree_stale_ran");
+    let folders = Folders::new(&case);
+    passed(&gate_box(&case, "preflight", &folders.payload(), None));
+    let ran = format!("{}.ran", folders.work);
+    fs::write(&ran, "2026-01-01T00:00:00.0000000Z").expect("the ran record can be written");
+    fs::remove_dir_all(Path::new(&folders.work).join(".git")).expect("the tree's .git can be removed");
+
+    let first = gate_box(&case, "preflight", &folders.payload(), None);
+    let second = gate_box(&case, "preflight", &folders.payload(), None);
+
+    for outcome in [&first, &second] {
+        assert!(said_cold(outcome), "no command has started in the remade tree: {outcome:?}");
+    }
+    assert!(!Path::new(&ran).exists(), "the remade tree's record is gone: {second:?}");
+}
+
+#[test]
+fn a_folder_at_the_ran_record_s_name_reads_as_new() {
+    let case = Case::new("ran_record_folder_new");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    fs::create_dir(ran_record(&payload)).expect("a folder can stand in for the record");
+
+    let cold = gate_box(&case, "preflight", &self::payload(&payload), None);
+
+    assert!(said_cold(&cold), "only a plain file counts as ran: {cold:?}");
+    let ran = run_box(&case, &payload);
+    assert_eq!(ran.code, Some(0), "the folder refuses no run: {ran:?}");
+    fs::write(format!("{}.layout", field(&payload, "Work")), "changing").expect("the layout record can be written");
+    let relaid = run_box(&case, &renamed(&payload, 1));
+    assert_eq!(relaid.code, Some(0), "nor a run that clears the work folder: {relaid:?}");
+    assert!(
+        ran_record(&payload).is_file(),
+        "the clear removed the folder and the command wrote the record: {relaid:?}"
+    );
+}
+
+#[test]
+fn a_relaid_folder_loses_its_ran_record() {
+    let case = Case::new("relaid_loses_ran");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let ran = run_box(&case, &payload);
+    assert_eq!(ran.code, Some(0), "{ran:?}");
+    assert!(ran_record(&payload).is_file(), "{ran:?}");
+    fs::write(format!("{}.layout", field(&payload, "Work")), "changing").expect("the layout record can be written");
+    // A command that never starts, so nothing writes the record again after the clear.
+    let mut unstarted = renamed(&payload, 1);
+    unstarted["Command"] = json!(["gate-suite-no-such-program"]);
+
+    let relaid = run_box(&case, &unstarted);
+
+    assert_eq!(relaid.code, Some(127), "{relaid:?}");
+    assert!(!ran_record(&payload).exists(), "the clear removed the ran record: {relaid:?}");
+    let after = gate_box(&case, "preflight", &self::payload(&payload), None);
+    assert!(said_cold(&after), "no command has started in the cleared folder: {after:?}");
 }
 
 #[test]
@@ -8602,6 +8708,11 @@ fn backdated(path: &Path, by: Duration) {
 /// The interrupted-command record of the work folder of `payload`, `{Work}.command`.
 fn command_record(payload: &Value) -> PathBuf {
     PathBuf::from(format!("{}.command", field(payload, "Work")))
+}
+
+/// The ran record of the work folder of `payload`, `{Work}.ran`.
+fn ran_record(payload: &Value) -> PathBuf {
+    PathBuf::from(format!("{}.ran", field(payload, "Work")))
 }
 
 /// Runs the command of `payload` to its end, then a run whose command writes [`HALF_WRITTEN`] and is killed by the

@@ -39,7 +39,7 @@ use crate::boxside::desktop::verify::{
 };
 use crate::boxside::run::{
     Beat, Launched, Look, One, Pipes, Prepared, Ran, Request, STARTING_COMMAND, Started, Stopper, box_run_job, command_record, failed, job_made,
-    not_started, record_failed, stopped_before_start, unstarted_record_removed, wait_for_path, watch, written_command_record,
+    not_started, ran_written, record_failed, stopped_before_start, unstarted_record_removed, wait_for_path, watch, written_command_record,
 };
 use crate::boxside::stamping;
 use crate::console::Console;
@@ -222,6 +222,7 @@ pub(super) fn hand_off(here: &Here<'_, '_>, console: &mut Console) -> Result<Ran
         }
         DesktopEnd::Ended(failed(console, &error.to_string()))
     })?;
+    ran_written(here.request.work, beat, console);
     let launched = Launched { running, pipes };
     let mut stopper = Stopper { job: &job, armed: true };
     let spec = Spec {

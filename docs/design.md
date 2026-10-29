@@ -3619,7 +3619,7 @@ Built verbs:
 
   A preflight that fails after its take lets the slot go before it returns, as a run's end does (`gate: slot release failed: {why}` on stderr when the claim could not be removed); one that passes keeps it for the run. A preflight with no `Session`, or on a root with no `slots.json`, takes nothing.
 
-  The preflight takes the work-folder lock `{Work}.lock` (made when missing, its write time never stamped) around its reads of `.layout`, `.warm` and `.command` and its writes inside the work folder, and lets it go before its SDK and tool probes.
+  The preflight takes the work-folder lock `{Work}.lock` (made when missing, its write time never stamped) around its reads of `.layout`, `.warm`, `.ran` and `.command` and its writes inside the work folder, and lets it go before its SDK and tool probes.
 
   A lock another process holds leaves the work folder alone: it writes nothing there, exits 0 and still prints `gate: remote new work tree` when `.git\HEAD` is missing, and the run that follows is refused `busy`. A lock that cannot be opened (a folder, a link) prints `gate: remote could not open the work folder lock <path>: <error>` on stderr and exits 0, with nothing written there either.
 
@@ -3635,7 +3635,7 @@ Built verbs:
 
   Right after the warm line it prints `gate: remote new work tree` when any of these holds, as the run then finds the folder cold.
 
-  First, it laid out the run's own single work tree now, that is when nothing had the name `.git` in the work folder. Second, any entry is at `{Work}.command` (the interrupted-command record below), looked at as itself and never opened or followed. Third, the layout record names another layout than the run's, a pair's first run having none yet, as the run then clears the whole folder.
+  First, it laid out the run's own single work tree now, that is when nothing had the name `.git` in the work folder. Second, any entry is at `{Work}.command` (the interrupted-command record below), looked at as itself and never opened or followed. Third, the layout record names another layout than the run's, a pair's first run having none yet, as the run then clears the whole folder. Fourth, `{Work}.ran` (the ran record, below) is not a plain file: missing, a folder, a link or unreadable, looked at as itself. So a folder a preflight laid out stays new until a command has started in it, however many runs ended before that (a version refusal, a push failure, Ctrl+C, a fallback), and every existing folder is new once after an upgrade.
 
   The layout comparison is read before the folders are readied, for a single layout and a pair alike, so a pair's first routed run is cold.
 
@@ -3837,11 +3837,15 @@ Built verbs:
 
   The layout record `<Work>.layout`, beside the lock, says which layout `Work` holds: `single`, `pair {Leaf} {siblings}` (the siblings sorted without regard to ASCII case, one space before each, so the same siblings in another order are one layout) or `changing` while the folder is being cleared. A missing record says `single`. It is read and written as the tools record is, through a handle that refuses a link, a folder or a file with more than one name.
 
-  The records beside the lock, one file each, named `Work` plus: `.lock` (the run's lock), `.index` (the sync-back's copy of the index), `.layout` (above), `.inputs` (the copies the `inputs` verb left), `.sent-build` (the PC's build the `inputs` verb's sent build left), `.tools` (the dotnet tool restore), `.packages` (the pnpm, bun and npm package restore) and `.warm` (the hash of the warm-up file whose commands last passed in the folder, 64 lower-case hex digits, no line end, written only by a warm-up) and `.command` (the interrupted-command record, below).
+  The records beside the lock, one file each, named `Work` plus: `.lock` (the run's lock), `.index` (the sync-back's copy of the index), `.layout` (above), `.inputs` (the copies the `inputs` verb left), `.sent-build` (the PC's build the `inputs` verb's sent build left), `.tools` (the dotnet tool restore), `.packages` (the pnpm, bun and npm package restore) `.warm` (the hash of the warm-up file whose commands last passed in the folder, 64 lower-case hex digits, no line end, written only by a warm-up), `.ran` (the ran record, below) and `.command` (the interrupted-command record, below).
 
   Each is described where its feature is.
 
   The warm record is removed before a warm-up's first command, when a run finds the layout changed (before `changing` is written) and when the work folder is missing and the run makes it, so it never outlives the folder state it describes. The preflight reads it without taking the lock, sharing reading, writing and deletion.
+
+  The ran record `<Work>.ran` holds one RFC 3339 UTC time (for example `2026-10-29T12:34:56.1234567Z`, no line end): when a command was first started in the folder. A run or a warm-up writes it once its command has started (after the launch succeeds, and after the resume in a desktop run's hand-off), only when no plain file is at the name already; a command that cannot start leaves none. A failed write says `gate: remote could not write <Work>.ran: <error>` and the command runs on.
+
+  It is removed with `.warm` when a tree is made anew (a missing `.git` or `.git\HEAD`) by a preflight or a run, when a run relays the folder for another layout, and when a run finds the folder missing; a folder at the name is removed rather than refusing the run. The interrupted-command clear leaves it, as a folder a command ran in is not new.
 
   The interrupted-command record `<Work>.command` holds `{UTC start, round-trip format} {job}`, the job being the run's `Local\gate-remote-{key}-{nonce}` name. The box writes it, flushed to the disk, just before it resumes a command, once the command is in its job, and removes it once the command exited with no stop signal set and the client still there.
 
@@ -4381,7 +4385,7 @@ Built verbs:
 
   For each key under `work` it takes `{key}.lock` (a lock it cannot open prints `gate: remote could not open the work folder lock <path>: <error>`), so a key whose lock a run or a sweep holds is kept, and `inflight` does not see a key whose lock a sweep holds. Idleness is the newest write time among the folder, each tree's `.git\FETCH_HEAD`, the key's records and the lock's write time (the stamp of the last take or release by a run, `inputs` or `lfs`).
 
-  A key idle for over 24 hours loses its records in this order: `.layout` is written as `changing` first; `.warm`, `.packages`, `.tools`, `.inputs`, `.sent-build` and `.command` are removed; the folder is renamed by handle into `{root}\pruned\{key}-{pid}-{nanos}`; `.layout` and `.index` are removed. The lock is released and the renamed folder is deleted through its handle. The `.lock` file stays.
+  A key idle for over 24 hours loses its records in this order: `.layout` is written as `changing` first; `.warm`, `.ran`, `.packages`, `.tools`, `.inputs`, `.sent-build` and `.command` are removed; the folder is renamed by handle into `{root}\pruned\{key}-{pid}-{nanos}`; `.layout` and `.index` are removed. The lock is released and the renamed folder is deleted through its handle. The `.lock` file stays.
 
   Every step works beneath held handles and never follows a link. A failed rename leaves `.layout` reading `changing`, so the next run clears the folder whole.
 
@@ -4703,7 +4707,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
   A lock the age prune cannot open prints `gate: remote could not open the work folder lock <path>: <error>`, and the keyed prune that key's could-not line.
 
-  Under the lock, an idle key (or any named key) loses its records in this order: `<key>.layout` is written as `changing`; `.warm`, `.packages`, `.tools`, `.inputs`, `.sent-build`, `.command`, `.pgid`, `.tools.pgid` and `.packages.pgid` are removed; the folder is renamed to `<root>/pruned/<key>.<pid>.<nanos>`; then `.layout`, `.index`, `.index.lock` and the temp files of the key's records (`<key>.<name>.gate-new-*`) are removed.
+  Under the lock, an idle key (or any named key) loses its records in this order: `<key>.layout` is written as `changing`; `.warm`, `.ran`, `.packages`, `.tools`, `.inputs`, `.sent-build`, `.command`, `.pgid`, `.tools.pgid` and `.packages.pgid` are removed; the folder is renamed to `<root>/pruned/<key>.<pid>.<nanos>`; then `.layout`, `.index`, `.index.lock` and the temp files of the key's records (`<key>.<name>.gate-new-*`) are removed.
 
   The lock is let go and the renamed folder deleted. A key with no folder has its records removed. A failed rename leaves `.layout` reading `changing`, so the next run clears the folder whole.
 
@@ -4723,6 +4727,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
   | `<key>.command`, `<key>.tools` | the command record, the tool manifests' hash | removes before the rename |
   | `<key>.inputs` | the `inputs` verb's record of installed inputs | removes before the rename |
   | `<key>.packages` | the package restore's record of the lockfile folders whose install passed | removes before the rename |
+  | `<key>.ran` | the ran record: when a command first started in the folder | removes before the rename |
   | `<key>.warm`, `<key>.sent-build` | not written by the Unix box (named so a later writer needs no prune change) | removes before the rename |
   | `<key>.layout` | the layout record (`single`, `pair ...`) | marks `changing`, removes after the rename |
   | `<key>.index`, `<key>.index.lock` | the back commit's copied index and git's lock on it | removes after the rename |
@@ -4876,7 +4881,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
   Each step also gets `-c protocol.allow=never -c protocol.file.allow=always -c submodule.recurse=false -c core.sharedRepository=umask` and `GIT_ALLOW_PROTOCOL=file`, with `--upload-pack` and `--receive-pack` pinned, so only local-path repositories are spoken to and no submodule is followed; the fetch and the back push also get `--no-recurse-submodules`. The checkout and clean steps run with umask 022 (Umask, under Work root).
 - **`preflight`** runs every git step from `<root>/work`, with `GIT_CEILING_DIRECTORIES` set to `<root>`; a broken `<Work>/.git` fails as `gate: remote git <step> failed (status <n>)`.
 
-  It takes no config fast path: the steps are `git init --bare`, `git init`, `git remote add` (or a `remote.origin.url` check) and the two `git config` calls, which it runs every time it readies a single tree. A new tree also removes `<Work>.warm`; when that fails it says `gate: remote could not remove <Work>.warm: <error>` and exits 1.
+  It takes no config fast path: the steps are `git init --bare`, `git init`, `git remote add` (or a `remote.origin.url` check) and the two `git config` calls, which it runs every time it readies a single tree. A new tree also removes `<Work>.warm` and `<Work>.ran`; when that fails it says `gate: remote could not remove <Work>.warm: <error>` (or `<Work>.ran`) and exits 1. The preflight says `gate: remote new work tree` as well when `<Work>.ran` is not a plain file, and a folder at that name is removed. A run writes `<Work>.ran` from `run_with`'s started hook, once the command has started and only when no plain file is there; a failed write says `gate: remote could not write <Work>.ran: <error>` and the command runs on.
 - **Lines.** `gate: remote created <Bare>` and `gate: remote sdks <list>` escape their text. A warm record is read only when it is a plain file holding exactly 64 lower-case hex digits and no line end, else `none`, as on the Windows box.
 - **Tool probes** run on the login `PATH` under the same shared 10 s deadline and read versions the same way (`gate_wire::version_of`). `unreal` and `netfx-sdk` say `missing`, so a run that needs one never routes here.
 
@@ -4891,7 +4896,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
   A pair preflight says `gate: remote created <root>/<name>.git` for each missing bare, the main one first, readies no tree, and says `gate: remote new work tree` when the layout record names another layout. The record `<Work>.layout` holds `pair <leaf> <siblings sorted ignoring case>` or `single`, and `changing` while the folder is cleared; a run whose layout differs clears the whole work folder, `.tools` kept. A link at a pair tree refuses the run `layout`.
 
-  The clear (`run.rs`, `beneath.rs`) removes `<Work>.warm` and `<Work>.inputs` first, whether or not the folder is there, then writes `changing`. It then opens `<Work>` beneath its judged root and `<root>/work`, a link at any of the three refused, and removes each child beneath that folder's descriptor, a folder with all it holds, a link or a fifo as itself and never followed; every open is `O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`.
+  The clear (`run.rs`, `beneath.rs`) removes `<Work>.warm`, `<Work>.ran` and `<Work>.inputs` first, whether or not the folder is there, then writes `changing`. It then opens `<Work>` beneath its judged root and `<root>/work`, a link at any of the three refused, and removes each child beneath that folder's descriptor, a folder with all it holds, a link or a fifo as itself and never followed; every open is `O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`.
 
   A `<Work>` that is a link, or cannot be opened or listed, refuses the run `layout` with `cannot list <Work>: <error>`; a child that stays says `cannot remove <path>: <error>`.
 
