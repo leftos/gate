@@ -1302,7 +1302,11 @@ fn a_warm_up_that_meets_the_drain_ends_at_once_with_its_line_and_gives_back_the_
     let (steps, outcome) = drained_warm_up(&case);
 
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
-    assert_eq!(outcome.stderr.trim_end(), DRAINED, "{outcome:?}");
+    assert_eq!(
+        outcome.stderr.lines().collect::<Vec<_>>(),
+        [format!("gate: preflighting {HOST}").as_str(), DRAINED],
+        "the preflight's start line, then the drain's: {outcome:?}"
+    );
     assert_eq!(calls(&steps), ["preflight"], "the refused preflight alone, and no poll: {outcome:?}");
     let lock = warm_entry(&case, "lock").expect("the warm-up made its lock");
     assert!(free(&lock), "the per-key lock is released");
