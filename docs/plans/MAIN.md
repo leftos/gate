@@ -12,13 +12,10 @@
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
 - [!] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
-- [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
-- [/] GATE-461 Make the cold-run raise hold for every first run and keep cold runs out of learned durations — High · Remote
-- [/] GATE-759 Move the rest of the box's shared wire rules into gate-wire (GATE-616 slices 2, 3, 5, 6) — High · Remote
-- [ ] GATE-821 Balance routed runs across every builder that can take them, not first-in-file-order — High · Remote
+- [!] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
 - [!] GATE-839 Route race-anywhere's Unreal editor and game runs: a desktop route with a GPU — High · Remote
-- [/] GATE-844 Serve godot-mcp's parallel itest lanes on the builder desktop, and match any --filter-class — High · Remote
-- [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
+- [!] GATE-844 Serve godot-mcp's parallel itest lanes on the builder desktop, and match any --filter-class — High · Remote
+- [!] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
 
@@ -38,6 +35,7 @@
 
 ## Remote
 
+- [ ] GATE-942 Fold the one-pool remote wait into the several-pool wait's path
 - [ ] GATE-887 Close GATE-861's remaining built-here gaps: a listed repo's nothing-back built list, add-only waits, client clear lines
 - [ ] GATE-885 Close GATE-873's remaining launch-window and path-read gaps
 - [ ] GATE-879 Release a builder slot a passing preflight took when the PC falls back on its own judgement
@@ -157,6 +155,7 @@
 - [ ] GATE-438 Stop the elevated ssh session trusting the builder user's profile (bare pwsh, HKCU environment, cmd AutoRun)
 - [ ] GATE-446 Judge the builder's installed gate.exe before the push runs it elevated
 - [ ] GATE-448 Read a Godot --script path against --path when deciding a route
+- [ ] GATE-958 Measure fairly whether routing commit-hook builds makes commits slower (sub-issue of GATE-449)
 - [ ] GATE-455 Escape the command word in the outside-the-worktree line
 - [ ] GATE-456 End or re-slot a gate that outlives its box run
 - [ ] GATE-460 Judge the --cd tree lookup by final paths, not spellings
@@ -263,7 +262,6 @@
 - [ ] GATE-811 Close the gitignored-input rule's edge cases: nested repos, unreadable metadata, spelled case, one check-ignore helper
 - [ ] GATE-816 Check the drain folder's protection before the prune trusts a barrier
 - [ ] GATE-818 Run the box prune's gc in a root with bares but no work folder
-- [ ] GATE-942 Fold the one-pool remote wait into the several-pool wait's path (sub-issue of GATE-821)
 - [ ] GATE-822 Remove a dead drain ticket by its listed name, not a rebuilt one, on both boxes
 - [ ] GATE-823 Settle GATE-806's carried inputs: the exact-path match cost and what the sweep skips
 - [ ] GATE-825 Leave the drain wait out of the slot claim's start and a pinned run's held seconds
@@ -324,6 +322,7 @@
 - [ ] GATE-950 Bound git_ran's post-exit reader and feed joins on the Windows box with the forwarders' drain, saying GIT_LEFTOVER
 - [ ] GATE-951 Say the tailscale-path-not-read line only when the read is truly late, not after every routed run
 - [ ] GATE-953 Cut the pair sync-back's chain of about 45 serial git calls on the builder
+- [ ] GATE-955 Read the durations store once per routing decision, not twice for a light run
 
 ## Cutover sweep
 
@@ -451,3 +450,5 @@
 - [ ] GATE-930 Accept -Builder in the launcher's PowerShell form
 - [ ] GATE-952 End what remote_client::a_bare_ssh_stand_in_name_is_not_searched_in_the_working_folder leaves holding its output (nextest LEAK)
 - [ ] GATE-954 Arm the desktop helper's done wait on a test file, so the never-says-done case needs no 20 s wait
+- [ ] GATE-956 Escape the outside text the Windows box's remaining preflight and tools lines print raw
+- [ ] GATE-957 Keep gate check --builder from cutting an escaped created path mid-escape
