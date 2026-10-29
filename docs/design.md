@@ -3580,6 +3580,8 @@ The box's ceiling has three seams: `--test-box-sample-ms <n>` replaces the 5 s s
 
 `--test-box-git-armed-by <path>` makes the bound `--test-box-git-limit` gives its step start only once `<path>` exists, checked at each look of the step's wait: until then that step has no bound, and the steps the limit does not name keep their class bound from their start. Without this flag the limit's bound starts with its step; given without `--test-box-git-limit` it is `gate: --test-box-git-armed-by needs --test-box-git-limit`.
 
+`--test-box-gone-reached <path>` makes the box write the empty file `<path>` the first time it sees its client gone, once per run, wherever it learns it (a failed write of the heartbeat's line or probe, of a forwarded line, or of a process line); a write that fails says nothing and changes nothing, and without the seam nothing is written (any path; an empty value is no value). A case gives the same path to `--test-box-git-armed-by`, so its bound starts only once the box has seen the client gone, whatever the machine's load.
+
 `--test-box-git-long-ms <ms>` replaces the 30-minute bound of every long box git step (`fetch`, `checkout`, `lfs checkout`, `clean`, `add -A`, `push` and prune's `gc --auto`, the bare writes among them included) with `ms` milliseconds; a step `--test-box-git-limit` names keeps that limit. A value that is not a whole number above 0 is `gate: --test-box-git-long-ms must be a whole number above 0, got '<value>'`.
 
 The suite's `box_call` helpers give 300 s, so a hung git step is ended and said by the box, naming the processes it still ran, before the suite's 600 s hang guard; a case built on `bare_box_call` keeps the 30 minutes unless it gives the seam itself.

@@ -147,6 +147,9 @@ pub struct BoxSeams {
     /// The file whose existence starts the bound of the git step `--test-box-git-limit` names; `None` without the
     /// feature, and every bound starts with its step.
     pub git_armed_by: Option<PathBuf>,
+    /// The file the box makes, empty, the first time it sees its client gone, so a case arms a bound on that moment;
+    /// `None` without the feature, and nothing is written.
+    pub gone_reached: Option<PathBuf>,
     /// How long each of `gate box`'s long git steps (`fetch`, `checkout`, `lfs checkout`, `clean`, `add -A`, `push`,
     /// prune's `gc --auto`) may take, in milliseconds, in place of the built-in 30 minutes; a step `git_limit` names keeps that limit.
     /// `None` without the feature.

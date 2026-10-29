@@ -1151,16 +1151,14 @@ fn preflight_a_dotnet_that_does_not_answer_is_an_unreadable_sdk_list() {
 /// the probe each end the step within a second or two of their own.
 const PARKED_GIT_GUARD: Duration = HANG_GUARD;
 
-/// The bound `--test-box-git-limit` gives a parked step whose own child's pid a case reads, armed by that pid file
-/// (`--test-box-git-armed-by`): the clock starts only once the stub's child has written the pid, so the step's start
-/// has no deadline to beat whatever the machine's load, and the bound then ends the step.
+/// The bound `--test-box-git-limit` gives a parked step a case arms by a file (`--test-box-git-armed-by`): the pid file
+/// the stub's child writes, or the mark the box makes once it has seen its client gone (`--test-box-gone-reached`). The
+/// clock starts only once that file exists, so the step's start has no deadline to beat whatever the machine's load, and
+/// the bound then ends the step.
 const ARMED_LIMIT_MS: u64 = 2_000;
 /// The bound [`box_call`] and the helpers built on it give the box's long git steps, in milliseconds: 300 s, below the
 /// suite's 600 s [`HANG_GUARD`], so a hung git step is ended and said by the box before the suite gives up on it.
 const SUITE_GIT_LONG_MS: &str = "300000";
-/// The armed bound of a case whose client goes while the step parks: long enough that the box has time to see the
-/// client gone before the bound fires.
-const GONE_ARMED_LIMIT_MS: u64 = 20_000;
 
 /// The preflight's first git step, the bare repository's `init`, never answers: it is ended with its tree at the bound
 /// `--test-box-git-limit` sets for it, armed by the pid file the stub's child writes, and the preflight fails with
@@ -2592,18 +2590,24 @@ fn run_box_parked(case: &Case, payload: &Value, path: &OsString, seams: &[&str])
 }
 
 /// `gate box run` of `payload` with `PATH` set to `path`, `seams` before the verb and a heartbeat every 200 ms: once
-/// the stub's parked step wrote its child's pid to `parked`, the client closes the box's stderr and, given `armed_by`,
-/// the case makes that file, so the step's bound, armed by it, can only start once the client has gone; the box is
-/// then waited for, failing once [`PARKED_GIT_GUARD`] has passed. Its outcome and the parked child's pid.
+/// the stub's parked step wrote its child's pid to `parked`, the client closes the box's stderr and, given `gone`, the
+/// box is given `--test-box-gone-reached` for that file, so the step's bound, armed by it, can only start once the box
+/// has seen the client gone; the box is then waited for, failing once [`PARKED_GIT_GUARD`] has passed. Its outcome and
+/// the parked child's pid.
 fn run_box_gone_while_parked(
     case: &Case,
     payload: &Value,
     path: &OsString,
     (seams, parked): (&[&str], &Path),
-    armed_by: Option<&Path>,
+    gone: Option<&Path>,
 ) -> (Outcome, u32) {
     let mut words = vec!["box", "--test-heartbeat-ms", "200"];
     words.extend_from_slice(seams);
+    let gone_word = gone.map(shown);
+    if let Some(gone_word) = &gone_word {
+        words.push("--test-box-gone-reached");
+        words.push(gone_word.as_str());
+    }
     words.push("run");
     let mut call = bare_box_call(case, &words, &self::payload(payload));
     call.env("PATH", path);
@@ -2611,9 +2615,6 @@ fn run_box_gone_while_parked(
     let stub = case.folder().join("stub");
     let pid = parked_pid(&running, &stub, parked);
     stderr.close();
-    if let Some(armed_by) = armed_by {
-        fs::write(armed_by, "").expect("the arm file can be made");
-    }
     (ended_within(running, PARKED_GIT_GUARD), pid)
 }
 
@@ -2882,19 +2883,19 @@ fn box_run_says_the_leftover_lfs_check_could_not_run_at_its_bound_after_the_comm
 }
 
 /// A write of the shared bare repository runs on past a gone client to its bound, which ends it with its tree; the run
-/// then exits 255 as a lost connection does, not 1 as for a step its bound alone ended. The bound is armed by a file
-/// the case makes once the client has gone, so it can only fire after it.
+/// then exits 255 as a lost connection does, not 1 as for a step its bound alone ended. The bound is armed by the file
+/// the box makes once it has seen the client gone, so it can only fire after that, whatever the load.
 #[test]
 fn box_run_exits_255_when_a_bare_write_s_bound_ends_it_after_the_client_went() {
     let case = Case::new("box_run_bare_bound_gone");
     let parked = case.folder().join("parked");
-    let armed = case.folder().join("armed");
+    let gone = case.folder().join("gone");
     let (payload, path) = run_with_git_doing(&case, &[("update-ref", Does::Park(&parked))]);
-    let limit = format!("back ref reset:{GONE_ARMED_LIMIT_MS}");
-    let armed_word = shown(&armed);
-    let seams = ["--test-box-git-limit", limit.as_str(), "--test-box-git-armed-by", armed_word.as_str()];
+    let limit = format!("back ref reset:{ARMED_LIMIT_MS}");
+    let gone_word = shown(&gone);
+    let seams = ["--test-box-git-limit", limit.as_str(), "--test-box-git-armed-by", gone_word.as_str()];
 
-    let (outcome, pid) = run_box_gone_while_parked(&case, &payload, &path, (&seams, &parked), Some(&armed));
+    let (outcome, pid) = run_box_gone_while_parked(&case, &payload, &path, (&seams, &parked), Some(&gone));
 
     assert_gone_before_the_command(&outcome);
     wait_until_gone(pid);
@@ -2902,21 +2903,22 @@ fn box_run_exits_255_when_a_bare_write_s_bound_ends_it_after_the_client_went() {
 
 /// A pair run whose second push the bound ends after the client went still deletes every back ref it pushed: the
 /// undo's `update-ref -d`, writes of the shared bare repository, start though the client is gone, and the run exits 255.
-/// The bound is armed by a file the case makes once the client has gone, so it can only fire after it.
+/// The bound is armed by the file the box makes once it has seen the client gone, so it can only fire after that,
+/// whatever the load.
 #[test]
 fn box_run_undoes_its_pushes_when_the_client_went_during_a_failed_push() {
     let case = Case::new("box_run_undo_after_gone");
     let payload = changing_two_of_three(&case);
     let stub = case.folder().join("stub");
     let parked = case.folder().join("parked");
-    let armed = case.folder().join("armed");
+    let gone = case.folder().join("gone");
     stub_git_doing(&stub, &[("push", Does::ParkSecond(&parked))]);
     let path = path_for_run(&[stub]);
-    let limit = format!("push lib:{GONE_ARMED_LIMIT_MS}");
-    let armed_word = shown(&armed);
-    let seams = ["--test-box-git-limit", limit.as_str(), "--test-box-git-armed-by", armed_word.as_str()];
+    let limit = format!("push lib:{ARMED_LIMIT_MS}");
+    let gone_word = shown(&gone);
+    let seams = ["--test-box-git-limit", limit.as_str(), "--test-box-git-armed-by", gone_word.as_str()];
 
-    let (outcome, pid) = run_box_gone_while_parked(&case, &payload, &path, (&seams, &parked), Some(&armed));
+    let (outcome, pid) = run_box_gone_while_parked(&case, &payload, &path, (&seams, &parked), Some(&gone));
 
     assert_eq!(outcome.code, Some(255), "a closed connection exits 255: {outcome:?}");
     let back = format!("refs/gate-back/{PAIR_KEY}");

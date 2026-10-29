@@ -12,7 +12,7 @@
 
 use std::io::{self, Write};
 use std::os::windows::io::{AsRawHandle, RawHandle};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -121,10 +121,22 @@ fn reader_gone(error: &io::Error) -> bool {
         .is_some_and(|code| READER_GONE.contains(&code))
 }
 
+/// Sets the run's gone flag, once: the first set makes the file `--test-box-gone-reached` names, when the box was given
+/// that seam, so a case can arm a bound on the moment the box saw its client gone. A file that cannot be made says
+/// nothing and changes nothing: the seam is a test aid, and the case that gave it ends on its own guard.
+pub(crate) fn mark_gone(gone: &ClientGone) {
+    if gone.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Some(path) = crate::boxside::preflight::gone_reached() {
+        let _ = std::fs::write(path, "");
+    }
+}
+
 /// Sets `gone` when `error` says the stream's reader has gone ([`reader_gone`]); any other failure leaves it alone.
-fn mark_if_gone(gone: &AtomicBool, error: &io::Error) {
+fn mark_if_gone(gone: &ClientGone, error: &io::Error) {
     if reader_gone(error) {
-        gone.store(true, Ordering::SeqCst);
+        mark_gone(gone);
     }
 }
 

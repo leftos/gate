@@ -467,7 +467,7 @@ impl Forwarder {
         // Stamped by the sink under the lock, so the stamps of the lines it writes never decrease down its stream.
         if self.sink.line(self.stamp, &read).is_err() {
             self.write_failed = true;
-            self.client_gone.store(true, Ordering::SeqCst);
+            crate::boxside::heartbeat::mark_gone(&self.client_gone);
         }
     }
 

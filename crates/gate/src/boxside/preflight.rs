@@ -1168,14 +1168,20 @@ static GIT_LIMIT_SEAM: OnceLock<(String, Duration)> = OnceLock::new();
 /// starts the bound of the step the limit names, that step having none until then.
 static GIT_ARMED_BY: OnceLock<PathBuf> = OnceLock::new();
 
+/// `--test-box-gone-reached <path>`, set once before the box's verb runs ([`set_git_limit`]): the file
+/// [`crate::boxside::heartbeat::mark_gone`] makes the first time the run sees its client gone, so a case can arm a bound
+/// on that moment rather than on a margin for it.
+static GONE_REACHED_SEAM: OnceLock<PathBuf> = OnceLock::new();
+
 /// `--test-box-git-long-ms <ms>`, set once before the box's verb runs ([`set_git_limit`]): the bound every long git
 /// step takes in place of [`GIT_LONG_LIMIT`], unless `--test-box-git-limit` names that step.
 static GIT_LONG_SEAM: OnceLock<Duration> = OnceLock::new();
 
 /// Makes `--test-box-git-limit`, when `seams` gives it, the bound of the git step it names in place of
 /// [`GIT_SHORT_LIMIT`] or [`GIT_LONG_LIMIT`], every other step keeping its own, and `--test-box-git-armed-by` the file
-/// that step's bound waits for before it starts counting, and `--test-box-git-long-ms` the bound of every other long
-/// step in place of [`GIT_LONG_LIMIT`]; called once, before the box's verb runs.
+/// that step's bound waits for before it starts counting, `--test-box-git-long-ms` the bound of every other long
+/// step in place of [`GIT_LONG_LIMIT`], and `--test-box-gone-reached` the file the run makes once it has seen its client
+/// gone; called once, before the box's verb runs.
 pub(crate) fn set_git_limit(seams: &BoxSeams) {
     if let Some(ms) = seams.git_long_ms {
         GIT_LONG_SEAM.get_or_init(|| Duration::from_millis(ms));
@@ -1186,6 +1192,14 @@ pub(crate) fn set_git_limit(seams: &BoxSeams) {
     if let Some(path) = &seams.git_armed_by {
         GIT_ARMED_BY.get_or_init(|| path.clone());
     }
+    if let Some(path) = &seams.gone_reached {
+        GONE_REACHED_SEAM.get_or_init(|| path.clone());
+    }
+}
+
+/// The file `--test-box-gone-reached` names, which the run makes once; `None` without the seam.
+pub(crate) fn gone_reached() -> Option<&'static Path> {
+    GONE_REACHED_SEAM.get().map(PathBuf::as_path)
 }
 
 /// Which bound a box git step takes, and whether a gone client or a stop ends it.

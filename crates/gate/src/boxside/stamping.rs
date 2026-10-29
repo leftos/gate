@@ -175,7 +175,7 @@ fn spawn_writer(lock: OutputLock, stopped: Arc<AtomicBool>, gone: ClientGone, ev
             let mut stderr = io::stderr().lock();
             if stderr.write_all(line.as_bytes()).and_then(|()| stderr.flush()).is_err() {
                 failed = true;
-                gone.store(true, Ordering::SeqCst);
+                crate::boxside::heartbeat::mark_gone(&gone);
             }
         }
     })

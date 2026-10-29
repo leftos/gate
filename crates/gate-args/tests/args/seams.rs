@@ -1738,6 +1738,68 @@ fn box_seam_git_armed_by_needs_the_git_limit_it_arms() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+fn box_seam_gone_reached_names_the_file_the_box_makes_once_gone() {
+    use std::path::PathBuf;
+
+    use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
+
+    use crate::support::invocation;
+
+    let reached = |gone_reached: Option<&str>| {
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Run,
+            seams: BoxSeams {
+                gone_reached: gone_reached.map(PathBuf::from),
+                ..BoxSeams::default()
+            },
+            root: None,
+            keys: Vec::new(),
+            hold: None,
+        })
+    };
+    assert_eq!(
+        invocation(&["box", "--test-box-gone-reached", r"C:\case\gone", "run", "--stdin"]),
+        reached(Some(r"C:\case\gone"))
+    );
+    assert_eq!(
+        invocation(&["box", "--test-box-gone-reached=C:\\case\\gone", "run", "--stdin"]),
+        reached(Some(r"C:\case\gone")),
+        "the seam in its = spelling"
+    );
+    assert_eq!(invocation(&["box", "run", "--stdin"]), reached(None), "no seam given, none set");
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seam_gone_reached_refuses_a_missing_or_repeated_value() {
+    let rows: [(&[&str], &[&str]); 3] = [
+        (
+            &["box", "--test-box-gone-reached=", "run", "--stdin"],
+            &["gate: --test-box-gone-reached needs a value"],
+        ),
+        (
+            &["box", "--test-box-gone-reached", "--test-heartbeat-ms", "30", "run", "--stdin"],
+            &["gate: --test-box-gone-reached needs a value"],
+        ),
+        (
+            &["box", "--test-box-gone-reached", "a", "--test-box-gone-reached=b", "run", "--stdin"],
+            &["gate: --test-box-gone-reached is given twice"],
+        ),
+    ];
+    for (words, want) in rows {
+        assert_eq!(problems(words), want, "{words:?}");
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+#[test]
+fn box_seam_gone_reached_is_an_unknown_word_without_the_feature() {
+    assert_eq!(problems(&["box", "--test-box-gone-reached", "gone", "run", "--stdin"]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-box-gone-reached=gone", "run", "--stdin"]), [BOX_USAGE]);
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
 fn the_probe_limit_seam_is_refused_outside_gate_box() {
     assert_eq!(
         problems(&refs(&with(&RUN, &["--test-probe-limit-ms", "5", "--", "cmd"]))),
