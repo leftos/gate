@@ -1620,6 +1620,29 @@ pub fn adjusted_prefix(nonce: &str) -> String {
     format!("gate-remote-adjusted: {nonce} ")
 }
 
+/// The line the box says on stderr just before it checks out the snapshot of the run whose payload carries `nonce`:
+/// `gate-remote-checkout: <nonce> start`. The client reads it only before the start marker ([`started_line`]), so no
+/// command can forge it.
+#[must_use]
+pub fn checkout_start_line(nonce: &str) -> String {
+    format!("{}start", checkout_prefix(nonce))
+}
+
+/// The line the box says on stderr once its checkout of the run whose payload carries `nonce` succeeded, with the
+/// seconds it took to three decimals, as [`adjusted_line`] writes them: `gate-remote-checkout: <nonce> done <s.sss>`.
+/// A checkout that fails says none.
+#[must_use]
+pub fn checkout_done_line(nonce: &str, seconds: f64) -> String {
+    format!("{}done {seconds:.3}", checkout_prefix(nonce))
+}
+
+/// The prefix of the checkout lines ([`checkout_start_line`], [`checkout_done_line`]) of the run whose payload carries
+/// `nonce`, their word after it.
+#[must_use]
+pub fn checkout_prefix(nonce: &str) -> String {
+    format!("gate-remote-checkout: {nonce} ")
+}
+
 /// What a box says on standard error, before why, when its preflight refuses the builder's work root: the Windows box
 /// when an account other than SYSTEM, Administrators, `TrustedInstaller` and the box's user may write in the root, or in
 /// a folder above it, or anyone else may empty, remove, re-permission or take one; the Unix box when the root is not the
@@ -1982,8 +2005,8 @@ mod tests {
         use serde_json::{Value, json};
 
         use crate::{
-            BoxKill, DrainAction, IDENTITY_NAMES, PathForm, Payload, Refusal, adjusted_line, adjusted_prefix, busy_line, killed_line, layout_line,
-            refused_line, started_line, tools_line,
+            BoxKill, DrainAction, IDENTITY_NAMES, PathForm, Payload, Refusal, adjusted_line, adjusted_prefix, busy_line, checkout_done_line,
+            checkout_prefix, checkout_start_line, killed_line, layout_line, refused_line, started_line, tools_line,
         };
 
         const NONCE: &str = "0123456789abcdef0123456789abcdef";
@@ -2100,6 +2123,19 @@ mod tests {
                 "three decimals always"
             );
             assert!(adjusted_line(NONCE, 7.5).starts_with(&adjusted_prefix(NONCE)));
+        }
+
+        #[test]
+        fn the_checkout_lines_carry_the_nonce_and_three_decimal_seconds() {
+            assert_eq!(checkout_start_line(NONCE), format!("gate-remote-checkout: {NONCE} start"));
+            assert_eq!(checkout_done_line(NONCE, 12.3456), format!("gate-remote-checkout: {NONCE} done 12.346"));
+            assert_eq!(
+                checkout_done_line(NONCE, 0.0),
+                format!("gate-remote-checkout: {NONCE} done 0.000"),
+                "three decimals always"
+            );
+            assert_eq!(checkout_prefix(NONCE), format!("gate-remote-checkout: {NONCE} "));
+            assert!(checkout_done_line(NONCE, 7.5).starts_with(&checkout_prefix(NONCE)));
         }
 
         #[test]

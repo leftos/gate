@@ -33,7 +33,7 @@ use gate_win32::{
     Donor, EnvironmentBlock, Job, LaunchError, NamedEvent, PipedConsole, PipedLaunch, PipedSuspended, RestrictedToken, Running, Utf8Console,
 };
 use gate_wire::stamp::Tag;
-use gate_wire::{PairSibling, PathForm, Payload, bare_stem, ordinal_upper, trees};
+use gate_wire::{PairSibling, PathForm, Payload, bare_stem, checkout_done_line, checkout_start_line, ordinal_upper, trees};
 
 use crate::answer::USAGE_STATUS;
 use crate::boxside::boot;
@@ -1418,6 +1418,13 @@ enum Of {
     WarmUp,
 }
 
+/// Why the run of `request` is refused `lfs` before its checkout begins, so before the checkout's start line: a sibling
+/// pair's run that carries an `LfsDigest`, as no pair takes LFS content. `None` for any other run.
+fn pair_lfs_refusal(request: &Request<'_>) -> Option<&'static str> {
+    (!request.siblings.is_empty() && request.lfs_digest.is_some())
+        .then_some("a sibling pair's run carries an LfsDigest, and no pair takes LFS content")
+}
+
 /// The run up to its command: the snapshot laid out and checked out, the subfolder found, the repo's dotnet tools
 /// restored and, for a pnpm, bun or npm command, its packages installed ([`packages::update`]); else `Err` with the status the
 /// run ends on, its lines said. A refusal is said as such; any other end is followed, on a pair run, by the box's
@@ -1432,8 +1439,16 @@ fn ready(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Bea
     };
     inputs_matched(request, &held, beat, console)?;
     sent_matched(request, &held, beat, console)?;
+    if let Some(why) = pair_lfs_refusal(request) {
+        return Err(lfs_refused(request, &lfs::not_the_snapshots(request.key, why), beat, console));
+    }
+    beat.say_protocol(console, &checkout_start_line(request.nonce));
+    let checking_out = Instant::now();
     let lfs = match git.checkout(request, console) {
-        Ok(lfs) => lfs,
+        Ok(lfs) => {
+            beat.say_protocol(console, &checkout_done_line(request.nonce, checking_out.elapsed().as_secs_f64()));
+            lfs
+        }
         Err(NotCheckedOut::Failed(failed)) => return Err(ended_before(said(console, &failed), request, beat, console)),
         Err(NotCheckedOut::Refused(why)) => return Err(lfs_refused(request, &lfs::not_the_snapshots(request.key, &why), beat, console)),
         Err(NotCheckedOut::NoScratch(why)) => return Err(lfs_refused(request, &lfs::no_scratch_line(&why), beat, console)),
@@ -3285,14 +3300,8 @@ impl WorkGit {
     /// Each repo's snapshot, fetched from its bare repository at `refs/gate/<key>` ([`WorkGit::fetched`]) and checked
     /// out, one repo after another, the main one first ([`WorkGit::checked_out_repo`]); between the main repo's fetch
     /// and its checkout, the run's LFS state is readied ([`WorkGit::run_lfs`]) and given back held, let go on a
-    /// failure. A pair run whose payload carries an `LfsDigest` is refused `lfs` before any checkout, as no pair takes
-    /// LFS content.
+    /// failure. A pair run whose payload carries an `LfsDigest` was refused before ([`pair_lfs_refusal`]).
     fn checkout(&self, request: &Request<'_>, console: &mut Console) -> Result<RunLfs, NotCheckedOut> {
-        if !request.siblings.is_empty() && request.lfs_digest.is_some() {
-            return Err(NotCheckedOut::Refused(
-                "a sibling pair's run carries an LfsDigest, and no pair takes LFS content".to_owned(),
-            ));
-        }
         self.fetched(request, &request.main, console)?;
         let mut lfs = self.run_lfs(request, console)?;
         let ended = request.repos().enumerate().try_for_each(|(at, repo)| {

@@ -895,6 +895,26 @@ fn a_preflight_reports_a_pair_s_first_run_as_cold() {
     assert!(!said_cold(&after), "the run recorded the pair's layout: {after:?}");
 }
 
+/// A pair run carrying an `LfsDigest` is refused `lfs` before its checkout begins, as no pair takes LFS content, so it
+/// says no checkout line.
+#[test]
+fn box_pair_run_refused_for_its_lfs_digest_says_no_checkout_line() {
+    let case = Case::new("box_pair_lfs_no_checkout");
+    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "out", "ran"]);
+    pair_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[("lib", &[("b.txt", "b\n")])]);
+    payload["LfsDigest"] = json!("0".repeat(64));
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    assert_eq!(
+        lines(&outcome.stderr).first().copied(),
+        Some(refused_line(&payload, "lfs").as_str()),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("gate-remote-checkout:"), "no checkout line: {outcome:?}");
+}
+
 #[test]
 fn a_pair_whose_layout_record_names_another_layout_gets_the_cold_raise() {
     let case = Case::new("preflight_pair_relaid_cold");
@@ -3114,6 +3134,32 @@ fn started_line(payload: &Value) -> String {
     format!("gate-remote-started: {}", field(payload, "Nonce"))
 }
 
+/// `stderr` of the run of `payload` past the box's two checkout lines it starts with: its start line, then its done
+/// line, whose seconds are a finite number of at least 0.
+fn after_checkout<'s>(payload: &Value, stderr: &'s str) -> &'s str {
+    let nonce = field(payload, "Nonce");
+    let start = format!("gate-remote-checkout: {nonce} start\n");
+    let done = format!("gate-remote-checkout: {nonce} done ");
+    let lines = stderr
+        .strip_prefix(start.as_str())
+        .and_then(|rest| rest.strip_prefix(done.as_str()))
+        .and_then(|rest| rest.split_once('\n'));
+    assert!(
+        lines.is_some_and(|(seconds, _)| seconds.parse::<f64>().is_ok_and(|seconds| seconds.is_finite() && seconds >= 0.0)),
+        "the checkout's start and done lines come first: {stderr:?}"
+    );
+    lines.map_or("", |(_, rest)| rest)
+}
+
+/// `stderr` of the run of `payload` past the box's checkout start line it starts with, as a checkout that failed says
+/// it, with no done line after it.
+fn after_checkout_start<'s>(payload: &Value, stderr: &'s str) -> &'s str {
+    let start = format!("gate-remote-checkout: {} start\n", field(payload, "Nonce"));
+    let rest = stderr.strip_prefix(start.as_str());
+    assert!(rest.is_some(), "the checkout's start line comes first: {stderr:?}");
+    rest.unwrap_or_default()
+}
+
 /// The tag the box says for the run of `payload` just before its human refusal line, refused for `reason`.
 fn refused_line(payload: &Value, reason: &str) -> String {
     format!("gate-remote-refused: {} {reason}", field(payload, "Nonce"))
@@ -4452,7 +4498,7 @@ fn box_run_refuses_a_job_name_already_held() {
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
     assert_eq!(outcome.stdout, "");
     assert_eq!(
-        outcome.stderr,
+        after_checkout(&payload, &outcome.stderr),
         format!("gate: the job {} already exists; a run's job name must be new\n", field(&payload, "Job"))
     );
     assert!(!Path::new(field(&payload, "Work")).join("new.txt").exists(), "the command did not run");
@@ -4505,7 +4551,10 @@ fn box_run_refuses_a_subfolder_the_snapshot_lacks() {
 
     assert_eq!(outcome.code, Some(2), "{outcome:?}");
     assert_eq!(outcome.stdout, "");
-    assert_eq!(outcome.stderr, "gate: remote subfolder nope does not exist in the snapshot\n");
+    assert_eq!(
+        after_checkout(&payload, &outcome.stderr),
+        "gate: remote subfolder nope does not exist in the snapshot\n"
+    );
 }
 
 #[test]
@@ -4533,6 +4582,22 @@ fn box_run_checks_out_the_snapshot_keeping_ignored_files_and_removing_untracked_
     assert_eq!(fs::read_to_string(work.join("a.txt")).expect("a.txt is checked out"), "b\n");
     assert!(work.join("ignored.txt").exists(), "an ignored file survives");
     assert!(!work.join("untracked.txt").exists(), "an untracked file is removed");
+}
+
+#[test]
+fn box_run_says_the_checkout_start_and_done_lines_before_its_start_marker() {
+    let case = Case::new("box_run_checkout_lines");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "err", "ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        after_checkout(&payload, &outcome.stderr),
+        format!("{}\nran\n", started_line(&payload)),
+        "the start and done lines, in order, then the marker: {outcome:?}"
+    );
 }
 
 #[test]
@@ -4564,7 +4629,7 @@ fn box_run_forwards_each_stream_line_by_line_ending_each_line_lf() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stdout, "a1\na2\nb\nc\nd\n", "CR LF and a lone CR each end a line");
-    assert_eq!(outcome.stderr, format!("{}\ne1\ne2\n", started_line(&payload)));
+    assert_eq!(after_checkout(&payload, &outcome.stderr), format!("{}\ne1\ne2\n", started_line(&payload)));
 }
 
 #[test]
@@ -4896,7 +4961,7 @@ fn box_run_refuses_a_batch_word_cmd_would_expand() {
     assert_eq!(outcome.code, Some(2), "{outcome:?}");
     assert_eq!(outcome.stdout, "");
     assert_eq!(
-        outcome.stderr,
+        after_checkout(&payload, &outcome.stderr),
         "gate: a .cmd or .bat command cannot take a word holding a line break or a %NAME% cmd.exe would expand: %PATH%\n"
     );
     assert!(!Path::new(field(&payload, "Work")).join("new.txt").exists(), "the command did not run");
@@ -4913,7 +4978,7 @@ fn box_run_an_unknown_program_exits_127() {
     assert_eq!(outcome.code, Some(127), "{outcome:?}");
     assert_eq!(outcome.stdout, "");
     assert_eq!(
-        outcome.stderr,
+        after_checkout(&payload, &outcome.stderr),
         format!("gate: could not start gate-suite-no-such-program: {}\n", gate_win32::win32_message(2))
     );
 }
@@ -4960,7 +5025,7 @@ fn box_run_gives_the_command_a_utf8_console() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stdout, "Active code page: 65001\n", "{outcome:?}");
     assert_eq!(
-        outcome.stderr,
+        after_checkout(&payload, &outcome.stderr),
         format!("{}\n", started_line(&payload)),
         "the marker, no fallback: {outcome:?}"
     );
@@ -4971,7 +5036,11 @@ fn box_run_gives_the_command_a_utf8_console() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.raw_stdout, "é€\n".as_bytes(), "non-ASCII bytes arrive intact: {outcome:?}");
-    assert_eq!(outcome.stderr, format!("{}\n", started_line(&bytes)), "{outcome:?}");
+    assert_eq!(
+        after_checkout(&bytes, &outcome.stderr),
+        format!("{}\n", started_line(&bytes)),
+        "{outcome:?}"
+    );
 }
 
 /// The lines `fake-tool token` prints when `gate box run` starts it, in a case of its own named `name`: the run passes
@@ -4985,7 +5054,7 @@ fn the_commands_token(name: &str) -> Vec<String> {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(
-        outcome.stderr,
+        after_checkout(&payload, &outcome.stderr),
         format!("{}\n", started_line(&payload)),
         "the marker, no line saying the command keeps the box's token: {outcome:?}"
     );
@@ -5026,7 +5095,7 @@ fn box_run_falls_back_to_its_own_token_when_the_restricted_start_is_refused() {
         gate_win32::win32_message(5)
     );
     assert_eq!(
-        outcome.stderr,
+        after_checkout(&payload, &outcome.stderr),
         format!("{}\n{fallback}\n", started_line(&payload)),
         "the marker, then the line saying the command keeps the box's token: {outcome:?}"
     );
@@ -5174,7 +5243,7 @@ fn box_run_falls_back_before_the_start_and_runs_the_command() {
 
     assert_eq!(outcome.code, Some(0), "the fallback never fails the run: {outcome:?}");
     assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
-    let said: Vec<&str> = outcome.stderr.lines().collect();
+    let said: Vec<&str> = after_checkout(&payload, &outcome.stderr).lines().collect();
     let marker = started_line(&payload);
     assert!(
         matches!(said[..], [first, line] if first == marker && is_console_fallback(line)),
@@ -5598,8 +5667,9 @@ fn box_run_says_a_snapshot_missing_after_the_fetch() {
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
     assert_eq!(outcome.stdout, "");
     assert_eq!(
-        outcome.stderr,
-        format!("gate: remote snapshot {absent} is not in the work folder's repository after the fetch\n")
+        after_checkout_start(&payload, &outcome.stderr),
+        format!("gate: remote snapshot {absent} is not in the work folder's repository after the fetch\n"),
+        "a checkout that fails says no done line"
     );
     assert_eq!(git(&["-C", field(&payload, "Work"), "rev-parse", "HEAD"]), head, "HEAD stands");
     assert!(work.join("untracked.txt").exists(), "the untracked file stands");
@@ -6313,7 +6383,7 @@ fn box_pair_run_that_ends_before_its_command_says_its_back_commits_failed() {
 
     assert_eq!(outcome.code, Some(2), "{outcome:?}");
     assert_eq!(
-        outcome.stderr,
+        after_checkout(&payload, &outcome.stderr),
         format!("gate: remote subfolder nope does not exist in the snapshot\n{BACK_COMMITS_FAILED}\n"),
         "{outcome:?}"
     );
@@ -6548,20 +6618,30 @@ fn box_run_echoes_a_subfolder_with_control_characters_escaped() {
     let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
     snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
     // One subfolder climbs out of the work folder and one is merely missing in the snapshot, so both refusal lines
-    // that show the subfolder are checked; each holds ESC and CR/LF.
+    // that show the subfolder are checked; each holds ESC and CR/LF. The missing one is refused after the checkout.
     let subs = [
-        ("..\\escape\u{1b}\r\n", r"..\escape\u{1b}\r\n", "is not a folder inside the work folder"),
-        ("missing\u{1b}\r\n", r"missing\u{1b}\r\n", "does not exist in the snapshot"),
+        (
+            "..\\escape\u{1b}\r\n",
+            r"..\escape\u{1b}\r\n",
+            "is not a folder inside the work folder",
+            false,
+        ),
+        ("missing\u{1b}\r\n", r"missing\u{1b}\r\n", "does not exist in the snapshot", true),
     ];
-    for (sub, shown, refusal) in subs {
+    for (sub, shown, refusal, checked_out) in subs {
         payload["Subfolder"] = json!(sub);
 
         let outcome = run_box(&case, &payload);
 
         assert_eq!(outcome.code, Some(2), "{sub:?}: {outcome:?}");
         assert_eq!(outcome.stdout, "", "{sub:?}");
+        let said = if checked_out {
+            after_checkout(&payload, &outcome.stderr)
+        } else {
+            outcome.stderr.as_str()
+        };
         assert_eq!(
-            outcome.stderr,
+            said,
             format!("gate: remote subfolder {shown} {refusal}\n"),
             "{sub:?}: the refusal shows the subfolder with its control characters escaped"
         );
@@ -6611,10 +6691,11 @@ fn box_run_echoes_a_command_word_with_control_characters_escaped() {
         assert_eq!(outcome.code, Some(127), "{word:?}: {outcome:?}");
         assert_eq!(outcome.stdout, "", "{word:?}");
         let marker = format!("{}\n", started_line(&payload));
+        let said = after_checkout(&payload, &outcome.stderr);
         let said = if marked {
-            outcome.stderr.strip_prefix(&marker).expect("the marker comes first")
+            said.strip_prefix(&marker).expect("the marker comes first")
         } else {
-            outcome.stderr.as_str()
+            said
         };
         let line = said.strip_suffix('\n').expect("the refusal is one line");
         let prefix = format!("gate: could not start {shown}{shown_resolved}: ");
@@ -6979,7 +7060,7 @@ fn box_run_without_dotnet_refuses_the_run_with_75() {
     // The win32 error `ERROR_FILE_NOT_FOUND`, as `locate` reports a word it does not find.
     let cannot_start = format!("gate: remote could not start the dotnet tool restore: {}", gate_win32::win32_message(2));
     assert_eq!(
-        lines(&outcome.stderr),
+        lines(after_checkout(&payload, &outcome.stderr)),
         [
             cannot_start.as_str(),
             "gate: remote tool restore failed (status 1)",
@@ -7574,7 +7655,7 @@ fn box_run_refuses_tools_when_pnpm_cannot_start() {
     // The win32 error `ERROR_FILE_NOT_FOUND`, as `locate` reports a word it does not find.
     let cannot_start = format!("gate: remote could not start the pnpm install: {}", gate_win32::win32_message(2));
     assert_eq!(
-        lines(&outcome.stderr),
+        lines(after_checkout(&payload, &outcome.stderr)),
         [
             cannot_start.as_str(),
             "gate: remote package restore failed (status 1)",
@@ -9188,7 +9269,7 @@ fn a_payload_with_no_timeout_gives_the_command_no_ceiling_on_the_box() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(
-        outcome.stderr,
+        after_checkout(&payload, &outcome.stderr),
         format!("{}\n", started_line(&payload)),
         "no kill and no adjusted line: {outcome:?}"
     );

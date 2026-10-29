@@ -45,7 +45,7 @@ use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
 use gate_router::{Config, DROPPED_NO_BUILD_LINE, SendPlan, build_settings, escaped, repo_name};
-use gate_wire::{PairRefused, Payload, SHA256_DIGITS, channel_prefix, is_cross_not_brought_back, is_lower_hex};
+use gate_wire::{PairRefused, Payload, SHA256_DIGITS, channel_prefix, checkout_prefix, is_cross_not_brought_back, is_lower_hex};
 
 use super::channel;
 use super::drain::{self, Drain, DrainLine};
@@ -3596,7 +3596,7 @@ impl Attempt<'_, '_> {
             echo,
             capped: echo != Echo::Console,
             lines: match (starts.nonce.as_deref(), starts.tag_nonce.as_deref()) {
-                (Some(nonce), _) => Some(Arc::new(ProtocolLines::new(nonce))),
+                (Some(nonce), _) => Some(Arc::new(ProtocolLines::new(nonce, self.call.host()))),
                 (None, Some(nonce)) => Some(Arc::new(ProtocolLines::tags(nonce))),
                 (None, None) => None,
             },
@@ -4988,6 +4988,15 @@ impl Reading {
     fn protocol(&self, line: &str, error: bool) -> Option<Protocol> {
         self.lines.as_deref().filter(|_| error).and_then(|lines| lines.of(line))
     }
+
+    /// The PC's line for the box's checkout line of the run call that `line` is, of standard error when `error`
+    /// ([`CheckoutSaid::said`]); `None` for a line of standard output, any line of a call that is no run call, a
+    /// checkout line once `progress` has the run started, as no command can have said one before then, and any other
+    /// line.
+    fn checkout(&self, line: &str, error: bool, progress: &Progress) -> Option<String> {
+        let checkout = self.lines.as_deref().filter(|_| error)?.checkout.as_ref()?;
+        checkout.said(line).filter(|_| progress.started_at().is_none())
+    }
 }
 
 /// One stream's reader: standard error when `error`; how it takes the lines; its own handle to the log, `None` when
@@ -5061,7 +5070,7 @@ impl Reader {
     /// Whether this reader marks the call's progress per line rather than per chunk read: a run call's does. A setup
     /// call's git progress ends its updates with a carriage return and no line feed, so its chunks mark it.
     fn marks_lines(&self) -> bool {
-        self.reading.lines.as_deref().is_some_and(|lines| lines.run_call)
+        self.reading.lines.as_deref().is_some_and(ProtocolLines::run_call)
     }
 
     /// The box's place or barrier line `line` is, of standard error, once the call's drain tag was heard and before
@@ -5126,6 +5135,13 @@ impl Reader {
         }
         let line = line_of(bytes, self.reading.echo);
         // Matched before any unstamping, so a command's own line, stamped by the box, never reads as one.
+        // The box's checkout line is hidden, and the PC's line for it passed on and kept as any line of the run's is.
+        if let Some(said) = self.reading.checkout(&line, self.error, &shared.progress) {
+            self.mark_line(shared);
+            self.passed(&logged_line(&said, None), Some(&said), true, shared);
+            held(&shared.heard).record(&said, self.error, None);
+            return true;
+        }
         let protocol = self.reading.protocol(&line, self.error).or_else(|| self.drain_line(&line, shared));
         if protocol == Some(Protocol::Started) {
             shared.progress.mark_started();
@@ -5911,13 +5927,34 @@ enum Protocol {
     ChannelRefused,
 }
 
+/// What the run call's readers say the PC's checkout lines with: the prefix of the box's checkout lines of the run, and
+/// the builder's name the PC's lines give.
+struct CheckoutSaid {
+    prefix: String,
+    builder: String,
+}
+
+impl CheckoutSaid {
+    /// The PC's line for the box's checkout line of the run that `line` is, compared as a whole line, naming the
+    /// builder: `gate: checking out on {builder}` for its start line ([`gate_wire::checkout_start_line`]), `gate: checked
+    /// out on {builder} in {s.s} s` for its done line ([`gate_wire::checkout_done_line`]), whose seconds are read as
+    /// [`adjusted_seconds`] reads them; `None` for any other line, a malformed one or another run's included.
+    fn said(&self, line: &str) -> Option<String> {
+        let said = line.strip_prefix(self.prefix.as_str())?;
+        if said == "start" {
+            return Some(format!("gate: checking out on {}", self.builder));
+        }
+        let seconds = said.strip_prefix("done ").and_then(adjusted_seconds)?;
+        Some(format!("gate: checked out on {} in {seconds:.1} s", self.builder))
+    }
+}
+
 /// What starts the box's line saying what it sent over a data channel ([`gate_wire::channel_sent_line`]).
 const CHANNEL_SENT: &str = "gate: data channel sent ";
 
 /// The start marker, the eleven refusal tags, the two kill tags and the adjusted line's prefix of one call, made once for
-/// its readers, and whether the call is the run call, whose readers mark its progress per line.
+/// its readers, and the run call's checkout lines.
 struct ProtocolLines {
-    run_call: bool,
     drain: String,
     started: String,
     busy: String,
@@ -5934,13 +5971,18 @@ struct ProtocolLines {
     adjusted: String,
     channel: String,
     channel_refused: String,
+    /// The run call's checkout lines and how its readers say the PC's for them; `None` for every other call.
+    checkout: Option<CheckoutSaid>,
 }
 
 impl ProtocolLines {
-    /// The lines of the run call whose nonce is `nonce`.
-    fn new(nonce: &str) -> ProtocolLines {
+    /// The lines of the run call whose nonce is `nonce`, on the builder named `builder`.
+    fn new(nonce: &str, builder: &str) -> ProtocolLines {
         ProtocolLines {
-            run_call: true,
+            checkout: Some(CheckoutSaid {
+                prefix: checkout_prefix(nonce),
+                builder: builder.to_owned(),
+            }),
             ..ProtocolLines::tags(nonce)
         }
     }
@@ -5948,7 +5990,6 @@ impl ProtocolLines {
     /// The lines of the preflight, inputs or LFS call whose nonce is `nonce`, which is no run call.
     fn tags(nonce: &str) -> ProtocolLines {
         ProtocolLines {
-            run_call: false,
             drain: refused_line(nonce, Refusal::Drain),
             started: started_line(nonce),
             busy: refused_line(nonce, Refusal::Busy),
@@ -5965,7 +6006,14 @@ impl ProtocolLines {
             adjusted: adjusted_prefix(nonce),
             channel: channel_prefix(nonce),
             channel_refused: refused_line(nonce, Refusal::Channel),
+            checkout: None,
         }
+    }
+
+    /// Whether these are the run call's lines, whose readers mark its progress per line: only the run call's have
+    /// checkout lines.
+    fn run_call(&self) -> bool {
+        self.checkout.is_some()
     }
 
     /// The port of the box's data channel line for this call that `line` is, compared as a whole line; `None` for any
@@ -6083,8 +6131,8 @@ mod tests {
     use crate::run::CONTROL_C_EXIT;
     use gate_router::{BuilderOs, escaped};
     use gate_state::v1::{self, WarmFailure};
-    use gate_wire::build_version;
     use gate_wire::slots::{BoxSlots, Claim, HoldClaim, Holder};
+    use gate_wire::{build_version, checkout_done_line, checkout_prefix, checkout_start_line};
     use jiff::Timestamp;
 
     /// A state root no gate uses; no test here takes its key's lock.
@@ -8193,7 +8241,7 @@ mod tests {
         let reading = Reading {
             echo: Echo::LogOnly,
             capped: false,
-            lines: Some(std::sync::Arc::new(ProtocolLines::new(NONCE))),
+            lines: Some(std::sync::Arc::new(ProtocolLines::new(NONCE, CHECKOUT_BUILDER))),
             log_cap: LOG_CAP,
         };
         let file = std::fs::File::create(&log).expect("the log can be made");
@@ -8205,6 +8253,54 @@ mod tests {
         let said = crate::remote::log_texts(&log);
         std::fs::remove_file(&log).expect("the log can be removed");
         (called, said)
+    }
+
+    /// The builder name the run call [`run_call_said`] reads gives the PC's checkout lines.
+    const CHECKOUT_BUILDER: &str = "box";
+
+    #[test]
+    fn a_checkout_line_after_the_start_marker_or_of_another_nonce_is_an_ordinary_line() {
+        let start = checkout_start_line(NONCE);
+        let done = checkout_done_line(NONCE, 1.234);
+        let marker = started_line(NONCE);
+
+        let (read, said) = run_call_said("", &format!("{start}\n{done}\n{marker}\n"), "checkout-read");
+        let pc_lines = [
+            format!("gate: checking out on {CHECKOUT_BUILDER}"),
+            format!("gate: checked out on {CHECKOUT_BUILDER} in 1.2 s"),
+        ];
+        assert_eq!(
+            said,
+            format!("{}\n", pc_lines.join("\n")),
+            "before the marker, the box's lines are hidden and the PC's said in their place"
+        );
+        assert_eq!(
+            read.lines, pc_lines,
+            "and the PC's kept as the run's lines, so a run here after a fallback says them"
+        );
+
+        let prefix = checkout_prefix(NONCE);
+        let ordinary = [
+            ("checkout-after-marker", start.clone(), true),
+            ("checkout-done-after-marker", done.clone(), true),
+            ("checkout-other-nonce", checkout_start_line("fedcba9876543210fedcba9876543210"), false),
+            ("checkout-done-no-seconds", format!("{prefix}done"), false),
+            ("checkout-done-negative", format!("{prefix}done -1.000"), false),
+            ("checkout-done-not-a-number", format!("{prefix}done NaN"), false),
+            ("checkout-done-extra-word", format!("{prefix}done 1.000 more"), false),
+            ("checkout-start-extra-word", format!("{prefix}start now"), false),
+            ("checkout-other-word", format!("{prefix}begin"), false),
+        ];
+        for (name, line, after_marker) in ordinary {
+            let stderr = if after_marker {
+                format!("{marker}\n{line}\n")
+            } else {
+                format!("{line}\n")
+            };
+            let (read, said) = run_call_said("", &stderr, name);
+            assert_eq!(said, format!("{line}\n"), "{name}: passed on as it came, and no PC line said");
+            assert_eq!(read.lines, std::slice::from_ref(&line), "{name}: kept as any line");
+        }
     }
 
     #[test]
@@ -10274,7 +10370,7 @@ mod tests {
             Reading {
                 echo: Echo::LogOnly,
                 capped: false,
-                lines: Some(Arc::new(ProtocolLines::new(NONCE))),
+                lines: Some(Arc::new(ProtocolLines::new(NONCE, super::CHECKOUT_BUILDER))),
                 log_cap: LOG_CAP,
             }
         }

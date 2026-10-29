@@ -19,8 +19,8 @@ use super::channel_pc::{
     BOX_PROOF, PC_PROOF, assert_no_proof, channel_line, free_port, listening, not_completed, pc_connected, proved, with_windows,
 };
 use super::{
-    Does, box_call, field, gate_box, git, has_ref, lines, pair_payload, pair_snapshot, passed, path_for_run, payload, refused_line, renamed, run_box,
-    run_box_with_env, run_box_with_path, snapshot, started_line, stub_git_doing,
+    Does, after_checkout, after_checkout_start, box_call, field, gate_box, git, has_ref, lines, pair_payload, pair_snapshot, passed, path_for_run,
+    payload, refused_line, renamed, run_box, run_box_with_env, run_box_with_path, snapshot, started_line, stub_git_doing,
 };
 use crate::support::{Case, FAKE_TOOL, Outcome, Running, box_payload, shown};
 
@@ -616,12 +616,12 @@ fn scratch_left(payload: &Value) -> Vec<String> {
     left
 }
 
-/// Asserts `outcome` is a run of `payload` refused `lfs` before its command: status 75, nothing on stdout, the tag line
-/// first; the line after it.
+/// Asserts `outcome` is a run of `payload` refused `lfs` during its checkout, before its command: status 75, nothing on
+/// stdout, the checkout's start line and then the tag line first; the line after it.
 fn assert_refused_run<'a>(payload: &Value, outcome: &'a Outcome, what: &str) -> &'a str {
     assert_eq!(outcome.code, Some(75), "{what}: {outcome:?}");
     assert_eq!(outcome.stdout, "", "{what}: the command never ran: {outcome:?}");
-    let said = lines(&outcome.stderr);
+    let said = lines(after_checkout_start(payload, &outcome.stderr));
     assert_eq!(said.first().copied(), Some(refused_line(payload, "lfs").as_str()), "{what}: {outcome:?}");
     said.get(1).copied().unwrap_or_default()
 }
@@ -922,7 +922,7 @@ fn a_run_with_pointers_whose_restricted_start_is_refused_fails_the_start() {
 
     assert_eq!(outcome.code, Some(127), "the start fails: {outcome:?}");
     assert_eq!(outcome.stdout, "", "the command never ran: {outcome:?}");
-    let said = lines(&outcome.stderr);
+    let said = lines(after_checkout(&digest, &outcome.stderr));
     assert_eq!(said.first().copied(), Some(started_line(&digest).as_str()), "{outcome:?}");
     assert_eq!(
         said.get(1).copied(),
@@ -1459,7 +1459,11 @@ fn a_run_with_no_pointers_runs_as_before() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
-    assert_eq!(outcome.stderr, format!("{}\n", started_line(&payload)), "only the marker: {outcome:?}");
+    assert_eq!(
+        after_checkout(&payload, &outcome.stderr),
+        format!("{}\n", started_line(&payload)),
+        "only the checkout's lines and the marker: {outcome:?}"
+    );
     assert!(!store(&payload).exists(), "no store is touched: {outcome:?}");
     assert!(scratch_left(&payload).is_empty(), "the scratch folder is removed: {outcome:?}");
 }

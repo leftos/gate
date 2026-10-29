@@ -10,14 +10,15 @@ use std::io::{self, BufRead};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use gate_args::BoxSeams;
 use gate_inputs::failure::Caps;
 use gate_inputs::manifest::{Listing, Manifest};
 use gate_wire::drain::refused_lines;
 use gate_wire::{
-    CROSS_STEP_START, CrossBuild, PairSibling, PathForm, Payload, Refusal, bare_stem, busy_line, escaped, layout_line, refused_line, trees,
+    CROSS_STEP_START, CrossBuild, PairSibling, PathForm, Payload, Refusal, bare_stem, busy_line, checkout_done_line, checkout_start_line, escaped,
+    layout_line, refused_line, trees,
 };
 
 use gate_watchdog::Pump;
@@ -1087,7 +1088,16 @@ fn locked<S: LineSink + 'static>(
     let git = run_git(request, lock, login_path.as_deref(), output);
     laid_out(&laying, &git, &fresh).map_err(|not| not_laid_out(output, request, not))?;
     inputs_matched(request, lock, output)?;
+    // A note for the client's checkout lines: the run goes on, and a client gone finds out at the next line.
+    let _ = output.say(Stream::Err, Stamp::Bare, &checkout_start_line(request.nonce));
+    let checking_out = Instant::now();
     checked_out(request, &git).map_err(|failed| Unready::Ended(failure(output, &failed)))?;
+    // A note as the start line is: the run goes on, and a client gone finds out at the next line.
+    let _ = output.say(
+        Stream::Err,
+        Stamp::Bare,
+        &checkout_done_line(request.nonce, checking_out.elapsed().as_secs_f64()),
+    );
     if !place.is_dir() {
         let line = format!("gate: remote subfolder {} does not exist in the snapshot", escaped(request.subfolder));
         return Err(Unready::Ended(said(output, &[&line], USAGE_STATUS)));
@@ -1733,7 +1743,9 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use gate_inputs::hash::sha256_of;
     use gate_inputs::manifest::Manifest;
-    use gate_wire::{PathForm, Payload, Refusal, busy_line, escaped, layout_line, refused_line, started_line, tools_line};
+    use gate_wire::{
+        PathForm, Payload, Refusal, busy_line, checkout_prefix, checkout_start_line, escaped, layout_line, refused_line, started_line, tools_line,
+    };
     use serde_json::{Value, json};
 
     use gate_watchdog::Pump;
@@ -2003,10 +2015,13 @@ mod tests {
             tmp_cleared(ready);
         }
         assert!(ready.as_ref().is_ok_and(|ready| ready.pump.is_none()), "{:?}", output.sink().said());
+        let said = stderr_of(&output);
         assert_eq!(
-            stderr_of(&output),
-            ["gate: remote heartbeat stopped: cannot start the heartbeat: no thread"]
+            said.first().map(String::as_str),
+            Some("gate: remote heartbeat stopped: cannot start the heartbeat: no thread"),
+            "{said:?}"
         );
+        assert_eq!(after_checkout(said.get(1..).unwrap_or_default()), Vec::<String>::new());
         assert_eq!(case.head(), commit, "the run went on to its checkout");
     }
 
@@ -2127,6 +2142,26 @@ mod tests {
         fn commanded(&self, snapshot: &str, command: &[&str]) -> Value {
             self.json(snapshot, &json!({"Command": command, "Identity": identity()}))
         }
+    }
+
+    #[test]
+    fn a_run_says_the_checkout_start_and_done_lines_before_its_start_marker() {
+        let case = Case::new("checkout-lines");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let (status, said) = whole_run(&case.commanded(&commit, &["/bin/sh", "-c", "true"]));
+        assert_eq!(status, 0, "{said:?}");
+        let err: Vec<String> = said
+            .iter()
+            .filter(|(stream, _)| *stream == Stream::Err)
+            .map(|(_, line)| line.clone())
+            .collect();
+        let start = checkout_start_line(NONCE);
+        let started = err.iter().position(|line| *line == start).expect("the checkout's start line is said");
+        let after = after_checkout(err.get(started..).unwrap_or_default());
+        assert!(
+            after.contains(&started_line(NONCE)),
+            "the start line, then the done line, then the start marker: {said:?}"
+        );
     }
 
     #[test]
@@ -2567,7 +2602,7 @@ mod tests {
         assert_eq!(tmpdir, format!("{name}/"));
         assert!(tmpdir.len() < 38, "the TMPDIR leaves room for .NET's pipes: {tmpdir}");
         assert!(!path.exists(), "the case removed it");
-        assert_eq!(stderr_of(&output), Vec::<String>::new());
+        assert_eq!(after_checkout(&stderr_of(&output)), Vec::<String>::new());
 
         let mut again = prepare(&payload, &output, quiet_periods(), own_path).expect("the run is ready again");
         let other = again.temp.as_ref().expect("the run made a temp folder").path().to_owned();
@@ -2649,6 +2684,7 @@ mod tests {
         test_template::set(c"/nonexistent-gate-box-unix-folder/gate.XXXXXXXX");
         let (status, said) = ran(&case.json(&commit, &json!({})));
         assert_eq!(status, REFUSED_STATUS, "{said:?}");
+        let said = after_checkout(&said);
         assert_eq!(said.len(), 2, "{said:?}");
         assert_eq!(said.first(), Some(&refused_line(NONCE, Refusal::Layout)), "{said:?}");
         assert!(
@@ -2731,6 +2767,31 @@ mod tests {
         lines.into_iter().map(|(_, line)| line).collect()
     }
 
+    /// `said`, stderr lines of a run of [`NONCE`] from its checkout on, past the box's two checkout lines they start with:
+    /// its start line, then its done line, whose seconds are a finite number of at least 0.
+    fn after_checkout(said: &[String]) -> &[String] {
+        let done = format!("{}done ", checkout_prefix(NONCE));
+        let finite = |line: &String| {
+            line.strip_prefix(done.as_str())
+                .and_then(|seconds| seconds.parse::<f64>().ok())
+                .is_some_and(|seconds| seconds.is_finite() && seconds >= 0.0)
+        };
+        let checked_out = matches!(said, [start, ended, ..] if *start == checkout_start_line(NONCE) && finite(ended));
+        assert!(checked_out, "the checkout's start and done lines come first: {said:?}");
+        said.get(2..).unwrap_or_default()
+    }
+
+    /// `said`, stderr lines of a run of [`NONCE`] whose checkout failed, past the box's checkout start line they start
+    /// with, which no done line follows.
+    fn after_checkout_start(said: &[String]) -> &[String] {
+        assert_eq!(
+            said.first(),
+            Some(&checkout_start_line(NONCE)),
+            "the checkout's start line comes first: {said:?}"
+        );
+        said.get(1..).unwrap_or_default()
+    }
+
     /// The layout refusal of `why`: its tag, then the layout line.
     fn layout_refusal(why: &str) -> [String; 2] {
         [refused_line(NONCE, Refusal::Layout), layout_line("repo", why)]
@@ -2756,7 +2817,7 @@ mod tests {
         assert!(config.contains("autocrlf = false") && config.contains("eol = lf"), "{config}");
         assert!(matches!(take_lock(Path::new(&case.lock())), Ok(Locked::Busy)), "the lock is held");
         assert!(
-            !stderr_of(&output).iter().any(|line| line.starts_with("gate")),
+            !after_checkout(&stderr_of(&output)).iter().any(|line| line.starts_with("gate")),
             "no gate line: {:?}",
             output.sink().said()
         );
@@ -2875,7 +2936,10 @@ mod tests {
         let (status, said) = ran(&case.json(&commit, &json!({ "Subfolder": "sub" })));
 
         assert_eq!(status, 2, "{said:?}");
-        assert_eq!(said, ["gate: remote subfolder sub is not a folder inside the work folder"]);
+        assert_eq!(
+            after_checkout(&said),
+            ["gate: remote subfolder sub is not a folder inside the work folder"]
+        );
     }
 
     #[test]
@@ -2957,7 +3021,7 @@ mod tests {
         let (status, said) = ran(&case.json(&commit, &json!({ "Subfolder": "nope" })));
 
         assert_eq!(status, 2);
-        assert_eq!(said, ["gate: remote subfolder nope does not exist in the snapshot"]);
+        assert_eq!(after_checkout(&said), ["gate: remote subfolder nope does not exist in the snapshot"]);
     }
 
     #[test]
@@ -2977,7 +3041,7 @@ mod tests {
         let (status, said) = ran(&case.json(&second, &json!({})));
 
         assert_eq!(status, 0, "{said:?}");
-        assert_eq!(said, Vec::<String>::new());
+        assert_eq!(after_checkout(&said), Vec::<String>::new());
         assert_eq!(case.head(), second);
         assert_eq!(fs::read_to_string(work.join("a.txt")).expect("a.txt is checked out"), "b\n");
         assert!(work.join("ignored.txt").exists(), "an ignored file survives");
@@ -3039,7 +3103,7 @@ mod tests {
 
         assert_eq!(status, 1);
         assert_eq!(
-            said,
+            after_checkout_start(&said),
             [format!(
                 "gate: remote snapshot {absent} is not in the work folder's repository after the fetch"
             )]
@@ -3824,7 +3888,12 @@ mod tests {
         let (status, said) = ran(&case.json(&commit, &json!({ "InputsDigest": DIGEST })));
 
         assert_eq!(status, 0, "{said:?}");
-        assert_eq!(said, [format!("gate: remote moved aside the folder {exclude} to {exclude}.gate-moved-1")]);
+        assert_eq!(
+            said.first(),
+            Some(&format!("gate: remote moved aside the folder {exclude} to {exclude}.gate-moved-1")),
+            "{said:?}"
+        );
+        assert_eq!(after_checkout(said.get(1..).unwrap_or_default()), Vec::<String>::new());
         assert_eq!(case.exclude_text().as_deref(), Some("/in.txt\n"));
     }
 

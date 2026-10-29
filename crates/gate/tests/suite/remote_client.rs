@@ -663,6 +663,72 @@ fn a_routed_run_runs_on_the_box_and_passes_its_output_and_status() {
     assert!(log.contains(&format!("gate: pushed snapshot {} in ", &snapshot[..8])), "{log}");
 }
 
+#[test]
+fn a_routed_run_says_the_box_s_checkout_and_its_duration() {
+    let case = client_case("client-checkout-lines");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
+    let log = log_texts(&case.folder().join("out.log"));
+    let lines: Vec<&str> = log.lines().collect();
+    let start = format!("gate: checking out on {HOST}");
+    let done = checked_out_pattern();
+    let checking = lines.iter().position(|line| *line == start);
+    let checked = lines.iter().position(|line| done.is_match(line));
+    let ran = lines.iter().position(|line| line.contains("ran there"));
+    assert!(
+        matches!((checking, checked, ran), (Some(checking), Some(checked), Some(ran)) if checking < checked && checked < ran),
+        "the start line, then the done line, both before the command's output: {log}"
+    );
+    assert!(
+        outcome.stderr.lines().any(|line| line == start) && outcome.stderr.lines().any(|line| done.is_match(line)),
+        "said on stderr too: {outcome:?}"
+    );
+    assert!(!log.contains("gate-remote-checkout:"), "the box's lines are hidden from the log: {log}");
+    assert!(!outcome.stderr.contains("gate-remote-checkout:"), "and from stderr: {outcome:?}");
+}
+
+/// The box checks out the snapshot, then its `dotnet` fails the restore of the snapshot's tool manifest, so it refuses
+/// the run `tools` after the checkout: the log of the run here still says the checkout, before the fallback line.
+#[test]
+fn a_run_refused_after_its_checkout_keeps_the_checkout_lines_in_the_log_of_its_run_here() {
+    let case = client_case("client-checkout-then-refused");
+    write(&case, ".config/dotnet-tools.json", "{\n  \"version\": 1\n}\n");
+    let stub = case.folder().join("ssh").join("stub");
+    fs::create_dir_all(&stub).expect("the stub's folder can be made");
+    fs::write(stub.join("dotnet.cmd"), "@exit /b 1\r\n").expect("the stub dotnet can be written");
+    let own_path = std::env::var_os("PATH").expect("PATH is set");
+    let path = std::env::join_paths(std::iter::once(stub).chain(std::env::split_paths(&own_path))).expect("the folders join into a PATH");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let mut gate = client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran"]);
+    gate.env("PATH", path);
+
+    let (pid, outcome) = finish_with_pid(gate);
+
+    assert_eq!(outcome.code, Some(0), "the run here passed: {outcome:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), ["tools"], "{outcome:?}");
+    let log = log_texts(&case.folder().join("out.log"));
+    let lines: Vec<&str> = log.lines().collect();
+    let start = format!("gate: checking out on {HOST}");
+    let done = checked_out_pattern();
+    let fallback = format!("gate: remote {HOST} tools; running here");
+    let checking = lines.iter().position(|line| *line == start);
+    let checked = lines.iter().position(|line| done.is_match(line));
+    let fell_back = lines.iter().position(|line| *line == fallback);
+    assert!(
+        matches!((checking, checked, fell_back), (Some(checking), Some(checked), Some(fell_back)) if checking < checked && checked < fell_back),
+        "the start line, then the done line, then the fallback line: {log}"
+    );
+}
+
+/// The PC's line saying the box checked out the snapshot on [`HOST`], with the seconds it took to one decimal.
+fn checked_out_pattern() -> Regex {
+    Regex::new(&format!(r"^gate: checked out on {} in [0-9]+\.[0-9] s$", regex::escape(HOST))).expect("the line's pattern")
+}
+
 /// A routed run whose builder has a slot count caches the builder's held slots its preflight said, its own session's
 /// among them, in `remote\host.box-slots` of its state root, stamped with the time the PC read them.
 #[test]

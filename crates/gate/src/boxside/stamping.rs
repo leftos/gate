@@ -73,7 +73,7 @@ pub(crate) fn out(console: &mut Console, line: &str) {
 }
 
 /// Says the protocol `line` on stderr exactly as it is, never stamped: a start marker, a refusal or kill tag, the
-/// adjusted line, the outputs line.
+/// adjusted line, the checkout's start and done lines, the outputs line.
 pub(crate) fn protocol(console: &mut Console, line: &str) {
     console.err(line);
 }

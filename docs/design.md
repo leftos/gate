@@ -946,6 +946,7 @@ The lines of a run that starts its command:
 - The expected-time line, on stderr and in the log, once a run that takes a slot has written its claim and woken the waiters and before the command's output: `gate: expected about <n> s (usual <n> s, p90 <n> s, <runs> runs)`, or in whole minutes from 90 s: `gate: expected about <n> min (usual <n> min, p90 <n> min, <runs> runs)`. A local light or heavy take says it, a critical gate after its holds line, a routed run at its remote take, and a fallback a second one at its local take.
 
   `about` is the mean wall time over the estimate's window (the last 30 passing runs or those within 14 days, whichever holds fewer), `usual` the median of the 5 newest, and every figure is rounded and floored at 1 s (or 1 min). An estimate from the family key ends `<runs> runs of similar commands)`. A key with fewer than 5 passing runs, a `--slot none` run, and a run a parent's slot covers or lends say nothing ([design/gate-durations.md](design/gate-durations.md), Estimate).
+- The checkout lines of a routed run, on stderr and in the log, said from the box's checkout lines ([Routing](#routing), the run call): `gate: checking out on {builder}` before the builder's checkout and `gate: checked out on {builder} in {s.s} s` after it succeeds. A builder too old to say its lines gives none. They are prose.
 - The ceiling lines, on stderr and in the log, right after the expected-time line (at each take, a lent take included): `gate: ceiling 42 min (3x this command's p99 of 14 min, above the given 15 min)` only when history raised an auto ceiling above its floor, then `gate: the ceiling 10 min is below this command's load-adjusted p90 of 14 min` when the resolved ceiling, given or auto, is below the estimate's adjusted p90.
 
   The ceiling is in load-adjusted seconds, so the hint compares it with the adjusted p90 alone: an estimate without one says no hint, however long its wall p90.
@@ -2829,13 +2830,17 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     `-o RequestTTY=no` leads the options of every `gate box` call and `gate push`'s, so stdin never passes through a pseudo-terminal. The last option, `-o Compression=yes`, is the run call's alone: the preflight, stop, boot and outputs calls, git's ssh command and `gate push` ask for none. The run call's compression covers both directions of its connection: the command's output and protocol lines one way, the request and the outputs manifest the other.
 
-    The box's output passes through to the log and the console, except the box's heartbeats and its machine lines, which the client hides from both and keeps out of the lines it holds: the start marker `gate-remote-started: <nonce>` and the refusal tag `gate-remote-refused: <nonce> busy|tools|layout|inputs|sent|lfs|desktop|install|drain|full`, each naming this run's `Nonce` and read on stderr only, as a whole line, and the kill tag and the adjusted line below.
+    The box's output passes through to the log and the console, except the box's heartbeats and its machine lines, which the client hides from both and keeps out of the lines it holds: the start marker `gate-remote-started: <nonce>` and the refusal tag `gate-remote-refused: <nonce> busy|tools|layout|inputs|sent|lfs|desktop|install|drain|full`, each naming this run's `Nonce` and read on stderr only, as a whole line, and the kill tag, the adjusted line and the checkout lines below.
 
     The client matches those protocol lines on the raw line, before any unstamping, so a command's own line, stamped by the box, never reads as one.
 
     Every other line is unstamped once before it is read: the log gets the line as it came, a line that came with no stamp (an older box's, a setup call's) stamped `gat` on arrival, and the console and the lines the client holds get its text alone. A process line is logged and nothing else: it is neither echoed nor held, and it never marks the call's progress, so the stall watch of a routed run sees only the box's other lines and its heartbeats. The client's own lines in the log are `gat`.
 
     The kill tag `gate-remote-killed: <nonce> timed-out|backstop` is said by the box just after its own kill line, and the client counts a box kill only on this run's tag with a status 124 (a status 124 alone is also what a stopped job or the command itself may end with). The client takes the run's verdict from the tag's kind, never from the log's last kill line.
+
+    The checkout lines `gate-remote-checkout: <nonce> start` and `gate-remote-checkout: <nonce> done <s.sss>` are said by the box just before its checkout and just after it succeeds ([The box side](#the-box-side)). The client reads them on the run call's stderr only, as a whole line, for its own nonce and only before the start marker; it hides them from the log and the console and says its own in their place: `gate: checking out on {builder}` and `gate: checked out on {builder} in {s.s} s`, the seconds read as the adjusted line's are and shown to one decimal. A line of another nonce, a malformed one, one on stdout, one after the start marker or one on any other call is a line like any other.
+
+    The PC's two checkout lines are kept lines: they stay in the log of a run that falls back here after the checkout, count toward the log cap and reach stderr when the call echoes to the console. A box too old to say its lines gives none, and the PC says nothing for the checkout.
 
     The adjusted line `gate-remote-adjusted: <nonce> <s.sss>` carries the load-adjusted seconds the box counted, said once the command's output has drained unless the sampler failed, read like the tag on stderr only and the last one winning; another run's, a malformed one or one whose seconds are not a finite number is a line like any other.
 
@@ -3728,6 +3733,8 @@ Built verbs:
 
   `gate-remote-adjusted: <nonce> <s.sss>` is also said as any watched command exits, once its output has drained, unless the sampler failed. A failed sample says `gate: sampler failed: <message>; watching by wall time only` and only the backstop is read from then on.
 
+  The checkout lines: just before the checkout, once a pair run's LFS refusal is past, the box says `gate-remote-checkout: <nonce> start` on stderr with the payload's `Nonce`, and just after the checkout succeeds `gate-remote-checkout: <nonce> done <s.sss>`, the seconds it took to three decimals. The span is the whole checkout: the fetch, the LFS scratch folder, the checkout and the clean. A checkout that fails says no done line. They are protocol lines, said without a stamp.
+
   The start marker: just before it launches the command, before the donor console and the launch, the box says `gate-remote-started: <nonce>` on stderr once, with the payload's `Nonce`; a launch then refused or stopped has said it too. A warm-up says it once, after every tool and package restore and before its first command, and not again before the later ones.
 
   Warm-up: a `run` with `WarmCommands` lays out and readies the work folder, restores the tools and the pnpm, bun and npm packages of every command, as a run does, then removes `{Work}.warm`, says the start marker and runs each command in order as a run's command is run (the stop signal looked at before each, and a client gone found by the heartbeat ending it with 255 and no line of its own).
@@ -3862,7 +3869,7 @@ Built verbs:
 
   Otherwise the run is refused with `gate-remote-refused: <nonce> sent` then `gate: remote build sent to work folder <key> is not the one there: <why>`, said together under the output lock, the command never started, and exit 75. A payload without `SentDigest` skips the check.
 
-  A payload with an `LfsDigest` (64 lower-case hex digits, else `gate: box payload LfsDigest is not 64 lower-case hex digits: <value>` and exit 2) is checked after the fetch and before the checkout, under the work folder's lock; a payload without one makes no such check, and a pair run that carries one is refused `lfs` before any checkout.
+  A payload with an `LfsDigest` (64 lower-case hex digits, else `gate: box payload LfsDigest is not 64 lower-case hex digits: <value>` and exit 2) is checked after the fetch and before the checkout, under the work folder's lock; a payload without one makes no such check, and a pair run that carries one is refused `lfs` before any checkout, and before the checkout's start line.
 
   The box lists the pointers from the snapshot itself, as the PC lists them (spec-v1 blobs of at most 1024 bytes whose `filter` is `lfs` at the commit, read with `-c core.attributesFile=` and `GIT_ATTR_NOSYSTEM=1`).
 
@@ -4942,6 +4949,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
     With the client gone the status is 255 and nothing is said. A signal still never gives 124. `box run` runs the command under this watch; `--test-box-sampler-fail` and `--test-box-free-percent` choose the sampler, the first over the second, else the machine's load, and `--test-heartbeat-ms` and `--test-box-sample-ms` set the periods.
   - **Output lock.** A say from the main thread that cannot take the output lock within 30 s (a pump or reader stuck writing to a stalled client) marks the client gone and writes nothing.
+- **Checkout lines.** `run` says `gate-remote-checkout: <nonce> start` on stderr just before its checkout and `gate-remote-checkout: <nonce> done <s.sss>` just after it succeeds, unstamped, as the Windows box's do ([The box side](#the-box-side), `run`); a failed checkout says no done line.
 - **Stamped lines.** The same rule as the Windows box's ([The box side](#the-box-side), `run`): in `box run` every line but the protocol lines and the heartbeat is stamped `<stamp> <tag> <text>`, the stamp taken under the output lock.
 
   The command's streams are `out` and `err`; the box's own lines, git's and the tool restore's forwarded output, the back commit's lines and the process lines are `gat`. The start marker, the refusal and kill tags, the adjusted line, the outputs line and the heartbeat stay bare and byte-exact, and the other verbs are unchanged.
