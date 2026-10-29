@@ -28,10 +28,10 @@ use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS
 use crate::durations::{seed, seed_warm};
 use crate::remote_inputs::inputs_case;
 use crate::support::{
-    ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, GIT_REDIRECTS, Go, Junction, NetfxKey, Outcome, PREFLIGHT_SEAMS_VARIABLE, Running,
-    STEPS_VARIABLE, allow_breakaway, assert_in_order, beside, build_version, calls, copy_tool, events, finish, git, git_init, heavy_words, log_texts,
-    nothing_back, refuse_breakaway, release, run_words, shown, ssh_steps, start, wait_for_journal_line, wait_until, wait_until_closed,
-    write_remote_json,
+    ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, GIT_REDIRECTS, Go, Junction, LOCAL_REASON, NetfxKey, Outcome,
+    PREFLIGHT_SEAMS_VARIABLE, Running, STEPS_VARIABLE, allow_breakaway, assert_in_order, beside, build_version, calls, copy_tool, events, finish,
+    git, git_init, heavy_words, log_texts, nothing_back, refuse_breakaway, release, run_words, shown, ssh_steps, start, wait_for_journal_line,
+    wait_until, wait_until_closed, write_remote_json,
 };
 
 pub(super) const HOST: &str = "builder";
@@ -8977,7 +8977,12 @@ fn restore_here_after_a_routed_build_that_brought_everything_back_keeps_a_later_
     let case = restore_case("client-restore-here", false);
 
     let outcome = passing_build(&case, &["ok", "ok", "ok"], &direct_build(RESTORED_PROJECT));
-    let here = finish(case.gate(&run_words("here.log", &[], &[r".\dotnet.cmd", "test", RESTORED_PROJECT, "--no-build"])));
+    // The no-build run matches the case's routing file, so `--local` keeps it here.
+    let here = finish(case.gate(&run_words(
+        "here.log",
+        &["--local", LOCAL_REASON[0], LOCAL_REASON[1]],
+        &[r".\dotnet.cmd", "test", RESTORED_PROJECT, "--no-build"],
+    )));
 
     assert!(case.folder().join(r"bin\new.txt").is_file(), "{outcome:?}");
     let said = outcome.stderr.lines().find(|line| line.starts_with(RESTORED_LINE));

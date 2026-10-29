@@ -7,6 +7,9 @@ use std::time::Duration;
 
 use gate_args::{Ceiling, MAX_WHOLE_NUMBER, TestSeams};
 use gate_router::Place;
+/// A span alone, by the expected-time line's rule ([`gate_router::balance::span_text`]).
+pub(crate) use gate_router::balance::span_text;
+use gate_router::balance::{in_minutes, span_in};
 use gate_state::{
     DurationKey, DurationStore, Estimate, JournalLock, KeyInputs, KeyPlace, RebuildOwner, RebuildReason, Rebuilt, Recorded, RunFacts, StoreError,
     StoreRead, StoreReadError, abandon_rebuild, begin_rebuild, duration_key, durations_path, place_by_shape, read_store, rebuild_store, record_run,
@@ -21,15 +24,12 @@ use crate::remote::git::{self, Git};
 use crate::route::{self, Placed};
 use crate::slots::{self, Liveness};
 
-/// The `about` figure, in seconds, from which the expected-time line is in minutes.
-const MINUTES_FROM: f64 = 90.0;
-
 /// The line a gate says as it takes its slot for a key with history: `gate: expected about {mean} (usual {p50}, p90
 /// {p90}, {runs} runs)`, every figure in whole seconds when the mean is under 90 s, else in whole minutes, each rounded to
 /// the nearest and never below 1. An estimate of the family key ends `runs of similar commands)`.
 pub(crate) fn expected_line(estimate: &Estimate) -> String {
     let in_minutes = in_minutes(estimate.mean);
-    let shown = |seconds: f64| in_unit(seconds, in_minutes);
+    let shown = |seconds: f64| span_in(seconds, in_minutes);
     let of = if estimate.family { " of similar commands" } else { "" };
     format!(
         "gate: expected about {} (usual {}, p90 {}, {} runs{of})",
@@ -38,28 +38,6 @@ pub(crate) fn expected_line(estimate: &Estimate) -> String {
         shown(estimate.p90),
         estimate.runs
     )
-}
-
-/// A span of `seconds` alone, by the expected-time line's rule: whole seconds below 90 s, whole minutes from 90 s,
-/// rounded to the nearest and never below 1.
-pub(crate) fn span_text(seconds: f64) -> String {
-    in_unit(seconds, in_minutes(seconds))
-}
-
-/// Whether a span of `seconds` is said in minutes: from 90 s once rounded to the whole second, so no span reads `90 s`.
-fn in_minutes(seconds: f64) -> bool {
-    seconds.round() >= MINUTES_FROM
-}
-
-/// A span of `seconds` in whole minutes when `in_minutes`, else in whole seconds, rounded to the nearest and never
-/// below 1; the minutes are those of the whole seconds, so 89.6 s, which is 90 s, reads as 90 s does.
-fn in_unit(seconds: f64, in_minutes: bool) -> String {
-    let whole_seconds = seconds.round();
-    if in_minutes {
-        format!("{} min", (whole_seconds / 60.0).round().max(1.0))
-    } else {
-        format!("{} s", whole_seconds.max(1.0))
-    }
 }
 
 /// A run's ceiling as a take resolved it: whole seconds, and the adjusted p99 that raised it above an auto ceiling's
@@ -296,6 +274,28 @@ pub(crate) fn builder_durations(root: &Path, place: &Place, command: &str, criti
             store.estimate(&key, now).map(|estimate| estimate.mean)
         })
         .collect()
+}
+
+/// The learned p50, in seconds, of the command `command`, a critical run's when `critical`, run here from the folder
+/// the routing decision placed at `place`: the key a local run files under ([`RunDurations::key`] with no build box),
+/// counted only from that exact key with at least five passing runs in the window, never from its family key. The
+/// store under the state root `root` is read once, with no lock; a store that is missing, not current or cannot be
+/// read gives `None`, as does a key with fewer runs.
+pub(crate) fn local_p50(root: &Path, place: &Place, command: &str, critical: bool) -> Option<f64> {
+    let StoreRead::Current(store) = read_store(root) else {
+        return None;
+    };
+    let key = duration_key(&KeyInputs {
+        folder: &from_route(place),
+        remote_host: None,
+        critical,
+        temp_root: temp_root().as_deref(),
+        command,
+    });
+    store
+        .estimate(&key, Timestamp::now())
+        .filter(|estimate| !estimate.family)
+        .map(|estimate| estimate.p50)
 }
 
 /// The key place of a folder the routing decision placed.
@@ -560,17 +560,19 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
+    use gate_router::Place;
     use gate_state::{
-        DurationStore, Estimate, Held, JournalLock, KeyPlace, LockError, RebuildOwner, durations_path, place_by_shape, rebuilding_path, write_store,
+        DurationKey, DurationStore, Estimate, Held, JournalLock, KeyInputs, KeyPlace, LockError, RebuildOwner, RunFacts, Verdict, duration_key,
+        durations_path, place_by_shape, rebuilding_path, write_store,
     };
-    use jiff::Timestamp;
+    use jiff::{SignedDuration, Timestamp};
     use serde_json::json;
 
     use gate_args::Ceiling;
 
     use super::{
-        GitLimits, Resolved, RunDurations, Said, StoreSeen, Usual, ceiling_hint, expected_line, hang_hint, in_unit, raised_ceiling_line,
-        resolve_ceiling, routed_usual, span_text,
+        GitLimits, Resolved, RunDurations, Said, StoreSeen, Usual, ceiling_hint, expected_line, from_route, hang_hint, local_p50,
+        raised_ceiling_line, resolve_ceiling, routed_usual, span_in, span_text, temp_root,
     };
     use crate::console::Console;
 
@@ -665,7 +667,7 @@ mod tests {
         assert_eq!(span_text(90.0), "2 min", "90 s is 1.5 min, rounded to 2");
         assert_eq!(span_text(240.0), "4 min");
         assert_eq!(span_text(0.2), "1 s", "never 0 s");
-        assert_eq!(in_unit(20.0, true), "1 min", "never 0 min in the unit of a longer figure");
+        assert_eq!(span_in(20.0, true), "1 min", "never 0 min in the unit of a longer figure");
     }
 
     #[test]
@@ -1072,5 +1074,84 @@ mod tests {
         assert_eq!(asked.get(), 0, "the journal is not read again");
         assert!(!rebuilding_path(&root.0).exists(), "no rebuild is claimed");
         assert_eq!(console.take_notes(), Vec::<String>::new(), "nothing is said");
+    }
+
+    /// The place of a gate at the root of a worktree of `repo`, as the routing decision places it.
+    fn routed_place() -> Place {
+        Place {
+            root: "X:/work/repo.wt/slug".to_owned(),
+            prefix: String::new(),
+            checkout: "repo".to_owned(),
+            folder: "X:/work/repo.wt/slug".to_owned(),
+        }
+    }
+
+    /// The key a light run of `command` here from `place` files under, as [`local_p50`] reads it.
+    fn local_key(place: &Place, command: &str) -> DurationKey {
+        duration_key(&KeyInputs {
+            folder: &from_route(place),
+            remote_host: None,
+            critical: false,
+            temp_root: temp_root().as_deref(),
+            command,
+        })
+    }
+
+    /// Writes into `root` a store holding `runs` passing runs here of `command` from `place`, the oldest first, taking
+    /// 1 s, 2 s and so on, each released a second apart just before now; the store written.
+    #[expect(clippy::expect_used, reason = "a test that cannot write its store must fail loudly")]
+    fn store_runs(root: &Path, place: &Place, command: &str, runs: u32) -> DurationStore {
+        let key = local_key(place, command);
+        let mut store = DurationStore::new();
+        let now = Timestamp::now();
+        for run in 1..=runs {
+            let time = now
+                .checked_sub(SignedDuration::from_secs(i64::from(runs - run + 1)))
+                .expect("a moment just before now");
+            let facts = RunFacts {
+                wall_seconds: f64::from(run),
+                adjusted_seconds: None,
+                avg_cores: None,
+                peak_cores: None,
+                free_cores: None,
+                verdict: Verdict::Passed,
+            };
+            store.record(&key, time, &facts, false);
+        }
+        write_store(root, &store).expect("the store can be written");
+        store
+    }
+
+    #[test]
+    fn a_local_p50_needs_five_runs_of_its_exact_key() {
+        let place = routed_place();
+        let four = Root::new("local-p50-four");
+        store_runs(&four.0, &place, "cargo build", 4);
+        assert_eq!(local_p50(&four.0, &place, "cargo build", false), None, "four runs are no proof");
+
+        let five = Root::new("local-p50-five");
+        store_runs(&five.0, &place, "cargo build", 5);
+        assert_eq!(local_p50(&five.0, &place, "cargo build", false), Some(3.0), "the p50 of 1 s to 5 s");
+        assert_eq!(local_p50(&five.0, &place, "cargo build", true), None, "a critical run's key is another");
+    }
+
+    #[test]
+    fn a_local_p50_never_comes_from_a_family_key() {
+        let place = routed_place();
+        let root = Root::new("local-p50-family");
+        let store = store_runs(&root.0, &place, "cargo nextest run -E other", 5);
+        let mine = "cargo nextest run -E mine";
+        assert!(
+            store
+                .estimate(&local_key(&place, mine), Timestamp::now())
+                .is_some_and(|estimate| estimate.family),
+            "the store estimates the command from its family key"
+        );
+        assert_eq!(local_p50(&root.0, &place, mine, false), None, "which is no proof");
+        assert_eq!(
+            local_p50(&root.0, &place, "cargo nextest run -E other", false),
+            Some(3.0),
+            "the runs' own exact key is"
+        );
     }
 }

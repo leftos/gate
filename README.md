@@ -43,7 +43,7 @@ For a repo with a `.gate/warmup.toml` or `remote.json` consent to warm-ups, it a
 
   `--reason "<why>"` states why a run needs `--local`, a critical slot or `--alone`; it is required with any of the three, accepted on any run, and recorded in the journal, the claim and the ticket so ops-tower's Gates page can show it. The command's output goes to the log; gate prints its tail and a one-line verdict, and exits with the command's status, or 124 when it killed the command.
 
-  `--builder <host>` routes a heavy run to the builder `<host>` alone, never another and never here: a run that cannot be routed there exits 2, and a builder that refuses or cannot be reached fails the run with exit 1, which is how a new builder is trialled.
+  `--builder <host>` routes a heavy or light run to the builder `<host>` alone, never another and never here: a run that cannot be routed there exits 2, and a builder that refuses or cannot be reached fails the run with exit 1, which is how a new builder is trialled.
 
   `--timeout auto:900` makes 900 a floor: from the command's recorded runs the ceiling rises to three times its adjusted p99 when that is longer, and the gate says so, warns when the ceiling is below the command's load-adjusted p90, and says once when a run goes past three times its usual wall-clock p90. With no history the ceiling is the 900. The old `-TimeoutSeconds` takes whole numbers only.
 
@@ -51,13 +51,13 @@ For a repo with a `.gate/warmup.toml` or `remote.json` consent to warm-ups, it a
 
   A critical gate does not wait for a `none` run and does not protect it.
 
-  The gate tells the caller when a run's slot did not fit it: for example, `gate: used 7.4 cores on average … on a light slot; work that keeps more than 2 busy belongs on heavy`. Act on that line: the next run of the same command uses the slot it names. The hint is how the slot gets chosen right; ignoring it keeps a heavy command on light, where it routes to a builder only when a critical request holds it back, or a light one holding a heavy slot.
+  The gate tells the caller when a run's slot did not fit it: for example, `gate: used 7.4 cores on average … on a light slot; work that keeps more than 2 busy belongs on heavy`. Act on that line: the next run of the same command uses the slot it names. The hint is how the slot gets chosen right; ignoring it keeps a heavy command on light, where it competes for the light slots.
 
   A gated `git commit` takes a slot for all its hooks: pass `--slot heavy` when the hooks build or run analyzers, else `--slot light` (`--slot none` runs on a light slot and says so). Its hint reads `gate: the commit's hooks used … cores on average … on a light slot; hooks that keep more than 2 busy belong on --slot heavy`. A gate in its hooks that asks for `--slot critical` or `--alone` is refused.
 
-  A long light run that passed also gets a routing hint when `remote.json` would have sent the same command to a builder on heavy: `gate: ran 42 s on a light slot; on heavy, remote.json would send this command to a builder`. Act on it the same way: move the command to heavy. A routed run gets no cores hint.
+  A light run routes to a builder as a heavy one does, unless its learned local time proves it faster here: `gate: not routed: faster here: about 8 s here, builder-1 about 15 s`. A routed run gets no cores hint.
 - **Slots.** The number of slots per kind comes from the machine's core count and can be changed in `%LOCALAPPDATA%\gate\v1\slot-counts.json`.
-- **Remote builders (optional).** A machine can send allowlisted heavy commands to other Windows machines it names in its own `%LOCALAPPDATA%\gate\v1\remote.json`. Builders are configured only there, on your machine; nothing about them lives in this repo. With no such file, gate runs everything locally.
+- **Remote builders (optional).** A machine can send allowlisted heavy and light commands to other Windows machines it names in its own `%LOCALAPPDATA%\gate\v1\remote.json`. Builders are configured only there, on your machine; nothing about them lives in this repo. With no such file, gate runs everything locally.
 
 gate runs on Windows. Its pure crates (formats, watchdog arithmetic, routing and quoting rules) also build and test on Linux.
 

@@ -13,7 +13,7 @@ use gate_router::{
     sdk_build_target, target, without_no_build, work_folder_key,
 };
 
-use crate::support::{FakeFacts, HEAD, ROOT, carried, fake_id, heavy, place_at, sibling_root, words};
+use crate::support::{FakeFacts, HEAD, ROOT, carried, fake_id, heavy, light, place_at, sibling_root, words};
 
 const SILENT: Route = Route::Local { reason: None };
 
@@ -115,13 +115,222 @@ fn the_control_command_routes_from_the_root() {
 }
 
 #[test]
-fn only_a_heavy_gate_routes_and_light_critical_or_none_ask_nothing_not_even_the_routing_file() {
+fn a_light_gate_routes_like_a_heavy_one_and_critical_or_none_ask_nothing() {
     let command = words(&["dotnet", "test"]);
-    for slot in [Slot::Light, Slot::Critical, Slot::None] {
+    let heavy_facts = FakeFacts::at_root();
+    let light_facts = FakeFacts::at_root();
+    let light_run = routed(decide(&light(&command), &light_facts));
+    assert_eq!(light_run, routed(decide(&heavy(&command), &heavy_facts)));
+    assert_eq!(light_facts.asked(), heavy_facts.asked(), "a light gate asks what a heavy one asks");
+    assert_eq!(light_facts.local_p50_asked.get(), 1, "and its local p50 once");
+    assert_eq!(heavy_facts.local_p50_asked.get(), 0, "a heavy gate never asks it");
+    for slot in [Slot::Critical, Slot::None] {
         let facts = FakeFacts::at_root();
         let inputs = Inputs { slot, ..heavy(&command) };
         assert_eq!(decide(&inputs, &facts), SILENT, "{slot:?}");
         assert!(facts.asked().is_empty(), "{slot:?} asked {:?}", facts.asked());
+        assert_eq!(facts.local_p50_asked.get(), 0, "{slot:?}");
+    }
+}
+
+#[test]
+fn a_light_gate_with_no_local_history_routes() {
+    let facts = FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, TWO_WINDOWS))
+        .with_figures("win-2", figures(0.0, Some(100.0)))
+        .with_figures("win-3", figures(0.0, Some(50.0)));
+    let run = routed(decide(&light(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(run.builder.alias, "win-3", "scored as a heavy run is");
+    let entry = |alias: &str, tenths| BalancedEntry {
+        alias: alias.to_owned(),
+        tenths,
+        free: 1,
+        cold: false,
+    };
+    assert_eq!(
+        run.balanced,
+        Some(Balanced {
+            entries: vec![entry("win-3", 500), entry("win-2", 1000)],
+            has_duration: true,
+        }),
+        "two scored builders are balanced, the chosen one first"
+    );
+    assert_eq!(facts.local_p50_asked.get(), 1);
+    assert_eq!(facts.figures_asked.get(), 1);
+}
+
+#[test]
+fn a_light_gate_with_a_local_p50_and_no_builder_duration_routes() {
+    let facts = FakeFacts {
+        local_p50: Some(1.0),
+        ..FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, TWO_WINDOWS))
+    }
+    .with_figures("win-2", figures(0.0, None))
+    .with_figures("win-3", figures(0.0, None));
+    let run = routed(decide(&light(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(run.builder.alias, "win-2", "a queue wait alone is no proof, so the run routes");
+    assert_eq!(facts.local_p50_asked.get(), 1);
+    assert_eq!(facts.figures_asked.get(), 1);
+}
+
+#[test]
+fn a_light_git_hook_run_follows_the_hooks_rule_as_a_heavy_one_does() {
+    let command = words(&["dotnet", "test"]);
+    let inputs = Inputs {
+        git_hook: true,
+        ..light(&command)
+    };
+    let no_hooks = FakeFacts::at_root();
+    assert_eq!(decide(&inputs, &no_hooks), SILENT);
+    assert_eq!(no_hooks.asked(), ["config"]);
+
+    let consented = hooks_facts(Some(r#"["Yaat"]"#));
+    let run = routed(decide(&inputs, &consented));
+    assert_eq!(run.repo, "yaat");
+    assert_eq!(consented.asked(), ["config", "place", "file_in_folder dotnet", "head_sha"]);
+
+    let unnamed = hooks_facts(Some(r#"["other"]"#));
+    assert_eq!(decide(&inputs, &unnamed), SILENT);
+    assert_eq!(unnamed.asked(), ["config", "place"], "the repo is read, nothing more");
+    for facts in [&no_hooks, &unnamed] {
+        assert_eq!(facts.local_p50_asked.get(), 0, "a hook run kept here asks no local p50");
+    }
+}
+
+#[test]
+fn a_light_git_or_prek_command_stays_local() {
+    for command in [&["git", "status"][..], &["prek", "run"]] {
+        let command = words(command);
+        let facts = FakeFacts::with_config(routing_all());
+        assert_eq!(decide(&light(&command), &facts), SILENT, "{command:?}");
+        assert_eq!(facts.asked(), ["config"], "{command:?}");
+        assert_eq!(facts.local_p50_asked.get(), 0, "{command:?}");
+    }
+}
+
+#[test]
+fn a_light_command_matching_a_declared_local_pattern_runs_here_asking_no_local_p50() {
+    let facts = FakeFacts {
+        local_p50: Some(1.0),
+        ..local_facts(&["dotnet test*"])
+    }
+    .with_figures("builder-1", figures(0.0, Some(100.0)));
+    assert_eq!(
+        local_line(&decide(&light(&words(&["dotnet", "test", "x"])), &facts)).as_deref(),
+        Some("gate: not routed: .gate/local.toml keeps it here (dotnet test*)")
+    );
+    assert_eq!(facts.local_read.get(), 1);
+    assert_eq!(facts.local_p50_asked.get(), 0, "the local file keeps it before any p50 is asked");
+    assert_eq!(facts.figures_asked.get(), 0);
+}
+
+#[test]
+fn a_light_gate_proven_faster_here_stays_here_and_says_why() {
+    let facts = FakeFacts {
+        local_p50: Some(9.0),
+        ..FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, TWO_WINDOWS))
+    }
+    .with_figures("win-2", figures(0.0, Some(14.0)))
+    .with_figures("win-3", figures(0.0, Some(20.0)));
+    let command = words(&["dotnet", "build"]);
+    let route = decide(&light(&command), &facts);
+    assert_eq!(
+        route,
+        Route::Local {
+            reason: Some(LocalReason::FasterHere {
+                here_tenths: 90,
+                builder: "win-2".to_owned(),
+                there_tenths: 140,
+            })
+        }
+    );
+    assert_eq!(
+        local_line(&route).as_deref(),
+        Some("gate: not routed: faster here: about 9 s here, win-2 about 14 s")
+    );
+    assert_eq!(facts.figures_asked.get(), 1);
+    assert_eq!(
+        routed(decide(&heavy(&command), &facts)).builder.alias,
+        "win-2",
+        "a heavy gate has no proof-of-speed exception"
+    );
+}
+
+#[test]
+fn a_light_gate_with_one_capable_builder_still_compares() {
+    let command = words(&["dotnet", "build"]);
+    let kept = FakeFacts {
+        local_p50: Some(9.0),
+        ..FakeFacts::with_config(routing_all())
+    }
+    .with_figures("builder-1", figures(0.0, Some(14.0)));
+    let route = decide(&light(&command), &kept);
+    assert_eq!(
+        local_line(&route).as_deref(),
+        Some("gate: not routed: faster here: about 9 s here, builder-1 about 14 s")
+    );
+    assert_eq!(kept.figures_asked.get(), 1, "one builder's figures are asked for the compare");
+
+    let slower_here = FakeFacts {
+        local_p50: Some(12.0),
+        ..FakeFacts::with_config(routing_all())
+    }
+    .with_figures("builder-1", figures(0.0, Some(14.0)));
+    let run = routed(decide(&light(&command), &slower_here));
+    assert_eq!(run.builder.alias, "builder-1", "12 s is not under 80% of 14 s");
+    assert_eq!(run.balanced, None, "one builder alone is never balanced");
+    assert_eq!(slower_here.figures_asked.get(), 1);
+}
+
+#[test]
+fn a_light_gate_under_a_covering_parent_stays_silent() {
+    let command = words(&["dotnet", "build"]);
+    let facts = FakeFacts {
+        local_p50: Some(9.0),
+        ..FakeFacts::at_root()
+    };
+    let inputs = Inputs {
+        covering_parent: true,
+        ..light(&command)
+    };
+    assert_eq!(decide(&inputs, &facts), SILENT);
+    assert!(facts.asked().is_empty(), "{:?}", facts.asked());
+    assert_eq!(facts.local_p50_asked.get(), 0);
+}
+
+#[test]
+fn a_light_pin_routes() {
+    let facts = FakeFacts {
+        local_p50: Some(1.0),
+        ..FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, TWO_WINDOWS))
+    }
+    .with_figures("win-2", figures(0.0, Some(100.0)));
+    let command = words(&["dotnet", "build"]);
+    let inputs = Inputs {
+        slot: Slot::Light,
+        ..pinned_to(&command, "win-2")
+    };
+    assert_eq!(routed(decide(&inputs, &facts)).builder.alias, "win-2", "a pin is not compared");
+    assert_eq!(facts.local_p50_asked.get(), 0);
+    assert_eq!(facts.figures_asked.get(), 0);
+}
+
+#[test]
+fn a_critical_pin_is_refused() {
+    let command = words(&["dotnet", "build"]);
+    for (slot, word) in [(Slot::Critical, "critical"), (Slot::None, "none")] {
+        let facts = FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, TWO_WINDOWS));
+        let inputs = Inputs {
+            slot,
+            ..pinned_to(&command, "win-2")
+        };
+        assert_eq!(
+            refused(decide(&inputs, &facts)),
+            PinRefusal::CannotRoute {
+                host: "win-2".to_owned(),
+                why: format!("only a heavy or light run routes, and this one is --slot {word}"),
+            },
+            "{slot:?}"
+        );
     }
 }
 
@@ -149,7 +358,13 @@ fn local_on_a_heavy_gate_says_not_routed_and_asks_nothing_not_even_the_routing_f
         local: true,
         ..heavy(&command)
     };
-    assert_eq!(decide(&light, &facts), SILENT);
+    assert_eq!(
+        decide(&light, &facts),
+        Route::Local {
+            reason: Some(LocalReason::LocalFlag)
+        },
+        "a light --local says why as a heavy one does"
+    );
     assert_eq!(facts.asked(), Vec::<String>::new());
 }
 
@@ -2824,9 +3039,9 @@ fn an_unlisted_repo_never_reads_the_siblings_file() {
     assert_eq!(other_repo.siblings_read.get(), 0);
     for (case, inputs) in [
         (
-            "light",
+            "critical",
             Inputs {
-                slot: Slot::Light,
+                slot: Slot::Critical,
                 ..heavy(&command)
             },
         ),
@@ -3569,9 +3784,12 @@ fn a_routed_run_with_two_capable_builders_asks_their_figures_once() {
 
 #[test]
 fn a_single_capable_builder_is_not_scored() {
-    let facts = FakeFacts::with_config(routing_all());
+    // For a heavy run, or a light one with no local proof; a proven light run compares even one builder.
+    let facts = FakeFacts::with_config(routing_all()).with_figures("builder-1", figures(0.0, Some(14.0)));
     assert_eq!(routed(decide(&heavy(&words(&["dotnet", "build"])), &facts)).builder.alias, "builder-1");
     assert_eq!(facts.figures_asked.get(), 0);
+    assert_eq!(routed(decide(&light(&words(&["dotnet", "build"])), &facts)).builder.alias, "builder-1");
+    assert_eq!(facts.figures_asked.get(), 0, "a light run without a local p50 is not scored either");
 }
 
 #[test]
@@ -4360,6 +4578,29 @@ fn a_pin_to_a_macos_builder_of_a_windows_only_test_is_refused() {
         refused(decide(&pinned_to(&words(&["dotnet", "test", "tests/X"]), "mac-1"), &facts)).line(),
         "gate: --builder mac-1 cannot route this run: it may test a Windows-only project, which a macOS builder cannot run"
     );
+}
+
+#[test]
+fn a_light_gate_compares_with_the_builder_left_after_the_macos_steer_off() {
+    let facts = FakeFacts {
+        local_p50: Some(9.0),
+        ..windows_only_facts(r#"{"other": ["*"]}"#, MAC_THEN_WINDOWS_TEST, true)
+    }
+    .with_figures("mac-1", figures(0.0, Some(10.0)))
+    .with_figures("win-2", figures(0.0, Some(60.0)));
+    let route = decide(&light(&words(&["dotnet", "test", "tests/X"])), &facts);
+    assert_eq!(
+        route,
+        Route::Local {
+            reason: Some(LocalReason::FasterHere {
+                here_tenths: 90,
+                builder: "win-2".to_owned(),
+                there_tenths: 600,
+            })
+        },
+        "the Mac cannot run the Windows-only test, so its 10 s is no finish to compare with"
+    );
+    assert_eq!(facts.windows_only_asked.get(), 1, "the steer-off ran before the compare");
 }
 
 /// A macOS builder `mac-1`, then a Windows builder `win-2`, each running `yaat`'s `dotnet` commands.

@@ -716,7 +716,7 @@ fn a_builder_refusal_shows_its_host_escaped() {
 }
 
 #[test]
-fn a_builder_on_a_light_slot_is_refused() {
+fn a_builder_on_a_critical_or_no_slot_is_refused_and_on_light_is_not() {
     let on = |slot: &str| {
         problems(&[
             "run",
@@ -735,21 +735,35 @@ fn a_builder_on_a_light_slot_is_refused() {
         ])
     };
     assert_eq!(
-        on("light"),
-        ["gate: --builder mac-1 cannot route this run: only a heavy run routes, and this one is --slot light"]
-    );
-    assert_eq!(
         on("none"),
-        ["gate: --builder mac-1 cannot route this run: only a heavy run routes, and this one is --slot none"]
+        ["gate: --builder mac-1 cannot route this run: only a heavy or light run routes, and this one is --slot none"]
     );
     assert_eq!(
         on("critical"),
-        ["gate: --builder mac-1 cannot route this run: only a heavy run routes, and this one is --slot critical"]
+        ["gate: --builder mac-1 cannot route this run: only a heavy or light run routes, and this one is --slot critical"]
     );
     assert_eq!(
         run_with(&["--builder", "mac-1", "--", "cmd"]).slot,
         Slot::Heavy,
         "a heavy run may be pinned"
+    );
+    let light = run_request(&[
+        "run",
+        "--slot",
+        "light",
+        "--timeout",
+        "5",
+        "--log",
+        "out.log",
+        "--builder",
+        "mac-1",
+        "--",
+        "cmd",
+    ]);
+    assert_eq!(
+        (light.slot, light.builder.as_deref()),
+        (Slot::Light, Some("mac-1")),
+        "a light run may be pinned"
     );
 }
 

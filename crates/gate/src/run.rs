@@ -98,8 +98,6 @@ const CONSOLE_HOST_IMAGE: &str = "conhost.exe";
 const END_PASSES: usize = 5;
 /// The wall time under which a passed run is too short to judge its slot by, so it gets no cores line.
 const HINT_MIN_WALL: Duration = Duration::from_secs(10);
-/// The unpaused wall time under which a passed light run is too short to ask whether its command would route on heavy.
-const ROUTE_HINT_MIN_WALL: Duration = Duration::from_secs(30);
 /// How long a routed run waits for its worktree's work folder while another of its runs holds it, before it falls back
 /// here as `busy` ([`Run::take_key`]); also the bound of a finished local build's one waiting take of the key, which no
 /// drain marker holds off ([`KeyTake::Bounded`]).
@@ -227,7 +225,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         writer: None,
         streams: None,
         rerouted_for: None,
-        reroute_tried: false,
+        may_reroute: false,
         restore_after: None,
         closing: Vec::new(),
         builder_call: BuilderCall::NotEnded,
@@ -813,9 +811,9 @@ struct Run<'a> {
     /// its `release` line takes if it has finished ([`Run::tailscale_path`]); `None` for a run that made no builder
     /// call.
     tailscale_read: Option<tailscale::PendingPath>,
-    /// What the routing decision saw of the run, kept for a passed light run's route line, which asks the decision again
-    /// as a heavy gate would ([`route::would_route_on_heavy`]). `None` for a run whose light parent lent it its slot,
-    /// which never asked.
+    /// What the routing decision saw of the run, kept for a light run a critical request holds back, which asks the
+    /// decision again as a heavy gate would ([`route::route_as_heavy`]). `None` for a run whose light parent lent it its
+    /// slot, which never asked.
     would: Option<route::Decision>,
     /// The run's first arrival in Unix epoch milliseconds, which every ticket it writes keeps.
     arrived: u64,
@@ -851,8 +849,10 @@ struct Run<'a> {
     /// The critical request whose barrier sent this light run to a builder, from its route on; `None` for every other
     /// run.
     rerouted_for: Option<u32>,
-    /// Whether the light run has asked to route once a critical request held it back; it asks at most once.
-    reroute_tried: bool,
+    /// Whether a critical request holding the light run back may still send it to a builder: set by the start decision
+    /// ([`Run::route`]) when it kept the run here, never when it routed it, as a run that routed and fell back here
+    /// already had its turn on a builder; cleared once the run has asked, so it asks at most once.
+    may_reroute: bool,
     /// The routed dotnet build that passed and brought everything back, whose target a restore here may need once the
     /// run has let its remote hold go ([`Run::restore_and_close`]); `None` for every other run.
     restore_after: Option<RoutedBuild>,
@@ -1803,6 +1803,7 @@ impl Run<'_> {
         } = route::route(self.request, environment, covering, (self.root, &self.gate), console);
         self.warm_hash = warm_hash;
         self.would = Some(decision);
+        self.may_reroute = !matches!(route, Route::Routed(_));
         self.tag = match &route {
             Route::Routed(remote) => Some(RemoteTag {
                 host: remote.builder.alias.clone(),
@@ -1957,11 +1958,11 @@ impl Run<'_> {
         LendMarker::write(&self.root.path, parent_pid, &of, console)
     }
 
-    /// Journals the queue of the run `route` sends: with `notRouted` for a heavy gate its caller kept here with
-    /// `--local`, with the remote tag for a routed one. A gate a parent's slot covers journals `covered` with the
-    /// parent's pid in place of the queue, then writes its covered marker ([`Covered`]). A gate its light parent lent
-    /// its slot before it queued journals nothing here. A routed run keeps the moment of its queue line in
-    /// [`Run::queued_at`], which its local take counts from when the full remote pool sent it back.
+    /// Journals the queue of the run `route` sends: with `notRouted` for a heavy or light gate kept here for a reason the
+    /// journal names ([`route::not_routed`]), with the remote tag for a routed one. A gate a parent's slot covers
+    /// journals `covered` with the parent's pid in place of the queue, then writes its covered marker ([`Covered`]). A
+    /// gate its light parent lent its slot before it queued journals nothing here. A routed run keeps the moment of its
+    /// queue line in [`Run::queued_at`], which its local take counts from when the full remote pool sent it back.
     fn queue(&mut self, route: &Route, console: &mut Console) {
         if self.lent {
             return;
@@ -2025,10 +2026,10 @@ impl Run<'_> {
     /// Runs the command here. A gate a parent's slot covers takes no slot; nor does one whose light parent lends it its
     /// slot while a critical request drains, before it queued or as it waits ([`Run::on_parent`]). Any other gate takes
     /// a slot into `hold`, one whose parent's slot does not cover it saying so first, before any wait line. A light run
-    /// a critical request holds back with no place beside it asks once whether its command would route on heavy
-    /// ([`route::route_as_heavy`]): when it would, it says so, closes its log and runs on the builder ([`Run::routed`]),
-    /// its remote tag naming the request; a refusal or fallback, or a command that would not route, sends it back to
-    /// its wait here, keeping the instant it queued. How the run ended; `None` when a Ctrl+C ended the wait for a slot
+    /// its start decision kept here that a critical request holds back with no place beside it asks once whether its
+    /// command would route on heavy ([`route::route_as_heavy`]): when it would, it says so, closes its log and runs on
+    /// the builder ([`Run::routed`]), its remote tag naming the request; a refusal or fallback, or a command that would
+    /// not route, sends it back to its wait here, keeping the instant it queued. How the run ended; `None` when a Ctrl+C ended the wait for a slot
     /// or for the remote client to start.
     fn here(&mut self, plan: Plan, hold: &mut Hold, console: &mut Console) -> Option<Ended> {
         self.open_log(console);
@@ -2069,7 +2070,7 @@ impl Run<'_> {
     /// The lines the route says are held, not written to the log, as a heavy routed run's are before its log opens: a
     /// fallback removes the log the client wrote, and the reopened log takes them, the fallback line after them.
     fn route_held_back(&mut self, by: u32, queued: Instant, hold: &mut Hold, console: &mut Console) -> Remotely {
-        self.reroute_tried = true;
+        self.may_reroute = false;
         self.queued_at = Some(queued);
         console.detach();
         let routed = self
@@ -3448,7 +3449,9 @@ impl Run<'_> {
         if let Some(left) = left {
             wait.limit_to(left);
         }
-        if matches!(pool, Pool::Local(gate_state::SlotKind::Light)) && self.would.is_some() && !self.reroute_tried && self.request.builder.is_none() {
+        // Only a light run its start decision kept here may be sent to a builder by a critical request; one that routed
+        // and fell back here is never rerouted ([`Run::may_reroute`]).
+        if matches!(pool, Pool::Local(gate_state::SlotKind::Light)) && self.would.is_some() && self.may_reroute && self.request.builder.is_none() {
             wait.may_route();
         }
         if pool.is_remote() && self.rerouted_for.is_some() {
@@ -4093,7 +4096,6 @@ impl Run<'_> {
         let Passing { pass, ceiling, stale } = passing;
         let mut lines: Vec<Said> = stale.iter().map(|line| Said::Err(line.clone())).collect();
         lines.extend(self.cores_hint(pass).map(Said::NoteOut));
-        lines.extend(self.route_hint(pass).map(Said::NoteOut));
         lines.push(Said::NoteOut(passed_line(pass, ceiling, shown)));
         lines
     }
@@ -4110,28 +4112,6 @@ impl Run<'_> {
                 Pass::On(..) => None,
             },
         })
-    }
-
-    /// The route line of a passed run that ran here as `pass` on a light slot, when its command would route on heavy
-    /// ([`route_hint_for`]).
-    fn route_hint(&self, pass: Pass<'_>) -> Option<String> {
-        let decision = self.would.as_ref()?;
-        route_hint_for(
-            RouteJudged {
-                own_slot: takes_own_slot(self.nesting, self.lent),
-                slot: self.request.slot,
-                timing: match pass {
-                    Pass::Here(timing) => Some(timing),
-                    Pass::On(..) => None,
-                },
-                floor: self
-                    .request
-                    .test_seams
-                    .route_hint_floor_ms
-                    .map_or(ROUTE_HINT_MIN_WALL, Duration::from_millis),
-            },
-            || route::would_route_on_heavy(decision, &self.request.test_seams),
-        )
     }
 
     /// The log's first marker lines, none when the run turned the scan off or is `unscanned`, and its tail: the last
@@ -4823,41 +4803,6 @@ fn cores_line(cores: Cores, misfit: Hint, commit: bool) -> String {
     }
 }
 
-/// What the route line of a run is decided from: whether it took its own slot (not covered by a parent's, nor lent
-/// one), the slot kind it asked for, how long it ran here (`None` for a run on a builder), and the floor under which a
-/// run is too short to ask whether its command would route on heavy.
-#[derive(Clone, Copy)]
-struct RouteJudged {
-    own_slot: bool,
-    slot: Slot,
-    timing: Option<Timing>,
-    floor: Duration,
-}
-
-/// The route line of `judged`, when its command would have routed on heavy: only a run that ran here on its own light
-/// slot, for at least its floor of unpaused wall time, is asked, and only then does it ask `would_route`, so no other
-/// run reads the routing file or git.
-fn route_hint_for(judged: RouteJudged, would_route: impl FnOnce() -> bool) -> Option<String> {
-    if !judged.own_slot || judged.slot != Slot::Light {
-        return None;
-    }
-    let timing = judged.timing?;
-    let unpaused = timing.wall.saturating_sub(timing.paused);
-    if unpaused < judged.floor || !would_route() {
-        return None;
-    }
-    Some(route_hint_line(unpaused))
-}
-
-/// The line that tells a passed light run its command would route on heavy, after `unpaused` of unpaused wall time:
-/// whole seconds, rounded down.
-fn route_hint_line(unpaused: Duration) -> String {
-    format!(
-        "gate: ran {} s on a light slot; on heavy, remote.json would send this command to a builder",
-        unpaused.as_secs()
-    )
-}
-
 /// The line a routed run says as it starts waiting for its worktree's work folder on `host`, which another of its runs
 /// holds, with `left`, the holder's time left by its remote claim, when that claim carries a usual run time.
 fn key_wait_line(host: &str, left: Option<String>) -> String {
@@ -5102,7 +5047,7 @@ fn unicode_words(command: &[OsString]) -> Option<Vec<String>> {
     reason = "a unit test starts cmd.exe directly, with no launch of its own open"
 )]
 mod tests {
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
     use std::fs;
     use std::io;
     use std::process::Command;
@@ -5113,9 +5058,9 @@ mod tests {
     use gate_watchdog::{Cores, Hint};
 
     use super::{
-        Ends, Judged, Pass, ROUTE_HINT_MIN_WALL, RouteJudged, Stopper, Timing, brought_everything_back, cores_hint_for, cores_line,
-        drain_waiting_line, dropped_line, earlier, holder_claim, interrupted, judging_globs, key_wait_left, key_wait_line, kill, log_in_state_root,
-        passed_line, records_after, route_hint_for, route_hint_line, routed_env, stop, takes_own_slot,
+        Ends, Judged, Pass, Stopper, Timing, brought_everything_back, cores_hint_for, cores_line, drain_waiting_line, dropped_line, earlier,
+        holder_claim, interrupted, judging_globs, key_wait_left, key_wait_line, kill, log_in_state_root, passed_line, records_after, routed_env,
+        stop, takes_own_slot,
     };
     use crate::console::Console;
     use crate::escaped::{Found, Look, Reached, Recorded};
@@ -5817,78 +5762,6 @@ mod tests {
         assert_eq!(
             cores_line(busy, Hint::Busy, false),
             "gate: used 1.5 cores on average (peak 2) on no slot; work that keeps 1.5 or more busy belongs on light or heavy"
-        );
-    }
-
-    /// A `Timing` of `wall_s` wall seconds, `paused_s` of them paused, with no cores sampled.
-    fn timing(wall_s: f64, paused_s: f64) -> Timing {
-        Timing {
-            wall: Duration::from_secs_f64(wall_s),
-            adjusted: None,
-            paused: Duration::from_secs_f64(paused_s),
-            cores: None,
-            nested_took_slot: false,
-        }
-    }
-
-    #[test]
-    fn the_route_hint_line_says_the_whole_seconds() {
-        assert_eq!(
-            route_hint_line(Duration::from_secs_f64(42.9)),
-            "gate: ran 42 s on a light slot; on heavy, remote.json would send this command to a builder"
-        );
-    }
-
-    /// A run on its own `slot` slot for `wall_s` seconds, `paused_s` of them paused, with `floor` as the route hint's
-    /// floor.
-    fn route_judged(slot: Slot, own_slot: bool, wall_s: f64, paused_s: f64, floor: Duration) -> RouteJudged {
-        RouteJudged {
-            own_slot,
-            slot,
-            timing: Some(timing(wall_s, paused_s)),
-            floor,
-        }
-    }
-
-    /// Asserts that `route_hint_for` says nothing for `judged` and never asks `would_route`.
-    fn refused_without_asking(judged: RouteJudged) {
-        let asked = Cell::new(false);
-        let line = route_hint_for(judged, || {
-            asked.set(true);
-            true
-        });
-        assert_eq!(line, None);
-        assert!(!asked.get(), "the route is asked of a run it must not judge");
-    }
-
-    #[test]
-    fn a_light_pass_under_the_floor_gets_no_route_hint() {
-        refused_without_asking(route_judged(Slot::Light, true, 29.0, 0.0, ROUTE_HINT_MIN_WALL));
-    }
-
-    #[test]
-    fn a_light_pass_whose_paused_time_leaves_it_under_the_floor_gets_no_route_hint() {
-        refused_without_asking(route_judged(Slot::Light, true, 40.0, 15.0, ROUTE_HINT_MIN_WALL));
-    }
-
-    #[test]
-    fn a_run_not_on_its_own_slot_gets_no_route_hint() {
-        refused_without_asking(route_judged(Slot::Light, false, 60.0, 0.0, ROUTE_HINT_MIN_WALL));
-    }
-
-    #[test]
-    fn a_heavy_or_no_slot_run_gets_no_route_hint() {
-        for slot in [Slot::Heavy, Slot::Critical, Slot::None] {
-            refused_without_asking(route_judged(slot, true, 60.0, 0.0, ROUTE_HINT_MIN_WALL));
-        }
-    }
-
-    #[test]
-    fn a_light_pass_of_exactly_the_route_hint_floor_is_hinted() {
-        let line = route_hint_for(route_judged(Slot::Light, true, 30.0, 0.0, ROUTE_HINT_MIN_WALL), || true);
-        assert_eq!(
-            line.as_deref(),
-            Some("gate: ran 30 s on a light slot; on heavy, remote.json would send this command to a builder")
         );
     }
 

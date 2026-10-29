@@ -79,6 +79,14 @@ pub fn heavy(words: &[String]) -> Inputs<'_> {
     }
 }
 
+/// A light gate, not `--local`, under no parent, outside a git hook.
+pub fn light(words: &[String]) -> Inputs<'_> {
+    Inputs {
+        slot: Slot::Light,
+        ..heavy(words)
+    }
+}
+
 pub struct FakeFacts {
     pub config: Result<Option<Config>, ConfigProblem>,
     pub place: Result<Option<Place>, String>,
@@ -153,6 +161,10 @@ pub struct FakeFacts {
     pub figures: Vec<(String, BuilderFigures)>,
     /// How many times the builders' figures were asked, kept apart from [`FakeFacts::asked`].
     pub figures_asked: Cell<usize>,
+    /// The command's learned local p50 as proof needs it; `None`, no proof, unless a case sets it.
+    pub local_p50: Option<f64>,
+    /// How many times the local p50 was asked, kept apart from [`FakeFacts::asked`].
+    pub local_p50_asked: Cell<usize>,
 }
 
 impl FakeFacts {
@@ -204,6 +216,8 @@ impl FakeFacts {
             sets_configuration: false,
             figures: Vec::new(),
             figures_asked: Cell::new(0),
+            local_p50: None,
+            local_p50_asked: Cell::new(0),
         }
     }
 
@@ -419,7 +433,7 @@ impl Facts for FakeFacts {
     }
 
     /// What [`FakeFacts::figures`] says of each builder, [`balance::ALIKE`] for one it does not name; `None`, no figures
-    /// read, when it names none, as the machine of a route hint answers.
+    /// read, when it names none.
     fn builder_figures(&self, _place: &Place, _words: &[String], builders: &[&Builder]) -> Option<Vec<BuilderFigures>> {
         self.figures_asked.set(self.figures_asked.get() + 1);
         if self.figures.is_empty() {
@@ -435,6 +449,11 @@ impl Facts for FakeFacts {
             })
             .collect();
         Some(figures)
+    }
+
+    fn local_p50(&self, _place: &Place, _words: &[String]) -> Option<f64> {
+        self.local_p50_asked.set(self.local_p50_asked.get() + 1);
+        self.local_p50
     }
 }
 

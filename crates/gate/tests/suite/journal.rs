@@ -401,7 +401,9 @@ fn a_routed_run_journals_the_tailscale_path_and_a_run_here_none() {
     let steps = shown(&stub(&case, &["status 0"]));
 
     let routed = finish(case.gate(&routed_words("routed.log", &steps, &seam, &[r".\tool.exe", "out", "hi"])));
-    let here = finish(case.gate(&run_words("here.log", &seam, &[FAKE_TOOL, "exit", "0"])));
+    // The run here matches the case's `*tool*`, so `--local` keeps it here.
+    let here_words = [&seam[..], &["--local"], &LOCAL_REASON[..]].concat();
+    let here = finish(case.gate(&run_words("here.log", &here_words, &[FAKE_TOOL, "exit", "0"])));
 
     assert_eq!((routed.code, here.code), (Some(0), Some(0)), "{routed:?}\n{here:?}");
     let releases: Vec<Value> = events(&case).into_iter().filter(|event| event["event"] == "release").collect();

@@ -49,8 +49,6 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     SampleMs,
     #[cfg(feature = "test-seams")]
-    RouteHintFloorMs,
-    #[cfg(feature = "test-seams")]
     LoadWindowMs,
     #[cfg(feature = "test-seams")]
     HeartbeatMs,
@@ -376,7 +374,6 @@ impl RunBuilder {
             ValueOption::Builder => self.builder = Some(value.to_owned()),
             #[cfg(feature = "test-seams")]
             ValueOption::SampleMs
-            | ValueOption::RouteHintFloorMs
             | ValueOption::LoadWindowMs
             | ValueOption::HeartbeatMs
             | ValueOption::PollMs
@@ -441,7 +438,6 @@ impl RunBuilder {
         let seams = &mut self.test_seams;
         match option {
             ValueOption::SampleMs => seams.sample_ms = Some(values::above_zero(spelled, value)?),
-            ValueOption::RouteHintFloorMs => seams.route_hint_floor_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::LoadWindowMs => seams.load_window_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::HeartbeatMs => seams.heartbeat_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::PollMs => seams.poll_ms = Some(values::above_zero(spelled, value)?),
@@ -644,7 +640,8 @@ impl RunBuilder {
         }
     }
 
-    /// Refuses a `--builder` pin on a run that can never route: one given `--local`, or one on a slot other than heavy.
+    /// Refuses a `--builder` pin on a run that can never route: one given `--local`, or one on a slot other than heavy or
+    /// light.
     fn check_builder_routes(&mut self) {
         let Some(host) = &self.builder else {
             return;
@@ -653,7 +650,9 @@ impl RunBuilder {
             "--local keeps it here".to_owned()
         } else {
             match self.slot {
-                Some(slot) if slot != Slot::Heavy => format!("only a heavy run routes, and this one is --slot {}", slot.as_str()),
+                Some(slot @ (Slot::Critical | Slot::None)) => {
+                    format!("only a heavy or light run routes, and this one is --slot {}", slot.as_str())
+                }
                 _ => return,
             }
         };

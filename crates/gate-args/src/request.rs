@@ -357,9 +357,6 @@ pub struct TestSeams {
     /// Whether the local watchdog's stall window runs only from the command's first output byte, so a quiet start is no
     /// stall.
     pub stall_from_output: bool,
-    /// The unpaused wall time under which a passed light run is too short to ask whether its command would route on
-    /// heavy, in milliseconds, in place of the gate's own floor.
-    pub route_hint_floor_ms: Option<u64>,
     /// How long each window of an `--alone` run's machine-load snapshot measures, in milliseconds, in place of the
     /// gate's own window.
     pub load_window_ms: Option<u64>,

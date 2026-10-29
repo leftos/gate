@@ -2,7 +2,7 @@
 //! drive table, then, for a command that would still route in a repo whose warm-up is set up, the hash of its warm-up
 //! file, and the lines they say. git runs on the run thread, before any command is started.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -40,8 +40,10 @@ use crate::{durations, wait, warm, worktree_record};
 use gate_inputs::names::PATH_DEPTH_LIMIT;
 use gate_state::v1;
 
-/// The `notRouted` value of a heavy gate its caller kept here with `--local`.
+/// The `notRouted` value of a heavy or light gate its caller kept here with `--local`.
 const LOCAL_FLAG: &str = "--local";
+/// The `notRouted` value of a light gate whose learned local run time proves it faster here.
+const FASTER_HERE: &str = "faster here";
 /// The `notRouted` value of a matched command kept here because its outside path lies in another git worktree.
 const ANOTHER_WORKTREE: &str = "another worktree";
 /// The `notRouted` value of a matched command its repo's `.gate/local.toml` keeps here.
@@ -64,9 +66,6 @@ pub(crate) const SIBLING_GIT_LINK: &str = "has a .git that is a link or a juncti
 pub(crate) const SIBLING_NO_GIT: &str = "has no .git";
 /// Why a command that would route runs here when one of its words is not valid Unicode.
 const NOT_UNICODE: &str = "a word of the command is not valid Unicode";
-/// How long a git call of the hint's decision may take while the run still holds its light slot: a call that cannot
-/// answer in time means no hint, silently ([`would_route_on_heavy`]).
-const HINT_GIT_LIMIT: Duration = Duration::from_secs(5);
 /// How long the git calls of one read of the change against `.gate/windows.toml`'s paths may take together, for the
 /// worktree and every sibling it reads ([`Facts::windows_change`]); each call's own limit is what is left of it.
 const CHANGE_DEADLINE: Duration = Duration::from_secs(10);
@@ -111,7 +110,7 @@ impl Placed {
 
 /// Where a run's command runs ([`route`]), what the decision learnt of the gate's place in its git worktree, the hash of
 /// the routed run's warm-up file when its repo's warm-up is set up ([`consented_hash`]), and what the decision saw,
-/// which a passed light run asks again as a heavy one ([`would_route_on_heavy`]).
+/// which a light run held back by a critical request asks again as a heavy one ([`route_as_heavy`]).
 pub(crate) struct Decided {
     pub route: Route,
     pub placed: Placed,
@@ -119,9 +118,10 @@ pub(crate) struct Decided {
     pub decision: Decision,
 }
 
-/// What the routing decision saw of the run, kept so a passed light run can ask whether its command would route on heavy
-/// without reading the routing file or git on any other run: the [`Inputs`] the run's own decision had, less the slot it
-/// asked for, and what [`Machine::new`] read of the environment.
+/// What the routing decision saw of the run, kept so a light run its start decision kept here can ask, once a critical
+/// request holds it back, whether its command would route on heavy without reading the routing file or git on any other
+/// run: the [`Inputs`] the run's own decision had, less the slot it asked for, and what [`Machine::new`] read of the
+/// environment.
 #[expect(
     clippy::struct_excessive_bools,
     reason = "each bool is an independent input of the decision, read by name; no two form a state machine"
@@ -337,7 +337,7 @@ fn balanced_figures(entry: &BalancedEntry, has_duration: bool) -> String {
 }
 
 /// The routed run a light gate held back behind a critical request gets when its command would route on heavy: the
-/// decision `decision` saw asked again with the heavy slot ([`would_route_on_heavy`]'s question), with the git limits
+/// decision `decision` saw asked again with the heavy slot, no proof of speed consulted, with the git limits
 /// and the `HEAD` a routed run reads. Says that the critical request of gate `by` sends the run to its builder, then
 /// the routed run's lines as [`route`] does, and notes the decision's log lines. `None` when the decision would keep
 /// the run here or a word is not valid Unicode, and `None` when the log lies in another worktree of the run's repo than
@@ -398,26 +398,6 @@ pub(crate) fn later_run(
     run
 }
 
-/// Whether a light run whose routing decision saw `decision` would route on heavy: the decision asked again with the
-/// heavy slot and every other input exactly as the run's own had it, routed only when every word of the command is valid
-/// Unicode (the [`NOT_UNICODE`] rule [`route`] applies). Its git calls run under [`HINT_GIT_LIMIT`], since the run still
-/// holds its light slot, and a call that cannot answer in time means no hint. It reads the routing file and git as the
-/// decision would, and never reads the warm-up file ([`consented_hash`]) or says a line; nor does it look up the
-/// worktree an outside path lies in, which only changes the line of a run kept here.
-pub(crate) fn would_route_on_heavy(decision: &Decision, seams: &TestSeams) -> bool {
-    let machine = Machine::hint(decision.local_app_data.as_deref(), seams).with_state(decision);
-    hint_holds(decision.unicode, &machine, |machine| {
-        matches!(decide(&decision.inputs(gate_router::Slot::Heavy), machine), Route::Routed(_))
-    })
-}
-
-/// Whether the hint's decision gives a hint: only for a command whose words are all valid Unicode (`unicode`), which
-/// alone asks `routes` whether the decision on `machine` routes it, and only when it does and the read of the change
-/// against `.gate/windows.toml`'s paths, if `machine` made one, could tell it.
-fn hint_holds(unicode: bool, machine: &Machine<'_>, routes: impl FnOnce(&Machine<'_>) -> bool) -> bool {
-    unicode && routes(machine) && !machine.change_unknown.get()
-}
-
 /// The line a routed run says for the watched variables of the gate's environment it does not send
 /// ([`gate_router::dropped_env`]), the names starting one of the repo's `declared` prefixes among them: those no
 /// `--env` pair of `request` names and the gate does not set itself. A name that is not valid Unicode is left out, and
@@ -472,8 +452,9 @@ fn consented_hash(remote: &RemoteRun, machine: &Machine<'_>) -> Option<String> {
     }
 }
 
-/// The queue line's `notRouted`: `--local` for a heavy gate its caller kept here with `--local`, `another worktree`
-/// for a matched command whose outside path lies in another git worktree, `declared local` for one its repo's
+/// The queue line's `notRouted`: `--local` for a heavy or light gate its caller kept here with `--local`, `faster here`
+/// for a light gate its learned local run time proves faster here ([`LocalReason::FasterHere`]), `another worktree` for
+/// a matched command whose outside path lies in another git worktree, `declared local` for one its repo's
 /// `.gate/local.toml` keeps here, by a pattern or by a problem, `gitignored input` for one whose word names a gitignored
 /// project input, else none.
 pub(crate) fn not_routed(route: &Route) -> Option<String> {
@@ -481,6 +462,9 @@ pub(crate) fn not_routed(route: &Route) -> Option<String> {
         Route::Local {
             reason: Some(LocalReason::LocalFlag),
         } => Some(LOCAL_FLAG.to_owned()),
+        Route::Local {
+            reason: Some(LocalReason::FasterHere { .. }),
+        } => Some(FASTER_HERE.to_owned()),
         Route::Local {
             reason: Some(LocalReason::OtherWorktree { .. }),
         } => Some(ANOTHER_WORKTREE.to_owned()),
@@ -690,27 +674,11 @@ pub(crate) struct Machine<'a> {
     /// module's [`git::OUTPUT_CAP`].
     listing_cap: usize,
     /// How long the git calls of one read of the change against `.gate/windows.toml`'s paths may take together
-    /// ([`Facts::windows_change`]): [`CHANGE_DEADLINE`], or the `--test-git-limit-ms` seam when it is given; the hint's
-    /// decision's own git limit for the hint's ([`would_route_on_heavy`]).
+    /// ([`Facts::windows_change`]): [`CHANGE_DEADLINE`], or the `--test-git-limit-ms` seam when it is given.
     change_deadline: Duration,
-    /// Whether a read of the change could not tell it ([`Facts::windows_change`]), which words are gitignored could not
-    /// be told for every candidate, or a word names a gitignored project input ([`Facts::gitignored_inputs`]): the
-    /// hint's decision then gives no hint ([`would_route_on_heavy`]), so a light run naming a gitignored project says
-    /// nothing whether heavy would carry it or keep it here.
-    change_unknown: Cell<bool>,
-    /// Whether a placement call's readers get as long as git itself may take once it exits by itself
-    /// ([`git::placing_drain`]): true for the decision, false for the hint's, which keeps the ordinary drain while the
-    /// run holds its light slot ([`would_route_on_heavy`]).
-    placing: bool,
     found: RefCell<Placed>,
     /// The routing file the decision read, when it read one: the warm-up's judgement reads its consent from this.
     config: RefCell<Option<Config>>,
-    /// Whether the worktree an outside path lies in is looked up ([`Facts::worktree_of`]): only a decision that may say
-    /// the line naming it does.
-    look_up_trees: bool,
-    /// Whether the worktree's `HEAD` is read ([`Facts::head_sha`]): the route hint, which throws the route away, does
-    /// not, and answers no sha.
-    read_head: bool,
     /// The log lines of the declaration files the decision read ([`Source::log_lines`]), for the log alone.
     notes: RefCell<Vec<String>>,
     /// Each declaration file the decision read, by name, with how the lines name it ([`Source::said`]).
@@ -719,7 +687,7 @@ pub(crate) struct Machine<'a> {
     /// `None` for the ssh transport.
     remote_transport: Option<String>,
     /// The absolute path of the log the run writes, which a sweep leaves out ([`swept_folder`]); `None` for a decision
-    /// that runs nothing (`gate warm`, the route hint).
+    /// that runs nothing (`gate warm`).
     run_log: Option<PathBuf>,
     /// The state root whose built-here record says which builds ran here ([`Facts::built_here`]); `None` for a
     /// decision that routes no command (`gate warm`), which then finds no build here.
@@ -728,9 +696,9 @@ pub(crate) struct Machine<'a> {
     figures: Figures<'a>,
 }
 
-/// What a machine tells of each builder a decision scores: nothing, as the route hint, a light run's reroute by a
-/// critical request and `gate warm` have it, so file order decides, or the figures this PC reads for the run of a
-/// routing decision ([`FigureReader`]).
+/// What a machine tells of each builder a decision scores, and of the run's learned local p50: nothing, as a light
+/// run's reroute by a critical request and `gate warm` have it, so file order decides and no run is proven faster here,
+/// or the figures this PC reads for the run of a routing decision ([`FigureReader`]).
 enum Figures<'a> {
     Unread,
     Read(FigureReader<'a>),
@@ -750,6 +718,14 @@ pub(crate) struct FigureReader<'a> {
 }
 
 impl<'a> FigureReader<'a> {
+    /// The run's learned p50 here, for the worktree at `place`: its exact key's, with at least five passing runs in
+    /// the window ([`durations::local_p50`], one read of the store); `None` when the gate's journal identity cannot be
+    /// read, as the run then has no durations.
+    fn local_p50(&self, place: &Place) -> Option<f64> {
+        let command = self.command.as_deref()?;
+        durations::local_p50(&self.root.path, place, command, self.critical)
+    }
+
     /// The reader of the figures of `request`'s run, the gate `gate` under the state root `root`.
     fn of(request: &RunRequest, root: &'a ResolvedRoot, gate: &'a ThisGate) -> FigureReader<'a> {
         FigureReader {
@@ -821,13 +797,9 @@ impl<'a> Machine<'a> {
             git_limit,
             git_drain,
             change_deadline: CHANGE_DEADLINE,
-            change_unknown: Cell::new(false),
             listing_cap: git::OUTPUT_CAP,
-            placing: true,
             found: RefCell::new(Placed::NotAsked),
             config: RefCell::new(None),
-            look_up_trees: true,
-            read_head: true,
             notes: RefCell::new(Vec::new()),
             said: RefCell::new(Vec::new()),
             remote_transport: None,
@@ -851,20 +823,6 @@ impl<'a> Machine<'a> {
         Machine {
             state: Some(decision.state.clone()),
             ..self
-        }
-    }
-
-    /// The facts of the hint's decision ([`would_route_on_heavy`]): the routing file `local_app_data` names, its git
-    /// calls under [`HINT_GIT_LIMIT`] or the seams' limit when that is shorter, its readers under the seams' drain,
-    /// which its placement call keeps, and neither the worktree of an outside path nor the worktree's `HEAD` read.
-    fn hint(local_app_data: Option<&'a OsStr>, seams: &TestSeams) -> Machine<'a> {
-        let limit = git::limit(seams).min(HINT_GIT_LIMIT);
-        Machine {
-            look_up_trees: false,
-            read_head: false,
-            placing: false,
-            change_deadline: limit,
-            ..Machine::at(local_app_data, limit, git::drain(seams))
         }
     }
 
@@ -960,13 +918,11 @@ impl<'a> Machine<'a> {
         Ok(listing.split('\0').filter(|file| !file.is_empty()).map(str::to_owned).collect())
     }
 
-    /// Says in the log why which words are gitignored cannot be told, and marks the decision as one that gives no
-    /// route hint ([`Machine::change_unknown`]).
+    /// Says in the log why which words are gitignored cannot be told.
     fn cannot_tell(&self, why: &str) {
         self.notes
             .borrow_mut()
             .push(format!("gate: cannot tell which words are gitignored: {why}"));
-        self.change_unknown.set(true);
     }
 
     /// The candidates of `judged` all of whose project files one `git check-ignore` in `root` reports ignored
@@ -1217,14 +1173,9 @@ impl<'a> Machine<'a> {
     }
 
     /// The decision's placement call in `folder`: [`PLACE_ARGS`] asked and built as every placement call is
-    /// ([`git::Call::placing`]), but for the hint's decision, which keeps the ordinary drain while the run holds its
-    /// light slot ([`would_route_on_heavy`]).
+    /// ([`git::Call::placing`]).
     fn place_call<'b>(&self, folder: &'b Path) -> git::Call<'b> {
-        if self.placing {
-            git::Call::placing(folder, &PLACE_ARGS, self.git_limit, self.git_drain, None)
-        } else {
-            self.git_call(folder, &PLACE_ARGS)
-        }
+        git::Call::placing(folder, &PLACE_ARGS, self.git_limit, self.git_drain, None)
     }
 }
 
@@ -1277,9 +1228,6 @@ impl Facts for Machine<'_> {
     /// The root's `HEAD` sha, `Ok(None)` when the worktree has none: a `git rev-parse --verify -q HEAD` that fails (an
     /// unborn branch among them) or writes anything but one sha is no sha.
     fn head_sha(&self, place: &Place) -> Result<Option<String>, String> {
-        if !self.read_head {
-            return Ok(None);
-        }
         let root = Path::new(&place.root);
         let args = ["rev-parse", "--verify", "-q", "HEAD"];
         let mut ran = git::Git::find(root)?.run(&self.git_call(root, &args))?;
@@ -1350,14 +1298,10 @@ impl Facts for Machine<'_> {
     }
 
     /// A change that touches a declared path, or cannot be told to, says why in the log ([`Machine::read_change`]).
-    /// The hint's machine notes an unknown change apart, which means no hint ([`would_route_on_heavy`]).
     fn windows_change(&self, place: &Place, siblings: &[SiblingRoot], absent: &[String], siblings_problem: Option<&str>) -> WindowsChange {
         let change = self
             .read_change(place, siblings, absent, siblings_problem)
             .unwrap_or_else(|why| WindowsChange::Unknown { why });
-        if matches!(change, WindowsChange::Unknown { .. }) {
-            self.change_unknown.set(true);
-        }
         if let Some(reason) = change.reason(&self.declaration_said(place, windows::WINDOWS_NAME)) {
             self.notes.borrow_mut().push(format!("gate: kept off the macOS builder: {reason}"));
         }
@@ -1384,7 +1328,7 @@ impl Facts for Machine<'_> {
     /// them ([`Machine::uncovered`]), are asked of one `git check-ignore` ([`Machine::ignored_candidates`]), made only
     /// when there is such a file; a path is given back when git reports every one of its project files ignored, and only
     /// such a path is swept, carrying its swept files git reports ignored, or why it cannot be carried
-    /// ([`Machine::carried_ignored`]). A decision given any path back gives no route hint ([`Machine::change_unknown`]).
+    /// ([`Machine::carried_ignored`]).
     fn gitignored_inputs(&self, place: &Place, paths: &[String], inputs: &[String]) -> Vec<GitignoredInput> {
         let root = Path::new(&place.root);
         let globs = match Globs::inputs(inputs, NOTHING_EXCLUDED) {
@@ -1404,12 +1348,7 @@ impl Facts for Machine<'_> {
             .into_iter()
             .map(|(path, own)| (*path, swept(root, path, own, &globs, log.as_deref())))
             .collect();
-        let found = self.carried_ignored(root, &swept);
-        // A light run naming a gitignored project input gives no route hint, whether or not heavy would carry it.
-        if !found.is_empty() {
-            self.change_unknown.set(true);
-        }
-        found
+        self.carried_ignored(root, &swept)
     }
 
     fn subst_target(&self, letter: char) -> Option<String> {
@@ -1447,11 +1386,7 @@ impl Facts for Machine<'_> {
         root_id(root)
     }
 
-    /// None without looking when the machine does not look up trees (the heavy-route hint's).
     fn worktree_of(&self, path: &Path) -> Option<PathBuf> {
-        if !self.look_up_trees {
-            return None;
-        }
         worktree_of(path)
     }
 
@@ -1465,6 +1400,13 @@ impl Facts for Machine<'_> {
         match &self.figures {
             Figures::Unread => None,
             Figures::Read(reader) => Some(reader.figures(place, builders, &self.notes)),
+        }
+    }
+
+    fn local_p50(&self, place: &Place, _words: &[String]) -> Option<f64> {
+        match &self.figures {
+            Figures::Unread => None,
+            Figures::Read(reader) => reader.local_p50(place),
         }
     }
 }
@@ -2148,10 +2090,10 @@ mod tests {
     };
 
     use super::{
-        CHANGE_DEADLINE, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, GATE_FILE_NOT_A_FILE, HINT_GIT_LIMIT, Machine, Origin, SIBLING_GIT_LINK,
-        SIBLING_LINK, SIBLING_NOT_A_FOLDER, Source, balanced_line, change_error, change_limit, checkout_of, hint_holds, holds_existing_path,
-        is_fixed_local, is_share_target, judge_declarations, not_routed, nul_separated, parse_head, parse_place, read_declaration, read_siblings,
-        same_folder, sibling_folder, worktree_of,
+        CHANGE_DEADLINE, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, GATE_FILE_NOT_A_FILE, Machine, Origin, SIBLING_GIT_LINK, SIBLING_LINK,
+        SIBLING_NOT_A_FOLDER, Source, balanced_line, change_error, change_limit, checkout_of, holds_existing_path, is_fixed_local, is_share_target,
+        judge_declarations, not_routed, nul_separated, parse_head, parse_place, read_declaration, read_siblings, same_folder, sibling_folder,
+        worktree_of,
     };
     use crate::remote::box_trees;
     use crate::remote::git;
@@ -2304,23 +2246,6 @@ mod tests {
             call.drain_once_exited(),
             Duration::from_secs(600),
             "the drain an ordinary git call was given is kept after a clean exit too"
-        );
-    }
-
-    #[test]
-    fn the_hint_s_placement_call_keeps_the_ordinary_drain() {
-        let hint = Machine::hint(None, &TestSeams::default());
-        let call = hint.place_call(Path::new(FOLDER));
-        assert_eq!(
-            call.limit, HINT_GIT_LIMIT,
-            "the hint holds its light slot, so its calls keep the hint's limit"
-        );
-        assert_eq!(call.drain, git::GitBounds::DEFAULT.drain, "the hint's readers get the seams' drain");
-        assert_eq!(call.exit_drain, None, "the hint's placement call is built as an ordinary git call");
-        assert_eq!(
-            call.drain_once_exited(),
-            git::GitBounds::DEFAULT.drain,
-            "the hint keeps the ordinary drain once git exits by itself too"
         );
     }
 
@@ -2782,22 +2707,6 @@ mod tests {
     }
 
     #[test]
-    fn a_hint_reads_nothing_for_a_word_not_unicode_and_none_holds_for_an_unknown_change() {
-        let machine = Machine::hint(None, &TestSeams::default());
-        assert!(!hint_holds(false, &machine, |_| panic!("the decision is not asked")));
-        assert!(hint_holds(true, &machine, |_| true), "a routed decision with a change told");
-        assert!(!hint_holds(true, &machine, |_| false));
-        let unknown = |machine: &Machine<'_>| {
-            machine.change_unknown.set(true);
-            true
-        };
-        assert!(
-            !hint_holds(true, &Machine::hint(None, &TestSeams::default()), unknown),
-            "a routed decision, change unknown"
-        );
-    }
-
-    #[test]
     fn a_head_git_cannot_read_says_git_failure_line_and_an_unborn_one_names_no_commit() {
         let (broken, _removed) = scratch("change-broken-git");
         put(&broken, ".gate/windows.toml");
@@ -2870,21 +2779,8 @@ mod tests {
     }
 
     #[test]
-    fn the_hint_reads_the_change_under_its_own_limit_and_an_unknown_one_means_no_hint() {
-        let seams = TestSeams::default();
-        let hint = Machine::hint(None, &seams);
-        assert_eq!((hint.change_deadline, hint.git_limit), (HINT_GIT_LIMIT, HINT_GIT_LIMIT));
-        assert_eq!(Machine::of(None, &seams).change_deadline, CHANGE_DEADLINE);
-        let (root, _removed) = scratch("change-hint");
-        git_in(&root, &["init", "--quiet"]);
-        put(&root, ".gate/windows.toml");
-        fs::write(root.join(".gate").join("windows.toml"), "paths = ['a/*']\n").expect("the declaration can be written");
-        let machine = Machine::hint(None, &seams);
-        assert!(matches!(
-            machine.windows_change(&place_of(&root), &[], &[], None),
-            WindowsChange::Unknown { .. }
-        ));
-        assert!(machine.change_unknown.get(), "the hint's decision gives no hint");
+    fn a_decision_reads_the_change_under_the_change_deadline() {
+        assert_eq!(Machine::of(None, &TestSeams::default()).change_deadline, CHANGE_DEADLINE);
     }
 
     #[test]

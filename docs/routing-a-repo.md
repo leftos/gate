@@ -16,13 +16,13 @@ Every repo that runs heavy gates is in scope, and every heavy command family in 
 
   A reason that work can remove does not keep a family local. It is a blocker to book. Examples: a tool or SDK the builder lacks, a window or GL the desktop route can serve, a `--local` whose recorded reason shows a routing gap, an outputs list that would need to grow (a routed `dotnet build`'s own project bin needs no entry: it comes back with the repo's list).
 
-Coverage is judged from the journal's history of gated commands per repo, not from the commands guessed to matter. Light-slot runs never route (the router considers heavy runs only), so a repo whose gates are all light, short checks stays local without an entry.
+Coverage is judged from the journal's history of gated commands per repo, not from the commands guessed to matter. A light-slot run routes by the same entries, and stays here when it is provably faster here (its learned local p50 under 0.8 times the chosen builder's expected finish), so a repo's short light checks need an entry only when they should run on a builder.
 
 A caller never adds `--local` (`-Local`) to a gate unless that command has been tried routed and failed. It then reruns locally only what failed and always reports the failure to the gate repo's inbox with the command, the gate's lines and the log path.
 
 The gate repo fixes the routing or rules that the command stays local, and a command ruled local is kept local by the router through the repo's `.gate/local.toml` ([A repo with a command that stays on this PC](#a-repo-with-a-command-that-stays-on-this-pc)), so callers do not carry the flag.
 
-Every `--local` run must give `--reason "<why>"` (the gate refuses it otherwise). A heavy one is journalled as `notRouted: --local` with the reason on its `queue` event, which is how stray uses are found (a command kept here by `.gate/local.toml` is journalled `notRouted: declared local`, never `--local`); a light one writes the reason without `notRouted`. The reason is also in its claim and ticket and on ops-tower's Gates page.
+Every `--local` run must give `--reason "<why>"` (the gate refuses it otherwise). It is journalled as `notRouted: --local` with the reason on its `queue` event, a light run's included, which is how stray uses are found (a command kept here by `.gate/local.toml` is journalled `notRouted: declared local`, never `--local`; a light run kept here for being faster is `notRouted: faster here`). The reason is also in its claim and ticket and on ops-tower's Gates page.
 
 A command run from one worktree that names a path in another worktree of a listed repo stays local, saying `gate: not routed: the command works in <tree>; run it with --cd <tree>`. Run it again with `--cd <tree>` to route it from that worktree ([design.md, Routing](design.md#routing)). A path in an unlisted repo, on a network drive or in no worktree keeps the plain `is outside the worktree` line.
 

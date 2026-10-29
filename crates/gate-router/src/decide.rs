@@ -1,7 +1,8 @@
 //! The routing decision: whether a gate's command runs on the builder and, when it does, the words, folder, key and
 //! outputs of that run. The rules apply in order, and each fact is asked of the caller ([`Facts`]) only at the rule
-//! that needs it: a light or critical gate, `--local` or a covering parent read no routing file, and a machine with no
-//! routing file costs no git call.
+//! that needs it: a critical or no-slot gate, `--local` or a covering parent read no routing file, and a machine with
+//! no routing file costs no git call. A heavy and a light gate route alike, except that a light one stays here when its
+//! learned local run time proves it faster here ([`balance::faster_here`]).
 
 use std::cell::OnceCell;
 use std::collections::HashSet;
@@ -213,7 +214,7 @@ pub enum Slot {
 /// What the caller knows before the decision asks anything.
 #[derive(Debug, Clone, Copy)]
 pub struct Inputs<'a> {
-    /// The gate's slot kind; only a heavy gate routes.
+    /// The gate's slot kind; only a heavy or light gate routes.
     pub slot: Slot,
     /// Whether a covering or lending parent slot holds this gate, which then runs on the parent's slot.
     pub covering_parent: bool,
@@ -255,7 +256,7 @@ pub struct GitignoredInput {
 /// The facts the decision asks the caller for, each only when a rule needs it.
 pub trait Facts {
     /// The routing file, read and given to [`Config::parse`]: `Ok(None)` when there is no such file. Asked only of a
-    /// heavy gate under no covering or lending parent and without `--local`.
+    /// heavy or light gate under no covering or lending parent and without `--local`.
     ///
     /// # Errors
     ///
@@ -436,8 +437,16 @@ pub trait Facts {
     /// when these facts read no figures, which keeps the builders in file order and the run without a balanced pick
     /// ([`RemoteRun::balanced`]). Asked once per decision, with every builder one of whose own patterns matches the
     /// command, of a matched command whose worktree opened and that its `.gate/local.toml` does not keep here, only when
-    /// two or more builders match; never asked of a run pinned with `--builder`.
+    /// two or more builders match, or when a light run has a learned local p50 ([`Facts::local_p50`]), then even of one
+    /// builder; never asked of a run pinned with `--builder`.
     fn builder_figures(&self, place: &Place, words: &[String], builders: &[&Builder]) -> Option<Vec<BuilderFigures>>;
+
+    /// The learned p50, in seconds, of the command `words`, rewritten for Windows, run here from the worktree at
+    /// `place`: only from its exact key with at least five passing runs in the window, never a family key's; `None`
+    /// otherwise, and when these facts read no durations. Asked once per decision, only of a light gate's matched
+    /// command that its `.gate/local.toml` does not keep here, before the builders' figures; a `Some` is compared with
+    /// the expected finish of the builder the steer-offs choose ([`balance::faster_here`]).
+    fn local_p50(&self, place: &Place, words: &[String]) -> Option<f64>;
 }
 
 /// The id of an open folder: its volume's serial number and its 128-bit file id. Two handles give one id only when they
@@ -539,8 +548,12 @@ impl PinRefusal {
 /// Why a command runs here, for each case that says so.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalReason {
-    /// `--local` was given on a heavy gate.
+    /// `--local` was given on a heavy or light gate.
     LocalFlag,
+    /// A light gate's command is proven faster here ([`balance::faster_here`]): its learned local p50, `here_tenths`,
+    /// is under the share of the expected finish, `there_tenths`, of `builder`, the builder the run would go to once the
+    /// steer-offs chose it; both in whole tenths of a second ([`balance::tenths`]).
+    FasterHere { here_tenths: u64, builder: String, there_tenths: u64 },
     /// The routing file at `path` is there but cannot be used, for `reason`.
     Ignored { path: PathBuf, reason: String },
     /// A matched command's word, as given, names a path outside the worktree.
@@ -608,6 +621,15 @@ impl LocalReason {
     pub fn reason(&self) -> String {
         match self {
             Self::LocalFlag => "--local".to_owned(),
+            Self::FasterHere {
+                here_tenths,
+                builder,
+                there_tenths,
+            } => format!(
+                "faster here: about {} here, {builder} about {}",
+                balance::span_text(balance::from_tenths(*here_tenths)),
+                balance::span_text(balance::from_tenths(*there_tenths))
+            ),
             Self::Ignored { path, reason } => format!("ignored {}: {reason}", path.display()),
             Self::Outside { word } => format!("{word} is outside the worktree"),
             Self::OtherWorktree { tree } => {
@@ -742,8 +764,8 @@ pub struct RemoteRun {
     /// Every builder the decision scored, when it scored two or more from figures the facts read
     /// ([`Facts::builder_figures`], [`balance::ranked`]): the builder this run goes to first, then every other in score
     /// order, each with its score and figures. `None` for a run pinned with `--builder`, a command only one builder may
-    /// run, a decision whose facts read no figures (the route hint, a light run's reroute by a critical request, `gate
-    /// warm`), and a later candidate's run ([`later_run`]).
+    /// run, a decision whose facts read no figures (a light run's reroute by a critical request, `gate warm`), and a
+    /// later candidate's run ([`later_run`]).
     pub balanced: Option<Balanced>,
     /// The cross build the macOS builder runs after the passing command, so its outputs come back built for Windows:
     /// set only for a direct `dotnet build`, or `dotnet test` without `--no-build`, of a repo the builder's entry
@@ -922,7 +944,7 @@ fn absent_line(names: &[String]) -> Option<String> {
     }
 }
 
-/// Where a gate's command runs. In order: only a heavy gate routes; a covering or lending parent keeps it here; `--local`
+/// Where a gate's command runs. In order: only a heavy or light gate routes; a covering or lending parent keeps it here; `--local`
 /// keeps it here saying so; then the routing file is read, and no file keeps it here, an unusable one saying it was
 /// ignored; a git hook whose `hooks` names no repo, no non-empty word, or a first word whose file name without extension
 /// is `git` or `prek` keep it here; so does a folder in no git worktree, a repo the routing file does not list, a git
@@ -938,7 +960,9 @@ fn absent_line(names: &[String]) -> Option<String> {
 /// when a word names a path outside the worktree and its siblings; or when the gate's folder holds nothing the snapshot
 /// sends; and so does one whose facts cannot be read. Last, a dotnet `test` or `run --no-build` whose last build ran
 /// here under its own settings ([`Facts::built_here`]) and whose send of the PC's build cannot be made runs here
-/// keeping its word, saying why ([`LocalReason::BuiltHere`]).
+/// keeping its word, saying why ([`LocalReason::BuiltHere`]). A light gate's matched command its `.gate/local.toml`
+/// does not keep here runs here, saying why, when its learned local p50 proves it faster here than the builder the
+/// macOS and backslash steer-offs leave it ([`LocalReason::FasterHere`]).
 ///
 /// A run pinned to one builder ([`Inputs::pin`]) goes to that builder alone, with no later candidates, or is refused
 /// ([`pinned`]).
@@ -1051,7 +1075,7 @@ struct Matched {
 
 fn route(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<RemoteRun, Here> {
     let config = eligible(inputs, facts)?;
-    let matched = matched(&config, inputs.git_hook, inputs.words, facts)?;
+    let matched = matched(&config, inputs, facts)?;
     ended(&config, matched, inputs.words, facts)
 }
 
@@ -1093,10 +1117,15 @@ fn spelled_as_own(tree: &Path, target: &Target) -> bool {
         .any(|root| eq_ignoring_case(&folded(root), &tree))
 }
 
+/// Whether a gate of `slot` may route at all: a heavy or light one, never a critical or no-slot one.
+fn routes_on(slot: Slot) -> bool {
+    matches!(slot, Slot::Heavy | Slot::Light)
+}
+
 /// The routing file when the gate may route at all, before any git fact is asked; the file is read only after the
 /// slot, parent and `--local` checks.
 fn eligible(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Config, Here> {
-    if inputs.slot != Slot::Heavy || inputs.covering_parent {
+    if !routes_on(inputs.slot) || inputs.covering_parent {
         return Err(None);
     }
     if inputs.local {
@@ -1476,7 +1505,8 @@ fn file_stem(path: &str) -> &str {
 /// A macOS pick runs the words rewritten with `/` ([`Separators::Slash`]) and its relative `\` paths the snapshot carries
 /// written with `/` ([`unix_form`]); a pick whose words still hold a `\` goes on, silently, to the next builder that is
 /// no macOS one ([`steer_off_backslashes`]).
-fn matched(config: &Config, git_hook: bool, words: &[String], facts: &dyn Facts) -> Result<Matched, Here> {
+fn matched(config: &Config, inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Matched, Here> {
+    let (git_hook, words) = (inputs.git_hook, inputs.words);
     let (opened, drives, sent) =
         opened_and_sent(config, git_hook, words, facts, |repo| config.is_routed(repo)).map_err(|unopened| unopened.here(git_hook))?;
     let matching = matching(config, &opened.repo, &sent.words);
@@ -1484,11 +1514,18 @@ fn matched(config: &Config, git_hook: bool, words: &[String], facts: &dyn Facts)
         return Err(None);
     }
     check_local(&opened.place, &sent.words, facts)?;
-    let Scored { order, balanced } = scored(matching, &opened.place, &sent.words, facts);
+    let local_p50 = (inputs.slot == Slot::Light)
+        .then(|| facts.local_p50(&opened.place, &sent.words))
+        .flatten();
+    let Scored { order, balanced, scores } = scored(matching, &opened.place, &sent.words, facts, local_p50);
     let first = pick(&order, |_| true).ok_or(None)?;
     let (builder, pattern, found) = steer_off_macos((config, &order), &opened, &sent.words, facts, first)?;
     let unix = slashed(&builder, &opened, words, &drives, facts);
     let (builder, pattern, unix) = steer_off_backslashes(&order, (builder, pattern, unix))?;
+    // Compared only now, so a builder the steer-offs turned away never sets the finish a light run must beat.
+    if let Some(reason) = proven_faster_here(local_p50, scores.as_ref(), &builder) {
+        return Err(Some(reason));
+    }
     let later = later_candidates(&order, &builder);
     let balanced = balanced.map(|balanced| picked_first(balanced, &builder));
     let kept = Kept {
@@ -1961,21 +1998,29 @@ fn pinned_builder(inputs: &Inputs<'_>, host: &str, facts: &dyn Facts) -> Result<
     Ok((config, builder))
 }
 
-/// Whether a run pinned to `host` may route at all: a heavy gate on no covering parent's slot, without `--local`.
+/// Whether a run pinned to `host` may route at all: a heavy or light gate on no covering parent's slot, without
+/// `--local`.
 fn pin_eligible(inputs: &Inputs<'_>, host: &str) -> Result<(), PinRefusal> {
-    let why = if inputs.slot != Slot::Heavy {
-        "only a heavy run routes"
+    let why = if !routes_on(inputs.slot) {
+        format!("only a heavy or light run routes, and this one is --slot {}", slot_word(inputs.slot))
     } else if inputs.covering_parent {
-        PIN_COVERED
+        PIN_COVERED.to_owned()
     } else if inputs.local {
-        "--local keeps it here"
+        "--local keeps it here".to_owned()
     } else {
         return Ok(());
     };
-    Err(PinRefusal::CannotRoute {
-        host: host.to_owned(),
-        why: why.to_owned(),
-    })
+    Err(PinRefusal::CannotRoute { host: host.to_owned(), why })
+}
+
+/// The `--slot` value that asks for `slot`, as the run's arguments spell it.
+fn slot_word(slot: Slot) -> &'static str {
+    match slot {
+        Slot::Heavy => "heavy",
+        Slot::Light => "light",
+        Slot::Critical => "critical",
+        Slot::None => "none",
+    }
 }
 
 /// The routing file a pinned run reads; a refusal when there is none or it cannot be used.
@@ -2551,27 +2596,35 @@ fn matching(config: &Config, repo: &str, words: &[String]) -> Vec<(Builder, Stri
 /// ([`Scored`]). Two or more are ordered by the figures the facts read for them ([`Facts::builder_figures`], asked
 /// once) as [`balance::ranked`] scores them, each scored builder kept in that order with its score, free slots and
 /// warmth ([`Scored::balanced`]); when the facts read none, they keep their file order and nothing is kept. Fewer than
-/// two are not scored, and nothing is asked; they keep their file order.
+/// two are not scored, and nothing is asked; they keep their file order. A light run's learned local p50, `local_p50`,
+/// has the figures asked even of one builder, whose scores ([`Scored::scores`]) the p50 is compared with once the
+/// steer-offs have chosen the builder ([`proven_faster_here`]); one builder alone is still never kept as balanced.
 ///
 /// # Panics
 ///
 /// When the facts give a figure count other than one per builder, which breaks [`Facts::builder_figures`]'s contract.
-fn scored(matching: Vec<(Builder, String)>, place: &Place, words: &[String], facts: &dyn Facts) -> Scored {
-    if matching.len() < 2 {
-        return Scored {
-            order: matching,
-            balanced: None,
-        };
+fn scored(matching: Vec<(Builder, String)>, place: &Place, words: &[String], facts: &dyn Facts, local_p50: Option<f64>) -> Scored {
+    let unscored = |order| Scored {
+        order,
+        balanced: None,
+        scores: None,
+    };
+    if matching.len() < 2 && local_p50.is_none() {
+        return unscored(matching);
     }
     let builders: Vec<&Builder> = matching.iter().map(|(builder, _)| builder).collect();
     let Some(figures) = facts.builder_figures(place, words, &builders) else {
-        return Scored {
-            order: matching,
-            balanced: None,
-        };
+        return unscored(matching);
     };
     assert_eq!(figures.len(), builders.len(), "the facts give one figure per builder");
     let ranking = balance::ranked(&figures);
+    let aliases: Vec<String> = builders.iter().map(|builder| builder.alias.clone()).collect();
+    if matching.len() < 2 {
+        return Scored {
+            scores: Some(Scores { aliases, ranking }),
+            ..unscored(matching)
+        };
+    }
     let entries = ranking
         .ranks
         .iter()
@@ -2587,10 +2640,11 @@ fn scored(matching: Vec<(Builder, String)>, place: &Place, words: &[String], fac
         has_duration: ranking.has_duration,
     };
     let mut unplaced: Vec<Option<(Builder, String)>> = matching.into_iter().map(Some).collect();
-    let order = ranking.ranks.into_iter().filter_map(|rank| unplaced[rank.index].take()).collect();
+    let order = ranking.ranks.iter().filter_map(|rank| unplaced[rank.index].take()).collect();
     Scored {
         order,
         balanced: Some(balanced),
+        scores: Some(Scores { aliases, ranking }),
     }
 }
 
@@ -2600,6 +2654,30 @@ struct Scored {
     order: Vec<(Builder, String)>,
     /// Each scored builder in score order, when two or more were scored from figures the facts read; `None` otherwise.
     balanced: Option<Balanced>,
+    /// Every builder's score, when the facts read figures for them; `None` when nothing was scored.
+    scores: Option<Scores>,
+}
+
+/// The scores [`scored`] gave the matching builders from the figures the facts read.
+struct Scores {
+    /// Each builder's alias, in the order its figures were asked, which the ranking's indexes count.
+    aliases: Vec<String>,
+    /// The builders best first, each with its score.
+    ranking: balance::Ranking,
+}
+
+/// Why a light run whose learned local p50 is `local_p50` runs here: proven faster here than on `chosen`, the builder
+/// the macOS and backslash steer-offs left it, by that builder's score ([`balance::faster_here`]). `None`, so the run
+/// routes, without a p50 or `scores`, and when the p50 is no proof.
+fn proven_faster_here(local_p50: Option<f64>, scores: Option<&Scores>, chosen: &Builder) -> Option<LocalReason> {
+    let (here, scores) = (local_p50?, scores?);
+    let index = scores.aliases.iter().position(|alias| *alias == chosen.alias)?;
+    let rank = balance::faster_here(here, &scores.ranking, index)?;
+    Some(LocalReason::FasterHere {
+        here_tenths: balance::tenths(here),
+        builder: chosen.alias.clone(),
+        there_tenths: balance::tenths(rank.seconds),
+    })
 }
 
 /// The scored builders as the run that goes to `chosen` tells them ([`RemoteRun::balanced`]): the chosen builder first,

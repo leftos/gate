@@ -16,7 +16,8 @@ use serde_json::{Value, json};
 use crate::durations::seed;
 use crate::nesting::{marked, test_marker};
 use crate::routing::{
-    BUSY_LINE, GIT_HANG_GUARDS, HOST, balance_case, has_no_remote_fields, has_remote_tag, names, own, repo, routed_case, routed_words, stub,
+    BUSY_LINE, GIT_HANG_GUARDS, HOST, balance_case, has_no_remote_fields, has_remote_tag, names, own, repo, routed_case, routed_words,
+    seed_faster_here, stub,
 };
 use crate::support::{
     Case, FAKE_TOOL, GATE, LOCAL_REASON, POLL, Running, UNTIL_KILLED, USAGE, assert_in_order, critical_words, events, events_of, finish, git,
@@ -738,10 +739,15 @@ impl HeldBack {
 fn light_holders(case: &Case, count: usize) -> (Vec<Running>, PathBuf) {
     let light_go = case.folder().join("light-go");
     let light_go_word = shown(&light_go);
+    // Each holder exists to hold a light slot here, and its fake-tool command matches a routed case's `*tool*`, so it
+    // is kept here with `--local` rather than routed.
+    let mut extra = POLL.to_vec();
+    extra.push("--local");
+    extra.extend(LOCAL_REASON);
     let lights = (0..count)
         .map(|index| {
             let log = format!("light-{index}.log");
-            holder(case, &run_words(&log, &POLL, &[FAKE_TOOL, "wait", &light_go_word, "exit", "0"]))
+            holder(case, &run_words(&log, &extra, &[FAKE_TOOL, "wait", &light_go_word, "exit", "0"]))
         })
         .collect();
     (lights, light_go)
@@ -759,6 +765,16 @@ fn light_with_client(case: &Case, log: &str, steps: &Path, extra: &[&str], comma
 
 /// The command of a light run that would route on heavy.
 const ROUTED_COMMAND: [&str; 3] = [r".\tool.exe", "out", "hi"];
+
+/// The line a light run kept here by its proof of speed starts with.
+const FASTER_HERE_LINE: &str = "gate: not routed: faster here:";
+
+/// Seeds the proof that `command` runs faster here than on each of `builders` ([`seed_faster_here`]), so a light run
+/// of it is kept here at its start, where only a critical request can hold it back; the reroute asks again as heavy,
+/// which no proof keeps here, so it still sends the run to a builder.
+fn proven_faster_here(case: &Case, command: &[&str], builders: &[&str]) {
+    seed_faster_here(case, command, builders, 1.0, 100.0);
+}
 
 /// The scripted client's steps that record the call at `call` and pass.
 fn recording_stub(case: &Case, call: &Path) -> PathBuf {
@@ -786,6 +802,8 @@ fn assert_stayed_here(events: &[Value]) {
 #[test]
 fn a_light_gate_the_critical_barrier_holds_back_routes_to_a_free_builder() {
     let case = reroute_case("a_light_gate_the_critical_barrier_holds_back_routes_to_a_free_builder", 2);
+    // Proven faster here, the light run stays here at its start, so the critical request can hold it back.
+    proven_faster_here(&case, &ROUTED_COMMAND, &[HOST]);
     let held = HeldBack::start(&case, false, 2);
     let critical_pid = held.critical_pid();
     let call = case.folder().join("call.json");
@@ -796,7 +814,7 @@ fn a_light_gate_the_critical_barrier_holds_back_routes_to_a_free_builder() {
     let outcome = light.finish();
 
     assert_passed(&outcome);
-    assert!(outcome.stderr.contains(&sent_to_builder(critical_pid)), "{outcome:?}");
+    assert_in_order(&outcome.stderr, &[FASTER_HERE_LINE, &sent_to_builder(critical_pid)]);
     assert!(call.exists(), "the builder ran the command: {outcome:?}");
     assert_rerouted(&own(&case, pid), critical_pid);
     held.finish();
@@ -805,6 +823,8 @@ fn a_light_gate_the_critical_barrier_holds_back_routes_to_a_free_builder() {
 #[test]
 fn a_light_gate_sent_to_a_builder_says_why_before_its_route_lines() {
     let case = reroute_case("a_light_gate_sent_to_a_builder_says_why_before_its_route_lines", 2);
+    // Proven faster here, the light run stays here at its start, so the critical request can hold it back.
+    proven_faster_here(&case, &[FAKE_TOOL, "out", "hi"], &[HOST]);
     let held = HeldBack::start(&case, false, 2);
     let critical_pid = held.critical_pid();
     let call = case.folder().join("call.json");
@@ -823,6 +843,8 @@ fn a_light_gate_sent_to_a_builder_says_why_before_its_route_lines() {
 #[test]
 fn a_light_gate_held_back_logging_into_another_worktree_stays_here_saying_so() {
     let case = reroute_case("a_light_gate_held_back_logging_into_another_worktree_stays_here_saying_so", 2);
+    // Proven faster here, the light run stays here at its start, so the critical request can hold it back.
+    proven_faster_here(&case, &ROUTED_COMMAND, &[HOST]);
     let held = HeldBack::start(&case, false, 2);
     let critical_pid = held.critical_pid();
     let call = case.folder().join("call.json");
@@ -855,6 +877,8 @@ fn a_light_gate_held_back_logging_into_another_worktree_stays_here_saying_so() {
 #[test]
 fn a_light_gate_held_back_after_a_wait_counts_its_remote_take_from_its_queue_line() {
     let case = reroute_case("a_light_gate_held_back_after_a_wait_counts_its_remote_take_from_its_queue_line", 2);
+    // Proven faster here, the light run stays here at its start, so the critical request can hold it back.
+    proven_faster_here(&case, &ROUTED_COMMAND, &[HOST]);
     let (lights, light_go) = light_holders(&case, 3);
     let call = case.folder().join("call.json");
     let steps = recording_stub(&case, &call);
@@ -897,6 +921,9 @@ fn a_light_gate_held_back_after_a_wait_counts_its_remote_take_from_its_queue_lin
 #[test]
 fn a_light_gate_with_a_place_beside_the_critical_request_stays_here() {
     let case = reroute_case("a_light_gate_with_a_place_beside_the_critical_request_stays_here", 2);
+    // Proven faster here, the light run, whose command would route on heavy, stays here at its start; its place beside
+    // the critical request then keeps it here.
+    proven_faster_here(&case, &ROUTED_COMMAND, &[HOST]);
     let held = HeldBack::start(&case, false, 1);
     let call = case.folder().join("call.json");
     let steps = recording_stub(&case, &call);
@@ -915,6 +942,8 @@ fn a_light_gate_with_a_place_beside_the_critical_request_stays_here() {
 #[test]
 fn a_light_gate_behind_a_request_to_hold_the_machine_alone_routes() {
     let case = reroute_case("a_light_gate_behind_a_request_to_hold_the_machine_alone_routes", 2);
+    // Proven faster here, the light run stays here at its start, so the critical request can hold it back.
+    proven_faster_here(&case, &ROUTED_COMMAND, &[HOST]);
     let held = HeldBack::start(&case, true, 0);
     let critical_pid = held.critical_pid();
     let call = case.folder().join("call.json");
@@ -945,6 +974,8 @@ fn a_light_run_rerouted_by_a_critical_request_keeps_file_order() {
     });
     write_remote_json(&case, &routing.to_string());
     write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+    // Proven faster here, the light run stays here at its start, so the critical request can hold it back.
+    proven_faster_here(&case, &ROUTED_COMMAND, &[FIRST, HOST]);
     let remote_go = case.folder().join("remote-go");
     let holder_steps = shown(&stub(&case, &[&format!("wait {}", shown(&remote_go))]));
     let remote = case.start(&routed_words("remote.log", &holder_steps, &["--builder", FIRST], &ROUTED_COMMAND));
@@ -989,6 +1020,8 @@ fn a_light_run_rerouted_by_a_critical_request_says_no_balanced_line() {
     });
     write_remote_json(&case, &routing.to_string());
     write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+    // Proven faster here, the light run stays here at its start, so the critical request can hold it back.
+    proven_faster_here(&case, &ROUTED_COMMAND, &[FIRST, HOST]);
     let held = HeldBack::start(&case, false, 2);
     let critical_pid = held.critical_pid();
     let call = case.folder().join("call.json");
@@ -1014,6 +1047,8 @@ fn a_light_run_rerouted_by_a_critical_request_says_no_balanced_line() {
 #[test]
 fn a_light_gate_finds_no_spare_remote_slot_and_waits_here_in_its_place() {
     let case = reroute_case("a_light_gate_finds_no_spare_remote_slot_and_waits_here_in_its_place", 1);
+    // Proven faster here, the light run stays here at its start, so the critical request can hold it back.
+    proven_faster_here(&case, &ROUTED_COMMAND, &[HOST]);
     let held = HeldBack::start(&case, false, 2);
     let critical_pid = held.critical_pid();
     let call = case.folder().join("call.json");
@@ -1045,6 +1080,8 @@ fn a_light_gate_finds_no_spare_remote_slot_and_waits_here_in_its_place() {
 #[test]
 fn a_light_gate_the_builder_refuses_waits_here_and_never_routes_again() {
     let case = reroute_case("a_light_gate_the_builder_refuses_waits_here_and_never_routes_again", 2);
+    // Proven faster here, the light run stays here at its start, so the critical request can hold it back.
+    proven_faster_here(&case, &ROUTED_COMMAND, &[HOST]);
     let held = HeldBack::start(&case, false, 2);
     let critical_pid = held.critical_pid();
     let call = case.folder().join("call.json");
@@ -1074,6 +1111,37 @@ fn a_light_gate_the_builder_refuses_waits_here_and_never_routes_again() {
     assert!(events[3..].iter().all(has_no_remote_fields), "{events:#?}");
     let log = fs::read_to_string(case.folder().join("light.log")).expect("the gate's log was written");
     assert_in_order(&log, &[&sent_to_builder(critical_pid), BUSY_LINE]);
+    held.finish();
+}
+
+#[test]
+fn a_light_run_that_fell_back_here_is_not_rerouted_by_a_critical_request() {
+    let case = reroute_case("a_light_run_that_fell_back_here_is_not_rerouted_by_a_critical_request", 2);
+    let held = HeldBack::start(&case, false, 2);
+    let critical_pid = held.critical_pid();
+    let call = case.folder().join("call.json");
+    let steps = stub(&case, &[&format!("record {}", shown(&call)), "refuse busy"]);
+
+    // No proof of speed: the light run routes at its start, the builder refuses it, and it waits here behind the request.
+    let light = light_with_client(&case, "light.log", &steps, &with_heartbeat(), &ROUTED_COMMAND);
+    let pid = light.id();
+    let still = still_beside(critical_pid);
+    light.wait_for_stderr_where("two still-waiting lines after the fallback line", |text| {
+        text.split_once(BUSY_LINE)
+            .is_some_and(|(_, after)| after.matches(still.as_str()).count() >= 2)
+    });
+    held.let_lights_go();
+    let outcome = light.finish();
+
+    assert_passed(&outcome);
+    assert!(call.exists(), "the builder was called at the run's start: {outcome:?}");
+    assert_eq!(outcome.stderr.matches(BUSY_LINE).count(), 1, "one call to the builder: {outcome:?}");
+    assert!(!outcome.stderr.contains(&sent_to_builder(critical_pid)), "{outcome:?}");
+    let events = own(&case, pid);
+    assert!(
+        events.iter().all(|event| event["criticalPid"].is_null()),
+        "no event names the request: {events:#?}"
+    );
     held.finish();
 }
 

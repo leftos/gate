@@ -1,6 +1,7 @@
 //! The order a routed run tries its capable builders in: by the earliest expected finish of each, read from the figures
 //! the caller gives for it ([`BuilderFigures`]), a held work folder and then file order breaking an exact tie
-//! ([`order`]).
+//! ([`order`], [`ranked`]); and the compare that keeps a light run here when its learned local p50 is under
+//! [`FASTER_HERE_SHARE`] of the expected finish of the builder it would go to ([`faster_here`]).
 
 /// What the PC knows of one builder for one command, each time in seconds.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -112,13 +113,19 @@ pub struct BalancedEntry {
 impl BalancedEntry {
     /// Its score in seconds, to the tenth it keeps.
     #[must_use]
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "a score in tenths of a second stays far below 2^53, where an f64 holds every whole number"
-    )]
     pub fn seconds(&self) -> f64 {
-        self.tenths as f64 / 10.0
+        from_tenths(self.tenths)
     }
+}
+
+/// `tenths` of a second in seconds, the inverse of [`tenths`] to the tenth it keeps.
+#[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a span in tenths of a second stays far below 2^53, where an f64 holds every whole number"
+)]
+pub fn from_tenths(tenths: u64) -> f64 {
+    tenths as f64 / 10.0
 }
 
 /// `seconds` in whole tenths of a second, rounded to the nearest; 0 for a negative or NaN span and `u64::MAX` past it,
@@ -131,6 +138,52 @@ impl BalancedEntry {
 )]
 pub fn tenths(seconds: f64) -> u64 {
     (seconds * 10.0).round() as u64
+}
+
+/// The share of the chosen builder's expected finish (the best capable one left after the steer-offs) under which a
+/// light run's learned local p50 keeps it here ([`faster_here`]).
+pub const FASTER_HERE_SHARE: f64 = 0.8;
+
+/// The rank in `ranking` of the builder at index `chosen` among its figures, the one the run would go to, when a light
+/// run whose learned local p50 is `local_p50` seconds is proven faster here: its p50 strictly under
+/// [`FASTER_HERE_SHARE`] of that builder's expected finish. `None`, so the run routes, at or above that share, when no
+/// builder has a duration ([`Ranking::has_duration`]), as a queue wait alone is nothing to compare a run time with, and
+/// when `chosen` is no index of the ranking.
+#[must_use]
+pub fn faster_here(local_p50: f64, ranking: &Ranking, chosen: usize) -> Option<Rank> {
+    if !ranking.has_duration {
+        return None;
+    }
+    let rank = ranking.ranks.iter().find(|rank| rank.index == chosen)?;
+    (local_p50 < FASTER_HERE_SHARE * rank.seconds).then_some(*rank)
+}
+
+/// The figure, in seconds once rounded to the whole second, from which a span is said in minutes.
+const MINUTES_FROM: f64 = 90.0;
+
+/// A span of `seconds` alone, as the gate's expected-time line says its figures: whole seconds below 90 s, whole
+/// minutes from 90 s, rounded to the nearest and never below 1.
+#[must_use]
+pub fn span_text(seconds: f64) -> String {
+    span_in(seconds, in_minutes(seconds))
+}
+
+/// Whether a span of `seconds` is said in minutes: from 90 s once rounded to the whole second, so no span reads `90 s`.
+#[must_use]
+pub fn in_minutes(seconds: f64) -> bool {
+    seconds.round() >= MINUTES_FROM
+}
+
+/// A span of `seconds` in whole minutes when `in_minutes`, else in whole seconds, rounded to the nearest and never
+/// below 1; the minutes are those of the whole seconds, so 89.6 s, which is 90 s, reads as 90 s does.
+#[must_use]
+pub fn span_in(seconds: f64, in_minutes: bool) -> String {
+    let whole_seconds = seconds.round();
+    if in_minutes {
+        format!("{} min", (whole_seconds / 60.0).round().max(1.0))
+    } else {
+        format!("{} s", whole_seconds.max(1.0))
+    }
 }
 
 /// The builder's expected finish: its queue wait, plus its duration (`fill` for a builder without one) and, when it
@@ -157,7 +210,7 @@ fn median(mut durations: Vec<f64>) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BuilderFigures, order};
+    use super::{BuilderFigures, Rank, faster_here, order, ranked};
 
     fn figures(queue_wait: f64, duration: Option<f64>, holds_folder: bool) -> BuilderFigures {
         BuilderFigures {
@@ -247,5 +300,49 @@ mod tests {
             figures(100.0, Some(100.0), true),
         ];
         assert_eq!(order(&given), [2, 1, 3, 0], "all but the third tie at 200 s; the warm ones go first");
+    }
+
+    #[test]
+    fn a_local_p50_under_80_percent_of_the_chosen_finish_stays_here() {
+        let ranking = ranked(&[figures(0.0, Some(20.0), true), figures(0.0, Some(10.0), true)]);
+        assert_eq!(faster_here(7.9, &ranking, 1), Some(Rank { index: 1, seconds: 10.0 }));
+        assert_eq!(
+            faster_here(15.9, &ranking, 0),
+            Some(Rank { index: 0, seconds: 20.0 }),
+            "compared with the chosen builder, not the best"
+        );
+    }
+
+    #[test]
+    fn a_local_p50_at_80_percent_routes() {
+        let ranking = ranked(&[figures(0.0, Some(10.0), true)]);
+        assert_eq!(faster_here(8.0, &ranking, 0), None, "equal to the share routes");
+        assert_eq!(faster_here(9.0, &ranking, 0), None);
+    }
+
+    #[test]
+    fn no_builder_duration_or_no_chosen_rank_means_route() {
+        let ranking = ranked(&[figures(30.0, None, true), figures(60.0, None, false)]);
+        assert_eq!(faster_here(1.0, &ranking, 0), None, "a queue wait alone is nothing to compare with");
+        assert_eq!(faster_here(1.0, &ranked(&[]), 0), None, "no builder at all routes too");
+        let ranking = ranked(&[figures(0.0, Some(10.0), true)]);
+        assert_eq!(faster_here(1.0, &ranking, 1), None, "an index the ranking does not hold routes");
+    }
+
+    #[test]
+    fn the_chosen_finish_is_its_score_with_its_cold_penalty() {
+        let ranking = ranked(&[figures(0.0, Some(6.0), false), figures(0.0, Some(10.0), true)]);
+        assert_eq!(
+            faster_here(9.5, &ranking, 0),
+            Some(Rank { index: 0, seconds: 12.0 }),
+            "the cold 6 s builder finishes at 12 s"
+        );
+        assert_eq!(faster_here(10.0, &ranking, 0), None, "at or above 80% of its 12 s");
+        let ranking = ranked(&[figures(5.0, Some(10.0), true)]);
+        assert_eq!(
+            faster_here(11.9, &ranking, 0),
+            Some(Rank { index: 0, seconds: 15.0 }),
+            "the queue wait counts"
+        );
     }
 }
