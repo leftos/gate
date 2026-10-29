@@ -571,6 +571,50 @@ impl Running {
         }
     }
 
+    /// Returns once `check` holds, as [`Running::wait_until`] does, but with its hang guard clocked from the last
+    /// progress: `progress` is read on every look, and a value different from the last one starts the whole guard
+    /// again, so a wait whose program keeps moving is never failed for how long the run before that took. Fails once
+    /// `progress` has stayed the same for the hang guard, with stderr so far, while the program still runs.
+    pub fn wait_until_progressing(&self, what: &str, progress: impl FnMut() -> u64, check: impl FnMut() -> bool) {
+        self.wait_progressing_within(HANG_GUARD, what, progress, check);
+    }
+
+    /// [`Running::wait_until_progressing`] with the guard its caller gives, so a case can watch the guard restart
+    /// without waiting the whole [`HANG_GUARD`].
+    #[expect(
+        clippy::panic,
+        reason = "a program that exited before its case's check held fails the case with its status and output"
+    )]
+    fn wait_progressing_within(&self, guard: Duration, what: &str, mut progress: impl FnMut() -> u64, mut check: impl FnMut() -> bool) {
+        let mut last = progress();
+        let mut deadline = Instant::now() + guard;
+        loop {
+            let ended = self.exit_status();
+            if check() {
+                return;
+            }
+            if let Some(status) = ended {
+                self.wait_for_readers();
+                let said = self.said();
+                panic!(
+                    "{what} did not happen before the program exited with {status}; stdout so far:\n{}\nstderr so far:\n{}",
+                    said.stdout, said.stderr
+                );
+            }
+            let now = progress();
+            if now != last {
+                last = now;
+                deadline = Instant::now() + guard;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what} did not happen within the hang guard of the last progress ({last} calls); stderr so far:\n{}",
+                text(&self.stderr)
+            );
+            thread::sleep(LOOK_AGAIN);
+        }
+    }
+
     /// The program's exit status once it has exited, read through its handle so a wait that only borrows it can ask.
     fn exit_status(&self) -> Option<ExitStatus> {
         let process = self.child.as_raw_handle();
@@ -941,6 +985,45 @@ fn a_wait_until_fails_at_once_when_the_program_exits_before_its_check_holds() {
     let running = start(command);
 
     running.wait_until("the third call", || false);
+}
+
+/// A progress that moves on every look starts the guard again with each, so a guard of one poll outlasts twenty looks,
+/// however loaded the machine: only a wait clocked from its start would have failed on the second.
+#[test]
+fn a_wait_on_progress_outlasts_the_hang_guard_while_progress_continues() {
+    let mut command = Command::new(FAKE_TOOL);
+    command.args(["sleep", UNTIL_KILLED]);
+    let running = start(command);
+    let mut made = 0;
+    let mut looks = 0;
+
+    running.wait_progressing_within(
+        LOOK_AGAIN,
+        "the twentieth progress",
+        || {
+            made += 1;
+            made
+        },
+        || {
+            looks += 1;
+            looks == 20
+        },
+    );
+
+    assert_eq!(looks, 20, "the wait returned on the look its check first held");
+    running.kill();
+}
+
+/// A progress that never moves leaves the guard nothing to restart it: the wait fails once the guard has passed,
+/// naming the progress it last saw, so the guard is only ever a lower bound on how long a wait may take.
+#[test]
+#[should_panic(expected = "the next call did not happen within the hang guard of the last progress (0 calls)")]
+fn a_wait_on_progress_fails_once_progress_stops_for_the_hang_guard() {
+    let mut command = Command::new(FAKE_TOOL);
+    command.args(["sleep", UNTIL_KILLED]);
+    let running = start(command);
+
+    running.wait_progressing_within(Duration::from_millis(100), "the next call", || 0, || false);
 }
 
 fn text(buffer: &Buffer) -> String {

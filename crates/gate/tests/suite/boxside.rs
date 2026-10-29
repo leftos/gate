@@ -1090,9 +1090,9 @@ fn preflight_ends_a_parked_git_step_when_the_client_goes() {
     // The tree's `init` is the first step whose words hold the tree itself.
     stub_git_on(&stub, &folders.work, &parked);
     let mut call = bare_box_call(&case, &["box", "preflight"], &folders.payload());
-    call.env("PATH", path_with_git(&[stub]));
+    call.env("PATH", path_with_git(std::slice::from_ref(&stub)));
     let (running, stderr) = call.start_with_closable_stderr();
-    let pid = parked_pid(&running, &parked);
+    let pid = parked_pid(&running, &stub, &parked);
 
     stderr.close();
     let outcome = ended_within(running, PARKED_GIT_GUARD);
@@ -1157,9 +1157,9 @@ fn preflight_ends_a_parked_config_read_when_the_client_goes() {
     let parked = case.folder().join("parked");
     stub_git_on(&stub, "--get", &parked);
     let mut call = bare_box_call(&case, &["box", "preflight"], &folders.payload());
-    call.env("PATH", path_with_git(&[stub]));
+    call.env("PATH", path_with_git(std::slice::from_ref(&stub)));
     let (running, stderr) = call.start_with_closable_stderr();
-    let pid = parked_pid(&running, &parked);
+    let pid = parked_pid(&running, &stub, &parked);
 
     stderr.close();
     let outcome = ended_within(running, PARKED_GIT_GUARD);
@@ -2362,7 +2362,8 @@ enum Does<'a> {
 
 /// Puts a `git.cmd` in the folder `stub`, made when missing, that runs the real git with the same words, except for a
 /// git step one of whose words is a rule's word: the first such word, in the step's order, has the stub do what its
-/// rule says.
+/// rule says. Every call appends a blank line to the stub's `calls.log`, so a case can tell a run whose git is still
+/// moving from one that has stopped.
 fn stub_git_doing(stub: &Path, rules: &[(&str, Does<'_>)]) {
     fs::create_dir_all(stub).expect("the stub folder can be made");
     let park = |parked: &Path| {
@@ -2372,7 +2373,8 @@ fn stub_git_doing(stub: &Path, rules: &[(&str, Does<'_>)]) {
             shown(&parked.with_extension("go"))
         )
     };
-    let mut script = vec!["@echo off\r\n:scan\r\nif \"%~1\"==\"\" goto real\r\n".to_owned()];
+    let counted = shown(&stub.join("calls.log"));
+    let mut script = vec![format!("@echo off\r\necho.>>\"{counted}\"\r\n:scan\r\nif \"%~1\"==\"\" goto real\r\n")];
     for (at, (word, _)) in rules.iter().enumerate() {
         script.push(format!("if \"%~1\"==\"{word}\" goto rule{at}\r\n"));
     }
@@ -2412,14 +2414,21 @@ fn stub_git_on(stub: &Path, step: &str, parked: &Path) {
     stub_git_doing(stub, &[(step, Does::Park(parked))]);
 }
 
-/// The pid of the fake-tool a [`stub_git_on`] stub parked on, once it has written it to `parked`: `running`, the box
-/// call holding the stub, fails at once with its status and output when it ends before the pid is written.
-fn parked_pid(running: &Running, parked: &Path) -> u32 {
+/// The pid of the fake-tool a [`stub_git_on`] stub in `stub` parked on, once it has written it to `parked`:
+/// `running`, the box call holding the stub, fails at once with its status and output when it ends before the pid is
+/// written. Its hang guard is clocked from the stub's last call, so a run that took long before the park, under load,
+/// is never failed for the git it ran before it.
+fn parked_pid(running: &Running, stub: &Path, parked: &Path) -> u32 {
+    let calls = stub.join("calls.log");
     let mut pid = None;
-    running.wait_until("the git stub parked", || {
-        pid = fs::read_to_string(parked).ok().and_then(|text| text.trim().parse().ok());
-        pid.is_some()
-    });
+    running.wait_until_progressing(
+        "the git stub parked",
+        || fs::metadata(&calls).map_or(0, |calls| calls.len()),
+        || {
+            pid = fs::read_to_string(parked).ok().and_then(|text| text.trim().parse().ok());
+            pid.is_some()
+        },
+    );
     pid.expect("the parked pid was read")
 }
 
@@ -2480,7 +2489,8 @@ fn run_box_gone_while_parked(
     let mut call = bare_box_call(case, &words, &self::payload(payload));
     call.env("PATH", path);
     let (running, stderr) = call.start_with_closable_stderr();
-    let pid = parked_pid(&running, parked);
+    let stub = case.folder().join("stub");
+    let pid = parked_pid(&running, &stub, parked);
     stderr.close();
     if let Some(armed_by) = armed_by {
         fs::write(armed_by, "").expect("the arm file can be made");
@@ -2549,7 +2559,8 @@ fn a_git_bound_armed_by_a_file_does_not_end_the_step_before_the_file_exists() {
     call.env("PATH", &path);
 
     let running = call.start();
-    let pid = parked_pid(&running, &parked);
+    let stub = case.folder().join("stub");
+    let pid = parked_pid(&running, &stub, &parked);
     let two_seconds = Instant::now() + Duration::from_secs(2);
     running.wait_until("two seconds with the parked step bound by no clock", || Instant::now() >= two_seconds);
     assert!(
@@ -2744,7 +2755,8 @@ fn box_run_a_stop_during_a_parked_fetch_ends_it_and_its_tree() {
     let parked = case.folder().join("parked");
     let (payload, path) = run_with_git_doing(&case, &[("fetch", Does::Park(&parked))]);
     let running = start_box_with_path(&case, &payload, Some(&path));
-    let pid = parked_pid(&running, &parked);
+    let stub = case.folder().join("stub");
+    let pid = parked_pid(&running, &stub, &parked);
 
     let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
     let outcome = ended_within(running, PARKED_GIT_GUARD);
