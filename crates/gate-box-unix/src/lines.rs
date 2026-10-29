@@ -7,9 +7,7 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use gate_wire::{
-    BoxKill, PathForm, Payload, Refusal, SHA256_DIGITS, build_version, channel_not_completed_line, escaped, is_lower_hex, refused_line, work_root,
-};
+use gate_wire::{BoxKill, PathForm, Payload, Refusal, build_version, channel_not_completed_line, escaped, refused_line, work_root};
 
 /// The line saying the work folder's tree is new, which the client raises a run's ceiling for.
 pub const NEW_WORK_TREE: &str = "gate: remote new work tree";
@@ -26,13 +24,6 @@ pub const USAGE_STATUS: u8 = 2;
 
 /// The status of a step that failed with no status of its own.
 pub const FAILED_STATUS: u8 = 1;
-
-/// The layout record's text for a work folder holding one repo's tree.
-pub const LAYOUT_SINGLE: &str = "single";
-
-/// The layout record's text while a run clears the work folder for another layout, as the Windows box writes it: a
-/// layout no run has, so a clear cut short is cleared again.
-pub const LAYOUT_CHANGING: &str = "changing";
 
 /// `gate: remote version <v>`, the version as `gate --version` says it after `gate `.
 #[must_use]
@@ -362,25 +353,6 @@ pub fn record_without_group(record: &str) -> String {
     format!("{} names no process group", escaped(record))
 }
 
-/// The hash a warm record holding `bytes` names: exactly 64 lower-case hex digits and nothing else, a line end
-/// included, as the Windows box reads one; `None` for anything else.
-#[must_use]
-pub fn warm_text(bytes: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    is_lower_hex(text, SHA256_DIGITS).then(|| text.to_owned())
-}
-
-/// The layout record's text for a run of one repo (`pair` none), or for the pair of the leaf and the siblings, the
-/// siblings ordered ignoring ASCII case, as the Windows box writes it.
-#[must_use]
-pub fn layout_text(pair: Option<(&str, Vec<&str>)>) -> String {
-    let Some((leaf, mut siblings)) = pair else {
-        return LAYOUT_SINGLE.to_owned();
-    };
-    siblings.sort_by_key(|name| name.to_ascii_lowercase());
-    format!("pair {leaf} {}", siblings.join(" "))
-}
-
 /// What a pair run says when its back commits were not all pushed, or were never made because the run ended before
 /// them: the PC applies nothing, as the Windows box's line tells it.
 pub const BACK_COMMITS_FAILED: &str = "gate: remote back commits: failed";
@@ -395,28 +367,6 @@ pub fn back_commits_line(commits: &[(&str, Option<&str>)]) -> String {
         .map(|(name, commit)| format!("{name} {}", commit.unwrap_or("none")))
         .collect();
     format!("gate: remote back commits: {}", named.join(", "))
-}
-
-/// Whether the layout record as `read` names another layout than `wanted`: a missing record is a single layout's, a
-/// record is compared ignoring ASCII case, and one that cannot be read counts as another.
-#[must_use]
-pub fn names_another_layout(read: &io::Result<Option<String>>, wanted: &str) -> bool {
-    match read {
-        Ok(None) => wanted != LAYOUT_SINGLE,
-        Ok(Some(text)) => !text.eq_ignore_ascii_case(wanted),
-        Err(_) => true,
-    }
-}
-
-/// Whether the layout record as `read` lets the preflight ready the work folder's single tree: missing, or saying a
-/// single layout.
-#[must_use]
-pub fn readies_single(read: &io::Result<Option<String>>) -> bool {
-    match read {
-        Ok(None) => true,
-        Ok(Some(text)) => text.eq_ignore_ascii_case(LAYOUT_SINGLE),
-        Err(_) => false,
-    }
 }
 
 /// What a job record, `<Work>.pgid`, says of the job a stop names.
@@ -735,11 +685,10 @@ mod tests {
     };
     use super::{
         FolderFlaw, JobRecord, Login, Recorded, RootFacts, WORK_ROOT_STEP, boot_line, created_line, folder_failure, folder_flaw, is_git_variable,
-        is_lower_hex, job_record, job_record_text, layout_text, login_marker, marked_login, names_another_layout, no_answer, readies_single,
-        record_unread, record_without_group, recorded_group, root_flaw, sdks_line, signal_guard, step_unran, version_line, warm_text, work_layout,
-        write_failure,
+        job_record, job_record_text, login_marker, marked_login, no_answer, record_unread, record_without_group, recorded_group, root_flaw,
+        sdks_line, signal_guard, step_unran, version_line, work_layout, write_failure,
     };
-    use gate_wire::BoxKill;
+    use gate_wire::{BoxKill, is_lower_hex};
 
     /// This builder has no data channel: a request asking for one is refused `channel`, so the PC sends over ssh; one
     /// without it is not; a malformed one is the payload's usage line, which never shows a proof.
@@ -1159,32 +1108,6 @@ mod tests {
         );
     }
 
-    const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-    #[test]
-    fn a_warm_record_is_exactly_64_lower_case_hex_digits() {
-        assert_eq!(warm_text(HASH.as_bytes()), Some(HASH.to_owned()));
-        for bad in [
-            format!("{HASH}\n"),
-            format!("{HASH}\r\n"),
-            HASH.to_uppercase(),
-            HASH[1..].to_owned(),
-            format!("{HASH}0"),
-            format!("{HASH}\n\n"),
-            format!(" {HASH}"),
-            String::new(),
-        ] {
-            assert_eq!(warm_text(bad.as_bytes()), None, "{bad:?}");
-        }
-        assert_eq!(warm_text(&[0xff; 64]), None, "not UTF-8");
-    }
-
-    #[test]
-    fn the_layout_text_orders_the_siblings_ignoring_case() {
-        assert_eq!(layout_text(None), "single");
-        assert_eq!(layout_text(Some(("app", vec!["lib", "Core", "b"]))), "pair app b Core lib");
-    }
-
     #[test]
     fn the_back_commits_line_is_the_windows_box_s() {
         let (main, lib) = ("a".repeat(40), "b".repeat(40));
@@ -1198,24 +1121,6 @@ mod tests {
             "gate: remote back commits: app none, lib none"
         );
         assert_eq!(BACK_COMMITS_FAILED, "gate: remote back commits: failed");
-    }
-
-    #[test]
-    fn a_layout_record_names_another_layout_unless_it_is_the_wanted_one() {
-        assert!(!names_another_layout(&Ok(None), "single"), "no record is a single layout's");
-        assert!(names_another_layout(&Ok(None), "pair app lib"), "a pair's first run");
-        assert!(!names_another_layout(&Ok(Some("SINGLE".to_owned())), "single"), "any case");
-        assert!(names_another_layout(&Ok(Some("pair app lib".to_owned())), "single"));
-        assert!(names_another_layout(&Err(io::Error::other("unreadable")), "single"));
-    }
-
-    #[test]
-    fn only_a_missing_or_single_layout_record_readies_the_tree() {
-        assert!(readies_single(&Ok(None)));
-        assert!(readies_single(&Ok(Some("Single".to_owned()))));
-        assert!(!readies_single(&Ok(Some("pair app lib".to_owned()))));
-        assert!(!readies_single(&Ok(Some("changing".to_owned()))));
-        assert!(!readies_single(&Err(io::Error::other("unreadable"))));
     }
 
     const JOB: &str = "gate-remote-repo-0123abcd-0123456789ab";

@@ -33,7 +33,10 @@ use gate_win32::{
     Donor, EnvironmentBlock, Job, LaunchError, NamedEvent, PipedConsole, PipedLaunch, PipedSuspended, RestrictedToken, Running, Utf8Console,
 };
 use gate_wire::stamp::Tag;
-use gate_wire::{PairSibling, PathForm, Payload, bare_stem, checkout_done_line, checkout_start_line, ordinal_upper, trees};
+use gate_wire::{
+    LAYOUT_CHANGING, PairSibling, PathForm, Payload, bare_stem, checkout_done_line, checkout_start_line, layout_text, names_another_layout,
+    ordinal_upper, trees,
+};
 
 use crate::answer::USAGE_STATUS;
 use crate::boxside::boot;
@@ -120,12 +123,6 @@ const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 /// `FILE_SHARE_READ | FILE_SHARE_WRITE`: the work folder is held sharing everything but deletion, so it cannot be
 /// removed, renamed or replaced while held.
 const SHARE_READ_WRITE: u32 = 0x1 | 0x2;
-/// What the work folder's layout record, `{Work}.layout`, says while its children are being cleared: a record that
-/// still says it when a run reads it is of a clear that did not finish, which clears again.
-pub(super) const LAYOUT_CHANGING: &str = "changing";
-/// What the layout record says of a run of one repo's layout, checked out in the work folder itself; no record says the
-/// same.
-pub(super) const LAYOUT_SINGLE: &str = "single";
 /// The warm record of the work folder `work`, `{work}.warm`: the hash of the warm-up file whose commands last passed
 /// in it, written once they all did and removed whenever the folder's state changes under it.
 pub(super) fn warm_record(work: &str) -> String {
@@ -329,24 +326,13 @@ impl Laid<'_> {
         std::iter::once(self.main).chain(self.siblings)
     }
 
-    /// The layout the work folder is laid out in, as its record says it: [`LAYOUT_SINGLE`] for one repo, else `pair`
-    /// followed by the leaf, then each sibling's name sorted without regard to ASCII case, one space before each, so
-    /// the same siblings named in another order are the same layout.
+    /// The layout the work folder is laid out in, as its record says it ([`layout_text`]): one repo's for no leaf, else
+    /// `pair` followed by the leaf, then each sibling's name sorted without regard to ASCII case, one space before
+    /// each, so the same siblings named in another order are the same layout.
     fn layout(&self) -> String {
         let siblings = self.siblings.iter().filter_map(|repo| repo.name.as_deref()).collect();
         layout_text(self.main.name.as_deref(), siblings)
     }
-}
-
-/// The layout a layout record names for a run whose main repo's leaf is `leaf` and whose siblings are `siblings`
-/// ([`Laid::layout`]): [`LAYOUT_SINGLE`] without a leaf, else `pair`, the leaf, then the siblings' names sorted without
-/// regard to ASCII case, one space before each.
-pub(super) fn layout_text(leaf: Option<&str>, mut siblings: Vec<&str>) -> String {
-    let Some(leaf) = leaf else {
-        return LAYOUT_SINGLE.to_owned();
-    };
-    siblings.sort_by_key(|name| name.to_ascii_lowercase());
-    format!("pair {leaf} {}", siblings.join(" "))
 }
 
 /// Lays out the work folder `asked` holds as a run of the same repos does before its checkout ([`WorkGit::lay_out`]):
@@ -1638,19 +1624,6 @@ fn plain_tree(tree: &str) -> Result<(), NotLaidOut> {
 /// Whether the layout record `record` names another layout than `layout`, no record naming a run of one repo's.
 fn layout_changed(record: &str, layout: &str) -> bool {
     names_another_layout(&tools::read_record(record), layout)
-}
-
-/// Whether a layout record that read as `read` names another layout than `layout`, as [`layout_changed`] judges it: no
-/// record names a run of one repo's, and one that cannot be read counts as another.
-pub(super) fn names_another_layout(read: &io::Result<Option<String>>, layout: &str) -> bool {
-    match read {
-        Ok(None) => layout != LAYOUT_SINGLE,
-        Ok(Some(text)) => !text.eq_ignore_ascii_case(layout),
-        // Counted as changed, so the run writes the record before any clear: one that is not a plain file cannot be
-        // written either, and refuses the run `layout` there with nothing cleared; one that can, such as one that is
-        // not UTF-8, is cleared as after a clear that did not finish.
-        Err(_) => true,
-    }
 }
 
 /// Removes `path` as itself ([`preflight::remove_entry`]); else why it could not be.

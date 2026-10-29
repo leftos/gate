@@ -17,8 +17,8 @@ use gate_inputs::failure::Caps;
 use gate_inputs::manifest::{Listing, Manifest};
 use gate_wire::drain::refused_lines;
 use gate_wire::{
-    CROSS_STEP_START, CrossBuild, PairSibling, PathForm, Payload, Refusal, bare_stem, busy_line, checkout_done_line, checkout_start_line, escaped,
-    layout_line, refused_line, trees,
+    CROSS_STEP_START, CrossBuild, LAYOUT_CHANGING, PairSibling, PathForm, Payload, Refusal, bare_stem, busy_line, checkout_done_line,
+    checkout_start_line, escaped, layout_line, layout_text, names_another_layout, refused_line, trees,
 };
 
 use gate_watchdog::Pump;
@@ -36,9 +36,8 @@ use crate::git::{
 use crate::heartbeat::{self, Periods};
 use crate::inputs::{self, Unmatched};
 use crate::lines::{
-    Along, BACK_COMMITS_FAILED, CommandEnd, FAILED_STATUS, FolderFlaw, Godot, LAYOUT_CHANGING, Login, OwnerFlaw, Translation, USAGE_STATUS,
-    WRITABLE_BY_OTHERS, back_commits_line, command_status, layout_text, login_path_line, names_another_layout, owner_flaw, recorded_group,
-    rosetta_lines, signal_guard, translation, work_layout,
+    Along, BACK_COMMITS_FAILED, CommandEnd, FAILED_STATUS, FolderFlaw, Godot, Login, OwnerFlaw, Translation, USAGE_STATUS, WRITABLE_BY_OTHERS,
+    back_commits_line, command_status, login_path_line, owner_flaw, recorded_group, rosetta_lines, signal_guard, translation, work_layout,
 };
 use crate::outputs::{self, Asked};
 use crate::packages;
@@ -317,7 +316,7 @@ impl<'a> Laying<'a> {
     /// The layout the work folder is laid out in, as its record says it ([`layout_text`]).
     fn layout(&self) -> String {
         let siblings = self.siblings.iter().filter_map(|repo| repo.name.as_deref()).collect();
-        layout_text(self.main.name.as_deref().map(|leaf| (leaf, siblings)))
+        layout_text(self.main.name.as_deref(), siblings)
     }
 }
 

@@ -9,20 +9,19 @@ use std::path::Path;
 use std::thread;
 
 use gate_args::BoxSeams;
-use gate_wire::{Pair, PairSibling, PathForm, Payload, ROOT_STATUS, bare_stem, escaped, root_unsafe_line, tool_line, trees};
+use gate_wire::{
+    Pair, PairSibling, PathForm, Payload, ROOT_STATUS, WARM_READ_LIMIT, bare_stem, escaped, layout_text_for, names_another_layout, readies_single,
+    root_unsafe_line, tool_line, trees, warm_record_hash,
+};
 
 use crate::console::Console;
 use crate::git::{self, AlternatesFailure, Failed, Git, Steps, Tree, failed_for, for_repo, line_ends_set, origin_set};
 use crate::lines::{
-    FAILED_STATUS, FolderFlaw, NEEDS_REFUSED, NEW_WORK_TREE, USAGE_STATUS, WORK_ROOT_STEP, created_line, folder_failure, layout_text,
-    login_path_line, names_another_layout, readies_single, root_flaw, sdks_failure, sdks_line, unsynced_failure, version_line, warm_line, warm_text,
-    work_layout, write_failure,
+    FAILED_STATUS, FolderFlaw, NEEDS_REFUSED, NEW_WORK_TREE, USAGE_STATUS, WORK_ROOT_STEP, created_line, folder_failure, login_path_line, root_flaw,
+    sdks_failure, sdks_line, unsynced_failure, version_line, warm_line, work_layout, write_failure,
 };
 use crate::stop::open_folder_line;
 use crate::{boot, drain, files, probe, process, run, slots};
-
-/// The most bytes of the warm record read: one past a hash, so a longer record is seen as not one.
-const WARM_READ_LIMIT: u64 = 65;
 
 /// Why the work root is not used.
 pub(crate) enum Refusal {
@@ -101,7 +100,7 @@ pub fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> 
     // record naming another layout than the run's, a pair's first run having none, has the run clear the whole folder
     // and lay its trees out again.
     let layout = layout_record(work);
-    let relaid = names_another_layout(&layout, &wanted_layout(pair.as_ref()));
+    let relaid = names_another_layout(&layout, &layout_text_for(pair.as_ref()));
     let warm = warm_state(work, pair.as_ref(), relaid);
     let interrupted = files::exists(Path::new(&format!("{work}.command")));
     let git = Git::of(&root, parent);
@@ -195,11 +194,6 @@ fn made_folder(path: &Path, recursive: bool) -> Result<(), Refusal> {
         .map_err(|error| Refusal::Folder(folder_failure(&path.display().to_string(), &error.to_string())))
 }
 
-/// The layout record's text for the run: a single tree's, or the pair's.
-fn wanted_layout(pair: Option<&Pair>) -> String {
-    layout_text(pair.map(|pair| (pair.leaf(), pair.siblings().iter().map(PairSibling::name).collect())))
-}
-
 /// The work folder's layout record, `<work>.layout`, read as a plain file; `None` when it is missing.
 pub(crate) fn layout_record(work: &str) -> io::Result<Option<String>> {
     match files::read_plain(Path::new(&format!("{work}.layout")), files::RECORD_LIMIT) {
@@ -221,7 +215,7 @@ fn bares<'a>(bare: &'a str, pair: Option<&'a Pair>) -> Vec<(&'a str, Option<&'a 
     std::iter::once((bare, Some(pair.leaf()))).chain(siblings).collect()
 }
 
-/// The hash the work folder's warm record, `<work>.warm`, names ([`warm_text`]); `None` when the layout record names
+/// The hash the work folder's warm record, `<work>.warm`, names ([`warm_record_hash`]); `None` when the layout record names
 /// another layout than the run's (`relaid`), a tree the run's layout holds ([`trees`]) has no plain folder at its
 /// `.git`, or the record is missing or not a plain file.
 fn warm_state(work: &str, pair: Option<&Pair>, relaid: bool) -> Option<String> {
@@ -236,7 +230,7 @@ fn warm_state(work: &str, pair: Option<&Pair>, relaid: bool) -> Option<String> {
         return None;
     }
     let bytes = files::read_plain(Path::new(&format!("{work}.warm")), WARM_READ_LIMIT).ok()?;
-    warm_text(&bytes)
+    warm_record_hash(&bytes)
 }
 
 /// Readies the bare repository `bare`, made when missing, and, when the layout record lets it ([`readies_single`]),

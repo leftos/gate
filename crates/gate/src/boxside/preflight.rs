@@ -20,7 +20,10 @@ use gate_args::BoxSeams;
 use gate_router::escaped;
 use gate_win32::{Job, LaunchError, Make, NamedEvent, PipedConsole, PipedLaunch, Share};
 use gate_wire::build_version;
-use gate_wire::{Pair, PairSibling, PathForm, Payload, ROOT_STATUS, bare_stem, root_busy_line, root_unsafe_line, work_root};
+use gate_wire::{
+    Pair, PathForm, Payload, ROOT_STATUS, WARM_READ_LIMIT, bare_stem, layout_text_for, names_another_layout, readies_single, root_busy_line,
+    root_unsafe_line, trees, warm_record_hash, work_root,
+};
 use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
@@ -34,7 +37,7 @@ use crate::boxside::heartbeat;
 use crate::boxside::helper_trusted;
 use crate::boxside::msys;
 use crate::boxside::probe;
-use crate::boxside::run::{self, FILE_FLAG_OPEN_REPARSE_POINT, LAYOUT_SINGLE, Stamp, StopSignal, WaitEnd, Watched, Watching};
+use crate::boxside::run::{self, FILE_FLAG_OPEN_REPARSE_POINT, Stamp, StopSignal, WaitEnd, Watched, Watching};
 use crate::boxside::slots;
 use crate::boxside::stamping;
 use crate::boxside::stop::terminate_and_wait;
@@ -94,7 +97,7 @@ pub(crate) fn git_failed(step: &str, code: i32) -> Failed {
 /// when the work folder of a run of one repo had no `.git` ([`ready_new_tree`]), when the work folder holds an
 /// interrupted-command record ([`crate::boxside::run::command_record`]; anything at its name counts, looked at as
 /// itself and never opened or followed) and when its layout record names another layout than the run's, or a pair's has none yet, as the run then
-/// clears the whole folder ([`run::names_another_layout`]), so the client raises the ceiling of a run that
+/// clears the whole folder ([`names_another_layout`]), so the client raises the ceiling of a run that
 /// meets a cold folder; then the boot line, the path line
 /// [`msys::NO_GIT_BIN`] when no trusted Git `bin` was found for the command's `PATH`, the SDK line, its list read
 /// within `--test-dotnet-limit-ms` when `seams` gives it, else [`git::DOTNET_LIMIT`], and the tool lines, probed
@@ -311,9 +314,6 @@ pub(super) fn refused_folders(payload: &Payload, work: &str) -> Vec<PathBuf> {
     folders
 }
 
-/// The most bytes of a warm record [`warm_state`] reads: one past a hash, so a longer record is seen as not one.
-const WARM_READ_LIMIT: u64 = 65;
-
 /// The hash the work folder `work`'s warm record, `{Work}.warm`, holds; `None` unless every tree its layout record
 /// `layout` names ([`laid_out_trees`]) has a plain `.git` ([`git_is_plain`]), as a work folder that is missing has
 /// not, and `None` when there is no record, when it cannot be opened or read or is not a plain file, and when it holds
@@ -330,8 +330,7 @@ fn warm_state(work: &str, layout: &io::Result<Option<String>>) -> Option<String>
         .take(WARM_READ_LIMIT)
         .read_to_end(&mut bytes)
         .ok()?;
-    let text = String::from_utf8(bytes).ok()?;
-    gate_wire::is_lower_hex(&text, gate_wire::SHA256_DIGITS).then_some(text)
+    warm_record_hash(&bytes)
 }
 
 /// The record `record` beside the work folder opened as the preflight reads one: sharing reading, writing and
@@ -359,21 +358,24 @@ fn layout_record(work: &str) -> io::Result<Option<String>> {
     Ok(Some(text))
 }
 
-/// The trees the layout record of the work folder `work`, `layout`, says it holds: `work` itself for a run of one
-/// repo's layout or no record, `{work}\{name}` for the leaf and each sibling of a pair's; `None` for a clear in
-/// progress, a record that cannot be read, or one that names no layout or a name that is not a folder name.
+/// The trees the layout record of the work folder `work`, `layout`, says it holds: `work` itself for a missing record
+/// or one of a run of one repo's layout ([`readies_single`]), `{work}\{name}` for the leaf and each sibling of a
+/// pair's ([`trees`]); `None` for a clear in progress, a record that cannot be read, or one that names no layout or a
+/// name that is not a folder name.
 fn laid_out_trees(work: &str, layout: &io::Result<Option<String>>) -> Option<Vec<String>> {
-    let text = match layout {
-        Ok(None) => return Some(vec![work.to_owned()]),
-        Ok(Some(text)) => text,
-        Err(_) => return None,
-    };
-    if text.eq_ignore_ascii_case(LAYOUT_SINGLE) {
+    if readies_single(layout) {
         return Some(vec![work.to_owned()]);
     }
+    let Ok(Some(text)) = layout else {
+        return None;
+    };
     let names: Vec<&str> = text.strip_prefix("pair ")?.split(' ').collect();
-    let named = names.len() >= 2 && names.iter().all(|name| gate_router::is_layout_name(name));
-    named.then(|| names.iter().map(|name| format!(r"{work}\{name}")).collect())
+    if names.len() < 2 || !names.iter().all(|name| gate_router::is_layout_name(name)) {
+        return None;
+    }
+    let (leaf, siblings) = names.split_first()?;
+    let (main, sibling_trees) = trees(work, Some((*leaf, siblings)), PathForm::Windows);
+    Some(std::iter::once(main).chain(sibling_trees).collect())
 }
 
 /// What the preflight read of the key's records under the key's lock, and whether the work folder's tree is new.
@@ -384,7 +386,7 @@ struct Readied {
     /// The warm record's hash ([`warm_state`]).
     warm: Option<String>,
     /// The run clears what the folder holds: a command ended mid-run left its record, or the layout record names
-    /// another layout than the run's ([`run::names_another_layout`]).
+    /// another layout than the run's ([`names_another_layout`]).
     cleared: bool,
 }
 
@@ -415,11 +417,8 @@ fn ready(bare: &str, work: &str, lock: &str, pair: Option<&Pair>, console: &mut 
     // clear the whole folder and lay its trees out again. Any entry at the record's name counts, a folder or a link
     // included, looked at as itself, never followed: the run takes one it cannot read as a record of no form.
     let interrupted = fs::symlink_metadata(run::command_record(work)).is_ok();
-    let wanted = match pair {
-        None => run::layout_text(None, Vec::new()),
-        Some(pair) => run::layout_text(Some(pair.leaf()), pair.siblings().iter().map(PairSibling::name).collect()),
-    };
-    let relaid = run::names_another_layout(&layout, &wanted);
+    let wanted = layout_text_for(pair);
+    let relaid = names_another_layout(&layout, &wanted);
     let made = match (pair, &held) {
         (Some(_), _) => false,
         (None, Some(_)) => ready_one_tree(&git, bare, work, &layout, console)?,
@@ -434,11 +433,11 @@ fn ready(bare: &str, work: &str, lock: &str, pair: Option<&Pair>, console: &mut 
 }
 
 /// The work folder `work`'s repository ([`ready_tree`], which readies nothing through a link at its `.git`), unless
-/// the work folder is laid out for another layout ([`laid_out_for_one_repo`] of its record `layout`), which a run of
+/// the work folder is laid out for another layout ([`readies_single`] of its record `layout`), which a run of
 /// the key changes. The preflight's lock only guards its writes ([`TreeGit::holds_the_lock`] is false). Whether the
 /// work folder's tree is new to this run ([`ready_new_tree`]).
 fn ready_one_tree(git: &Git, bare: &str, work: &str, layout: &io::Result<Option<String>>, console: &mut Console) -> Result<bool, Failed> {
-    if !laid_out_for_one_repo(layout) {
+    if !readies_single(layout) {
         return Ok(false);
     }
     let warm = crate::boxside::run::warm_record(work);
@@ -451,16 +450,6 @@ fn ready_one_tree(git: &Git, bare: &str, work: &str, layout: &io::Result<Option<
         Unready::Git(failed) => failed,
         Unready::Folder(why) => Failed::without_status(format!("gate: remote {why}")),
     })
-}
-
-/// Whether the work folder's layout record `layout` ([`layout_record`]) says the layout of a run of one repo or is
-/// missing; a record that says a pair's layout or a clear in progress, or that cannot be read, is not.
-fn laid_out_for_one_repo(layout: &io::Result<Option<String>>) -> bool {
-    match layout {
-        Ok(None) => true,
-        Ok(Some(text)) => text.eq_ignore_ascii_case(LAYOUT_SINGLE),
-        Err(_) => false,
-    }
 }
 
 /// For a run of the sibling pair `pair`: the bare repository of the main checkout, `bare`, and of each sibling, each

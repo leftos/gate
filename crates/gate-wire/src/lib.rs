@@ -9,6 +9,8 @@
     reason = "each reader's own doc names the usage line it refuses with, as the parser's docs always have"
 )]
 
+use std::io;
+
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use gate_args::{EnvRefusal, MAX_WHOLE_NUMBER, MOST_ENV_BYTES, MOST_ENV_NAMES, env_refusal, over_cap, repeated_name, shown_name};
@@ -146,6 +148,70 @@ pub fn lower_hex(bytes: &[u8]) -> String {
         hex.push(char::from(DIGITS[usize::from(byte & 0xf)]));
     }
     hex
+}
+
+/// The layout record's text for a work folder holding one repo's tree, checked out in the work folder itself.
+pub const LAYOUT_SINGLE: &str = "single";
+
+/// The layout record's text while a run clears the work folder for another layout: a layout no run has, so a clear cut
+/// short is cleared again.
+pub const LAYOUT_CHANGING: &str = "changing";
+
+/// The most bytes of a warm record [`warm_record_hash`] judges: one past a hash, so a longer record is seen as not one.
+pub const WARM_READ_LIMIT: u64 = SHA256_DIGITS as u64 + 1;
+
+/// The hash a warm record holding `bytes` names: exactly [`SHA256_DIGITS`] lower-case hex digits and nothing else, a
+/// line end included; `None` for anything else.
+#[must_use]
+pub fn warm_record_hash(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    is_lower_hex(text, SHA256_DIGITS).then(|| text.to_owned())
+}
+
+/// The layout record's text for a run of one repo (`leaf` none), or for the pair of the leaf and the siblings, the
+/// siblings ordered without regard to ASCII case, one space before each.
+#[must_use]
+pub fn layout_text(leaf: Option<&str>, mut siblings: Vec<&str>) -> String {
+    let Some(leaf) = leaf else {
+        return LAYOUT_SINGLE.to_owned();
+    };
+    siblings.sort_by_key(|name| name.to_ascii_lowercase());
+    format!("pair {leaf} {}", siblings.join(" "))
+}
+
+/// The layout record's text for a run of the boxes' `pair` ([`layout_text`]): one repo's for no pair, else the pair's
+/// leaf and its siblings' names.
+#[must_use]
+pub fn layout_text_for(pair: Option<&Pair>) -> String {
+    match pair {
+        None => layout_text(None, Vec::new()),
+        Some(pair) => layout_text(Some(pair.leaf()), pair.siblings().iter().map(PairSibling::name).collect()),
+    }
+}
+
+/// Whether the layout record as `read` names another layout than `wanted`: a missing record is a single layout's, a
+/// record is compared ignoring ASCII case, and one that cannot be read counts as another.
+#[must_use]
+pub fn names_another_layout(read: &io::Result<Option<String>>, wanted: &str) -> bool {
+    match read {
+        Ok(None) => !wanted.eq_ignore_ascii_case(LAYOUT_SINGLE),
+        Ok(Some(text)) => !text.eq_ignore_ascii_case(wanted),
+        // Counted as changed, so the run writes the record before any clear: one that is not a plain file cannot be
+        // written either, and refuses the run `wanted` there with nothing cleared; one that can, such as one that is
+        // not UTF-8, is cleared as after a clear that did not finish.
+        Err(_) => true,
+    }
+}
+
+/// Whether the layout record as `read` lets the preflight ready the work folder's single tree: missing, or saying a
+/// single layout; a record that says a pair's layout or a clear in progress, or that cannot be read, is not.
+#[must_use]
+pub fn readies_single(read: &io::Result<Option<String>>) -> bool {
+    match read {
+        Ok(None) => true,
+        Ok(Some(text)) => text.eq_ignore_ascii_case(LAYOUT_SINGLE),
+        Err(_) => false,
+    }
 }
 
 /// The path rules a payload is read under, those of the box that reads it.
@@ -1421,7 +1487,7 @@ pub const IDENTITY_NAMES: [&str; 6] = [
 
 impl Payload {
     /// The payload's `Identity`: only the git author and committer variables ([`IDENTITY_NAMES`]), none holding a
-    /// NUL; else the usage line.
+    /// NUL; else the usage line, the name shortened and escaped.
     ///
     /// # Errors
     ///
@@ -1432,7 +1498,7 @@ impl Payload {
             if !IDENTITY_NAMES.contains(&name.as_str()) {
                 return Err(format!(
                     "gate: box payload Identity may set only GIT_AUTHOR_* and GIT_COMMITTER_* names: {}",
-                    name.escape_debug()
+                    shown_name(name).escape_debug()
                 ));
             }
             if value.contains('\0') {
@@ -1999,14 +2065,17 @@ mod tests {
 
     #[expect(clippy::expect_used, reason = "a payload a case cannot build must fail the case loudly")]
     mod run_lines {
+        use std::io;
+
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD;
         use gate_args::{EnvRefusal, MOST_ENV_NAMES};
         use serde_json::{Value, json};
 
         use crate::{
-            BoxKill, DrainAction, IDENTITY_NAMES, PathForm, Payload, Refusal, adjusted_line, adjusted_prefix, busy_line, checkout_done_line,
-            checkout_prefix, checkout_start_line, killed_line, layout_line, refused_line, started_line, tools_line,
+            BoxKill, DrainAction, IDENTITY_NAMES, LAYOUT_CHANGING, LAYOUT_SINGLE, PathForm, Payload, Refusal, WARM_READ_LIMIT, adjusted_line,
+            adjusted_prefix, busy_line, checkout_done_line, checkout_prefix, checkout_start_line, killed_line, layout_line, layout_text,
+            layout_text_for, names_another_layout, readies_single, refused_line, started_line, tools_line, warm_record_hash,
         };
 
         const NONCE: &str = "0123456789abcdef0123456789abcdef";
@@ -2151,6 +2220,78 @@ mod tests {
             );
         }
 
+        /// A good warm record: 64 lower-case hex digits.
+        const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        #[test]
+        fn a_warm_record_is_exactly_64_lower_case_hex_digits() {
+            assert_eq!(warm_record_hash(HASH.as_bytes()), Some(HASH.to_owned()));
+            for bad in [
+                format!("{HASH}\n"),
+                format!("{HASH}\r\n"),
+                HASH.to_uppercase(),
+                HASH[1..].to_owned(),
+                format!("{HASH}0"),
+                format!("{HASH}\n\n"),
+                format!(" {HASH}"),
+                String::new(),
+            ] {
+                assert_eq!(warm_record_hash(bad.as_bytes()), None, "{bad:?}");
+            }
+            assert_eq!(warm_record_hash(&[0xff; 64]), None, "not UTF-8");
+            assert_eq!(WARM_READ_LIMIT, 65, "one past a hash");
+        }
+
+        #[test]
+        fn the_layout_text_orders_the_siblings_ignoring_case() {
+            assert_eq!(layout_text(None, Vec::new()), "single");
+            assert_eq!(layout_text(Some("app"), vec!["lib", "Core", "b"]), "pair app b Core lib");
+            assert_eq!(
+                layout_text(Some("app"), Vec::new()),
+                "pair app ",
+                "zero siblings leave the trailing space"
+            );
+            assert_eq!(LAYOUT_SINGLE, "single");
+            assert_eq!(LAYOUT_CHANGING, "changing");
+        }
+
+        /// A pair's layout text is [`layout_text`]'s for its leaf and its siblings' names, the siblings sorted without
+        /// regard to ASCII case; no pair is a single tree's.
+        #[test]
+        #[expect(clippy::expect_used, reason = "a payload the case cannot build must fail the case loudly")]
+        fn a_pair_s_layout_text_is_the_shared_rule_s_text() {
+            let pair = payload(&json!({
+                "Key": "app-1a2b3c4d",
+                "Work": "/g/work/app-1a2b3c4d",
+                "Bare": "/g/app.git",
+                "Pair": {"Leaf": "app", "Siblings": ["tools", "lib"]},
+            }))
+            .pair()
+            .expect("the pair payload decodes")
+            .expect("it names a pair");
+            assert_eq!(layout_text_for(Some(&pair)), "pair app lib tools");
+            assert_eq!(layout_text_for(None), "single");
+        }
+
+        #[test]
+        fn a_layout_record_names_another_layout_unless_it_is_the_wanted_one() {
+            assert!(!names_another_layout(&Ok(None), "single"), "no record is a single layout's");
+            assert!(!names_another_layout(&Ok(None), "SINGLE"), "the single layout in any case");
+            assert!(names_another_layout(&Ok(None), "pair app lib"), "a pair's first run");
+            assert!(!names_another_layout(&Ok(Some("SINGLE".to_owned())), "single"), "any case");
+            assert!(names_another_layout(&Ok(Some("pair app lib".to_owned())), "single"));
+            assert!(names_another_layout(&Err(io::Error::other("unreadable")), "single"));
+        }
+
+        #[test]
+        fn only_a_missing_or_single_layout_record_readies_the_tree() {
+            assert!(readies_single(&Ok(None)));
+            assert!(readies_single(&Ok(Some("Single".to_owned()))));
+            assert!(!readies_single(&Ok(Some("pair app lib".to_owned()))));
+            assert!(!readies_single(&Ok(Some("changing".to_owned()))));
+            assert!(!readies_single(&Err(io::Error::other("unreadable"))));
+        }
+
         #[test]
         fn an_identity_sets_only_the_git_author_and_committer_names() {
             assert_eq!(payload(&json!({})).identity(), Ok(Vec::new()), "no Identity sets nothing");
@@ -2163,6 +2304,23 @@ mod tests {
             assert_eq!(
                 payload(&json!({ "Identity": { "GIT_AUTHOR_NAME": "a\u{0}b" } })).identity(),
                 Err("gate: box payload Identity GIT_AUTHOR_NAME holds a NUL".to_owned())
+            );
+        }
+
+        /// A refused name shows its first 200 characters with `…` after them, then escapes it: a backslash, a quote, a
+        /// control character or an invisible mark cannot make one name read as another. Shortened before it is
+        /// escaped, as the payload's other refusals are.
+        #[test]
+        fn a_refused_payload_name_is_escaped_and_capped() {
+            let name = format!("a\\b'c\"d\u{1}e\u{200b}{}", "x".repeat(250));
+            let escaped = r#"a\\b\'c\"d\u{1}e\u{200b}"#;
+            let shown = format!("{escaped}{}…", "x".repeat(190));
+            let identity: serde_json::Map<String, Value> = [(name, json!("/x"))].into_iter().collect();
+            assert_eq!(
+                payload(&json!({ "Identity": identity })).identity(),
+                Err(format!(
+                    "gate: box payload Identity may set only GIT_AUTHOR_* and GIT_COMMITTER_* names: {shown}"
+                ))
             );
         }
 

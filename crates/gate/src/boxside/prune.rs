@@ -40,13 +40,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use gate_args::BoxSeams;
 use gate_router::escaped;
 use gate_win32::{Make, Share};
-use gate_wire::{is_drive_path, is_key};
+use gate_wire::{LAYOUT_CHANGING, is_drive_path, is_key};
 use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES};
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
 use crate::boxside::forward::{ClientGone, OutputLock};
 use crate::boxside::preflight::{Git, GitClass, GitFailure, GitOutput, GitStep, Pipe, Shared, Streams, is_folder_itself, written_beneath};
-use crate::boxside::run::{FILE_FLAG_OPEN_REPARSE_POINT, LAYOUT_CHANGING, LOCK_VIOLATION, SHARING_VIOLATION};
+use crate::boxside::run::{FILE_FLAG_OPEN_REPARSE_POINT, LOCK_VIOLATION, SHARING_VIOLATION};
 use crate::boxside::{drain, stamping};
 use crate::console::Console;
 

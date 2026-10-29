@@ -35,13 +35,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gate_args::BoxSeams;
 use gate_wire::drain::Clock;
-use gate_wire::{escaped, is_key};
+use gate_wire::{LAYOUT_CHANGING, escaped, is_key};
 
 use crate::console::Console;
 use crate::drain::barrier_stands;
 use crate::files::{self, HeldLock, Locked};
 use crate::git::Git;
-use crate::lines::{FAILED_STATUS, LAYOUT_CHANGING, OwnerFlaw, Recorded, USAGE_STATUS, WRITABLE_BY_OTHERS, owner_flaw, recorded_group, signal_guard};
+use crate::lines::{FAILED_STATUS, OwnerFlaw, Recorded, USAGE_STATUS, WRITABLE_BY_OTHERS, owner_flaw, recorded_group, signal_guard};
 use crate::stop::{Record, own_group, record_current, records_folder, unusable_refusal};
 
 /// How long a work folder goes unused before a sweep removes it.
