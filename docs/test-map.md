@@ -6,7 +6,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 
 ## 0. How the suite reaches src (the shape that decides everything)
 
-- Every case builds a `Case` (`support.rs`, own `--state-dir`), runs the built `gate.exe` and the `fake-tool` helper. `main.rs` -> `answer::answer` (`crates/gate/src/answer.rs:21-43`) dispatches: Run -> `run::run`; StopTree -> `stop_tree.rs`; Cutover -> `cutover.rs`; Push -> `push.rs`; Drain -> `drain_cmd.rs`; Prune -> `prune_cmd.rs`; Check -> `check.rs`; Box -> `boxside::answer`; `--version/--help` in-place.
+- Every case builds a `Case` (`support.rs`, own `--state-dir`), runs the built `gate.exe` and the `fake-tool` helper, with the fake-ssh guard first on its `PATH` (`ssh_guard`, the one case `ssh_guard::a_routed_case_without_a_remote_seam_reaches_the_suite_s_ssh_guard`). `main.rs` -> `answer::answer` (`crates/gate/src/answer.rs:21-43`) dispatches: Run -> `run::run`; StopTree -> `stop_tree.rs`; Cutover -> `cutover.rs`; Push -> `push.rs`; Drain -> `drain_cmd.rs`; Prune -> `prune_cmd.rs`; Check -> `check.rs`; Box -> `boxside::answer`; `--version/--help` in-place.
 - Every `Run` goes `answer.rs` -> `resolve.rs` -> `run.rs` (`run.rs:63`), which uses `acquire, covered, environment, journal, log, machine, nesting, remote, route, slots, wait, watch` (`run.rs:22-36`). So run.rs, answer.rs, main.rs, resolve.rs, console.rs, slots.rs, wait.rs, journal.rs, log.rs, environment.rs, watch.rs are on the path of nearly every case.
 - Seam flags are declared in `crates/gate-args/src/{run,request,boxcmd,values}.rs` and parsed to the per-feature behaviour below.
 

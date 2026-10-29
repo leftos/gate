@@ -138,6 +138,14 @@ Never suspend a thread during its start-up: it holds the loader lock, and the ri
 
 `cdb -pv` plus `llvm-symbolizer --relative-address` reads a hung test's stacks without disturbing it.
 
+The Windows builder's Win32-OpenSSH blocks forever writing its first stderr line when stderr is a pipe, so a suite case that reached the machine's real ssh there sat out the whole 120 s stall window; the suite puts a fake-ssh guard first on every case's PATH for that reason (GATE-948). On this PC the same ssh exits at once.
+
+To probe a builder without writing files there, pipe a script into `ssh {builder} "pwsh -NoProfile -NonInteractive -Command -"`. To read a builder process's stacks, write a minidump there with `MiniDumpWriteDump` from PowerShell, scp it back, delete it there, and read it here with `cdb -z` and the Win32-OpenSSH release's symbols zip.
+
+A hold rig on a box LFS case roots on `box run`: the box's LFS checkout starts two `sh.exe` and `uname.exe`, which git-lfs waits on with no limit. `GIT_TRACE2_EVENT` reaches box children through `-Env` with an absolute builder path. Keep a hanging routed run's log before its worktree is removed: it records every process start and exit, so a hung process shows as a start with no exit (GATE-939).
+
+To count a routed case's git processes, pass a nextest target runner by `--config target.x86_64-pc-windows-msvc.runner=['pwsh','-NoProfile','-NonInteractive','-CommandWithArgs','<decode-and-run>','<base64 script>']` (pwsh 7.4+; `-EncodedCommand` refuses trailing arguments) with `--success-output immediate`; the script passes a `--list` call straight through, sets `GIT_TRACE2_EVENT`, and rewrites any `gate: FAILED` it echoes from a case's logs. Builder load swings a routed case's seconds several-fold, so a before-and-after compares git counts and fixed waits, and reads seconds only within one run (GATE-940).
+
 The suspend rig cannot stretch a box whose own CPU use is small and whose git children live only briefly: a one-target freezer that catches the box at its creation (by the case folder in its command line) and cycles freeze and run on it alone does. GATE-859 was found that way (rig in `.tmp/859-rig/` of its worktree while it lasts).
 
 A race in the Unix box's own file handling is opened deterministically by a `DYLD_INSERT_LIBRARIES` interposer filtered by `fcntl(F_GETPATH)` and argv. The suspend rig cannot do this: it freezes whole processes, on Windows only. GATE-895 was found that way (rig in `.tmp/895-rig/` of its worktree while it lasts).

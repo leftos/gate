@@ -5260,6 +5260,7 @@ Rules:
 A Rust integration suite drives the built `gate.exe` through its CLI and reads only what it writes: exit codes, stdout, stderr, the log, the journal, claims and tickets.
 
 - **Own state root per case.** Every case creates a fresh folder under the target directory's temporary folder. The folder is the case's working folder, holding its logs and its `LOCALAPPDATA`, and its `state` subfolder is the `--state-dir`, so cases never touch the machine's real slots, journal or counts, or each other's. Cases run side by side.
+- **No real ssh.** Every case's command runs with a folder first on its `PATH` that holds the suite's fake-ssh as `ssh.exe`, one folder per fake-ssh build, so a routed case that names no remote seam fails its preflight at once with the stand-in's own line and status 2, never running the machine's ssh (the Windows builder's ssh blocks writing a piped stderr, which costs the whole stall window). A case that sets its own `PATH` keeps it.
 - **Load.** Watchdog-timing cases depend on the scheduler. The gate under test runs at Normal priority, and its command runs at BelowNormal. Under an all-core load, the gate was measured runnable but not running for up to 13.7 s, and a BelowNormal command for up to 31.8 s with no CPU.
 
   So a case never races a fixed sleep against the watcher: its command sleeps past the 600 s hang guard, and only the behaviour under test ends it. A stall window a case relies on is far past those gaps, or the case is ignored and run with `--ignored` on a critical slot (the repo's nextup profile lists them).

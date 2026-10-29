@@ -10,7 +10,7 @@ use std::process::{Child, ChildStderr, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use std::{fs, process, thread};
 
 use gate_win32::StoppableProcess;
@@ -163,6 +163,7 @@ impl Case {
         command
             .env("LOCALAPPDATA", self.local_app_data())
             .env(TAILSCALE_STATUS_VARIABLE, self.tailscale_status())
+            .env("PATH", guard_path())
             .current_dir(&self.folder)
             .args(args);
     }
@@ -1303,6 +1304,77 @@ fn place(path: &Path, content: &str) {
         assert!(
             held.as_deref().is_ok_and(|held| held == content),
             "{} cannot be replaced ({error}) and holds {held:?}",
+            path.display()
+        );
+    }
+}
+
+/// The suite's ssh guard under the target's temporary folder, shared by every test process and made once by each: a copy of
+/// the stand-in ([`FAKE_SSH`]) named `ssh.exe`, in a folder named for the build it copies, which every case's `PATH`
+/// holds first ([`guard_path`]). The folder takes the stand-in's length and modification time, so a guard left behind by
+/// another build is never the one a case runs.
+fn ssh_guard() -> &'static Path {
+    static GUARD: OnceLock<PathBuf> = OnceLock::new();
+    GUARD.get_or_init(|| {
+        let built = fs::metadata(FAKE_SSH).expect("the suite's stand-in program can be read");
+        let modified = built
+            .modified()
+            .expect("the stand-in's modification time can be read")
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("the stand-in was built after the Unix epoch")
+            .as_nanos();
+        let folder = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("ssh-guard-{}-{modified}", built.len()));
+        place_program(&folder.join("ssh.exe"), Path::new(FAKE_SSH));
+        folder
+    })
+}
+
+/// This process's `PATH` with the suite's ssh guard folder first ([`ssh_guard`]): a case that reaches ssh without naming a
+/// stand-in of its own runs the guard, which fails its call at once, and never the machine's own ssh, which on a builder
+/// whose ssh blocks writing its first line to a piped standard error holds the preflight to the gate's whole stall window.
+/// A case that sets `PATH` of its own afterwards keeps its own, the last `Command::env` winning.
+fn guard_path() -> OsString {
+    let own = std::env::var_os("PATH").expect("PATH is set");
+    std::env::join_paths(std::iter::once(ssh_guard().to_path_buf()).chain(std::env::split_paths(&own)))
+        .expect("the suite's ssh guard and this process's PATH join into a PATH")
+}
+
+/// Copies the program `source` to `path`, as many test processes may at once: a copy already there is left alone, so no
+/// case runs a program being written; otherwise `source` is copied beside it under a name of this process's and renamed
+/// into place, a rename refused as by another process's copy being made being fine once the copy is there. A copy or a
+/// rename that fails says both its own error and any error removing the copy beside it.
+#[expect(clippy::panic, reason = "a suite program that cannot be placed where a case runs it must fail loudly")]
+fn place_program(path: &Path, source: &Path) {
+    if path.exists() {
+        return;
+    }
+    let folder = path.parent().expect("a program placed in the target's folder has a folder");
+    fs::create_dir_all(folder).expect("the folder a program is placed in can be made");
+    let name = path.file_name().expect("a program placed has a name").to_string_lossy();
+    let staged = folder.join(format!("{name}.{}.new", process::id()));
+    if let Err(copied) = fs::copy(source, &staged) {
+        let cleaned = fs::remove_file(&staged);
+        panic!(
+            "cannot copy {} to {}: {copied}; removing the copy: {cleaned:?}",
+            source.display(),
+            staged.display()
+        );
+    }
+    if let Err(renamed) = fs::rename(&staged, path) {
+        if path.exists() {
+            let cleaned = fs::remove_file(&staged);
+            assert!(
+                cleaned.is_ok(),
+                "another process placed {}, and the copy beside it ({}) cannot be removed: {cleaned:?}",
+                path.display(),
+                staged.display()
+            );
+            return;
+        }
+        let cleaned = fs::remove_file(&staged);
+        panic!(
+            "cannot rename {} to {}: {renamed}; removing the copy: {cleaned:?}",
+            staged.display(),
             path.display()
         );
     }

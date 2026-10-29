@@ -38,6 +38,7 @@ mod remote_lfs;
 mod request;
 mod routing;
 mod slots;
+mod ssh_guard;
 mod stall;
 mod stop_tree;
 mod support;
