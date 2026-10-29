@@ -12,7 +12,7 @@ use gate_router::escaped as shown;
 use gate_state::{KernelObject, StateRoot};
 use gate_win32::{Job, OpenedJob, ProcessTimes, StoppableProcess, WaitableProcess, file_time_now};
 use jiff::Timestamp;
-use proc_table::{Children, ProcessInfo, ProcessTree, Win32ProcessTable, filetime_to_timestamp};
+use proc_table::{Children, ProcessInfo, ProcessTree, Win32ProcessTable, filetime_to_timestamp, system_list};
 
 use crate::stopping::{Node, Opened, failure, open_checked};
 
@@ -131,9 +131,15 @@ fn forgettable(walked: &[Departed], since: Timestamp, tree: &ProcessTree) -> Vec
 /// What a kill's `look` finds outside the job, as [`outside`] finds it under the members and under the `earlier`
 /// processes, with a line saying why the job's memory may lack a member when its `trouble` says so: the look goes on
 /// with the members the memory has.
-fn kill_look(look: Look<'_>, trouble: Option<&str>, earlier: &[Escaped], running: impl Fn(u32) -> bool) -> Found {
+fn kill_look(
+    look: Look<'_>,
+    trouble: Option<&str>,
+    earlier: &[Escaped],
+    running: impl Fn(u32) -> bool,
+    listed_starts: impl FnOnce() -> Option<HashMap<u32, Timestamp>>,
+) -> Found {
     let members = members(look.before, &look.after, look.since, look.tree, look.departed);
-    let mut found = outside(&members, earlier, look.tree, running);
+    let mut found = outside(&members, earlier, look.tree, running, listed_starts);
     found
         .problems
         .extend(trouble.map(|why| could_not_look(&format!("the job's memory failed: {why}"))));
@@ -251,7 +257,7 @@ impl Reach<'_> {
             tree: &tree,
             departed: ended,
         };
-        Ok(kill_look(look, trouble.as_deref(), earlier, still_runs))
+        Ok(kill_look(look, trouble.as_deref(), earlier, still_runs, listed_starts))
     }
 
     /// Terminates the job with `status`, then ends with `status` every process outside it that `earlier` found or a
@@ -381,7 +387,7 @@ impl Ending<'_> {
             self.problems.push(could_not_look(EMPTY_SNAPSHOT));
             return Vec::new();
         }
-        let late = children_since(ended, seen, &ProcessTree::new(snapshot), still_runs);
+        let late = children_since(ended, seen, &ProcessTree::new(snapshot), still_runs, listed_starts);
         self.unjudged.extend(late.unjudged);
         late.escaped
     }
@@ -539,6 +545,19 @@ pub(crate) fn now() -> Option<Timestamp> {
     i64::try_from(file_time_now()).ok().and_then(filetime_to_timestamp)
 }
 
+/// The start of each process the system's process list holds with one, by pid; `None` when the list cannot be read,
+/// so a sweep counts every process whose start it does not know, as with no list.
+fn listed_starts() -> Option<HashMap<u32, Timestamp>> {
+    let list = system_list::process_list().ok()?;
+    let entries = system_list::walk(system_list::as_bytes(&list), |entry| entry.create != 0).ok()?;
+    Some(
+        entries
+            .iter()
+            .filter_map(|entry| Some((u32::try_from(entry.pid).ok()?, filetime_to_timestamp(entry.create)?)))
+            .collect(),
+    )
+}
+
 /// Whether a process has the pid `pid` and still runs, so that one not judged is left running: false when none has it
 /// or the one that has it has ended, true when that cannot be told.
 fn still_runs(pid: u32) -> bool {
@@ -631,8 +650,16 @@ fn union(earlier: Found, later: Found) -> Found {
 /// parent has been judged before it. A process under a member or one found whose own start or whose parent's is
 /// unknown cannot be judged, and is counted while `running` says a process still has its pid. Each of the `earlier`
 /// processes the snapshot still lists as itself, by its pid and start, follows with its descendants, as a member's are
-/// taken, though the process that started it has ended.
-fn outside(members: &Members, earlier: &[Escaped], tree: &ProcessTree, running: impl Fn(u32) -> bool) -> Found {
+/// taken, though the process that started it has ended. When a start is unknown, `listed_starts` reads the system's
+/// list of starts once, and a process it lists as started before the process it names as its parent is not counted:
+/// that is no child of it ([`still_unjudged`]); with no list read, every such process is counted.
+fn outside(
+    members: &Members,
+    earlier: &[Escaped],
+    tree: &ProcessTree,
+    running: impl Fn(u32) -> bool,
+    listed_starts: impl FnOnce() -> Option<HashMap<u32, Timestamp>>,
+) -> Found {
     let roots = members.roots();
     let mut walk = Walk::new(tree, &members.held);
     walk.members(members);
@@ -653,10 +680,25 @@ fn outside(members: &Members, earlier: &[Escaped], tree: &ProcessTree, running: 
         .chain(departed)
         .chain(escaped.iter().map(|process| process.node.pid))
         .collect();
-    let unjudged = tree
+    let candidates: Vec<&ProcessInfo> = tree
         .iter()
         .filter(|process| process.pid != process.parent_pid && parents.contains(&process.parent_pid))
         .filter(|process| !held.contains(&process.pid) && !seen.contains(&process.pid) && unknown_start(tree, process))
+        .collect();
+    // Read only when a start is unknown: the system's list holds the starts of processes this user cannot open.
+    let listed = if candidates.is_empty() { None } else { listed_starts() };
+    let parent_start = |pid: u32| {
+        tree.get(pid)
+            .and_then(|parent| parent.created)
+            .or_else(|| members.departed.iter().find(|member| member.pid == pid).map(|member| member.start))
+    };
+    let unjudged = candidates
+        .into_iter()
+        .filter(|process| {
+            listed
+                .as_ref()
+                .is_none_or(|starts| still_unjudged(starts.get(&process.pid).copied(), parent_start(process.parent_pid)))
+        })
         .map(|process| process.pid)
         .filter(|&pid| running(pid))
         .collect();
@@ -672,10 +714,30 @@ fn unknown_start(tree: &ProcessTree, process: &ProcessInfo) -> bool {
     process.created.is_none() || tree.get(process.parent_pid).is_some_and(|parent| parent.created.is_none())
 }
 
+/// Whether a process whose start the snapshot does not know is still counted as not judged, given its start as the
+/// system's process list gives it, `listed` (`None` when the list does not hold it), and the start of the process whose
+/// pid it names as its parent's, `parent` (`None` when unknown): it is not when it started before that process, so
+/// cannot be its child (the process that started it died and its pid was taken since), and is otherwise.
+fn still_unjudged(listed: Option<Timestamp>, parent: Option<Timestamp>) -> bool {
+    !matches!((listed, parent), (Some(listed), Some(parent)) if listed < parent)
+}
+
 /// The children in `tree` of the processes `ended` that are none of `seen` and started while their parent ran; one of
-/// which that cannot be told is counted as not judged while `running` says a process still has its pid.
-fn children_since(ended: &[Ended], seen: &HashSet<(u32, Option<Timestamp>)>, tree: &ProcessTree, running: impl Fn(u32) -> bool) -> Found {
+/// which that cannot be told is counted as not judged while `running` says a process still has its pid, unless the
+/// system's list of starts, read once by `listed_starts` when the first such process is met, lists it as started before
+/// its parent ([`still_unjudged`]).
+fn children_since(
+    ended: &[Ended],
+    seen: &HashSet<(u32, Option<Timestamp>)>,
+    tree: &ProcessTree,
+    running: impl Fn(u32) -> bool,
+    listed_starts: impl FnOnce() -> Option<HashMap<u32, Timestamp>>,
+) -> Found {
     let mut found = Found::default();
+    // Read only when a start is unknown, at most once: the system's list holds the starts of processes this user cannot
+    // open.
+    let mut read = Some(listed_starts);
+    let mut listed: Option<Option<HashMap<u32, Timestamp>>> = None;
     for process in tree.iter().filter(|process| process.pid != process.parent_pid) {
         let Some(parent) = ended.iter().find(|parent| parent.process.node.pid == process.parent_pid) else {
             continue;
@@ -685,10 +747,16 @@ fn children_since(ended: &[Ended], seen: &HashSet<(u32, Option<Timestamp>)>, tre
         }
         match kinship(process.created, parent) {
             Kin::Child => found.escaped.push(Escaped::of(process)),
-            Kin::Unknown if running(process.pid) => {
-                found.unjudged.insert(process.pid);
+            Kin::Unknown => {
+                let starts = listed.get_or_insert_with(|| read.take().and_then(|read| read()));
+                let counted = starts
+                    .as_ref()
+                    .is_none_or(|starts| still_unjudged(starts.get(&process.pid).copied(), parent.process.node.created));
+                if counted && running(process.pid) {
+                    found.unjudged.insert(process.pid);
+                }
             }
-            Kin::Other | Kin::Unknown => {}
+            Kin::Other => {}
         }
     }
     found
@@ -766,7 +834,7 @@ fn could_not_judge(count: usize) -> String {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test timestamp that does not parse must fail loudly")]
 mod tests {
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::io;
     use std::time::{Duration, Instant};
 
@@ -777,7 +845,7 @@ mod tests {
 
     use super::{
         Departed, EMPTY_SNAPSHOT, Ended, Escaped, Found, Look, Members, Recorded, children_since, could_not_end, could_not_judge, could_not_look,
-        forgettable, is_gate, kill_look, members, memory_line, outside, terminated_line, union, wait_left,
+        forgettable, is_gate, kill_look, members, memory_line, outside, still_unjudged, terminated_line, union, wait_left,
     };
     use crate::stopping::Node;
 
@@ -884,7 +952,7 @@ mod tests {
             departed: vec![gone(2, 1, 5)],
         };
 
-        let found = kill_look(look, None, &[], all_run);
+        let found = kill_look(look, None, &[], all_run, no_list);
 
         assert_eq!(pids(&found), vec![3], "the job's memory reaches what it started");
     }
@@ -897,7 +965,7 @@ mod tests {
             ..look(&[1], &tree)
         };
 
-        let found = kill_look(look, Some("its drain thread ended on a panic"), &[], all_run);
+        let found = kill_look(look, Some("its drain thread ended on a panic"), &[], all_run, no_list);
 
         assert_eq!(pids(&found), vec![3], "the members it has are still looked under");
         assert_eq!(
@@ -922,7 +990,7 @@ mod tests {
     /// sample records there.
     fn found_and_recorded(held: &[u32], departed: &[Departed], tree: &ProcessTree) -> (Vec<u32>, Vec<u32>) {
         let members = members(held.to_vec(), held, at(9), tree, departed.to_vec());
-        let found = outside(&members, &[], tree, all_run);
+        let found = outside(&members, &[], tree, all_run, no_list);
         let mut recorded = Recorded::default();
         let look = Look {
             departed: departed.to_vec(),
@@ -1012,7 +1080,7 @@ mod tests {
         let tree = ProcessTree::new(vec![process(1, 0, "cmd.exe", 0), unknown_start(3, 2, "pwsh.exe")]);
         let members = members(vec![1], &[1], at(9), &tree, vec![gone(2, 1, 8)]);
 
-        let found = outside(&members, &[], &tree, all_run);
+        let found = outside(&members, &[], &tree, all_run, no_list);
 
         assert_eq!(pids(&found), Vec::<u32>::new());
         assert_eq!(found.unjudged, HashSet::from([3]), "as a live member's child is");
@@ -1028,7 +1096,7 @@ mod tests {
         ]);
         let members = members(vec![1], &[1], at(9), &tree, vec![gone(2, 1, 8)]);
 
-        let found = outside(&members, &[], &tree, all_run);
+        let found = outside(&members, &[], &tree, all_run, no_list);
 
         assert_eq!(found.unjudged, HashSet::new(), "the stranger's child is no process of the run");
     }
@@ -1043,9 +1111,50 @@ mod tests {
         ]);
         let members = members(vec![1], &[1], at(9), &tree, vec![gone(2, 1, 8)]);
 
-        let found = outside(&members, &[], &tree, all_run);
+        let found = outside(&members, &[], &tree, all_run, no_list);
 
         assert_eq!(found.unjudged, HashSet::from([5]), "the holder is the member itself");
+    }
+
+    #[test]
+    fn an_orphan_listed_as_started_before_the_member_it_names_is_not_counted_as_not_judged() {
+        // csrss.exe started at boot under a smss.exe that died; member 2 took that pid at second 5.
+        assert!(
+            !still_unjudged(Some(at(1)), Some(at(5))),
+            "a process that started before its named parent is no child of it: the pid was reused"
+        );
+    }
+
+    #[test]
+    fn a_child_of_an_ended_member_listed_before_it_is_not_counted_as_not_judged() {
+        // pwsh 2 started at second 3 and ended at second 9; 7, listed as started at second 1, names pid 2 as its parent's
+        // and is no child of pwsh; 8, listed at second 4, may be.
+        let pwsh = ended(&process(2, 1, "pwsh.exe", 3), Some(9));
+        let tree = ProcessTree::new(vec![unknown_start(7, 2, "csrss.exe"), unknown_start(8, 2, "unknown.exe")]);
+        let listed = || Some(HashMap::from([(7, at(1)), (8, at(4))]));
+
+        let found = children_since(&[pwsh], &HashSet::new(), &tree, all_run, listed);
+
+        assert_eq!(
+            found.unjudged,
+            HashSet::from([8]),
+            "the process listed before its named parent is no child of it"
+        );
+    }
+
+    #[test]
+    fn a_process_listed_as_started_after_the_member_it_names_is_counted_as_not_judged() {
+        assert!(still_unjudged(Some(at(6)), Some(at(5))), "it may be the member's child");
+        assert!(
+            still_unjudged(Some(at(5)), Some(at(5))),
+            "one started in its parent's tick may be its child"
+        );
+    }
+
+    #[test]
+    fn a_process_the_list_does_not_hold_or_whose_parent_start_is_unknown_is_counted_as_not_judged() {
+        assert!(still_unjudged(None, Some(at(5))), "the list does not hold it");
+        assert!(still_unjudged(Some(at(1)), None), "its parent's start is unknown");
     }
 
     /// `process`, ended at second `exited`, or with an end that could not be read.
@@ -1059,6 +1168,11 @@ mod tests {
     /// Every process still runs.
     fn all_run(_pid: u32) -> bool {
         true
+    }
+
+    /// The system's list of starts cannot be read.
+    fn no_list() -> Option<HashMap<u32, Timestamp>> {
+        None
     }
 
     #[test]
@@ -1235,7 +1349,7 @@ mod tests {
             ..Found::default()
         };
 
-        let now = outside(&held(&[1]), &earlier.escaped, &tree, all_run);
+        let now = outside(&held(&[1]), &earlier.escaped, &tree, all_run, no_list);
         let found = union(earlier, now);
 
         assert_eq!(
@@ -1255,7 +1369,7 @@ mod tests {
         ]);
 
         let members = members(vec![1], &[1, 2], at(9), &tree, Vec::new());
-        let found = outside(&members, &[], &tree, all_run);
+        let found = outside(&members, &[], &tree, all_run, no_list);
 
         assert_eq!(
             pids(&found),
@@ -1274,7 +1388,7 @@ mod tests {
             unknown_start(5, 9, "other.exe"),
         ]);
 
-        let found = outside(&held(&[1]), &[], &tree, all_run);
+        let found = outside(&held(&[1]), &[], &tree, all_run, no_list);
 
         assert_eq!(pids(&found), vec![2]);
         assert_eq!(found.unjudged, HashSet::from([3, 4]), "not a process under no member or escaped one");
@@ -1299,7 +1413,7 @@ mod tests {
         ]);
 
         let members = members(vec![1, 4, 7, 9], &[1], at(3), &tree, Vec::new());
-        let found = outside(&members, &[], &tree, all_run);
+        let found = outside(&members, &[], &tree, all_run, no_list);
 
         assert_eq!(pids(&found), vec![2, 10], "nothing under the process that took member 4's pid");
         assert_eq!(
@@ -1318,7 +1432,7 @@ mod tests {
         ]);
         let running = |pid: u32| pid != 4;
 
-        let found = outside(&held(&[1]), &[], &tree, running);
+        let found = outside(&held(&[1]), &[], &tree, running, no_list);
 
         assert_eq!(found.unjudged, HashSet::from([3]), "the first look: only the one still running");
 
@@ -1326,7 +1440,7 @@ mod tests {
         let tree = ProcessTree::new(vec![process(5, 2, "rustc.exe", 3), process(6, 2, "link.exe", 3)]);
         let running = |pid: u32| pid != 6;
 
-        let found = children_since(&[pwsh], &HashSet::new(), &tree, running);
+        let found = children_since(&[pwsh], &HashSet::new(), &tree, running, no_list);
 
         assert_eq!(found.unjudged, HashSet::from([5]), "the second pass: only the one still running");
     }
@@ -1367,7 +1481,7 @@ mod tests {
         ]);
         let seen = HashSet::from([known.key()]);
 
-        let found = children_since(&[pwsh], &seen, &tree, all_run);
+        let found = children_since(&[pwsh], &seen, &tree, all_run, no_list);
 
         assert_eq!(pids(&found), vec![5], "not the one already seen, an older one, nor another's child");
         assert_eq!(found.unjudged, HashSet::from([7]));
@@ -1386,7 +1500,7 @@ mod tests {
             process(7, 3, "fake-tool.exe", 3),
         ]);
 
-        let found = children_since(&[pwsh, unread], &HashSet::new(), &tree, all_run);
+        let found = children_since(&[pwsh, unread], &HashSet::new(), &tree, all_run, no_list);
 
         assert_eq!(
             pids(&found),

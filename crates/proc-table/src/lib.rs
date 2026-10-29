@@ -1,7 +1,10 @@
 //! The machine's processes: one snapshot of every process with its parent, executable name, command line and start
 //! time, read through the [`ProcessTable`] trait so a daemon and the tests supply their own. [`win32`] implements it on
-//! 64-bit Windows from a `ToolHelp` snapshot and each process's PEB (the PEB offsets are x64).
+//! 64-bit Windows from a `ToolHelp` snapshot and each process's PEB (the PEB offsets are x64). [`system_list`] reads the
+//! system's process list, which holds every process's start and CPU times, a process this user cannot open included.
 
+#[cfg(all(windows, target_pointer_width = "64"))]
+pub mod system_list;
 #[cfg(all(windows, target_pointer_width = "64"))]
 pub mod win32;
 

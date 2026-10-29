@@ -114,6 +114,8 @@ To hold a process's end open with no load (a process asked to end but not yet go
 
 The debugger does not pass to the children the debuggee creates, so attach to each process itself; to catch a short-lived stand-in, watch for a file the box writes while it is still suspended, since a Toolhelp poll (about 16 ms a snapshot) misses it. GATE-694 was found that way (rig in `.tmp/map-694-rig/` while it lasts).
 
+A pid-reuse fault is reproduced by staging, not load: make a process A, start the process to be orphaned with `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` set to A (and an empty DACL through `SetSecurityInfo` when it must be one this user cannot open), end A, then let a stand-in inside the job start suspended children until one takes A's pid (2,000 to 13,000 starts here). Every Windows boot leaves csrss.exe with wininit.exe, and csrss.exe with winlogon.exe, naming a dead smss.exe as parent, and a gate that is not elevated cannot open any of them. GATE-938 was found that way.
+
 To make a gate wait on its journal, hold the case root's journal mutex, `Local\gate-<first 8 hex of the SHA-256 of the lower-cased state path>-journal`, for under 2 s: past 2 s the gate drops the line by design. To freeze a child gate outside a journal write, take the mutex first, suspend the child, then let the mutex go; GATE-658 was settled that way.
 
 A gate writes a slot's claim file before its journal take line, on one thread, and stamps the take line's `time` before its journal wait: a case that needs the take waits for the take line and reads the claim after it, never the reverse.
