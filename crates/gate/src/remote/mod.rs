@@ -77,6 +77,10 @@ const TRANSFER_FAILED: i64 = 74;
 /// What a client failure says: `gate: the remote run failed: <why>`.
 const FAILED_RUN: &str = "gate: the remote run failed";
 
+/// How the client's note on a run whose work folder on the builder is new, its ceiling raised, begins. A run that
+/// falls back after the raise keeps its own ceiling here, so the log of its run here does not repeat the note.
+pub(crate) const COLD_NOTE_PREFIX: &str = "gate: remote cold:";
+
 // The protocol lines the box says and the client matches, built once in `gate-wire` for every box.
 pub(crate) use gate_wire::{BoxKill, Refusal, adjusted_line, adjusted_prefix, busy_line, killed_line, layout_line, refused_line, started_line};
 
@@ -1228,8 +1232,16 @@ mod scripted {
 mod tests {
     use gate_wire::{ROOT_BUSY, ROOT_STATUS, ROOT_UNSAFE, root_busy_line, root_unsafe_line};
 
-    use super::{INSTALL_UNTRUSTED, git, root_busy_why, root_why};
+    use super::{COLD_NOTE_PREFIX, INSTALL_UNTRUSTED, client, git, root_busy_why, root_why};
     use crate::boxside::WORK_ROOT_STEP;
+
+    #[test]
+    fn the_client_s_cold_note_starts_with_the_prefix_the_fallback_filter_drops() {
+        for warm_up in [false, true] {
+            let note = client::cold_line(60, 120, warm_up);
+            assert!(note.starts_with(COLD_NOTE_PREFIX), "{note}");
+        }
+    }
 
     #[test]
     fn the_root_line_names_why_escaped_and_the_installer_step() {

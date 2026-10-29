@@ -2952,7 +2952,9 @@ impl Run<'_> {
     /// Gives up the remote attempt for `reason`: journals the fallback, the attempt's last line with the remote tag,
     /// while the remote slot `held` is still held, then deletes its claim, lets it go and wakes the waiters, removes the
     /// log so the client's own bytes do not stand beside the notes that say them, and gathers the attempt's lines into
-    /// the log's notes unsaid. The host the tag named, which the fallback line names.
+    /// the log's notes unsaid, all but the cold note of an attempt whose ceiling was raised: neither the run here nor
+    /// the next builder runs under that raised ceiling, and a next builder that raises its own says its own note. The
+    /// host the tag named, which the fallback line names.
     fn give_up(&mut self, reason: FallbackReason, outcome: &RemoteOutcome, held: Option<Taken>, console: &mut Console) -> String {
         self.routing.fell_back.push(reason);
         let tag = self.tag.take();
@@ -2969,7 +2971,11 @@ impl Run<'_> {
                 self.log.path().display()
             ));
         }
+        let raised = outcome.raised.is_some();
         for line in &outcome.lines {
+            if raised && line.starts_with(remote::COLD_NOTE_PREFIX) {
+                continue;
+            }
             console.note(line);
         }
         tag.map_or_else(String::new, |tag| tag.host)

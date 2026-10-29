@@ -475,13 +475,7 @@ fn a_run_the_box_refuses_for_its_inputs_falls_back_inputs() {
     let case = inputs_case("client-inputs-run-refused");
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", &format!("hold {}", shown(go.path())), "ok"]);
-    // The attempt's lines, the cold note of the work folder made now among them, are said again after the command's
-    // own: a tail of 40 lines keeps the command's line in sight.
-    let tuned = Tuned {
-        extra: &["--tail", "40"],
-        ..Tuned::default()
-    };
-    let running = start(client_gate_tuned(&case, "out.log", &steps, &tuned, &RAN));
+    let running = start(client_gate(&case, "out.log", &steps, &RAN));
     running.wait_until("the run call", || calls(&steps).len() == 4);
     fs::remove_file(work_folder(&case).join(INPUT_ON_DISK)).expect("the installed input can be removed");
     drop(go);

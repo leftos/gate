@@ -5608,7 +5608,7 @@ fn new_work_tree(lines: &[String]) -> bool {
 
 /// The note a run whose work folder on the builder is new says before its run call, its ceiling raised from `from` to
 /// `to` whole seconds: naming `gate warm` when the repo's warm-up is set up (`warm_up`), else the warm-up file it needs.
-fn cold_line(from: u64, to: u64, warm_up: bool) -> String {
+pub(crate) fn cold_line(from: u64, to: u64, warm_up: bool) -> String {
     let prewarm = if warm_up {
         "prewarm the next new worktree with gate warm"
     } else {

@@ -1286,6 +1286,61 @@ fn a_routed_run_in_a_new_work_folder_is_given_a_raised_ceiling_and_told_to_prewa
     assert!(warm.get("cold").is_none(), "{warm}");
 }
 
+/// The run in a new work folder is given the raised ceiling, then its connection is lost and the builder is
+/// unreachable, so it falls back here: the cold note is said once on stderr, and the log of the run here, which keeps
+/// its own ceiling, does not say it.
+#[test]
+fn a_run_that_falls_back_after_the_cold_raise_logs_no_cold_note_in_its_local_log() {
+    let case = client_case("client-cold-then-unreachable");
+    let steps = ssh_steps(&case, "ssh", &[&format!("boot {BOOTED}"), "out-then-drop", "ok", "fail-other"]);
+    let tuned = Tuned {
+        timeout: "60",
+        extra: &HANG_GUARD_BOUND,
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), ["unreachable"], "{outcome:?}");
+    assert_eq!(
+        outcome.stderr.lines().filter(|line| *line == COLD_NOTE).count(),
+        1,
+        "said once on stderr: {outcome:?}"
+    );
+    let log = log_texts(&case.folder().join("out.log"));
+    assert!(log.lines().any(|line| line == "ran here"), "the log is the run here's: {log}");
+    assert!(!log.lines().any(|line| line.starts_with("gate: remote cold:")), "{log}");
+}
+
+/// A builder's gate of another build is refused at the preflight, before any ceiling is raised: the log of the run
+/// here keeps the attempt's refusal line before the fallback line, and holds no cold note.
+#[test]
+fn a_run_refused_before_the_cold_raise_logs_its_refusal_lines_in_its_local_log() {
+    let case = client_case("client-version-before-cold");
+    let step = format!("version {}", env!("CARGO_PKG_VERSION"));
+    let steps = ssh_steps(&case, "ssh", &[step.as_str()]);
+    let tuned = Tuned {
+        timeout: "60",
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), ["version"], "{outcome:?}");
+    let log = log_texts(&case.folder().join("out.log"));
+    let lines: Vec<&str> = log.lines().collect();
+    let refused = lines.iter().position(|line| line.starts_with("gate: not routed: builder runs gate "));
+    let fell_back = lines.iter().position(|line| *line == "gate: remote builder version; running here");
+    assert!(
+        matches!((refused, fell_back), (Some(refused), Some(fell_back)) if refused < fell_back),
+        "the refusal line, then the fallback line: {log}"
+    );
+    assert!(!log.lines().any(|line| line.starts_with("gate: remote cold:")), "{log}");
+    assert!(!outcome.stderr.contains("gate: remote cold:"), "{outcome:?}");
+}
+
 /// A run after one whose command was ended mid-run meets a work folder holding the interrupted-command record, which
 /// the box clears what that command wrote from: the run is given the raised ceiling, as in a new work folder.
 #[test]
@@ -6194,15 +6249,14 @@ fn a_boot_time_within_the_slack_is_the_same_boot() {
 }
 
 /// The run call writes a line before its connection is lost, and the boot query fails after the banner, so it is not
-/// made again.
+/// made again. The log of the run here holds the attempt's lines (the preflight's new work tree line among them), then
+/// the fallback line, then the command's own output, which the default tail keeps in sight; it holds no cold note.
 #[test]
 fn a_builder_unreachable_after_the_loss_falls_back_unreachable() {
     let case = client_case("client-lost-unreachable");
     let steps = ssh_steps(&case, "ssh", &[&format!("boot {BOOTED}"), "out-then-drop", "ok", "fail-other"]);
-    // The attempt's lines, the cold note of the work folder made now among them, are said again after the command's
-    // own: a tail of 40 lines keeps the command's line in sight.
     let tuned = Tuned {
-        extra: &[HANG_GUARD_BOUND[0], HANG_GUARD_BOUND[1], "--tail", "40"],
+        extra: &HANG_GUARD_BOUND,
         ..Tuned::default()
     };
 
@@ -6216,9 +6270,25 @@ fn a_builder_unreachable_after_the_loss_falls_back_unreachable() {
     let line = "gate: builder unreachable after the connection was lost; the run did not finish there";
     assert!(outcome.stderr.contains(line), "{outcome:?}");
     assert!(!outcome.stderr.contains(LOST_LINE), "{outcome:?}");
-    assert!(outcome.stdout.contains("ran here"), "it ran here: {outcome:?}");
+    assert!(
+        outcome.stdout.lines().any(|line| line.trim_end() == "ran here"),
+        "the default tail holds the command's line: {outcome:?}"
+    );
     assert_eq!(calls(&steps), ["preflight", "run", "stop", "boot"]);
     assert_eq!(fallbacks(&events(&case)), ["unreachable"]);
+    let log = log_texts(&case.folder().join("out.log"));
+    let lines: Vec<&str> = log.lines().collect();
+    let fallback = format!("gate: remote {HOST} unreachable");
+    let attempt = lines.iter().position(|line| *line == "gate: remote new work tree");
+    let fell_back = lines
+        .iter()
+        .position(|line| line.starts_with(&fallback) && line.ends_with("; running here"));
+    let ran = lines.iter().position(|line| *line == "ran here");
+    assert!(
+        matches!((attempt, fell_back, ran), (Some(attempt), Some(fell_back), Some(ran)) if attempt < fell_back && fell_back < ran),
+        "the attempt's line, then the fallback line, then the command's output: {log}"
+    );
+    assert!(!log.lines().any(|line| line.starts_with("gate: remote cold:")), "{log}");
 }
 
 #[test]
@@ -6264,9 +6334,8 @@ fn a_boot_call_that_does_not_finish_falls_back_unreachable() {
     let case = client_case("client-boot-hangs");
     let hold = format!("hold {}", never(&case));
     let steps = ssh_steps(&case, "ssh", &[&format!("boot {BOOTED}"), "drop", &hold, &hold]);
-    // A tail of 40 lines keeps the command's line in sight below the attempt's, said again after it.
     let tuned = Tuned {
-        extra: &["--test-remote-bound-ms", "200", "--tail", "40"],
+        extra: &["--test-remote-bound-ms", "200"],
         ..Tuned::default()
     };
 
