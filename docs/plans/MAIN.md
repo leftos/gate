@@ -7,20 +7,18 @@
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [!] GATE-828 Fix the flaky Unix box test a_clear_refuses_a_volume_mounted_in_the_work_folder_and_keeps_its_files — Urgent · Remote
 - [ ] GATE-871 Carry routed runs' bulk data on a TCP data channel instead of ssh to the Windows builder — Urgent · Remote
-- [ ] GATE-878 Show builder-side slot holders on ops-tower through a PC cache of the builder's slots — High · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
 - [/] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
-- [ ] GATE-751 Make a routed build's outputs pull fast enough for yaat's trees, or skip it for verdict-only runs — High · Remote
 - [ ] GATE-753 Log every step of a run in the gate's log: start, progress, end and duration — High · Remote
 - [ ] GATE-759 Move the rest of the box's shared wire rules into gate-wire (GATE-616 slices 2, 3, 5, 6) — High · Remote
-- [ ] GATE-839 Route race-anywhere's Unreal editor and game runs: a desktop route with a GPU — High · Remote
-- [ ] GATE-841 Route yaat's output-writing tools and probe tests: .tmp outputs and passing tests' output — High · Remote
+- [!] GATE-839 Route race-anywhere's Unreal editor and game runs: a desktop route with a GPU — High · Remote
 - [ ] GATE-843 Keep the routing facts a census needs past the journal's roll — High · Remote
-- [ ] GATE-844 Serve godot-mcp's parallel itest lanes on the builder desktop, and match any --filter-class — High · Remote
-- [ ] GATE-876 Carry the input put, the sent build and the LFS put on the data channel — High · Remote
+- [/] GATE-844 Serve godot-mcp's parallel itest lanes on the builder desktop, and match any --filter-class — High · Remote
+- [/] GATE-876 Carry the input put, the sent build and the LFS put on the data channel — High · Remote
+- [ ] GATE-910 Route yaat's tools one by one after a trial each, with .tmp outputs globs (GATE-841 ruling 2) — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
@@ -309,6 +307,9 @@
 - [ ] GATE-902 Say when a routed run's command changed no file, instead of printing no sync-back line
 - [ ] GATE-904 Read more MSBuild file-writing switches and binlog forms for a routed run's outputs
 - [ ] GATE-905 Measure and polish the refusal of a routed run whose log is in another worktree
+- [ ] GATE-906 Check an ssh put's length and SHA-256 on the box, as the data channel put does
+- [ ] GATE-908 Treat an outputs folder that vanishes mid-walk as empty instead of failing the manifest
+- [ ] GATE-911 Cover the channel put's retry freshness, mid-transfer stall and send-buffer seam, and log a PC-side failure after install
 
 ## Cutover sweep
 
@@ -430,3 +431,5 @@
 - [ ] GATE-802 Find why test-install-macos.sh takes 19 minutes on the PC under load
 - [ ] GATE-853 Say in design.md that a routed hook gate writes take with parentPid and is not covered
 - [ ] GATE-856 Reword the 71 one-sentence Markdown lines over 500 characters
+- [ ] GATE-907 Count a TestResults glob segment only when no fused ** precedes it
+- [ ] GATE-909 Name the archive's kind in the shared reader's over-limit refusal, not always "outputs"
