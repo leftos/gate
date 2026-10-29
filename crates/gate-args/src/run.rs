@@ -145,6 +145,8 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     ProbeDrainMs,
     #[cfg(feature = "test-seams")]
+    CheckChannelMs,
+    #[cfg(feature = "test-seams")]
     SdkLimitMs,
     #[cfg(feature = "test-seams")]
     NetfxKey,
@@ -422,6 +424,7 @@ impl RunBuilder {
             | ValueOption::PushRegister
             | ValueOption::ProbeLimitMs
             | ValueOption::ProbeDrainMs
+            | ValueOption::CheckChannelMs
             | ValueOption::SdkLimitMs
             | ValueOption::NetfxKey
             | ValueOption::WarmWaitMs
@@ -493,6 +496,7 @@ impl RunBuilder {
             ValueOption::PushRegister => self.push_seams.register_ok = Some(values::remote_call(spelled, value, PUSH_REGISTER_RESULTS)? == "ok"),
             ValueOption::ProbeLimitMs => self.check_seams.probe_limit_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::ProbeDrainMs => self.check_seams.probe_drain_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::CheckChannelMs => self.check_seams.check_channel_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::SdkLimitMs => self.check_seams.sdk_limit_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::NetfxKey => self.check_seams.netfx_key = Some(value.to_owned()),
             ValueOption::DrainRaiseMs => self.drain_seams.raise_ms = Some(values::above_zero(spelled, value)?),
@@ -930,6 +934,7 @@ impl RunBuilder {
             (self.test_seams.remote_ssh.is_some(), "--test-remote-ssh"),
             (self.test_seams.remote_timeout_ms.is_some(), "--test-remote-timeout-ms"),
             (self.test_seams.tailscale_status.is_some(), "--test-tailscale-status"),
+            (self.check_seams.check_channel_ms.is_some(), "--test-check-channel-ms"),
         ] {
             if read && !builder {
                 self.problems.push(Problem::SeamNeeds {

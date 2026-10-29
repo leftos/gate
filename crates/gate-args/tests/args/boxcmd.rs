@@ -182,6 +182,7 @@ fn each_verb_parses_with_stdin() {
         ("inflight", BoxVerb::Inflight),
         ("inputs", BoxVerb::Inputs),
         ("lfs", BoxVerb::Lfs),
+        ("channel-check", BoxVerb::ChannelCheck),
     ] {
         assert_eq!(
             invocation(&["box", word, "--stdin"]),

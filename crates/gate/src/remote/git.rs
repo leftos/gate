@@ -399,6 +399,23 @@ impl ProgramPlace {
             variables: variables.with(NO_CURRENT_FOLDER, "1"),
         })
     }
+
+    /// The launch of `program`, started as it is with `args` and not looked for along `PATH`, in this place's folder,
+    /// with its environment, on `console`.
+    pub(crate) fn launch_of(&self, program: &Path, args: &[OsString], console: PipedConsole) -> io::Result<PipedLaunch> {
+        let words: Vec<Vec<u16>> = std::iter::once(program.as_os_str())
+            .chain(args.iter().map(OsString::as_os_str))
+            .map(|word| word.encode_wide().collect())
+            .collect();
+        Ok(PipedLaunch {
+            application: program.to_owned(),
+            command_line: command_line(&words),
+            directory: self.folder.clone(),
+            environment: self.variables.block()?,
+            console,
+            token: None,
+        })
+    }
 }
 
 impl ProgramCall<'_> {
@@ -601,10 +618,25 @@ fn output_of(spawn: &Spawn<'_>, call: &Call<'_>, over: String) -> Result<(ExitSt
     Ok((status, output, errors))
 }
 
+/// Runs the process `launch` starts as `call` bounds it, as [`bounded`] runs every call: its standard output read and
+/// dropped, its standard error read with `stderr` on a thread of its own; its exit status and what `stderr` returned.
+/// Its failure lines call it `name`, and one that outlives the call's limit fails with `late`.
+pub(crate) fn bounded_stderr<E: Send + 'static>(
+    name: &str,
+    late: String,
+    launch: io::Result<PipedLaunch>,
+    call: &Call<'_>,
+    stderr: impl FnOnce(File) -> io::Result<E> + Send + 'static,
+) -> Result<(ExitStatus, E), GitError> {
+    let spawn = Spawn { name, late, launch };
+    bounded(&spawn, call, dropped, stderr, None).map(|(status, (), errors)| (status, errors))
+}
+
 /// Runs `spawn`'s process, created suspended with no standard input, or with `call`'s input fed by a thread of its own
 /// and then closed, and put in an anonymous kill-on-close job of its own before it runs; a thread per stream reads its
 /// standard output with `stdout` and its standard error with `stderr`, and what they read is returned with its exit
-/// status once it has exited. Whatever it left running then is ended with its job. A call made while the console
+/// status once it has exited, the readers waited for as [`after_exit`] says. Whatever it left running then is ended with
+/// its job. A call made while the console
 /// interrupt is already raised starts no process; one whose wait ends otherwise than in the process's exit (it outlived
 /// `call`'s limit, was interrupted, wrote more than `over` allows, or could not be waited for) has its whole job ended.
 fn bounded<O, E>(
@@ -658,23 +690,55 @@ where
     // The process has exited; whatever it left running, which would hold its pipes open, ends with the job, and the
     // readers then reach their pipes' ends within a short while.
     drop(job);
-    let drain = call.drain_once_exited();
-    let until = Instant::now() + drain;
+    let drained = after_exit(Instant::now(), call, &spawn.late);
     let not_read = || {
         if call.interrupt.is_some_and(Interrupt::is_raised) {
             return GitError::Interrupted;
         }
-        GitError::Failed(format!(
-            "cannot read {name}'s output: it did not end within {} of {name}'s exit",
-            spelled_limit(drain)
-        ))
+        drained.not_ended(&format!("cannot read {name}'s output"), name)
     };
-    let output = received_or_interrupted(&output, until, call.interrupt).ok_or_else(not_read)?;
-    let errors = received_or_interrupted(&errors, until, call.interrupt).ok_or_else(not_read)?;
+    let output = received_or_interrupted(&output, drained.until, call.interrupt).ok_or_else(not_read)?;
+    let errors = received_or_interrupted(&errors, drained.until, call.interrupt).ok_or_else(not_read)?;
     let cannot_read = |error: io::Error| GitError::Failed(format!("cannot read {name}'s output: {error}"));
     let status = ExitStatus::from_raw(code);
-    fed_whole(fed.as_ref(), status, until, call, name)?;
+    fed_whole(fed.as_ref(), status, &drained, call, name)?;
     Ok((status, output.map_err(cannot_read)?, errors.map_err(cannot_read)?))
+}
+
+/// Until when the readers and the feed of a call whose process has exited by itself are waited for, and how the call
+/// fails when one of them has not ended by then ([`after_exit`]).
+struct AfterExit<'s> {
+    until: Instant,
+    /// The drain the call gives its readers once its process exited ([`Call::drain_once_exited`]).
+    drain: Duration,
+    /// The call's late line when its [`Call::drain_deadline`], not its drain, set `until`.
+    late: Option<&'s str>,
+}
+
+/// Until when the readers of `call`, whose process exited at `exited`, are waited for: its drain once it exited, or
+/// `call`'s own drain past its [`Call::drain_deadline`] when that comes first, after which the call is late, `late`.
+fn after_exit<'s>(exited: Instant, call: &Call<'_>, late: &'s str) -> AfterExit<'s> {
+    let drain = call.drain_once_exited();
+    let until = exited + drain;
+    match call.drain_deadline.map(|deadline| deadline + call.drain) {
+        Some(latest) if latest < until => AfterExit {
+            until: latest,
+            drain,
+            late: Some(late),
+        },
+        _ => AfterExit { until, drain, late: None },
+    }
+}
+
+impl AfterExit<'_> {
+    /// How a call fails whose `what` (its output read, its input fed) had not ended when this wait did: late, when its
+    /// deadline ended the wait, else not ended within its drain of `name`'s exit.
+    fn not_ended(&self, what: &str, name: &str) -> GitError {
+        GitError::Failed(match self.late {
+            Some(late) => late.to_owned(),
+            None => format!("{what}: it did not end within {} of {name}'s exit", spelled_limit(self.drain)),
+        })
+    }
 }
 
 /// Reads `pipe` to its end and drops what it read: the standard error of a call that reads none of it.
@@ -682,23 +746,25 @@ fn dropped(mut pipe: File) -> io::Result<()> {
     io::copy(&mut pipe, &mut io::sink()).map(drop)
 }
 
-/// Whether the process `name`, which exited with `status`, was fed its whole input by `fed`, waited for until `until`:
-/// one that failed says why in its own lines, so a feed it cut short by exiting is no failure of its own, and a call
-/// with no input has nothing to check. One that succeeded while its feed failed, or whose feed did not end within the
-/// call's drain once it exited by itself, fails the call; an interrupt raised during the wait ends it as
-/// [`GitError::Interrupted`].
-fn fed_whole(fed: Option<&Receiver<io::Result<()>>>, status: ExitStatus, until: Instant, call: &Call<'_>, name: &str) -> Result<(), GitError> {
+/// Whether the process `name`, which exited with `status`, was fed its whole input by `fed`, waited for as `drained`
+/// says: one that failed says why in its own lines, so a feed it cut short by exiting is no failure of its own, and a
+/// call with no input has nothing to check. One that succeeded while its feed failed, or whose feed had not ended when
+/// that wait did, fails the call; an interrupt raised during the wait ends it as [`GitError::Interrupted`].
+fn fed_whole(
+    fed: Option<&Receiver<io::Result<()>>>,
+    status: ExitStatus,
+    drained: &AfterExit<'_>,
+    call: &Call<'_>,
+    name: &str,
+) -> Result<(), GitError> {
     let Some(fed) = fed.filter(|_| status.success()) else {
         return Ok(());
     };
-    match received_or_interrupted(fed, until, call.interrupt) {
+    match received_or_interrupted(fed, drained.until, call.interrupt) {
         Some(Ok(())) => Ok(()),
         Some(Err(error)) => Err(GitError::Failed(format!("cannot feed {name} its input: {error}"))),
         None if call.interrupt.is_some_and(Interrupt::is_raised) => Err(GitError::Interrupted),
-        None => Err(GitError::Failed(format!(
-            "cannot feed {name} its input: it did not end within {} of {name}'s exit",
-            spelled_limit(call.drain_once_exited())
-        ))),
+        None => Err(drained.not_ended(&format!("cannot feed {name} its input"), name)),
     }
 }
 
@@ -858,8 +924,14 @@ pub(crate) struct Call<'a> {
     pub drain: Duration,
     /// How long git's readers get to reach their pipes' ends once git has exited by itself and its job is dropped, when
     /// that is not `drain`: `None` for every call but a placement call, whose readers get [`placing_drain`]
-    /// ([`Call::placing`]), and set by [`Call::drain_once_exited`].
+    /// ([`Call::placing`]), and the data channel's probe of `gate check --builder`, whose standard error reader may still
+    /// dial the channel then; read by [`Call::drain_once_exited`].
     pub exit_drain: Option<Duration>,
+    /// The deadline of a call whose bound its caller counts from before the call, as something the caller runs beside it
+    /// ends at that same instant: once git has exited by itself, its readers are not waited for past `drain` after this
+    /// deadline, however long `exit_drain` is, and a call whose readers have not ended by then is late. `None` for every
+    /// call but the data channel's probe of `gate check --builder`, whose standard error reader dials until it.
+    pub drain_deadline: Option<Instant>,
     /// The console interrupt a Ctrl+C raises: git is ended with it, and the call is [`GitError::Interrupted`].
     pub interrupt: Option<Interrupt>,
     /// The console git is created on: this process's, so a Ctrl+C reaches git as it reaches the gate, or a hidden one
@@ -891,6 +963,7 @@ impl<'a> Call<'a> {
             limit: bounds.limit,
             drain: bounds.drain,
             exit_drain: None,
+            drain_deadline: None,
             interrupt: None,
             console: PipedConsole::Attached,
             stdin: None,
@@ -1106,8 +1179,8 @@ fn output_file() -> io::Result<File> {
     reason = "a test whose git cannot be found or whose bytes cannot be read must fail loudly"
 )]
 mod tests {
-    use std::ffi::OsStr;
-    use std::fs;
+    use std::ffi::{OsStr, OsString};
+    use std::fs::{self, File};
     use std::io;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
@@ -1120,8 +1193,8 @@ mod tests {
 
     use super::{
         Call, DRAIN, ERRORS_KEPT, FAILURE_BYTES, GIT_LIMIT, Git, GitError, LaunchGuard, NO_CURRENT_FOLDER, OUTPUT_CAP, ProgramCall, ProgramPlace,
-        capped, failed_line, failure_text, is_indexed_config, late_git_line, program_call, program_output, received_or_interrupted, sdk_listing,
-        tail, without_verbatim,
+        bounded_stderr, capped, failed_line, failure_text, is_indexed_config, late_git_line, program_call, program_output, received_or_interrupted,
+        sdk_listing, tail, without_verbatim,
     };
     use crate::environment::Variables;
     use crate::remote::snapshot::repository;
@@ -1724,6 +1797,35 @@ mod tests {
         };
         let failed = program_output(&call, &place).err().map(String::from);
         assert_eq!(failed.as_deref(), Some("cannot run cmd: the gate is ending"));
+    }
+
+    /// A call whose program exits by itself after the call's deadline gives its readers no more than one drain past that
+    /// deadline, however long the drain it gives them once the program exited: a reader still running then makes the
+    /// call late. The reader here ends only once the case lets it go, after the call has ended.
+    #[test]
+    fn a_bounded_call_gives_its_readers_one_drain_past_its_deadline_once_its_program_exits() {
+        let place = ProgramPlace::new(Variables::from_process()).expect("the system folder can be read");
+        let cmd = gate_win32::system_directory().expect("the system folder is read").join("cmd.exe");
+        let args: Vec<OsString> = ["/d", "/c", "exit 0"].into_iter().map(OsString::from).collect();
+        let launch = place.launch_of(&cmd, &args, PipedConsole::Hidden);
+        let late = "cmd.exe did not end within its bound".to_owned();
+        // The deadline has passed before the program starts; the drain once it exited is far longer than one drain.
+        let call = Call {
+            exit_drain: Some(Duration::from_secs(60)),
+            drain_deadline: Some(Instant::now()),
+            ..Call::plain(Path::new(""), &[], HANG_GUARD)
+        };
+        let (release, held) = mpsc::channel::<()>();
+        let read = move |_stderr: File| {
+            // The sender is dropped only once the call has ended, which lets the reader go.
+            held.recv().ok();
+            Ok(())
+        };
+
+        let ended = bounded_stderr("cmd.exe", late.clone(), launch, &call, read);
+        drop(release);
+
+        assert_eq!(ended.map(drop).map_err(String::from), Err(late));
     }
 
     #[test]

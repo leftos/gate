@@ -5,7 +5,7 @@
 //! The box opens the channel ([`proved`]): it binds a port of the range, says the channel line, takes the first
 //! connection from the PC's address, sends its proof and checks the PC's. A pull then sends; a put receives
 //! ([`received`]): exactly the length its request declares, never a byte more, checked against the request's SHA-256
-//! before the box acks it.
+//! before the box acks it. The `channel-check` verb opens one and drops it at once ([`channel_check`]).
 
 use std::io::{self, Read};
 use std::sync::atomic::Ordering;
@@ -15,8 +15,9 @@ use gate_args::BoxSeams;
 use gate_inputs::hash::Hashing;
 use gate_router::escaped;
 use gate_win32::socket::{self, Listener, Stream};
-use gate_wire::{CHANNEL_FIRST_PORT, CHANNEL_LAST_PORT, Channel, PROOF_BYTES, PutChannel, channel_line, lower_hex};
+use gate_wire::{CHANNEL_FIRST_PORT, CHANNEL_LAST_PORT, Channel, PROOF_BYTES, Payload, PutChannel, channel_line, lower_hex};
 
+use crate::answer::{FAILED_STATUS, USAGE_STATUS};
 use crate::boxside::forward::{ClientGone, OutputLock};
 use crate::boxside::heartbeat;
 use crate::boxside::stamping;
@@ -131,6 +132,35 @@ pub(super) fn proved(channel: &Channel, nonce: &str, seams: &BoxSeams, console: 
         return Err("the PC's proof does not match".to_owned());
     }
     Ok((stream, idle, watch))
+}
+
+/// Answers `gate box channel-check`: opens the data channel the request's `Channel` asks for ([`proved`]) and drops the
+/// connection as soon as the PC's proof matched, saying nothing more. The request carries its `Nonce` and `Channel`
+/// alone; the drain and the work folders are not read. The verb's status: 0 once the PC's proof matched; the usage
+/// status, its line said, for a request without a channel or a nonce; else the failure status, once `gate: {why}` is
+/// said, which never holds a proof.
+pub(super) fn channel_check(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
+    let asked = payload.channel().and_then(|channel| {
+        let channel = channel.ok_or_else(|| "gate: box payload lacks Channel".to_owned())?;
+        Ok((channel, payload.nonce()?))
+    });
+    let (channel, nonce) = match asked {
+        Ok(asked) => asked,
+        Err(line) => {
+            stamping::err(console, &line);
+            return u32::from(USAGE_STATUS);
+        }
+    };
+    match proved(&channel, nonce, seams, console) {
+        Ok((stream, _, _)) => {
+            drop(stream);
+            0
+        }
+        Err(why) => {
+            stamping::err(console, &format!("gate: {why}"));
+            u32::from(FAILED_STATUS)
+        }
+    }
 }
 
 /// Receives a put's archive over its data channel `put` of the call carrying `nonce` ([`proved`]): `take` reads it

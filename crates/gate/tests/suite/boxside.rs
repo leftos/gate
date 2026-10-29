@@ -9573,3 +9573,63 @@ fn the_preflights_install_refusal_says_the_version_line_first() {
     );
     assert_eq!(outcome.stderr.lines().count(), 1, "one install line after the version line: {outcome:?}");
 }
+
+/// The `channel-check` payload: the call's `Nonce`, and with `channel` a data channel on loopback from loopback with
+/// the case's proofs.
+fn channel_check_payload(channel: bool) -> Value {
+    let mut payload = json!({ "Nonce": "00112233445566778899aabbccddeeff" });
+    if channel {
+        payload["Channel"] = json!({
+            "Address": "127.0.0.1",
+            "Peer": "127.0.0.1",
+            "BoxProof": channel_pc::BOX_PROOF,
+            "PcProof": channel_pc::PC_PROOF,
+        });
+    }
+    payload
+}
+
+#[test]
+fn channel_check_proves_the_pc_and_says_its_port_line() {
+    let case = Case::new("box_channel_check_proves");
+    let payload = channel_check_payload(true);
+    let mut args = vec!["box"];
+    args.extend(channel_pc::with_windows(&[]));
+    args.push("channel-check");
+    let running = box_call(&case, &args, &self::payload(&payload)).start();
+    // The box binds a port of the range itself; the case reads it back from the box's line.
+    let prefix = format!("gate-remote-channel: {} ", field(&payload, "Nonce"));
+    let said = running.wait_for_stderr_where("the data channel line", |said| said.lines().any(|line| line.starts_with(&prefix)));
+    let port: u16 = said
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .and_then(|port| port.trim().parse().ok())
+        .expect("the channel line names a port");
+
+    let mut stream = channel_pc::pc_connected(port);
+    channel_pc::proved(&mut stream, channel_pc::PC_PROOF);
+    let mut rest = Vec::new();
+    let read = std::io::Read::read_to_end(&mut stream, &mut rest);
+    let outcome = running.finish_read();
+
+    assert!(
+        read.is_err() || rest.is_empty(),
+        "the box sends nothing after its proof: {} came",
+        rest.len()
+    );
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stderr, format!("{}\n", channel_pc::channel_line(&payload, port)), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    channel_pc::assert_no_proof(&outcome);
+}
+
+#[test]
+fn channel_check_refuses_a_request_without_a_channel() {
+    let case = Case::new("box_channel_check_no_channel");
+
+    let outcome = gate_box(&case, "channel-check", &self::payload(&channel_check_payload(false)), None);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(outcome.stderr, "gate: box payload lacks Channel\n", "{outcome:?}");
+}

@@ -1585,7 +1585,7 @@ fn kept(stream: impl Read) -> Kept {
 
 /// The next line of `reader` without its line break, cut to [`LINE_CAP`] bytes with the rest of it skipped; `None` at
 /// the end.
-fn next_line(reader: &mut impl BufRead) -> io::Result<Option<String>> {
+pub(crate) fn next_line(reader: &mut impl BufRead) -> io::Result<Option<String>> {
     let mut bytes = Vec::new();
     if reader.by_ref().take(LINE_CAP).read_until(b'\n', &mut bytes)? == 0 {
         return Ok(None);

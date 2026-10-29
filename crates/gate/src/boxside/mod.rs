@@ -88,6 +88,7 @@ pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
         BoxVerb::Inputs => with_request(console, |payload, console| inputs::inputs(payload, seams, console)),
         BoxVerb::Lfs => with_request(console, |payload, console| lfs::lfs(payload, seams, console)),
         BoxVerb::Drain => with_request(console, |payload, console| drain::drain(payload, seams, console)),
+        BoxVerb::ChannelCheck => with_request(console, |payload, console| channel::channel_check(payload, seams, console)),
         // Its words are all it takes; it reads no request, and its command gets no stdin (`NUL`).
         BoxVerb::Hold => slots::hold(request, console),
     }

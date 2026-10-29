@@ -82,6 +82,8 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Cutover sweep**: the change of every calling repo from the PowerShell launcher to the slim wrapper (`tools/gate.ps1`), after which the PowerShell gate is deleted.
 - **Data channel**: the TCP connection between the PC and a Windows builder's box that carries a routed run's outputs pull instead of ssh's stdout (the box also takes an `inputs` and an `lfs` put on it, which the PC sends for the input put, the sent build and the LFS put), to the builder's `remote.json` `data` address (the top-level `host`'s or a `builders` entry's), on a port of 47100-47131 the box listens on for that one transfer; each side's 16-byte proof is checked before any byte moves and the PC acks with the SHA-256 of what it read.
 
+  `gate check --builder` probes the channel with no transfer: the box opens it, the PC dials it, both proofs are checked and the connection is dropped.
+
   The ssh call stays the control that judges the pull and falls back to ssh on the box's `channel` refusal. Dormant until the `host` or a builder names `data` ([design.md, Data channel](design.md#routing)).
 - **Declarations folder**: the PC-owned folder `remote.json`'s `declarations` names for a repo, holding the `.gate/toolchain.toml`, `siblings.toml`, `desktop.toml`, `local.toml`, `env.toml` and `warmup.toml` the repo cannot commit; a file is read from it only when the repo has none of that name.
 - **Declared local**: the `notRouted` journal word of a matched command a repo's `.gate/local.toml` keeps on this PC, by a pattern its words match or by a file the gate cannot use.

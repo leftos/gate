@@ -1495,6 +1495,169 @@ fn check_builder_lists_every_item_and_exits_0_when_nothing_is_missing() {
     assert_eq!(calls(&steps), ["preflight"], "one call reached the builder");
 }
 
+/// The routing file of a data channel case: [`ROUTING`] with `builder-1`'s `data` address on loopback, which a build
+/// with the test seams dials.
+const DATA_ROUTING: &str = r#"{"host": "builder-1", "data": "127.0.0.1", "hosts": ["builder-2"], "repos": {"app": ["*"]}}"#;
+
+/// The variable whose words the stand-in gives a `channel-check` call as box seams.
+const BOX_SEAMS_VARIABLE: &str = "GATE_FAKE_SSH_BOX_SEAMS";
+
+/// The box's data channel windows a case gives its probe unless it says otherwise, and the probe call's bound: ten
+/// minutes, so no case leans on the built-in 10 s and 30 s on a busy machine.
+const CHANNEL_WINDOWS: &str = "--test-box-channel-accept-ms 600000 --test-box-channel-proof-ms 600000";
+
+/// A [`builder_case`] whose `builder-1` has the `data` address of [`DATA_ROUTING`].
+fn data_channel_case(name: &str) -> Case {
+    let case = builder_case(name);
+    write_remote_json(&case, DATA_ROUTING);
+    case
+}
+
+/// A [`check_builder`] of `builder-1` with no tool stubs whose probe call is bounded at `bound_ms` and whose box's data
+/// channel takes the seams `box_seams` after [`CHANNEL_WINDOWS`].
+fn channel_check_builder(case: &Case, steps: &Path, bound_ms: &str, box_seams: &str) -> Outcome {
+    let mut command = builder_check(case, "builder-1", &[], steps);
+    command
+        .args(["--test-check-channel-ms", bound_ms])
+        .env(BOX_SEAMS_VARIABLE, format!("{CHANNEL_WINDOWS} {box_seams}"));
+    finish(command)
+}
+
+/// The data channel line of a check of `builder-1`.
+fn channel_lines(outcome: &Outcome) -> Vec<&str> {
+    lines(&outcome.stdout)
+        .into_iter()
+        .filter(|line| line.starts_with("check: builder-1: data channel"))
+        .collect()
+}
+
+#[test]
+fn check_builder_says_an_open_data_channel_and_exits_0() {
+    let case = data_channel_case("check_builder_channel_open");
+    write(
+        &case,
+        ".gate/toolchain.toml",
+        "[tools]\nrust = \"1.89\"\ncargo-nextest = \"0.9.100\"\nnode = \"24\"\npnpm = \"\"\npwsh = \"7.4\"\nffmpeg = \"\"\n",
+    );
+    let stub = stubs(&case, &EVERY_TOOL);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    // No port seam: the box binds a port of the channel's own range on loopback, which its line names.
+    let mut command = builder_check(&case, "builder-1", &[stub], &steps);
+    command
+        .args(["--test-check-channel-ms", "600000"])
+        .env(BOX_SEAMS_VARIABLE, CHANNEL_WINDOWS);
+
+    let outcome = finish(command);
+
+    let [header, created] = first_lines(&case, "builder-1");
+    assert_eq!(
+        lines(&outcome.stdout),
+        [
+            header.as_str(),
+            created.as_str(),
+            "check: builder-1: rust 1.99.0 ok (needs 1.89.0 or later)",
+            "check: builder-1: cargo-nextest 0.9.148 ok (needs 0.9.100 or later)",
+            "check: builder-1: node 24.19.0 ok (needs 24.0.0 or later)",
+            "check: builder-1: pnpm 10.0.0 ok",
+            "check: builder-1: pwsh 7.6.6 ok (needs 7.4.0 or later)",
+            "check: builder-1: ffmpeg 9.0.2 ok",
+            "check: builder-1: tailscale path: not checked: tailscale is not installed",
+            "check: builder-1: data channel: open on 127.0.0.1",
+            "check: builder-1: nothing missing",
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "the probe's lines are not echoed: {outcome:?}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "channel-check"], "the probe is a second call");
+}
+
+#[test]
+fn check_builder_says_a_closed_data_channel_and_exits_1() {
+    let case = data_channel_case("check_builder_channel_closed");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    // The case holds the one port the box may listen on, so the box finds none free.
+    let held = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("a loopback listener binds");
+    let port = held.local_addr().expect("the listener's address is read").port();
+
+    let outcome = channel_check_builder(&case, &steps, "600000", &format!("--test-box-channel-ports {port}-{port}"));
+
+    drop(held);
+    assert_eq!(
+        channel_lines(&outcome),
+        ["check: builder-1: data channel: closed: no data channel port is free"],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "the probe's lines are not echoed: {outcome:?}");
+    assert_eq!(outcome.code, Some(1), "a closed channel fails the check: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "channel-check"], "the probe is a second call");
+}
+
+#[test]
+fn check_builder_makes_no_probe_for_a_builder_without_data() {
+    let case = builder_case("check_builder_channel_no_data");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = channel_check_builder(&case, &steps, "600000", "");
+
+    assert_eq!(channel_lines(&outcome), Vec::<&str>::new(), "{outcome:?}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"], "no probe call");
+}
+
+#[test]
+fn check_builder_makes_no_probe_after_a_refused_preflight() {
+    let case = data_channel_case("check_builder_channel_drained");
+    builder_drain(&case, "raise");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = channel_check_builder(&case, &steps, "600000", "");
+
+    assert_eq!(outcome.stdout, "", "nothing was checked: {outcome:?}");
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"], "no probe call after a drained preflight");
+}
+
+#[test]
+fn check_builder_makes_no_probe_after_a_box_refused_its_work_root() {
+    let case = data_channel_case("check_builder_channel_open_root");
+    let root = builder_root(&case);
+    fs::create_dir_all(&root).expect("the builder root can be made");
+    open_to_another_account(&root);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = channel_check_builder(&case, &steps, "600000", "");
+
+    assert!(
+        lines(&outcome.stdout)
+            .iter()
+            .any(|line| line.starts_with("check: builder-1: the work root is not locked down: ")),
+        "the refusal is the report's item: {outcome:?}"
+    );
+    assert_eq!(channel_lines(&outcome), Vec::<&str>::new(), "{outcome:?}");
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"], "no probe call after a refused work root");
+}
+
+/// A probe call that does not end within its bound is ended at it and the channel said closed. The stand-in holds the
+/// probe on a file no one makes, so only the bound ends the call, and nothing here asserts how long it took.
+#[test]
+fn check_builder_says_a_probe_call_past_its_bound() {
+    let case = data_channel_case("check_builder_channel_bound");
+    let never = case.folder().join("never-made");
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", never.display())]);
+
+    let outcome = channel_check_builder(&case, &steps, "500", "");
+
+    assert_eq!(
+        channel_lines(&outcome),
+        ["check: builder-1: data channel: closed: the probe call did not end within 0.5 s"],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "channel-check"], "the probe is a second call");
+}
+
 /// A builder with a slot count says its held slots in the check's report, one line a holder after the count, and the
 /// check caches them, stamped with the time it read them, in the state root `GATE_STATE_DIR` names; it takes no slot.
 #[test]

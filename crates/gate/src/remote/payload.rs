@@ -270,6 +270,15 @@ pub(crate) fn outputs_word(location: &Location, name: &str, channel: Option<(&As
     word(&object)
 }
 
+/// The payload word of the `channel-check` verb: the call's `Nonce` its channel line carries and the data channel
+/// `asked`, `Channel`, alone, with no location.
+pub(crate) fn channel_check_word(asked: &Asked, nonce: &str) -> String {
+    let mut object = Map::new();
+    object.insert("Nonce".to_owned(), json!(nonce));
+    object.insert("Channel".to_owned(), Value::Object(channel_object(asked)));
+    word(&object)
+}
+
 /// The payload word of the drain verb (design.md, "gate box drain"): the builder's `Root` and the `Action` taken on its
 /// barrier, `raise`, `status` or `lift`.
 pub(crate) fn drain_word(root: &str, action: DrainAction) -> String {

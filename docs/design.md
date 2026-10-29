@@ -473,6 +473,8 @@ The repo is found as for the local check (outside a git worktree is `check: not 
 
 It runs the box's preflight once over ssh with this repo's real work-folder key and the manifest's tools, bounded at 120 s, with no retry and no PC-side lock. A routed run of the same worktree running at the same time may collide with it (GATE-270). The preflight creates the same folders a routed run's preflight would.
 
+A Windows builder whose `remote.json` entry names `data`, whose preflight was not refused and whose box did not refuse its work root, then gets a second box call, `gate box channel-check`, that probes its [data channel](GLOSSARY.md) (item 7 below). A builder without `data`, a macOS builder and one whose preflight or work root was refused get no second call and no line.
+
 On stdout, each line prefixed `check: <host>: `, in this order:
 
 1. The header `check: <host>: <repo> (work folder <key>)`.
@@ -487,10 +489,16 @@ On stdout, each line prefixed `check: <host>: `, in this order:
 4. The warm-up's items, as on this PC ([The warm-up items](#the-warm-up-items)) and this PC's own: the lock is probed before the record is read, as the route does, and the record is said only when it names `<host>` or cannot be read (`check: <host>: warm-up: the warm-up record <path> cannot be read: <error>`, with the suffix above, only informing), and with consent and a warm-up file that parsed, `check: <host>: warm-up: the work folder is warm` (ok) when the preflight's `gate: remote warm` line holds the hash of the worktree's file, else `check: <host>: warm-up: the work folder is not warm` (only informs).
 5. Tailscale's path to the builder, one item `check: <host>: tailscale path: <text>` after the warm-up's items, never failing the check: `direct` (ok), `relayed via DERP (<region>)`, `relayed via a peer relay`, `no path yet`, or `not checked: <why>` for `tailscale is not installed`, `tailscale is <state>` (a tailnet that is not running), `no tailnet peer matches <host>`, `several tailnet peers match <host word>` (the alias without `user@`, or the `ssh -G` hostname; of several matches the one online wins) and `ssh -G <alias> <why>`. `tailscale status --json` is read once, bounded at 3 s, and the peer is the one whose `HostName`, `DNSName` (its first label or the whole name) or `TailscaleIPs` equals the alias with any `user@` cut, in any case; when none does, the hostname `ssh -G -- <alias>` resolves the alias to is matched the same way. Text from `tailscale` and `ssh` is escaped. This PC's check says no such item.
 6. The builder's own held slots, only for a builder whose preflight said the box slots line ([Builder-side slots](#builder-side-slots)), never failing the check: `check: <host>: box slots: <n> of <m> held` (`<n> held; the slot count cannot be read: <why>` when the count file is there and does not read, `<n> held; the builder has no slot count` otherwise, with `; <k> claims cannot be read` appended when `<k>` is above 0, `; 1 claim cannot be read` at 1); then one line per holder, `check: <host>: box slot <n>: session of <repo> from <pc>: <command> (taken <t>)` or `check: <host>: box slot <n>: hold by <holder> (ceiling <s> s, builder pid <pid>, started <t>)`; then `check: <host>: box slots: and <k> more holders` (`and 1 more holder` at 1) when the line left holders out. Times are the box's own text and every text is escaped. The check writes the same line to the box slots cache.
-7. The install hints `install: <host>: <tool>: <command>`: `cargo install cargo-nextest --locked`, `npm install -g pnpm@<min>` (`npm install -g pnpm` with no minimum), `rustup toolchain install <min> && rustup default <min>`, `dotnet-install.ps1 -Version <v>`, and for node, pwsh, ffmpeg and a rust with no minimum a hint that names `tools/builder/install-toolchains.ps1` and points to [routing-a-repo.md, Builder setup](routing-a-repo.md#builder-setup).
+7. The data channel probe, one line after the box slots, only for a builder the second call above probes: `check: <host>: data channel: open on <data>` (ok), or `check: <host>: data channel: closed: <why>`, counted missing, so the check exits 1.
+
+   The PC draws the channel's proofs and a nonce, sends the box `gate box channel-check --stdin` ([The box side](#the-box-side)), reads the box's `gate-remote-channel: <nonce> <port>` line as it comes and dials that port from its own address toward `data`, as a routed pull does (Data channel in [Routing](#routing)). The whole call is bounded at 45 s (10 s for the PC's connect, 10 s for the box's accept, 10 s for the proof wait, 15 s for ssh's connection and the box's start), and ends within the bound plus one 2 s drain.
+
+   `<why>` is the first that applies: the PC's own channel text (`data address <a> is loopback`, `cannot connect to …`, `no connection to … within 10 s`, `the box's proof does not match`, `the box's port <n> is outside 47100-47131`, and the like); the box's line without its `gate: ` (for example `no data channel port is free`); `the probe call failed: unreachable: <ssh's last line>` or `the probe call failed: the box exited with status <n>`, with `: <last line>` when there is one; `the box named no data channel port`; or `the probe call did not end within 45 s`, followed by ` after <the PC's why>` when the dial had failed and `, and ssh could not be stopped: <error>` when ssh could not be stopped. Text from the builder is escaped.
+
+8. The install hints `install: <host>: <tool>: <command>`: `cargo install cargo-nextest --locked`, `npm install -g pnpm@<min>` (`npm install -g pnpm` with no minimum), `rustup toolchain install <min> && rustup default <min>`, `dotnet-install.ps1 -Version <v>`, and for node, pwsh, ffmpeg and a rust with no minimum a hint that names `tools/builder/install-toolchains.ps1` and points to [routing-a-repo.md, Builder setup](routing-a-repo.md#builder-setup).
 
    `netfx-sdk` gets the same hint, with the script's step `'.NET Framework 4.8 Developer Pack'`.
-8. The summary.
+9. The summary.
 
 When the repo's `.gate/siblings.toml` names a sibling or cannot be read, one line `check: <host>: siblings skipped: a routed run lays them out` comes instead of the sibling lines and counts as skipped. The sibling folders themselves are not checked on the builder.
 
@@ -511,7 +519,7 @@ A failure is one stderr line, exit 1, and nothing else on stdout:
 
 Text from the builder is cut to 4 KiB and escaped. The exit is 0 when nothing is missing, 1 when something is missing or the check could not run (not in a git repository, unreachable, a different build, no box, `remote.json` missing or unusable), 2 for a usage error.
 
-Test-seams builds accept, with `--builder` only, `--test-remote-transport`, `--test-remote-ssh` (which also needs `--test-remote-transport`) and `--test-remote-timeout-ms`, as the routed client reads them ([Black-box suite harness](#black-box-suite-harness)), and `--test-tailscale-status <file>`, the file the path is read from in place of running `tailscale status --json` (a file that does not exist stands for a PC without Tailscale); a test-seams build also reads `GATE_TEST_TAILSCALE_STATUS` when the flag is absent.
+Test-seams builds accept, with `--builder` only, `--test-remote-transport`, `--test-remote-ssh` (which also needs `--test-remote-transport`) and `--test-remote-timeout-ms`, as the routed client reads them ([Black-box suite harness](#black-box-suite-harness)), `--test-check-channel-ms <n>` (the 45 s bound of the data channel probe's call, in milliseconds above 0), and `--test-tailscale-status <file>`, the file the path is read from in place of running `tailscale status --json` (a file that does not exist stands for a PC without Tailscale); a test-seams build also reads `GATE_TEST_TAILSCALE_STATUS` when the flag is absent.
 
 ### `gate burn`
 
@@ -3122,6 +3130,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     What the channel moved before the fallback counts into the pull's total in its ended line.
 
+    `gate check --builder` probes the channel with no transfer: its second call, `gate box channel-check`, opens the box's listener, the PC dials it and both proofs are checked, then the connection is dropped ([With `--builder`](#with---builder)).
+
     The test seam `--test-remote-channel-fault <kind>` ([The remote client's run](#routing)) drives each failure: the PC acts on the box's port line after its dial. It needs `--test-remote-transport` and exists only in a `test-seams` build.
 
     - A fetch the watchdog stops says its `gate: STALLED: ...` or `gate: TRANSFER TIMED OUT after 1800 s fetching the outputs` line (the ceiling counted from the fetch's own start), then `gate: remote outputs not brought back: the fetch was stopped by the watchdog after <size> in <n> s (<size>/s)`, and the run ends 124.
@@ -4227,9 +4237,13 @@ Built verbs:
 
   Any other end (no connection, a wrong proof, a stalled or gone peer, a wrong ack, a gone client, no free port) keeps the archive, says `gate-remote-refused: <nonce> channel` then `gate: data channel not completed: <why>` and exits 75, so the PC sends over ssh; the why never holds a proof.
 
-  The Windows box's seams are `--test-box-channel-ports <first>-<last>` (any ports within 1-65535 in place of the range), `--test-box-channel-accept-ms <n>` and `--test-box-channel-idle-ms <n>` (replacing the 10 s windows; the idle one does not shorten the wait for the PC's whole proof) and `--test-box-channel-send-buffer-bytes <n>` (1 B to 16 MiB), plus `--test-box-channel-proof-ms <n>` (the 10 s the channel waits for the PC's whole proof), all test-seams only; the `inputs` put takes the ports, accept, idle and proof seams too; the fake-ssh test bin hands the words of `GATE_FAKE_SSH_BOX_SEAMS` to an `outputs` call as to the other box verbs.
+  The Windows box's seams are `--test-box-channel-ports <first>-<last>` (any ports within 1-65535 in place of the range), `--test-box-channel-accept-ms <n>` and `--test-box-channel-idle-ms <n>` (replacing the 10 s windows; the idle one does not shorten the wait for the PC's whole proof) and `--test-box-channel-send-buffer-bytes <n>` (1 B to 16 MiB), plus `--test-box-channel-proof-ms <n>` (the 10 s the channel waits for the PC's whole proof), all test-seams only; the `inputs` put takes the ports, accept, idle and proof seams too; the fake-ssh test bin hands the words of `GATE_FAKE_SSH_BOX_SEAMS` to an `outputs` or a `channel-check` call as to the other box verbs.
 
   A sent archive that cannot be removed prints `gate: remote could not remove the outputs archive <name>: <error>` and still exits 0; a later run's prune takes it. An archive already gone at its removal (another run's trim took it after it was sent) says nothing and exits 0.
+
+- **`channel-check`** (`boxside/channel.rs`, `--stdin`) is the box's half of the data channel probe of `gate check --builder`. It reads a request with `Nonce` and `Channel` only, opens the channel as `outputs` does, says `gate-remote-channel: <nonce> <port>` on stderr, sends its proof, checks the PC's, drops the connection and exits 0. No archive moves and the verb does not read the drain.
+
+  A channel that does not complete says `gate: <why>` (for example `gate: no data channel port is free`) and exits 1; a request without `Channel` says `gate: box payload lacks Channel` and exits 2. The Unix box says `gate: box channel-check is not built on this builder`. The Windows box takes the channel seams of `outputs`. The box usage line does not list the verb yet (GATE-929).
 
 - **`inflight`** counts the routed runs holding a lock in the payload's `Root`, for the cutover's drain. It reads only `Root`; a trailing separator is folded off.
 
@@ -5255,7 +5269,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   On `push` the seams are `--test-push-ssh <path>` (the ssh program to run instead of the one found along `PATH`, the suite's `fake-ssh`) and `--test-push-bound-ms <n>` (each builder's bound); `push` has no `--test-print-request` ([`gate push`](#gate-push)).
 
-  On `check` the seams are `--test-probe-limit-ms <n>` and `--test-sdk-limit-ms <n>` (each refused with `--builder`), `--test-probe-drain-ms <n>` (also bounding the drain of the builder check's call with `--builder`) and, each needing `--builder`, `--test-remote-transport`, `--test-remote-ssh` (which also needs `--test-remote-transport`), `--test-remote-timeout-ms` and `--test-tailscale-status <file>` ([`gate check`](#gate-check)).
+  On `check` the seams are `--test-probe-limit-ms <n>` and `--test-sdk-limit-ms <n>` (each refused with `--builder`), `--test-probe-drain-ms <n>` (also bounding the drain of the builder check's call with `--builder`) and, each needing `--builder`, `--test-remote-transport`, `--test-remote-ssh` (which also needs `--test-remote-transport`), `--test-remote-timeout-ms`, `--test-check-channel-ms <n>` and `--test-tailscale-status <file>` ([`gate check`](#gate-check)).
 
   `--test-print-request`, on `run`, `stop-tree`, `cutover` and the compatibility form, prints the parsed request as one JSON line on stdout and exits 0, so the suite sees what a command line asked for; it is the one hidden switch the compatibility layer accepts. On `run`, `"timeout"` is the number given, or the floor of `auto:<n>`, and `"timeoutAuto": true|false` follows it, always present.
 
@@ -5411,7 +5425,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   It is copied under the names the gate classifies (`VBCSCompiler.exe`, `dotnet.exe`, `MSBuild.exe`).
 
-  A second helper, `fake-ssh`, stands in for ssh in the remote client's cases (`--test-remote-ssh`). Its `ok` step puts the words of the variable `GATE_FAKE_SSH_BOX_SEAMS` before the verb of a `gate box run` call, so a case gives the box its seams (it reaches a `gate box lfs` call too); the variable `GATE_FAKE_SSH_PREFLIGHT_SEAMS` does the same for a `gate box preflight` call.
+  A second helper, `fake-ssh`, stands in for ssh in the remote client's cases (`--test-remote-ssh`). Its `ok` step puts the words of the variable `GATE_FAKE_SSH_BOX_SEAMS` before the verb of a `gate box run` call, so a case gives the box its seams (it reaches a `gate box lfs`, `inputs`, `drain`, `outputs` and `channel-check` call too); the variable `GATE_FAKE_SSH_PREFLIGHT_SEAMS` does the same for a `gate box preflight` call.
 
   The variable `GATE_FAKE_SSH_ROOT_WALK_STOP`, a folder named as one path (never split), puts `--test-box-root-walk-stop <folder>` before a `gate box preflight` call's verb, after those seams, so the preflight's walk above the work root stops there.
 

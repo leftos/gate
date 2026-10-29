@@ -279,6 +279,9 @@ pub enum BoxVerb {
     Drain,
     /// One of the builder's own slots, held while a command runs; it takes no request, only its words.
     Hold,
+    /// A test of the builder's data channel: the box listens, takes the PC's connection and checks its proof, then
+    /// drops it; it reads only the request's `Nonce` and `Channel`.
+    ChannelCheck,
 }
 
 impl BoxVerb {
@@ -298,6 +301,7 @@ impl BoxVerb {
             BoxVerb::Prune => "prune",
             BoxVerb::Drain => "drain",
             BoxVerb::Hold => "hold",
+            BoxVerb::ChannelCheck => "channel-check",
         }
     }
 
@@ -642,6 +646,9 @@ pub struct CheckSeams {
     /// The file the builder check reads Tailscale's status JSON from, in place of running `tailscale status --json`; a
     /// file that does not exist stands for a PC without Tailscale (`--test-tailscale-status`).
     pub tailscale_status: Option<PathBuf>,
+    /// How long the builder check's data channel probe call may take, in milliseconds, in place of 30 s
+    /// (`--test-check-channel-ms`).
+    pub check_channel_ms: Option<u64>,
 }
 
 /// A valid `gate drain`, which takes no words: what it does to the builder's barrier, the builder it drains in place of

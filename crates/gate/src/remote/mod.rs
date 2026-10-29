@@ -35,7 +35,7 @@ pub(crate) use retry::SSH_FAILED;
 pub(crate) use carried::{Sibling, carried};
 
 mod carried;
-mod channel;
+pub(crate) mod channel;
 mod client;
 pub(crate) mod drain;
 

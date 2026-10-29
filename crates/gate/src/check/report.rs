@@ -1,12 +1,14 @@
 //! What `gate check` says, as a pure function of where it looked ([`At`]) and what it found ([`Checked`]): a header, a
 //! builder's created folders, each item's line in the order manifest tools, the .NET SDK, workloads, the routing file's
 //! `siblings` problem, siblings, the warm-up's items (`warm-up: ...`), a builder's Tailscale path
-//! (`tailscale path: ...`), a builder's held slots (`box slots: ...`, then a `box slot <n>: ...` line per holder), an
-//! install hint per missing or too-old item, then a summary, all prefixed `check: <where>: `
+//! (`tailscale path: ...`), a builder's held slots (`box slots: ...`, then a `box slot <n>: ...` line per holder), a
+//! builder's data channel (`data channel: ...`), an install hint per missing or too-old item, then a summary, all prefixed `check: <where>: `
 //! (`install: <where>: ` for a hint), `<where>` being `here` for this PC and the host for a builder, and the problems of
 //! the `.gate` files on stderr as `check: .gate/<file>: <problem>`. A builder's hints are commands that work over ssh,
 //! and its SDK line names the builder. The exit status is 0 only when nothing is missing or too old: a skipped item, a
 //! warm-up line that only informs, and a Tailscale path that is not direct never fail the check.
+
+use std::net::Ipv4Addr;
 
 use gate_router::warm::{shown_value, warming_text};
 use gate_router::{SiblingFolder, escaped, spelled};
@@ -192,6 +194,16 @@ pub(crate) struct Checked {
     pub tailscale: Option<tailscale::Found>,
     /// The builder's own held slots its preflight said; `None` for this PC and for a builder that said none.
     pub box_slots: Option<BoxSlots>,
+    /// What the probe of a builder's data channel found; `None` for this PC and for a builder with no channel to probe.
+    pub data_channel: Option<DataChannel>,
+}
+
+/// What the probe of a builder's data channel found: it opened on the builder's `data` address, or it is closed for
+/// why, which never holds a proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DataChannel {
+    Open(Ipv4Addr),
+    Closed(String),
 }
 
 impl Checked {
@@ -370,7 +382,19 @@ fn items(at: At<'_>, checked: &Checked) -> Vec<Item> {
     if let Some(slots) = &checked.box_slots {
         items.extend(box_slots_items(slots));
     }
+    if let (At::Builder { .. }, Some(channel)) = (at, &checked.data_channel) {
+        items.push(data_channel_item(channel));
+    }
     items
+}
+
+/// The line of a builder's data channel `channel`: open on its address, or closed for why, which is missing and fails
+/// the check.
+fn data_channel_item(channel: &DataChannel) -> Item {
+    match channel {
+        DataChannel::Open(data) => Item::new(format!("data channel: open on {data}"), Kind::Ok),
+        DataChannel::Closed(why) => Item::new(format!("data channel: closed: {}", escaped(why)), Kind::Missing),
+    }
 }
 
 /// The lines of a builder's own held slots `slots`, none counted: how many claims it holds of its count, or why it has
@@ -677,7 +701,7 @@ mod tests {
     use gate_router::{FolderId, SiblingFolder};
     use gate_wire::{Probed, build_version};
 
-    use super::{Kind, box_slots_items, items};
+    use super::{DataChannel, Kind, box_slots_items, items};
     use crate::check::local::record_item;
     use crate::remote::toolchain::{Pin, Reported, ToolNeed, Version};
     use crate::tailscale::{Found as TailscaleFound, PeerPath};
@@ -732,6 +756,51 @@ mod tests {
             warmup: Vec::new(),
             tailscale: None,
             box_slots: None,
+            data_channel: None,
+        }
+    }
+
+    /// A builder's data channel is said last, as one item: open is ok, and closed is missing and fails the check, its
+    /// why escaped; this PC says none.
+    #[test]
+    fn the_data_channel_is_one_item_that_fails_the_check_when_closed() {
+        let at = At::Builder {
+            host: "builder-1",
+            key: "app-1a2b3c4d",
+        };
+        for (channel, text, kind, status) in [
+            (
+                DataChannel::Open(std::net::Ipv4Addr::new(100, 64, 0, 7)),
+                "data channel: open on 100.64.0.7",
+                Kind::Ok,
+                0,
+            ),
+            (
+                DataChannel::Closed("no data channel port is free".to_owned()),
+                "data channel: closed: no data channel port is free",
+                Kind::Missing,
+                1,
+            ),
+            (
+                DataChannel::Closed("the box said\u{1b}[2J".to_owned()),
+                "data channel: closed: the box said\\u{1b}[2J",
+                Kind::Missing,
+                1,
+            ),
+        ] {
+            let checked = Checked {
+                tailscale: Some(TailscaleFound::Path(PeerPath::Direct)),
+                data_channel: Some(channel),
+                ..checked(Vec::new())
+            };
+            let all = items(at, &checked);
+            let said_items: Vec<(&str, Kind)> = all.iter().map(|item| (item.text.as_str(), item.kind)).collect();
+            assert_eq!(said_items, [("tailscale path: direct", Kind::Ok), (text, kind)], "{text}");
+            assert_eq!(said(at, &checked).status, status, "{text}");
+            assert!(
+                items(HERE, &checked).iter().all(|item| !item.text.starts_with("data channel")),
+                "this PC says no data channel: {text}"
+            );
         }
     }
 

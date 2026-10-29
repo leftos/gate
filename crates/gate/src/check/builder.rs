@@ -6,9 +6,15 @@
 //! the repo would ready, and its answer is read with the remote client's own readers: the builder's gate build, the
 //! folders it created, its SDK list, what it found of each tool, and whether its work folder is warm for the
 //! worktree's warm-up file. The warm-up's items are this PC's, its record said only when it names the builder checked.
+//! A Windows builder with a `data` address then gets a second, bounded call, `gate box channel-check`, whose data channel
+//! the PC dials at the port the box's channel line names, the box's lines read as they come.
 
+use std::fs::File;
+use std::io::BufReader;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use gate_args::{BoxVerb, CheckRequest, CheckSeams};
 use gate_router::{Builder, Place, escaped, repo_name, work_folder_key};
@@ -19,9 +25,11 @@ use jiff::Timestamp;
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
 use crate::check::local::{self, Declarations, Declared, SiblingsFile, WarmSources, Warmed};
-use crate::check::report::{self, At, Checked, Problem, Tool, Warmup};
+use crate::check::report::{self, At, Checked, DataChannel, Problem, Tool, Warmup};
 use crate::console::Console;
 use crate::environment::Variables;
+use crate::push;
+use crate::remote::channel::{self, Probed};
 use crate::remote::drain::{self, Drain};
 use crate::remote::git::{self, GitError, ProgramCall, ProgramOutput, ProgramPlace};
 use crate::remote::launch;
@@ -36,11 +44,14 @@ use crate::remote::{
 };
 use crate::route;
 use crate::tailscale;
-use gate_wire::build_version;
+use gate_wire::{build_version, channel_prefix};
 
 /// How long the builder's call may take before it is ended: the box's tool probes and SDK list take up to 30 s, and
 /// ssh's connection up to 10 s more.
 const BOUND: Duration = Duration::from_secs(120);
+/// How long the data channel's probe call may take before it is ended: 45 s, the PC's 10 s connect wait, the box's 10 s
+/// accept window and 10 s proof wait, and 15 s for ssh's connection and the box's start.
+const CHANNEL_BOUND: Duration = Duration::from_secs(45);
 /// What a failure to end a call that outlived its bound says after the late line, before why.
 const NOT_STOPPED: &str = "could not be stopped: ";
 /// The status of a preflight the box refused, its drain's among them ([`crate::remote::REFUSED`]).
@@ -91,6 +102,11 @@ pub(crate) fn check(request: &CheckRequest, host: &str, console: &mut Console) -
                 launch_guard: None,
             };
             asked.checked.tailscale = Some(tailscale::path_to(host, request.seams.tailscale_status.as_deref(), reads));
+            // A box that refused its work root refused the preflight: its channel is not probed either.
+            if asked.checked.root_problem.is_none() {
+                let channel_bound = request.seams.check_channel_ms.map_or(CHANNEL_BOUND, Duration::from_millis);
+                asked.checked.data_channel = channel_probed(&*transport, &builder, channel_bound);
+            }
             let at = At::Builder { host, key: &asked.key };
             super::say(&report::said(at, &asked.checked), console)
         }
@@ -350,6 +366,177 @@ fn heard(output: &ProgramOutput) -> Heard {
     }
 }
 
+/// What the probe of `builder`'s data channel over `transport` found, its call bounded at `bound`; `None` for a builder
+/// whose entry has no `data` and for one that is not a Windows builder, neither of which is probed. The why of a closed
+/// channel is cut here, once, as a line shows it; the report escapes it.
+fn channel_probed(transport: &dyn Transport, builder: &Builder, bound: Duration) -> Option<DataChannel> {
+    let opened = match channel::planned(builder) {
+        Ok(Some(data)) => channel_dialled(transport, builder, data, bound).map(|()| data),
+        Ok(None) => return None,
+        Err(why) => Err(why),
+    };
+    Some(match opened {
+        Ok(data) => DataChannel::Open(data),
+        Err(why) => DataChannel::Closed(shown(&why)),
+    })
+}
+
+/// Probes the data channel to `data` of `builder`: draws the channel's proofs, makes the `channel-check` call over
+/// `transport` within `bound` and dials the port the box's channel line names; else why the channel is closed, which
+/// never holds a proof.
+fn channel_dialled(transport: &dyn Transport, builder: &Builder, data: Ipv4Addr, bound: Duration) -> Result<(), String> {
+    let host = builder.alias.as_str();
+    let asked = channel::Asked::drawn(data, channel::local_toward(data)?)?;
+    let nonce = payload::run_nonce();
+    let input = payload::input(&payload::channel_check_word(&asked, &nonce), None);
+    let profile = transport.profile(builder);
+    let program = transport.call(host, &profile.line(BoxVerb::ChannelCheck), Wire::Plain);
+    probe_heard(&program, input.as_bytes(), (asked, &nonce), bound, host)?.verdict(host)
+}
+
+/// The why of a probe call that failed for `failure`: its line for `host` without the line's `check: {host}: `.
+fn failed_call(failure: &Failure, host: &str) -> String {
+    let line = failure.line(host);
+    let why = line.strip_prefix(&format!("check: {host}: ")).unwrap_or(&line);
+    format!("the probe call failed: {why}")
+}
+
+/// What the probe call said: its exit status, the last line of its standard error that is not blank and is not the
+/// channel line, as it was read, and how the PC's dial ended, `None` when no channel line named a port.
+#[derive(Debug)]
+struct ProbeHeard {
+    status: Option<i32>,
+    last: Option<String>,
+    dial: Option<Probed>,
+}
+
+impl ProbeHeard {
+    /// Whether the channel opened, else why not: the PC's own failure first, then ssh's, then the box's line without its
+    /// `gate: `.
+    fn verdict(self, host: &str) -> Result<(), String> {
+        if let Some(Probed::Failed(why)) = self.dial {
+            return Err(why);
+        }
+        let last = self.last.filter(|line| !line.trim().is_empty());
+        match self.status {
+            Some(0) if self.dial == Some(Probed::Proved) => Ok(()),
+            Some(0) => Err("the box named no data channel port".to_owned()),
+            Some(SSH_FAILED) => {
+                let why = last.unwrap_or_else(|| format!("ssh exited {SSH_FAILED} with no message"));
+                Err(failed_call(&Failure::Unreachable(why), host))
+            }
+            status => Err(box_why(status, last)),
+        }
+    }
+}
+
+/// Why a probe call that ended with `status`, its last line `last`, failed: the box's line without its `gate: `, or
+/// else the status and the line.
+fn box_why(status: Option<i32>, last: Option<String>) -> String {
+    match last {
+        Some(line) if line.starts_with("gate: ") => line["gate: ".len()..].to_owned(),
+        last => {
+            let status = status.map_or_else(|| "unknown".to_owned(), |status| status.to_string());
+            let said = last.map(|line| format!(": {line}")).unwrap_or_default();
+            format!("the probe call failed: the box exited with status {status}{said}")
+        }
+    }
+}
+
+/// Makes the probe call `program`, fed `input` on its standard input, within `bound`, as the client's other programs
+/// are made ([`git::bounded_stderr`]): where [`ProgramPlace`] runs a program, so nothing is found by name in the
+/// worktree, in a kill-on-close job of its own, ended past its bound. Its standard error is read as it comes through a
+/// line-capped reader, which dials the channel `asked` once the box's channel line of `nonce` names its port, the dial
+/// ended too at the bound's end; so once the program exited the reader is given the whole bound, as the dial may still
+/// wait then, but never more than one drain past the bound's end, so the whole call ends by then. What it said; else
+/// why the channel is closed ([`probe_end`]).
+fn probe_heard(program: &Program, input: &[u8], (asked, nonce): (channel::Asked, &str), bound: Duration, host: &str) -> Result<ProbeHeard, String> {
+    let end = Instant::now() + bound;
+    let late = format!("the probe call did not end within {} s", bound.as_secs_f64());
+    let name = program.program.to_string_lossy().into_owned();
+    let place = ProgramPlace::new(Variables::from_process()).map_err(|why| failed_call(&Failure::Other(why), host))?;
+    let call = git::Call {
+        stdin: Some(input),
+        exit_drain: Some(bound),
+        drain_deadline: Some(end),
+        // No call made from a launch reads its folder: the launch says where the program runs.
+        ..git::Call::plain(Path::new(""), &[], bound)
+    };
+    let (dialled, dial) = mpsc::channel();
+    let prefix = channel_prefix(nonce);
+    let read = move |pipe: File| {
+        Ok(stderr_read(pipe, &prefix, |port| {
+            // The receiver is gone only once the call's end was said without it.
+            dialled.send(port_dialled(&asked, port, &|| Instant::now() >= end)).ok();
+        }))
+    };
+    let launch = place.launch_of(&program.program, &program.args, PipedConsole::Attached);
+    match git::bounded_stderr(&name, late.clone(), launch, &call, read) {
+        Ok((status, last)) => probe_said(status.code(), last, dial.try_recv().ok(), &late),
+        // A reader the call gave up on may still hold the dial's sender: a dial that has not ended by now says nothing.
+        Err(error) => Err(probe_end(error, &late, &name, dial.try_recv().ok(), host)),
+    }
+}
+
+/// What the probe call that exited with `status` said, its last line `last` and its dial `dial`; else, for a dial that
+/// gave up at the bound, the `late` line: the call outlived its bound by the dial's clock, however its program ended.
+fn probe_said(status: Option<i32>, last: Option<String>, dial: Option<Probed>, late: &str) -> Result<ProbeHeard, String> {
+    if dial == Some(Probed::CallEnded) {
+        return Err(late.to_owned());
+    }
+    Ok(ProbeHeard { status, last, dial })
+}
+
+/// Why the probe call that ended in `error` gave no answer, its program named `name` in the call's lines. One that
+/// outlived its bound says the `late` line; then the PC's own failure when its dial, `dial`, failed; then why the call's
+/// job could not be ended when it could not, its program said as ssh, as the preflight's line says it
+/// ([`not_stopped`]). Any other failure is the call's.
+fn probe_end(error: GitError, late: &str, name: &str, dial: Option<Probed>, host: &str) -> String {
+    let why = match error {
+        GitError::Failed(why) | GitError::OverCap(why) => why,
+        GitError::Interrupted => "the call was interrupted".to_owned(),
+    };
+    let unstopped = not_stopped(&why, late, name);
+    if why != late && unstopped.is_none() {
+        return failed_call(&Failure::Other(why), host);
+    }
+    let after = match dial {
+        Some(Probed::Failed(pc)) => format!(" after {pc}"),
+        _ => String::new(),
+    };
+    let unstopped = unstopped.map(|kill| format!(", and ssh {NOT_STOPPED}{kill}")).unwrap_or_default();
+    format!("{late}{after}{unstopped}")
+}
+
+/// How the PC's dial of the channel `asked` at the port its channel line said, `port`, ended, given up once `ended`.
+fn port_dialled(asked: &channel::Asked, port: &str, ended: &dyn Fn() -> bool) -> Probed {
+    match port.trim().parse() {
+        Ok(port) => channel::probe_dialled(asked, port, ended),
+        Err(_) => Probed::Failed(format!("the box's channel line names no port: {port}")),
+    }
+}
+
+/// Reads the probe call's `stderr` to its end, each line cut as [`push::next_line`] cuts it, and has `dial` dial the
+/// port of the first line that starts with `prefix`, the box's channel line, before it reads on; its last other line
+/// that is not blank. A read that fails ends the stream as its end does: the call's status says the rest.
+fn stderr_read(stderr: File, prefix: &str, dial: impl FnOnce(&str)) -> Option<String> {
+    let mut reader = BufReader::new(stderr);
+    let mut dial = Some(dial);
+    let mut last = None;
+    while let Ok(Some(line)) = push::next_line(&mut reader) {
+        match (line.strip_prefix(prefix), dial.take()) {
+            (Some(port), Some(dial)) => dial(port),
+            (_, left) => {
+                dial = left;
+                if !line.trim().is_empty() {
+                    last = Some(line);
+                }
+            }
+        }
+    }
+    last
+}
+
 /// The one line of a builder `host`, whose root is `root`, that cannot be checked, as its call `heard` ended: ssh's
 /// failure, a builder whose drain refused the check ([`drained_line`]), a builder with no `gate box` that takes the
 /// call, a preflight that failed, or a builder that runs another
@@ -467,6 +654,7 @@ impl Answer<'_> {
             warmup: Vec::new(),
             tailscale: None,
             box_slots: None,
+            data_channel: None,
         }
     }
 
@@ -507,10 +695,11 @@ mod tests {
     use gate_wire::{build_version, root_busy_line, root_unsafe_line};
     use jiff::Timestamp;
 
-    use super::{Answer, Failure, Heard, box_slots_heard, builder_warmth, failure, refusal, root_problem, warm_items};
+    use super::{Answer, Failure, Heard, ProbeHeard, box_slots_heard, builder_warmth, failure, probe_end, refusal, root_problem, warm_items};
     use crate::boxside::WORK_ROOT_STEP;
     use crate::check::local::{Consent, Declarations, Declared, SiblingsFile, WarmSources};
     use crate::check::report::{At, Checked, Line, Sdk, Warmup, said};
+    use crate::remote::channel::Probed;
     use crate::remote::git::GitError;
     use crate::remote::install_untrusted_line;
     use crate::remote::parity::pin_of;
@@ -518,6 +707,7 @@ mod tests {
     use gate_wire::slots::BoxSlots;
 
     const HOST: &str = "builder-1";
+
     const AT: At<'static> = At::Builder {
         host: HOST,
         key: "app-1a2b3c4d",
@@ -566,6 +756,161 @@ mod tests {
 
     fn reported(checked: &Checked) -> Vec<(&str, &Reported)> {
         checked.tools.iter().map(|tool| (tool.need.name.as_str(), &tool.reported)).collect()
+    }
+
+    /// The verdict of a probe call that ended with `status`, said `last` last and dialled as `dial`.
+    fn probe_verdict(status: Option<i32>, last: Option<&str>, dial: Option<Probed>) -> Result<(), String> {
+        ProbeHeard {
+            status,
+            last: last.map(str::to_owned),
+            dial,
+        }
+        .verdict(HOST)
+    }
+
+    /// The PC's own dial failure beats every line the box said; then ssh's status 255 is an unreachable builder; then
+    /// the box's own line is said without its `gate: `, any other line with the box's status; an exit 0 that named no
+    /// port is no open channel.
+    #[test]
+    fn a_probe_s_verdict_takes_the_pc_s_failure_then_ssh_s_then_the_box_s_line() {
+        let pc_failed = Some(Probed::Failed("the box's proof does not match".to_owned()));
+        assert_eq!(
+            probe_verdict(Some(1), Some("gate: the PC closed the channel before its proof"), pc_failed.clone()),
+            Err("the box's proof does not match".to_owned())
+        );
+        assert_eq!(
+            probe_verdict(Some(255), Some("gate: no data channel port is free"), pc_failed),
+            Err("the box's proof does not match".to_owned()),
+            "the PC's failure beats ssh's status too"
+        );
+        assert_eq!(
+            probe_verdict(Some(255), Some("ssh: connect to host builder-1 port 22: Connection refused"), None),
+            Err("the probe call failed: unreachable: ssh: connect to host builder-1 port 22: Connection refused".to_owned())
+        );
+        assert_eq!(
+            probe_verdict(Some(255), None, None),
+            Err("the probe call failed: unreachable: ssh exited 255 with no message".to_owned())
+        );
+        assert_eq!(
+            probe_verdict(Some(1), Some("gate: no data channel port is free"), None),
+            Err("no data channel port is free".to_owned())
+        );
+        assert_eq!(
+            probe_verdict(Some(9009), Some("'gate' is not recognized"), None),
+            Err("the probe call failed: the box exited with status 9009: 'gate' is not recognized".to_owned())
+        );
+        assert_eq!(
+            probe_verdict(Some(3), None, None),
+            Err("the probe call failed: the box exited with status 3".to_owned())
+        );
+        assert_eq!(
+            probe_verdict(Some(0), Some("said something"), None),
+            Err("the box named no data channel port".to_owned())
+        );
+        assert_eq!(probe_verdict(Some(0), None, Some(Probed::Proved)), Ok(()));
+        assert_eq!(
+            probe_verdict(Some(1), Some("gate: the PC's proof does not match"), Some(Probed::Proved)),
+            Err("the PC's proof does not match".to_owned()),
+            "a box that failed after the PC's dial says why"
+        );
+    }
+
+    /// A probe call past its bound says the bound, then the PC's own dial failure when the dial failed, then why its job
+    /// could not be ended when it could not, its program said as ssh in either form the call's line names it. Any other
+    /// failure of the call is the call's.
+    #[test]
+    fn a_probe_past_its_bound_says_the_bound_then_the_pc_s_own_failure() {
+        const SSH: &str = r"C:\Windows\System32\OpenSSH\ssh.exe";
+        let late = "the probe call did not end within 45 s";
+        let failed = |why: &str| GitError::Failed(why.to_owned());
+        let pc_failed = Some(Probed::Failed("the box's proof does not match".to_owned()));
+        let after_pc = format!("{late} after the box's proof does not match");
+        assert_eq!(probe_end(failed(late), late, SSH, pc_failed.clone(), HOST), after_pc);
+        assert_eq!(probe_end(failed(late), late, SSH, None, HOST), late);
+        assert_eq!(probe_end(failed(late), late, SSH, Some(Probed::Proved), HOST), late);
+        let unkilled = format!("{late}, and could not be stopped: Access is denied.");
+        let named = format!("{late}, and {SSH} could not be stopped: Access is denied.");
+        let said = format!("{late}, and ssh could not be stopped: Access is denied.");
+        assert_eq!(probe_end(failed(&unkilled), late, SSH, None, HOST), said);
+        assert_eq!(
+            probe_end(failed(&named), late, SSH, None, HOST),
+            said,
+            "the program is said as ssh, never its path"
+        );
+        assert_eq!(
+            probe_end(failed(&named), late, SSH, pc_failed.clone(), HOST),
+            format!("{after_pc}, and ssh could not be stopped: Access is denied."),
+            "the PC's failure keeps why the call could not be stopped"
+        );
+        assert_eq!(
+            super::probe_said(
+                Some(1),
+                Some("gate: no connection from the PC within 10000 ms".to_owned()),
+                Some(Probed::CallEnded),
+                late
+            )
+            .map(|heard| heard.status),
+            Err(late.to_owned()),
+            "a dial that gave up at the bound is late, whatever the box said"
+        );
+        assert_eq!(
+            probe_end(
+                failed("cannot wait for ssh: The handle is invalid., and ssh could not be stopped: Access is denied."),
+                late,
+                SSH,
+                pc_failed,
+                HOST
+            ),
+            "the probe call failed: cannot wait for ssh: The handle is invalid., and ssh could not be stopped: Access is denied."
+        );
+    }
+
+    /// A probe call whose program exits while the PC's dial still waits for the box's proof gets the dial's own verdict,
+    /// never a reader cut short at the program's exit: the box's side here sends a wrong proof only after the program
+    /// printed its channel line and exited, and more than the readers' drain has passed since.
+    #[cfg(feature = "test-seams")]
+    #[test]
+    #[expect(clippy::expect_used, reason = "a case that cannot make its files or sockets must fail loudly")]
+    fn a_probe_whose_program_exits_during_the_dial_says_the_dial_s_failure() {
+        use std::io::{Read, Write};
+        use std::net::{Ipv4Addr, TcpListener};
+
+        const GUARD: Duration = Duration::from_secs(60);
+        let nonce = "00112233445566778899aabbccddeeff";
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback listener binds");
+        let port = listener.local_addr().expect("the listener's address is read").port();
+        let folder = std::env::temp_dir().join(format!("gate-probe-exit-{}", std::process::id()));
+        fs::create_dir_all(&folder).expect("the case folder can be made");
+        let script = folder.join("box.cmd");
+        fs::write(&script, format!("@echo gate-remote-channel: {nonce} {port} 1>&2\r\n")).expect("the box script can be written");
+        let served = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the PC connects");
+            stream.set_read_timeout(Some(GUARD)).expect("the read guard is set");
+            // The program exits as soon as it printed its line; the proof comes once its readers' drain has passed.
+            std::thread::sleep(crate::remote::launch::DRAIN + Duration::from_secs(1));
+            stream.write_all(&[1_u8; 16]).expect("the box sends a wrong proof");
+            let mut rest = Vec::new();
+            stream.read_to_end(&mut rest).expect("the PC closes");
+            rest
+        });
+        let system = gate_win32::system_directory().expect("the system folder is read");
+        let program = crate::remote::transport::Program {
+            program: system.join("cmd.exe"),
+            args: vec!["/d".into(), "/c".into(), script.into_os_string()],
+        };
+        let asked = crate::remote::channel::Asked {
+            data: Ipv4Addr::LOCALHOST,
+            local: Ipv4Addr::LOCALHOST,
+            box_proof: gate_wire::Proof::new([7_u8; 16]),
+            pc_proof: gate_wire::Proof::new([9_u8; 16]),
+        };
+
+        let heard = super::probe_heard(&program, b"", (asked, nonce), GUARD, HOST);
+
+        let verdict = heard.and_then(|heard| heard.verdict(HOST));
+        assert_eq!(verdict, Err("the box's proof does not match".to_owned()));
+        assert_eq!(served.join().expect("the box's side ends"), Vec::<u8>::new(), "the PC sent no proof");
+        fs::remove_dir_all(&folder).ok();
     }
 
     #[test]

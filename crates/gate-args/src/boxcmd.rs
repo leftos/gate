@@ -186,6 +186,7 @@ fn verb(text: &str) -> Option<BoxVerb> {
         "prune" => Some(BoxVerb::Prune),
         "drain" => Some(BoxVerb::Drain),
         "hold" => Some(BoxVerb::Hold),
+        "channel-check" => Some(BoxVerb::ChannelCheck),
         _ => None,
     }
 }

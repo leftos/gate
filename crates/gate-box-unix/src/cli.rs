@@ -46,7 +46,9 @@ pub fn unbuilt(verb: BoxVerb) -> Option<String> {
         | BoxVerb::Outputs
         | BoxVerb::Drain
         | BoxVerb::Hold => None,
-        BoxVerb::Inflight | BoxVerb::Lfs | BoxVerb::RegisterDesktop => Some(format!("gate: box {} is not built on this builder", verb.as_str())),
+        BoxVerb::Inflight | BoxVerb::Lfs | BoxVerb::RegisterDesktop | BoxVerb::ChannelCheck => {
+            Some(format!("gate: box {} is not built on this builder", verb.as_str()))
+        }
     }
 }
 
@@ -241,7 +243,7 @@ mod tests {
         ] {
             assert_eq!(unbuilt(verb), None, "{verb:?}");
         }
-        for verb in [BoxVerb::Lfs, BoxVerb::Inflight, BoxVerb::RegisterDesktop] {
+        for verb in [BoxVerb::Lfs, BoxVerb::Inflight, BoxVerb::RegisterDesktop, BoxVerb::ChannelCheck] {
             assert_eq!(
                 unbuilt(verb),
                 Some(format!("gate: box {} is not built on this builder", verb.as_str())),

@@ -334,6 +334,7 @@ fn checked(place: &Place, seams: &CheckSeams) -> Checked {
         warmup: warmed.items,
         tailscale: None,
         box_slots: None,
+        data_channel: None,
     }
 }
 

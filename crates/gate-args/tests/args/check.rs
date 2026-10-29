@@ -156,6 +156,7 @@ fn check_builder_seams_parse_with_the_feature() {
                 remote_ssh: Some(PathBuf::from("fake-ssh.exe")),
                 remote_timeout_ms: Some(250),
                 tailscale_status: None,
+                check_channel_ms: None,
             },
         })
     );

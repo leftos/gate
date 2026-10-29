@@ -8,6 +8,9 @@
 //! A put goes the other way ([`pushed`]): the PC checks the box's proof, sends its own, sends the archive whose length
 //! and SHA-256 its request declared, and reads the box's ack, that SHA-256; the box's verdict over ssh, not the ack,
 //! says whether the put installed.
+//!
+//! `gate check --builder` probes the channel ([`probe_dialled`]): the PC checks the box's proof, sends its own, and
+//! closes; nothing else crosses it.
 
 use std::io::{self, Read};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -51,7 +54,7 @@ pub(super) const SEND_BUFFER: i32 = 16 * 1024 * 1024;
 /// The `data` address an outputs pull from `builder`, or a put to it, dials: `None` for a builder with no `data` key,
 /// and for one that is not a Windows builder, which stays on ssh; else why the channel is not used: a loopback
 /// address, which only a build with the test seams dials.
-pub(super) fn planned(builder: &Builder) -> Result<Option<Ipv4Addr>, String> {
+pub(crate) fn planned(builder: &Builder) -> Result<Option<Ipv4Addr>, String> {
     let Some(data) = builder.data else {
         return Ok(None);
     };
@@ -66,7 +69,7 @@ pub(super) fn planned(builder: &Builder) -> Result<Option<Ipv4Addr>, String> {
 
 /// This PC's own address toward `data`: the local address of a UDP socket connected to it, a connect that sends no
 /// packet; else why it cannot be read.
-pub(super) fn local_toward(data: Ipv4Addr) -> Result<Ipv4Addr, String> {
+pub(crate) fn local_toward(data: Ipv4Addr) -> Result<Ipv4Addr, String> {
     let cannot = |error: io::Error| format!("cannot read this PC's address toward {data}: {error}");
     let probe = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).map_err(cannot)?;
     probe.connect((data, CHANNEL_FIRST_PORT)).map_err(cannot)?;
@@ -88,7 +91,7 @@ pub(crate) struct Asked {
 
 impl Asked {
     /// The channel to `data` from `local`, with two proofs new to it; else why they could not be drawn.
-    pub(super) fn drawn(data: Ipv4Addr, local: Ipv4Addr) -> Result<Asked, String> {
+    pub(crate) fn drawn(data: Ipv4Addr, local: Ipv4Addr) -> Result<Asked, String> {
         let draw = || {
             socket::random_proof()
                 .map(Proof::new)
@@ -238,6 +241,55 @@ pub(super) fn pulled(asked: &Asked, (port, size, fault): (u16, u64, Option<Fault
     stream.shut_down().ok();
     drop(stream);
     end
+}
+
+/// How a probe of a builder's data channel ended on the PC's side ([`probe_dialled`]): the box's proof matched and the
+/// PC's was sent; it failed for why, which never holds a proof; or the call ended first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Probed {
+    Proved,
+    Failed(String),
+    CallEnded,
+}
+
+/// Probes the data channel `asked` at the box's `port`: connects from the PC's own address, checks the box's proof
+/// before it sends anything, sends its own, then shuts the connection down and closes it. Every wait, the connect's
+/// included, lasts at most [`SLICE`] before it looks again at whether `ended` says the call has ended, and gives up
+/// once it has.
+pub(crate) fn probe_dialled(asked: &Asked, port: u16, ended: &dyn Fn() -> bool) -> Probed {
+    if !port_taken(asked.data, port) {
+        return Probed::Failed(format!("the box's port {port} is outside {CHANNEL_FIRST_PORT}-{CHANNEL_LAST_PORT}"));
+    }
+    let stream = match connected(asked, SocketAddrV4::new(asked.data, port), ended) {
+        Ok(stream) => stream,
+        Err(stop) => return probe_stopped(stop),
+    };
+    let end = match proofs_traded(&stream, asked, ended) {
+        Ok(()) => Probed::Proved,
+        Err(stop) => probe_stopped(stop),
+    };
+    // A shutdown that fails leaves the close alone, which the drop makes either way; how the probe went stands.
+    stream.shut_down().ok();
+    drop(stream);
+    end
+}
+
+/// A probe's exchange over the connected `stream`: the box's proof checked before anything is sent, then the PC's sent.
+fn proofs_traded(stream: &Stream, asked: &Asked, ended: &dyn Fn() -> bool) -> Result<(), Stop> {
+    let mut proof = [0_u8; PROOF_BYTES];
+    proof_read(stream, &mut proof, ended)?;
+    if !asked.box_proof.matches(&proof) {
+        return Err(Stop::Failed("the box's proof does not match".to_owned()));
+    }
+    written(stream, asked.pc_proof.bytes(), ended, &mut |_| {})
+}
+
+/// How a probe that stopped short for `stop` ended.
+fn probe_stopped(stop: Stop) -> Probed {
+    match stop {
+        Stop::CallEnded => Probed::CallEnded,
+        Stop::Failed(why) => Probed::Failed(why),
+    }
 }
 
 /// How a pull that stopped short for `stop` ended.
@@ -642,6 +694,59 @@ mod tests {
             .sum();
         assert_eq!(chunked, ARCHIVE.len(), "{seen:?}");
         assert!(seen[2..seen.len() - 1].iter().all(|seen| matches!(seen, Seen::Chunk(_))), "{seen:?}");
+    }
+
+    /// A probe whose box sends a proof that does not match sends nothing back and closes: the PC's proof never reaches a
+    /// listener that is not the box; one whose box's proof matches sends the PC's and closes.
+    #[cfg(feature = "test-seams")]
+    #[test]
+    #[expect(clippy::expect_used, reason = "a case that cannot make its sockets must fail loudly")]
+    fn a_probe_sends_its_proof_only_to_a_box_whose_proof_matches() {
+        use std::io::{Read, Write};
+
+        const GUARD: std::time::Duration = std::time::Duration::from_secs(30);
+        let (box_proof, pc_proof) = ([7_u8; 16], [9_u8; 16]);
+        for (sent_proof, wanted, pc_sent) in [
+            ([1_u8; 16], super::Probed::Failed("the box's proof does not match".to_owned()), Vec::new()),
+            (box_proof, super::Probed::Proved, pc_proof.to_vec()),
+        ] {
+            let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback listener binds");
+            let port = listener.local_addr().expect("the listener's address is read").port();
+            listener.set_nonblocking(true).expect("the listener does not block");
+            // The accept is polled to the guard, so a dial that never connects fails the case as hung, never hangs it.
+            let served = std::thread::spawn(move || {
+                let hung = std::time::Instant::now() + GUARD;
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() >= hung {
+                                return Err("hung: no connection from the PC".to_owned());
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(error) => return Err(format!("the accept failed: {error}")),
+                    }
+                };
+                stream.set_nonblocking(false).expect("the connection blocks");
+                stream.set_read_timeout(Some(GUARD)).expect("the read guard is set");
+                stream.write_all(&sent_proof).expect("the box sends its proof");
+                let mut rest = Vec::new();
+                stream.read_to_end(&mut rest).expect("the PC closes");
+                Ok(rest)
+            });
+            let asked = super::Asked {
+                data: Ipv4Addr::LOCALHOST,
+                local: Ipv4Addr::LOCALHOST,
+                box_proof: gate_wire::Proof::new(box_proof),
+                pc_proof: gate_wire::Proof::new(pc_proof),
+            };
+
+            let end = super::probe_dialled(&asked, port, &|| false);
+
+            assert_eq!(end, wanted);
+            assert_eq!(served.join().expect("the box's side ends"), Ok(pc_sent), "what the PC sent: {wanted:?}");
+        }
     }
 
     /// What a put's feed was told, in order.
