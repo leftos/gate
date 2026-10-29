@@ -647,7 +647,8 @@ mod snapshot_only {
 /// the log and say it on stdout or stderr; `record <path>` writes the call as one JSON object; `wait <path>` returns
 /// when the path exists or the interrupt is raised, the latter ending the run with `STATUS_CONTROL_C_EXIT`;
 /// `interrupt` raises the call's interrupt; `killed` marks the run killed; `status <n>` sets the status; `refuse
-/// <reason>` refuses with status 75; `fail-start <why>` ends the run as a client that could not start; `warmed`,
+/// <reason>` refuses with status 75; `fail-start <why>` ends the run as a client that could not start; `cold` ends the
+/// run as a cold run does, the builder's preflight having found its work tree new, so its ceiling was raised; `warmed`,
 /// `warm-failed commands|refused <reason>` and `warm-deleted` set how a warm-up ended. `draining <calls> <place|none>
 /// <raised> <lapses>` ends each of the client's first `<calls>` calls, runs and drain polls counted together, as the
 /// builder's drain refusal with that place and barrier, and nothing else of such a call runs; `draining-at <call>
@@ -711,6 +712,8 @@ mod scripted {
         FailStart(String),
         Adjusted(f64),
         BoxKilled(BoxKill),
+        /// Ends the run as a cold run does: the builder's preflight found its work tree new, so its ceiling was raised.
+        Cold,
         Warmed,
         WarmFailed(WarmFailure, String),
         WarmDeleted,
@@ -883,6 +886,7 @@ mod scripted {
             "killed" => Ok(Step::Killed),
             "warmed" => Ok(Step::Warmed),
             "warm-deleted" => Ok(Step::WarmDeleted),
+            "cold" => Ok(Step::Cold),
             other => Err(format!("unknown step, or a step without its value: '{other}'")),
         }
     }
@@ -1008,6 +1012,7 @@ mod scripted {
                 *outcome = RemoteOutcome::not_started(why.clone());
                 return false;
             }
+            Step::Cold => outcome.raised = Some(super::watchdog::cold_ceiling(call.timeout)),
             Step::Warmed => outcome.warm = Some(WarmEnd::Warm),
             Step::WarmFailed(failure, reason) => {
                 outcome.warm = Some(WarmEnd::Failed {
@@ -1155,7 +1160,7 @@ mod scripted {
             let text = "out ran there\nerr error CS1002: x\n\nrecord C:\\a b\\call.json\r\nwait go\ninterrupt\nkilled\n\
                         status -1\nrefuse rebooted\nfail-start no pwsh\nrefuse cold\nwarmed\n\
                         warm-failed commands command stopped with status 2\nwarm-failed refused the builder refused: busy\n\
-                        warm-deleted\n";
+                        warm-deleted\ncold\n";
             assert_eq!(
                 parse(text),
                 Ok(vec![
@@ -1173,6 +1178,7 @@ mod scripted {
                     Step::WarmFailed(WarmFailure::Commands, "command stopped with status 2".to_owned()),
                     Step::WarmFailed(WarmFailure::Refused, "the builder refused: busy".to_owned()),
                     Step::WarmDeleted,
+                    Step::Cold,
                 ])
             );
             assert_eq!(parse(""), Ok(Vec::new()), "no steps");

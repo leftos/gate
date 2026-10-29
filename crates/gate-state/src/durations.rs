@@ -31,12 +31,15 @@ use crate::verdict::Verdict;
 pub const DURATIONS_FILE: &str = "durations.json";
 /// The marker's file name under the state root while a gate rebuilds the store.
 pub const REBUILDING_FILE: &str = "durations.rebuilding";
-/// The rule set the keys are made by; a store written under another one is rebuilt.
-pub const KEY_VERSION: u64 = 1;
+/// The rules that make the keys and that file runs under them; a store written under another set is rebuilt, so a
+/// change to either bumps it.
+pub const KEY_VERSION: u64 = 2;
 /// The store's format version, its `v`.
 const STORE_VERSION: u64 = 1;
 /// How many of a key's newest passing runs the estimate looks at, at most.
 const WINDOW_RUNS: usize = 30;
+/// How many of a key's newest passing cold runs it keeps, at most.
+const COLD_RUNS: usize = 10;
 /// How old a passing run may be for the estimate to look at it, and a key's newest release for the store to keep it.
 const WINDOW_AGE: SignedDuration = SignedDuration::from_hours(14 * 24);
 /// How many passing runs in the window a key needs for an estimate.
@@ -403,6 +406,10 @@ pub struct KeyHistory {
     pub failed: u64,
     /// The newest passing runs, oldest first: at most 30, none more than 14 days older than the newest record.
     pub samples: Vec<Sample>,
+    /// The newest passing cold runs, oldest first: at most 10, none more than 14 days older than the newest record.
+    /// A cold run is one whose work tree its own preflight laid out; the estimate never reads these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cold: Vec<Sample>,
 }
 
 impl KeyHistory {
@@ -411,17 +418,25 @@ impl KeyHistory {
             last: time,
             failed: 0,
             samples: Vec::new(),
+            cold: Vec::new(),
         }
     }
 
-    /// Drops the samples more than 14 days before `now`, then all but the newest 30, leaving them oldest first.
+    /// Drops the samples more than 14 days before `now`, then all but the newest 30, leaving them oldest first, and the
+    /// cold runs the same way, keeping the newest 10.
     fn trim(&mut self, now: Timestamp) {
         let start = window_start(now);
-        self.samples.retain(|sample| sample.time >= start);
-        self.samples.sort_by_key(|sample| sample.time);
-        let excess = self.samples.len().saturating_sub(WINDOW_RUNS);
-        self.samples.drain(..excess);
+        trim_runs(&mut self.samples, start, WINDOW_RUNS);
+        trim_runs(&mut self.cold, start, COLD_RUNS);
     }
+}
+
+/// Drops the runs of `runs` older than `start`, then all but the newest `cap`, leaving them oldest first.
+fn trim_runs(runs: &mut Vec<Sample>, start: Timestamp, cap: usize) {
+    runs.retain(|sample| sample.time >= start);
+    runs.sort_by_key(|sample| sample.time);
+    let excess = runs.len().saturating_sub(cap);
+    runs.drain(..excess);
 }
 
 /// How long runs of a key take, from its passing runs in the window.
@@ -494,11 +509,11 @@ impl DurationStore {
         Self::default()
     }
 
-    /// Files a run released at `time` under the key's exact and family keys: a passing run as a sample, then each key
-    /// trimmed to the window ending at `time`; any other known verdict as a failure. Either way `time` becomes the key's
-    /// newest release when it is newer. A run with an unknown verdict, or a passing run with no finite wall time, is not
-    /// filed.
-    pub fn record(&mut self, key: &DurationKey, time: Timestamp, facts: &RunFacts) {
+    /// Files a run released at `time` under the key's exact and family keys: a passing run as a sample, or as a cold
+    /// run's when `cold`, then each key trimmed to the window ending at `time`; any other known verdict as a failure.
+    /// Either way `time` becomes the key's newest release when it is newer. A run with an unknown verdict, or a passing
+    /// run with no finite wall time, is not filed.
+    pub fn record(&mut self, key: &DurationKey, time: Timestamp, facts: &RunFacts, cold: bool) {
         let timed = sample(
             time,
             Some(facts.wall_seconds),
@@ -506,11 +521,13 @@ impl DurationStore {
             (facts.avg_cores, facts.peak_cores),
         );
         if let Some(outcome) = Outcome::new(facts.verdict, timed) {
-            self.file(key, time, &outcome);
+            self.file(key, time, &outcome, cold);
         }
     }
 
-    fn file(&mut self, key: &DurationKey, time: Timestamp, outcome: &Outcome) {
+    /// Files `outcome` under the key's exact and family keys, a passing run's in `cold` when `cold` and in `samples`
+    /// otherwise.
+    fn file(&mut self, key: &DurationKey, time: Timestamp, outcome: &Outcome, cold: bool) {
         let names: &[&String] = if key.family == key.exact {
             &[&key.exact]
         } else {
@@ -522,7 +539,8 @@ impl DurationStore {
             match outcome {
                 Outcome::Failed => history.failed += 1,
                 Outcome::Passed(sample) => {
-                    history.samples.push(sample.clone());
+                    let runs = if cold { &mut history.cold } else { &mut history.samples };
+                    runs.push(sample.clone());
                     history.trim(time);
                 }
             }
@@ -600,7 +618,8 @@ fn estimate_of(history: &KeyHistory, now: Timestamp, key: &str, family: bool) ->
     })
 }
 
-/// The store file as written: `{"v": 1, "keyVersion": 1, "keys": {key: {"last", "failed", "samples"}}}`.
+/// The store file as written: `{"v": 1, "keyVersion": 2, "keys": {key: {"last", "failed", "samples", "cold"}}}`, a key
+/// without cold runs left out of `cold`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StoreFileOut<'a> {
@@ -743,16 +762,16 @@ pub enum Recorded {
 }
 
 /// Files a run released at `time` in `root`'s store, drops the keys with no release in the 14 days before `time`, and
-/// writes it back: the step a gate runs inside the journal hold once its `release` line is written. A store that needs
-/// a rebuild is left for [`rebuild_store`].
+/// writes it back: the step a gate runs inside the journal hold once its `release` line is written. `cold` files a passing
+/// run apart from the samples the estimate reads. A store that needs a rebuild is left for [`rebuild_store`].
 ///
 /// # Errors
 ///
 /// The store could not be written.
-pub fn record_run(root: &Path, key: &DurationKey, time: Timestamp, facts: &RunFacts) -> Result<Recorded, StoreError> {
+pub fn record_run(root: &Path, key: &DurationKey, time: Timestamp, facts: &RunFacts, cold: bool) -> Result<Recorded, StoreError> {
     match read_store(root) {
         StoreRead::Current(mut store) => {
-            store.record(key, time, facts);
+            store.record(key, time, facts, cold);
             store.prune(time);
             write_store(root, &store)?;
             Ok(Recorded::Written)
@@ -937,6 +956,9 @@ struct ReleaseLine {
     command: String,
     #[serde(default)]
     remote: bool,
+    /// Whether the run was routed to a work tree its own preflight laid out; a line without the field is a warm run.
+    #[serde(default)]
+    cold: bool,
     host: Option<String>,
     wall_seconds: Option<f64>,
     adjusted_seconds: Option<f64>,
@@ -1037,7 +1059,7 @@ impl Releases {
                 temp_root,
                 command: &run.command,
             });
-            store.file(&key, run.time, &outcome);
+            store.file(&key, run.time, &outcome, run.cold);
         }
     }
 }

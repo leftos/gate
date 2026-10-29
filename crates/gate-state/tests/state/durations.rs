@@ -88,7 +88,7 @@ fn days_before_now(days: i64) -> Timestamp {
 /// Records passing runs of `walls` under `key`, oldest first, one minute apart, the last a minute before [`NOW`].
 fn record_walls(store: &mut DurationStore, key: &DurationKey, walls: &[f64]) {
     for (index, wall) in walls.iter().enumerate() {
-        store.record(key, minutes_before_now(walls.len() - index), &passed(*wall));
+        store.record(key, minutes_before_now(walls.len() - index), &passed(*wall), false);
     }
 }
 
@@ -401,7 +401,7 @@ fn record_adjusted(store: &mut DurationStore, key: &DurationKey, adjusted: usize
             adjusted_seconds: (minutes <= adjusted).then_some(1.0),
             ..passed(10.0)
         };
-        store.record(key, minutes_before_now(minutes), &facts);
+        store.record(key, minutes_before_now(minutes), &facts, false);
     }
 }
 
@@ -448,7 +448,7 @@ fn adjusted_p90_and_p99_differ_over_a_wide_window() {
             adjusted_seconds: Some(adjusted),
             ..passed(10.0)
         };
-        store.record(&key, minutes_before_now(20 - index), &facts);
+        store.record(&key, minutes_before_now(20 - index), &facts, false);
     }
 
     let estimate = store.estimate(&key, ts(NOW)).expect("twenty passing runs give an estimate");
@@ -466,11 +466,11 @@ fn five_passing_runs_needed() {
     let mut store = DurationStore::new();
     record_walls(&mut store, &key, &[2.0, 2.0, 2.0, 2.0]);
     for minutes in 1..=3 {
-        store.record(&key, minutes_before_now(minutes), &failed(9.0));
+        store.record(&key, minutes_before_now(minutes), &failed(9.0), false);
     }
     assert_eq!(store.estimate(&key, ts(NOW)), None, "four passing runs and three failures are not enough");
 
-    store.record(&key, ts(NOW), &passed(2.0));
+    store.record(&key, ts(NOW), &passed(2.0), false);
 
     assert_eq!(store.estimate(&key, ts(NOW)).map(|estimate| estimate.runs), Some(5));
 }
@@ -493,7 +493,7 @@ fn window_is_30_runs_or_14_days_whichever_is_fewer() {
 
     let old = local_key("cargo test");
     for _ in 0..10 {
-        store.record(&old, days_before_now(20), &passed(1000.0));
+        store.record(&old, days_before_now(20), &passed(1000.0), false);
     }
     record_walls(&mut store, &old, &[2.0; 6]);
 
@@ -505,16 +505,99 @@ fn window_is_30_runs_or_14_days_whichever_is_fewer() {
 }
 
 #[test]
+fn a_passing_cold_run_is_filed_apart_and_leaves_the_estimate_unchanged() {
+    let key = local_key("cargo build");
+    let mut store = DurationStore::new();
+    record_walls(&mut store, &key, &[10.0, 11.0, 12.0, 13.0, 14.0]);
+    let warm = store.estimate(&key, ts(NOW)).expect("five warm runs give an estimate");
+
+    store.record(&key, ts(NOW), &passed(900.0), true);
+
+    assert_eq!(
+        store.estimate(&key, ts(NOW)),
+        Some(warm),
+        "a passing cold run leaves the estimate as it was"
+    );
+    let history = store.history(&key.exact).expect("the key has a history");
+    let cold: Vec<f64> = history.cold.iter().map(|sample| sample.wall).collect();
+    assert_eq!(
+        (walls_of(&store, &key.exact), cold),
+        (vec![10.0, 11.0, 12.0, 13.0, 14.0], vec![900.0]),
+        "the warm runs stay the samples, the cold run goes apart"
+    );
+}
+
+#[test]
+fn a_failing_cold_run_is_counted_as_failed() {
+    let key = local_key("cargo build");
+    let mut store = DurationStore::new();
+    record_walls(&mut store, &key, &[10.0; 5]);
+
+    store.record(&key, ts(NOW), &failed(900.0), true);
+
+    let history = store.history(&key.exact).expect("the key has a history");
+    assert_eq!(
+        (history.failed, history.samples.len(), history.cold.len()),
+        (1, 5, 0),
+        "a failing cold run is counted, never timed"
+    );
+}
+
+#[test]
+fn the_cold_list_keeps_the_newest_ten_within_the_window() {
+    let windowed = local_key("cargo test");
+    let mut short = DurationStore::new();
+    short.record(&windowed, days_before_now(20), &passed(1000.0), true);
+    short.record(&windowed, minutes_before_now(2), &passed(2.0), true);
+    short.record(&windowed, minutes_before_now(1), &passed(1.0), true);
+
+    let dropped: Vec<f64> = short
+        .history(&windowed.exact)
+        .expect("the key has a history")
+        .cold
+        .iter()
+        .map(|sample| sample.wall)
+        .collect();
+
+    assert_eq!(
+        dropped,
+        [2.0, 1.0],
+        "the cold run 20 days old leaves the window while the list is still short of ten"
+    );
+
+    let capped = local_key("cargo build");
+    let mut store = DurationStore::new();
+    let walls = [12.0, 11.0, 10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+    for (index, wall) in walls.iter().enumerate() {
+        store.record(&capped, minutes_before_now(walls.len() - index), &passed(*wall), true);
+    }
+
+    let kept: Vec<f64> = store
+        .history(&capped.exact)
+        .expect("the key has a history")
+        .cold
+        .iter()
+        .map(|sample| sample.wall)
+        .collect();
+
+    assert_eq!(
+        kept,
+        (1..=10).rev().map(f64::from).collect::<Vec<_>>(),
+        "the newest ten cold runs, oldest first, the two oldest dropped"
+    );
+}
+
+#[test]
 fn the_mean_is_over_the_window() {
     let key = local_key("cargo build");
     let mut store = DurationStore::new();
     for _ in 0..3 {
-        store.record(&key, days_before_now(20), &passed(5000.0));
+        store.record(&key, days_before_now(20), &passed(5000.0), false);
     }
     let mut walls = vec![1000.0; 10];
     walls.extend((1..=30).map(f64::from));
     record_walls(&mut store, &key, &walls);
-    store.record(&key, ts(NOW), &failed(9000.0));
+    store.record(&key, ts(NOW), &failed(9000.0), false);
 
     let estimate = store.estimate(&key, ts(NOW)).expect("forty recent runs give an estimate");
 
@@ -531,7 +614,7 @@ fn failures_are_counted_not_timed() {
     let mut store = DurationStore::new();
     record_walls(&mut store, &key, &[10.0; 5]);
     for minutes in 1..=3 {
-        store.record(&key, minutes_before_now(minutes), &failed(999.0));
+        store.record(&key, minutes_before_now(minutes), &failed(999.0), false);
     }
     store.record(
         &key,
@@ -540,6 +623,7 @@ fn failures_are_counted_not_timed() {
             verdict: Verdict::TimedOut,
             ..passed(999.0)
         },
+        false,
     );
 
     let history = store.history(&key.exact).expect("the key has a history");
@@ -563,6 +647,7 @@ fn a_transfer_that_timed_out_leaves_the_history_unchanged() {
             verdict: Verdict::TransferTimedOut,
             ..passed(999.0)
         },
+        false,
     );
 
     assert_eq!(store.history(&key.exact), Some(&before));
@@ -582,6 +667,7 @@ fn a_transfer_that_failed_leaves_the_history_unchanged() {
             verdict: Verdict::TransferFailed,
             ..passed(999.0)
         },
+        false,
     );
 
     assert_eq!(store.history(&key.exact), Some(&before));
@@ -592,7 +678,7 @@ fn a_family_estimate_says_it_is_one() {
     let filtered = |filter: &str| local_key(&format!("cargo nextest run -E test({filter})"));
     let mut store = DurationStore::new();
     for (minutes, filter) in [(5, "a"), (4, "b"), (3, "a"), (2, "c"), (1, "b")] {
-        store.record(&filtered(filter), minutes_before_now(minutes), &passed(10.0));
+        store.record(&filtered(filter), minutes_before_now(minutes), &passed(10.0), false);
     }
     let unseen = filtered("d");
 
@@ -613,7 +699,7 @@ fn odd_release_values_are_not_samples() {
     let key = local_key("cargo build");
     let mut store = DurationStore::new();
     for wall in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-        store.record(&key, ts(NOW), &passed(wall));
+        store.record(&key, ts(NOW), &passed(wall), false);
     }
     store.record(
         &key,
@@ -622,6 +708,7 @@ fn odd_release_values_are_not_samples() {
             verdict: Verdict::Unknown,
             ..passed(1.0)
         },
+        false,
     );
     assert_eq!(store.history(&key.exact), None, "no run was filed");
 
@@ -676,7 +763,7 @@ fn a_torn_store_asks_for_a_rebuild_with_its_reason() {
     assert_ne!(error.reason, "", "a torn store says why");
     assert_eq!(error.to_string(), format!("cannot read {} ({})", path.display(), error.reason));
     assert_eq!(
-        record_run(&root, &local_key("cargo build"), ts(NOW), &passed(1.0)),
+        record_run(&root, &local_key("cargo build"), ts(NOW), &passed(1.0), false),
         Ok(Recorded::NeedsRebuild(RebuildReason::Invalid(error)))
     );
     assert_eq!(
@@ -710,7 +797,7 @@ fn a_key_version_mismatch_asks_for_a_rebuild() {
 
     assert_eq!(read_store(&root), StoreRead::NeedsRebuild(RebuildReason::Stale));
     assert_eq!(
-        record_run(&root, &key, ts(NOW), &passed(1.0)),
+        record_run(&root, &key, ts(NOW), &passed(1.0), false),
         Ok(Recorded::NeedsRebuild(RebuildReason::Stale))
     );
     assert_eq!(
@@ -721,15 +808,27 @@ fn a_key_version_mismatch_asks_for_a_rebuild() {
 
     fs::remove_file(&path).expect("the stale store can be removed");
     assert_eq!(
-        record_run(&root, &key, ts(NOW), &passed(1.0)),
+        record_run(&root, &key, ts(NOW), &passed(1.0), false),
         Ok(Recorded::NeedsRebuild(RebuildReason::Missing))
     );
     assert!(!path.exists(), "a missing store is left for the rebuild");
 
     write_store(&root, &DurationStore::new()).expect("an empty store can be written");
-    assert_eq!(record_run(&root, &key, ts(NOW), &passed(1.0)), Ok(Recorded::Written));
+    assert_eq!(record_run(&root, &key, ts(NOW), &passed(1.0), false), Ok(Recorded::Written));
     let store = current(&root).expect("the store is current after a run wrote it");
     assert_eq!(walls_of(&store, &key.exact), [1.0]);
+}
+
+#[test]
+fn a_store_of_key_version_1_needs_a_rebuild() {
+    let root = fresh_dir("durations_key_version_1");
+    fs::write(durations_path(&root), r#"{"v":1,"keyVersion":1,"keys":{}}"#).expect("an old store can be seeded");
+
+    assert_eq!(
+        read_store(&root),
+        StoreRead::NeedsRebuild(RebuildReason::Stale),
+        "a store without the cold list was made by another rule set"
+    );
 }
 
 #[test]
@@ -741,7 +840,7 @@ fn a_newer_key_version_is_left_alone() {
     let key = local_key("cargo build");
 
     assert_eq!(read_store(&root), StoreRead::Newer, "no history, no rebuild and nothing to say");
-    assert_eq!(record_run(&root, &key, ts(NOW), &passed(1.0)), Ok(Recorded::Newer));
+    assert_eq!(record_run(&root, &key, ts(NOW), &passed(1.0), false), Ok(Recorded::Newer));
     write_lines(&root.join("events.jsonl"), &[build_at("2026-10-03T01:00:00Z", 10.0)]);
     let rebuilt = rebuild_store(&root, Some(TEMP), ts(NOW), lookup);
     let swap = swap_rebuilt(&root, &FakeLock::Free, &rebuilt, ts(NOW), ME).expect("the swap runs");
@@ -765,12 +864,12 @@ fn a_key_with_no_release_in_14_days_is_pruned() {
     let failing = local_key("cargo failing");
     let new = local_key("cargo new");
     let mut store = DurationStore::new();
-    store.record(&old, days_before_now(15), &passed(1.0));
-    store.record(&failing, days_before_now(15), &passed(1.0));
-    store.record(&failing, days_before_now(1), &failed(1.0));
+    store.record(&old, days_before_now(15), &passed(1.0), false);
+    store.record(&failing, days_before_now(15), &passed(1.0), false);
+    store.record(&failing, days_before_now(1), &failed(1.0), false);
     write_store(&root, &store).expect("the store can be seeded");
 
-    assert_eq!(record_run(&root, &new, ts(NOW), &passed(2.0)), Ok(Recorded::Written));
+    assert_eq!(record_run(&root, &new, ts(NOW), &passed(2.0), false), Ok(Recorded::Written));
 
     let kept = current(&root).expect("the store is current");
     assert_eq!(
@@ -789,6 +888,7 @@ struct Release<'a> {
     kind: &'a str,
     host: Option<&'a str>,
     facts: RunFacts,
+    cold: bool,
 }
 
 impl Release<'_> {
@@ -807,7 +907,7 @@ impl Release<'_> {
             status: Some(i64::from(self.facts.verdict != Verdict::Passed)),
             facts: Some(self.facts),
             trace: RunTrace::default(),
-            cold: false,
+            cold: self.cold,
             path: None,
             routing: None,
         };
@@ -828,6 +928,7 @@ fn local_release<'a>(time: &'a str, cwd: &'a str, command: &'a str, facts: RunFa
         kind: "heavy",
         host: None,
         facts,
+        cold: false,
     }
 }
 
@@ -900,6 +1001,7 @@ fn rebuild_reads_the_live_journal_and_the_archive() {
         kind: "critical",
         host: Some(HOST),
         facts: passed(16.0),
+        cold: false,
     };
     write_lines(
         &root.join("events.jsonl"),
@@ -932,6 +1034,63 @@ fn rebuild_reads_the_live_journal_and_the_archive() {
             "skipped 1 release line(s) of {} that do not parse",
             root.join("events.jsonl").display()
         )]
+    );
+}
+
+#[test]
+fn a_rebuild_files_a_cold_release_line_apart() {
+    let root = fresh_dir("durations_rebuild_cold");
+    let cold = Release {
+        time: "2026-10-03T02:00:00Z",
+        cwd: ROOT,
+        command: "cargo build",
+        kind: "heavy",
+        host: Some(HOST),
+        facts: passed(900.0),
+        cold: true,
+    };
+    write_lines(&root.join("events.jsonl"), &[build_at("2026-10-03T01:00:00Z", 10.0), cold.line()]);
+
+    let rebuilt = rebuild_store(&root, Some(TEMP), ts(NOW), lookup);
+
+    let routed = rebuilt
+        .store
+        .history("remote:builder@build-box::repo | cargo build")
+        .expect("the routed key has a history");
+    let apart: Vec<f64> = routed.cold.iter().map(|sample| sample.wall).collect();
+    assert_eq!(
+        walls_of(&rebuilt.store, "local::repo | cargo build"),
+        [10.0],
+        "the line without `cold` files as warm"
+    );
+    assert_eq!(apart, [900.0], "the routed cold line files in its own key's cold list");
+    assert!(routed.samples.is_empty(), "a cold line files no sample: {routed:?}");
+}
+
+#[test]
+fn a_key_without_cold_runs_is_written_as_before() {
+    let root = fresh_dir("durations_no_cold_runs");
+    let key = local_key("cargo build");
+    let mut store = DurationStore::new();
+    store.record(&key, minutes_before_now(2), &passed(10.0), false);
+    write_store(&root, &store).expect("the store can be written");
+
+    let text = fs::read_to_string(durations_path(&root)).expect("the store can be read");
+    assert!(!text.contains("\"cold\""), "a key with no cold runs gains no `cold` key: {text}");
+
+    let mut mixed = DurationStore::new();
+    mixed.record(&key, minutes_before_now(3), &passed(1.0), true);
+    mixed.record(&key, minutes_before_now(2), &passed(2.0), true);
+    mixed.record(&key, minutes_before_now(1), &passed(3.0), false);
+    write_store(&root, &mixed).expect("the store can be written");
+
+    let read = current(&root).expect("the store reads back");
+    let history = read.history(&key.exact).expect("the key has a history");
+    let cold: Vec<f64> = history.cold.iter().map(|sample| sample.wall).collect();
+    assert_eq!(
+        (cold, walls_of(&read, &key.exact)),
+        (vec![1.0, 2.0], vec![3.0]),
+        "the cold runs round-trip in order, apart from the samples"
     );
 }
 
@@ -1073,7 +1232,7 @@ fn rebuild_swap_is_skipped_when_the_store_was_written_meanwhile() {
     write_lines(&root.join("events.jsonl"), &[build_at("2026-10-03T01:00:00Z", 10.0)]);
     let rebuilt = rebuild_store(&root, Some(TEMP), ts(NOW), lookup);
     let mut meanwhile = DurationStore::new();
-    meanwhile.record(&local_key("cargo test"), ts(NOW), &passed(3.0));
+    meanwhile.record(&local_key("cargo test"), ts(NOW), &passed(3.0), false);
     write_store(&root, &meanwhile).expect("another gate's store can be written");
 
     let kept = swap_rebuilt(&root, &FakeLock::Free, &rebuilt, ts(NOW), ME).expect("the swap runs");
@@ -1257,7 +1416,7 @@ fn a_store_that_cannot_be_opened_is_no_history_without_a_rebuild() {
     assert_eq!(error.path, path);
     assert_ne!(error.reason, "", "it says why");
     assert_eq!(
-        record_run(&root, &local_key("cargo build"), ts(NOW), &passed(1.0)),
+        record_run(&root, &local_key("cargo build"), ts(NOW), &passed(1.0), false),
         Ok(Recorded::Unavailable(error)),
         "the run is not recorded and no rebuild is asked for"
     );

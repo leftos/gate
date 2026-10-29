@@ -1490,17 +1490,18 @@ fn alternating_builders_each_bridge_on_their_own_last_snapshot() {
 #[test]
 fn a_routed_run_past_3x_its_usual_p90_is_hinted_once() {
     let case = client_case("client-hang-hint");
-    // The command waits for `go` in the folder it runs in: the snapshot of the first five runs sends it, so they pass
+    // The command waits for `go` in the folder it runs in: the snapshot of the first six runs sends it, so they pass
     // at once; the held run's snapshot has none, and the case writes it into the builder's work folder.
     let command = [r".\tool.exe", "wait", "go", "out", "ran"];
-    let steps = ssh_steps(&case, "ssh", &["ok"; 12]);
+    let steps = ssh_steps(&case, "ssh", &["ok"; 15]);
     write(&case, "go", "");
-    for _ in 0..5 {
+    // The first routed run of a fresh case is cold and files no sample, so six runs make five.
+    for _ in 0..6 {
         let outcome = finish(client_gate(&case, "history.log", &steps, &command));
         assert_eq!(outcome.code, Some(0), "{outcome:?}");
     }
     fs::remove_file(case.folder().join("go")).expect("the go file can be removed");
-    // The builder key's five runs, rewritten to a wall p90 of 1 s.
+    // The builder key's six runs, rewritten to a wall p90 of 1 s.
     seed(&case, " out ran", 1.0, None);
     // Each span in seconds or, for a hint a starved watch says 90 s or more into the run, in minutes.
     let hint = Regex::new(r"gate: still running after (\d+ (?:s|min)), \d+x its usual p90 of 1 s; running on builder for (\d+ (?:s|min))\n")
@@ -1509,6 +1510,8 @@ fn a_routed_run_past_3x_its_usual_p90_is_hinted_once() {
     let go = Go(case.folder().join("builder").join("work").join(key_of(&events(&case))).join("go"));
 
     let mut running = start(client_gate(&case, "out.log", &steps, &command));
+    let taken = running.wait_for_stderr_while_running("the run's push", |stderr| stderr.contains("gate: pushed snapshot"));
+    assert_expected(&taken);
     running.wait_for_stderr_while_running("the hang hint", |stderr| hint.is_match(stderr));
     fs::write(go.path(), "").expect("the go file can be made");
     let outcome = running.finish();
@@ -1612,19 +1615,22 @@ fn a_second_routed_run_of_one_worktree_waits_for_its_holder_and_routes() {
 
 #[test]
 fn a_second_routed_run_of_one_worktree_says_the_holders_time_left() {
-    // Five runs file the command's duration and `seed` makes its usual 600 s, so the holder's remote claim carries that
+    // Six runs file the command's duration and `seed` makes its usual 600 s, so the holder's remote claim carries that
     // expected time and the wait's line says what is left of it.
     let case = client_case_of("client-key-eta", 1);
     let steps = ssh_steps(&case, "seed", &["ok"; 12]);
     let command = [r".\tool.exe", "out", "ran"];
-    for _ in 0..5 {
+    // The first routed run of a fresh case is cold and files no sample, so six runs make five.
+    for _ in 0..6 {
         let outcome = finish(client_gate(&case, "history.log", &steps, &command));
         assert_eq!(outcome.code, Some(0), "{outcome:?}");
     }
     seed(&case, " out ran", 600.0, None);
     let go = Go(case.folder().join("ssh").join("go"));
     let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
-    let first = start(client_gate(&case, "first.log", &first_steps, &command));
+    let mut first = start(client_gate(&case, "first.log", &first_steps, &command));
+    let taken = first.wait_for_stderr_while_running("the first run's push", |stderr| stderr.contains("gate: pushed snapshot"));
+    assert_expected(&taken);
     first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
     let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
     let tuned = Tuned {
@@ -7159,7 +7165,7 @@ fn start_held_pull(case: &Case, log: &str, release: &Go, command: &[&str], seams
     start(client_gate_tuned(case, log, &steps, &tuned, command))
 }
 
-/// The command waits for `go` in the folder it runs in, then writes an output: the first five runs' snapshots send `go`,
+/// The command waits for `go` in the folder it runs in, then writes an output: the first six runs' snapshots send `go`,
 /// so they pass at once. The first held run keeps `go` and, under `--test-remote-hint-from-pull`, can be hinted only
 /// during its held pull; the second has none, so it is hinted during its run call, which it holds until the hint, and,
 /// let go, says no second hint during its pull, which outlasts 3x the p90 too.
@@ -7169,7 +7175,8 @@ fn a_routed_run_hinted_during_its_pull_names_the_pull_once() {
     let command = [r".\tool.exe", "wait", "go", "write", r"bin\new.txt", "hinted"];
     let history = ssh_steps(&case, "history", &["ok"; 15]);
     write(&case, "go", "");
-    for _ in 0..5 {
+    // The first routed run of a fresh case is cold and files no sample, so six runs make five.
+    for _ in 0..6 {
         let outcome = finish(client_gate(&case, "history.log", &history, &command));
         assert_eq!(outcome.code, Some(0), "{outcome:?}");
     }
@@ -7191,6 +7198,8 @@ fn a_routed_run_hinted_during_its_pull_names_the_pull_once() {
     take_output(&case);
     let release = Go(case.folder().join("release-pull"));
     let mut running = start_held_pull(&case, "pull.log", &release, &command, &PULL_HINTED);
+    let taken = running.wait_for_stderr_while_running("the run's push", |stderr| stderr.contains("gate: pushed snapshot"));
+    assert_expected(&taken);
     running.wait_for_stderr_while_running("the pull's hint", |stderr| pulling.is_match(stderr));
     fs::write(release.path(), "").expect("the release file can be made");
     let during_pull = running.finish();
@@ -7204,6 +7213,8 @@ fn a_routed_run_hinted_during_its_pull_names_the_pull_once() {
     let release = Go(case.folder().join("release-run"));
     let progress = Regex::new(r"(?m)^gate: pulling outputs: ").expect("the pattern is valid");
     let mut running = start_held_pull(&case, "run.log", &release, &command, &PULL_HELD);
+    let taken = running.wait_for_stderr_while_running("the run's push", |stderr| stderr.contains("gate: pushed snapshot"));
+    assert_expected(&taken);
     running.wait_for_stderr_while_running("the run call's hint", |stderr| running_on.is_match(stderr));
     fs::write(go.path(), "").expect("the go file can be made");
     // Two progress lines: the pull has run past 3x the p90 as its run counts, the hint already said.
@@ -7229,7 +7240,8 @@ fn a_pull_retried_names_its_phase_time_from_the_pull_s_start() {
     let case = outputs_case("client-outputs-pull-retried", &BIN);
     let command = [r".\tool.exe", "write", r"bin\new.txt", "retried"];
     let history = ssh_steps(&case, "history", &["ok"; 15]);
-    for _ in 0..5 {
+    // The first routed run of a fresh case is cold and files no sample, so six runs make five.
+    for _ in 0..6 {
         let outcome = finish(client_gate(&case, "history.log", &history, &command));
         assert_eq!(outcome.code, Some(0), "{outcome:?}");
     }
@@ -7253,6 +7265,8 @@ fn a_pull_retried_names_its_phase_time_from_the_pull_s_start() {
             .expect("the pattern is valid");
 
     let mut running = start(client_gate_tuned(&case, "out.log", &steps, &tuned, &command));
+    let taken = running.wait_for_stderr_while_running("the run's push", |stderr| stderr.contains("gate: pushed snapshot"));
+    assert_expected(&taken);
     running.wait_for_stderr_while_running("the pull's hint", |stderr| pulling.is_match(stderr));
     fs::write(release.path(), "").expect("the release file can be made");
     // The stand-in's 100 bytes are no archive, so the install fails: the case reads the hint alone.
@@ -8901,6 +8915,16 @@ fn direct_build(target: &str) -> Vec<&str> {
     vec![r".\dotnet.cmd", "build", target]
 }
 
+/// Asserts that `said`, the stderr of a run whose first routed call has started, carries the expected-time line its
+/// case's estimate-driven line needs: a hang hint, a pull hint, a held `auto` ceiling, or a holder's time left. Without
+/// an estimate the case would otherwise sit until the hang guard.
+fn assert_expected(said: &str) {
+    assert!(
+        said.contains("gate: expected about "),
+        "the run has no estimate: no `gate: expected about …` line before its routed call; stderr so far:\n{said}"
+    );
+}
+
 /// Whether the run said a line of a restore here.
 fn says_a_restore(outcome: &Outcome) -> bool {
     outcome
@@ -9101,14 +9125,15 @@ fn a_routed_build_of_a_folder_says_it_is_not_restored_here() {
     assert!(!case.folder().join(r"tests\X\obj\project.assets.json").exists(), "{outcome:?}");
 }
 
-/// Five routed builds make the key's history, seeded to a load-adjusted 100 s, so `auto:10` resolves to a 300 s
+/// Six routed builds make the key's history, seeded to a load-adjusted 100 s, so `auto:10` resolves to a 300 s
 /// ceiling on the sixth, a warm run. Counted from the run's arrival against the floor, under 10 s would be left and
 /// the restore skipped; counted from the routed call's start against the ceiling, nearly 300 s are.
 #[test]
 fn a_restore_after_an_auto_ceiling_raised_by_history_gets_the_time_left() {
     let case = restore_case("client-restore-here-auto", false);
     let steps = ssh_steps(&case, "ssh", &["ok"; 30]);
-    for run in 0..5 {
+    // The first routed run of a fresh case is cold and files no sample, so six runs make five.
+    for run in 0..6 {
         let outcome = finish(client_gate(&case, &format!("history-{run}.log"), &steps, &direct_build(RESTORED_PROJECT)));
         assert_eq!(outcome.code, Some(0), "{outcome:?}");
     }
@@ -9121,6 +9146,7 @@ fn a_restore_after_an_auto_ceiling_raised_by_history_gets_the_time_left() {
 
     let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &direct_build(RESTORED_PROJECT)));
 
+    assert_expected(&outcome.stderr);
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(outcome.stdout.contains(", ceiling 300 s; command "), "{outcome:?}");
     assert!(outcome.stderr.lines().any(|line| line.starts_with(RESTORED_LINE)), "{outcome:?}");

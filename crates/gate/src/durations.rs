@@ -387,13 +387,15 @@ impl RunDurations {
         }
     }
 
-    /// What files the run's release on `remote_host` in the journal hold, or `None` when the run reached no verdict.
-    pub(crate) fn filing(&self, remote_host: Option<&str>, facts: Option<RunFacts>) -> Option<Filing> {
+    /// What files the run's release on `remote_host` in the journal hold, or `None` when the run reached no verdict;
+    /// `cold` files a passing cold run apart from the samples the estimate reads.
+    pub(crate) fn filing(&self, remote_host: Option<&str>, facts: Option<RunFacts>, cold: bool) -> Option<Filing> {
         let facts = facts?;
         Some(Filing {
             root: self.root.clone(),
             key: self.key(remote_host),
             facts,
+            cold,
         })
     }
 
@@ -512,12 +514,14 @@ pub(crate) struct Filing {
     root: PathBuf,
     key: DurationKey,
     facts: RunFacts,
+    /// Whether the run was cold: its builder work tree was one its own preflight laid out.
+    cold: bool,
 }
 
 impl Filing {
     /// Files the release, its line written at `time`: no git, no journal read.
     pub(crate) fn file(&self, time: Timestamp) -> Result<Recorded, StoreError> {
-        record_run(&self.root, &self.key, time, &self.facts)
+        record_run(&self.root, &self.key, time, &self.facts, self.cold)
     }
 }
 

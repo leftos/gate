@@ -1855,7 +1855,7 @@ impl Run<'_> {
         let filing = self
             .durations
             .as_ref()
-            .and_then(|durations| durations.filing(remote.map(|tag| tag.host.as_str()), facts));
+            .and_then(|durations| durations.filing(remote.map(|tag| tag.host.as_str()), facts, self.cold));
         let filed = self
             .journal
             .write_then(&release, remote, console, |time| filing.as_ref().map(|filing| filing.file(time)));

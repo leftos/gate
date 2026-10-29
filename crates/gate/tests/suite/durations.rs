@@ -87,6 +87,11 @@ fn samples(history: &Value) -> &Vec<Value> {
     history["samples"].as_array().expect("a history holds its samples")
 }
 
+/// The cold runs of a key's history.
+fn cold_samples(history: &Value) -> &Vec<Value> {
+    history["cold"].as_array().expect("a history with cold runs holds them")
+}
+
 #[test]
 fn a_gate_says_the_expected_time_when_it_takes_its_slot() {
     let case = Case::new("durations-says");
@@ -213,6 +218,36 @@ fn a_routed_run_keys_remote_host() {
     let keys = keys(&case);
     assert_eq!(keys.len(), 1, "{keys:?}");
     assert!(keys[0].starts_with("remote:builder::") && keys[0].ends_with(" | tool exit 0"), "{keys:?}");
+}
+
+#[test]
+fn a_cold_routed_run_is_filed_apart_from_the_warm_runs() {
+    let case = routed_case("durations-cold");
+    let cold_file = case.folder().join("cold.txt");
+    fs::write(&cold_file, "cold\nstatus 0").expect("the step file can be written");
+    let cold_steps = shown(&cold_file);
+    let cold_words = heavy_words_with_limit("out.log", &["--test-remote-client", &cold_steps], &[r".\tool.exe", "exit", "0"]);
+    let warm_file = case.folder().join("warm.txt");
+    fs::write(&warm_file, "status 0").expect("the step file can be written");
+    let warm_steps = shown(&warm_file);
+    let warm_words = heavy_words_with_limit("out.log", &["--test-remote-client", &warm_steps], &[r".\tool.exe", "exit", "0"]);
+
+    passing(case.gate(&cold_words));
+    for _ in 0..5 {
+        let outcome = passing(case.gate(&warm_words));
+        assert!(!outcome.stderr.contains("gate: expected"), "{outcome:?}");
+    }
+
+    let history = history_ending(&case, " | tool exit 0");
+    assert_eq!(
+        (samples(&history).len(), cold_samples(&history).len()),
+        (5, 1),
+        "the five warm runs are the samples and the cold run goes apart: {history:#}"
+    );
+
+    let sixth = passing(case.gate(&warm_words));
+
+    assert_eq!(said_runs(&sixth.stderr), 5, "the expected time comes from the warm runs alone: {sixth:?}");
 }
 
 #[test]
