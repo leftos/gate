@@ -392,9 +392,9 @@ impl Config {
         &self.host
     }
 
-    /// The builders that may run `repo`'s commands, in the order a command's pick tries them, each with the patterns
-    /// listed for the repo: each routed `builders` entry whose `repos` lists it, in file order, then `host` when `repos`
-    /// does. An entry marked `"routed": false` is never among them.
+    /// The builders that may run `repo`'s commands, in file order, each with the patterns listed for the repo: each
+    /// routed `builders` entry whose `repos` lists it, then `host` when `repos` does. It is the order the pick's scorer
+    /// is fed and breaks its ties by. An entry marked `"routed": false` is never among them.
     pub(crate) fn routes(&self, repo: &str) -> Vec<(&Builder, &[Pattern])> {
         let entries = self
             .entries

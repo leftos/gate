@@ -13,11 +13,13 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use gate_args::{GATE_SET_NAMES, RunRequest, Slot, TestSeams, env_refusal};
+use gate_router::balance::{self, BuilderFigures};
 use gate_router::warm::FileRead;
 use gate_router::windows::{self, WindowsChange};
 use gate_router::{
-    Config, ConfigProblem, CrossTarget, Facts, FolderId, GitignoredInput, Inputs, LaterCandidate, LocalReason, Pattern, PinRefusal, Place, RemoteRun,
-    Route, SiblingFolder, SiblingRoot, Target, decide, dropped_env, dropped_env_line, escaped, is_input_file, is_project_or_solution, repo_name,
+    Builder, Config, ConfigProblem, CrossTarget, Facts, FolderId, GitignoredInput, Inputs, LaterCandidate, LocalReason, Pattern, PinRefusal, Place,
+    RemoteRun, Route, SiblingFolder, SiblingRoot, Target, decide, dropped_env, dropped_env_line, escaped, is_input_file, is_project_or_solution,
+    repo_name,
 };
 use gate_win32::Share;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -1334,6 +1336,11 @@ impl Facts for Machine<'_> {
 
     fn checkout_of(&self, tree: &Path) -> Option<String> {
         checkout_of(tree)
+    }
+
+    /// The same figures for every builder ([`balance::ALIKE`]), so every builder scores alike and file order decides.
+    fn builder_figures(&self, _place: &Place, _words: &[String], builders: &[&Builder]) -> Vec<BuilderFigures> {
+        builders.iter().map(|_| balance::ALIKE).collect()
     }
 }
 

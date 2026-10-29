@@ -3,10 +3,11 @@
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 
+use gate_router::balance::{self, BuilderFigures};
 use gate_router::windows::WindowsChange;
 use gate_router::{
-    CarriedSibling, Config, ConfigProblem, CrossTarget, Facts, FolderId, GitignoredInput, Inputs, Pattern, Place, SiblingFolder, SiblingRoot, Slot,
-    Target,
+    Builder, CarriedSibling, Config, ConfigProblem, CrossTarget, Facts, FolderId, GitignoredInput, Inputs, Pattern, Place, SiblingFolder,
+    SiblingRoot, Slot, Target,
 };
 
 /// The worktree root the fixtures use.
@@ -147,6 +148,10 @@ pub struct FakeFacts {
     pub project_files: Vec<String>,
     /// Whether a build file names a `Configuration` property, which counts only for a command that sets none.
     pub sets_configuration: bool,
+    /// The figures of these builders, by alias; every other builder gets [`balance::ALIKE`], so file order decides.
+    pub figures: Vec<(String, BuilderFigures)>,
+    /// How many times the builders' figures were asked, kept apart from [`FakeFacts::asked`].
+    pub figures_asked: Cell<usize>,
 }
 
 impl FakeFacts {
@@ -196,6 +201,8 @@ impl FakeFacts {
             built_here_asked: Cell::new(0),
             project_files: Vec::new(),
             sets_configuration: false,
+            figures: Vec::new(),
+            figures_asked: Cell::new(0),
         }
     }
 
@@ -214,6 +221,12 @@ impl FakeFacts {
             config: Ok(Some(config)),
             ..Self::at_root()
         }
+    }
+
+    /// These facts with the builder `alias` given `figures`.
+    pub fn with_figures(mut self, alias: &str, figures: BuilderFigures) -> Self {
+        self.figures.push((alias.to_owned(), figures));
+        self
     }
 
     pub fn asked(&self) -> Vec<String> {
@@ -402,6 +415,20 @@ impl Facts for FakeFacts {
             .iter()
             .find(|(folder, _)| folder == tree)
             .map(|(_, checkout)| checkout.clone())
+    }
+
+    /// What [`FakeFacts::figures`] says of each builder, [`balance::ALIKE`] for one it does not name.
+    fn builder_figures(&self, _place: &Place, _words: &[String], builders: &[&Builder]) -> Vec<BuilderFigures> {
+        self.figures_asked.set(self.figures_asked.get() + 1);
+        builders
+            .iter()
+            .map(|builder| {
+                self.figures
+                    .iter()
+                    .find(|(alias, _)| *alias == builder.alias)
+                    .map_or(balance::ALIKE, |(_, figures)| *figures)
+            })
+            .collect()
     }
 }
 

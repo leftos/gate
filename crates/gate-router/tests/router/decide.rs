@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use gate_router::balance::BuilderFigures;
 use gate_router::windows::WindowsChange;
 use gate_router::{
     BuildSettings, BuildTarget, Builder, BuilderOs, CARRIED_INPUT, Config, ConfigProblem, CrossBlocked, CrossTarget, DROPPED_NO_BUILD_LINE,
@@ -3458,6 +3459,158 @@ fn a_single_builder_route_has_no_later_candidates() {
     let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
     assert_eq!(run.builder.alias, "builder-1");
     assert!(run.later.is_empty(), "{:?}", later_aliases(&run));
+}
+
+/// Figures of a builder with `queue_wait` seconds to wait for a slot, its learned `duration` and a work folder held.
+fn figures(queue_wait: f64, duration: Option<f64>) -> BuilderFigures {
+    BuilderFigures {
+        free_slots: u32::from(queue_wait <= 0.0),
+        queue_wait,
+        duration,
+        holds_folder: true,
+    }
+}
+
+/// Two Windows builders, `win-2` then `win-3`, each running every `yaat` command.
+const TWO_WINDOWS: &str = r#"[{"host": "win-2", "os": "windows", "repos": {"yaat": ["*"]}},
+    {"host": "win-3", "os": "windows", "repos": {"yaat": ["*"]}}]"#;
+
+#[test]
+fn a_free_later_builder_is_picked_over_a_full_first_one() {
+    let facts = FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, TWO_WINDOWS))
+        .with_figures("win-2", figures(60.0, None))
+        .with_figures("win-3", figures(0.0, None));
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(run.builder.alias, "win-3", "the free builder starts first");
+    assert_eq!(later_aliases(&run), ["win-2"]);
+}
+
+#[test]
+fn a_faster_later_builder_is_picked() {
+    let facts = FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, TWO_WINDOWS))
+        .with_figures("win-2", figures(0.0, Some(300.0)))
+        .with_figures("win-3", figures(0.0, Some(100.0)));
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(run.builder.alias, "win-3", "the faster builder finishes first");
+}
+
+#[test]
+fn a_steered_off_best_builder_falls_to_the_next_best_score_not_the_next_in_file_order() {
+    let builders = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["dotnet test*"]}},
+        {"host": "win-2", "os": "windows", "repos": {"yaat": ["dotnet test*"]}},
+        {"host": "win-3", "os": "windows", "repos": {"yaat": ["dotnet test*"]}}]"#;
+    let facts = windows_only_facts(r#"{"other": ["*"]}"#, builders, true)
+        .with_figures("mac-1", figures(0.0, Some(60.0)))
+        .with_figures("win-2", figures(120.0, Some(60.0)))
+        .with_figures("win-3", figures(30.0, Some(60.0)));
+    let run = routed(decide(&heavy(&words(&["dotnet", "test", "tests/X"])), &facts));
+    assert_eq!(run.builder.alias, "win-3", "the Windows-only test leaves the Mac for the next best score");
+    assert_eq!(later_aliases(&run), ["mac-1", "win-2"], "the walk goes on in score order");
+}
+
+#[test]
+fn the_later_candidates_follow_the_score_order() {
+    let builders = r#"[{"host": "win-1", "os": "windows", "repos": {"yaat": ["*"]}},
+        {"host": "win-2", "os": "windows", "repos": {"yaat": ["*"]}},
+        {"host": "win-3", "os": "windows", "repos": {"yaat": ["*"]}}]"#;
+    let facts = FakeFacts::with_config(with_builders(r#"{"yaat": ["dotnet *"]}"#, builders))
+        .with_figures("win-1", figures(60.0, None))
+        .with_figures("win-2", figures(30.0, None))
+        .with_figures("win-3", figures(0.0, None));
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(run.builder.alias, "win-3");
+    assert_eq!(
+        later_aliases(&run),
+        ["builder-1", "win-2", "win-1"],
+        "host ties with the pick and comes after it in file order; then the shorter wait first"
+    );
+}
+
+/// A macOS builder `mac-1`, then Windows builders `win-2` and `win-3`, each running `yaat`'s `dotnet` commands, under a
+/// `host` that does not list `yaat`; `mac-1` scores best, `win-3` next and `win-2` last.
+fn mac_best_win_3_next(builders_pattern: &str, windows_only: bool) -> FakeFacts {
+    let builders = format!(
+        r#"[{{"host": "mac-1", "os": "macos", "root": "/m", "repos": {{"yaat": ["{builders_pattern}"]}}}},
+            {{"host": "win-2", "os": "windows", "repos": {{"yaat": ["{builders_pattern}"]}}}},
+            {{"host": "win-3", "os": "windows", "repos": {{"yaat": ["{builders_pattern}"]}}}}]"#
+    );
+    windows_only_facts(r#"{"other": ["*"]}"#, &builders, windows_only)
+        .with_figures("mac-1", figures(0.0, Some(60.0)))
+        .with_figures("win-2", figures(120.0, Some(60.0)))
+        .with_figures("win-3", figures(30.0, Some(60.0)))
+}
+
+#[test]
+fn a_backslash_steered_off_best_builder_falls_to_the_next_best_score_not_the_next_in_file_order() {
+    let facts = mac_best_win_3_next("dotnet *", false);
+    let command = words(&["dotnet", "build", r"src\Duel.sln"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(
+        run.builder.alias, "win-3",
+        "the word the snapshot does not carry leaves the Mac for the next best score"
+    );
+    assert_eq!(run.words, stamped(&["dotnet", "build", r"src\Duel.sln"]));
+    assert_eq!(later_aliases(&run), ["mac-1", "win-2"]);
+    assert_eq!(facts.figures_asked.get(), 1, "the steer-off walks the one order");
+}
+
+#[test]
+fn a_routed_run_with_two_capable_builders_asks_their_figures_once() {
+    let facts = FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, TWO_WINDOWS));
+    routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(facts.figures_asked.get(), 1);
+
+    let facts = mac_best_win_3_next("dotnet test*", true);
+    let run = routed(decide(&heavy(&words(&["dotnet", "test", "tests/X"])), &facts));
+    assert_eq!(run.builder.alias, "win-3");
+    assert_eq!(facts.figures_asked.get(), 1, "the Windows-only steer-off walks the one order");
+}
+
+#[test]
+fn a_single_capable_builder_is_not_scored() {
+    let facts = FakeFacts::with_config(routing_all());
+    assert_eq!(routed(decide(&heavy(&words(&["dotnet", "build"])), &facts)).builder.alias, "builder-1");
+    assert_eq!(facts.figures_asked.get(), 0);
+}
+
+#[test]
+fn a_command_no_builder_s_pattern_matches_asks_no_figures() {
+    let builders = r#"[{"host": "win-2", "os": "windows", "repos": {"yaat": ["cargo *"]}},
+        {"host": "win-3", "os": "windows", "repos": {"yaat": ["cargo *"]}}]"#;
+    let facts = FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, builders));
+    assert_eq!(decide(&heavy(&words(&["dotnet", "build"])), &facts), SILENT);
+    assert_eq!(facts.figures_asked.get(), 0);
+}
+
+#[test]
+fn a_run_the_local_file_keeps_here_asks_no_figures() {
+    let facts = FakeFacts {
+        local: Ok(patterns(&["dotnet build*"])),
+        ..FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, TWO_WINDOWS))
+    };
+    let route = decide(&heavy(&words(&["dotnet", "build"])), &facts);
+    assert!(
+        matches!(
+            &route,
+            Route::Local {
+                reason: Some(LocalReason::DeclaredLocal { .. })
+            }
+        ),
+        "{:?}",
+        local_line(&route)
+    );
+    assert_eq!(facts.figures_asked.get(), 0);
+}
+
+#[test]
+fn a_run_pinned_with_builder_asks_no_figures() {
+    let facts = FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, TWO_WINDOWS))
+        .with_figures("win-2", figures(60.0, None))
+        .with_figures("win-3", figures(0.0, None));
+    let command = words(&["dotnet", "build"]);
+    let run = routed(decide(&pinned_to(&command, "win-2"), &facts));
+    assert_eq!(run.builder.alias, "win-2", "the pin is not scored");
+    assert_eq!(facts.figures_asked.get(), 0);
 }
 
 #[test]

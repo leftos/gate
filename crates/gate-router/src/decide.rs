@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use crate::balance::{self, BuilderFigures};
 use crate::config::{Builder, BuilderOs, CARGO_OUTPUTS, Config, ConfigProblem, DEFAULT_OUTPUTS, ignored_line};
 use crate::escape::escaped;
 use crate::key::{is_layout_name, repo_name, work_folder_key};
@@ -429,6 +430,13 @@ pub trait Facts {
     /// parent of its common git folder, read from its `.git` alone with no git started; `None` when it cannot be read.
     /// Asked only of a tree [`Facts::worktree_of`] found that is not the run's own.
     fn checkout_of(&self, tree: &Path) -> Option<String>;
+
+    /// What the PC knows of each of `builders` for the command `words`, rewritten for Windows, of the worktree at
+    /// `place` ([`BuilderFigures`]): one entry per builder, in the order given, which [`balance::order`] scores. Asked
+    /// once per decision, with every builder one of whose own patterns matches the command, of a matched command whose
+    /// worktree opened and that its `.gate/local.toml` does not keep here, only when two or more builders match; never
+    /// asked of a run pinned with `--builder`.
+    fn builder_figures(&self, place: &Place, words: &[String], builders: &[&Builder]) -> Vec<BuilderFigures>;
 }
 
 /// The id of an open folder: its volume's serial number and its 128-bit file id. Two handles give one id only when they
@@ -662,8 +670,9 @@ fn not_allowed_reason(names: &[String], problem: Option<&str>) -> String {
     reason = "each flag is an independent fact of the route that a caller reads by name; no two form a state machine"
 )]
 pub struct RemoteRun {
-    /// The builder this run goes to: the command's pick, the first `builders` entry listing the repo, in file order,
-    /// with a pattern that matches, else `host`.
+    /// The builder this run goes to: the command's pick, the first builder listing the repo with a pattern that matches
+    /// (each `builders` entry, then `host`), in score order ([`balance::order`]), a held work folder and then file
+    /// order breaking ties.
     pub builder: Builder,
     /// The worktree root as git gives it.
     pub root: String,
@@ -723,10 +732,11 @@ pub struct RemoteRun {
     /// `SourceRevisionId` variable so any build there is pinned to it; `None` when the branch is unborn or git cannot
     /// read it.
     pub source_revision: Option<String>,
-    /// The builders the run may try next when it falls back, in the order it would try them, from the config alone:
-    /// each `builders` entry listing the repo, in file order, then `host`, minus the builder this run goes to, each
-    /// one a pattern of whose own list the command matched, held by its alias alone. A caller that falls back builds a
-    /// candidate's run when it tries it ([`later_run`]); nothing is built here.
+    /// The builders the run may try next when it falls back, in the order it would try them: each `builders` entry
+    /// listing the repo, then `host`, in score order ([`balance::order`]), a held work folder and then file order
+    /// breaking ties, minus the builder this run goes to, each one a pattern of whose own list the command matched, held
+    /// by its alias alone. A caller that falls back builds a candidate's run when it tries it ([`later_run`]); nothing is
+    /// built here.
     pub later: Vec<LaterCandidate>,
     /// The cross build the macOS builder runs after the passing command, so its outputs come back built for Windows:
     /// set only for a direct `dotnet build`, or `dotnet test` without `--no-build`, of a repo the builder's entry
@@ -1460,12 +1470,17 @@ fn file_stem(path: &str) -> &str {
 fn matched(config: &Config, git_hook: bool, words: &[String], facts: &dyn Facts) -> Result<Matched, Here> {
     let (opened, drives, sent) =
         opened_and_sent(config, git_hook, words, facts, |repo| config.is_routed(repo)).map_err(|unopened| unopened.here(git_hook))?;
-    let first = pick(config, &opened.repo, &sent.words, |_| true).ok_or(None)?;
+    let matching = matching(config, &opened.repo, &sent.words);
+    if matching.is_empty() {
+        return Err(None);
+    }
     check_local(&opened.place, &sent.words, facts)?;
-    let (builder, pattern, found) = steer_off_macos(config, &opened, &sent.words, facts, first)?;
+    let order = scored(matching, &opened.place, &sent.words, facts);
+    let first = pick(&order, |_| true).ok_or(None)?;
+    let (builder, pattern, found) = steer_off_macos((config, &order), &opened, &sent.words, facts, first)?;
     let unix = slashed(&builder, &opened, words, &drives, facts);
-    let (builder, pattern, unix) = steer_off_backslashes(config, &opened, &sent.words, (builder, pattern, unix))?;
-    let later = later_candidates(config, &opened.repo, &builder, &sent.words);
+    let (builder, pattern, unix) = steer_off_backslashes(&order, (builder, pattern, unix))?;
+    let later = later_candidates(&order, &builder);
     let kept = Kept {
         builder,
         pattern,
@@ -1899,7 +1914,7 @@ fn pinned(inputs: &Inputs<'_>, host: &str, facts: &dyn Facts) -> Result<RemoteRu
     opened.built_here = BuiltHere::default();
     let pattern = match config.own_patterns(&builder, &opened.repo) {
         Some(patterns) => first_match(patterns, &sent.words),
-        None => pick(&config, &opened.repo, &sent.words, |_| true).map(|(_, pattern)| pattern),
+        None => pick(&matching(&config, &opened.repo, &sent.words), |_| true).map(|(_, pattern)| pattern),
     };
     let pattern = pattern.ok_or_else(|| PinRefusal::NotRouted {
         host: host.to_owned(),
@@ -1988,14 +2003,12 @@ fn kept_here(here: Here) -> String {
     here.map_or_else(|| "the routing decision would now run it here".to_owned(), |reason| reason.reason())
 }
 
-/// The builders `repo`'s run may try next after the `chosen` one, in the order it would try them: [`Config::routes`]
-/// order, minus the chosen builder, each with one of its own patterns that matches the `sent` words. The config alone
-/// decides them; no fact is asked.
-fn later_candidates(config: &Config, repo: &str, chosen: &Builder, sent: &[String]) -> Vec<LaterCandidate> {
-    config
-        .routes(repo)
-        .into_iter()
-        .filter(|(builder, patterns)| *builder != chosen && first_match(patterns, sent).is_some())
+/// The builders the run may try next after the `chosen` one, in the order it would try them: the decision's score
+/// `order` ([`scored`]), ties broken as [`balance::order`] breaks them, minus the chosen builder. No fact is asked.
+fn later_candidates(order: &[(Builder, String)], chosen: &Builder) -> Vec<LaterCandidate> {
+    order
+        .iter()
+        .filter(|(builder, _)| builder != chosen)
         .map(|(builder, _)| LaterCandidate {
             alias: builder.alias.clone(),
         })
@@ -2021,21 +2034,16 @@ enum Slashed {
 }
 
 /// The pick `chosen` of the opened worktree's command, with what a macOS pick runs ([`unix_words`]): kept, with its
-/// Unix words, unless they could not be had; then the pick goes on, silently, to the next builder that is no macOS one,
-/// which runs the `sent` words, as [`steer_off_macos`] does. A pick of another builder carries no Unix words and is kept
-/// as it is. `Err(None)` when no other builder's pattern matches.
-fn steer_off_backslashes(
-    config: &Config,
-    opened: &Opened,
-    sent: &[String],
-    chosen: (Builder, String, Slashed),
-) -> Result<(Builder, String, Option<Vec<String>>), Here> {
+/// Unix words, unless they could not be had; then the pick goes on, silently, to the next builder of the score `order`
+/// that is no macOS one, which runs the words as sent, as [`steer_off_macos`] does. A pick of another builder carries no
+/// Unix words and is kept as it is. `Err(None)` when no other builder's pattern matches.
+fn steer_off_backslashes(order: &[(Builder, String)], chosen: (Builder, String, Slashed)) -> Result<(Builder, String, Option<Vec<String>>), Here> {
     let (builder, pattern, unix) = chosen;
     match unix {
         Slashed::NotMacos => Ok((builder, pattern, None)),
         Slashed::Unix(unix) => Ok((builder, pattern, Some(unix))),
         Slashed::Backslash => {
-            let (builder, pattern) = pick(config, &opened.repo, sent, |other| other.os != BuilderOs::Macos).ok_or(None)?;
+            let (builder, pattern) = pick(order, |other| other.os != BuilderOs::Macos).ok_or(None)?;
             Ok((builder, pattern, None))
         }
     }
@@ -2223,11 +2231,12 @@ fn desktop_pattern(place: &Place, words: &[String], facts: &dyn Facts) -> Result
 /// pattern matches the command ([`desktop_pattern`]), as a macOS builder has no desktop to run it on, or the command is
 /// a `dotnet test` of a Windows-only test project ([`macos_windows_only`]), or the change touches the paths of the
 /// worktree's `.gate/windows.toml` or cannot be told to ([`macos_windows_change`]), or the last build of a dotnet
-/// `test` or `run --no-build` ran here ([`macos_built_here`]): the pick then goes on to the next builder that is no
-/// macOS one. Also what it read of the desktop file; `Err(None)` when no other builder's pattern matches, but for a run
-/// whose last build ran here, which runs here keeping its word ([`LocalReason::BuiltHere`]).
+/// `test` or `run --no-build` ran here ([`macos_built_here`]): the pick then goes on to the next builder of the
+/// decision's score `order` that is no macOS one. Also what it read of the desktop file; `Err(None)` when no other
+/// builder's pattern matches, but for a run whose last build ran here, which runs here keeping its word
+/// ([`LocalReason::BuiltHere`]).
 fn steer_off_macos(
-    config: &Config,
+    (config, order): (&Config, &[(Builder, String)]),
     opened: &Opened,
     words: &[String],
     facts: &dyn Facts,
@@ -2241,7 +2250,7 @@ fn steer_off_macos(
         Unkept::BuiltHere(project) => Some(LocalReason::BuiltHere { project }),
         _ => None,
     };
-    let (builder, pattern) = pick(config, &opened.repo, words, |builder| builder.os != BuilderOs::Macos).ok_or(unpicked)?;
+    let (builder, pattern) = pick(order, |builder| builder.os != BuilderOs::Macos).ok_or(unpicked)?;
     Ok((builder, pattern, read))
 }
 
@@ -2516,14 +2525,40 @@ fn rewritten<'s>(
     rewrite_named(&rewrite_place, words, drives, siblings, separators)
 }
 
-/// The builder that runs `repo`'s command `words`, rewritten for Windows, and the pattern that chose it: the first of
-/// [`Config::routes`] that `eligible` lets run it with a pattern that matches, the first such pattern of its list.
-fn pick(config: &Config, repo: &str, words: &[String], eligible: impl Fn(&Builder) -> bool) -> Option<(Builder, String)> {
+/// The builders of [`Config::routes`] one of whose own patterns matches `repo`'s command `words`, rewritten for Windows,
+/// in file order, then `host`, each with the first such pattern of its list.
+fn matching(config: &Config, repo: &str, words: &[String]) -> Vec<(Builder, String)> {
     config
         .routes(repo)
         .into_iter()
-        .filter(|(builder, _)| eligible(builder))
-        .find_map(|(builder, patterns)| first_match(patterns, words).map(|pattern| (builder.clone(), pattern)))
+        .filter_map(|(builder, patterns)| first_match(patterns, words).map(|pattern| (builder.clone(), pattern)))
+        .collect()
+}
+
+/// The `matching` builders of the command `words` of the worktree at `place`, best first: ordered by the figures the
+/// facts give for them ([`Facts::builder_figures`], asked once) as [`balance::order`] scores them. Fewer than two are
+/// not scored, and nothing is asked; they keep their file order.
+///
+/// # Panics
+///
+/// When the facts give a figure count other than one per builder, which breaks [`Facts::builder_figures`]'s contract.
+fn scored(matching: Vec<(Builder, String)>, place: &Place, words: &[String], facts: &dyn Facts) -> Vec<(Builder, String)> {
+    if matching.len() < 2 {
+        return matching;
+    }
+    let order = {
+        let builders: Vec<&Builder> = matching.iter().map(|(builder, _)| builder).collect();
+        let figures = facts.builder_figures(place, words, &builders);
+        assert_eq!(figures.len(), builders.len(), "the facts give one figure per builder");
+        balance::order(&figures)
+    };
+    let mut unplaced: Vec<Option<(Builder, String)>> = matching.into_iter().map(Some).collect();
+    order.into_iter().filter_map(|at| unplaced[at].take()).collect()
+}
+
+/// The builder that runs the command and the pattern that chose it: the first of `order` that `eligible` lets run it.
+fn pick(order: &[(Builder, String)], eligible: impl Fn(&Builder) -> bool) -> Option<(Builder, String)> {
+    order.iter().find(|(builder, _)| eligible(builder)).cloned()
 }
 
 /// The present declared siblings as the rewrite reads them: each declared name and its root, borrowed.

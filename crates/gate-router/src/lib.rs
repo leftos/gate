@@ -8,12 +8,14 @@
 //! declaration ([`desktop`]). It holds too the caller's
 //! environment a routed run does not send ([`dropped_env`]) and the repo's declaration of the prefixes its commands
 //! read ([`env`]), of the commands that stay on this PC ([`local`]) and of the paths whose change keeps a run off a
-//! macOS builder ([`windows`]).
+//! macOS builder ([`windows`]). The order a run tries the builders able to run it in is the earliest expected finish
+//! first ([`balance`]).
 //!
 //! The crate is pure: it reads no file, runs no git or other process and reads no environment or clock. The decision
 //! asks the caller for each fact it needs through [`Facts`], and only at the rule that needs it, so it builds and tests
 //! everywhere.
 
+pub mod balance;
 mod config;
 mod decide;
 pub mod desktop;
