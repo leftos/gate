@@ -15,9 +15,10 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::remote_client::{
-    CLIENT_IGNORED, Tuned, client_case, client_gate, client_gate_tuned, fallbacks, pair_case, sibling_repository, work_folder, write,
+    CLIENT_IGNORED, HOST, SENT_TEST, Tuned, client_case, client_gate, client_gate_tuned, dotnet_gate, fallbacks, pair_case, sent_build_case,
+    sibling_repository, work_folder, write,
 };
-use crate::support::{Case, Go, Outcome, beside, calls, events, finish, log_texts, shown, ssh_steps, start, write_remote_json};
+use crate::support::{Case, Go, Outcome, assert_in_order, beside, calls, events, finish, log_texts, shown, ssh_steps, start, write_remote_json};
 
 /// The case's one input, `/`-separated as its glob matches it, and as the builder's work folder holds it.
 const INPUT: &str = "secrets/keys.json";
@@ -126,6 +127,49 @@ fn an_unchanged_input_is_not_sent_again() {
     assert!(has_line(&log_of(&case, "second.log"), UNCHANGED), "{outcome:?}");
     assert!(!outcome.stderr.contains(UNCHANGED), "the line is the log's alone: {outcome:?}");
     assert!(!sent_line().is_match(&outcome.stderr), "{outcome:?}");
+}
+
+/// A put of the inputs says it as it starts, naming the builder, before the end line that counts the same files.
+#[test]
+fn a_routed_run_that_sends_inputs_says_the_put_as_it_starts_with_its_file_count() {
+    let case = inputs_case("client-inputs-says-the-put");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &RAN));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said = &outcome.stderr;
+    let start = said
+        .lines()
+        .find(|line| line.starts_with(&format!("gate: sending inputs to {HOST}: ")))
+        .expect("the put said its start");
+    assert_eq!(start, format!("gate: sending inputs to {HOST}: 1 file(s)"));
+    let end = said
+        .lines()
+        .find(|line| line.starts_with("gate: inputs: 1 file(s), "))
+        .expect("the put said its end");
+    assert_in_order(said, &[start, end]);
+    assert_eq!(on_builder(&case).as_deref(), Some("one"));
+}
+
+/// A put of the PC's build says it as it starts, in the build's own form and with the count its end line reports.
+#[test]
+fn a_routed_run_that_sends_the_pc_s_build_says_the_put_as_it_starts() {
+    let case = sent_build_case("client-sent-build-says-the-put", None);
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(dotnet_gate(&case, "out.log", &steps, &SENT_TEST));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said = &outcome.stderr;
+    let started = Regex::new(&format!(r"gate: sending the PC's build to {HOST}: (\d+) file\(s\)")).expect("the pattern is valid");
+    let start = said.lines().find(|line| started.is_match(line)).expect("the put said its start");
+    let count = started.captures(start).expect("the line matched").get(1).expect("the count").as_str();
+    let end = said
+        .lines()
+        .find(|line| line.starts_with(&format!("gate: sent build: {count} file(s), ")))
+        .expect("the end line counts the same files");
+    assert_in_order(said, &[start, end]);
 }
 
 /// The command naming the gitignored probe project, which its repo declares no input glob for.
@@ -343,6 +387,7 @@ fn a_run_with_no_inputs_after_a_carried_run_deletes_the_carried_copies() {
     assert_eq!(calls(&third), ["preflight", "run"], "no inputs step once no copy is left: {again:?}");
     let said = log_of(&case, "third.log");
     assert!(!said.contains("gate: inputs:"), "{said}");
+    assert!(!said.contains("gate: sending inputs"), "a run that sends nothing says no put: {said}");
 }
 
 #[test]

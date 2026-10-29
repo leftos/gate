@@ -756,7 +756,7 @@ pub(super) fn send(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &s
 }
 
 /// The diff, then the put of what it needs ([`send`]), the worktree's `.tmp` held from before the diff's answer is made
-/// until the put has ended.
+/// until the put has ended. Says the put as it starts, with the objects it sends, once the diff says there are any.
 fn sent_to(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, sending: &Sending) -> Result<(), Unsent> {
     let root = Path::new(attempt.call.root);
     let folder = root.join(TMP);
@@ -776,6 +776,12 @@ fn sent_to(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, send
             attempt.lfs_budget
         )));
     }
+    // Said as the pack begins, once the diff says there is something to send: a run that sends nothing says nothing new.
+    attempt.say(format!(
+        "gate: sending lfs objects to {}: {} object(s)",
+        attempt.call.host(),
+        needed.len()
+    ));
     let started = Instant::now();
     let alone = Bounded {
         root,

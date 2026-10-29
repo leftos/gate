@@ -1567,6 +1567,11 @@ struct RunEnd {
     last_error: Option<String>,
 }
 
+/// The eight hex digits of `commit` a push's lines name its snapshot by.
+fn short_commit(commit: &str) -> &str {
+    commit.get(..8).unwrap_or(commit)
+}
+
 impl Attempt<'_, '_> {
     /// The profile of the call's builder over the transport ([`super::transport::Transport::profile`]).
     pub(super) fn profile(&self) -> Profile {
@@ -2307,9 +2312,15 @@ impl Attempt<'_, '_> {
     /// The preflight: readies the work folder, asks the builder to probe the tools of `needs`, and checks the builder
     /// runs this gate's version. Whether it created the bare repository just now, the builder's boot time, its SDKs and
     /// what it said of each tool sent. A builder with no `gate box` that takes the run is not routed, as one of another
-    /// version is not.
+    /// version is not. Says its start, and once it passed how long it took across every attempt; a refused one says its
+    /// refusal alone, and no end line. A log-only call, the drain's and the slot wait's poll, says neither line.
     fn preflight(&mut self, location: &Location, needs: &[(String, String)]) -> Result<Prepared, End> {
         self.go_on()?;
+        let said = !self.log_only;
+        if said {
+            self.say(format!("gate: preflighting {}", self.call.host()));
+        }
+        let started = Instant::now();
         let nonce: Arc<str> = Arc::from(payload::run_nonce());
         let input = payload::input(&payload::preflight_word(location, needs, &nonce), None);
         let sent: Vec<String> = needs.iter().map(|(name, _)| name.clone()).collect();
@@ -2347,6 +2358,13 @@ impl Attempt<'_, '_> {
                 self.say(line);
             }
             return Err(end);
+        }
+        if said {
+            self.say(format!(
+                "gate: preflighted {} in {:.1} s",
+                self.call.host(),
+                started.elapsed().as_secs_f64()
+            ));
         }
         Ok(Prepared {
             created,
@@ -2798,8 +2816,9 @@ impl Attempt<'_, '_> {
 
     /// Pushes one repository's snapshot, and its bridge unless its bare repository was created just now, with no hooks
     /// and no submodules, then saves the local ref and says the push: `gate: pushed snapshot …` for a run of one
-    /// repository, `gate: remote pushed snapshot {name} …` for each of a pair's. A push that fails is `unreachable`; a
-    /// sibling's save that fails keeps the run here naming it, the main one's ends the run.
+    /// repository, `gate: remote pushed snapshot {name} …` for each of a pair's. The run's first push says it as it
+    /// starts, `gate: pushing snapshot {8} to {host}`, or `gate: pushing snapshots to {host}` for a pair's. A push that
+    /// fails is `unreachable`; a sibling's save that fails keeps the run here naming it, the main one's ends the run.
     fn push(&mut self, push: &Push<'_>, watch: Watch) -> Result<(), End> {
         self.go_on()?;
         let Push { at, repo, snapshot, created } = *push;
@@ -2829,6 +2848,15 @@ impl Attempt<'_, '_> {
         let ssh_command = target.ssh_command.as_deref().map(|ssh| ("GIT_SSH_COMMAND", std::ffi::OsStr::new(ssh)));
         let allowed = ("GIT_ALLOW_PROTOCOL", std::ffi::OsStr::new(protocol));
         let set: Vec<(&str, &std::ffi::OsStr)> = ssh_command.into_iter().chain([allowed]).chain(variables.iter().copied()).collect();
+        // Said once, before the run's first push call: a pair's two pushes say one line between them.
+        if at == 0 {
+            let line = if pair {
+                format!("gate: pushing snapshots to {}", self.call.host())
+            } else {
+                format!("gate: pushing snapshot {} to {}", short_commit(&snapshot.commit), self.call.host())
+            };
+            self.say(line);
+        }
         let (mut called, _) = self.with_retry(GIT_SSH_FAILED, |attempt| {
             attempt.git_started(git.command(root), &args, &set, Echo::Progress, watch)
         })?;
@@ -2859,7 +2887,7 @@ impl Attempt<'_, '_> {
     /// says the push.
     fn pushed(&mut self, repo: &Repo, commit: &str, size: &str, took: Duration) {
         self.split.push += took;
-        let short = commit.get(..8).unwrap_or(commit);
+        let short = short_commit(commit);
         let line = if self.call.siblings.is_empty() {
             format!("gate: pushed snapshot {short} in {} s ({size})", seconds(took))
         } else {

@@ -34,7 +34,7 @@ use crate::support::{
     write_remote_json,
 };
 
-const HOST: &str = "builder";
+pub(super) const HOST: &str = "builder";
 /// How a run of the seam says its commits: `gate: remote snapshot <commit> bridge <commit or none>`.
 const SAID: &str = "gate: remote snapshot ";
 /// What no snapshot sends: the gate's state root, LOCALAPPDATA and logs, the tool, the holder's step and go files,
@@ -484,7 +484,7 @@ const PC_SDKS_ANSWERING: [&str; 2] = ["--test-dotnet-limit-ms", "3600000"];
 
 /// [`client_gate`] for a case whose tree is a .NET one with no SDK pin, so the run reads this PC's SDK list: with
 /// [`PC_SDKS_ANSWERING`].
-fn dotnet_gate(case: &Case, log: &str, steps: &Path, command: &[&str]) -> Command {
+pub(super) fn dotnet_gate(case: &Case, log: &str, steps: &Path, command: &[&str]) -> Command {
     let tuned = Tuned {
         extra: &PC_SDKS_ANSWERING,
         ..Tuned::default()
@@ -2159,6 +2159,192 @@ fn a_builder_without_a_usable_gate_box_is_not_routed() {
         assert_eq!(fallbacks(&events(&case)), ["version"], "{name}");
         assert!(!case.folder().join("builder").exists(), "{name}: nothing reached the builder");
     }
+}
+
+/// A routed run says its preflight as it starts and, once it passed, how long it took, both before its snapshot push.
+#[test]
+fn a_routed_run_says_its_preflight_as_it_starts_and_its_duration_when_it_passed() {
+    let case = inputs_case("client-preflight-said");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said = out_log(&case);
+    let started = format!("gate: preflighting {HOST}");
+    let ended = format!("gate: preflighted {HOST} in ");
+    assert!(said.lines().any(|line| line == started), "{said}");
+    let took = said
+        .lines()
+        .find(|line| line.starts_with(&ended))
+        .expect("the preflight said how long it took");
+    assert!(
+        Regex::new(&format!(r"^gate: preflighted {HOST} in \d+\.\d s$"))
+            .expect("the pattern is valid")
+            .is_match(took),
+        "{took}"
+    );
+    assert_in_order(&said, &[&started, &ended, "gate: pushing snapshot "]);
+}
+
+/// A refused preflight says its start and no end line: the refusal it says is the whole of what it says.
+#[test]
+fn a_refused_preflight_says_its_start_and_no_preflighted_line() {
+    let case = client_case("client-preflight-refused-said");
+    let steps = ssh_steps(&case, "ssh", &["exit 9009"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said = out_log(&case);
+    assert!(said.lines().any(|line| line == format!("gate: preflighting {HOST}")), "{said}");
+    assert!(!said.contains(&format!("gate: preflighted {HOST}")), "{said}");
+    assert!(said.contains("(preflight status 9009)"), "the refusal as before: {said}");
+}
+
+/// A routed run says its snapshot push as it starts, once, naming the snapshot its end line names, before that line.
+#[test]
+fn a_routed_run_says_its_snapshot_push_as_it_starts_once_before_the_pushed_line() {
+    let case = inputs_case("client-push-said");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said = out_log(&case);
+    let short = pushed_snapshot(&case, "out.log");
+    let starts: Vec<&str> = said.lines().filter(|line| line.starts_with("gate: pushing snapshot ")).collect();
+    let start = format!("gate: pushing snapshot {short} to {HOST}");
+    assert_eq!(starts.len(), 1, "one start line for the run's push: {said}");
+    assert_eq!(starts[0], start);
+    assert_in_order(&said, &[&start, "gate: pushed snapshot "]);
+}
+
+/// The drain's polls are log-only calls: they say no preflight line. Each of the run's own attempts says its own once,
+/// and an attempt the drain refuses says its start and its refusal alone, with no end line.
+#[test]
+fn a_run_waiting_behind_the_drain_says_each_attempt_s_preflight_once_and_no_poll_s() {
+    let case = client_case("client-drain-preflight-once");
+    builder_drain(&case, "raise");
+    let steps = ssh_steps(&case, "ssh", &POLLS);
+    let running = start(drain_gate(&case, "out.log", &steps));
+
+    running.wait_for_stderr(DRAIN_WAITING);
+    builder_drain(&case, "lift");
+    let outcome = running.finish();
+
+    assert_waited_then_ran(&case, &outcome, &steps);
+    let said = out_log(&case);
+    let start = format!("gate: preflighting {HOST}");
+    assert_eq!(
+        said.lines().filter(|line| *line == start).count(),
+        2,
+        "an attempt each, the polls saying none: {said}"
+    );
+    let ended = format!("gate: preflighted {HOST} in ");
+    let ends: Vec<&str> = said.lines().filter(|line| line.starts_with(&ended)).collect();
+    assert_eq!(ends.len(), 1, "the refused attempt says no end line, the admitted one does: {said}");
+    assert_in_order(&said, &[&start, &start, ends[0]]);
+}
+
+/// A pair's two pushes say one start line between them, before either end line.
+#[test]
+fn a_pair_run_says_its_snapshot_push_once_before_both_pushed_lines() {
+    let (case, _leaf, _name, sibling) = pair_case("client-pair-push-said", &[], sibling_repository);
+    let steps = ssh_steps(&case, "ssh", &["ok"; 2]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran"]));
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said = out_log(&case);
+    let starts: Vec<&str> = said.lines().filter(|line| line.starts_with("gate: pushing snapshots to ")).collect();
+    assert_eq!(
+        starts,
+        vec![format!("gate: pushing snapshots to {HOST}")],
+        "one start line for the pair: {said}"
+    );
+    let pushed: Vec<&str> = said.lines().filter(|line| line.starts_with("gate: remote pushed snapshot ")).collect();
+    assert_eq!(pushed.len(), 2, "one end line a repo: {said}");
+    assert_in_order(&said, &[starts[0], pushed[0], pushed[1]]);
+}
+
+/// A preflight retried before the banner says its start and its end once: the retry repeats the call, not the lines.
+#[test]
+fn a_preflight_retried_before_the_banner_says_its_lines_once() {
+    let case = client_case("client-preflight-retry-said-once");
+    let steps = ssh_steps(&case, "ssh", &["fail-banner", "ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 1, "the preflight was retried: {outcome:?}");
+    let said = out_log(&case);
+    let start = format!("gate: preflighting {HOST}");
+    assert_eq!(said.lines().filter(|line| *line == start).count(), 1, "{said}");
+    let ended = said
+        .lines()
+        .filter(|line| line.starts_with(&format!("gate: preflighted {HOST} in ")))
+        .count();
+    assert_eq!(ended, 1, "{said}");
+    // The start line is said before the retry, so it cannot be a line the retried call said.
+    assert_in_order(&said, &[&start, RETRY_LINE, "gate: remote version"]);
+}
+
+/// A push retried before the banner says its start once, and its end once.
+#[test]
+fn a_push_retried_before_the_banner_says_its_start_once() {
+    let case = client_case("client-push-retry-said-once");
+    let steps = ssh_steps(&case, "ssh", &["ok", "fail-banner", "ok", "ok", "ok", "ok", "ok", "ok"]);
+
+    let outcome = finish(client_gate_through(
+        &case,
+        "local-ssh",
+        "out.log",
+        &steps,
+        &[r".\tool.exe", "out", "ran there"],
+    ));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 1, "the push was retried: {outcome:?}");
+    let said = out_log(&case);
+    let starts: Vec<&str> = said.lines().filter(|line| line.starts_with("gate: pushing snapshot ")).collect();
+    assert_eq!(starts.len(), 1, "{said}");
+    let pushed = said.lines().filter(|line| line.starts_with("gate: pushed snapshot ")).count();
+    assert_eq!(pushed, 1, "{said}");
+    // The start line is said before the retry, so it cannot be a line the retried push said.
+    assert_in_order(&said, &[starts[0], RETRY_LINE, "gate: pushed snapshot "]);
+}
+
+/// A run handed on to a second builder says each builder's own lines: each once, and the push of the one that pushed.
+#[test]
+fn a_run_handed_to_the_next_builder_says_each_builder_s_lines_once() {
+    let case = next_builder_case("client-next-builder-start-lines");
+    let (first_on, host_on) = (format!("on {FIRST_BUILDER}"), format!("on {HOST}"));
+    let steps = ssh_steps(&case, "ssh", &[&first_on, "version 0.0.0-other", &host_on, "ok", "ok"]);
+    let folders = map_folders(&case);
+    let tuned = Tuned {
+        folders: Some(&folders),
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said = out_log(&case);
+    let count = |needle: &str| said.lines().filter(|line| *line == needle).count();
+    assert_eq!(count(&format!("gate: preflighting {FIRST_BUILDER}")), 1, "{said}");
+    assert_eq!(count(&format!("gate: preflighting {HOST}")), 1, "{said}");
+    let refused = format!("gate: preflighted {FIRST_BUILDER}");
+    assert!(!said.contains(&refused), "the first builder refused, so it said no end line: {said}");
+    let preflighted = format!("gate: preflighted {HOST} in ");
+    assert_eq!(said.lines().filter(|line| line.starts_with(&preflighted)).count(), 1, "{said}");
+    let started: Vec<&str> = said.lines().filter(|line| line.starts_with("gate: pushing snapshot ")).collect();
+    assert_eq!(started.len(), 1, "the push said once, by the builder that pushed: {said}");
+    assert_eq!(
+        started[0],
+        format!("gate: pushing snapshot {} to {HOST}", pushed_snapshot(&case, "out.log"))
+    );
 }
 
 /// A preflight that ended with a shell's status after the box said its own `gate: remote … failed (status …)` line on
@@ -9903,7 +10089,7 @@ fn a_routed_run_of_any_godot_or_no_pin_sends_no_version() {
 
 /// The routed `dotnet test --no-build` of the send cases: the stand-in dotnet prints its words after `argv`, so a case
 /// sees whether the builder kept `--no-build`.
-const SENT_TEST: [&str; 7] = [r".\dotnet.exe", "test", "argv", "App.csproj", "-c", "Release", "--no-build"];
+pub(super) const SENT_TEST: [&str; 7] = [r".\dotnet.exe", "test", "argv", "App.csproj", "-c", "Release", "--no-build"];
 /// The PC's build of the send cases' one project, below the worktree root.
 const SENT_DLL: &str = r"bin\Release\App.dll";
 /// The log line of a send that did not land, before its reason.
@@ -9923,7 +10109,7 @@ fn sent_routing(case: &Case, listed: bool) {
 /// An [`outputs_case`] bringing back `**/bin/**` whose repo `sendBuild` lists, whose project `App.csproj` at the root the
 /// PC built in Release: its `bin\Release` and the two restore files of its `obj` folder, but the one named `missing`,
 /// both folders ignored by git.
-fn sent_build_case(name: &str, missing: Option<&str>) -> Case {
+pub(super) fn sent_build_case(name: &str, missing: Option<&str>) -> Case {
     let case = outputs_case(name, &BIN);
     sent_routing(&case, true);
     copy_tool(&case, "dotnet.exe");

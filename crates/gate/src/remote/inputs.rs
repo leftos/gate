@@ -680,6 +680,14 @@ impl<'k> Kind<'k> {
         }
     }
 
+    /// What a line saying the put as it starts calls it.
+    fn sent_what(self) -> &'static str {
+        match self {
+            Kind::Inputs => "inputs",
+            Kind::Build(_) => "the PC's build",
+        }
+    }
+
     /// The name of its files in `.tmp`, after `{key}-{nonce}.`: its diff answer `{name}-diff` and its archive
     /// `{name}.tar.zst`.
     pub(crate) fn file(self) -> &'static str {
@@ -714,7 +722,7 @@ struct Request<'r> {
 }
 
 /// The diff, then the put of what it needs ([`send`]), the worktree's `.tmp` held from before the diff's answer is
-/// made until the put has ended.
+/// made until the put has ended. Says the put as it starts, with the files it sends, once the diff says there are any.
 fn sent_to(attempt: &mut Attempt<'_, '_>, request: &Request<'_>, built: &Built) -> Result<(), Unsent> {
     let (nonce, kind) = (request.nonce, request.kind);
     let root = Path::new(attempt.call.root);
@@ -738,6 +746,13 @@ fn sent_to(attempt: &mut Attempt<'_, '_>, request: &Request<'_>, built: &Built) 
             attempt.inputs_budget
         )));
     }
+    // Said as the pack begins, once the diff says there is something to send: a run that sends nothing says nothing new.
+    attempt.say(format!(
+        "gate: sending {} to {}: {} file(s)",
+        kind.sent_what(),
+        attempt.call.host(),
+        needed.len()
+    ));
     let path = folder.join(format!("{}-{nonce}.{}.tar.zst", attempt.call.key, kind.file()));
     let started = Instant::now();
     let archive = made_in_tmp(root, &path, &format!("the {} archive", kind.label()))?;

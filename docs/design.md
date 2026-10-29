@@ -884,9 +884,13 @@ The lines of a run that starts its command:
 
   The record is not dropped on `version`, `tools` or `inputs`: that would re-warm every worktree after each `gate push` for nothing, since the preflight's `.warm` check catches a folder that really went cold. A removal that fails says `gate: cannot remove the warm-up record <path>: <error>` before that hint.
 
-  A routed run whose repo declares `inputs` says `gate: inputs: <n> file(s), <X.X> MB (<Y.Y> MB compressed) in <Z.Z> s` once a put has sent files.
+  A routed run says its preflight as it starts, `gate: preflighting <builder>`, and once it passed, `gate: preflighted <builder> in <s.s> s`, timed across its exit-255 retries. It says them once per attempt: the first, one admitted after a drain or slot wait, and the one on a later builder. A log-only call, a drain or slot-wait poll, says neither. A refused preflight says its start line and its refusal, with no end line.
 
-  A routed run whose snapshot holds Git LFS pointers says `gate: lfs: <n> object(s), <X.X> MB in <Z.Z> s` once a put has sent objects, and `gate: lfs: <n> object(s) present` in the log only when the builder's store held them all. The reason of an `lfs` fallback is the log line `gate: remote lfs not sent: <reason>` ([Routing](#routing), Git LFS).
+  A routed run says its snapshot push as it starts, once and before the push call, outside its retry: `gate: pushing snapshot <8 hex> to <builder>`, or `gate: pushing snapshots to <builder>` once for a pair, before both `gate: remote pushed snapshot` lines. The end lines are `gate: pushed snapshot` and `gate: remote pushed snapshot` ([Routing](#routing), Push).
+
+  A routed run whose repo declares `inputs` says `gate: sending inputs to <builder>: <n> file(s)` after the diff and before the pack, only when the diff named a file, and `gate: inputs: <n> file(s), <X.X> MB (<Y.Y> MB compressed) in <Z.Z> s` once a put has sent files. A sent PC build says `gate: sending the PC's build to <builder>: <n> file(s)` in the same place.
+
+  A routed run whose snapshot holds Git LFS pointers says `gate: sending lfs objects to <builder>: <n> object(s)` after the diff and before the pack, only when the diff named an object, and `gate: lfs: <n> object(s), <X.X> MB in <Z.Z> s` once a put has sent objects, and `gate: lfs: <n> object(s) present` in the log only when the builder's store held them all. The reason of an `lfs` fallback is the log line `gate: remote lfs not sent: <reason>` ([Routing](#routing), Git LFS).
 
   Four lines go to the log only: `gate: inputs: <n> file(s) unchanged` (the manifest's entries, said when the builder needed none), `gate: inputs: <glob> matched nothing`, `gate: inputs: <path> is in the snapshot; not sent as an input` and `gate: inputs: <folder> is another repository; not sent as an input`. The reason of an `inputs` fallback is the log line `gate: remote inputs not sent: <reason>` ([Routing](#routing), Inputs).
 
@@ -2196,7 +2200,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   The Rust client sends the build after the inputs and the LFS content: the files under `<project>/bin/<configuration>/` and the project's two restore files, `<project>/obj/*.nuget.g.props` and `*.nuget.g.targets`, through the `inputs` verb's diff and put with `SentBin` ([The box side](#the-box-side)).
 
-  It has its own nonce, its own `.tmp` files (`<key>-<nonce>.sent-build-diff` and `<key>-<nonce>.sent-build.tar.zst`), its own PC hash cache `remote\<key>.sent-build-hashes`, and its own part of the passed line's split, `sent build <n> s`. A put says `gate: sent build: <n> file(s), <x> MB (<y> MB compressed) in <s> s`; a diff that needs nothing says `gate: sent build: <n> file(s) unchanged` in the log.
+  It has its own nonce, its own `.tmp` files (`<key>-<nonce>.sent-build-diff` and `<key>-<nonce>.sent-build.tar.zst`), its own PC hash cache `remote\<key>.sent-build-hashes`, and its own part of the passed line's split, `sent build <n> s`. A put first says `gate: sending the PC's build to <builder>: <n> file(s)`, after the diff and before the pack, and then `gate: sent build: <n> file(s), <x> MB (<y> MB compressed) in <s> s`; a diff that needs nothing says `gate: sent build: <n> file(s) unchanged` in the log.
 
   A send that lands runs the kept words with the run payload's `SentDigest`, and writes neither the outputs-pending marker nor the nothing-back record.
 
@@ -2583,7 +2587,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   - **Hold.** The run takes the worktree locks of its main root and each carried sibling ([Sync-back](#routing), The worktree lock) and, for a pair, holds its folders ([Sibling worktrees](#routing)); one it cannot hold keeps the run here ([Output lines](#output-lines)).
   - **Snapshot.** Part A's snapshot and bridge commit, for each repository of a pair.
   - **Run line.** The run call's cmd line is the fixed `"C:\Program Files\gate\bin\gate.exe" box run --stdin`, the same whatever the run holds; every other `gate box` call's line differs only in its verb. The request, base64 of compact UTF-8 JSON, is the first line of the call's stdin, followed for the run call by the outputs manifest line, so no request size is capped by a command line. The box reads the request line with a cap of 16 MiB, newline included ([The box side](#the-box-side)).
-  - **Preflight.** `gate box preflight` over ssh. Status 255, ssh's own status for a lost connection, says `gate: remote <host> unreachable: <last stderr line>` and falls back `unreachable`; the line is the last `\r` update of the last stderr line, its first 4 KiB, escaped (Escaping, below).
+  - **Preflight.** `gate box preflight` over ssh, said as `gate: preflighting <builder>` before its first try and `gate: preflighted <builder> in <s.s> s` when it passed (Output lines). Status 255, ssh's own status for a lost connection, says `gate: remote <host> unreachable: <last stderr line>` and falls back `unreachable`; the line is the last `\r` update of the last stderr line, its first 4 KiB, escaped (Escaping, below).
 
     Status 9009 or 2 (no `gate box` verb there), or a Unix shell's 126 or 127 (a box program it cannot run or does not find), says `gate: not routed: <host> has no gate box that takes this run (preflight status <n>)` and falls back `version`.
 
@@ -2751,7 +2755,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     A Windows builder's `--receive-pack` is `pwsh -NoProfile -NonInteractive -Command $env:GIT_CONFIG_COUNT='1'; $env:GIT_CONFIG_KEY_0='receive.autogc'; $env:GIT_CONFIG_VALUE_0='false'; git-receive-pack '<path>'`, so a push never starts a gc on the builder.
 
-    Success says `gate: pushed snapshot <8 hex> in <s> s (<size>|up to date)` and moves the builder's local snapshot ref (`refs/gate-remote/<key>` for `host`, `refs/gate-remote/<id>/<key>` for a builder with an id).
+    Before the push call, once and outside its retry, the run says `gate: pushing snapshot <8 hex> to <builder>` (a pair: `gate: pushing snapshots to <builder>` once, before both pushes). Success says `gate: pushed snapshot <8 hex> in <s> s (<size>|up to date)` and moves the builder's local snapshot ref (`refs/gate-remote/<key>` for `host`, `refs/gate-remote/<id>/<key>` for a builder with an id).
 
     The builder keeps one bare repo per repo name, `<builder root>/<repo>.git`, shared by every key of that repo; the key is only the ref's name.
 
@@ -2766,7 +2770,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The calls are made after the push and before the run call, and the run call's request carries `InputsDigest`, the SHA-256 of the manifest line.
 
-    The diff call (`gate box inputs`, `Step` `diff`) is fed the request and the manifest line and answers the paths whose copy is missing or differs. The put call (`Step` `put`) is made only when the diff named a file, fed the request, the manifest line and then an archive of exactly those files, in the outputs archive's format. A diff that names none says `gate: inputs: <n> file(s) unchanged` in the log.
+    The diff call (`gate box inputs`, `Step` `diff`) is fed the request and the manifest line and answers the paths whose copy is missing or differs. The put call (`Step` `put`) is made only when the diff named a file, fed the request, the manifest line and then an archive of exactly those files, in the outputs archive's format. The put says `gate: sending inputs to <builder>: <n> file(s)` before it packs. A diff that names none says `gate: inputs: <n> file(s) unchanged` in the log.
 
     A glob that matches nothing, a match git does not report ignored (it is in the snapshot) and a file inside a folder holding a `.git` of its own (another repository, which git cannot be asked about) are each said in the log and skipped.
 
@@ -2809,7 +2813,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The calls are made after the push and the inputs and before the run call, and the run call's request carries `LfsDigest`, the SHA-256 of the manifest line (`<oid> <size>` entries, space-separated, in the order of the first pointer naming each). The diff call (`gate box lfs`, `Step` `diff`) is fed the request and the manifest line and answers the oids the builder's store lacks or holds at another size.
 
-    The put call (`Step` `put`) is made only when the diff named an object, fed the request, the manifest line and an archive of exactly those objects in the inputs archive's format, each member named by its oid. A diff that names none says `gate: lfs: <n> object(s) present` in the log.
+    The put call (`Step` `put`) is made only when the diff named an object, fed the request, the manifest line and an archive of exactly those objects in the inputs archive's format, each member named by its oid. The put says `gate: sending lfs objects to <builder>: <n> object(s)` before it packs. A diff that names none says `gate: lfs: <n> object(s) present` in the log.
 
     To a `windows` builder with `data` the put asks for a [data channel](GLOSSARY.md) as the inputs put does (Data channel, in the outputs fetch): the PC reads the archive back for its SHA-256, the request carries `Channel` and a fresh `Nonce` and proofs for each attempt, and the archive goes over the channel instead of stdin. To a builder without `data`, or a non-Windows one, it neither hashes the archive nor asks for a channel, and the diff never asks for one.
 

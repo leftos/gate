@@ -13,9 +13,9 @@ use regex::Regex;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::remote_client::{Tuned, client_case, client_gate, client_gate_tuned, fallbacks, pair_case, sibling_repository, write};
+use crate::remote_client::{HOST, Tuned, client_case, client_gate, client_gate_tuned, fallbacks, pair_case, sibling_repository, write};
 use crate::routing::assert_refused;
-use crate::support::{Case, Outcome, calls, events, finish, git, log_texts, shown, ssh_steps};
+use crate::support::{Case, Outcome, assert_in_order, calls, events, finish, git, log_texts, shown, ssh_steps};
 
 /// The content of the case's LFS file, `a.bin`, which its snapshot holds as a pointer.
 const CONTENT: &str = "the LFS file's content, never pointer text\n";
@@ -170,6 +170,25 @@ fn a_routed_run_brings_its_lfs_content_to_the_command() {
     assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
 }
 
+/// A put of the LFS objects says it as it starts, once, before the end line that counts them.
+#[test]
+fn a_routed_run_that_sends_lfs_objects_says_the_put_as_it_starts() {
+    let case = lfs_case("client-lfs-says-the-put");
+    let steps = run_kept(&case, 4);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &PRINT));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said = &outcome.stderr;
+    let start = format!("gate: sending lfs objects to {HOST}: 1 object(s)");
+    assert_eq!(said.lines().filter(|line| *line == start).count(), 1, "once: {outcome:?}");
+    let end = said
+        .lines()
+        .find(|line| line.starts_with("gate: lfs: 1 object(s), "))
+        .expect("the put said its end");
+    assert_in_order(said, &[&start, end]);
+}
+
 #[test]
 fn a_second_run_sends_no_object_again() {
     let case = lfs_case("client-lfs-present");
@@ -185,6 +204,10 @@ fn a_second_run_sends_no_object_again() {
     assert!(has_line(&log_of(&case, "second.log"), PRESENT), "{outcome:?}");
     assert!(!outcome.stderr.contains(PRESENT), "the line is the log's alone: {outcome:?}");
     assert!(!sent_line().is_match(&outcome.stderr), "{outcome:?}");
+    assert!(
+        !outcome.stderr.contains("gate: sending lfs"),
+        "nothing to put, no start line: {outcome:?}"
+    );
     assert!(outcome.stdout.contains(CONTENT.trim_end()), "{outcome:?}");
 }
 
@@ -300,6 +323,7 @@ fn a_repo_without_pointers_makes_no_lfs_call_and_sends_no_digest() {
     assert_eq!(calls(&steps), ["preflight", "run"]);
     assert!(kept_request(&steps).get("LfsDigest").is_none(), "no LfsDigest is sent");
     assert!(!log_of(&case, "out.log").contains("gate: lfs:"), "no LFS line");
+    assert!(!log_of(&case, "out.log").contains("gate: sending lfs"), "no LFS call, no start line");
 }
 
 /// The pointer text of [`CONTENT`], as git-lfs writes it.
