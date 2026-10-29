@@ -6393,31 +6393,30 @@ fn box_run_that_cannot_clear_a_held_file_refuses_before_the_command() {
 #[test]
 fn box_run_replaces_a_junction_where_a_tree_or_its_git_folder_should_be() {
     let case = Case::new("box_run_replaces_a_junction_tree");
-    let (payload, commits) = changing_pair(&case);
+    let payload = changing_two_of_three(&case);
     assert_eq!(run_box(&case, &payload).code, Some(0), "the first run lays out the pair");
     let lib = PathBuf::from(pair_tree(&payload, "lib"));
-    let lib_git = lib.join(".git");
-    let first = canary(&case, "canary");
+    let tools = PathBuf::from(pair_tree(&payload, "tools"));
+    let tools_git = tools.join(".git");
+    let tree_target = canary(&case, "canary");
     fs::remove_dir_all(&lib).expect("the sibling's tree can be removed");
-    junction(&lib, &first);
+    junction(&lib, &tree_target);
+    let git_target = canary(&case, "canary2");
+    fs::remove_dir_all(&tools_git).expect("the sibling's .git can be removed");
+    junction(&tools_git, &git_target);
 
     let outcome = run_box(&case, &renamed(&payload, 1));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert_eq!(entries_of(&first), ["keep.txt"], "the canary is untouched");
+    assert_eq!(entries_of(&tree_target), ["keep.txt"], "the tree's canary is untouched");
+    assert_eq!(entries_of(&git_target), ["keep.txt"], "the .git's canary is untouched");
     assert!(is_real_folder(&lib), "the tree is a folder again");
-    assert_eq!(git(&["-C", &shown(&lib), "rev-parse", "HEAD"]), commits[1], "at its snapshot");
-
-    let second = canary(&case, "canary2");
-    fs::remove_dir_all(&lib_git).expect("the sibling's .git can be removed");
-    junction(&lib_git, &second);
-
-    let outcome = run_box(&case, &renamed(&payload, 2));
-
-    assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert_eq!(entries_of(&second), ["keep.txt"], "the canary is untouched");
-    assert!(is_real_folder(&lib_git), "the .git is a folder again");
-    assert_eq!(git(&["-C", &shown(&lib), "rev-parse", "HEAD"]), commits[1], "at its snapshot");
+    assert!(is_real_folder(&tools_git), "the .git is a folder again");
+    let snapshots = &payload["SiblingSnapshots"];
+    let lib_snapshot = snapshots["lib"].as_str().expect("lib's snapshot is a commit");
+    let tools_snapshot = snapshots["tools"].as_str().expect("tools' snapshot is a commit");
+    assert_eq!(git(&["-C", &shown(&lib), "rev-parse", "HEAD"]), lib_snapshot, "at its snapshot");
+    assert_eq!(git(&["-C", &shown(&tools), "rev-parse", "HEAD"]), tools_snapshot, "at its snapshot");
 }
 
 #[test]

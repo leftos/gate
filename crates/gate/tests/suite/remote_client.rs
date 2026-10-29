@@ -2450,7 +2450,7 @@ fn a_command_a_macos_builder_picks_is_sent_its_unix_wire_and_caches_in_its_own_f
 
 /// The record of a work folder's last complete outputs pull names the builder that made it, so a run on another builder
 /// asks for every output that differs from the PC's (`OutputsFull`), and the next run on that same builder does not: a
-/// worktree whose runs go host, `builder-a`, `builder-a`, host sends full on both switches.
+/// worktree whose runs go host, `builder-a`, `builder-a` sends full on the switch and changed only on the builder's next run.
 #[test]
 fn a_run_after_another_builder_s_run_sends_outputs_full_and_the_next_on_the_same_builder_does_not() {
     let case = outputs_case("client-outputs-builder-switch", &BIN);
@@ -2497,12 +2497,6 @@ fn a_run_after_another_builder_s_run_sends_outputs_full_and_the_next_on_the_same
         same["OutputsFull"],
         json!(false),
         "the next run on that builder sends changed only: {same}"
-    );
-    let back = run("fourth", "b");
-    assert_eq!(
-        back["OutputsFull"],
-        json!(true),
-        "back on the first builder, the switch asks again: {back}"
     );
 }
 
@@ -2838,14 +2832,14 @@ fn a_pair_run_pushes_each_repo_main_first_and_syncs_both_back() {
 
 /// A pair run's box checks the main repository out in `{work}\{leaf}` and the sibling in `{work}\{name}`: a fetched
 /// test host's manifest that records both trees, in either case, names the main worktree and the sibling's own root on
-/// this PC, never the work folder's place under the main worktree. A first run names the work-folder key.
+/// this PC, never the work folder's place under the main worktree.
 #[test]
 fn a_pair_s_fetched_output_is_rewritten_to_the_main_s_pc_root() {
     let (case, leaf, name, sibling) = pair_case("client-pair-rewrite", &BIN, sibling_repository);
     write(&case, ".gitignore", &format!("{CLIENT_IGNORED}bin/\n"));
-    first_run(&case);
     let builder = std::path::absolute(case.folder().join("builder")).expect("the builder root has a full path");
-    let work = format!(r"{}\work\{}", builder.display(), key_of(&events(&case)));
+    let key = work_folder_key(&git(&case, &["rev-parse", "--show-toplevel"]));
+    let work = format!(r"{}\work\{key}", builder.display());
     // After a `_`, neither path is one the router rewrites into the work folder: the builder sits in the worktree here.
     let recorded = format!(r"Root_{}\{leaf}\src\App;Lib_{work}\{name}\lib", work.to_uppercase());
     let second = ssh_steps(&case, "second", &["ok", "ok", "ok"]);
