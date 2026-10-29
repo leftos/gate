@@ -130,6 +130,7 @@ fn a_v1_remote_ticket_shows_its_pool_and_pinned_in_the_queue() {
         alone: false,
         remote: Some(true),
         pool: Some("1f0efc62".to_owned()),
+        also_pools: Vec::new(),
         pinned: Some(true),
         reason: None,
         expected: None,

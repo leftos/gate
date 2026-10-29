@@ -4947,52 +4947,57 @@ fn a_held_work_folder_key_runs_here_without_trying_the_next_builder() {
 #[test]
 fn full_pools_on_both_builders_share_one_remote_wait() {
     let case = two_builder_case("routing-shared-budget");
-    let go = case.folder().join("go");
-    let wait_go = format!("wait {}", shown(&go));
-    let mut holders = Vec::new();
-    for (log, program) in [("mac.log", r".\tool.exe"), ("host.log", r".\host.exe")] {
-        let steps = shown(&stub(&case, &[&wait_go]));
-        let holder = case.start(&routed_words(log, &steps, &[], &[program, "out", "hi"]));
-        wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, holder.id()));
-        holders.push(holder);
-    }
-    let steps = shown(&stub(&case, &["status 0"]));
-    let waiter = case.start(&routed_words(
-        "waiter.log",
-        &steps,
-        &["--test-remote-wait-ms", "400"],
-        &[r".\tool.exe", "out", "ran here"],
+    let (mac_go, host_go, waiter_go) = (
+        case.folder().join("mac-go"),
+        case.folder().join("host-go"),
+        case.folder().join("waiter-go"),
+    );
+    let mac_holder = remote_holder(&case, "mac.log", &mac_go);
+    let host_holder = several_pool_holder(&case, "host.log", r".\host.exe", &[], &host_go);
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(
+        &case,
+        &[&format!("record {}", shown(&call)), &format!("wait {}", shown(&waiter_go))],
     ));
+    // A program named by its absolute path makes each builder's run say a route line.
+    let waiter = case.start(&routed_words("waiter.log", &steps, &[], &[FAKE_TOOL, "out", "ran there"]));
     let pid = waiter.id();
+
+    waiter.wait_for_stderr("gate: waiting for a remote slot on mac-1 or builder (2 busy");
+    let ticket = ticket_of(&case, pid);
+    // The second-listed builder's slot frees first: the run takes it.
+    let_go(&host_go);
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{pid},"#));
+    wait_until("the call on host", || call.exists());
+    let claim: Value =
+        serde_json::from_str(&fs::read_to_string(remote_claim(&case)).expect("host's slot has the run's claim")).expect("the claim is JSON");
+    let_go(&waiter_go);
     let outcome = waiter.finish();
+    let_go(&mac_go);
+    assert_eq!((mac_holder.finish().code, host_holder.finish().code), (Some(0), Some(0)));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
-    assert_in_order(
-        &outcome.stderr,
-        &[
-            "gate: waiting for a remote slot on mac-1",
-            "gate: remote mac-1 full; trying builder",
-            "gate: remote builder full; running here",
-        ],
-    );
     assert_eq!(
         outcome.stderr.matches("gate: waiting for a remote slot").count(),
         1,
-        "host's pool, with nothing left of the budget, is not waited for: {outcome:?}"
+        "one wait for both pools: {outcome:?}"
     );
+    assert_eq!(ticket["pool"], json!(gate_router::builder_id(MAC)), "{ticket}");
+    assert_eq!(ticket["alsoPools"], json!(["host"]), "{ticket}");
+    assert_eq!((&claim["pid"], &claim["host"]), (&json!(pid), &json!(HOST)), "{claim}");
+    let routed_line = format!("gate: routed {FAKE_TOOL} as {}", fake_tool_name());
+    assert_in_order(
+        &outcome.stderr,
+        &[
+            "gate: waiting for a remote slot on mac-1 or builder",
+            &routed_line,
+            "gate: took a remote slot on builder after ",
+        ],
+    );
+    assert_eq!(recorded(&call)["host"], HOST, "host ran the command");
     let own = own(&case, pid);
-    assert_eq!(names(&own), ["queue", "fallback", "fallback", "take", "release"], "{own:#?}");
-    assert_eq!(hosts(&own), [Some(MAC), Some(MAC), Some(HOST), None, None], "{own:#?}");
-    let waited = own[3]["waitedSeconds"].as_f64().expect("the local take says how long the run waited");
-    assert!(
-        waited >= 0.35,
-        "the last fallback is full, so the local take counts from the queue line: {waited} s"
-    );
-    let_go(&go);
-    for holder in holders {
-        assert_eq!(holder.finish().code, Some(0));
-    }
+    assert_eq!(names(&own), ["queue", "take", "release"], "{own:#?}");
+    assert_eq!(hosts(&own)[1..], [Some(HOST), Some(HOST)], "{own:#?}");
 }
 
 #[test]
@@ -5049,6 +5054,32 @@ fn a_ctrl_c_as_the_next_builder_is_built_ends_the_run_without_saying_where_it_go
         Some(0.0),
         "the release holds no slot, the Mac's ended with its fallback: {own:#?}"
     );
+
+    // With both builders full, a Ctrl+C as `host` is built for the several-pool wait ends the walk before it queues.
+    let (mac_go, host_go) = (case.folder().join("mac-go"), case.folder().join("host-go"));
+    let mac_holder = remote_holder(&case, "mac.log", &mac_go);
+    let host_holder = several_pool_holder(&case, "host.log", r".\host.exe", &[], &host_go);
+    let listed = case.start(&routed_words(
+        "listed.log",
+        &steps,
+        &["--test-interrupt-before-later"],
+        &[r".\tool.exe", "out", "ran here"],
+    ));
+    let listed_pid = listed.id();
+    let listed_outcome = listed.finish();
+    let_go(&mac_go);
+    let_go(&host_go);
+    assert_eq!((mac_holder.finish().code, host_holder.finish().code), (Some(0), Some(0)));
+
+    assert_eq!(listed_outcome.code, Some(CONTROL_C_EXIT), "{listed_outcome:?}");
+    assert!(
+        has_line(&listed_outcome.stderr, "gate: interrupted before the command started"),
+        "{listed_outcome:?}"
+    );
+    assert!(!listed_outcome.stderr.contains("waiting for a remote slot"), "{listed_outcome:?}");
+    // `own` names the first run's lines here.
+    let listed_own: Vec<Value> = events(&case).into_iter().filter(|event| event["pid"] == listed_pid).collect();
+    assert_eq!(names(&listed_own), ["queue", "release"], "no wait to abandon: {listed_own:#?}");
 }
 
 #[test]
@@ -5354,7 +5385,7 @@ fn marker_folder(case: &Case, id: Option<&str>) -> PathBuf {
 
 /// Holds a drain marker in the case's marker folder of the builder `id`, as a run waiting behind that builder's drain
 /// holds one: a file open sharing nothing, held until it is dropped.
-fn hold_marker(case: &Case, id: Option<&str>) -> fs::File {
+pub(crate) fn hold_marker(case: &Case, id: Option<&str>) -> fs::File {
     use std::os::windows::fs::OpenOptionsExt;
 
     let folder = marker_folder(case, id);
@@ -5562,44 +5593,6 @@ fn a_drain_wait_is_left_out_of_the_release_s_held_and_wall_seconds_and_the_durat
 
 /// What a run whose key wait passed its bound says once a drain marker holds that bound off.
 const KEY_HELD_OFF: &str = "gate: still waiting for the worktree's key past its bound: a routed run waits behind a builder drain";
-
-/// The Mac's pool is full past the run's whole remote budget, so `host`'s attempt has none left: a live marker of
-/// `host` does not hold that wait off, and the run falls back full at once instead of waiting on `host`'s pool.
-#[test]
-fn a_wait_with_no_remote_budget_is_not_held_off_by_a_drain_marker() {
-    let case = two_builder_case("routing-drain-no-budget");
-    let (host_go, mac_go) = (case.folder().join("host-go"), case.folder().join("mac-go"));
-    let mac_holder = remote_holder(&case, "mac.log", &mac_go);
-    let host_steps = shown(&stub(&case, &[&format!("wait {}", shown(&host_go))]));
-    let host_holder = case.start(&routed_words("host.log", &host_steps, &[], &[r".\host.exe", "out", "hi"]));
-    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, host_holder.id()));
-    let marker = hold_marker(&case, None);
-    let steps = shown(&stub(&case, &["status 0"]));
-    let seams = ["--test-remote-wait-ms", "1", "--test-heartbeat-ms", "50", "--test-poll-ms", "20"];
-    let waiter = case.start(&routed_words("waiter.log", &steps, &seams, &[r".\tool.exe", "out", "ran here"]));
-    let pid = waiter.id();
-
-    let said = waiter.wait_for_stderr_where("the fallback or a still-waiting line", |said| {
-        said.contains(FULL_LINE) || said.contains("gate: still waiting for a remote slot on builder (")
-    });
-    // Let go before the run's end, so a run held off ends too and fails on what it said.
-    drop(marker);
-    let_go(&mac_go);
-    let_go(&host_go);
-    let outcome = waiter.finish();
-    assert_eq!((mac_holder.finish().code, host_holder.finish().code), (Some(0), Some(0)));
-
-    assert!(said.contains(FULL_LINE), "the run left the remote queue at once: {said}");
-    assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
-    let own = own(&case, pid);
-    assert_eq!(hosts(&own).last(), Some(&None), "the run ran here: {own:#?}");
-    assert!(
-        own.iter()
-            .any(|event| event["event"] == "fallback" && event["host"] == HOST && event["reason"] == "full"),
-        "host's pool fell back full: {own:#?}"
-    );
-}
 
 #[test]
 fn a_held_off_remote_wait_takes_its_limit_again_once_the_marker_is_gone() {
@@ -6151,6 +6144,35 @@ fn a_builder_with_a_free_slot_wins_over_a_full_builder_listed_first() {
 }
 
 #[test]
+fn a_run_whose_busy_pick_scores_best_waits_on_the_pick_with_a_free_builder_beside_it() {
+    let case = balance_case("routing-busy-pick");
+    // The first builder's runs take 10 s and host's 1000 s: even behind its holder, the first builder finishes first.
+    seed_both(&case, 10.0, 1000.0);
+    let go = case.folder().join("go");
+    let holder = several_pool_holder(&case, "holder.log", r".\tool.exe", &["--builder", SLOT_FIRST], &go);
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let mut waiter = case.start(&routed_words("waiter.log", &steps, &[], &[r".\tool.exe", "out", "ran there"]));
+    let pid = waiter.id();
+
+    let waiting = format!("gate: waiting for a remote slot on {SLOT_FIRST} (");
+    waiter.wait_for_stderr_while_running("the run waits on the first builder", |stderr| stderr.contains(&waiting));
+    let text = ticket_text(&case, pid);
+    let_go(&go);
+    let outcome = waiter.finish();
+    assert_eq!(holder.finish().code, Some(0));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!text.contains("alsoPools"), "the pick's pool alone: {text}");
+    let ticket: Value = serde_json::from_str(&text).expect("the ticket is JSON");
+    assert_eq!(ticket["pool"], json!(gate_router::builder_id(SLOT_FIRST)), "{ticket}");
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "take", "release"], "{own:#?}");
+    assert_eq!(took_on(&case, pid), [SLOT_FIRST], "{outcome:?}");
+    assert_eq!(recorded(&call)["host"], SLOT_FIRST, "the pick ran the command");
+}
+
+#[test]
 fn a_builder_holding_the_worktree_s_folder_wins_when_durations_tie() {
     let case = balance_case("routing-balance-folder");
     plant_worktree_record(&case, &[HOST]);
@@ -6564,4 +6586,292 @@ fn a_local_run_logging_into_another_worktree_of_its_repo_runs_here_as_before() {
         !outcome.stderr.contains("run it with --cd"),
         "a run that stays local is not checked: {outcome:?}"
     );
+}
+
+/// Starts a routed run logging to `log` of `program`, `extra` before `--`, whose client holds its remote slot until `go`
+/// exists, and returns once it has taken it.
+fn several_pool_holder(case: &Case, log: &str, program: &str, extra: &[&str], go: &Path) -> Running {
+    let steps = shown(&stub(case, &[&format!("wait {}", shown(go))]));
+    let running = case.start(&routed_words(log, &steps, extra, &[program, "out", "hi"]));
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, running.id()));
+    running
+}
+
+/// The text of the ticket of the gate `pid` in the case root.
+fn ticket_text(case: &Case, pid: u32) -> String {
+    let path = fs::read_dir(case.root().join("waiting"))
+        .expect("the waiting folder lists")
+        .map(|entry| entry.expect("a ticket entry can be read").path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&format!("{pid}-")))
+        })
+        .expect("the gate has a ticket");
+    fs::read_to_string(&path).expect("the ticket can be read")
+}
+
+/// The ticket of the gate `pid` in the case root, as JSON.
+fn ticket_of(case: &Case, pid: u32) -> Value {
+    serde_json::from_str(&ticket_text(case, pid)).expect("the ticket is JSON")
+}
+
+/// The first line of `outcome`'s stderr that says the run waits for a remote slot.
+fn remote_waiting_line(outcome: &Outcome) -> &str {
+    outcome
+        .stderr
+        .lines()
+        .find(|line| line.starts_with("gate: waiting for a remote slot on "))
+        .expect("the run said it waits for a remote slot")
+}
+
+#[test]
+fn a_several_pool_wait_that_runs_out_falls_back_full_once_and_runs_here() {
+    let case = two_builder_case("routing-several-pool-limit");
+    let (mac_go, host_go) = (case.folder().join("mac-go"), case.folder().join("host-go"));
+    let mac_holder = remote_holder(&case, "mac.log", &mac_go);
+    let host_holder = several_pool_holder(&case, "host.log", r".\host.exe", &[], &host_go);
+    let steps = shown(&stub(&case, &["status 0"]));
+    let waiter = case.start(&routed_words(
+        "waiter.log",
+        &steps,
+        &["--test-remote-wait-ms", "400"],
+        &[r".\tool.exe", "out", "ran here"],
+    ));
+    let pid = waiter.id();
+    let outcome = waiter.finish();
+    let_go(&mac_go);
+    let_go(&host_go);
+    assert_eq!((mac_holder.finish().code, host_holder.finish().code), (Some(0), Some(0)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(
+        remote_waiting_line(&outcome),
+        "gate: waiting for a remote slot on mac-1 or builder (2 busy)"
+    );
+    assert!(has_line_once(&outcome.stderr, "gate: remote mac-1 full; running here"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("trying"), "no listed builder is tried again: {outcome:?}");
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "fallback", "take", "release"], "{own:#?}");
+    assert_eq!(hosts(&own), [Some(MAC), Some(MAC), None, None], "{own:#?}");
+    assert_eq!(own[1]["reason"], "full", "{own:#?}");
+}
+
+#[test]
+fn a_builder_taken_from_a_several_pool_wait_that_refuses_is_not_tried_again() {
+    let case = two_builder_case("routing-several-pool-refused");
+    let (mac_go, host_go) = (case.folder().join("mac-go"), case.folder().join("host-go"));
+    let mac_holder = remote_holder(&case, "mac.log", &mac_go);
+    let host_holder = several_pool_holder(&case, "host.log", r".\host.exe", &[], &host_go);
+    let steps = shown(&stub(
+        &case,
+        &["on builder", "refuse version", "on mac-1", "out ran on the mac", "status 0"],
+    ));
+    let waiter = case.start(&routed_words("waiter.log", &steps, &[], &[r".\tool.exe", "out", "ran here"]));
+    let pid = waiter.id();
+
+    waiter.wait_for_stderr("gate: waiting for a remote slot on mac-1 or builder (");
+    let_go(&host_go);
+    waiter.wait_for_stderr("gate: remote builder version; trying mac-1");
+    let_go(&mac_go);
+    let outcome = waiter.finish();
+    assert_eq!((mac_holder.finish().code, host_holder.finish().code), (Some(0), Some(0)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran on the mac"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("running here"), "{outcome:?}");
+    assert_eq!(took_on(&case, pid), [HOST, MAC], "host is taken once, then the untried Mac");
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "take", "fallback", "take", "release"], "{own:#?}");
+    assert_eq!((&own[2]["host"], &own[2]["reason"]), (&json!(HOST), &json!("version")), "{own:#?}");
+}
+
+#[test]
+fn a_several_pool_wait_lists_only_builders_that_can_run_the_command() {
+    // No origin ref: the run's change cannot be told, so the Mac is steered off for this command.
+    let case = windows_paths_case("routing-several-pool-capable", "['tools/Hook/*']", false);
+    let routing = json!({
+        "host": HOST,
+        "repos": { repo(&case): ["*tool*", "*host.exe*"] },
+        "builders": [
+            { "host": SLOT_FIRST, "os": "windows", "repos": { repo(&case): ["*tool*"] } },
+            { "host": MAC, "os": "macos", "root": "/m", "repos": { repo(&case): ["*tool*"] } },
+        ],
+    });
+    write_remote_json(&case, &routing.to_string());
+    let (first_go, host_go) = (case.folder().join("first-go.log"), case.folder().join("host-go.log"));
+    let first_holder = several_pool_holder(&case, "first.log", r".\tool.exe", &["--builder", SLOT_FIRST], &first_go);
+    let host_holder = several_pool_holder(&case, "host.log", r".\host.exe", &[], &host_go);
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let waiter = case.start(&routed_words("waiter.log", &steps, &[], &[r".\tool.exe", "out", "ran there"]));
+    let pid = waiter.id();
+
+    waiter.wait_for_stderr("gate: waiting for a remote slot on builder-a or builder (");
+    let ticket = ticket_of(&case, pid);
+    let_go(&host_go);
+    let outcome = waiter.finish();
+    let_go(&first_go);
+    assert_eq!((first_holder.finish().code, host_holder.finish().code), (Some(0), Some(0)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        remote_waiting_line(&outcome),
+        "gate: waiting for a remote slot on builder-a or builder (2 busy)",
+        "the Mac's free pool is not listed: {outcome:?}"
+    );
+    assert_eq!(ticket["pool"], json!(gate_router::builder_id(SLOT_FIRST)), "{ticket}");
+    assert_eq!(ticket["alsoPools"], json!(["host"]), "{ticket}");
+    assert_eq!(recorded(&call)["host"], HOST, "host ran the command");
+}
+
+#[test]
+fn a_drain_marker_on_any_listed_builder_holds_the_several_pool_limit_off() {
+    let case = two_builder_case("routing-several-pool-drain");
+    let (mac_go, host_go) = (case.folder().join("mac-go"), case.folder().join("host-go"));
+    let mac_holder = remote_holder(&case, "mac.log", &mac_go);
+    let host_holder = several_pool_holder(&case, "host.log", r".\host.exe", &[], &host_go);
+    // The marker of `host`, the second-listed builder.
+    let marker = hold_marker(&case, None);
+    let steps = shown(&stub(&case, &["out ran there", "status 0"]));
+    let seams = ["--test-remote-wait-ms", "1", "--test-heartbeat-ms", "50", "--test-poll-ms", "20"];
+    let waiter = case.start(&routed_words("waiter.log", &steps, &seams, &[r".\tool.exe", "out", "ran here"]));
+    let pid = waiter.id();
+
+    // The still-waiting line comes past the wait's 1 ms limit: the marker held the limit off.
+    waiter.wait_for_stderr("gate: still waiting for a remote slot on mac-1 or builder (");
+    let_go(&mac_go);
+    let_go(&host_go);
+    assert_eq!((mac_holder.finish().code, host_holder.finish().code), (Some(0), Some(0)));
+    let outcome = waiter.finish();
+    drop(marker);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains("full;"), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "take", "release"], "no fallback: {own:#?}");
+}
+
+/// Sets the adjusted seconds of every sample of the [`balanced_run`] command's runs on `place` to `adjusted`, the case's
+/// store seeded by [`seed_both`].
+fn seed_adjusted(case: &Case, place: &str, adjusted: f64) {
+    let path = case.root().join("durations.json");
+    let mut store: Value = serde_json::from_str(&fs::read_to_string(&path).expect("the store was written")).expect("the store is JSON");
+    let keys = store["keys"].as_object_mut().expect("the store holds its keys");
+    let first = format!("remote:{SLOT_FIRST}");
+    let rest = keys
+        .keys()
+        .find_map(|key| key.strip_prefix(&first))
+        .expect("the runs are filed on the first builder")
+        .to_owned();
+    let history = keys.get_mut(&format!("remote:{place}{rest}")).expect("the place's runs are seeded");
+    for sample in history["samples"].as_array_mut().expect("a history holds its samples") {
+        sample["adjusted"] = Value::from(adjusted);
+    }
+    fs::write(&path, store.to_string()).expect("the store can be seeded");
+}
+
+#[test]
+fn a_run_taken_on_the_slower_builder_runs_under_that_builder_s_ceiling() {
+    let case = balance_case("routing-several-pool-ceiling");
+    seed_both(&case, 100.0, 840.0);
+    seed_adjusted(&case, HOST, 840.0);
+    let (first_go, host_go) = (case.folder().join("first-go"), case.folder().join("host-go"));
+    let first_holder = several_pool_holder(&case, "first.log", r".\tool.exe", &["--builder", SLOT_FIRST], &first_go);
+    let host_holder = several_pool_holder(&case, "host.log", r".\tool.exe", &["--builder", HOST], &host_go);
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let mut words = routed_words("waiter.log", &steps, &[], &[r".\tool.exe", "out", "ran there"]);
+    words[4] = "auto:900";
+    let waiter = case.start(&words);
+    let pid = waiter.id();
+
+    waiter.wait_for_stderr("gate: waiting for a remote slot on builder-a or builder (");
+    let_go(&host_go);
+    let outcome = waiter.finish();
+    let_go(&first_go);
+    assert_eq!((first_holder.finish().code, host_holder.finish().code), (Some(0), Some(0)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(took_on(&case, pid), [HOST], "{outcome:?}");
+    let call = recorded(&call);
+    assert_eq!(call["host"], HOST, "{call}");
+    assert_eq!(call["timeout"], 2520, "3x host's adjusted p99, not the first builder's floor: {call}");
+}
+
+#[test]
+fn a_pinned_run_writes_a_single_pool_ticket() {
+    let case = two_builder_case("routing-several-pool-pinned");
+    let (mac_go, host_go) = (case.folder().join("mac-go"), case.folder().join("host-go"));
+    let mac_holder = remote_holder(&case, "mac.log", &mac_go);
+    let host_holder = several_pool_holder(&case, "host.log", r".\host.exe", &[], &host_go);
+    let steps = shown(&stub(&case, &["status 0"]));
+    let waiter = case.start(&routed_words(
+        "waiter.log",
+        &steps,
+        &["--builder", MAC],
+        &[r".\tool.exe", "out", "ran there"],
+    ));
+    let pid = waiter.id();
+
+    waiter.wait_for_stderr("gate: waiting for a remote slot on mac-1 (1 busy");
+    let text = ticket_text(&case, pid);
+    let_go(&mac_go);
+    let outcome = waiter.finish();
+    let_go(&host_go);
+    assert_eq!((mac_holder.finish().code, host_holder.finish().code), (Some(0), Some(0)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!text.contains("alsoPools"), "{text}");
+    let ticket: Value = serde_json::from_str(&text).expect("the ticket is JSON");
+    assert_eq!(ticket["pool"], json!(gate_router::builder_id(MAC)), "{ticket}");
+    assert_eq!(ticket["pinned"], true, "{ticket}");
+}
+
+/// Writes an earlier remote ticket of this test process, a live gate holding no slot, queued for the Mac's pool and also
+/// listing `host`'s, in the case's root; its path.
+fn plant_listing_ticket(case: &Case) -> PathBuf {
+    let start = gate_win32::process_start_of(process::id())
+        .expect("this process's start can be read")
+        .expect("this process runs");
+    let start_ms = start.as_millisecond().unsigned_abs();
+    let pid = process::id();
+    let ticket = json!({
+        "v": 1, "kind": "heavy", "arrived": 1, "pid": pid, "startTicks": start_ms, "holds": false, "remote": true,
+        "pool": gate_router::builder_id(MAC), "alsoPools": ["host"],
+    });
+    let path = case.root().join("waiting").join(format!("{pid}-{start_ms}.json"));
+    fs::create_dir_all(path.parent().expect("a ticket has a folder")).expect("the waiting folder can be made");
+    fs::write(&path, ticket.to_string()).expect("the ticket can be written");
+    path
+}
+
+#[test]
+fn a_free_slot_another_waiter_is_ahead_for_does_not_split_the_shared_wait() {
+    let case = two_builder_case("routing-several-pool-ahead");
+    let mac_go = case.folder().join("mac-go");
+    let mac_holder = remote_holder(&case, "mac.log", &mac_go);
+    // `host`'s one slot is free, but an earlier waiter listing it is ahead for it.
+    let planted = plant_listing_ticket(&case);
+    let steps = shown(&stub(&case, &["status 0"]));
+    let waiter = case.start(&routed_words(
+        "waiter.log",
+        &steps,
+        &["--test-remote-wait-ms", "400"],
+        &[r".\tool.exe", "out", "ran here"],
+    ));
+    let pid = waiter.id();
+    let outcome = waiter.finish();
+    fs::remove_file(&planted).expect("the planted ticket can be deleted");
+    let_go(&mac_go);
+    assert_eq!(mac_holder.finish().code, Some(0));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    // A wait deferring to the ticket ahead of it while a slot is free says no waiting line.
+    assert_eq!(outcome.stderr.matches("full; ").count(), 1, "{outcome:?}");
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "fallback", "take", "release"], "one full fallback: {own:#?}");
+    assert_eq!(own[1]["reason"], "full", "{own:#?}");
 }

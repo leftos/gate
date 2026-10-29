@@ -64,6 +64,7 @@ fn ticket(pid: u32, arrived: u64) -> Ticket {
         alone: false,
         remote: None,
         pool: None,
+        also_pools: Vec::new(),
         pinned: None,
         reason: None,
         expected: None,
@@ -1062,6 +1063,64 @@ fn a_ticket_of_a_builders_pool_carries_its_pool_and_one_of_host_s_pool_none() {
     let text = fs::read_to_string(&path).expect("the pooled ticket is there");
     assert!(text.ends_with(r#""remote":true,"pool":"1f0efc62"}"#), "{text}");
     assert_eq!(v1::read_ticket(&path).expect("the pooled ticket reads"), pooled);
+}
+
+#[test]
+fn a_ticket_with_an_unknown_key_reads_as_before() {
+    let dir = scratch("ticket-unknown-key");
+    let path = v1::ticket_path(&dir, 60080, 1_759_439_762_015);
+    fs::create_dir_all(path.parent().expect("the ticket has a folder")).expect("the ticket folder can be made");
+    let text = TICKET_TEXT.trim_end().replacen(r#""kind""#, r#""later":{"x":[1,2]},"kind""#, 1);
+    assert_ne!(text, TICKET_TEXT.trim_end(), "the unknown key is in the text");
+    fs::write(&path, &text).expect("the ticket can be written");
+
+    assert_eq!(
+        v1::read_ticket(&path).expect("an unknown key is ignored"),
+        ticket(60080, 1_759_439_762_015)
+    );
+}
+
+#[test]
+fn a_ticket_lists_also_pools_with_host_by_name() {
+    let dir = scratch("ticket-also-pools");
+    let path = v1::ticket_path(&dir, 60080, 1);
+    let listed = Ticket {
+        kind: TicketKind::Heavy,
+        remote: Some(true),
+        pool: Some("1f0efc62".to_owned()),
+        also_pools: vec!["host".to_owned(), "0a1b2c3d".to_owned()],
+        ..ticket(60080, 1)
+    };
+    v1::write_ticket(&path, &listed).expect("the listing ticket is written");
+    let text = fs::read_to_string(&path).expect("the listing ticket is there");
+
+    assert!(text.ends_with(r#""pool":"1f0efc62","alsoPools":["host","0a1b2c3d"]}"#), "{text}");
+    assert_eq!(v1::read_ticket(&path).expect("the listing ticket reads"), listed);
+}
+
+#[test]
+fn an_also_pools_entry_that_is_no_pool_is_skipped() {
+    let dir = scratch("ticket-also-pools-skipped");
+    let path = v1::ticket_path(&dir, 60080, 1);
+    let single = Ticket {
+        kind: TicketKind::Heavy,
+        remote: Some(true),
+        pool: Some("1f0efc62".to_owned()),
+        ..ticket(60080, 1)
+    };
+    v1::write_ticket(&path, &single).expect("the single-pool ticket is written");
+    let text = fs::read_to_string(&path).expect("the single-pool ticket is there");
+    assert!(!text.contains("alsoPools"), "an empty list is not written: {text}");
+    let listed = text.replacen(
+        r#""pool":"1f0efc62""#,
+        r#""pool":"1f0efc62","alsoPools":["host","0A1B2C3D","nope",3,null,"0a1b2c3d","0a1b2c3"]"#,
+        1,
+    );
+    fs::write(&path, listed).expect("the ticket can be rewritten");
+
+    let read = v1::read_ticket(&path).expect("an entry that is no pool leaves the ticket readable");
+
+    assert_eq!(read.also_pools, ["host", "0a1b2c3d"]);
 }
 
 #[test]

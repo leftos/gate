@@ -230,7 +230,7 @@ impl<'a> Late<'a> {
         let State::Waiting { wait, .. } = std::mem::replace(&mut self.state, State::Done) else {
             unreachable!("the state was waiting a moment ago")
         };
-        let Waited::Taken(taken) = waited else {
+        let Waited::Taken { taken, .. } = waited else {
             unreachable!("a late wait is under no parent, has no limit and reads no Ctrl+C, so only a take ends it")
         };
         let waited = since.elapsed().as_secs_f64();

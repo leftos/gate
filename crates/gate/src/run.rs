@@ -72,7 +72,7 @@ use crate::route::{self, Placed};
 use crate::slots::{self, BuilderPool, ClaimOf, LendMarker, Pool, Survey, Taken, Takes, ThisGate, epoch_ms};
 use crate::stopping::failure;
 use crate::tailscale;
-use crate::wait::{self, Arrival, Host, UnderParent, Wait, Waited};
+use crate::wait::{self, Arrival, Host, PoolNow, UnderParent, Wait, Waited};
 use crate::warm;
 use crate::watch::{Start, Watched, Watcher, Watching};
 use crate::worktree_record;
@@ -1601,6 +1601,21 @@ struct Refusal {
     held: Option<Taken>,
 }
 
+/// A routed run's walk over its builders ([`Run::try_builders`]).
+struct Walk {
+    /// The time the run's remote waits took so far, which its remote budget is spent by.
+    waited: Duration,
+    /// The drain session of every attempt and poll of the run.
+    session: String,
+    /// The aliases of the builders the run has tried, each at most once: one whose slot it took, one whose pool stayed
+    /// full, one skipped as it was built, and every builder a several-pool wait that ran out listed.
+    tried: HashSet<String>,
+    /// The runs of builders built for a several-pool wait or passed over for a free slot and not tried yet.
+    built: Vec<RemoteRun>,
+    /// The run of the builder the walk is on; `None` for the routed run's first builder.
+    current: Option<Box<RemoteRun>>,
+}
+
 /// Where a routed run goes after a builder's attempt fell back ([`Run::next_candidate`]).
 enum Next {
     /// To this later builder.
@@ -2190,23 +2205,28 @@ impl Run<'_> {
         // Under the key lock, once a run: the key is the same for every builder the run tries.
         worktree_record::leave(&self.root.path, &remote.root, &remote.repo, &remote.key, console);
         // One drain session for every attempt and poll of the run.
-        let session = remote::payload::run_nonce();
-        let mut waited = Duration::ZERO;
-        let mut looked = 0;
-        let mut later: Option<Box<RemoteRun>> = None;
+        let mut walk = Walk {
+            waited: Duration::ZERO,
+            session: remote::payload::run_nonce(),
+            tried: HashSet::new(),
+            built: Vec::new(),
+            current: None,
+        };
         loop {
-            let current = later.as_deref().unwrap_or(remote);
             // Before each attempt, whose builder may plan another drop, so a run killed on the builder leaves its
             // entries cleared. A record that cannot be removed would outlast the build there: the run falls back here.
-            if let Err(line) = self.clear_built_here(current) {
+            if let Err(line) = self.clear_built_here(walk.current.as_deref().unwrap_or(remote)) {
                 console.err(&line);
                 let reason = FallbackReason::Inputs;
                 return (self.fell_back(reason, &RemoteOutcome::not_started(line), console), Some(reason));
             }
-            let refusal = match self.attempt(current, hold, (&mut waited, &session), console) {
+            let refusal = match self.attempt(remote, &mut walk, hold, console) {
                 Attempt::Done(remotely) => return (remotely, None),
                 Attempt::Refused(refusal) => refusal,
             };
+            // The builder whose attempt was refused: the one whose slot the attempt took, or whose pool stayed full.
+            let refused = walk.current.take();
+            let current = refused.as_deref().unwrap_or(remote);
             if pinned {
                 // A pinned run ends on its builder's refusal, its slot kept in the hold its release lets go; one the
                 // full pool turned away took none, so its take is still unset.
@@ -2219,8 +2239,8 @@ impl Run<'_> {
             // The refused attempt's slot is let go below: the run holds nothing until it takes another.
             hold.took = None;
             let reason = refusal.reason;
-            match self.after_refusal(remote, current, refusal, &mut looked, console) {
-                Ok(next) => later = Some(next),
+            match self.after_refusal(remote, current, refusal, &mut walk, console) {
+                Ok(next) => walk.current = Some(next),
                 Err(remotely) => return (remotely, Some(reason)),
             }
         }
@@ -2237,14 +2257,14 @@ impl Run<'_> {
         first: &RemoteRun,
         current: &RemoteRun,
         refusal: Refusal,
-        looked: &mut usize,
+        walk: &mut Walk,
         console: &mut Console,
     ) -> Result<Box<RemoteRun>, Remotely> {
         let Refusal { reason, outcome, held } = refusal;
         let said = self.drop_warm_record(current, reason);
         self.forget_builder(current, reason, console);
         let host = self.give_up(reason, &outcome, held, console);
-        let next = match self.next_candidate(first, reason, looked, console) {
+        let next = match self.next_candidate(first, reason, walk, console) {
             Next::Interrupted => {
                 console.err(&fallback_head(&host, reason, outcome.detail.as_deref()));
                 return Err(Remotely::Ended(self.interrupted_before_start(console)));
@@ -2267,12 +2287,13 @@ impl Run<'_> {
         Ok(next)
     }
 
-    /// Where the routed run `first` goes after a fallback for `reason`: the first of its later candidates after the
-    /// `looked` already looked at that is built ([`route::later_run`]), each looked at counted, and one skipped for a
-    /// reason noted in the log naming it; here when the reason is not worth another builder ([`RETRIED`]) or no
-    /// candidate is left. A Ctrl+C raised before a candidate is built, or by the time its build returned, built or
-    /// skipped, ends the walk.
-    fn next_candidate(&self, first: &RemoteRun, reason: FallbackReason, looked: &mut usize, console: &mut Console) -> Next {
+    /// Where the routed run `first` goes after a fallback for `reason`: the first builder in score order the `walk` has
+    /// not tried, each looked at counted as tried, at most once a builder ([`Walk::tried`]): `first` itself when a
+    /// several-pool wait took another builder's slot, else the first of its later candidates that is built
+    /// ([`route::later_run`]), or was built for that wait, one skipped for a reason noted in the log naming it; here
+    /// when the reason is not worth another builder ([`RETRIED`]) or no builder is left. A Ctrl+C raised before a
+    /// candidate is built, or by the time its build returned, built or skipped, ends the walk.
+    fn next_candidate(&self, first: &RemoteRun, reason: FallbackReason, walk: &mut Walk, console: &mut Console) -> Next {
         if !RETRIED.contains(&reason) {
             return Next::Here;
         }
@@ -2280,10 +2301,21 @@ impl Run<'_> {
             return Next::Here;
         };
         let interrupted = || self.host.interrupt.is_some_and(Interrupt::is_raised);
-        while let Some(candidate) = first.later.get(*looked) {
-            *looked += 1;
+        if walk.tried.insert(first.builder.alias.clone()) {
             if interrupted() {
                 return Next::Interrupted;
+            }
+            return Next::Builder(Box::new(first.clone()));
+        }
+        for candidate in &first.later {
+            if !walk.tried.insert(candidate.alias.clone()) {
+                continue;
+            }
+            if interrupted() {
+                return Next::Interrupted;
+            }
+            if let Some(at) = walk.built.iter().position(|run| run.builder.alias == candidate.alias) {
+                return Next::Builder(Box::new(walk.built.remove(at)));
             }
             let built = self.build_candidate(decision, candidate, console);
             if interrupted() {
@@ -2318,23 +2350,29 @@ impl Run<'_> {
         }
     }
 
-    /// One builder's attempt of the routed run `remote`: takes a remote slot of the builder's pool into `hold`, waiting
-    /// only for what is left of the run's remote budget ([`wait::remote_budget`]) after the `waited` of its earlier
-    /// attempts, which this wait adds to, then calls the client ([`Run::call_builder`]). A full pool is a refusal. A
-    /// Ctrl+C ends the run here, with the remote slot released: one raised before the call, or during it over a refusal.
-    fn attempt(&mut self, remote: &RemoteRun, hold: &mut Hold, (waited, session): (&mut Duration, &str), console: &mut Console) -> Attempt {
-        let left = self.remote_left(*waited);
-        let begun = Instant::now();
+    /// One builder's attempt of the routed run `first`, on the builder the `walk` goes to now: takes a remote slot into
+    /// `hold`, waiting only for what is left of the run's remote budget ([`wait::remote_budget`]) after the time its
+    /// earlier attempts waited, which this wait adds to, then calls the client ([`Run::call_builder`]). When that
+    /// builder's pool has no room as the run queues, the wait lists every untried capable builder's pool at once
+    /// ([`Run::listed_runs`]), building their runs before the budget's clock starts, and the run goes to whichever
+    /// builder's slot frees first ([`Run::take_over`]). A full pool is a refusal; a several-pool wait that ran out leaves
+    /// every builder it listed tried. A Ctrl+C ends the run here, with the remote slot released: one raised before the
+    /// call, or during it over a refusal.
+    fn attempt(&mut self, first: &RemoteRun, walk: &mut Walk, hold: &mut Hold, console: &mut Console) -> Attempt {
         // A light run a critical request sent here counts its remote take's wait from its first queue line.
         let since = self.queued_at.filter(|_| self.rerouted_for.is_some());
-        let taking = self.take(
-            Pool::Remote(BuilderPool::of(&remote.builder)),
-            since,
-            Some(left),
-            &mut hold.taken,
-            console,
-        );
-        *waited += begun.elapsed();
+        let Some(listed) = self.listed_runs(first, walk, self.remote_left(walk.waited), console) else {
+            return Attempt::Done(Remotely::Ended(self.interrupted_before_start(console)));
+        };
+        // The budget counts the wait alone, not the builds of the listed builders' runs.
+        let left = self.remote_left(walk.waited);
+        let begun = Instant::now();
+        let current = walk.current.as_deref().unwrap_or(first);
+        let pool = Pool::Remote(BuilderPool::of(&current.builder));
+        let current_alias = current.builder.alias.clone();
+        let also: Vec<&RemoteRun> = listed.iter().collect();
+        let (taking, taken) = self.take_listed((pool, &also), since, Some(left), &mut hold.taken, console);
+        walk.waited += begun.elapsed();
         let figures = match taking {
             Taking::Took(took, figures) => {
                 hold.took = Some(took);
@@ -2342,15 +2380,114 @@ impl Run<'_> {
             }
             Taking::Lent(_) => unreachable!("only a local wait is lent a parent's slot"),
             Taking::Interrupted => return Attempt::Done(Remotely::Interrupted),
-            Taking::Full => return Attempt::refused(FallbackReason::Full, RemoteOutcome::default(), None),
+            Taking::Full => {
+                walk.tried.insert(current_alias);
+                walk.tried.extend(listed.into_iter().map(|run| run.builder.alias));
+                return Attempt::refused(FallbackReason::Full, RemoteOutcome::default(), None);
+            }
             Taking::HeldBack { .. } => unreachable!("only a local light wait is held back to route"),
         };
+        if let Err(line) = self.take_over(first, walk, (listed, taken)) {
+            return Attempt::refused(FallbackReason::Inputs, RemoteOutcome::not_started(line), hold.taken.take());
+        }
+        let run = walk.current.as_deref().unwrap_or(first);
         // A Ctrl+C that came once the remote slot was held, before the client was called, ends the run as an
         // interrupt before a command starts does here; the caller releases the slot with the run's tag.
         if self.host.interrupt.is_some_and(Interrupt::is_raised) {
             return Attempt::Done(Remotely::Ended(self.interrupted_before_start(console)));
         }
-        self.call_builder(remote, hold, (figures, session, waited), console)
+        self.call_builder(run, hold, (figures, &walk.session, &mut walk.waited), console)
+    }
+
+    /// Makes the builder whose slot a take of `listed`'s pools took, `taken` counted from 0 for the builder the walk
+    /// was on, the one the `walk` is on and tried, the other listed builders' runs kept built for the walk. A run that
+    /// came to another builder, whose route lines its take said ([`Run::take_listed`]), clears the worktree's
+    /// built-here record for it ([`Run::clear_built_here`]).
+    ///
+    /// # Errors
+    ///
+    /// The line saying the record cannot be removed, so the attempt is not sent.
+    fn take_over(&self, first: &RemoteRun, walk: &mut Walk, (mut listed, taken): (Vec<RemoteRun>, usize)) -> Result<(), String> {
+        if let Some(index) = taken.checked_sub(1) {
+            let run = listed.remove(index);
+            if let Some(passed) = walk.current.replace(Box::new(run)) {
+                walk.built.push(*passed);
+            }
+        }
+        walk.built.extend(listed);
+        let run = walk.current.as_deref().unwrap_or(first);
+        walk.tried.insert(run.builder.alias.clone());
+        if taken == 0 {
+            return Ok(());
+        }
+        self.clear_built_here(run)
+    }
+
+    /// The other capable builders a several-pool wait of this attempt lists after the builder the `walk` goes to, in
+    /// score order, each one's run built: none for a pinned run, a light run a critical request sent here, a run with
+    /// nothing left of its remote budget `left`, and none when the pool of the builder it goes to, or of any of them,
+    /// has room as the run queues, probed now: more free slots than live tickets ahead in it ([`PoolNow::has_room`]).
+    /// The run then queues on the builder it goes to alone, whose score already counted its pool's wait; the runs built
+    /// stay built for the walk, none counted tried. The candidates are every untried builder of the routed run `first`
+    /// that builds ([`Run::untried_runs`]). `None` when a Ctrl+C ended the walk as they were built.
+    fn listed_runs(&mut self, first: &RemoteRun, walk: &mut Walk, left: Duration, console: &mut Console) -> Option<Vec<RemoteRun>> {
+        if left.is_zero() || self.request.builder.is_some() || self.rerouted_for.is_some() {
+            return Some(Vec::new());
+        }
+        let current = BuilderPool::of(&walk.current.as_deref().unwrap_or(first).builder);
+        if wait::pools_now(self.root, &[current], &mut self.survey, console)[0].has_room() {
+            return Some(Vec::new());
+        }
+        let mut runs = self.untried_runs(first, walk, console)?;
+        let pools: Vec<BuilderPool> = runs.iter().map(|run| BuilderPool::of(&run.builder)).collect();
+        if !pools.is_empty()
+            && wait::pools_now(self.root, &pools, &mut self.survey, console)
+                .iter()
+                .any(PoolNow::has_room)
+        {
+            walk.built.append(&mut runs);
+        }
+        Some(runs)
+    }
+
+    /// The run of every builder of the routed run `first` the `walk` has not tried, other than the one it goes to, in
+    /// score order: `first` itself, then its later candidates, each taken from those built before or built now
+    /// ([`Run::build_candidate`]); one skipped as it is built counts as tried. `None` when a Ctrl+C was raised before a
+    /// candidate is looked at, or by the time its build returned, built or skipped, which ends the walk.
+    fn untried_runs(&self, first: &RemoteRun, walk: &mut Walk, console: &mut Console) -> Option<Vec<RemoteRun>> {
+        let Some(decision) = self.would.as_ref() else {
+            return Some(Vec::new());
+        };
+        let interrupted = || self.host.interrupt.is_some_and(Interrupt::is_raised);
+        let goes = walk.current.as_deref().unwrap_or(first).builder.alias.clone();
+        let untried = |alias: &str, walk: &Walk| alias != goes && !walk.tried.contains(alias);
+        let mut runs = Vec::new();
+        if untried(&first.builder.alias, walk) {
+            runs.push(first.clone());
+        }
+        for candidate in &first.later {
+            if !untried(&candidate.alias, walk) {
+                continue;
+            }
+            if interrupted() {
+                return None;
+            }
+            if let Some(at) = walk.built.iter().position(|run| run.builder.alias == candidate.alias) {
+                runs.push(walk.built.remove(at));
+                continue;
+            }
+            let built = self.build_candidate(decision, candidate, console);
+            if interrupted() {
+                return None;
+            }
+            match built {
+                Some(run) => runs.push(run),
+                None => {
+                    walk.tried.insert(candidate.alias.clone());
+                }
+            }
+        }
+        Some(runs)
     }
 
     /// What is left of the run's remote budget ([`wait::remote_budget`]) after `waited`, the time its remote waits took
@@ -3419,6 +3556,22 @@ impl Run<'_> {
     /// parent lent the run its slot, which deletes the ticket and wakes the waiters. A wait that said its waiting line
     /// makes the take say how long it waited, after the claim and its journal line and before the expected-time line.
     fn take(&mut self, pool: Pool, since: Option<Instant>, left: Option<Duration>, held: &mut Option<Taken>, console: &mut Console) -> Taking {
+        self.take_listed((pool, &[]), since, left, held, console).0
+    }
+
+    /// [`Run::take`] of a slot of `pool`, or, with `also` the other listed builders' pools in score order each with its
+    /// alias, of whichever listed pool frees a slot first ([`Wait::queue_listed`]), and which listed pool it took, 0 for
+    /// `pool`. The ticket is deleted straight after the take; then everything of the take follows the builder taken:
+    /// the run's remote tag names it, and its estimate, re-read for it, gives the claim's `expected`, the ceiling and
+    /// the expected-time line.
+    fn take_listed(
+        &mut self,
+        (pool, also): (Pool, &[&RemoteRun]),
+        since: Option<Instant>,
+        left: Option<Duration>,
+        held: &mut Option<Taken>,
+        console: &mut Console,
+    ) -> (Taking, usize) {
         let queued = since.unwrap_or_else(Instant::now);
         let estimate = self.estimate(console);
         let expected = estimate.as_ref().map(expected_field);
@@ -3445,7 +3598,11 @@ impl Run<'_> {
             },
             expected: expected.as_ref(),
         };
-        let mut wait = Wait::queue(self.root, pool, arrival, self.host, console);
+        let others: Vec<(BuilderPool, &str)> = also
+            .iter()
+            .map(|run| (BuilderPool::of(&run.builder), run.builder.alias.as_str()))
+            .collect();
+        let mut wait = Wait::queue_listed(self.root, (pool, &others), arrival, self.host, console);
         if let Some(left) = left {
             wait.limit_to(left);
         }
@@ -3457,9 +3614,9 @@ impl Run<'_> {
         if pool.is_remote() && self.rerouted_for.is_some() {
             wait.keep_spare();
         }
-        let taken = loop {
+        let (taken, index) = loop {
             match wait.until_taken(&mut self.survey, console) {
-                Waited::Taken(taken) => break held.insert(taken),
+                Waited::Taken { taken, pool } => break (held.insert(taken), pool),
                 Waited::Lent(beside) => {
                     let Some(figures) = self.lent_as_it_waits(beside, estimate.as_ref(), expected.as_ref(), console) else {
                         wait.refuse_lend();
@@ -3467,28 +3624,44 @@ impl Run<'_> {
                     };
                     wait.end(console);
                     slots::wake_waiters(self.root, &mut self.survey, console);
-                    return Taking::Lent(figures);
+                    return (Taking::Lent(figures), 0);
                 }
                 Waited::Interrupted => {
                     self.abandon(wait, pool, queued, console);
-                    return Taking::Interrupted;
+                    return (Taking::Interrupted, 0);
                 }
                 Waited::TimedOut => {
                     wait.end(console);
                     slots::wake_waiters(self.root, &mut self.survey, console);
-                    return Taking::Full;
+                    return (Taking::Full, 0);
                 }
                 Waited::HeldBack(by) => {
                     wait.end(console);
                     slots::wake_waiters(self.root, &mut self.survey, console);
-                    return Taking::HeldBack { by, queued };
+                    return (Taking::HeldBack { by, queued }, 0);
                 }
             }
         };
         let waited = queued.elapsed().as_secs_f64();
         let took_line = wait.took_line(waited);
+        // No listed pool is held back past the take: the ticket goes before any step of the builder taken.
         wait.end(console);
         let took = Instant::now();
+        let (pool, estimate, expected) = match index.checked_sub(1).map(|other| also[other]) {
+            None => (pool, estimate, expected),
+            Some(run) => {
+                // The builder taken says its route lines, as a later builder does, before its took line.
+                run.lines().iter().for_each(|line| console.err(line));
+                self.tag = Some(RemoteTag {
+                    host: run.builder.alias.clone(),
+                    key: run.key.clone(),
+                    critical_pid: self.rerouted_for,
+                });
+                let estimate = self.estimate(console);
+                let expected = estimate.as_ref().map(expected_field);
+                (Pool::Remote(BuilderPool::of(&run.builder)), estimate, expected)
+            }
+        };
         let parent_pid = self.nesting.uncovering().map(|parent| parent.pid);
         self.routing.parent_pid = parent_pid;
         let (figures, resolved) = Figures::resolved(self.request.timeout, estimate.as_ref());
@@ -3498,7 +3671,7 @@ impl Run<'_> {
             console.err(&line);
         }
         say_expected(estimate.as_ref(), resolved, console);
-        Taking::Took(took, figures)
+        (Taking::Took(took, figures), index)
     }
 
     /// The figures of a run its light parent lent its slot as it waited, the lend decided holding the beside mutex

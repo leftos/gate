@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use crate::durations::seed;
 use crate::nesting::{marked, test_marker};
 use crate::routing::{
-    BUSY_LINE, GIT_HANG_GUARDS, HOST, balance_case, has_no_remote_fields, has_remote_tag, names, own, repo, routed_case, routed_words,
+    BUSY_LINE, GIT_HANG_GUARDS, HOST, balance_case, has_no_remote_fields, has_remote_tag, hold_marker, names, own, repo, routed_case, routed_words,
     seed_faster_here, stub,
 };
 use crate::support::{
@@ -108,6 +108,7 @@ fn write_ticket(case: &Case, kind: TicketKind, (pid, start): (u32, Timestamp), a
         alone: false,
         remote: remote.then_some(true),
         pool: None,
+        also_pools: Vec::new(),
         pinned: None,
         reason: None,
         expected: None,
@@ -958,6 +959,43 @@ fn a_light_gate_behind_a_request_to_hold_the_machine_alone_routes() {
     assert!(call.exists(), "the builder ran the command: {outcome:?}");
     assert_rerouted(&own(&case, pid), critical_pid);
     held.finish();
+}
+
+/// A light run a critical request sends to a builder has none of the remote budget: its wait for the builder's full
+/// pool ends at once though a drain marker of that builder stands, and the run comes back here.
+#[test]
+fn a_wait_with_no_remote_budget_is_not_held_off_by_a_drain_marker() {
+    let case = reroute_case("a_wait_with_no_remote_budget_is_not_held_off_by_a_drain_marker", 1);
+    // Proven faster here, the light run stays here at its start, so the critical request can hold it back.
+    proven_faster_here(&case, &ROUTED_COMMAND, &[HOST]);
+    let remote_go = case.folder().join("remote-go");
+    let holder_steps = shown(&stub(&case, &[&format!("wait {}", shown(&remote_go))]));
+    let remote = case.start(&routed_words("remote.log", &holder_steps, &[], &ROUTED_COMMAND));
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, remote.id()));
+    let marker = hold_marker(&case, None);
+    let held = HeldBack::start(&case, true, 0);
+    let critical_pid = held.critical_pid();
+    let call = case.folder().join("call.json");
+    let steps = recording_stub(&case, &call);
+
+    let light = light_with_client(&case, "light.log", &steps, &POLL, &ROUTED_COMMAND);
+    let pid = light.id();
+    wait_for_journal_line(&case.root(), &format!(r#""event":"fallback","pid":{pid},"#));
+    held.finish();
+    let outcome = light.finish();
+    drop(marker);
+    let_go(&remote_go);
+    assert_passed(&remote.finish());
+
+    assert_passed(&outcome);
+    assert!(outcome.stderr.contains(&sent_to_builder(critical_pid)), "{outcome:?}");
+    assert!(!outcome.stderr.contains("still waiting for a remote slot"), "{outcome:?}");
+    assert!(!call.exists(), "the builder ran nothing: {outcome:?}");
+    let fallback = own(&case, pid)
+        .into_iter()
+        .find(|event| event["event"] == "fallback")
+        .expect("the run fell back");
+    assert_eq!((&fallback["reason"], &fallback["host"]), (&json!("full"), &json!(HOST)), "{fallback}");
 }
 
 /// A light run a critical request sends to a builder is not scored: its first try goes to the first builder listed,

@@ -20,7 +20,7 @@ use serde_json::{Map, Value};
 
 use crate::counts::{PoolCount, WRITE_ATTEMPTS, ignored_line, remove_if_present, with_retry, write_replacing, write_replacing_once};
 use crate::model::{SlotCount, SlotCounts, SlotKind};
-use crate::root::KernelObject;
+use crate::root::{KernelObject, PoolId};
 
 /// The only format version this module reads and the one it writes, as `v`.
 const FORMAT_VERSION: u64 = 1;
@@ -150,7 +150,7 @@ pub fn drain_dir(root: &Path) -> PathBuf {
 #[must_use]
 pub fn drain_marker_dir(root: &Path, id: Option<&str>) -> PathBuf {
     debug_assert_builder_id(id);
-    drain_dir(root).join(id.unwrap_or("host"))
+    drain_dir(root).join(id.unwrap_or(HOST_POOL))
 }
 
 /// The pending marker of the work folder `key`, `<root>\remote\<key>.outputs-pending`, whichever builder the run went
@@ -952,6 +952,11 @@ pub struct Ticket {
     /// `host`'s pool and for a local ticket.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool: Option<String>,
+    /// The other remote pools a routed run waits on at once when every capable builder is full, in score order after
+    /// `pool`: each a builder's pool id ([`crate::PoolId`]), or [`HOST_POOL`] for `host`'s pool, which has none. The
+    /// ticket waits in each of them as in `pool`. Written only when not empty; a reader skips an entry that is neither.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "listed_pools")]
+    pub also_pools: Vec<String>,
     /// True only for a run pinned to this builder with `--builder`, which no pick chose. Written only when true, so a
     /// ticket without it is not pinned.
     #[serde(default, skip_serializing_if = "is_not_true")]
@@ -964,6 +969,22 @@ pub struct Ticket {
     /// `null` reads as absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected: Option<Map<String, Value>>,
+}
+
+/// How a ticket's `alsoPools` names `host`'s pool, which has no id; the drain marker folder of `host` is named so too.
+pub const HOST_POOL: &str = "host";
+
+/// A ticket's `alsoPools` as read: the entries that are a pool id or [`HOST_POOL`], every other entry skipped, so an
+/// entry a later writer adds never makes the ticket unreadable. A value that is not a list does.
+fn listed_pools<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    let entries = Vec::<Value>::deserialize(deserializer)?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            Value::String(name) if name == HOST_POOL || PoolId::parse(&name).is_some() => Some(name),
+            _ => None,
+        })
+        .collect())
 }
 
 impl Ticket {
