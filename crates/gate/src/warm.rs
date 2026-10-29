@@ -21,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime};
 use gate_args::{DEFAULT_STALL_SECONDS, Spelling, TestSeams, WarmRequest};
 use gate_router::warm::{FailureClass, FileRead, Record, RecordRead, RecordState, WarmupFile, read_warmup, warmup_hash};
 use gate_router::{Config, Facts, Place, Target, builder_words, escaped, repo_name, stays_local, target};
+use gate_state::FallbackReason;
 use gate_state::v1::{self, WarmFailure, WarmRecord, WarmState};
 use gate_win32::{Interrupt, OwnedMutexGuard};
 use gate_wire::build_version;
@@ -507,7 +508,7 @@ fn warm_up(prepared: &Prepared<'_>, request: &WarmRequest, started: Timestamp, c
         })
         .ok();
     let mut held = Held::default();
-    let ending = attempt(prepared, &request.test_seams, interrupt, &mut held);
+    let ending = attempt(prepared, &request.test_seams, interrupt, &mut held, console);
     let status = conclude(ending, &record, request.background, console);
     drop(held);
     status
@@ -533,8 +534,9 @@ struct Held {
 }
 
 /// Runs the warm-up once its record says `warming`: the client chosen and ready, the key's mutex and the cap waited
-/// for into `held`, consent, the routing entry and the file read again, then the client's warm call; how it ended.
-fn attempt(prepared: &Prepared<'_>, seams: &TestSeams, interrupt: Option<Interrupt>, held: &mut Held) -> Ending {
+/// for into `held`, consent, the routing entry and the file read again, then the client's warm call, its builder listed
+/// on the worktree record as the call says ([`list_builder`]); how it ended.
+fn attempt(prepared: &Prepared<'_>, seams: &TestSeams, interrupt: Option<Interrupt>, held: &mut Held, console: &mut Console) -> Ending {
     let first = &prepared.first;
     let mut client = match remote::chosen(seams) {
         Ok(client) => client,
@@ -571,8 +573,25 @@ fn attempt(prepared: &Prepared<'_>, seams: &TestSeams, interrupt: Option<Interru
         hash: &late.hash,
     };
     match call_of(prepared, &log, interrupt, late.file.timeout_seconds, warmth) {
-        Ok(call) => ending_of(&client.run(&call), &late.hash),
+        Ok(call) => {
+            let outcome = client.run(&call);
+            list_builder(prepared, &outcome, console);
+            ending_of(&outcome, &late.hash)
+        }
         Err(why) => refused(&late.hash, why),
+    }
+}
+
+/// Lists the warm-up's builder on the worktree record of its key, under the key's mutex the warm-up holds, as a routed
+/// run lists its own: added once the box was asked to lay out or warm the work folder ([`RemoteOutcome::run_called`]),
+/// and taken off again by a `layout` refusal, which says the builder holds no usable work folder for the key.
+fn list_builder(prepared: &Prepared<'_>, outcome: &RemoteOutcome, console: &mut Console) {
+    let (state, key, host) = (&prepared.root.path, &prepared.target.key, &prepared.target.builder.alias);
+    if outcome.run_called {
+        worktree_record::add_builder(state, key, host, console);
+    }
+    if outcome.fallback() == Some(FallbackReason::Layout) {
+        worktree_record::remove_builder(state, key, host, console);
     }
 }
 

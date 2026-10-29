@@ -1069,15 +1069,17 @@ struct CallParts<'r> {
 /// until that barrier lapses, and is the outcome after. Any other poll the drain does not refuse starts a fresh attempt,
 /// whose outcome it is, unless the drain refused that attempt too, which says the waiting line again and waits again
 /// from the poll; a poll whose preflight passed is the builder's admission, and says the run's admitted line first.
-/// While it waits it holds its drain marker ([`drain::Marker`]), let go once the wait ends. `None` for a Ctrl+C during
+/// While it waits it holds its drain marker ([`drain::Marker`]), let go once the wait ends. `run_called` is set once
+/// `first` or any attempt of the wait began its run call, a wait a Ctrl+C ends included. `None` for a Ctrl+C during
 /// the wait.
 fn behind_drain(
     client: &mut dyn RemoteClient,
     call: &RemoteCall<'_>,
     first: RemoteOutcome,
-    request: &RunRequest,
+    (request, run_called): (&RunRequest, &mut bool),
     console: &mut Console,
 ) -> Option<Behind> {
+    *run_called |= first.run_called;
     let Some(mut drain) = first.draining else {
         return Some(Behind {
             outcome: first,
@@ -1111,6 +1113,7 @@ fn behind_drain(
         }
         let admitted = Instant::now();
         let ran = client.run(call);
+        *run_called |= ran.run_called;
         match ran.draining {
             Some(again) => drain = again,
             None => {
@@ -1130,6 +1133,8 @@ struct SlotWait<'w> {
     request: &'w RunRequest,
     left: Duration,
     waited: &'w mut Duration,
+    /// Set once any call of the attempt began its run call, however the waits end, a Ctrl+C included.
+    run_called: &'w mut bool,
 }
 
 /// The outcome a routed run of `call` goes on with once `first`, the outcome of its call, ended. Each call of the
@@ -1145,10 +1150,15 @@ fn after_waits(
     wait: SlotWait<'_>,
     console: &mut Console,
 ) -> Option<Behind> {
-    let SlotWait { request, left, waited } = wait;
+    let SlotWait {
+        request,
+        left,
+        waited,
+        run_called,
+    } = wait;
     let (mut outcome, mut admitted, mut spent) = (first, None, Duration::ZERO);
     loop {
-        let behind = behind_drain(client, call, outcome, request, console)?;
+        let behind = behind_drain(client, call, outcome, (request, &mut *run_called), console)?;
         admitted = behind.admitted.or(admitted);
         outcome = behind.outcome;
         let rest = left.saturating_sub(spent);
@@ -1172,6 +1182,7 @@ fn after_waits(
             SlotEnd::Polled => {
                 admitted = Some(Instant::now());
                 outcome = client.run(call);
+                *run_called |= outcome.run_called;
             }
         }
     }
@@ -1789,7 +1800,7 @@ impl Run<'_> {
             placed: place,
             warm_hash,
             decision,
-        } = route::route(self.request, environment, covering, &self.root.path, console);
+        } = route::route(self.request, environment, covering, (self.root, &self.gate), console);
         self.warm_hash = warm_hash;
         self.would = Some(decision);
         self.tag = match &route {
@@ -2197,6 +2208,7 @@ impl Run<'_> {
                 let Refusal { reason, outcome, held } = refusal;
                 hold.taken = held;
                 let said = self.drop_warm_record(current, reason);
+                self.forget_builder(current, reason, console);
                 return (self.pin_ended(reason, &outcome, said.as_deref(), console), Some(reason));
             }
             // The refused attempt's slot is let go below: the run holds nothing until it takes another.
@@ -2225,6 +2237,7 @@ impl Run<'_> {
     ) -> Result<Box<RemoteRun>, Remotely> {
         let Refusal { reason, outcome, held } = refusal;
         let said = self.drop_warm_record(current, reason);
+        self.forget_builder(current, reason, console);
         let host = self.give_up(reason, &outcome, held, console);
         let next = match self.next_candidate(first, reason, looked, console) {
             Next::Interrupted => {
@@ -2377,14 +2390,22 @@ impl Run<'_> {
             Err(why) => return Attempt::refused(FallbackReason::Client, RemoteOutcome::not_started(why), hold.taken.take()),
         };
         let first = self.client.run(&call);
+        let mut run_called = false;
         let wait = SlotWait {
             request: self.request,
             left: self.remote_left(*waited),
             waited,
+            run_called: &mut run_called,
         };
         // A full builder is waited for within the run's remote budget, and a drain's refusal is no fallback: the run
         // waits behind it, and goes on with the outcome of its admitted attempt.
-        let Some(Behind { outcome, admitted }) = after_waits(self.client.as_mut(), &call, first, wait, console) else {
+        let behind = after_waits(self.client.as_mut(), &call, first, wait, console);
+        // Under the key lock the run holds: a run call that began, however the attempt ended, a Ctrl+C during a wait
+        // after it included, left the builder a work folder.
+        if run_called {
+            worktree_record::add_builder(&self.root.path, &remote.key, &remote.builder.alias, console);
+        }
+        let Some(Behind { outcome, admitted }) = behind else {
             return Attempt::Done(Remotely::Ended(self.interrupted_before_start(console)));
         };
         // A wait for a builder slot or behind the drain is no part of the run's time: its slot's hold and its wall time
@@ -2401,8 +2422,15 @@ impl Run<'_> {
         }
         let fallback = outcome.fallback();
         // A Ctrl+C during the call wins over a refusal: the command never runs here.
-        if fallback.is_some() && interrupted {
-            return Attempt::Done(Remotely::Ended(self.interrupted_before_start(console)));
+        if let Some(reason) = fallback.filter(|_| interrupted) {
+            // A `layout` refusal says the builder holds no usable work folder, whatever ended the run.
+            let said = self.drop_warm_record(remote, reason);
+            self.forget_builder(remote, reason, console);
+            let ended = self.interrupted_before_start(console);
+            if let Some(line) = said {
+                console.err(&line);
+            }
+            return Attempt::Done(Remotely::Ended(ended));
         }
         if let Some(reason) = fallback {
             return Attempt::refused(reason, outcome, hold.taken.take());
@@ -2445,6 +2473,15 @@ impl Run<'_> {
                 gate_router::escaped(&error.to_string())
             )),
             _ => None,
+        }
+    }
+
+    /// Takes the builder of `remote` off the worktree record's builders after its refusal for `reason`, while the run
+    /// still holds the work folder's key: a `layout` refusal says the builder holds no usable work folder for it; any
+    /// other reason keeps it listed.
+    fn forget_builder(&self, remote: &RemoteRun, reason: FallbackReason, console: &mut Console) {
+        if reason == FallbackReason::Layout {
+            worktree_record::remove_builder(&self.root.path, &remote.key, &remote.builder.alias, console);
         }
     }
 
@@ -5080,6 +5117,234 @@ mod tests {
     use gate_state::v1::{Claim, ClaimKind};
     use jiff::Timestamp;
     use serde_json::{Map, Value};
+
+    /// The waits after a routed run's call ([`super::after_waits`]), driven by a client of the unit tests' own.
+    #[cfg(feature = "test-seams")]
+    mod waits {
+        use std::collections::VecDeque;
+        use std::path::Path;
+        use std::time::Duration;
+
+        use gate_args::Slot;
+        use gate_state::FallbackReason;
+        use gate_win32::Interrupt;
+        use jiff::Timestamp;
+
+        use crate::console::Console;
+        use crate::remote::drain::Drain;
+        use crate::remote::{REFUSED, RemoteCall, RemoteClient, RemoteOutcome};
+        use crate::run::{SlotWait, after_waits};
+        use crate::wait::scratch::{Scratch, request};
+
+        /// A client each of whose calls began its run call and ended as `ended` makes it, and whose drain or slot poll
+        /// raises the interrupt, as a Ctrl+C during the wait does, before it answers the same.
+        struct BeganThenInterrupted {
+            ended: fn() -> RemoteOutcome,
+            interrupt: Interrupt,
+        }
+
+        impl RemoteClient for BeganThenInterrupted {
+            fn run(&mut self, _call: &RemoteCall<'_>) -> RemoteOutcome {
+                (self.ended)()
+            }
+
+            fn poll_drain(&mut self, _call: &RemoteCall<'_>) -> RemoteOutcome {
+                self.interrupt.raise();
+                (self.ended)()
+            }
+        }
+
+        /// A refusal `full` of a call whose run call began.
+        fn full_after_the_run_call() -> RemoteOutcome {
+            RemoteOutcome {
+                status: REFUSED,
+                reason: Some(FallbackReason::Full),
+                run_called: true,
+                ..RemoteOutcome::default()
+            }
+        }
+
+        /// The drain's refusal of a call whose run call began.
+        fn drained_after_the_run_call() -> RemoteOutcome {
+            let now = Timestamp::now().as_second();
+            RemoteOutcome {
+                status: REFUSED,
+                draining: Some(Drain {
+                    place: Some(1),
+                    raised: now - 60,
+                    lapses: now + 1800,
+                }),
+                run_called: true,
+                ..RemoteOutcome::default()
+            }
+        }
+
+        /// The call of a routed run of `HOST` under the scratch root `scratch`, logging to `log`, seeing `interrupt`.
+        fn waiting_call<'a>(scratch: &'a Scratch, log: &'a Path, interrupt: Interrupt) -> RemoteCall<'a> {
+            RemoteCall {
+                cross_build: None,
+                builder: &crate::test_support::HOST,
+                key: "app-1a2b3c4d",
+                session: "0123456789abcdef0123456789abcdef",
+                root: r"C:\no-such-worktree",
+                root_id: gate_router::FolderId { volume: 0, file: [0; 16] },
+                leaf: "app",
+                siblings: Vec::new(),
+                repo: "app",
+                subfolder: "",
+                words: &[],
+                outputs: &[],
+                outputs_withheld: false,
+                bins_withheld: false,
+                failure_outputs: &[],
+                dropped_no_build: false,
+                send: None,
+                desktop: false,
+                inputs: &[],
+                log,
+                timeout: 3600,
+                usual: None,
+                stall: 0,
+                tail: 0,
+                no_markers: false,
+                bring_tracked: &[],
+                env: &[],
+                interrupt: Some(interrupt),
+                state: &scratch.root.root,
+                state_dir: scratch.path(),
+                warmth: crate::remote::Warmth::Unasked,
+            }
+        }
+
+        #[test]
+        fn a_ctrl_c_ending_a_full_or_drain_wait_after_the_run_call_began_still_lists_the_builder() {
+            let scratch = Scratch::new("ctrl-c-after-run-call");
+            let log = scratch.path().join("out.log");
+            let interrupt = Interrupt::install().expect("the console handler is installed");
+            let mut request = request(Slot::Heavy);
+            request.test_seams.drain_poll_ms = Some(1);
+            let call = waiting_call(&scratch, &log, interrupt);
+            // The slot wait comes first: once the interrupt is raised, a refusal `full` waits no more, while a drain's
+            // refusal still waits, and its first sleep meets the raised interrupt.
+            for ended in [full_after_the_run_call as fn() -> RemoteOutcome, drained_after_the_run_call] {
+                let mut client = BeganThenInterrupted { ended, interrupt };
+                let (mut waited, mut run_called) = (Duration::ZERO, false);
+                let wait = SlotWait {
+                    request: &request,
+                    left: Duration::from_secs(3600),
+                    waited: &mut waited,
+                    run_called: &mut run_called,
+                };
+                let mut console = Console::new();
+
+                let behind = after_waits(&mut client, &call, ended(), wait, &mut console);
+
+                assert!(behind.is_none(), "the Ctrl+C ends the wait");
+                assert!(run_called, "the run call began, so the builder is listed: {:?}", ended());
+            }
+        }
+
+        /// A client answering each run call and each drain or slot poll in turn from its lists, each answer raising
+        /// the interrupt first when it says so, as a Ctrl+C during that call does.
+        struct Scripted {
+            runs: VecDeque<(RemoteOutcome, bool)>,
+            polls: VecDeque<(RemoteOutcome, bool)>,
+            interrupt: Interrupt,
+        }
+
+        impl Scripted {
+            fn answer(&self, (outcome, raises): (RemoteOutcome, bool)) -> RemoteOutcome {
+                if raises {
+                    self.interrupt.raise();
+                }
+                outcome
+            }
+        }
+
+        impl RemoteClient for Scripted {
+            fn run(&mut self, _call: &RemoteCall<'_>) -> RemoteOutcome {
+                let next = self.runs.pop_front().expect("a run call the test planned");
+                self.answer(next)
+            }
+
+            fn poll_drain(&mut self, _call: &RemoteCall<'_>) -> RemoteOutcome {
+                let next = self.polls.pop_front().expect("a poll the test planned");
+                self.answer(next)
+            }
+        }
+
+        /// A refusal `full`, by the box's run call when `run_called`, else by its preflight.
+        fn full(run_called: bool) -> RemoteOutcome {
+            RemoteOutcome {
+                run_called,
+                ..full_after_the_run_call()
+            }
+        }
+
+        /// The drain's refusal, by the box's run call when `run_called`, else by its preflight.
+        fn drained(run_called: bool) -> RemoteOutcome {
+            RemoteOutcome {
+                run_called,
+                ..drained_after_the_run_call()
+            }
+        }
+
+        /// Runs `after_waits` for `client` from its `first` outcome, a call its preflight refused; whether the wait
+        /// ended by the Ctrl+C, and the flag `call_builder` reads to list the builder.
+        fn waited(test: &str, first: RemoteOutcome, runs: Vec<(RemoteOutcome, bool)>, polls: Vec<(RemoteOutcome, bool)>) -> (bool, bool) {
+            let scratch = Scratch::new(test);
+            let log = scratch.path().join("out.log");
+            let interrupt = Interrupt::install().expect("the console handler is installed");
+            let mut request = request(Slot::Heavy);
+            request.test_seams.drain_poll_ms = Some(1);
+            let call = waiting_call(&scratch, &log, interrupt);
+            let mut client = Scripted {
+                runs: runs.into(),
+                polls: polls.into(),
+                interrupt,
+            };
+            let (mut waited, mut run_called) = (Duration::ZERO, false);
+            let wait = SlotWait {
+                request: &request,
+                left: Duration::from_secs(3600),
+                waited: &mut waited,
+                run_called: &mut run_called,
+            };
+            let behind = after_waits(&mut client, &call, first, wait, &mut Console::new());
+            assert!(client.runs.is_empty() && client.polls.is_empty(), "every planned call was made");
+            (behind.is_none(), run_called)
+        }
+
+        #[test]
+        fn a_ctrl_c_ending_a_slot_wait_after_a_later_call_began_its_run_call_still_lists_the_builder() {
+            // The preflight refuses full; the first poll passes, and the call after it is refused full at its run
+            // call; a Ctrl+C during the second poll ends the wait.
+            let (interrupted, run_called) = waited(
+                "slot-wait-later-run-call",
+                full(false),
+                vec![(full(true), false)],
+                vec![(RemoteOutcome::default(), false), (full(false), true)],
+            );
+
+            assert!(interrupted, "the Ctrl+C ends the wait");
+            assert!(run_called, "a later call began its run call, so the builder is listed");
+        }
+
+        #[test]
+        fn a_ctrl_c_ending_a_drain_wait_after_a_later_call_began_its_run_call_still_lists_the_builder() {
+            // The preflight meets the drain; the first poll passes, and the drain refuses the call after it at its
+            // run call; a Ctrl+C during the second poll ends the wait.
+            let (interrupted, run_called) = waited(
+                "drain-wait-later-run-call",
+                drained(false),
+                vec![(drained(true), false)],
+                vec![(RemoteOutcome::default(), false), (drained(false), true)],
+            );
+
+            assert!(interrupted, "the Ctrl+C ends the wait");
+            assert!(run_called, "a later call began its run call, so the builder is listed");
+        }
+    }
 
     #[test]
     fn stale_folders_are_not_judged_by_a_glob_naming_tmp() {

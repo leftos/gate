@@ -5920,6 +5920,292 @@ fn a_builder_slot_wait_that_spends_the_budget_hands_the_run_to_the_next_builder(
     assert_eq!((took(SLOT_FIRST), took(HOST)), (1, 1), "{own:#?}");
 }
 
+/// A [`routed_case`] whose routing file sends its `*tool*` commands to the `builders` entry [`SLOT_FIRST`], a Windows
+/// builder listed first, and to [`HOST`], each with one remote slot on this PC.
+pub(crate) fn balance_case(name: &str) -> Case {
+    let case = routed_case(name);
+    let routing = json!({
+        "host": HOST,
+        "repos": { repo(&case): ["*tool*"] },
+        "builders": [{ "host": SLOT_FIRST, "os": "windows", "repos": { repo(&case): ["*tool*"] } }],
+    });
+    write_remote_json(&case, &routing.to_string());
+    case
+}
+
+/// The builder each `take` line of the gate `pid` names, in order.
+fn took_on(case: &Case, pid: u32) -> Vec<String> {
+    own(case, pid)
+        .iter()
+        .filter(|event| event["event"] == "take")
+        .map(|event| event["host"].as_str().unwrap_or("here").to_owned())
+        .collect()
+}
+
+/// A routed run of a [`balance_case`] whose scripted client records its call at `call.json` and passes; its pid and
+/// outcome, and the call it recorded.
+fn balanced_run(case: &Case, log: &str) -> (u32, Outcome, Value) {
+    let call = case.folder().join(format!("{log}.call.json"));
+    let steps = shown(&stub(case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let running = case.start(&routed_words(log, &steps, &[], &[r".\tool.exe", "out", "ran there"]));
+    let pid = running.id();
+    let outcome = running.finish();
+    assert!(call.exists(), "the builder was called: {outcome:?}");
+    let recorded = fs::read_to_string(&call).expect("the call can be read");
+    (pid, outcome, serde_json::from_str(&recorded).expect("the call is JSON"))
+}
+
+/// Writes the worktree record of the case's worktree, listing `builders` as holding its work folder.
+fn plant_worktree_record(case: &Case, builders: &[&str]) {
+    let root = git(case, &["rev-parse", "--show-toplevel"]);
+    let common = git(case, &["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    let path = case.root().join("remote").join(format!("{}.worktree", work_folder_key(&root)));
+    fs::create_dir_all(path.parent().expect("the record has a folder")).expect("the remote folder can be made");
+    let record = json!({ "v": 1, "root": root, "commonDir": common, "repo": repo(case), "lastRouted": "2026-10-21T12:00:00Z", "builders": builders });
+    fs::write(&path, record.to_string()).expect("the record can be written");
+}
+
+/// Files five passing runs of the [`balanced_run`] command on [`SLOT_FIRST`], pinned there, then rewrites the case's
+/// store so the command's runs took `first` wall seconds on [`SLOT_FIRST`] and `next` on [`HOST`].
+fn seed_both(case: &Case, first: f64, next: f64) {
+    let steps = shown(&stub(case, &["status 0"]));
+    for index in 0..5 {
+        let log = format!("seed-{index}.log");
+        let outcome = finish(case.gate(&routed_words(
+            &log,
+            &steps,
+            &["--builder", SLOT_FIRST],
+            &[r".\tool.exe", "out", "ran there"],
+        )));
+        assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    }
+    let path = case.root().join("durations.json");
+    let mut store: Value = serde_json::from_str(&fs::read_to_string(&path).expect("the store was written")).expect("the store is JSON");
+    let keys = store["keys"].as_object_mut().expect("the store holds its keys");
+    let prefix = format!("remote:{SLOT_FIRST}");
+    let (key, history) = keys
+        .iter()
+        .find(|(key, _)| key.starts_with(&prefix))
+        .map(|(key, history)| (key.clone(), history.clone()))
+        .expect("the runs are filed on the first builder");
+    let rest = key.strip_prefix(&prefix).expect("the key starts with its place").to_owned();
+    for (place, wall) in [(SLOT_FIRST, first), (HOST, next)] {
+        let mut seeded = history.clone();
+        for sample in seeded["samples"].as_array_mut().expect("a history holds its samples") {
+            sample["wall"] = Value::from(wall);
+        }
+        keys.insert(format!("remote:{place}{rest}"), seeded);
+    }
+    fs::write(&path, store.to_string()).expect("the store can be seeded");
+}
+
+#[test]
+fn a_builder_with_a_free_slot_wins_over_a_full_builder_listed_first() {
+    let case = balance_case("routing-balance-free-slot");
+    let go = case.folder().join("go");
+    let holder_steps = shown(&stub(&case, &[&format!("wait {}", shown(&go))]));
+    let holder = case.start(&routed_words(
+        "holder.log",
+        &holder_steps,
+        &["--builder", SLOT_FIRST],
+        &[r".\tool.exe", "out", "hi"],
+    ));
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, holder.id()));
+
+    let (pid, outcome, call) = balanced_run(&case, "out.log");
+    let_go(&go);
+    assert_eq!(holder.finish().code, Some(0));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "take", "release"], "the full builder is never tried: {own:#?}");
+    assert_eq!(took_on(&case, pid), [HOST], "{outcome:?}");
+    assert_eq!(call["host"], HOST, "{call}");
+}
+
+#[test]
+fn a_builder_holding_the_worktree_s_folder_wins_when_durations_tie() {
+    let case = balance_case("routing-balance-folder");
+    plant_worktree_record(&case, &[HOST]);
+
+    let (pid, outcome, call) = balanced_run(&case, "out.log");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(took_on(&case, pid), [HOST], "{outcome:?}");
+    assert_eq!(call["host"], HOST, "{call}");
+}
+
+#[test]
+fn a_faster_builder_wins_over_a_warm_one_more_than_twice_as_slow() {
+    let case = balance_case("routing-balance-faster");
+    seed_both(&case, 100.0, 40.0);
+    plant_worktree_record(&case, &[SLOT_FIRST, HOST]);
+
+    let (pid, outcome, call) = balanced_run(&case, "out.log");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(took_on(&case, pid), [HOST], "{outcome:?}");
+    assert_eq!(call["host"], HOST, "{call}");
+}
+
+#[test]
+fn with_nothing_known_the_first_builder_in_file_order_takes_the_run() {
+    let case = balance_case("routing-balance-nothing-known");
+
+    let (pid, outcome, call) = balanced_run(&case, "out.log");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(took_on(&case, pid), [SLOT_FIRST], "{outcome:?}");
+    assert_eq!(call["host"], SLOT_FIRST, "{call}");
+}
+
+/// A [`client_case`] whose routing file lists [`SLOT_FIRST`] before [`HOST`], both taking its `*tool*` commands, each
+/// builder laying its work folder out under a folder of its own; with the folders part of the run's transport.
+fn two_folder_case(name: &str) -> (Case, String) {
+    let case = client_case(name);
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({
+        "host": HOST,
+        "repos": { &repo: ["*tool*"] },
+        "outputs": { &repo: [] },
+        "builders": [{ "host": SLOT_FIRST, "os": "windows", "repos": { &repo: ["*tool*"] } }],
+    });
+    write_remote_json(&case, &routing.to_string());
+    let (first, next) = (case.folder().join("builder").join("a"), case.folder().join("builder").join("b"));
+    for folder in [&first, &next] {
+        fs::create_dir_all(folder).expect("a builder's folder can be made");
+    }
+    let folders = format!("{SLOT_FIRST}={}|{HOST}={}", shown(&first), shown(&next));
+    (case, folders)
+}
+
+/// A routed run of `case` through the stand-in of the steps file `steps`, each builder under its folder of `folders`.
+fn two_folder_run(case: &Case, log: &str, steps: &Path, folders: &str) -> Outcome {
+    let tuned = Tuned {
+        folders: Some(folders),
+        ..Tuned::default()
+    };
+    finish(client_gate_tuned(case, log, steps, &tuned, &[r".\tool.exe", "out", "ran there"]))
+}
+
+/// The worktree record of the case's one work-folder key, `<root>\remote\<key>.worktree`.
+fn worktree_record_of(case: &Case) -> PathBuf {
+    let remote = case.root().join("remote");
+    let records: Vec<PathBuf> = fs::read_dir(&remote)
+        .expect("the remote folder can be listed")
+        .map(|entry| entry.expect("an entry can be read").path())
+        .filter(|path| path.extension() == Some(OsStr::new("worktree")))
+        .collect();
+    assert_eq!(records.len(), 1, "one worktree record: {records:?}");
+    records.into_iter().next().expect("one record")
+}
+
+/// The `builders` of the case's worktree record, in their order; none when the record has no such key.
+fn worktree_builders(case: &Case) -> Vec<String> {
+    let text = fs::read_to_string(worktree_record_of(case)).expect("the worktree record can be read");
+    let record: Value = serde_json::from_str(&text).expect("the worktree record is JSON");
+    record
+        .get("builders")
+        .map(|builders| serde_json::from_value(builders.clone()).expect("the builders are a list of aliases"))
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_routed_run_s_run_call_adds_its_builder_to_the_worktree_record() {
+    let (case, folders) = two_folder_case("routing-record-adds");
+    let first = ssh_steps(&case, "first", &["ok", "ok"]);
+    let outcome = two_folder_run(&case, "first.log", &first, &folders);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(worktree_builders(&case), [SLOT_FIRST], "the first builder ran it");
+
+    // The first builder turns the second run away at its preflight; host's run call adds host after it, once.
+    let second = ssh_steps(&case, "second", &["on builder-a", "version 0.0.0-other", "on builder", "ok", "ok"]);
+    let outcome = two_folder_run(&case, "second.log", &second, &folders);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&second), ["preflight", "preflight", "run"], "{outcome:?}");
+    assert_eq!(worktree_builders(&case), [SLOT_FIRST, HOST], "in the order each was first added");
+
+    let third = ssh_steps(&case, "third", &["ok", "ok"]);
+    let outcome = two_folder_run(&case, "third.log", &third, &folders);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(worktree_builders(&case), [SLOT_FIRST, HOST], "a builder already listed is listed once");
+}
+
+#[test]
+fn a_run_refused_at_preflight_adds_no_builder_to_the_worktree_record() {
+    let (case, folders) = two_folder_case("routing-record-preflight");
+    let steps = ssh_steps(&case, "ssh", &["on builder-a", "version 0.0.0-other", "on builder", "ok", "ok"]);
+
+    let outcome = two_folder_run(&case, "out.log", &steps, &folders);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        has_line(&outcome.stderr, &format!("gate: remote {SLOT_FIRST} version; trying {HOST}")),
+        "{outcome:?}"
+    );
+    assert_eq!(worktree_builders(&case), [HOST], "only the builder whose run call began");
+}
+
+/// The box refuses the run `tools` at its run call, after the preflight passed: the run call began, so the builder is
+/// listed though the command ran here.
+#[test]
+fn a_refusal_at_the_run_call_still_adds_its_builder_to_the_worktree_record() {
+    let case = client_case("routing-record-run-call-refused");
+    fs::create_dir_all(case.folder().join(".config")).expect("the tools folder can be made");
+    fs::write(case.folder().join(".config").join("dotnet-tools.json"), "{\n  \"version\": 1\n}\n").expect("the manifest can be written");
+    let stub = case.folder().join("ssh").join("stub");
+    fs::create_dir_all(&stub).expect("the stub's folder can be made");
+    fs::write(stub.join("dotnet.cmd"), "@exit /b 1\r\n").expect("the stub dotnet can be written");
+    let own_path = std::env::var_os("PATH").expect("PATH is set");
+    let path = std::env::join_paths(std::iter::once(stub).chain(std::env::split_paths(&own_path))).expect("the folders join into a PATH");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let mut gate = client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran"]);
+    gate.env("PATH", path);
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), ["tools"], "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "{outcome:?}");
+    assert_eq!(worktree_builders(&case), [HOST]);
+}
+
+/// The box cannot clear the work folder, whose layout record says another layout, for a file held open in it, so it
+/// refuses the run `layout` at its run call: the refusing builder leaves the record, and another builder stays.
+#[test]
+fn a_layout_refusal_takes_the_refusing_builder_off_the_worktree_record() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let case = client_case("routing-record-layout");
+    let first = ssh_steps(&case, "first", &["ok", "ok"]);
+    let outcome = finish(client_gate(&case, "first.log", &first, &[r".\tool.exe", "out", "ran there"]));
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(worktree_builders(&case), [HOST]);
+    let record = worktree_record_of(&case);
+    let mut written: Value = serde_json::from_str(&fs::read_to_string(&record).expect("the record can be read")).expect("JSON");
+    written["builders"] = json!(["other", HOST]);
+    fs::write(&record, written.to_string()).expect("the record can be rewritten");
+    let key = record.file_stem().expect("the record has a name").to_string_lossy().into_owned();
+    let work = case.folder().join("builder").join("work").join(&key);
+    fs::write(format!("{}.layout", shown(&work)), "pair app lib").expect("the layout record can be written");
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(work.join("held.txt"))
+        .expect("a file in the work folder can be held");
+    let second = ssh_steps(&case, "second", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "second.log", &second, &[r".\tool.exe", "out", "ran"]));
+    drop(held);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: remote builder layout; running here"), "{outcome:?}");
+    assert_eq!(worktree_builders(&case), ["other"]);
+}
+
 /// A Ctrl+C during the wait for a builder slot ends the run before its command started, its remote slot released.
 #[test]
 fn a_ctrl_c_in_the_builder_slot_wait_ends_the_run_and_frees_the_remote_slot() {

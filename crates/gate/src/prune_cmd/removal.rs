@@ -62,7 +62,9 @@ pub(super) fn removed(removal: &Removal<'_>, records: &[&Scanned], outcomes: &Ou
 /// Removes what the PC keeps of the key of `scanned`, which `builders` answered for, when any of them pruned it: under
 /// the key's mutex taken without waiting, and only while the record on disk is still the one the sweep judged, which
 /// it leaves for the next sweep, silently, when it changed or cannot be read. A builder's own files that cannot be
-/// removed keep the shared ones and the record too, so the next sweep tries the key again.
+/// removed keep the shared ones and the record too, so the next sweep tries the key again. A record kept because only
+/// some builders pruned the key no longer lists those builders among the ones holding a work folder; a rewrite of it
+/// that fails is said, and is a failure.
 fn key_removed(removal: &Removal<'_>, scanned: &Scanned, builders: &[(Option<String>, Outcome)], console: &mut Console) -> Removed {
     let (state, key) = (&removal.state.path, &scanned.key);
     if !builders.iter().any(|(_, outcome)| *outcome == Outcome::Removed) {
@@ -86,9 +88,34 @@ fn key_removed(removal: &Removal<'_>, scanned: &Scanned, builders: &[(Option<Str
         return Removed::Failed;
     }
     if !every_removed(builders) {
-        return Removed::Kept;
+        // The record is kept for the builders that still hold the key: those that pruned it no longer hold a folder.
+        let pruned = pruned_aliases(removal.config, &scanned.record, builders);
+        return match worktree_record::remove_builders(state, key, &pruned) {
+            Ok(()) => Removed::Kept,
+            Err(line) => {
+                console.err(&line);
+                Removed::Failed
+            }
+        };
     }
     shared_removed(removal, scanned, console)
+}
+
+/// The aliases among the `builders` of `record` whose builder, as `config` names it ([`Config::named_builder`]), pruned
+/// the key by `answered`, each builder's id and what it did; an alias the file no longer names stays listed.
+fn pruned_aliases<'r>(config: &Config, record: &'r v1::WorktreeRecord, answered: &[(Option<String>, Outcome)]) -> Vec<&'r str> {
+    record
+        .builders
+        .iter()
+        .filter(|alias| {
+            config
+                .named_builder(alias)
+                .ok()
+                .flatten()
+                .is_some_and(|builder| answered.contains(&(builder.id, Outcome::Removed)))
+        })
+        .map(String::as_str)
+        .collect()
 }
 
 /// Removes, under the state root `state`, the own files of `key` of each of `builders` that pruned it, saying each
@@ -287,9 +314,10 @@ fn key_ref(name: &str, key: &str) -> bool {
 #[expect(clippy::expect_used, reason = "a test that cannot write or read its files must fail loudly")]
 mod tests {
     use std::fs;
+    use std::os::windows::fs::OpenOptionsExt;
     use std::path::Path;
 
-    use gate_router::Config;
+    use gate_router::{Config, builder_id};
     use gate_state::{StateRoot, v1};
 
     use super::{BACK_KEPT, Removal, builders_removed, every_removed, key_ref, own_files, removed, shared_files, young};
@@ -298,6 +326,7 @@ mod tests {
     use crate::remote::git::Git;
     use crate::resolve::ResolvedRoot;
     use crate::test_support::temp_dir;
+    use crate::worktree_record;
 
     const KEY: &str = "app-1a2b3c4d";
     const ID: &str = "9f8e7d6c";
@@ -327,6 +356,7 @@ mod tests {
             repo: "app".to_owned(),
             last_routed: "2026-10-01T00:00:00Z".parse().expect("a time"),
             gone_since: since.map(|since| since.parse().expect("a time")),
+            builders: Vec::new(),
         }
     }
 
@@ -391,6 +421,83 @@ mod tests {
         assert!(!failed, "a record rewritten since is no failure");
         assert!(all_there(&own) && all_there(&shared) && path.exists(), "nothing is removed");
         assert!(console.take_notes().is_empty(), "nothing is said");
+    }
+
+    /// Prunes a gone worktree's key that `host` pruned and the other builder still holds, its record listing `host`,
+    /// the other builder and one the routing file no longer names, in a fresh state root `name`, with `meanwhile` run
+    /// on the record's path just before: whether the removal failed, the notes it said, and the record's path.
+    fn partially_pruned(name: &str, meanwhile: impl FnOnce(&Path) -> Option<fs::File>) -> (bool, Vec<String>, std::path::PathBuf) {
+        let state = fresh(name);
+        let path = v1::worktree_record_path(&state, KEY);
+        let gone = v1::WorktreeRecord {
+            builders: vec!["builder-1".to_owned(), "other".to_owned(), "retired".to_owned()],
+            ..record(Some("2026-10-02T00:00:00Z"))
+        };
+        written(std::slice::from_ref(&path));
+        v1::write_worktree_record(&path, &gone).expect("the record can be written");
+        let resolved = ResolvedRoot {
+            path: state.clone(),
+            root: StateRoot::new(&state.to_string_lossy(), None),
+        };
+        let config = Config::parse(
+            r#"{"host": "builder-1", "repos": {"app": ["*"]}, "builders": [{"host": "other", "os": "windows", "repos": {"app": ["*"]}}]}"#,
+        )
+        .expect("the routing file is usable");
+        let git = Git::find(Path::new(temp_dir())).expect("git is found");
+        let removal = Removal {
+            state: &resolved,
+            config: &config,
+            git: &git,
+        };
+        let judged = Scanned {
+            key: KEY.to_owned(),
+            path: path.clone(),
+            record: gone,
+        };
+        let outcomes = Outcomes::from([(KEY.to_owned(), vec![(None, Outcome::Removed), (Some(builder_id("other")), Outcome::Held)])]);
+        let mut console = Console::new();
+        let held = meanwhile(&path);
+
+        let failed = removed(&removal, &[&judged], &outcomes, &mut console);
+        drop(held);
+        (failed, console.take_notes(), path)
+    }
+
+    #[test]
+    fn a_partial_prune_takes_the_removed_builders_off_the_record() {
+        let (failed, said, path) = partially_pruned("prune-partial-builders", |_| None);
+
+        assert!(!failed, "a partial prune is no failure");
+        let kept = worktree_record::read_worktree_record(&path).expect("the record is kept");
+        assert_eq!(
+            kept.builders,
+            ["other", "retired"],
+            "the pruned builder is off the record; a held one and one the file no longer names stay"
+        );
+        assert!(said.is_empty(), "nothing is said");
+    }
+
+    #[test]
+    fn a_partial_prune_that_cannot_rewrite_the_record_says_so_and_fails() {
+        // Held open sharing reading alone: the prune can read the record, but nothing can replace it.
+        let (failed, said, path) = partially_pruned("prune-partial-held", |path| {
+            Some(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(1)
+                    .open(path)
+                    .expect("the record can be held"),
+            )
+        });
+
+        assert!(failed, "a record that cannot be rewritten is a failure");
+        assert!(
+            said.iter()
+                .any(|line| line.starts_with(&format!("gate: cannot write {}: ", path.display()))),
+            "the failure is said: {said:?}"
+        );
+        let kept = worktree_record::read_worktree_record(&path).expect("the record is kept");
+        assert_eq!(kept.builders, ["builder-1", "other", "retired"], "the record is as it was");
     }
 
     #[test]

@@ -291,6 +291,10 @@ pub(crate) enum WarmEnd {
 /// What the client hands back: the status, a refusal's reason, whether it killed the run, the lines it wrote to the
 /// log, why it could not start, and whether the run's outputs were brought back.
 #[derive(Debug, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent fact of the outcome, read by name; no two form a state machine"
+)]
 pub(crate) struct RemoteOutcome {
     pub status: i64,
     pub reason: Option<FallbackReason>,
@@ -324,6 +328,9 @@ pub(crate) struct RemoteOutcome {
     /// What the builder's `drain` refusal said, a status 75 with no reason that is no fallback: the run waits behind
     /// the drain. `None` for any other end.
     pub draining: Option<drain::Drain>,
+    /// Whether the client began the box run call, after a passing preflight and the snapshot push, however the call
+    /// ended, a refusal at it included.
+    pub run_called: bool,
 }
 
 /// How long a routed run's parts took: the run call, the command's own time, which its ceiling counts; the push; and the

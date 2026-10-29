@@ -427,6 +427,7 @@ fn worktree(last_routed: Timestamp) -> v1::WorktreeRecord {
         repo: "repo".to_owned(),
         last_routed,
         gone_since: None,
+        builders: Vec::new(),
     }
 }
 
@@ -467,6 +468,41 @@ fn a_worktree_record_with_a_field_it_does_not_know_reads() {
     let text = r#"{"v":1,"root":"X:/dev/repo.wt/a","commonDir":"X:\\dev\\repo\\.git","repo":"repo","lastRouted":"2026-10-21T12:00:00Z","laterField":"2026-10-21T13:00:00Z"}"#;
 
     assert_eq!(v1::worktree_record(text.as_bytes()).expect("the record reads"), worktree(worktree_now()));
+}
+
+#[test]
+fn a_worktree_record_without_builders_reads_as_an_empty_list() {
+    let text = r#"{"v":1,"root":"X:/dev/repo.wt/a","commonDir":"X:\\dev\\repo\\.git","repo":"repo","lastRouted":"2026-10-21T12:00:00Z"}"#;
+
+    let record = v1::worktree_record(text.as_bytes()).expect("the record reads");
+    assert!(record.builders.is_empty(), "{record:?}");
+}
+
+#[test]
+fn a_worktree_record_with_no_builders_writes_no_builders_key() {
+    let root = scratch("worktree-record-no-builders");
+    let path = v1::worktree_record_path(&root, "app-1a2b3c4d");
+
+    v1::write_worktree_record(&path, &worktree(worktree_now())).expect("the record can be written");
+
+    let text = fs::read_to_string(&path).expect("the record can be read");
+    assert!(!text.contains("builders"), "{text}");
+}
+
+#[test]
+fn a_worktree_record_keeps_its_builders_in_order() {
+    let root = scratch("worktree-record-builders");
+    let path = v1::worktree_record_path(&root, "app-1a2b3c4d");
+    let written = v1::WorktreeRecord {
+        builders: vec!["zeta".to_owned(), "alpha".to_owned()],
+        ..worktree(worktree_now())
+    };
+
+    v1::write_worktree_record(&path, &written).expect("the record can be written");
+
+    let text = fs::read_to_string(&path).expect("the record can be read");
+    assert!(text.contains(r#""builders":["zeta","alpha"]"#), "{text}");
+    assert_eq!(v1::worktree_record(text.as_bytes()).expect("the record reads"), written);
 }
 
 #[test]

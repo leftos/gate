@@ -15,7 +15,9 @@ use serde_json::{Value, json};
 
 use crate::durations::seed;
 use crate::nesting::{marked, test_marker};
-use crate::routing::{BUSY_LINE, GIT_HANG_GUARDS, HOST, has_no_remote_fields, has_remote_tag, names, own, repo, routed_case, routed_words, stub};
+use crate::routing::{
+    BUSY_LINE, GIT_HANG_GUARDS, HOST, balance_case, has_no_remote_fields, has_remote_tag, names, own, repo, routed_case, routed_words, stub,
+};
 use crate::support::{
     Case, FAKE_TOOL, GATE, LOCAL_REASON, POLL, Running, UNTIL_KILLED, USAGE, assert_in_order, critical_words, events, events_of, finish, git,
     heavy_words, log_texts, none_words, run_words, shown, start, take_of, wait_for_file, wait_for_journal_line, wait_until, write_counts,
@@ -927,6 +929,50 @@ fn a_light_gate_behind_a_request_to_hold_the_machine_alone_routes() {
     assert!(call.exists(), "the builder ran the command: {outcome:?}");
     assert_rerouted(&own(&case, pid), critical_pid);
     held.finish();
+}
+
+/// A light run a critical request sends to a builder is not scored: its first try goes to the first builder listed,
+/// though that builder's one remote slot is held, and that pool's full refusal hands the run to the next.
+#[test]
+fn a_light_run_rerouted_by_a_critical_request_keeps_file_order() {
+    const FIRST: &str = "builder-a";
+    let case = balance_case("a_light_run_rerouted_by_a_critical_request_keeps_file_order");
+    let routing = json!({
+        "host": HOST,
+        "slots": 2,
+        "repos": { repo(&case): ["*tool*"] },
+        "builders": [{ "host": FIRST, "os": "windows", "repos": { repo(&case): ["*tool*"] } }],
+    });
+    write_remote_json(&case, &routing.to_string());
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+    let remote_go = case.folder().join("remote-go");
+    let holder_steps = shown(&stub(&case, &[&format!("wait {}", shown(&remote_go))]));
+    let remote = case.start(&routed_words("remote.log", &holder_steps, &["--builder", FIRST], &ROUTED_COMMAND));
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, remote.id()));
+    let held = HeldBack::start(&case, false, 2);
+    let critical_pid = held.critical_pid();
+    let call = case.folder().join("call.json");
+    let steps = recording_stub(&case, &call);
+
+    let light = light_with_client(&case, "light.log", &steps, &POLL, &ROUTED_COMMAND);
+    let pid = light.id();
+    let outcome = light.finish();
+    held.finish();
+    let_go(&remote_go);
+    assert_passed(&remote.finish());
+
+    assert_passed(&outcome);
+    let sent = format!("gate: held back by the critical request of gate {critical_pid}; sending this light run to {FIRST}");
+    assert!(outcome.stderr.contains(&sent), "{outcome:?}");
+    let events = own(&case, pid);
+    let tried: Vec<(&str, &str)> = events
+        .iter()
+        .filter_map(|event| Some((event["event"].as_str()?, event["host"].as_str()?)))
+        .collect();
+    assert_eq!(tried.first(), Some(&("fallback", FIRST)), "the first builder is tried first: {events:#?}");
+    assert!(tried.contains(&("take", HOST)), "the next builder takes the run: {events:#?}");
+    let recorded: Value = serde_json::from_str(&fs::read_to_string(&call).expect("the builder was called")).expect("the call is JSON");
+    assert_eq!(recorded["host"], HOST, "{recorded}");
 }
 
 #[test]

@@ -405,6 +405,10 @@ pub struct WorktreeRecord {
     /// When the worktree was first found gone, written as `lastRouted` is; `None`, and no key, while it is live.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "optional_iso_time")]
     pub gone_since: Option<Timestamp>,
+    /// The aliases of the builders a routed run's run call reached for this work folder, in the order each was first
+    /// added, each once; a `layout` refusal from a builder takes it off. Empty, and no key, when none is known.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub builders: Vec<String>,
 }
 
 /// Whether a routed run or `gate warm`, whose record of a live worktree would be `fresh`, writes it over `existing`,
@@ -1502,6 +1506,7 @@ mod tests {
             repo: "repo".to_owned(),
             last_routed: at("2026-10-21T12:00:00Z"),
             gone_since,
+            builders: Vec::new(),
         }
     }
 

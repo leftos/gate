@@ -4,6 +4,7 @@
 //! the pause marker a gate under a parent's slot keeps while a critical request holds it back, and the lines a waiting
 //! gate says. The waiter's core, which a critical gate's wait for the machine shares, is [`Waiter`].
 
+use std::collections::HashSet;
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -12,17 +13,17 @@ use std::time::{Duration, Instant};
 
 use gate_args::RunRequest;
 use gate_state::v1::{self, Claim, ClaimKind, Counts, Ticket, TicketKind};
-use gate_state::{KernelObject, SlotKind, beside_allowance};
+use gate_state::{KernelObject, SlotKind, StateRoot, beside_allowance};
 use gate_win32::{Interrupt, NamedEvent, OwnedMutexGuard, mutex_exists};
 use jiff::Timestamp;
 use serde_json::{Map, Value};
 
-use crate::console::Console;
+use crate::console::{Console, Say};
 use crate::durations::span_text;
 use crate::pause::Pause;
 use crate::remote::drain;
 use crate::resolve::ResolvedRoot;
-use crate::slots::{self, BesideTry, Pool, Survey, Taken, ThisGate};
+use crate::slots::{self, BesideTry, BuilderPool, Pool, Survey, Taken, ThisGate};
 
 /// The fallback poll: the longest a waiter sleeps before it reads the counts and the tickets again.
 const POLL: Duration = Duration::from_secs(2);
@@ -636,25 +637,13 @@ impl<'a> Wait<'a> {
     /// How many live tickets of the gate's kind and pool of `others` are ahead of it ([`queued_ahead`]). A ticket whose
     /// gate a live claim names is not counted: that gate holds a slot already, and only failed to delete its ticket.
     fn ahead(&self, others: &[Ticket], survey: &mut Survey, console: &mut Console) -> usize {
-        let ahead: Vec<&Ticket> = others.iter().filter(|ticket| queued_ahead(ticket, self.pool, self.order)).collect();
-        if ahead.is_empty() {
-            return 0;
-        }
-        let holders = survey.holders(&self.root.path, console);
-        ahead.iter().filter(|ticket| !holders.contains(&(ticket.pid, ticket.start_ms))).count()
+        live_ahead(&self.root.path, others, self.pool, self.order, survey, console)
     }
 
     /// Whether some gate has each of the pool's slots `indices` open; `None` for a slot that cannot be probed, said
     /// once, which counts as neither free nor busy.
     fn probe(&self, indices: Range<u32>, survey: &mut Survey, console: &mut Console) -> Probe {
-        indices
-            .map(|index| {
-                let name = self.root.root.object_name(self.pool.object(index));
-                mutex_exists(&name)
-                    .inspect_err(|error| survey.say_once("cannot probe", &name, error, console))
-                    .ok()
-            })
-            .collect()
+        probe_pool(&self.root.root, self.pool, indices, survey, console)
     }
 
     /// Says the still-waiting line when it is due, with the whole seconds since the gate queued; a light gate held
@@ -689,6 +678,133 @@ impl<'a> Wait<'a> {
         let busy = format!("{seconds}; {} busy", probe.len());
         with_eta(busy, self.eta(&probe, range, survey, console))
     }
+}
+
+/// Whether some gate has each of the slots `indices` of `pool` under the state root `root` open, by the existence of
+/// its mutex alone, none taken; `None` for a slot that cannot be probed, said once, which counts as neither free nor
+/// busy.
+fn probe_pool(root: &StateRoot, pool: Pool, indices: Range<u32>, survey: &mut Survey, console: &mut impl Say) -> Probe {
+    indices
+        .map(|index| {
+            let name = root.object_name(pool.object(index));
+            mutex_exists(&name)
+                .inspect_err(|error| survey.say_once("cannot probe", &name, error, console))
+                .ok()
+        })
+        .collect()
+}
+
+/// How many of the live tickets `others` under the state root `root` wait ahead of a gate at the place `order` in the
+/// queue of `pool` ([`queued_ahead`]). A ticket whose gate a live claim names is not counted: that gate holds a slot
+/// already, and only failed to delete its ticket.
+fn live_ahead(root: &Path, others: &[Ticket], pool: Pool, order: (u64, u32), survey: &mut Survey, console: &mut Console) -> usize {
+    if !others.iter().any(|ticket| queued_ahead(ticket, pool, order)) {
+        return 0;
+    }
+    let holders = survey.holders(root, console);
+    unheld_ahead(others, pool, order, &holders)
+}
+
+/// How many of the live tickets `others` wait ahead of a gate at the place `order` in the queue of `pool`
+/// ([`queued_ahead`]), a ticket whose gate is among `holders`, the gates a live claim names, left out.
+fn unheld_ahead(others: &[Ticket], pool: Pool, order: (u64, u32), holders: &HashSet<(u32, u64)>) -> usize {
+    others
+        .iter()
+        .filter(|ticket| queued_ahead(ticket, pool, order) && !holders.contains(&(ticket.pid, ticket.start_ms)))
+        .count()
+}
+
+/// What this PC knows now of a builder's remote pool, read as the wait reads it and with nothing taken: how many of its
+/// slots are free, how many live tickets wait for it, and in how many seconds the first holder of a busy slot is
+/// expected to free it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PoolNow {
+    /// The pool's size.
+    pub slots: u32,
+    /// The slots no gate has open; a slot that cannot be probed is not free.
+    pub free: u32,
+    /// The live tickets of the pool, every one ahead of a run arriving now.
+    pub ahead: usize,
+    /// The seconds until the first holder of a busy slot reaches its usual run time, 0 once it is past it, and 0 for
+    /// an idle pool, every slot probed and none busy, which has no holder to wait for; `None` when a slot cannot be
+    /// probed or a busy slot's claim carries no usual ([`pool_usuals`]).
+    pub first_frees_in: Option<f64>,
+}
+
+/// The remote pools `builders` of the builders under `root` as they stand now ([`PoolNow`]), in order: every pool's
+/// slots probed first as a wait probes them ([`probe_pool`]), then the other gates' live tickets and claims read once
+/// for all of them, so a slot taken after the probe never reads as busy without its claim. Each pool's tickets are the
+/// live ones waiting for it, a run arriving now behind every one, and its first holder's expected end is derived as a
+/// wait line's estimate derives it ([`pool_eta`]). Each problem in reading them is said once through `survey` to `say`.
+pub(crate) fn pools_now(root: &ResolvedRoot, builders: &[BuilderPool], survey: &mut Survey, say: &mut impl Say) -> Vec<PoolNow> {
+    let probes: Vec<Probe> = builders
+        .iter()
+        .map(|builder| probe_pool(&root.root, Pool::Remote(*builder), 0..builder.slots, survey, say))
+        .collect();
+    let tickets = live_others(root, survey, say);
+    let claims = survey
+        .other_claims(&root.path, say)
+        .inspect_err(|error| survey.say_once("cannot read the claims in", &v1::slots_dir(&root.path).display().to_string(), error, say))
+        .ok();
+    let holders: HashSet<(u32, u64)> = claims
+        .iter()
+        .flatten()
+        .map(|(_, claim)| (claim.pid, slots::epoch_ms(claim.process_start)))
+        .collect();
+    builders
+        .iter()
+        .zip(probes)
+        .map(|(builder, probe)| {
+            let pool = Pool::Remote(*builder);
+            PoolNow {
+                slots: builder.slots,
+                free: u32::try_from(slots_where(&probe, false)).unwrap_or(u32::MAX),
+                ahead: unheld_ahead(&tickets, pool, (u64::MAX, u32::MAX), &holders),
+                first_frees_in: first_frees_in(pool, &probe, claims.as_deref()),
+            }
+        })
+        .collect()
+}
+
+/// The seconds until the first holder of a busy slot of `pool`, as `probe` found its slots, reaches its usual run time
+/// by the other gates' live claims `claims`, 0 once it is past it; 0 when every slot was probed and none is busy;
+/// `None` when a slot could not be probed, the claims could not be read, or a busy slot's claim carries no usual.
+fn first_frees_in(pool: Pool, probe: &Probe, claims: Option<&[(String, Claim)]>) -> Option<f64> {
+    if probe.iter().any(Option::is_none) {
+        return None;
+    }
+    let busy: Vec<u32> = (0..)
+        .zip(probe)
+        .filter(|(_, slot)| **slot == Some(true))
+        .map(|(index, _)| index)
+        .collect();
+    if busy.is_empty() {
+        return Some(0.0);
+    }
+    pool_usuals(claims?, pool, &busy, Timestamp::now())?
+        .into_iter()
+        .map(|holder| holder.left)
+        .min_by(f64::total_cmp)
+        .map(|left| left.max(0.0))
+}
+
+/// The expected wait, in seconds, for a slot of the pool `now` describes, by a run whose learned duration there is
+/// `duration`: 0 while more slots are free than tickets wait ahead; else the first holder's expected time left, plus
+/// `duration` once for each slot's worth of tickets ahead (`duration * ahead / slots`). A part that cannot be known,
+/// no first holder's expected end or no duration for tickets ahead, counts as [`REMOTE_LIMIT`], the longest the run
+/// waits before it moves on, so an unknown full pool never scores as free. Always finite and non-negative.
+pub(crate) fn queue_wait(now: &PoolNow, duration: Option<f64>) -> f64 {
+    if usize::try_from(now.free).unwrap_or(usize::MAX) > now.ahead {
+        return 0.0;
+    }
+    let limit = REMOTE_LIMIT.as_secs_f64();
+    let first = now.first_frees_in.unwrap_or(limit);
+    let behind = match (now.ahead, duration) {
+        (0, _) => 0.0,
+        (ahead, Some(duration)) => duration * f64::from(u32::try_from(ahead).unwrap_or(u32::MAX)) / f64::from(now.slots.max(1)),
+        (_, None) => limit,
+    };
+    first + behind
 }
 
 /// Whether `ticket` waits ahead of a gate at the place `order` in the queue of `pool`: of the pool's ticket kind,
@@ -749,6 +865,21 @@ pub(crate) fn holder_eta(claims: &[Claim], busy: &[(ClaimKind, u32)], which: Whi
 /// remote pool's estimate never names the holder of another builder's pool, whose claims are of the same kind. `None`
 /// when a busy slot has no claim carrying a usual.
 fn pool_eta(claims: &[(String, Claim)], pool: Pool, busy: &[u32], which: Which, now: Timestamp) -> Option<String> {
+    let (own, slots) = pool_holders(claims, pool, busy);
+    holder_eta(&own, &slots, which, now)
+}
+
+/// The holders of the busy slots `busy` of `pool` as their ETAs read them at `now` ([`holder_usuals`]), by the other
+/// gates' live claims `claims`, each with its file name, as [`pool_eta`] finds them; `None` when a busy slot has no
+/// claim carrying a usual.
+fn pool_usuals(claims: &[(String, Claim)], pool: Pool, busy: &[u32], now: Timestamp) -> Option<Vec<Usual>> {
+    let (own, slots) = pool_holders(claims, pool, busy);
+    holder_usuals(&own, &slots, now)
+}
+
+/// The claims among `claims`, each with its file name, of the busy slots `busy` of `pool`, a slot's holder the claim
+/// named as that slot's claim file, and those slots, each with the pool's claim kind.
+fn pool_holders(claims: &[(String, Claim)], pool: Pool, busy: &[u32]) -> (Vec<Claim>, Vec<(ClaimKind, u32)>) {
     let files: Vec<String> = busy.iter().filter_map(|&index| pool.object(index).claim_file_name()).collect();
     let own: Vec<Claim> = claims
         .iter()
@@ -756,8 +887,7 @@ fn pool_eta(claims: &[(String, Claim)], pool: Pool, busy: &[u32], which: Which, 
         .map(|(_, claim)| claim.clone())
         .collect();
     let kind = pool.claim_kind();
-    let slots: Vec<(ClaimKind, u32)> = busy.iter().map(|&index| (kind, index)).collect();
-    holder_eta(&own, &slots, which, now)
+    (own, busy.iter().map(|&index| (kind, index)).collect())
 }
 
 /// The holders of the busy slots `busy`, each a claim kind and slot index, as their ETAs read them at `now` by their
@@ -842,7 +972,7 @@ fn read_counts(root: &ResolvedRoot, processors: usize) -> Counts {
 
 /// The other gates' live tickets under `root`. A read that deleted a dead gate's ticket wakes the waiters, since the
 /// queue moved.
-fn live_others(root: &ResolvedRoot, survey: &mut Survey, console: &mut Console) -> Vec<Ticket> {
+fn live_others(root: &ResolvedRoot, survey: &mut Survey, console: &mut impl Say) -> Vec<Ticket> {
     let (others, deleted) = survey.others(&root.path, console);
     if deleted {
         slots::signal(root, &others);
@@ -1165,14 +1295,32 @@ mod tests {
     use gate_state::v1::ClaimKind;
     use jiff::{SignedDuration, Timestamp};
 
+    use super::PoolNow;
     use super::scratch::{Holder, Scratch, holding, request};
     use super::{
-        Arrival, Barrier, Beside, Host, LendFacts, Wait, Waited, Which, barrier, beside_of, beside_place, beside_room, first_heartbeat, held_back,
-        holder_eta, lends, light_barrier, may_take, pool_eta, queued_ahead, slot_range, spare_left,
+        Arrival, Barrier, Beside, Host, LendFacts, Wait, Waited, Which, barrier, beside_of, beside_place, beside_room, first_frees_in,
+        first_heartbeat, held_back, holder_eta, lends, light_barrier, may_take, pool_eta, queue_wait, queued_ahead, slot_range, spare_left,
     };
     use crate::console::Console;
     use crate::slots::BesideTry;
     use crate::slots::{self, BuilderPool, Pool, Survey, ThisGate};
+
+    #[test]
+    fn an_idle_pool_with_one_ticket_ahead_waits_one_duration() {
+        let idle = PoolNow {
+            slots: 1,
+            free: 1,
+            ahead: 1,
+            // Its one slot was probed free, and no claim could be read: there is no holder to wait for.
+            first_frees_in: first_frees_in(Pool::Local(SlotKind::Heavy), &vec![Some(false)], None),
+        };
+
+        assert!(
+            (queue_wait(&idle, Some(90.0)) - 90.0).abs() < f64::EPSILON,
+            "no holder to wait for, then one run's duration: {}",
+            queue_wait(&idle, Some(90.0))
+        );
+    }
 
     /// The fixed moment the ETA cases count from.
     fn now() -> Timestamp {

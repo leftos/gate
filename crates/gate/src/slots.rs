@@ -18,7 +18,7 @@ use jiff::Timestamp;
 use serde_json::{Map, Value};
 
 use crate::acquire;
-use crate::console::Console;
+use crate::console::{Console, Say};
 use crate::resolve::ResolvedRoot;
 
 /// The pool of slots a gate takes from: this machine's pool of one kind, or a builder's remote pool.
@@ -331,16 +331,16 @@ impl Survey {
     }
 
     /// Says `gate: <what> <subject>: <detail>`, unless this wait said `what` of `subject` already.
-    pub(crate) fn say_once(&mut self, what: &str, subject: &str, detail: impl Display, console: &mut Console) {
+    pub(crate) fn say_once(&mut self, what: &str, subject: &str, detail: impl Display, console: &mut impl Say) {
         if self.said.insert(format!("{what} {subject}")) {
-            console.err(&format!("gate: {what} {subject}: {detail}"));
+            console.say(&format!("gate: {what} {subject}: {detail}"));
         }
     }
 
     /// Whether the gate `pid` started at `start_ms`, named by the file at `path`, still runs. This gate's own ticket
     /// counts as live unjudged. A gate that cannot be checked counts as live, said once for `path`: a gate never
     /// deletes what it cannot judge.
-    fn is_live(&mut self, path: &Path, pid: u32, start_ms: u64, console: &mut Console) -> bool {
+    fn is_live(&mut self, path: &Path, pid: u32, start_ms: u64, console: &mut impl Say) -> bool {
         if (pid, start_ms) == self.own {
             return true;
         }
@@ -357,7 +357,7 @@ impl Survey {
     /// The live tickets under `root`, and whether a dead one was deleted on the way. An unreadable ticket is said once
     /// and left in place. A tickets folder that cannot be read holds none, said once. The dead gates' covered markers
     /// are deleted first ([`Survey::sweep_covered`]).
-    pub(crate) fn live_tickets(&mut self, root: &Path, console: &mut Console) -> (Vec<Ticket>, bool) {
+    pub(crate) fn live_tickets(&mut self, root: &Path, console: &mut impl Say) -> (Vec<Ticket>, bool) {
         self.sweep_covered(root, console);
         let dir = v1::tickets_dir(root);
         let listed = match listed_tickets(root, self.own) {
@@ -394,7 +394,7 @@ impl Survey {
     /// Deletes the covered markers under `root` whose gates are gone, judged as tickets are ([`Survey::is_live`]). A
     /// marker that cannot be read is left in place unsaid, as the reader skips it; a covered folder that cannot be listed
     /// or a marker that cannot be deleted is said once.
-    fn sweep_covered(&mut self, root: &Path, console: &mut Console) {
+    fn sweep_covered(&mut self, root: &Path, console: &mut impl Say) {
         let dir = v1::covered_dir(root);
         let markers = match v1::read_covered(&dir) {
             Ok(markers) => markers,
@@ -419,7 +419,7 @@ impl Survey {
 
     /// The live tickets under `root` of the other gates, this gate's own left out, and whether a dead one was deleted
     /// on the way, as [`Survey::live_tickets`] reads them.
-    pub(crate) fn others(&mut self, root: &Path, console: &mut Console) -> (Vec<Ticket>, bool) {
+    pub(crate) fn others(&mut self, root: &Path, console: &mut impl Say) -> (Vec<Ticket>, bool) {
         let (live, deleted) = self.live_tickets(root, console);
         (others(live, self.own), deleted)
     }
@@ -429,7 +429,7 @@ impl Survey {
     /// out, and the live lend markers, judged by their names alone, a dead gate's deleted ([`Survey::judge_lend_marker`]).
     /// An entry of the folder that cannot be read is said once and noted. Else why the claims folder cannot be listed;
     /// a missing one holds none.
-    pub(crate) fn claims_folder(&mut self, root: &Path, console: &mut Console) -> io::Result<ClaimsFolder> {
+    pub(crate) fn claims_folder(&mut self, root: &Path, console: &mut impl Say) -> io::Result<ClaimsFolder> {
         let dir = v1::slots_dir(root);
         let mut folder = ClaimsFolder::default();
         let entries = match fs::read_dir(&dir) {
@@ -456,7 +456,7 @@ impl Survey {
 
     /// The listed `entry` of the claims folder `dir` when it is a file; `None` for one that is not, and for one that
     /// cannot be read, said once and noted in `folder`.
-    fn file_entry(&mut self, entry: io::Result<fs::DirEntry>, dir: &Path, folder: &mut ClaimsFolder, console: &mut Console) -> Option<fs::DirEntry> {
+    fn file_entry(&mut self, entry: io::Result<fs::DirEntry>, dir: &Path, folder: &mut ClaimsFolder, console: &mut impl Say) -> Option<fs::DirEntry> {
         match entry.and_then(|entry| entry.file_type().map(|kind| (entry, kind))) {
             Ok((entry, kind)) if kind.is_file() => Some(entry),
             Ok(_) => None,
@@ -469,7 +469,7 @@ impl Survey {
     }
 
     /// The claim at `path` when it can be read and names another gate that still runs; else `None`.
-    fn live_other_claim(&mut self, path: &Path, console: &mut Console) -> Option<Claim> {
+    fn live_other_claim(&mut self, path: &Path, console: &mut impl Say) -> Option<Claim> {
         let claim = v1::read_claim(path).ok()?;
         let start_ms = epoch_ms(claim.process_start);
         ((claim.pid, start_ms) != self.own && self.is_live(path, claim.pid, start_ms, console)).then_some(claim)
@@ -478,7 +478,7 @@ impl Survey {
     /// Keeps the lend marker at `path`, named `name`, in `lent` when the gate its name names still runs, whatever its
     /// content, and deletes it when that gate is gone, saying once a delete that fails. A name that names no gate is
     /// said once and passed over.
-    fn judge_lend_marker(&mut self, path: PathBuf, name: &str, lent: &mut Vec<PathBuf>, console: &mut Console) {
+    fn judge_lend_marker(&mut self, path: PathBuf, name: &str, lent: &mut Vec<PathBuf>, console: &mut impl Say) {
         let shown = path.display().to_string();
         let Some((pid, start_ms)) = lend_marker_gate(name) else {
             self.say_once("ignored the lend marker", &shown, "its name names no gate", console);
@@ -493,7 +493,7 @@ impl Survey {
 
     /// The live claims under `root` of the other gates, each with its file name, sorted by it, as
     /// [`Survey::claims_folder`] reads them; else why the claims folder cannot be listed.
-    pub(crate) fn other_claims(&mut self, root: &Path, console: &mut Console) -> io::Result<Vec<(String, Claim)>> {
+    pub(crate) fn other_claims(&mut self, root: &Path, console: &mut impl Say) -> io::Result<Vec<(String, Claim)>> {
         self.claims_folder(root, console).map(|folder| folder.claims)
     }
 

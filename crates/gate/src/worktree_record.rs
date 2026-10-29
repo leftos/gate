@@ -51,21 +51,77 @@ pub(crate) fn leave(state: &Path, root: &str, repo: &str, key: &str, console: &m
     let Some(common) = common.to_str() else {
         return;
     };
+    let path = v1::worktree_record_path(state, key);
+    let existing = read_worktree_record(&path);
     let fresh = v1::WorktreeRecord {
         root: root.to_owned(),
         common_dir: common.to_owned(),
         repo: repo.to_owned(),
         last_routed: Timestamp::now(),
         gone_since: None,
+        builders: existing.as_ref().map(|record| record.builders.clone()).unwrap_or_default(),
     };
-    let path = v1::worktree_record_path(state, key);
-    let existing = read_worktree_record(&path);
     if !v1::needs_write(existing.as_ref(), &fresh) {
         return;
     }
     if let Err(error) = v1::write_worktree_record(&path, &fresh) {
         console.err(&format!("gate: cannot write {}: {error}", path.display()));
     }
+}
+
+/// Adds the builder `alias` to the `builders` of the worktree record of the work-folder `key` under the state root
+/// `state`, once, after the ones already listed: the run call of a routed run reached it. A record that is missing or
+/// cannot be read is left as it is, and one that lists the builder already is not written. A write that fails is noted
+/// in the log through `console` and changes nothing else.
+pub(crate) fn add_builder(state: &Path, key: &str, alias: &str, console: &mut Console) {
+    let added = change_builders(state, key, |builders| {
+        let absent = !builders.iter().any(|listed| listed == alias);
+        if absent {
+            builders.push(alias.to_owned());
+        }
+        absent
+    });
+    if let Err(line) = added {
+        console.note(&line);
+    }
+}
+
+/// Takes the builder `alias` off the `builders` of the worktree record of the work-folder `key` under the state root
+/// `state`: the builder refused the run `layout`. A record that is missing, cannot be read or does not list the builder
+/// is left as it is. A write that fails is noted in the log through `console` and changes nothing else.
+pub(crate) fn remove_builder(state: &Path, key: &str, alias: &str, console: &mut Console) {
+    if let Err(line) = remove_builders(state, key, &[alias]) {
+        console.note(&line);
+    }
+}
+
+/// Takes each of the builders `aliases` off the `builders` of the worktree record of the work-folder `key` under the
+/// state root `state`, as [`remove_builder`] takes one: a builder refused the run `layout`, or pruned the key's work
+/// folder. A record that is missing, cannot be read or lists none of them is left as it is.
+///
+/// # Errors
+///
+/// The line saying why the changed record cannot be written.
+pub(crate) fn remove_builders(state: &Path, key: &str, aliases: &[&str]) -> Result<(), String> {
+    change_builders(state, key, |builders| {
+        let before = builders.len();
+        builders.retain(|listed| !aliases.contains(&listed.as_str()));
+        builders.len() != before
+    })
+}
+
+/// Reads the worktree record of `key` under `state`, lets `change` change its `builders`, and writes it again when
+/// `change` says it changed them; a missing or unreadable record is left as it is. Else the line saying why the
+/// changed record cannot be written.
+fn change_builders(state: &Path, key: &str, change: impl FnOnce(&mut Vec<String>) -> bool) -> Result<(), String> {
+    let path = v1::worktree_record_path(state, key);
+    let Some(mut record) = read_worktree_record(&path) else {
+        return Ok(());
+    };
+    if !change(&mut record.builders) {
+        return Ok(());
+    }
+    v1::write_worktree_record(&path, &record).map_err(|error| format!("gate: cannot write {}: {error}", path.display()))
 }
 
 /// The bytes of the regular file at `path`, opened as itself, with `cap` bytes the most it reads: a link, a junction, a
@@ -118,6 +174,7 @@ mod tests {
             repo: "app".to_owned(),
             last_routed: "2026-10-21T12:00:00Z".parse().expect("a time"),
             gone_since: None,
+            builders: Vec::new(),
         }
     }
 

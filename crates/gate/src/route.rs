@@ -19,7 +19,7 @@ use gate_router::windows::{self, WindowsChange};
 use gate_router::{
     Builder, Config, ConfigProblem, CrossTarget, Facts, FolderId, GitignoredInput, Inputs, LaterCandidate, LocalReason, Pattern, PinRefusal, Place,
     RemoteRun, Route, SiblingFolder, SiblingRoot, Target, decide, dropped_env, dropped_env_line, escaped, is_input_file, is_project_or_solution,
-    repo_name,
+    repo_name, work_folder_key,
 };
 use gate_win32::Share;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -34,9 +34,11 @@ use crate::outputs::glob::Globs;
 use crate::outputs::walk::walk;
 use crate::remote::inputs::{EXCLUDED, nested_folder, relative};
 use crate::remote::{self, git, siblings};
-use crate::resolve::{self, Environment};
-use crate::warm;
+use crate::resolve::{self, Environment, ResolvedRoot};
+use crate::slots::{BuilderPool, Survey, ThisGate};
+use crate::{durations, wait, warm, worktree_record};
 use gate_inputs::names::PATH_DEPTH_LIMIT;
+use gate_state::v1;
 
 /// The `notRouted` value of a heavy gate its caller kept here with `--local`.
 const LOCAL_FLAG: &str = "--local";
@@ -173,9 +175,17 @@ impl Decision {
 /// is not valid Unicode runs here, saying so. A gate under a `covering_parent`'s slot runs here, saying nothing. With
 /// the route, what the decision learnt of the gate's place in its git worktree, and, for a routed run of a repo whose
 /// warm-up is set up, the hash of its warm-up file ([`consented_hash`]).
-pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_parent: bool, state: &Path, console: &mut Console) -> Decided {
-    let decision = Decision::of(request, environment, covering_parent, state);
-    let mut machine = Machine::new(environment, &request.test_seams).with_state(&decision);
+pub(crate) fn route(
+    request: &RunRequest,
+    environment: &Environment,
+    covering_parent: bool,
+    (root, gate): (&ResolvedRoot, &ThisGate),
+    console: &mut Console,
+) -> Decided {
+    let decision = Decision::of(request, environment, covering_parent, &root.path);
+    let mut machine = Machine::new(environment, &request.test_seams)
+        .with_state(&decision)
+        .reading_figures(FigureReader::of(request, root, gate));
     machine.run_log = run_log(request);
     let route = match decide(&decision.inputs(slot(request.slot)), &machine) {
         Route::Routed(_) if !decision.unicode => match &decision.pin {
@@ -682,6 +692,75 @@ pub(crate) struct Machine<'a> {
     /// The state root whose built-here record says which builds ran here ([`Facts::built_here`]); `None` for a
     /// decision that routes no command (`gate warm`), which then finds no build here.
     state: Option<PathBuf>,
+    /// What the machine tells of each builder the decision scores ([`Facts::builder_figures`]).
+    figures: Figures<'a>,
+}
+
+/// What a machine tells of each builder a decision scores: the same figures for every builder ([`balance::ALIKE`]),
+/// as the route hint, a light run's reroute by a critical request and `gate warm` have them, or the figures this PC
+/// reads for the run of a routing decision ([`FigureReader`]).
+enum Figures<'a> {
+    Alike,
+    Read(FigureReader<'a>),
+}
+
+/// What reads the figures of each builder for the run of a routing decision: the state root and the gate itself, whose
+/// remote pools, tickets, claims, worktree records and durations it reads, and the run's command and class, which key
+/// its durations.
+pub(crate) struct FigureReader<'a> {
+    root: &'a ResolvedRoot,
+    gate: &'a ThisGate,
+    /// The command as the run's durations key it, the gate's own journal command; `None` when the gate's journal
+    /// identity cannot be read, as the run then has no durations.
+    command: Option<String>,
+    /// Whether the run is a critical gate's, which its durations key.
+    critical: bool,
+}
+
+impl<'a> FigureReader<'a> {
+    /// The reader of the figures of `request`'s run, the gate `gate` under the state root `root`.
+    fn of(request: &RunRequest, root: &'a ResolvedRoot, gate: &'a ThisGate) -> FigureReader<'a> {
+        FigureReader {
+            root,
+            gate,
+            command: gate.journal_identity().ok().map(|identity| identity.command),
+            critical: matches!(request.slot, Slot::Critical),
+        }
+    }
+
+    /// The figures of each of `builders`, in order, for the run of the worktree at `place`, read now: the free slots
+    /// of each builder's remote pool on this PC and the wait for one ([`wait::pools_now`], every pool probed before
+    /// the other gates' tickets and claims are read once for all of them, and [`wait::queue_wait`]), the run's learned
+    /// duration on it ([`durations::builder_durations`], one read of the store), and whether the worktree record of the
+    /// run's work-folder key lists it among the builders holding a work folder; none is listed when there is no record
+    /// or it cannot be read. Each problem in reading the pools is kept once among `notes`, for the log.
+    fn figures(&self, place: &Place, builders: &[&Builder], notes: &RefCell<Vec<String>>) -> Vec<BuilderFigures> {
+        let aliases: Vec<&str> = builders.iter().map(|builder| builder.alias.as_str()).collect();
+        let learned = match &self.command {
+            Some(command) => durations::builder_durations(&self.root.path, place, command, self.critical, &aliases),
+            None => vec![None; aliases.len()],
+        };
+        let record = v1::worktree_record_path(&self.root.path, &work_folder_key(&place.root));
+        let holding = worktree_record::read_worktree_record(&record)
+            .map(|record| record.builders)
+            .unwrap_or_default();
+        let mut survey = Survey::new(self.gate);
+        let mut problems = Vec::new();
+        let pools: Vec<BuilderPool> = builders.iter().map(|builder| BuilderPool::of(builder)).collect();
+        let now = wait::pools_now(self.root, &pools, &mut survey, &mut problems);
+        notes.borrow_mut().extend(problems);
+        builders
+            .iter()
+            .zip(learned)
+            .zip(now)
+            .map(|((builder, duration), pool)| BuilderFigures {
+                free_slots: pool.free,
+                queue_wait: wait::queue_wait(&pool, duration),
+                duration,
+                holds_folder: holding.contains(&builder.alias),
+            })
+            .collect()
+    }
 }
 
 impl<'a> Machine<'a> {
@@ -722,6 +801,16 @@ impl<'a> Machine<'a> {
             remote_transport: None,
             run_log: None,
             state: None,
+            figures: Figures::Alike,
+        }
+    }
+
+    /// These facts reading each scored builder's figures through `reader`, as the machine of a run's routing decision
+    /// reads them, in place of [`balance::ALIKE`] for every builder.
+    fn reading_figures(self, reader: FigureReader<'a>) -> Machine<'a> {
+        Machine {
+            figures: Figures::Read(reader),
+            ..self
         }
     }
 
@@ -1338,9 +1427,13 @@ impl Facts for Machine<'_> {
         checkout_of(tree)
     }
 
-    /// The same figures for every builder ([`balance::ALIKE`]), so every builder scores alike and file order decides.
-    fn builder_figures(&self, _place: &Place, _words: &[String], builders: &[&Builder]) -> Vec<BuilderFigures> {
-        builders.iter().map(|_| balance::ALIKE).collect()
+    /// The figures this PC reads of each builder for the run of a routing decision ([`FigureReader::figures`]); the
+    /// same figures for every builder ([`balance::ALIKE`]) for any other machine, so file order decides.
+    fn builder_figures(&self, place: &Place, _words: &[String], builders: &[&Builder]) -> Vec<BuilderFigures> {
+        match &self.figures {
+            Figures::Alike => builders.iter().map(|_| balance::ALIKE).collect(),
+            Figures::Read(reader) => reader.figures(place, builders, &self.notes),
+        }
     }
 }
 

@@ -119,6 +119,25 @@ impl Console {
     }
 }
 
+/// Where a reader of the state root says a problem line it meets: on stderr and in the log, through a [`Console`], or
+/// kept in a list, as a routing decision keeps its figures' problems among its notes for the log.
+pub(crate) trait Say {
+    /// Says `line`, or keeps it.
+    fn say(&mut self, line: &str);
+}
+
+impl Say for Console {
+    fn say(&mut self, line: &str) {
+        self.err(line);
+    }
+}
+
+impl Say for Vec<String> {
+    fn say(&mut self, line: &str) {
+        self.push(line.to_owned());
+    }
+}
+
 fn write_line(stream: &mut impl Write, line: &str) {
     // A write that fails leaves no stream to say so on; the status still carries the gate's answer.
     let _ = writeln!(stream, "{line}").and_then(|()| stream.flush());

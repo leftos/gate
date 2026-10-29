@@ -270,6 +270,34 @@ pub(crate) fn unreadable_line(error: &StoreReadError) -> String {
     )
 }
 
+/// The learned seconds of the command `command`, a critical run's when `critical`, of the folder the routing decision
+/// placed at `place`, on each builder of `aliases`, in order: the figure the expected-time line says as `about` (the
+/// estimate's mean), under the key place `remote:<alias>`, read as [`RunDurations::estimate`] reads it, the exact key
+/// else the family key. The store under the state root `root` is read once for every builder, with no lock; a store
+/// that is missing, not current or cannot be read gives `None` for every builder, and a key without history `None` for
+/// its builder.
+pub(crate) fn builder_durations(root: &Path, place: &Place, command: &str, critical: bool, aliases: &[&str]) -> Vec<Option<f64>> {
+    let StoreRead::Current(store) = read_store(root) else {
+        return vec![None; aliases.len()];
+    };
+    let folder = from_route(place);
+    let temp_root = temp_root();
+    let now = Timestamp::now();
+    aliases
+        .iter()
+        .map(|alias| {
+            let key = duration_key(&KeyInputs {
+                folder: &folder,
+                remote_host: Some(alias),
+                critical,
+                temp_root: temp_root.as_deref(),
+                command,
+            });
+            store.estimate(&key, now).map(|estimate| estimate.mean)
+        })
+        .collect()
+}
+
 /// The key place of a folder the routing decision placed.
 fn from_route(place: &Place) -> KeyPlace {
     KeyPlace::InGit {

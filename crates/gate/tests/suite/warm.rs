@@ -1068,6 +1068,53 @@ fn a_real_client_warm_up_writes_the_record_the_log_and_the_builder_s_record() {
     assert!(free(&lock), "the per-key lock is free afterwards");
 }
 
+/// The `builders` of the case's worktree record, in their order; none when the record has no such key.
+fn record_builders(case: &Case) -> Vec<String> {
+    let text = fs::read_to_string(worktree_record_path(case)).expect("the worktree record can be read");
+    let record: Value = serde_json::from_str(&text).expect("the worktree record is JSON");
+    record
+        .get("builders")
+        .map(|builders| serde_json::from_value(builders.clone()).expect("the builders are a list of aliases"))
+        .unwrap_or_default()
+}
+
+/// A warm-up whose run call began lists its builder on the worktree record of its key, as a routed run does; a later
+/// warm-up the builder refuses `layout` takes it off again, and leaves the other builders listed.
+#[test]
+fn a_warm_up_lists_its_builder_on_the_worktree_record() {
+    let case = warm_client_case("warm-real-builders");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(warm_client(&case, &steps, &[]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(record_builders(&case), [HOST], "the warm-up's builder is listed");
+
+    let path = worktree_record_path(&case);
+    let mut written: Value = serde_json::from_str(&fs::read_to_string(&path).expect("the record can be read")).expect("JSON");
+    written["builders"] = json!(["other", HOST]);
+    fs::write(&path, written.to_string()).expect("the record can be rewritten");
+    let key = path.file_stem().expect("the record has a name").to_string_lossy().into_owned();
+    let work = case.folder().join("builder").join("work").join(&key);
+    fs::write(format!("{}.layout", shown(&work)), "pair app lib").expect("the layout record can be written");
+    // A file of the work folder held open keeps the box from laying the folder out again: it refuses `layout`.
+    let held = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(work.join("held.txt"))
+        .expect("a file in the work folder can be held");
+    let steps = ssh_steps(&case, "layout", &["ok", "ok"]);
+
+    let outcome = finish(warm_client(&case, &steps, &[]));
+    drop(held);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(record_builders(&case), ["other"], "the refusing builder is taken off: {outcome:?}");
+}
+
 #[test]
 fn a_real_client_warm_up_withdrawn_when_consent_goes_is_deleted() {
     for background in [false, true] {
@@ -1755,6 +1802,24 @@ fn a_layout_refusal_removes_the_record_and_says_no_warm_hint() {
     assert!(outcome.stderr.contains("gate: remote builder layout; running here"), "{outcome:?}");
     assert!(!outcome.stderr.contains(WARM_HINT), "{outcome:?}");
     assert_eq!(record(&case), None, "the record is removed");
+}
+
+/// A Ctrl+C during the call of a run the builder refuses `layout` ends the run, and still drops the builder's current
+/// warm-up record and takes the builder off the worktree record, as the refusal does without one.
+#[test]
+fn a_ctrl_c_over_a_layout_refusal_drops_the_warm_record_and_the_builder() {
+    let case = recorded_case("warm-route-layout-ctrl-c", "warmed");
+    let path = worktree_record_path(&case);
+    let mut written: Value = serde_json::from_str(&fs::read_to_string(&path).expect("the record can be read")).expect("JSON");
+    written["builders"] = json!([HOST, "other"]);
+    fs::write(&path, written.to_string()).expect("the record can be rewritten");
+
+    let outcome = routed_run(&case, &steps(&case, &["interrupt", "refuse layout"]), &[], &RAN_HERE);
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    assert!(!outcome.stdout.contains("ran here"), "the command ran nowhere: {outcome:?}");
+    assert_eq!(record(&case), None, "the warm-up record is removed");
+    assert_eq!(record_builders(&case), ["other"], "the refusing builder is taken off: {outcome:?}");
 }
 
 #[test]

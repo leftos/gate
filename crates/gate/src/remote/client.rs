@@ -451,15 +451,7 @@ impl RustClient {
             pause: self.pause,
             transfer_pauses: self.transfer_pauses,
             transfer_failed: false,
-            limits: Limits {
-                started: Instant::now(),
-                stall,
-                command: Duration::from_secs(call.timeout),
-                backstop: self.backstop_ms.map_or_else(|| watchdog::backstop(call.timeout), Duration::from_millis),
-                transfer: TRANSFER_CEILING,
-                bound: self.bound,
-                transfer_from: None,
-            },
+            limits: Limits::starting(call.timeout, stall, self.backstop_ms, self.bound),
             one_call: one.map(|name| OneCall {
                 name,
                 stall: self.stall_ms.map(Duration::from_millis),
@@ -502,6 +494,7 @@ impl RustClient {
             local_major: None,
             warm: None,
             marker_seen: false,
+            run_call_started: false,
             raised: None,
             backstop_seam: self.backstop_ms.map(Duration::from_millis),
             carried: match phases {
@@ -1079,6 +1072,21 @@ pub(super) struct Limits {
 }
 
 impl Limits {
+    /// The limits of an attempt starting now: the stall window `stall`, the command's ceiling of `timeout` seconds, the
+    /// backstop of `backstop_ms` milliseconds when the client's seam gives one, else the ceiling's own, the transfer ceiling and the
+    /// bounded calls' `bound`.
+    fn starting(timeout: u64, stall: Duration, backstop_ms: Option<u64>, bound: Duration) -> Limits {
+        Limits {
+            started: Instant::now(),
+            stall,
+            command: Duration::from_secs(timeout),
+            backstop: backstop_ms.map_or_else(|| watchdog::backstop(timeout), Duration::from_millis),
+            transfer: TRANSFER_CEILING,
+            bound,
+            transfer_from: None,
+        }
+    }
+
     /// Why a setup call watched by these limits is killed at `now`, nothing having come from it for `idle`: stalled
     /// once silent for the stall window, else cut at the transfer ceiling counted from [`Limits::started`]; `None`
     /// while it may run on.
@@ -1532,6 +1540,8 @@ pub(super) struct Attempt<'c, 'a> {
     warm: Option<WarmEnd>,
     /// Whether a call of the attempt said the box's start marker, however the call ended, a failure included.
     marker_seen: bool,
+    /// Whether the attempt began its box run call: its preflight passed and its snapshot was pushed.
+    run_call_started: bool,
     /// The run call's ceiling, in whole seconds, once it was raised for a work tree the preflight found new
     /// ([`Attempt::raise_ceiling`]); `None` while it is the call's own.
     raised: Option<u64>,
@@ -1664,6 +1674,7 @@ impl Attempt<'_, '_> {
             desktop: self.call.desktop,
             cross_build: self.call.cross_build,
         };
+        self.run_call_started = true;
         let (called, nonce) = self.run_called(&location, &run, &mut sent, withheld)?;
         // A warm-up brings nothing back: its end is classed, and neither the sync-back nor the outputs step follows.
         if self.warm_ran(&called) {
@@ -3907,6 +3918,7 @@ impl Attempt<'_, '_> {
             warm,
             raised: self.raised,
             draining,
+            run_called: self.run_call_started,
         }
     }
 
@@ -3971,6 +3983,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             local_major: None,
             warm: None,
             marker_seen: false,
+            run_call_started: false,
             raised: None,
             backstop_seam: None,
             carried: Carried::default(),
@@ -6341,6 +6354,7 @@ mod tests {
             local_major: None,
             warm: None,
             marker_seen: false,
+            run_call_started: false,
             raised: None,
             backstop_seam: None,
             carried: Carried::default(),
