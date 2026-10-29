@@ -1136,7 +1136,7 @@ fn no_ceiling_hint_at_or_above_the_load_adjusted_p90_or_without_history_or_witho
     let no_slot = with_timeout(none_words("out.log", &[], &QUICK), "300");
     let fresh = Case::new("durations-no-ceiling-hint-fresh");
     let mut words = run_words("out.log", &[], &QUICK);
-    words[4] = "1";
+    words[4] = "300";
     let no_history = passing(fresh.gate(&words));
 
     assert!(at_p90.stderr.contains("gate: expected about 10 min"), "{at_p90:?}");
