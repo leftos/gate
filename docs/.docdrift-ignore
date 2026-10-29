@@ -16,6 +16,7 @@ siblings.toml
 warmup.toml
 
 # Files in caller repos.
+**/.tmp/x.json
 global.json
 rust-toolchain.toml
 dotnet-tools.json
