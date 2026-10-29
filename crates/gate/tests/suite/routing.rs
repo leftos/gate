@@ -6211,6 +6211,61 @@ fn a_faster_builder_wins_over_a_warm_one_more_than_twice_as_slow() {
     assert_eq!(call["host"], HOST, "{call}");
 }
 
+/// Rewrites the case's store, as [`seed_both`] left it, so the command's key on `builder` holds `runs` passing cold
+/// runs of `wall` seconds, each a copy of its newest warm sample.
+fn seed_cold(case: &Case, builder: &str, wall: f64, runs: usize) {
+    let path = case.root().join("durations.json");
+    let mut store: Value = serde_json::from_str(&fs::read_to_string(&path).expect("the store was written")).expect("the store is JSON");
+    let keys = store["keys"].as_object_mut().expect("the store holds its keys");
+    let prefix = format!("remote:{builder}:");
+    let history = keys
+        .iter_mut()
+        .find(|(key, _)| key.starts_with(&prefix))
+        .map(|(_, history)| history)
+        .expect("the builder's runs are seeded");
+    let mut sample = history["samples"]
+        .as_array()
+        .and_then(|samples| samples.last())
+        .cloned()
+        .expect("a seeded history holds its samples");
+    sample["wall"] = Value::from(wall);
+    history["cold"] = Value::from(vec![sample; runs]);
+    fs::write(&path, store.to_string()).expect("the store can be seeded");
+}
+
+#[test]
+fn a_cold_builder_with_a_learned_gap_beats_a_warm_one_the_default_penalty_would_pick() {
+    let case = balance_case("routing-balance-learned-gap");
+    // The first builder is warm at 100 s; host's 60 s runs cold would score 120 s at twice, but its cold runs take 70 s.
+    seed_both(&case, 100.0, 60.0);
+    seed_cold(&case, HOST, 70.0, 3);
+    plant_worktree_record(&case, &[SLOT_FIRST]);
+
+    let (pid, outcome, call) = balanced_run(&case, "out.log");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(took_on(&case, pid), [HOST], "host scores 60 s plus its 10 s gap: {outcome:?}");
+    assert_eq!(call["host"], HOST, "{call}");
+}
+
+#[test]
+fn a_key_with_too_few_cold_runs_keeps_the_double_penalty() {
+    let case = balance_case("routing-balance-few-cold");
+    seed_both(&case, 100.0, 60.0);
+    seed_cold(&case, HOST, 70.0, 2);
+    plant_worktree_record(&case, &[SLOT_FIRST]);
+
+    let (pid, outcome, call) = balanced_run(&case, "out.log");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        took_on(&case, pid),
+        [SLOT_FIRST],
+        "two cold runs learn no gap, so host scores 120 s: {outcome:?}"
+    );
+    assert_eq!(call["host"], SLOT_FIRST, "{call}");
+}
+
 #[test]
 fn with_nothing_known_the_first_builder_in_file_order_takes_the_run() {
     let case = balance_case("routing-balance-nothing-known");

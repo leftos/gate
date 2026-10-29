@@ -14,6 +14,9 @@ pub struct BuilderFigures {
     pub duration: Option<f64>,
     /// Whether the builder is known to hold a work folder for the worktree.
     pub holds_folder: bool,
+    /// The learned seconds, non-negative and finite, a cold run of this command on the builder takes over `duration`;
+    /// `None` when it has none.
+    pub cold_gap: Option<f64>,
 }
 
 /// The figures every builder gets when the caller knows nothing to tell them apart: a free slot, no wait, no learned
@@ -23,13 +26,14 @@ pub const ALIKE: BuilderFigures = BuilderFigures {
     queue_wait: 0.0,
     duration: None,
     holds_folder: true,
+    cold_gap: None,
 };
 
 /// The indexes of `figures`, best first: by expected finish, the queue wait plus the duration plus, for a builder that
-/// holds no work folder for the worktree, the duration once more. A builder without a duration is given the median of
-/// the others' (for an even count the mean of the two middle ones); when no builder has one, the queue wait alone
-/// decides. An exact tie goes to a builder that holds a work folder first, then keeps the given (file) order, as the
-/// sort is stable. Every queue wait and duration is non-negative and finite.
+/// holds no work folder for the worktree, its learned cold gap, else the duration once more. A builder without a
+/// duration is given the median of the others' (for an even count the mean of the two middle ones); when no builder
+/// has one, the queue wait alone decides. An exact tie goes to a builder that holds a work folder first, then keeps the
+/// given (file) order, as the sort is stable. Every queue wait, duration and cold gap is non-negative and finite.
 #[must_use]
 pub fn order(figures: &[BuilderFigures]) -> Vec<usize> {
     ranked(figures).ranks.into_iter().map(|rank| rank.index).collect()
@@ -40,8 +44,9 @@ pub fn order(figures: &[BuilderFigures]) -> Vec<usize> {
 pub struct Rank {
     /// The builder's index among the figures given.
     pub index: usize,
-    /// Its expected finish in seconds: the queue wait, plus the duration and, without a held work folder, the duration
-    /// once more; the queue wait alone when no builder has a duration ([`Ranking::has_duration`]).
+    /// Its expected finish in seconds: the queue wait, plus the duration and, without a held work folder, the learned
+    /// cold gap, else the duration once more; the queue wait alone when no builder has a duration
+    /// ([`Ranking::has_duration`]).
     pub seconds: f64,
 }
 
@@ -63,8 +68,8 @@ pub fn ranked(figures: &[BuilderFigures]) -> Ranking {
     debug_assert!(
         figures
             .iter()
-            .all(|builder| usable(builder.queue_wait) && builder.duration.is_none_or(usable)),
-        "every queue wait and duration is non-negative and finite: {figures:?}"
+            .all(|builder| usable(builder.queue_wait) && builder.duration.is_none_or(usable) && builder.cold_gap.is_none_or(usable)),
+        "every queue wait, duration and cold gap is non-negative and finite: {figures:?}"
     );
     let known: Vec<f64> = figures.iter().filter_map(|builder| builder.duration).collect();
     let fill = median(known);
@@ -187,18 +192,23 @@ pub fn span_in(seconds: f64, in_minutes: bool) -> String {
 }
 
 /// The builder's expected finish: its queue wait, plus its duration (`fill` for a builder without one) and, when it
-/// holds no work folder for the worktree, that duration once more; the queue wait alone when `fill` is `None`, as no
-/// builder has a duration.
+/// holds no work folder for the worktree, its learned cold gap, else that duration once more; the queue wait alone when
+/// `fill` is `None`, as no builder has a duration.
 fn expected_finish(builder: &BuilderFigures, fill: Option<f64>) -> f64 {
     let Some(duration) = builder.duration.or(fill) else {
         return builder.queue_wait;
     };
-    let penalty = if builder.holds_folder { 0.0 } else { duration };
+    let penalty = if builder.holds_folder {
+        0.0
+    } else {
+        builder.cold_gap.unwrap_or(duration)
+    };
     builder.queue_wait + duration + penalty
 }
 
 /// The median of `durations`, the mean of the two middle ones for an even count; `None` when there are none.
-fn median(mut durations: Vec<f64>) -> Option<f64> {
+#[must_use]
+pub fn median(mut durations: Vec<f64>) -> Option<f64> {
     durations.sort_by(f64::total_cmp);
     let middle = durations.len() / 2;
     match durations.len() {
@@ -218,7 +228,35 @@ mod tests {
             queue_wait,
             duration,
             holds_folder,
+            cold_gap: None,
         }
+    }
+
+    #[test]
+    fn a_learned_cold_gap_replaces_the_default_penalty() {
+        let cold = BuilderFigures {
+            cold_gap: Some(20.0),
+            ..figures(0.0, Some(100.0), false)
+        };
+        let ranking = ranked(&[figures(0.0, Some(150.0), true), cold]);
+        assert_eq!(
+            ranking.ranks[0],
+            Rank { index: 1, seconds: 120.0 },
+            "the cold 100 s builder pays its 20 s gap, not 100 s more, and beats the warm 150 s one"
+        );
+    }
+
+    #[test]
+    fn a_builder_holding_the_folder_pays_no_cold_gap() {
+        let warm = BuilderFigures {
+            cold_gap: Some(20.0),
+            ..figures(5.0, Some(100.0), true)
+        };
+        assert_eq!(
+            ranked(&[warm]).ranks,
+            [Rank { index: 0, seconds: 105.0 }],
+            "the wait and the duration alone"
+        );
     }
 
     #[test]

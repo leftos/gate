@@ -44,6 +44,8 @@ const COLD_RUNS: usize = 10;
 const WINDOW_AGE: SignedDuration = SignedDuration::from_hours(14 * 24);
 /// How many passing runs in the window a key needs for an estimate.
 const MIN_RUNS: usize = 5;
+/// How many passing cold runs in the window a key needs for a cold gap.
+const MIN_COLD_RUNS: usize = 3;
 /// How many of the newest runs the usual time is the median of.
 const RECENT_RUNS: usize = 5;
 /// The characters a key keeps before its hash is appended.
@@ -407,7 +409,7 @@ pub struct KeyHistory {
     /// The newest passing runs, oldest first: at most 30, none more than 14 days older than the newest record.
     pub samples: Vec<Sample>,
     /// The newest passing cold runs, oldest first: at most 10, none more than 14 days older than the newest record.
-    /// A cold run is one whose work tree its own preflight laid out; the estimate never reads these.
+    /// A cold run is one whose work tree its own preflight laid out; the estimate reads these only for its cold gap.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cold: Vec<Sample>,
 }
@@ -462,6 +464,9 @@ pub struct Estimate {
     pub key: String,
     /// True when the figures are the family key's, the exact key having too few runs.
     pub family: bool,
+    /// The seconds a cold run of the key takes over `mean`: the median wall seconds of its passing cold runs within
+    /// the window, less `mean`, never below 0; `None` unless the window holds at least 3 cold runs.
+    pub cold_gap: Option<f64>,
 }
 
 /// The durations store: each key's history.
@@ -615,7 +620,19 @@ fn estimate_of(history: &KeyHistory, now: Timestamp, key: &str, family: bool) ->
         runs: window.len(),
         key: key.to_owned(),
         family,
+        cold_gap: cold_gap(&history.cold, start, mean),
     })
+}
+
+/// The seconds the cold runs of `cold` from `start` on take over `warm_mean`: their median wall seconds (for an even
+/// count the mean of the two middle ones) less `warm_mean`, never below 0; `None` with fewer than 3 such runs.
+fn cold_gap(cold: &[Sample], start: Timestamp, warm_mean: f64) -> Option<f64> {
+    let walls: Vec<f64> = cold.iter().filter(|sample| sample.time >= start).map(|sample| sample.wall).collect();
+    if walls.len() < MIN_COLD_RUNS {
+        return None;
+    }
+    let median = gate_router::balance::median(walls)?;
+    Some((median - warm_mean).max(0.0))
 }
 
 /// The store file as written: `{"v": 1, "keyVersion": 2, "keys": {key: {"last", "failed", "samples", "cold"}}}`, a key

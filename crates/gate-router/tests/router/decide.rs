@@ -3684,6 +3684,7 @@ fn figures(queue_wait: f64, duration: Option<f64>) -> BuilderFigures {
         queue_wait,
         duration,
         holds_folder: true,
+        cold_gap: None,
     }
 }
 
@@ -3857,6 +3858,7 @@ fn the_balanced_value_lists_the_pick_then_the_others_in_score_order() {
         queue_wait: 0.0,
         duration: Some(100.0),
         holds_folder: false,
+        cold_gap: None,
     };
     let facts = FakeFacts::with_config(with_builders(r#"{"yaat": ["dotnet *"]}"#, builders))
         .with_figures("win-1", figures(0.0, Some(300.0)))

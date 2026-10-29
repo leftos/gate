@@ -739,14 +739,14 @@ impl<'a> FigureReader<'a> {
     /// The figures of each of `builders`, in order, for the run of the worktree at `place`, read now: the free slots
     /// of each builder's remote pool on this PC and the wait for one ([`wait::pools_now`], every pool probed before
     /// the other gates' tickets and claims are read once for all of them, and [`wait::queue_wait`]), the run's learned
-    /// duration on it ([`durations::builder_durations`], one read of the store), and whether the worktree record of the
-    /// run's work-folder key lists it among the builders holding a work folder; none is listed when there is no record
-    /// or it cannot be read. Each problem in reading the pools is kept once among `notes`, for the log.
+    /// duration and cold gap on it ([`durations::builder_durations`], one read of the store), and whether the worktree
+    /// record of the run's work-folder key lists it among the builders holding a work folder; none is listed when there
+    /// is no record or it cannot be read. Each problem in reading the pools is kept once among `notes`, for the log.
     fn figures(&self, place: &Place, builders: &[&Builder], notes: &RefCell<Vec<String>>) -> Vec<BuilderFigures> {
         let aliases: Vec<&str> = builders.iter().map(|builder| builder.alias.as_str()).collect();
         let learned = match &self.command {
             Some(command) => durations::builder_durations(&self.root.path, place, command, self.critical, &aliases),
-            None => vec![None; aliases.len()],
+            None => vec![durations::Learned::default(); aliases.len()],
         };
         let record = v1::worktree_record_path(&self.root.path, &work_folder_key(&place.root));
         let holding = worktree_record::read_worktree_record(&record)
@@ -761,11 +761,12 @@ impl<'a> FigureReader<'a> {
             .iter()
             .zip(learned)
             .zip(now)
-            .map(|((builder, duration), pool)| BuilderFigures {
+            .map(|((builder, learned), pool)| BuilderFigures {
                 free_slots: pool.free,
-                queue_wait: wait::queue_wait(&pool, duration),
-                duration,
+                queue_wait: wait::queue_wait(&pool, learned.duration),
+                duration: learned.duration,
                 holds_folder: holding.contains(&builder.alias),
+                cold_gap: learned.cold_gap,
             })
             .collect()
     }

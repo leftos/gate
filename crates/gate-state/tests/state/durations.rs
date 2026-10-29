@@ -587,6 +587,109 @@ fn the_cold_list_keeps_the_newest_ten_within_the_window() {
     );
 }
 
+/// Records passing cold runs of `walls` under `key`, oldest first, one minute apart, the last a minute before [`NOW`].
+fn record_cold(store: &mut DurationStore, key: &DurationKey, walls: &[f64]) {
+    for (index, wall) in walls.iter().enumerate() {
+        store.record(key, minutes_before_now(walls.len() - index), &passed(*wall), true);
+    }
+}
+
+/// The cold gap of `key`'s estimate at `now`; `None` without an estimate or without a gap.
+fn cold_gap_at(store: &DurationStore, key: &DurationKey, now: Timestamp) -> Option<f64> {
+    store.estimate(key, now).and_then(|estimate| estimate.cold_gap)
+}
+
+#[test]
+fn a_key_with_enough_cold_runs_gives_a_cold_gap_over_its_warm_figure() {
+    let key = local_key("cargo build");
+    let mut store = DurationStore::new();
+    record_walls(&mut store, &key, &[10.0; 5]);
+    record_cold(&mut store, &key, &[30.0, 100.0, 40.0]);
+
+    assert_eq!(
+        cold_gap_at(&store, &key, ts(NOW)),
+        Some(30.0),
+        "the cold runs' median 40 s over the warm mean 10 s, not their mean"
+    );
+}
+
+#[test]
+fn a_key_with_fewer_than_three_cold_runs_gives_no_cold_gap() {
+    let key = local_key("cargo build");
+    let mut store = DurationStore::new();
+    record_walls(&mut store, &key, &[10.0; 5]);
+    record_cold(&mut store, &key, &[40.0, 40.0]);
+
+    assert_eq!(cold_gap_at(&store, &key, ts(NOW)), None, "two cold runs are too few");
+}
+
+#[test]
+fn a_cold_run_older_than_the_window_does_not_count_toward_the_gap() {
+    let key = local_key("cargo build");
+    let mut store = DurationStore::new();
+    store.record(&key, days_before_now(10), &passed(40.0), true);
+    record_walls(&mut store, &key, &[10.0; 5]);
+    record_cold(&mut store, &key, &[40.0, 40.0]);
+
+    assert_eq!(cold_gap_at(&store, &key, ts(NOW)), Some(30.0), "three cold runs in the window give a gap");
+    let later = ts(NOW) + SignedDuration::from_hours(5 * 24);
+    assert_eq!(
+        cold_gap_at(&store, &key, later),
+        None,
+        "five days on, the cold run 10 days old has left the window, leaving two"
+    );
+}
+
+#[test]
+fn a_cold_gap_below_zero_counts_as_zero() {
+    let key = local_key("cargo build");
+    let mut store = DurationStore::new();
+    record_walls(&mut store, &key, &[10.0; 5]);
+    record_cold(&mut store, &key, &[4.0, 4.0, 4.0]);
+
+    assert_eq!(
+        cold_gap_at(&store, &key, ts(NOW)),
+        Some(0.0),
+        "cold runs faster than warm ones cost nothing"
+    );
+}
+
+#[test]
+fn a_key_with_cold_runs_and_no_warm_estimate_gives_no_cold_gap() {
+    let key = local_key("cargo build");
+    let mut store = DurationStore::new();
+    record_walls(&mut store, &key, &[10.0; 4]);
+    record_cold(&mut store, &key, &[40.0; 5]);
+
+    assert_eq!(store.estimate(&key, ts(NOW)), None, "four warm runs give no estimate");
+    assert_eq!(cold_gap_at(&store, &key, ts(NOW)), None, "nor a gap, whatever the cold runs");
+}
+
+#[test]
+fn the_cold_gap_comes_from_the_same_key_as_the_warm_figure() {
+    let mine = local_key("cargo nextest run -E mine");
+    let other = local_key("cargo nextest run -E other");
+    let third = local_key("cargo nextest run -E third");
+    assert_eq!((&mine.family, &other.family), (&third.family, &third.family), "one family");
+    let mut store = DurationStore::new();
+    record_walls(&mut store, &mine, &[10.0; 5]);
+    record_cold(&mut store, &mine, &[40.0; 3]);
+    record_cold(&mut store, &other, &[400.0; 3]);
+
+    let exact = store.estimate(&mine, ts(NOW)).expect("five warm runs give an estimate");
+    assert_eq!(
+        (exact.family, exact.cold_gap),
+        (false, Some(30.0)),
+        "the exact key's own cold runs, never the family's"
+    );
+    let family = store.estimate(&third, ts(NOW)).expect("the family key gives an estimate");
+    assert_eq!(
+        (family.family, family.cold_gap),
+        (true, Some(210.0)),
+        "the family's cold median 220 s over its warm mean 10 s"
+    );
+}
+
 #[test]
 fn the_mean_is_over_the_window() {
     let key = local_key("cargo build");

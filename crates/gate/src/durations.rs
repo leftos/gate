@@ -250,13 +250,13 @@ pub(crate) fn unreadable_line(error: &StoreReadError) -> String {
 
 /// The learned seconds of the command `command`, a critical run's when `critical`, of the folder the routing decision
 /// placed at `place`, on each builder of `aliases`, in order: the figure the expected-time line says as `about` (the
-/// estimate's mean), under the key place `remote:<alias>`, read as [`RunDurations::estimate`] reads it, the exact key
-/// else the family key. The store under the state root `root` is read once for every builder, with no lock; a store
-/// that is missing, not current or cannot be read gives `None` for every builder, and a key without history `None` for
-/// its builder.
-pub(crate) fn builder_durations(root: &Path, place: &Place, command: &str, critical: bool, aliases: &[&str]) -> Vec<Option<f64>> {
+/// estimate's mean) with the estimate's cold gap, under the key place `remote:<alias>`, read as
+/// [`RunDurations::estimate`] reads it, the exact key else the family key. The store under the state root `root` is
+/// read once for every builder, with no lock; a store that is missing, not current or cannot be read gives neither
+/// figure for any builder, and a key without an estimate neither for its builder.
+pub(crate) fn builder_durations(root: &Path, place: &Place, command: &str, critical: bool, aliases: &[&str]) -> Vec<Learned> {
     let StoreRead::Current(store) = read_store(root) else {
-        return vec![None; aliases.len()];
+        return vec![Learned::default(); aliases.len()];
     };
     let folder = from_route(place);
     let temp_root = temp_root();
@@ -271,9 +271,22 @@ pub(crate) fn builder_durations(root: &Path, place: &Place, command: &str, criti
                 temp_root: temp_root.as_deref(),
                 command,
             });
-            store.estimate(&key, now).map(|estimate| estimate.mean)
+            store.estimate(&key, now).map_or_else(Learned::default, |estimate| Learned {
+                duration: Some(estimate.mean),
+                cold_gap: estimate.cold_gap,
+            })
         })
         .collect()
+}
+
+/// What [`builder_durations`] learned of one builder, each in seconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Learned {
+    /// The estimate's mean; `None` for a key without an estimate.
+    pub(crate) duration: Option<f64>,
+    /// The seconds a cold run takes over `duration`, from the same key's cold runs ([`Estimate::cold_gap`]); `None`
+    /// without one.
+    pub(crate) cold_gap: Option<f64>,
 }
 
 /// The learned p50, in seconds, of the command `command`, a critical run's when `critical`, run here from the folder
@@ -374,7 +387,7 @@ impl RunDurations {
         }
     }
 
-    /// The run's key on the build box `remote_host` (`user@host`), or here when it is `None`.
+    /// The run's key on the builder whose alias is `remote_host`, or here when it is `None`.
     fn key(&self, remote_host: Option<&str>) -> DurationKey {
         duration_key(&KeyInputs {
             folder: &self.folder,
@@ -415,8 +428,8 @@ impl RunDurations {
         }
     }
 
-    /// What files the run's release on `remote_host` in the journal hold, or `None` when the run reached no verdict;
-    /// `cold` files a passing cold run apart from the samples the estimate reads.
+    /// What files the run's release on the builder whose alias is `remote_host` in the journal hold, or `None` when the
+    /// run reached no verdict; `cold` files a passing cold run apart from the samples the estimate reads.
     pub(crate) fn filing(&self, remote_host: Option<&str>, facts: Option<RunFacts>, cold: bool) -> Option<Filing> {
         let facts = facts?;
         Some(Filing {
@@ -571,8 +584,8 @@ mod tests {
     use gate_args::Ceiling;
 
     use super::{
-        GitLimits, Resolved, RunDurations, Said, StoreSeen, Usual, ceiling_hint, expected_line, from_route, hang_hint, local_p50,
-        raised_ceiling_line, resolve_ceiling, routed_usual, span_in, span_text, temp_root,
+        GitLimits, Learned, Resolved, RunDurations, Said, StoreSeen, Usual, builder_durations, ceiling_hint, expected_line, from_route, hang_hint,
+        local_p50, raised_ceiling_line, resolve_ceiling, routed_usual, span_in, span_text, temp_root,
     };
     use crate::console::Console;
 
@@ -587,6 +600,7 @@ mod tests {
             runs,
             key: "local:: | cargo build".to_owned(),
             family,
+            cold_gap: None,
         }
     }
 
@@ -1152,6 +1166,48 @@ mod tests {
             local_p50(&root.0, &place, "cargo nextest run -E other", false),
             Some(3.0),
             "the runs' own exact key is"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test that cannot write its store must fail loudly")]
+    fn builder_durations_reads_the_cold_gap_with_the_figure() {
+        let place = routed_place();
+        let root = Root::new("builder-cold-gap");
+        let key = duration_key(&KeyInputs {
+            folder: &from_route(&place),
+            remote_host: Some("win-1"),
+            critical: false,
+            temp_root: temp_root().as_deref(),
+            command: "cargo build",
+        });
+        let mut store = DurationStore::new();
+        let now = Timestamp::now();
+        let walls = [(10.0, false); 5].into_iter().chain([(40.0, true); 3]);
+        for (index, (wall, cold)) in (1_i64..).zip(walls) {
+            let time = now.checked_sub(SignedDuration::from_secs(10 - index)).expect("a moment just before now");
+            let facts = RunFacts {
+                wall_seconds: wall,
+                adjusted_seconds: None,
+                avg_cores: None,
+                peak_cores: None,
+                free_cores: None,
+                verdict: Verdict::Passed,
+            };
+            store.record(&key, time, &facts, cold);
+        }
+        write_store(&root.0, &store).expect("the store can be written");
+
+        assert_eq!(
+            builder_durations(&root.0, &place, "cargo build", false, &["win-1", "win-2"]),
+            [
+                Learned {
+                    duration: Some(10.0),
+                    cold_gap: Some(30.0),
+                },
+                Learned::default(),
+            ],
+            "the warm mean with the cold runs' 30 s over it; a builder without history has neither"
         );
     }
 }
