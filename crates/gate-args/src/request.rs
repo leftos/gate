@@ -147,6 +147,10 @@ pub struct BoxSeams {
     /// The file whose existence starts the bound of the git step `--test-box-git-limit` names; `None` without the
     /// feature, and every bound starts with its step.
     pub git_armed_by: Option<PathBuf>,
+    /// How long each of `gate box`'s long git steps (`fetch`, `checkout`, `lfs checkout`, `clean`, `add -A`, `push`,
+    /// prune's `gc --auto`) may take, in milliseconds, in place of the built-in 30 minutes; a step `git_limit` names keeps that limit.
+    /// `None` without the feature.
+    pub git_long_ms: Option<u64>,
     /// How long `gate box hold` waits between its looks for a free slot, in milliseconds, in place of the built-in
     /// 5 s; `None` without the feature.
     pub hold_poll_ms: Option<u64>,

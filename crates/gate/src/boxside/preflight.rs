@@ -24,6 +24,8 @@ use gate_wire::{
     Pair, PathForm, Payload, ROOT_STATUS, WARM_READ_LIMIT, bare_stem, layout_text_for, names_another_layout, readies_single, root_busy_line,
     root_unsafe_line, trees, warm_record_hash, work_root,
 };
+use jiff::Timestamp;
+use proc_table::{ProcessTree, Win32ProcessTable};
 use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
@@ -1166,10 +1168,18 @@ static GIT_LIMIT_SEAM: OnceLock<(String, Duration)> = OnceLock::new();
 /// starts the bound of the step the limit names, that step having none until then.
 static GIT_ARMED_BY: OnceLock<PathBuf> = OnceLock::new();
 
+/// `--test-box-git-long-ms <ms>`, set once before the box's verb runs ([`set_git_limit`]): the bound every long git
+/// step takes in place of [`GIT_LONG_LIMIT`], unless `--test-box-git-limit` names that step.
+static GIT_LONG_SEAM: OnceLock<Duration> = OnceLock::new();
+
 /// Makes `--test-box-git-limit`, when `seams` gives it, the bound of the git step it names in place of
 /// [`GIT_SHORT_LIMIT`] or [`GIT_LONG_LIMIT`], every other step keeping its own, and `--test-box-git-armed-by` the file
-/// that step's bound waits for before it starts counting; called once, before the box's verb runs.
+/// that step's bound waits for before it starts counting, and `--test-box-git-long-ms` the bound of every other long
+/// step in place of [`GIT_LONG_LIMIT`]; called once, before the box's verb runs.
 pub(crate) fn set_git_limit(seams: &BoxSeams) {
+    if let Some(ms) = seams.git_long_ms {
+        GIT_LONG_SEAM.get_or_init(|| Duration::from_millis(ms));
+    }
     if let Some((step, ms)) = &seams.git_limit {
         GIT_LIMIT_SEAM.get_or_init(|| (step.clone(), Duration::from_millis(*ms)));
     }
@@ -1194,11 +1204,11 @@ pub(crate) enum GitClass {
 }
 
 impl GitClass {
-    /// Its built-in bound.
+    /// Its class's bound: the built-in one, or `--test-box-git-long-ms`'s for a long step when the box was given it.
     fn limit(self) -> Duration {
         match self {
             GitClass::Short | GitClass::ShortBare => GIT_SHORT_LIMIT,
-            GitClass::Long | GitClass::LongBare => GIT_LONG_LIMIT,
+            GitClass::Long | GitClass::LongBare => GIT_LONG_SEAM.get().copied().unwrap_or(GIT_LONG_LIMIT),
         }
     }
 
@@ -1488,6 +1498,7 @@ fn git_ran(
     let mut bound = Bound::new(step);
     let end = waited(&watched, &mut bound, signal.as_ref(), shared, console);
     let Watched { forwarders, .. } = watched;
+    let bounded = matches!(end, WaitEnd::Killed(GitEnd::Bound));
     let failure = match end {
         WaitEnd::Exited { code, stopped: false } => {
             let drained = forwarders.drain(DRAIN);
@@ -1513,6 +1524,9 @@ fn git_ran(
     } else {
         failure
     };
+    if bounded {
+        still_ran(&job, &job_name(step), shared.lock, console);
+    }
     Err(ended(&job, forwarders, failure, step, shared.lock, console))
 }
 
@@ -1590,13 +1604,70 @@ fn waited(watched: &Watched<'_>, bound: &mut Bound, signal: Option<&StopSignal<'
 fn ended(job: &Job, forwarders: Forwarders, failure: GitFailure, step: GitStep<'_>, lock: &OutputLock, console: &mut Console) -> GitFailure {
     let ending = terminate_and_wait(job);
     forwarders.drain(DRAIN);
-    let name = format!("git {}", step.name.strip_prefix("git ").unwrap_or(step.name));
+    let name = job_name(step);
     let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
     match ending {
         Ok(ending) => ending.say(&name, console),
         Err(error) => stamping::err(console, &format!("gate: remote could not stop job {name}: {error}")),
     }
     failure
+}
+
+/// How many of the processes a bounded git step still ran [`still_ran`] names, one line each.
+const NAMED_AT_BOUND: usize = 16;
+
+/// The name the lines about the job of the git step `step` give it: `git checkout`, `git push lib`, `git init --bare`.
+fn job_name(step: GitStep<'_>) -> String {
+    format!("git {}", step.name.strip_prefix("git ").unwrap_or(step.name))
+}
+
+/// Says under `lock`, before the job of the git step `name` its bound ended is terminated, each process `job` still
+/// ran ([`still_ran_lines`]), so a hung step names what hung; a job or a process snapshot that could not be read is
+/// said instead ([`could_not_list`]), and the step is ended all the same.
+fn still_ran(job: &Job, name: &str, lock: &OutputLock, console: &mut Console) {
+    let listed_at = Timestamp::now();
+    let listed = job
+        .process_ids()
+        .and_then(|pids| Win32ProcessTable.try_snapshot_without_command_lines().map(|snapshot| (pids, snapshot)));
+    let lines = match listed {
+        Ok((pids, snapshot)) => still_ran_lines(name, pids, &ProcessTree::new(snapshot), listed_at, Timestamp::now()),
+        Err(error) => vec![could_not_list(name, &error)],
+    };
+    let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    for line in &lines {
+        stamping::err(console, line);
+    }
+}
+
+/// The line said when the job of the git step `name` or the process snapshot could not be read at its bound.
+fn could_not_list(name: &str, error: &io::Error) -> String {
+    format!("gate: remote could not list job {name}: {error}")
+}
+
+/// One line per process of `pids`, in pid order, the job of the git step `name` still ran at its bound: its image,
+/// escaped, and its age at `now` to a tenth of a second, as `tree` lists it, `?` for what it does not. A snapshot
+/// entry that started after `listed_at`, when the job's pids were listed, took the pid since and is not the job's: both
+/// are `?` for it. An age that would be negative is `?`. At most [`NAMED_AT_BOUND`] are named, and one more line
+/// counts the rest.
+fn still_ran_lines(name: &str, mut pids: Vec<u32>, tree: &ProcessTree, listed_at: Timestamp, now: Timestamp) -> Vec<String> {
+    pids.sort_unstable();
+    let mut lines: Vec<String> = pids
+        .iter()
+        .take(NAMED_AT_BOUND)
+        .map(|&pid| {
+            let process = tree.get(pid).filter(|process| process.created.is_none_or(|created| created <= listed_at));
+            let image = process.map_or_else(|| "?".to_owned(), |process| escaped(&process.name));
+            let age = process
+                .and_then(|process| process.created)
+                .filter(|&created| created <= now)
+                .map_or_else(|| "?".to_owned(), |created| format!("{:.1}", now.duration_since(created).as_secs_f64()));
+            format!("gate: remote {name} still ran at its bound: {image} pid {pid}, {age} s old")
+        })
+        .collect();
+    if pids.len() > NAMED_AT_BOUND {
+        lines.push(format!("gate: remote {name} still ran {} more processes", pids.len() - NAMED_AT_BOUND));
+    }
+    lines
 }
 
 /// The launch of the git `command` as a step of `class`, created suspended: its program, words, working folder and
@@ -1741,8 +1812,8 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 
     use super::{
-        Bound, Git, GitClass, GitFailure, GitStep, Shared, Streams, TreeAt, fresh_config, fresh_config_written, git_failed, git_launch, git_ran,
-        lock_waited, readers, ready_tree, refused_folders, replace_config, waited,
+        Bound, Git, GitClass, GitFailure, GitStep, NAMED_AT_BOUND, Shared, Streams, TreeAt, could_not_list, fresh_config, fresh_config_written,
+        git_failed, git_launch, git_ran, lock_waited, readers, ready_tree, refused_folders, replace_config, still_ran_lines, waited,
     };
     use crate::boxside::forward::{ClientGone, OutputLock};
     use crate::boxside::helper_trusted;
@@ -1750,6 +1821,112 @@ mod tests {
     use crate::console::Console;
     use crate::remote::launch;
     use gate_wire::Payload;
+    use jiff::{SignedDuration, Timestamp};
+    use proc_table::{ProcessInfo, ProcessTree};
+
+    /// The moment the job's pids were listed in the [`still_ran_lines`] cases, and `now` 10 s after it.
+    #[expect(clippy::expect_used, reason = "a fixed second inside jiff's range")]
+    fn listed_and_now() -> (Timestamp, Timestamp) {
+        let listed_at = Timestamp::from_second(1_800_000_000).expect("a timestamp in range");
+        (listed_at, listed_at + SignedDuration::from_secs(10))
+    }
+
+    /// A snapshot entry for `pid`, named `name`, started `before` the moment the pids were listed (`None`: unknown).
+    fn entry(pid: u32, name: &str, before: Option<SignedDuration>) -> ProcessInfo {
+        let (listed_at, _) = listed_and_now();
+        ProcessInfo {
+            pid,
+            parent_pid: 4,
+            name: name.to_owned(),
+            command_line: None,
+            created: before.map(|before| listed_at - before),
+        }
+    }
+
+    #[test]
+    fn still_ran_lines_name_each_process_in_pid_order_with_its_image_and_age() {
+        let (listed_at, now) = listed_and_now();
+        let tree = ProcessTree::new(vec![
+            entry(30, "git.exe", Some(SignedDuration::from_millis(2_500))),
+            entry(7, "fake-tool.exe", Some(SignedDuration::from_secs(5))),
+        ]);
+        assert_eq!(
+            still_ran_lines("git checkout", vec![30, 7], &tree, listed_at, now),
+            [
+                "gate: remote git checkout still ran at its bound: fake-tool.exe pid 7, 15.0 s old",
+                "gate: remote git checkout still ran at its bound: git.exe pid 30, 12.5 s old",
+            ]
+        );
+    }
+
+    #[test]
+    fn still_ran_lines_show_a_question_mark_for_what_the_snapshot_does_not_say() {
+        let (listed_at, now) = listed_and_now();
+        let tree = ProcessTree::new(vec![
+            entry(2, "unstarted.exe", None),
+            entry(3, "reused.exe", Some(SignedDuration::from_secs(-1))),
+        ]);
+        assert_eq!(
+            still_ran_lines("git fetch", vec![3, 1, 2], &tree, listed_at, now),
+            [
+                "gate: remote git fetch still ran at its bound: ? pid 1, ? s old",
+                "gate: remote git fetch still ran at its bound: unstarted.exe pid 2, ? s old",
+                "gate: remote git fetch still ran at its bound: ? pid 3, ? s old",
+            ],
+            "a pid missing from the snapshot, an unknown start, and a pid taken by a process started after the listing"
+        );
+    }
+
+    #[test]
+    fn still_ran_lines_never_show_a_negative_age() {
+        let (listed_at, _) = listed_and_now();
+        let tree = ProcessTree::new(vec![entry(9, "git.exe", Some(SignedDuration::from_secs(1)))]);
+        let now = listed_at - SignedDuration::from_secs(5);
+        assert_eq!(
+            still_ran_lines("git checkout", vec![9], &tree, listed_at, now),
+            ["gate: remote git checkout still ran at its bound: git.exe pid 9, ? s old"]
+        );
+    }
+
+    #[test]
+    fn still_ran_lines_escape_the_image() {
+        let (listed_at, now) = listed_and_now();
+        let tree = ProcessTree::new(vec![entry(5, "evil\u{202e}exe.\u{7}git", Some(SignedDuration::from_secs(1)))]);
+        let lines = still_ran_lines("git checkout", vec![5], &tree, listed_at, now);
+        assert_eq!(
+            lines,
+            [format!(
+                "gate: remote git checkout still ran at its bound: {} pid 5, 11.0 s old",
+                gate_router::escaped("evil\u{202e}exe.\u{7}git")
+            )]
+        );
+        assert!(!lines[0].contains(['\u{202e}', '\u{7}']), "{lines:?}");
+    }
+
+    #[test]
+    fn still_ran_lines_name_at_most_sixteen_and_count_the_rest() {
+        let (listed_at, now) = listed_and_now();
+        let pids: Vec<u32> = (1..=20).rev().collect();
+        let lines = still_ran_lines("git push lib", pids, &ProcessTree::new(Vec::new()), listed_at, now);
+        assert_eq!(lines.len(), NAMED_AT_BOUND + 1, "{lines:?}");
+        assert_eq!(lines[0], "gate: remote git push lib still ran at its bound: ? pid 1, ? s old");
+        assert_eq!(
+            lines[NAMED_AT_BOUND - 1],
+            "gate: remote git push lib still ran at its bound: ? pid 16, ? s old"
+        );
+        assert_eq!(lines[NAMED_AT_BOUND], "gate: remote git push lib still ran 4 more processes");
+        let exactly = still_ran_lines("git push lib", (1..=16).collect(), &ProcessTree::new(Vec::new()), listed_at, now);
+        assert_eq!(exactly.len(), NAMED_AT_BOUND, "sixteen are all named, with no count line: {exactly:?}");
+    }
+
+    #[test]
+    fn could_not_list_names_the_job_and_the_error() {
+        let error = io::Error::other("access denied");
+        assert_eq!(
+            could_not_list("git checkout", &error),
+            "gate: remote could not list job git checkout: access denied"
+        );
+    }
 
     #[test]
     #[expect(clippy::expect_used, reason = "a git that cannot be named must fail the case loudly")]

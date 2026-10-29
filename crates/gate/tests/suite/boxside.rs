@@ -206,10 +206,20 @@ fn box_call(case: &Case, args: &[&str], request: &str) -> BoxCall {
     box_call_stopped_at(case, &case.folder(), args, request)
 }
 
-/// [`box_call`] with the walk above the work root ending at `stop`, unjudged, in place of the case folder.
+/// [`box_call`] with the walk above the work root ending at `stop`, unjudged, in place of the case folder. Its long git
+/// steps are bound at [`SUITE_GIT_LONG_MS`] in place of the box's 30 minutes, so the box's own bound fires before the
+/// suite's [`HANG_GUARD`] and a hung git step is said by the box, naming what still ran.
 fn box_call_stopped_at(case: &Case, stop: &Path, args: &[&str], request: &str) -> BoxCall {
     let stop = shown(stop);
-    let mut words = vec!["box", "--test-heartbeat-ms", QUIET_HEARTBEAT_MS, "--test-box-root-walk-stop", &stop];
+    let mut words = vec![
+        "box",
+        "--test-heartbeat-ms",
+        QUIET_HEARTBEAT_MS,
+        "--test-box-root-walk-stop",
+        &stop,
+        "--test-box-git-long-ms",
+        SUITE_GIT_LONG_MS,
+    ];
     words.extend_from_slice(args.strip_prefix(&["box"][..]).unwrap_or(args));
     bare_box_call(case, &words, request)
 }
@@ -1145,6 +1155,9 @@ const PARKED_GIT_GUARD: Duration = HANG_GUARD;
 /// (`--test-box-git-armed-by`): the clock starts only once the stub's child has written the pid, so the step's start
 /// has no deadline to beat whatever the machine's load, and the bound then ends the step.
 const ARMED_LIMIT_MS: u64 = 2_000;
+/// The bound [`box_call`] and the helpers built on it give the box's long git steps, in milliseconds: 300 s, below the
+/// suite's 600 s [`HANG_GUARD`], so a hung git step is ended and said by the box before the suite gives up on it.
+const SUITE_GIT_LONG_MS: &str = "300000";
 /// The armed bound of a case whose client goes while the step parks: long enough that the box has time to see the
 /// client gone before the bound fires.
 const GONE_ARMED_LIMIT_MS: u64 = 20_000;
@@ -2647,6 +2660,68 @@ fn box_run_ends_the_git_tree_of_a_step_it_bounded() {
 
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
     wait_until_gone(parked_pid_ended(&parked));
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// A git step the bound ends names, before it ends them, the processes its job still ran: the parked stub's own child,
+/// fake-tool, is named with its pid, so a hung step says which process hung. The bound is armed by the child's pid
+/// file, as in [`box_run_ends_the_git_tree_of_a_step_it_bounded`], so no load can end the step before the child runs.
+#[test]
+fn box_run_names_the_processes_a_bounded_git_step_still_ran() {
+    let case = Case::new("box_run_git_bound_named");
+    let (payload, path, parked) = parking_checkout(&case);
+    let limit = format!("checkout:{ARMED_LIMIT_MS}");
+    let armed = shown(&parked);
+
+    let outcome = run_box_parked(
+        &case,
+        &payload,
+        &path,
+        &["--test-box-git-limit", &limit, "--test-box-git-armed-by", &armed],
+    );
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let pid = parked_pid_ended(&parked);
+    let named = format!("gate: remote git checkout still ran at its bound: fake-tool.exe pid {pid}, ");
+    assert!(outcome.stderr.lines().any(|line| line.starts_with(&named)), "{named}: {outcome:?}");
+    wait_until_gone(pid);
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// `--test-box-git-long-ms` bounds a long git step no `--test-box-git-limit` names: the parked checkout is ended at
+/// that bound, says what it still ran, and the run fails with status 1 before its command. The run's real `fetch`, the
+/// one long step before the checkout, is named by `--test-box-git-limit` and keeps that limit in place of the long
+/// bound, so no load can end it at the short bound the checkout takes. The case gives the long seam itself, in place
+/// of the suite's [`SUITE_GIT_LONG_MS`].
+#[test]
+fn a_long_git_step_takes_the_test_long_bound() {
+    let case = Case::new("box_run_git_long_bound");
+    let (payload, path, _parked) = parking_checkout(&case);
+    let stop = shown(&case.folder());
+    let long = ARMED_LIMIT_MS.to_string();
+    let words = [
+        "box",
+        "--test-heartbeat-ms",
+        QUIET_HEARTBEAT_MS,
+        "--test-box-root-walk-stop",
+        &stop,
+        "--test-box-git-long-ms",
+        &long,
+        "--test-box-git-limit",
+        "fetch:600000",
+        "run",
+    ];
+    let mut call = bare_box_call(&case, &words, &self::payload(&payload));
+    call.env("PATH", &path);
+
+    let outcome = call.start().finish_read();
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let bound = format!("gate: remote checkout failed: git did not answer within {} s", ARMED_LIMIT_MS / 1000);
+    assert!(outcome.stderr.lines().any(|line| line == bound), "{bound}: {outcome:?}");
+    let named = "gate: remote git checkout still ran at its bound: ";
+    assert!(outcome.stderr.lines().any(|line| line.starts_with(named)), "{named}: {outcome:?}");
+    assert!(!outcome.stdout.contains("command-ran"), "the command never ran: {outcome:?}");
     wait_until_closed(Path::new(field(&payload, "Lock")));
 }
 

@@ -3568,6 +3568,10 @@ The box's ceiling has three seams: `--test-box-sample-ms <n>` replaces the 5 s s
 
 `--test-box-git-armed-by <path>` makes the bound `--test-box-git-limit` gives its step start only once `<path>` exists, checked at each look of the step's wait: until then that step has no bound, and the steps the limit does not name keep their class bound from their start. Without this flag the limit's bound starts with its step; given without `--test-box-git-limit` it is `gate: --test-box-git-armed-by needs --test-box-git-limit`.
 
+`--test-box-git-long-ms <ms>` replaces the 30-minute bound of every long box git step (`fetch`, `checkout`, `lfs checkout`, `clean`, `add -A`, `push` and prune's `gc --auto`, the bare writes among them included) with `ms` milliseconds; a step `--test-box-git-limit` names keeps that limit. A value that is not a whole number above 0 is `gate: --test-box-git-long-ms must be a whole number above 0, got '<value>'`.
+
+The suite's `box_call` helpers give 300 s, so a hung git step is ended and said by the box, naming the processes it still ran, before the suite's 600 s hang guard; a case built on `bare_box_call` keeps the 30 minutes unless it gives the seam itself.
+
 `--test-lfs-budget-bytes <n>` replaces the 16 GiB a `gate box lfs` put unpacks, in bytes.
 
 `--test-box-root-walk-stop <folder>`, which the keyed `gate box prune` also honours, ends the preflight's walk over the folders above the work root at that folder, which and those above it go unjudged (any path; an empty value is no value), so a case does not depend on the host's folders.

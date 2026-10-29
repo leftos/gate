@@ -13,11 +13,10 @@
 //! `--test-box-kill-leaves <n>`, `--test-probe-limit-ms <n>`, `--test-probe-drain-ms <n>`, `--test-box-desktop <fault>`,
 //! `--test-box-desktop-session <state>`, `--test-box-desktop-mutex <name>`, `--test-box-desktop-ms <n>`,
 //! `--test-box-desktop-message-ms <n>` and `--test-box-register ok|fail`, `--test-box-root-walk-stop <folder>`,
-//! `--test-box-git-limit <step>:<ms>`, `--test-box-git-armed-by <path>`, `--test-box-channel-ports <first>-<last>`,
-//! `--test-box-channel-accept-ms <n>`, `--test-box-channel-proof-ms <n>`, `--test-box-channel-idle-ms <n>` and
-//! `--test-box-channel-send-buffer-bytes <n>`
-//! (each also as `--<seam>=<value>`) before the
-//! verb; without the feature each is no verb, and so the box usage.
+//! `--test-box-git-limit <step>:<ms>`, `--test-box-git-armed-by <path>`, `--test-box-git-long-ms <ms>`,
+//! `--test-box-channel-ports <first>-<last>`, `--test-box-channel-accept-ms <n>`, `--test-box-channel-proof-ms <n>`,
+//! `--test-box-channel-idle-ms <n>` and `--test-box-channel-send-buffer-bytes <n>` (each also as `--<seam>=<value>`)
+//! before the verb; without the feature each is no verb, and so the box usage.
 
 use std::ffi::{OsStr, OsString};
 use std::iter::Peekable;
@@ -258,6 +257,8 @@ enum Seam {
     /// `--test-box-git-armed-by <path>`: the bound `--test-box-git-limit` gives its step starts only once this file
     /// exists.
     GitArmedBy,
+    /// `--test-box-git-long-ms <ms>`: how long each of the box's long git steps may take, in milliseconds.
+    GitLongMs,
     /// `--test-box-hold-poll-ms <n>`: how long `hold` waits between its looks for a free slot, in milliseconds.
     HoldPollMs,
     /// `--test-box-channel-ports <first>-<last>`: the ports a data channel may listen on.
@@ -307,6 +308,7 @@ impl Seam {
             "--test-box-root-walk-stop" => Some(Seam::RootWalkStop),
             "--test-box-git-limit" => Some(Seam::GitLimit),
             "--test-box-git-armed-by" => Some(Seam::GitArmedBy),
+            "--test-box-git-long-ms" => Some(Seam::GitLongMs),
             "--test-box-hold-poll-ms" => Some(Seam::HoldPollMs),
             "--test-box-channel-ports" => Some(Seam::ChannelPorts),
             "--test-box-channel-accept-ms" => Some(Seam::ChannelAcceptMs),
@@ -349,6 +351,7 @@ impl Seam {
             Seam::RootWalkStop => "--test-box-root-walk-stop",
             Seam::GitLimit => "--test-box-git-limit",
             Seam::GitArmedBy => "--test-box-git-armed-by",
+            Seam::GitLongMs => "--test-box-git-long-ms",
             Seam::HoldPollMs => "--test-box-hold-poll-ms",
             Seam::ChannelPorts => "--test-box-channel-ports",
             Seam::ChannelAcceptMs => "--test-box-channel-accept-ms",
@@ -393,11 +396,10 @@ fn seams(words: &mut Peekable<impl Iterator<Item = OsString>>, problems: &mut Ve
 }
 
 /// Sets `seam` from `value`: whole milliseconds above 0 for the heartbeat, the dotnet limit, the sample period, the
-/// probe limit, the probe drain, the desktop waits and the desktop message limit, a step and whole milliseconds above 0 after its last `:` for
-/// the git limit,
-/// `fail-before` for the console, `refused` for the token, any path for the park and for the git bound's arm,
-/// whole bytes above 0 for the outputs, the inputs and the LFS budgets, `true` or `false` for the sampler's failure, a whole
-/// percent from 1 to 100 for the free share, a whole count above 0 for the processes a kill leaves, one of the desktop
+/// probe limit, the probe drain, the desktop waits, the desktop message limit and the long git steps' bound, a step and
+/// whole milliseconds above 0 after its last `:` for the git limit, `fail-before` for the console, `refused` for the
+/// token, any path for the park and for the git bound's arm, whole bytes above 0 for the outputs, the inputs and the
+/// LFS budgets, `true` or `false` for the sampler's failure, a whole percent from 1 to 100 for the free share, a whole count above 0 for the processes a kill leaves, one of the desktop
 /// faults for the desktop, one of the session states for the desktop session, 1 to 64 letters, digits and `-` for the
 /// desktop mutex, `ok` or `fail` for the registration, any key path for the netfx key and any path for the root walk's
 /// stop. An empty or missing value is no value.
@@ -440,6 +442,7 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::DesktopMessageMs => seams.desktop_message_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::GitLimit => seams.git_limit = Some(crate::values::git_limit(name, &value)?),
         Seam::GitArmedBy => seams.git_armed_by = Some(PathBuf::from(value)),
+        Seam::GitLongMs => seams.git_long_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::ChannelPorts => seams.channel_ports = Some(crate::values::port_range(name, &value)?),
         Seam::ChannelAcceptMs => seams.channel_accept_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::ChannelProofMs => seams.channel_proof_ms = Some(crate::values::above_zero(name, &value)?),

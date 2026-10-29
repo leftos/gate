@@ -1583,6 +1583,59 @@ fn box_seam_git_limit_refuses_a_value_without_a_step_or_whole_milliseconds() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+fn box_seam_git_long_ms_bounds_the_long_git_steps_before_the_verb() {
+    use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
+
+    use crate::support::invocation;
+
+    let bounded = |git_long_ms: Option<u64>| {
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Run,
+            seams: BoxSeams {
+                git_long_ms,
+                ..BoxSeams::default()
+            },
+            root: None,
+            keys: Vec::new(),
+            hold: None,
+        })
+    };
+    assert_eq!(
+        invocation(&["box", "--test-box-git-long-ms", "300000", "run", "--stdin"]),
+        bounded(Some(300_000))
+    );
+    assert_eq!(invocation(&["box", "--test-box-git-long-ms=1", "run", "--stdin"]), bounded(Some(1)));
+    assert_eq!(invocation(&["box", "run", "--stdin"]), bounded(None), "no seam given, none set");
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seam_git_long_ms_refuses_a_value_that_is_not_whole_milliseconds_above_zero() {
+    let rows: [(&[&str], &[&str]); 4] = [
+        (
+            &["box", "--test-box-git-long-ms", "0", "run", "--stdin"],
+            &["gate: --test-box-git-long-ms must be a whole number above 0, got '0'"],
+        ),
+        (
+            &["box", "--test-box-git-long-ms", "fast", "run", "--stdin"],
+            &["gate: --test-box-git-long-ms must be a whole number above 0, got 'fast'"],
+        ),
+        (
+            &["box", "--test-box-git-long-ms", "1", "--test-box-git-long-ms=2", "run", "--stdin"],
+            &["gate: --test-box-git-long-ms is given twice"],
+        ),
+        (
+            &["box", "--test-box-git-long-ms"],
+            &["gate: --test-box-git-long-ms needs a value", BOX_USAGE],
+        ),
+    ];
+    for (words, want) in rows {
+        assert_eq!(problems(words), want, "{words:?}");
+    }
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
 fn box_seam_git_armed_by_names_the_file_that_arms_a_bound() {
     use std::path::PathBuf;
 
