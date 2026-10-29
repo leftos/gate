@@ -192,6 +192,26 @@ pub(crate) enum InputsStep {
 /// The payload word of an inputs call: the location, the run's `Nonce` and the `Step`, and, for a send of the PC's
 /// build of one project, its bin folder `sent_bin` as `SentBin`, `{project}/bin/{configuration}`.
 pub(crate) fn inputs_word(location: &Location, nonce: &str, step: InputsStep, sent_bin: Option<&str>) -> String {
+    word(&inputs_object(location, nonce, step, sent_bin))
+}
+
+/// The payload word of an inputs put, the [`inputs_word`] of the step `put`; with `channel`, the data channel its
+/// archive goes over, `Channel`: the builder's `Address`, the PC's own `Peer`, the two proofs as lower-case hex, and
+/// the archive's `Length` in bytes and `Sha256` as lower-case hex, which this word alone carries, on the call's
+/// standard input. A diff carries no channel, so only a put's word has one.
+pub(crate) fn put_word(location: &Location, nonce: &str, sent_bin: Option<&str>, channel: Option<(&Asked, u64, &[u8; 32])>) -> String {
+    let mut object = inputs_object(location, nonce, InputsStep::Put, sent_bin);
+    if let Some((asked, length, sha256)) = channel {
+        let mut channel = channel_object(asked);
+        channel.insert("Length".to_owned(), json!(length));
+        channel.insert("Sha256".to_owned(), json!(lower_hex(sha256)));
+        object.insert("Channel".to_owned(), Value::Object(channel));
+    }
+    word(&object)
+}
+
+/// The payload object of an inputs call ([`inputs_word`]).
+fn inputs_object(location: &Location, nonce: &str, step: InputsStep, sent_bin: Option<&str>) -> Map<String, Value> {
     let mut object = location.object();
     let step = match step {
         InputsStep::Diff => "diff",
@@ -202,7 +222,18 @@ pub(crate) fn inputs_word(location: &Location, nonce: &str, step: InputsStep, se
     if let Some(bin) = sent_bin {
         object.insert("SentBin".to_owned(), json!(bin));
     }
-    word(&object)
+    object
+}
+
+/// The `Channel` object of the data channel `asked`: the builder's `Address`, the PC's own `Peer` and the two proofs
+/// as lower-case hex.
+fn channel_object(asked: &Asked) -> Map<String, Value> {
+    let mut channel = Map::new();
+    channel.insert("Address".to_owned(), json!(asked.data.to_string()));
+    channel.insert("Peer".to_owned(), json!(asked.local.to_string()));
+    channel.insert("BoxProof".to_owned(), json!(lower_hex(asked.box_proof.bytes())));
+    channel.insert("PcProof".to_owned(), json!(lower_hex(asked.pc_proof.bytes())));
+    channel
 }
 
 /// The payload word of the preflight, and of every verb that reads only the location.
@@ -234,15 +265,7 @@ pub(crate) fn outputs_word(location: &Location, name: &str, channel: Option<(&As
     object.insert("Name".to_owned(), Value::String(name.to_owned()));
     if let Some((asked, nonce)) = channel {
         object.insert("Nonce".to_owned(), json!(nonce));
-        object.insert(
-            "Channel".to_owned(),
-            json!({
-                "Address": asked.data.to_string(),
-                "Peer": asked.local.to_string(),
-                "BoxProof": lower_hex(asked.box_proof.bytes()),
-                "PcProof": lower_hex(asked.pc_proof.bytes()),
-            }),
-        );
+        object.insert("Channel".to_owned(), Value::Object(channel_object(asked)));
     }
     word(&object)
 }
@@ -598,6 +621,36 @@ mod tests {
     /// The box's reading of the payload word `word`.
     fn on_the_box(word: &str) -> Payload {
         Payload::decode(word, gate_wire::PathForm::Windows).expect("the box decodes the client's word")
+    }
+
+    /// A put's `Channel` is read back by the box whole: the addresses, both proofs, and the archive's length and
+    /// SHA-256; a put without a channel carries none.
+    #[test]
+    fn a_put_s_channel_round_trips_through_the_box_s_put_channel() {
+        let asked = crate::remote::channel::Asked {
+            data: std::net::Ipv4Addr::new(100, 64, 0, 7),
+            local: std::net::Ipv4Addr::new(100, 64, 0, 9),
+            box_proof: gate_wire::Proof::new([7_u8; 16]),
+            pc_proof: gate_wire::Proof::new([9_u8; 16]),
+        };
+        let sha256 = [0xab_u8; 32];
+
+        let word = super::put_word(&location(), NONCE, Some("App/bin/Release"), Some((&asked, 4097, &sha256)));
+        let payload = on_the_box(&word);
+        let put = payload
+            .put_channel()
+            .expect("the channel is well formed")
+            .expect("the put asks for a channel");
+
+        assert_eq!(put.channel.address, asked.data);
+        assert_eq!(put.channel.peer, asked.local);
+        assert!(put.channel.box_proof.matches(&[7_u8; 16]), "the box's proof");
+        assert!(put.channel.pc_proof.matches(&[9_u8; 16]), "the PC's proof");
+        assert_eq!(put.length, 4097);
+        assert_eq!(put.sha256, sha256);
+        assert_eq!(payload.nonce(), Ok(NONCE), "the put's nonce");
+        let plain = on_the_box(&super::put_word(&location(), NONCE, None, None));
+        assert!(matches!(plain.put_channel(), Ok(None)), "a put without a channel carries none");
     }
 
     #[test]

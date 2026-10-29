@@ -4,8 +4,12 @@
 //! anything, then sends its own, reads exactly the archive's size, the box's line over ssh having said it, and sends the
 //! SHA-256 of what it read as its ack. It then shuts the connection down and closes it first. No length or digest is
 //! taken from the channel: the call's own ssh stderr says what the box sent, which the outputs step compares.
+//!
+//! A put goes the other way ([`pushed`]): the PC checks the box's proof, sends its own, sends the archive whose length
+//! and SHA-256 its request declared, and reads the box's ack, that SHA-256; the box's verdict over ssh, not the ack,
+//! says whether the put installed.
 
-use std::io;
+use std::io::{self, Read};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -24,8 +28,8 @@ const CHUNK: usize = 1024 * 1024;
 /// the call's own stall watch is.
 const SLICE: Duration = Duration::from_millis(200);
 
-/// The line the log gets when an outputs pull that could go over the data channel goes over ssh instead, for `why`,
-/// which never holds a proof.
+/// The line the log gets when an outputs pull or a put that could go over the data channel goes over ssh instead, for
+/// `why`, which never holds a proof.
 pub(super) fn not_used_line(why: &str) -> String {
     format!("gate: data channel not used: {why}; sent over ssh")
 }
@@ -35,9 +39,18 @@ pub(super) fn pull_line(bytes: u64, took: Duration) -> String {
     format!("gate: data channel: pull {bytes} in {:.1} s", took.as_secs_f64())
 }
 
-/// The `data` address an outputs pull from `builder` dials: `None` for a builder with no `data` key, and for one that is
-/// not a Windows builder, which stays on ssh; else why the channel is not used: a loopback address, which only a build
-/// with the test seams dials.
+/// The line the log gets once a put moved `bytes` over the data channel in `took`, in seconds to one decimal, the box
+/// having acked them.
+pub(super) fn put_line(bytes: u64, took: Duration) -> String {
+    format!("gate: data channel: put {bytes} in {:.1} s", took.as_secs_f64())
+}
+
+/// The send buffer the PC's connection of a put gets: 16 MiB.
+pub(super) const SEND_BUFFER: i32 = 16 * 1024 * 1024;
+
+/// The `data` address an outputs pull from `builder`, or a put to it, dials: `None` for a builder with no `data` key,
+/// and for one that is not a Windows builder, which stays on ssh; else why the channel is not used: a loopback
+/// address, which only a build with the test seams dials.
 pub(super) fn planned(builder: &Builder) -> Result<Option<Ipv4Addr>, String> {
     let Some(data) = builder.data else {
         return Ok(None);
@@ -100,10 +113,22 @@ pub(super) struct Dial {
     pub(super) fault: Option<Fault>,
 }
 
-/// A fault `--test-remote-channel-fault` has the PC's side of a pull take once it dialled the box: it takes the box's
-/// proof for a mismatch (`box-proof`); stops after half the archive's size and drops without an ack (`truncate`);
-/// flips the first byte it reads before it hashes and acks (`alter`); or drops once it read everything, before its
-/// ack (`no-ack`).
+/// What a put's channel dials: the channel asked for, the archive's `length` and `sha256` the request declares, the
+/// send buffer the PC's connection gets, and the fault the PC's side takes, which only `--test-remote-channel-fault`
+/// names.
+#[derive(Debug)]
+pub(super) struct Put {
+    pub(super) asked: Asked,
+    pub(super) length: u64,
+    pub(super) sha256: [u8; 32],
+    pub(super) send_buffer: i32,
+    pub(super) fault: Option<Fault>,
+}
+
+/// A fault `--test-remote-channel-fault` has the PC's side of a channel take once it dialled the box: it takes the
+/// box's proof for a mismatch (`box-proof`); stops after half the archive's size and drops without an ack
+/// (`truncate`); flips the first byte it reads before it hashes and acks, or, on a put, the first byte it sends
+/// (`alter`); or drops once it read or sent everything, before the ack (`no-ack`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Fault {
     BoxProof,
@@ -129,7 +154,8 @@ impl Fault {
 /// so the PC did not dial; it failed for why, having sent nothing more after the failure; the call ended first, which
 /// the PC gave up for, a failure with no reason of its own; its thread did not end within the call's drain, which the
 /// PC's caller says; or it read `bytes` whose SHA-256 in lower-case hex is `sha256` and acked them, `took` from its
-/// connect to its close.
+/// connect to its close; or, for a put, it sent `bytes` and the box acked them with the SHA-256 the request declares,
+/// `took` from its connect to its close.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Dialled {
     NoPort,
@@ -138,6 +164,18 @@ pub(super) enum Dialled {
     CallEnded,
     NotEnded,
     Pulled { bytes: u64, sha256: String, took: Duration },
+    Pushed { bytes: u64, took: Duration },
+}
+
+/// What a put's channel tells its call: each step of the exchange before the archive, the archive's bytes as they are
+/// written to the connection, and the archive's end once its last byte is written.
+pub(super) trait Feed {
+    /// Marks the call's progress for a step of the exchange that moved no byte of the archive.
+    fn mark(&mut self);
+    /// Counts `bytes` more of the archive written to the connection.
+    fn sent(&mut self, bytes: u64);
+    /// Says the archive's last byte is written; what is left is the box's ack and its verdict.
+    fn finished(&mut self);
 }
 
 /// Where a pull's archive goes: each piece read, the call's progress marked at each step of the exchange before the
@@ -247,7 +285,7 @@ fn served(
     if fault == Some(Fault::BoxProof) || !asked.box_proof.matches(&proof) {
         return Err(Stop::Failed("the box's proof does not match".to_owned()));
     }
-    written(stream, asked.pc_proof.bytes(), ended)?;
+    written(stream, asked.pc_proof.bytes(), ended, &mut |_| {})?;
     fill.mark();
     let (got, digest) = archive_read(stream, (size, fault), fill, ended)?;
     if fault == Some(Fault::NoAck) {
@@ -255,7 +293,7 @@ fn served(
             "the test seam dropped the channel before the PC's acknowledgement".to_owned(),
         ));
     }
-    written(stream, &digest[..], ended)?;
+    written(stream, &digest[..], ended, &mut |_| {})?;
     Ok((got, lower_hex(&digest)))
 }
 
@@ -289,6 +327,106 @@ fn archive_read(
         return Err(Stop::Failed(format!("the test seam stopped the pull after {got} of {size} bytes")));
     }
     Ok((got, hasher.finalize().into()))
+}
+
+/// Sends a put's archive, `put.length` bytes read from `source`, over the channel `put` asks for to the box's `port`,
+/// taking `put.fault` when one is named; every wait, the connect's included, lasts at most [`SLICE`] before it looks
+/// again at whether `ended` says the call has ended, and gives up once it has. The box's proof is checked before
+/// anything is sent; `feed` is marked once the connection is made and once the proofs are exchanged, told each piece
+/// written, and told the archive finished once its last byte is written; the ack is then read and compared with the
+/// declared SHA-256 to say whether the put is `Pushed`, but a mismatched ack is no verdict: the box's own over ssh is.
+/// Whatever the end, the connection is shut down and closed, the PC closing first after the ack.
+pub(super) fn pushed(put: &Put, port: u16, source: &mut dyn Read, feed: &mut dyn Feed, ended: &dyn Fn() -> bool) -> Dialled {
+    if !port_taken(put.asked.data, port) {
+        return Dialled::Failed(format!("the box's port {port} is outside {CHANNEL_FIRST_PORT}-{CHANNEL_LAST_PORT}"));
+    }
+    let began = Instant::now();
+    let stream = match connected(&put.asked, SocketAddrV4::new(put.asked.data, port), ended) {
+        Ok(stream) => stream,
+        Err(stop) => return stopped(stop),
+    };
+    feed.mark();
+    let end = match delivered(&stream, put, source, feed, ended) {
+        Ok(bytes) => Dialled::Pushed {
+            bytes,
+            took: began.elapsed(),
+        },
+        Err(stop) => stopped(stop),
+    };
+    // A shutdown that fails leaves the close alone, which the drop makes either way; how the put went stands.
+    stream.shut_down().ok();
+    drop(stream);
+    end
+}
+
+/// A put's exchange over the connected `stream`: the box's proof checked before anything is sent, the PC's sent,
+/// `feed` marked, the send buffer set, the archive sent from `source`, and the box's ack read and compared; the bytes
+/// sent, else why not.
+fn delivered(stream: &Stream, put: &Put, source: &mut dyn Read, feed: &mut dyn Feed, ended: &dyn Fn() -> bool) -> Result<u64, Stop> {
+    let mut proof = [0_u8; PROOF_BYTES];
+    proof_read(stream, &mut proof, ended)?;
+    if put.fault == Some(Fault::BoxProof) || !put.asked.box_proof.matches(&proof) {
+        return Err(Stop::Failed("the box's proof does not match".to_owned()));
+    }
+    written(stream, put.asked.pc_proof.bytes(), ended, &mut |_| {})?;
+    feed.mark();
+    stream
+        .set_send_buffer(put.send_buffer)
+        .map_err(|error| Stop::Failed(format!("cannot set the send buffer: {error}")))?;
+    let sent = archive_sent(stream, put, source, feed, ended)?;
+    feed.finished();
+    if put.fault == Some(Fault::NoAck) {
+        return Err(Stop::Failed(
+            "the test seam dropped the channel before the box's acknowledgement".to_owned(),
+        ));
+    }
+    let mut ack = [0_u8; 32];
+    ack_read(stream, &mut ack, ended)?;
+    if ack != put.sha256 {
+        return Err(Stop::Failed("the box's acknowledgement does not match what was sent".to_owned()));
+    }
+    Ok(sent)
+}
+
+/// Writes the archive's `put.length` bytes from `source` on `stream`, each piece told to `feed` as it is written; the
+/// count, else why not. With `put.fault` a truncation, it stops after half the length and says so; with it an
+/// alteration, the first byte sent is flipped.
+fn archive_sent(stream: &Stream, put: &Put, source: &mut dyn Read, feed: &mut dyn Feed, ended: &dyn Fn() -> bool) -> Result<u64, Stop> {
+    let length = put.length;
+    let taken = if put.fault == Some(Fault::Truncate) { length / 2 } else { length };
+    let mut buffer = vec![0_u8; CHUNK];
+    let mut sent = 0_u64;
+    while sent < taken {
+        let want = usize::try_from(taken - sent).unwrap_or(usize::MAX).min(CHUNK);
+        let read = match source.read(&mut buffer[..want]) {
+            Ok(0) => return Err(Stop::Failed(format!("the archive ended after {sent} of its {length} bytes"))),
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(Stop::Failed(format!("cannot read the archive: {error}"))),
+        };
+        if sent == 0 && put.fault == Some(Fault::Alter) {
+            buffer[0] ^= 0xff;
+        }
+        written(stream, &buffer[..read], ended, &mut |wrote| feed.sent(wrote))?;
+        sent += read as u64;
+    }
+    if taken < length {
+        return Err(Stop::Failed(format!("the test seam stopped the put after {sent} of {length} bytes")));
+    }
+    Ok(sent)
+}
+
+/// Fills `ack` from `stream`, waiting as long as the call goes on, whose stall watch bounds the wait; else why not,
+/// the call's end among the reasons.
+fn ack_read(stream: &Stream, ack: &mut [u8], ended: &dyn Fn() -> bool) -> Result<(), Stop> {
+    let mut filled = 0;
+    while filled < ack.len() {
+        match read_some(stream, &mut ack[filled..], ended)? {
+            0 => return Err(Stop::Failed("the box closed the channel before its acknowledgement".to_owned())),
+            read => filled += read,
+        }
+    }
+    Ok(())
 }
 
 /// Fills `proof` from `stream` within [`PROOF_WAIT`]; else why not, the call's end among the reasons.
@@ -331,14 +469,18 @@ fn read_some(stream: &Stream, buffer: &mut [u8], ended: &dyn Fn() -> bool) -> Re
     }
 }
 
-/// Writes all of `bytes` on `stream`; else why not, the call's end among the reasons.
-fn written(stream: &Stream, mut bytes: &[u8], ended: &dyn Fn() -> bool) -> Result<(), Stop> {
+/// Writes all of `bytes` on `stream`, telling `wrote` the count of each write that took some; else why not, the call's
+/// end among the reasons.
+fn written(stream: &Stream, mut bytes: &[u8], ended: &dyn Fn() -> bool, wrote: &mut dyn FnMut(u64)) -> Result<(), Stop> {
     while !bytes.is_empty() {
         if ended() {
             return Err(Stop::CallEnded);
         }
         match stream.write(bytes, Instant::now() + SLICE) {
-            Ok(Some(wrote)) => bytes = &bytes[wrote..],
+            Ok(Some(taken)) => {
+                bytes = &bytes[taken..];
+                wrote(taken as u64);
+            }
             Ok(None) => {}
             Err(error) => return Err(Stop::Failed(format!("the channel failed: {error}"))),
         }
@@ -500,5 +642,108 @@ mod tests {
             .sum();
         assert_eq!(chunked, ARCHIVE.len(), "{seen:?}");
         assert!(seen[2..seen.len() - 1].iter().all(|seen| matches!(seen, Seen::Chunk(_))), "{seen:?}");
+    }
+
+    /// What a put's feed was told, in order.
+    #[cfg(feature = "test-seams")]
+    #[derive(Debug, PartialEq, Eq)]
+    enum Told {
+        Mark,
+        Sent(u64),
+        Finished,
+    }
+
+    /// A feed that records what it is told.
+    #[cfg(feature = "test-seams")]
+    #[derive(Default)]
+    struct Feeds {
+        told: Vec<Told>,
+    }
+
+    #[cfg(feature = "test-seams")]
+    impl super::Feed for Feeds {
+        fn mark(&mut self) {
+            self.told.push(Told::Mark);
+        }
+
+        fn sent(&mut self, bytes: u64) {
+            self.told.push(Told::Sent(bytes));
+        }
+
+        fn finished(&mut self) {
+            self.told.push(Told::Finished);
+        }
+    }
+
+    /// A put marks the call's progress once its connection is made and once the proofs are exchanged, counts every
+    /// byte of the archive as it is written, and says the archive finished only after its last byte; the box reads
+    /// exactly the archive, and then the PC's close after the ack.
+    #[cfg(feature = "test-seams")]
+    #[test]
+    #[expect(clippy::expect_used, reason = "a case that cannot make its sockets must fail loudly")]
+    fn a_put_marks_its_connect_and_proofs_counts_each_byte_sent_and_finishes_only_after_the_last() {
+        use std::io::{Read, Write};
+
+        use sha2::{Digest, Sha256};
+
+        const GUARD: std::time::Duration = std::time::Duration::from_secs(30);
+        const ARCHIVE: &[u8] = b"the archive put over the channel";
+        let sha256: [u8; 32] = Sha256::digest(ARCHIVE).into();
+        let (box_proof, pc_proof) = ([7_u8; 16], [9_u8; 16]);
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback listener binds");
+        let port = listener.local_addr().expect("the listener's address is read").port();
+        let served = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the PC connects");
+            stream.set_read_timeout(Some(GUARD)).expect("the read guard is set");
+            stream.write_all(&box_proof).expect("the box sends its proof");
+            let mut proof = [0_u8; 16];
+            stream.read_exact(&mut proof).expect("the PC sends its proof");
+            let mut archive = vec![0_u8; ARCHIVE.len()];
+            stream.read_exact(&mut archive).expect("the PC sends the archive");
+            stream.write_all(&Sha256::digest(&archive)).expect("the box acks");
+            let mut rest = Vec::new();
+            stream.read_to_end(&mut rest).expect("the PC closes");
+            (proof, archive, rest)
+        });
+        let put = super::Put {
+            asked: super::Asked {
+                data: Ipv4Addr::LOCALHOST,
+                local: Ipv4Addr::LOCALHOST,
+                box_proof: gate_wire::Proof::new(box_proof),
+                pc_proof: gate_wire::Proof::new(pc_proof),
+            },
+            length: ARCHIVE.len() as u64,
+            sha256,
+            send_buffer: super::SEND_BUFFER,
+            fault: None,
+        };
+        let mut feed = Feeds::default();
+
+        let end = super::pushed(&put, port, &mut &ARCHIVE[..], &mut feed, &|| false);
+
+        assert!(
+            matches!(end, super::Dialled::Pushed { bytes, .. } if bytes == ARCHIVE.len() as u64),
+            "{end:?}"
+        );
+        let (proof, archive, rest) = served.join().expect("the box's side ends");
+        assert_eq!(proof, pc_proof, "the PC sent its proof");
+        assert_eq!(archive, ARCHIVE, "the box read the archive whole");
+        assert!(rest.is_empty(), "nothing follows the archive: {rest:?}");
+        let told = &feed.told;
+        assert_eq!(
+            told[..2],
+            [Told::Mark, Told::Mark],
+            "marked at the connect and the proof exchange: {told:?}"
+        );
+        assert_eq!(told.last(), Some(&Told::Finished), "{told:?}");
+        let counted: u64 = told[2..told.len() - 1]
+            .iter()
+            .map(|told| match told {
+                Told::Sent(bytes) => *bytes,
+                Told::Mark | Told::Finished => 0,
+            })
+            .sum();
+        assert_eq!(counted, ARCHIVE.len() as u64, "{told:?}");
+        assert!(told[2..told.len() - 1].iter().all(|told| matches!(told, Told::Sent(_))), "{told:?}");
     }
 }

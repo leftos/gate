@@ -428,6 +428,7 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-tailscale-wait-ms" => Some(RunOption::Value(ValueOption::TailscaleWaitMs)),
         "test-tailscale-hold-start-ms" => Some(RunOption::Value(ValueOption::TailscaleHoldStartMs)),
         "test-remote-channel-fault" => Some(RunOption::Value(ValueOption::RemoteChannelFault)),
+        "test-remote-channel-send-buffer-bytes" => Some(RunOption::Value(ValueOption::RemoteChannelSendBufferBytes)),
         _ => None,
     }
 }

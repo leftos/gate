@@ -482,10 +482,14 @@ pub struct TestSeams {
     /// How long a routed run's Tailscale path read holds its launch guard, in milliseconds, between creating a program
     /// suspended and putting it in its job (`--test-tailscale-hold-start-ms`).
     pub tailscale_hold_start_ms: Option<u64>,
-    /// A fault the PC's side of an outputs pull's data channel takes once it dialled the box: it takes the box's proof
-    /// for a mismatch (`box-proof`), stops after half the archive's size (`truncate`), flips the first byte it reads
-    /// before it hashes and acks (`alter`), or drops the connection once it read everything, before its ack (`no-ack`).
+    /// A fault the PC's side of an outputs pull's or a put's data channel takes once it dialled the box: it takes the
+    /// box's proof for a mismatch (`box-proof`), stops after half the archive's size (`truncate`), flips the first byte
+    /// it reads before it hashes and acks, or the first byte it sends (`alter`), or drops the connection once it read or
+    /// sent everything, before the ack (`no-ack`).
     pub remote_channel_fault: Option<String>,
+    /// The send buffer the PC's connection of a put's data channel gets, in bytes, at most 16 MiB, in place of its
+    /// 16 MiB (`--test-remote-channel-send-buffer-bytes`).
+    pub remote_channel_send_buffer_bytes: Option<u32>,
     /// Make this gate's own start unreadable both ways, so the run refuses before it writes anything.
     pub own_start_fails: bool,
     /// Count every live parent a slot marker names as one this gate runs inside the command of, so a marker naming the

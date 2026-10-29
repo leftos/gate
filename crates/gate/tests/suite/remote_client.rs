@@ -9907,6 +9907,49 @@ fn a_sent_build_lands_and_the_builder_keeps_no_build() {
     assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
 }
 
+/// With `data` on the builder, the PC's build is sent over the data channel: the put's log line says its bytes, and
+/// the work folder holds the PC's build, as the ssh send leaves it.
+#[test]
+fn a_sent_build_with_data_goes_over_the_data_channel() {
+    let case = sent_build_case("client-sent-build-channel", None);
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({
+        "host": HOST, "slots": 2, "data": "127.0.0.1",
+        "repos": { &repo: ["*tool*", "*dotnet*"] }, "outputs": { &repo: BIN }, "sendBuild": [repo],
+    });
+    write_remote_json(&case, &routing.to_string());
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+    let mut gate = dotnet_gate(&case, "out.log", &steps, &SENT_TEST);
+    let port = free_channel_port();
+    gate.env(
+        BOX_SEAMS_VARIABLE,
+        format!("--test-box-channel-ports {port}-{port} --test-box-channel-accept-ms 3600000 --test-box-channel-idle-ms 3600000"),
+    );
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        calls(&steps),
+        ["preflight", "inputs", "inputs", "run"],
+        "the send's diff and put, then the run"
+    );
+    let log = out_log(&case);
+    assert!(
+        Regex::new(r"(?m)^gate: data channel: put \d+ in \d+\.\d s\r?$")
+            .expect("the pattern compiles")
+            .is_match(&log),
+        "the sent build went over the channel: {log}"
+    );
+    assert!(!log.contains("gate: data channel not used"), "{log}");
+    assert_eq!(
+        fs::read_to_string(work_folder(&case).join(SENT_DLL)).ok().as_deref(),
+        Some("the PC's build"),
+        "the work folder holds the PC's build"
+    );
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
 /// A withheld run whose send of the PC's build lands keeps `--no-build` and builds nothing on the builder, so it
 /// writes no marker of its own; nor does its passing end clear the one an earlier run left, though it carries failure
 /// output globs.
@@ -11044,7 +11087,7 @@ const CHANNEL_PULL: &str = r"(?m)^gate: data channel: pull (\d+) in \d+\.\d s\r?
 
 /// A loopback port free a moment ago: the system's pick for a listener closed at once, which the box's channel then
 /// listens on alone.
-fn free_channel_port() -> u16 {
+pub(super) fn free_channel_port() -> u16 {
     let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("a loopback listener binds");
     listener.local_addr().expect("the listener's address is read").port()
 }

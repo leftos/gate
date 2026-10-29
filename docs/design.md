@@ -3063,7 +3063,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The archive and the pending marker are kept for the install. The call's stderr goes to the log only.
 
-    **Data channel** (`remote/channel.rs`; the box's half is the `outputs` verb's, [The box side](#the-box-side); the box also takes an `inputs` put on a channel, which no PC code sends yet). A `windows` builder that names `data` (the top-level `host`'s own or an entry's, [remote.json](#remotejson)) has the pull carried on a [data channel](GLOSSARY.md) instead of the call's stdout, with the ssh call as the control.
+    **Data channel** (`remote/channel.rs`; the box's half is the `outputs` verb's, [The box side](#the-box-side); the box also takes an `inputs` put on a channel, which the PC sends for the input put and the sent build, the LFS put staying on ssh). A `windows` builder that names `data` (the top-level `host`'s own or an entry's, [remote.json](#remotejson)) has the pull carried on a [data channel](GLOSSARY.md) instead of the call's stdout, with the ssh call as the control.
 
     The outputs call's payload gains `Nonce`, drawn afresh for each attempt, and `Channel` (`Address` the builder's `data`, `Peer` this PC's own address toward it, found by a UDP connect to `data` that sends no packet, and `BoxProof` and `PcProof`, two 128-bit proofs drawn for the attempt from the same random source as the pipe names, as 32 lower-case hex digits each).
 
@@ -3082,6 +3082,14 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     The channel decides nothing about the pull's fate. A channel that did not complete (a refused connect, proof or archive, a drop before the ack) is answered by the box's `channel` refusal tag with status 75 over ssh once the control call has exited, and the pull is made again over ssh from byte 0, with `gate: data channel not used: <why>; sent over ssh` in the log only.
 
     A socket error alone never starts the ssh pull, and after the ack matched nothing does.
+
+    The input put and the sent build's put take the same channel for a `windows` builder with `data`: the `put` request carries `Channel` (`Address`, `Peer`, `BoxProof`, `PcProof`, `Length`, `Sha256`), never on a `diff`, and the PC reads the archive back for its SHA-256 only then. A read failure ends the put with `cannot read {path} back: {why}` for inputs, and a Ctrl+C during the read-back ends the run as an interrupt. The put's `Nonce` is drawn per attempt.
+
+    The PC sends its proof, then the archive, then reads the box's acknowledgement; a channel put logs `gate: data channel: put <bytes> in <s> s`. Its stall watch counts the head and channel bytes and is finished once the last byte is written, as the ssh put's is. Only the box's `channel` refusal over ssh falls back: `gate: data channel not used: <why>; sent over ssh` and one ssh put with a new nonce and no `Channel`; a put the box verified and installed is never put again.
+
+    A thread that does not end is told in the log: `gate: the outputs call's raw copy ...` or `gate: the put's data channel thread ...`, with `panicked` or `did not end within <n> s`.
+
+    The test seam `--test-remote-channel-send-buffer-bytes <n>` (1 to 16 MiB, needs `--test-remote-transport`) sets the send buffer, and `--test-remote-channel-fault` (`box-proof`, `truncate`, `alter`, `no-ack`) applies to puts as to pulls.
 
     `<why>` is the first that applies: the PC's own failure (for example `data address <addr> is loopback`, `cannot read this PC's address toward <addr>`, `the box's proof does not match`, `the box closed the channel after <got> of <size> bytes`), `the box said no archive size`, the box's own `gate: data channel not completed: ` text, `the channel did not end` (the PC's thread outlasting its 2 s drain), then `the box did not complete it`.
 
@@ -4238,7 +4246,7 @@ Built verbs:
 
   Caps: an archive of more than 50,000 members, or that decompresses to more than 4 GiB (`--test-inputs-budget-bytes` replaces it), is refused as the outputs archive's are, and the put fails (`gate: remote inputs put failed: <why>`, exit 1). The step is not watched on the box; the PC watches both calls ([The remote client's run](#routing), Inputs).
 
-  A `put` payload may carry a `Channel` (`Length`, the archive's whole number of bytes, and `Sha256`, 64 lower-case hex digits; both required, else `gate: box payload Channel lacks Length`, `... lacks Sha256`, `... Channel Length is not a whole number of bytes` or `... Channel Sha256 is not 64 lower-case hex digits`, exit 2; on a `diff` step `gate: box payload Channel is not taken on a diff step`, exit 2). The box then takes the archive over a [data channel](GLOSSARY.md) instead of stdin, which holds the request line and the manifest only. No PC code sends one yet.
+  A `put` payload may carry a `Channel` (`Length`, the archive's whole number of bytes, and `Sha256`, 64 lower-case hex digits; both required, else `gate: box payload Channel lacks Length`, `... lacks Sha256`, `... Channel Length is not a whole number of bytes` or `... Channel Sha256 is not 64 lower-case hex digits`, exit 2; on a `diff` step `gate: box payload Channel is not taken on a diff step`, exit 2). The box then takes the archive over a [data channel](GLOSSARY.md) instead of stdin, which holds the request line and the manifest only. The PC sends one for the input put and the sent build; the LFS put does not.
 
   A `Length` over the limit the stdin path holds a sent archive to (the unpack budget plus a 64th of it plus 1 MiB, `sent_limit`) is refused before any channel line, in the stdin path's own words: `gate: remote inputs put failed: the outputs archive holds more than <limit> bytes as sent`, exit 1. Otherwise, after the drain, the manifest, the scope check, the stage check and the budget, the box listens as `outputs` does and says `gate-remote-channel: <nonce> <port>`, reads exactly `Length` bytes from the PC, checks the count and the SHA-256, acks with the 32-byte SHA-256, waits for the PC's close, drops the socket and then installs.
 

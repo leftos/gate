@@ -11,16 +11,19 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
-use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gate_router::{CARRIED_INPUT, escaped};
 use gate_state::{FallbackReason, v1};
 use gate_win32::Interrupt;
+use sha2::{Digest, Sha256};
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_DELETE_ON_CLOSE, FILE_SHARE_READ};
 
-use super::client::{Attempt, Called, End, RawSink, Watch};
+use super::channel;
+use super::client::{Attempt, Called, End, RawSink, Sent, Watch};
 use super::git::{Call, Git, GitBounds, GitError, git_failure};
 use super::outputs::{Archive, DELETE, GENERIC_WRITE, Unbuilt, sha256_for};
 use super::payload::{self, InputsStep, Location};
@@ -745,8 +748,10 @@ fn sent_to(attempt: &mut Attempt<'_, '_>, request: &Request<'_>, built: &Built) 
         manifest: &built.manifest,
         cache: &cache,
     };
-    let compressed = packed(&archive, &path, &packing, &|| attempt.go_on().is_ok())?;
-    put(attempt, request, built, (&archive, compressed, needed.len()))?;
+    // The archive's SHA-256 is read back only for a put that asks for the builder's data channel, which declares it.
+    let hashed = matches!(channel::planned(attempt.call.builder), Ok(Some(_)));
+    let (compressed, sha256) = packed(&archive, &path, &packing, &|| attempt.go_on().is_ok(), hashed)?;
+    put(attempt, request, built, (&archive, (compressed, sha256.as_ref()), needed.len()))?;
     drop(archive);
     drop(held);
     attempt.say(sent_line(kind.label(), needed.len(), bytes, compressed, started.elapsed()));
@@ -821,9 +826,9 @@ fn diffed<'b>(attempt: &mut Attempt<'_, '_>, request: &Request<'_>, built: &'b B
         })
     };
     let watch = Watch::Fetch(attempt.limits_for("inputs-diff"), None);
-    let called = attempt
-        .inputs_call((&head, &call_nonce), None, Some(&make), watch)
-        .map_err(Unsent::Ended)?;
+    // A diff asks for no data channel: every attempt carries the one head.
+    let made = |_: Option<&channel::Asked>| (call_nonce.clone(), Arc::clone(&head));
+    let called = attempt.inputs_call(&made, None, Some(&make), watch).map_err(Unsent::Ended)?;
     judged(attempt, &called, Step::Diff)?;
     let mut text = Vec::new();
     (&answer)
@@ -894,8 +899,9 @@ struct Pack<'p> {
 /// Packs `packing`'s files into the open `archive`, shown as `shown`, `go_on` asked before the pack and before each
 /// write into the archive; each packed file is checked to hold what the manifest says it held when it was hashed, and
 /// one that does not is forgotten from the inputs hash cache before the step is refused, so the next run hashes it
-/// again. The archive's compressed size; else the interrupt, or why not.
-fn packed(archive: &File, shown: &Path, packing: &Pack<'_>, go_on: &dyn Fn() -> bool) -> Result<u64, Unsent> {
+/// again. The archive's compressed size and, when `hashed`, the SHA-256 of those bytes, read back from the file once it
+/// is packed, `go_on` asked before each read; else the interrupt, or why not.
+fn packed(archive: &File, shown: &Path, packing: &Pack<'_>, go_on: &dyn Fn() -> bool, hashed: bool) -> Result<(u64, Option<[u8; 32]>), Unsent> {
     let stopped = Cell::new(false);
     if !go_on() {
         return Err(Unsent::Ended(End::Interrupted));
@@ -922,7 +928,38 @@ fn packed(archive: &File, shown: &Path, packing: &Pack<'_>, go_on: &dyn Fn() -> 
         }
         return Err(Unsent::Refused(format!("{} changed after it was hashed", escaped(&entry.path))));
     }
-    Ok(packed.compressed)
+    let sha256 = if hashed {
+        Some(archive_sha256(archive, (shown, packed.compressed), go_on)?)
+    } else {
+        None
+    };
+    Ok((packed.compressed, sha256))
+}
+
+/// The SHA-256 of the first `length` bytes of `archive`, shown as `shown`, `go_on` asked before each read, as the pack
+/// asks it before each write; else the interrupt, or why not, a file shorter than `length` included. Each read names
+/// its own offset, counted from the file's start, so where the handle's position stood does not matter; on Windows
+/// each read moves that position, which no later read of the archive relies on, as each names its offset too.
+fn archive_sha256(archive: &File, (shown, length): (&Path, u64), go_on: &dyn Fn() -> bool) -> Result<[u8; 32], Unsent> {
+    let cannot = |why: String| Unsent::Refused(format!("cannot read {} back: {why}", shown.display()));
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut offset = 0_u64;
+    while offset < length {
+        if !go_on() {
+            return Err(Unsent::Ended(End::Interrupted));
+        }
+        let want = usize::try_from(length - offset).unwrap_or(usize::MAX).min(buffer.len());
+        let read = archive
+            .seek_read(&mut buffer[..want], offset)
+            .map_err(|error| cannot(error.to_string()))?;
+        if read == 0 {
+            return Err(cannot(format!("the archive ends after {offset} of its {length} bytes")));
+        }
+        hasher.update(&buffer[..read]);
+        offset += read as u64;
+    }
+    Ok(hasher.finalize().into())
 }
 
 /// A writer into the inputs archive that asks `go_on` before each write, and fails the write once it says no, with
@@ -947,19 +984,22 @@ impl<W: Write> Write for Asking<'_, W> {
     }
 }
 
-/// The put call of the `sent` files packed into the open archive, its compressed length and their count: the request,
-/// the manifest and then the archive, watched as a put; else why not, a builder that installed another count than was
-/// sent included.
-fn put(attempt: &mut Attempt<'_, '_>, request: &Request<'_>, built: &Built, sent: (&File, u64, usize)) -> Result<(), Unsent> {
-    let (archive, length, count) = sent;
-    // Each call's word carries a nonce new to it, which the box's refusal tags for the call name.
-    let call_nonce = payload::run_nonce();
-    let word = payload::inputs_word(request.location, &call_nonce, InputsStep::Put, request.kind.bin());
-    let head = payload::input(&word, Some(&built.line));
+/// The put call of the `sent` files packed into the open archive, its compressed length, its SHA-256 when the put may
+/// take the builder's data channel, and their count: the request, the manifest and then the archive, over ssh or that
+/// channel, watched as a put; else why not, a builder that installed another count than was sent included.
+fn put(attempt: &mut Attempt<'_, '_>, request: &Request<'_>, built: &Built, sent: (&File, (u64, Option<&[u8; 32]>), usize)) -> Result<(), Unsent> {
+    let (file, (length, sha256), count) = sent;
+    // Each attempt's word carries a nonce new to it, which the box's refusal tags for the call name and the box's
+    // stage is named by, and the data channel the attempt asks for, with proofs of its own.
+    let head = |asked: Option<&channel::Asked>| {
+        let nonce = payload::run_nonce();
+        let channel = asked.zip(sha256).map(|(asked, sha256)| (asked, length, sha256));
+        let word = payload::put_word(request.location, &nonce, request.kind.bin(), channel);
+        (nonce, payload::input(&word, Some(&built.line)))
+    };
     let watch = Watch::Put(attempt.limits_for("inputs"));
-    let called = attempt
-        .inputs_call((&head, &call_nonce), Some((archive, length)), None, watch)
-        .map_err(Unsent::Ended)?;
+    let archive = Sent { file, length, sha256 };
+    let called = attempt.inputs_call(&head, Some(archive), None, watch).map_err(Unsent::Ended)?;
     judged(attempt, &called, Step::Put)?;
     installed_all(&called.lines, count).map_err(Unsent::Refused)
 }
@@ -1108,7 +1148,7 @@ mod tests {
 
     /// Packs every file of `built` in `root` into a new archive in its `.tmp`, the cache at [`cache_of`] forgotten from,
     /// `go_on` asked.
-    fn pack_all(root: &Path, built: &Built, go_on: &dyn Fn() -> bool) -> Result<u64, Unsent> {
+    fn pack_all(root: &Path, built: &Built, go_on: &dyn Fn() -> bool) -> Result<(u64, Option<[u8; 32]>), Unsent> {
         fs::create_dir_all(root.join(".tmp")).expect("the .tmp folder can be made");
         let path = root.join(".tmp").join("pack.tar.zst");
         let archive = made_in_tmp(root, &path, "the inputs archive").expect("the archive can be made");
@@ -1120,7 +1160,7 @@ mod tests {
             manifest: &built.manifest,
             cache: &cache,
         };
-        packed(&archive, &path, &packing, go_on)
+        packed(&archive, &path, &packing, go_on, false)
     }
 
     #[test]
@@ -1359,7 +1399,37 @@ mod tests {
             matches!(&refused, Err(Unsent::Refused(why)) if why == ".tmp/a.txt changed after it was hashed"),
             "{refused:?}"
         );
-        assert!(matches!(sent, Ok(compressed) if compressed > 0), "{sent:?}");
+        assert!(matches!(sent, Ok((compressed, _)) if compressed > 0), "{sent:?}");
+    }
+
+    #[test]
+    fn packed_returns_the_sha256_of_the_archive_it_wrote() {
+        use sha2::{Digest, Sha256};
+        use std::io::{Read, Seek, SeekFrom};
+
+        let root = worktree("pack-sha256", ".tmp/\nstate/\n");
+        put(&root, ".tmp/a.txt", "first");
+        put(&root, ".tmp/b.txt", "second");
+        let built = build(&root, &[".tmp/**"]).expect("the build");
+        fs::create_dir_all(root.join(".tmp")).expect("the .tmp folder can be made");
+        let path = root.join(".tmp").join("pack.tar.zst");
+        let mut archive = made_in_tmp(&root, &path, "the inputs archive").expect("the archive can be made");
+        let files: Vec<&Found> = built.found.iter().collect();
+        let cache = cache_of(&root);
+        let packing = Pack {
+            root: &root,
+            files: &files,
+            manifest: &built.manifest,
+            cache: &cache,
+        };
+
+        let (length, sha256) = packed(&archive, &path, &packing, &|| true, true).expect("the pack passes");
+
+        let mut written = Vec::new();
+        archive.seek(SeekFrom::Start(0)).expect("the archive can be read from its start");
+        archive.read_to_end(&mut written).expect("the archive can be read");
+        assert_eq!(length, written.len() as u64, "the length is the file's");
+        assert_eq!(sha256, Some(<[u8; 32]>::from(Sha256::digest(&written))), "the digest is the file's");
     }
 
     #[test]

@@ -14,6 +14,10 @@ use crate::values;
 /// The values `--test-push-register` takes: each builder's registration succeeds, or fails as the box's seam refusing.
 #[cfg(feature = "test-seams")]
 const PUSH_REGISTER_RESULTS: &[&str] = &["ok", "fail"];
+/// The largest send buffer `--test-remote-channel-send-buffer-bytes` takes: the 16 MiB a put's data channel gets
+/// without it.
+#[cfg(feature = "test-seams")]
+const CHANNEL_SEND_BUFFER_MOST: u32 = 16 * 1024 * 1024;
 
 /// The lookup a bare `--env NAME` word forwards `NAME`'s value from: the gate's own environment, unless a test built the
 /// builder with one of its own.
@@ -126,6 +130,8 @@ pub(crate) enum ValueOption {
     TailscaleHoldStartMs,
     #[cfg(feature = "test-seams")]
     RemoteChannelFault,
+    #[cfg(feature = "test-seams")]
+    RemoteChannelSendBufferBytes,
     #[cfg(feature = "test-seams")]
     ConfirmMs,
     #[cfg(feature = "test-seams")]
@@ -409,6 +415,7 @@ impl RunBuilder {
             | ValueOption::TailscaleWaitMs
             | ValueOption::TailscaleHoldStartMs
             | ValueOption::RemoteChannelFault
+            | ValueOption::RemoteChannelSendBufferBytes
             | ValueOption::ConfirmMs
             | ValueOption::PushSsh
             | ValueOption::PushBoundMs
@@ -475,6 +482,9 @@ impl RunBuilder {
             ValueOption::TailscaleHoldStartMs => seams.tailscale_hold_start_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::RemoteChannelFault => {
                 seams.remote_channel_fault = Some(values::remote_call(spelled, value, values::CHANNEL_FAULTS)?);
+            }
+            ValueOption::RemoteChannelSendBufferBytes => {
+                seams.remote_channel_send_buffer_bytes = Some(values::in_range(spelled, value, 1, CHANNEL_SEND_BUFFER_MOST)?);
             }
             ValueOption::WarmWaitMs => seams.warm_wait_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::ConfirmMs => self.cutover_seams.confirm_ms = Some(values::above_zero(spelled, value)?),
@@ -673,7 +683,7 @@ impl RunBuilder {
     /// `--test-remote-fetch-cap-bytes`,
     /// `--test-remote-apply-cap-bytes`, `--test-remote-outputs-budget-bytes`, `--test-remote-inputs-budget-bytes`,
     /// `--test-remote-lfs-budget-bytes`, `--test-remote-log-cap-bytes`, `--test-remote-tamper` and
-    /// `--test-remote-channel-fault` without
+    /// `--test-remote-channel-fault`, `--test-remote-channel-send-buffer-bytes` without
     /// `--test-remote-transport`,
     /// whose client alone reads them, `--test-remote-timeout-ms` with it unless `--test-remote-watch-call` names a call
     /// other than `run`, and `--test-remote-snapshot` with it, as each chooses the client.
@@ -705,6 +715,10 @@ impl RunBuilder {
             (self.test_seams.remote_log_cap_bytes.is_some(), "--test-remote-log-cap-bytes"),
             (self.test_seams.remote_tamper.is_some(), "--test-remote-tamper"),
             (self.test_seams.remote_channel_fault.is_some(), "--test-remote-channel-fault"),
+            (
+                self.test_seams.remote_channel_send_buffer_bytes.is_some(),
+                "--test-remote-channel-send-buffer-bytes",
+            ),
         ] {
             if read && !transport {
                 self.problems.push(Problem::SeamNeeds {

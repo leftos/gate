@@ -182,8 +182,10 @@ pub(crate) struct RustClient {
     watch_call: Option<String>,
     /// `--test-remote-interrupt-at`: the call after whose first output byte the client raises the console interrupt.
     interrupt_at: Option<String>,
-    /// `--test-remote-channel-fault`: the fault the PC's side of an outputs pull's data channel takes.
+    /// `--test-remote-channel-fault`: the fault the PC's side of an outputs pull's or a put's data channel takes.
     channel_fault: Option<String>,
+    /// `--test-remote-channel-send-buffer-bytes`: the send buffer the PC's connection of a put's data channel gets.
+    channel_send_buffer: Option<u32>,
     /// `--test-local-sdks`: this PC's SDK list, read in place of `dotnet --list-sdks`.
     local_sdks: Option<String>,
     /// How long this PC's `dotnet --list-sdks` may take: `--test-dotnet-limit-ms`, else 30 s.
@@ -282,6 +284,7 @@ impl RustClient {
             watch_call: seams.remote_watch_call.clone(),
             interrupt_at: seams.remote_interrupt_at.clone(),
             channel_fault: seams.remote_channel_fault.clone(),
+            channel_send_buffer: seams.remote_channel_send_buffer_bytes,
             local_sdks: seams.local_sdks.clone(),
             dotnet_limit: dotnet_limit(seams),
             fetch_cap: seams.remote_fetch_cap_bytes.unwrap_or(watchdog::FETCH_CAP),
@@ -436,7 +439,6 @@ impl RustClient {
                 return RemoteOutcome::not_started(why);
             }
         }
-        let started = Instant::now();
         let one = self.watch_call.as_deref();
         // With `--test-remote-watch-call`, the stall seam is that one call's, and the run keeps its own.
         let stall_ms = if one.is_some() { None } else { self.stall_ms };
@@ -450,7 +452,7 @@ impl RustClient {
             transfer_pauses: self.transfer_pauses,
             transfer_failed: false,
             limits: Limits {
-                started,
+                started: Instant::now(),
                 stall,
                 command: Duration::from_secs(call.timeout),
                 backstop: self.backstop_ms.map_or_else(|| watchdog::backstop(call.timeout), Duration::from_millis),
@@ -465,6 +467,7 @@ impl RustClient {
             }),
             interrupt_at: self.interrupt_at.as_deref(),
             channel_fault: self.channel_fault.as_deref(),
+            channel_send_buffer: self.channel_send_buffer,
             local_sdks: self.local_sdks.as_deref(),
             dotnet_limit: self.dotnet_limit,
             fetch_cap: self.fetch_cap,
@@ -1263,7 +1266,8 @@ pub(super) struct Called {
     /// What its raw copy had written into its sink when the watch cut it, for a call with a raw copy the watch cut;
     /// `None` for any other.
     pub(super) received: Option<Received>,
-    /// How the data channel an outputs call asked for ended on the PC's side; `None` for a call that asked for none.
+    /// How the data channel an outputs or put call asked for ended on the PC's side; `None` for a call that asked for
+    /// none.
     pub(super) channel: Option<channel::Dialled>,
     /// Its last standard error line saying what the box sent over a data channel ([`gate_wire::channel_sent_line`]).
     pub(super) channel_sent: Option<String>,
@@ -1333,8 +1337,9 @@ impl Called {
         }
     }
 
-    /// Whether the box refused the outputs call's data channel by its `channel` tag, read as [`Called::refusal`] reads a
-    /// tag: the channel did not complete, nothing was installed and the archive is kept, so the pull goes over ssh.
+    /// Whether the box refused the call's data channel by its `channel` tag, read as [`Called::refusal`] reads a tag:
+    /// the channel did not complete and nothing was installed, the outputs archive kept or the put's stage removed, so
+    /// the pull or the put goes again over ssh.
     pub(super) fn channel_refused(&self) -> bool {
         self.refused == Some(Tagged::Channel) && !self.started
     }
@@ -1387,14 +1392,14 @@ enum Tagged {
     Fallback(FallbackReason),
     Sent,
     Drain,
-    /// The box's `channel` refusal of an outputs call's data channel, which the pull over ssh answers.
+    /// The box's `channel` refusal of an outputs or put call's data channel, which the pull or put over ssh answers.
     Channel,
 }
 
 /// What the box's line says after its `channel` refusal tag, before why ([`gate_wire::channel_not_completed_line`]).
 const NOT_COMPLETED: &str = "gate: data channel not completed: ";
 
-/// Why the outputs call that ended as `called`, refused by the box's `channel` tag, did not complete its data channel:
+/// Why the outputs or put call that ended as `called`, refused by the box's `channel` tag, did not complete its data channel:
 /// the PC's own reason when it had one, else that the box said no size, else the box's from its line, else that the
 /// PC's channel did not end within the call's drain, else that the box did not complete it. A PC side that gave up
 /// because the call ended has no reason of its own.
@@ -1442,9 +1447,12 @@ pub(super) struct Attempt<'c, 'a> {
     /// more while the stop call that Ctrl+C leads to runs; or `apply`, once a pair's sync-back has checked every patch
     /// and before it applies the first; or `lfs`, at the start of the LFS phase, before its first call.
     pub(super) interrupt_at: Option<&'c str>,
-    /// `--test-remote-channel-fault`: the fault the PC's side of the outputs pull's data channel takes once it dialled
-    /// the box ([`channel::Fault`]).
+    /// `--test-remote-channel-fault`: the fault the PC's side of an outputs pull's or a put's data channel takes once it
+    /// dialled the box ([`channel::Fault`]).
     channel_fault: Option<&'c str>,
+    /// `--test-remote-channel-send-buffer-bytes`: the send buffer the PC's connection of a put's data channel gets in
+    /// place of [`channel::SEND_BUFFER`].
+    channel_send_buffer: Option<u32>,
     /// `--test-local-sdks`: this PC's SDK list, read in place of `dotnet --list-sdks`.
     local_sdks: Option<&'c str>,
     /// How long this PC's `dotnet --list-sdks` may take before it is killed and its list counts as unreadable.
@@ -2941,6 +2949,7 @@ impl Attempt<'_, '_> {
                 sink: None,
                 wire: Wire::Compressed,
                 channel: None,
+                put: None,
             };
             let called = attempt.ssh(BoxVerb::Run, Echo::Console, Watch::Run(limits), raise, run)?;
             heard.clone_from(&called.outputs);
@@ -3248,6 +3257,7 @@ impl Attempt<'_, '_> {
             tag_nonce: only.tag_nonce,
             sink: only.sink,
             channel: only.channel,
+            put: only.put,
         };
         self.started(&command, echo, watch, starts)
     }
@@ -3298,6 +3308,7 @@ impl Attempt<'_, '_> {
                             size: pull.total,
                             fault: attempt.channel_fault.and_then(channel::Fault::named),
                         }),
+                        put: None,
                     }
                 }
                 drawn => {
@@ -3348,7 +3359,7 @@ impl Attempt<'_, '_> {
         ended
     }
 
-    /// The builder's `data` address and this PC's own address toward it, when the outputs pull goes over a data channel
+    /// The builder's `data` address and this PC's own address toward it, when an outputs pull or a put goes over a data channel
     /// ([`channel::planned`]); `None` when it goes over ssh, the line saying why logged when the builder has `data`.
     fn channel_towards(&mut self) -> Option<(Ipv4Addr, Ipv4Addr)> {
         let towards = channel::planned(self.call.builder).and_then(|data| match data {
@@ -3366,23 +3377,25 @@ impl Attempt<'_, '_> {
 
     /// One inputs call, `gate box inputs`, made again when it failed before the banner, watched as `watch` says,
     /// and the console interrupt raised after its first output byte with `--test-remote-interrupt-at inputs`. Each
-    /// attempt is fed `head`, then, when an archive is given, the open file's first bytes up to its packed length, read
-    /// from its start at a position of its own; its standard output goes raw into the sink `sink` makes anew when
-    /// one is given, else to the log with its standard error. The call that counts, its lines kept; else why the
+    /// attempt is fed the head `head` makes for it, then, when an archive is given, the open file's first bytes up to
+    /// its packed length, read from its start at a position of its own, on its standard input or, for a put whose
+    /// builder has a data channel, over that channel; its standard output goes raw into the sink `sink` makes anew
+    /// when one is given, else to the log with its standard error. The call that counts, its lines kept; else why the
     /// archive, the sink or the call could not be made, or the interrupt.
     pub(super) fn inputs_call(
         &mut self,
-        (head, nonce): (&Arc<str>, &str),
-        archive: Option<(&File, u64)>,
+        head: Head<'_>,
+        archive: Option<Sent<'_>>,
         sink: Option<&dyn Fn() -> Result<RawSink, String>>,
         watch: Watch,
     ) -> Result<Called, End> {
         let raise = self.raises_at("inputs");
-        self.archive_call(BoxVerb::Inputs, raise, (head, nonce, archive), sink, watch)
+        self.archive_call(BoxVerb::Inputs, raise, (head, archive), sink, watch)
     }
 
-    /// One LFS call, `gate box lfs`, made as [`Attempt::inputs_call`] makes an inputs call, but for the console
-    /// interrupt, which `--test-remote-interrupt-at lfs` raises at the LFS phase's start instead.
+    /// One LFS call, `gate box lfs`, fed `head`, whose word carries the call's `nonce`, made as
+    /// [`Attempt::inputs_call`] makes an inputs call over ssh alone, but for the console interrupt, which
+    /// `--test-remote-interrupt-at lfs` raises at the LFS phase's start instead.
     pub(super) fn lfs_call(
         &mut self,
         (head, nonce): (&Arc<str>, &str),
@@ -3390,43 +3403,115 @@ impl Attempt<'_, '_> {
         sink: Option<&dyn Fn() -> Result<RawSink, String>>,
         watch: Watch,
     ) -> Result<Called, End> {
-        self.archive_call(BoxVerb::Lfs, false, (head, nonce, archive), sink, watch)
+        let made = |_: Option<&channel::Asked>| (nonce.to_owned(), Arc::clone(head));
+        let archive = archive.map(|(file, length)| Sent { file, length, sha256: None });
+        self.archive_call(BoxVerb::Lfs, false, (&made, archive), sink, watch)
     }
 
-    /// One call of `gate box <verb>` fed `head`, whose word carries the call's `nonce`, and, when given, an archive
-    /// ([`Attempt::inputs_call`]), the console interrupt raised after its first output byte when `raise`. A call the
-    /// builder's drain refused by its tag for `nonce` ends the attempt [`End::Draining`].
+    /// One call of `gate box <verb>` fed the head `head` makes for each attempt and, when given, an archive
+    /// ([`Attempt::inputs_call`]), the console interrupt raised after its first output byte when `raise`. A put whose
+    /// archive carries its SHA-256 asks for the builder's data channel when the builder has one, each attempt with
+    /// proofs of its own; when the box refused that channel by its `channel` tag, the put is made again over ssh with
+    /// a head of its own, its nonce new, the line saying why logged. A call the builder's install refused, or its
+    /// drain by its tag for the attempt's nonce, ends the attempt, judged before the channel's tag.
     fn archive_call(
         &mut self,
         verb: BoxVerb,
         raise: bool,
-        (head, nonce, archive): (&Arc<str>, &str, Option<(&File, u64)>),
+        (head, archive): (Head<'_>, Option<Sent<'_>>),
         sink: Option<&dyn Fn() -> Result<RawSink, String>>,
         watch: Watch,
     ) -> Result<Called, End> {
         self.go_on()?;
-        let nonce: Arc<str> = Arc::from(nonce);
-        let (called, _) = self.with_retry(SSH_FAILED, |attempt| {
-            let input = match archive {
-                Some((file, length)) => {
-                    let file = file
-                        .try_clone()
-                        .map_err(|error| End::Failed(format!("cannot read the archive sent: {error}")))?;
-                    Input::Streamed(Arc::clone(head), Archived::new(file, length))
+        let towards = if archive.is_some_and(|sent| sent.sha256.is_some()) {
+            self.channel_towards()
+        } else {
+            None
+        };
+        // Why the proofs could not be drawn, said once for the call when its last attempt could not draw them either.
+        let mut undrawn = None;
+        let retried = self.with_retry(SSH_FAILED, |attempt| {
+            let asked = match towards.map(|(data, local)| channel::Asked::drawn(data, local)) {
+                Some(Ok(asked)) => {
+                    undrawn = None;
+                    Some(asked)
                 }
-                None => Input::Text(Arc::clone(head)),
+                Some(Err(why)) => {
+                    undrawn = Some(why);
+                    None
+                }
+                None => None,
             };
-            let sink = sink.map(|make| make()).transpose().map_err(End::Failed)?;
-            let only = CallOnly {
-                input,
-                nonce: None,
-                tag_nonce: Some(Arc::clone(&nonce)),
-                sink,
-                wire: Wire::Plain,
-                channel: None,
-            };
-            attempt.ssh(verb, Echo::LogOnly, watch, raise, only)
+            attempt.archive_attempt(verb, raise, (head, archive, asked), sink, watch)
+        });
+        if let Some(why) = undrawn {
+            self.logged(&channel::not_used_line(&why));
+        }
+        let (called, _) = retried?;
+        let called = self.archive_judged(called)?;
+        if !called.channel_refused() {
+            if let Some(channel::Dialled::Pushed { bytes, took }) = &called.channel {
+                self.logged(&channel::put_line(*bytes, *took));
+            }
+            return Ok(called);
+        }
+        self.logged(&channel::not_used_line(&channel_why(&called)));
+        let (called, _) = self.with_retry(SSH_FAILED, |attempt| {
+            attempt.archive_attempt(verb, raise, (head, archive, None), sink, watch)
         })?;
+        self.archive_judged(called)
+    }
+
+    /// One attempt of an archive call ([`Attempt::archive_call`]): its nonce and head made anew, with the data channel
+    /// `asked` when given, which the archive then goes over instead of the call's standard input.
+    fn archive_attempt(
+        &mut self,
+        verb: BoxVerb,
+        raise: bool,
+        (head, archive, asked): (Head<'_>, Option<Sent<'_>>, Option<channel::Asked>),
+        sink: Option<&dyn Fn() -> Result<RawSink, String>>,
+        watch: Watch,
+    ) -> Result<Called, End> {
+        let (nonce, text) = head(asked.as_ref());
+        let (input, put) = match archive {
+            Some(sent) => {
+                let file = sent
+                    .file
+                    .try_clone()
+                    .map_err(|error| End::Failed(format!("cannot read the archive sent: {error}")))?;
+                let archived = Archived::new(file, sent.length);
+                match (asked, sent.sha256) {
+                    (Some(asked), Some(sha256)) => {
+                        let put = channel::Put {
+                            asked,
+                            length: sent.length,
+                            sha256: *sha256,
+                            send_buffer: self.channel_send_buffer.map_or(channel::SEND_BUFFER, u32::cast_signed),
+                            fault: self.channel_fault.and_then(channel::Fault::named),
+                        };
+                        (Input::Text(text), Some(PutDial { put, archive: archived }))
+                    }
+                    _ => (Input::Streamed(text, archived), None),
+                }
+            }
+            None => (Input::Text(text), None),
+        };
+        let sink = sink.map(|make| make()).transpose().map_err(End::Failed)?;
+        let only = CallOnly {
+            input,
+            nonce: None,
+            tag_nonce: Some(Arc::from(nonce)),
+            sink,
+            wire: Wire::Plain,
+            channel: None,
+            put,
+        };
+        self.ssh(verb, Echo::LogOnly, watch, raise, only)
+    }
+
+    /// The archive call's attempt that ended as `called`, its lines kept: ended [`End::Refused`] when the builder's
+    /// install refused it, and [`End::Draining`] when its drain did by its tag; else the call.
+    fn archive_judged(&mut self, called: Called) -> Result<Called, End> {
         self.lines.extend(called.lines.iter().cloned());
         if let Some(line) = install_refused(self.call.host(), &called) {
             self.say(line);
@@ -3470,6 +3555,7 @@ impl Attempt<'_, '_> {
             tag_nonce: None,
             sink: None,
             channel: None,
+            put: None,
         };
         self.started(&command, echo, watch, starts)
     }
@@ -3497,7 +3583,12 @@ impl Attempt<'_, '_> {
         let (suspended, stdout, stderr, stdin) = launched(&launch, &job, starts.input.is_some()).map_err(|error| cannot_start(error.to_string()))?;
         let running = suspended.assign_and_resume(&job).map_err(|error| cannot_start(error.to_string()))?;
         let feeding = Arc::new(Feeding::default());
-        let feeder = stdin.zip(starts.input).map(|(stdin, input)| fed(stdin, input, Arc::clone(&feeding)));
+        // A put over a data channel is fed by its channel, whose thread says when the archive's last byte is written:
+        // the feeder of its head counts its bytes, but its close of standard input after the head is no end of the put.
+        let finishes = starts.put.is_none();
+        let feeder = stdin
+            .zip(starts.input)
+            .map(|(stdin, input)| fed(stdin, input, (Arc::clone(&feeding), finishes)));
         let shared = Arc::new(Shared::new());
         // Only the run call carries the run's nonce.
         let run_call = starts.nonce.is_some();
@@ -3513,26 +3604,14 @@ impl Attempt<'_, '_> {
             log_cap: self.log_cap,
         };
         let copied = starts.sink.is_some();
-        let asked_channel = starts.channel.is_some();
-        let raw = if let Some(sink) = starts.sink {
-            let capped = Capped {
-                inner: sink.file,
-                cap: sink.cap,
-                shared: Arc::clone(&shared),
-                written: 0,
-            };
-            Some(match starts.channel {
-                // The archive comes over the channel: the call's standard output is read as lines, as any call's.
-                Some(dial) => {
-                    relayed(stdout, Reader::new(false, reading.clone(), out_log), &shared, done.clone());
-                    dialled(dial, capped, sink.shown, &shared)
-                }
-                None => relayed_raw(stdout, capped, sink.shown, &shared, done.clone()),
-            })
-        } else {
-            relayed(stdout, Reader::new(false, reading.clone(), out_log), &shared, done.clone());
-            None
-        };
+        let asked_channel = starts.channel.is_some() || starts.put.is_some();
+        let raw = out_relayed(
+            stdout,
+            (starts.sink, starts.channel, starts.put),
+            Reader::new(false, reading.clone(), out_log),
+            (&shared, &feeding),
+            &done,
+        );
         relayed(stderr, Reader::new(true, reading, err_log), &shared, done);
         let watched = Watched {
             running: &running,
@@ -3553,7 +3632,12 @@ impl Attempt<'_, '_> {
             // it does within a slice of the stop, before it is joined.
             shared.stop();
             let drained = watching.ended.as_ref().is_ok_and(|(ended, _)| ended.drained());
-            dialled = self.ended_raw(raw, drained && !asked_channel);
+            let joined = if finishes {
+                "the outputs call's raw copy"
+            } else {
+                "the put's data channel thread"
+            };
+            dialled = self.ended_raw((raw, joined), drained && !asked_channel);
         }
         // A channel asked for whose thread gave no end, as one that did not end within the drain, counts as failed.
         let dialled = asked_channel.then(|| dialled.unwrap_or(channel::Dialled::NotEnded));
@@ -3669,12 +3753,12 @@ impl Attempt<'_, '_> {
     }
 
     /// Gives the raw copy's reader `raw` the rest of its [`DRAIN`] to end, when the call's own end did not already
-    /// drain it (`drained`, never so for a data channel's thread, which says no drain), joins it, and says a reader
-    /// that panicked or one that has not ended by then. The sink has already been made to stop writing, so nothing more
+    /// drain it (`drained`, never so for a data channel's thread, which says no drain), joins it, and says, naming it as
+    /// `joined` does, a thread that panicked or one that has not ended by then. The sink has already been made to stop writing, so nothing more
     /// goes into the archive the fetch is about to remove.
     /// How the data channel the thread fed the sink from ended, for a channel's thread; `None` for a raw copy, and for a
     /// thread that panicked or did not end.
-    fn ended_raw(&mut self, raw: thread::JoinHandle<Option<channel::Dialled>>, drained: bool) -> Option<channel::Dialled> {
+    fn ended_raw(&mut self, (raw, joined): (thread::JoinHandle<Option<channel::Dialled>>, &str), drained: bool) -> Option<channel::Dialled> {
         let deadline = if drained { Instant::now() } else { Instant::now() + DRAIN };
         while !raw.is_finished() && Instant::now() < deadline {
             thread::sleep(PAUSE_STEP);
@@ -3683,11 +3767,11 @@ impl Attempt<'_, '_> {
             if let Ok(dialled) = raw.join() {
                 dialled
             } else {
-                self.logged("gate: the outputs call's raw copy panicked");
+                self.logged(&format!("gate: {joined} panicked"));
                 None
             }
         } else {
-            self.logged(&format!("gate: the outputs call's raw copy did not end within {} s", DRAIN.as_secs()));
+            self.logged(&format!("gate: {joined} did not end within {} s", DRAIN.as_secs()));
             None
         }
     }
@@ -3826,6 +3910,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             one_call: None,
             interrupt_at: None,
             channel_fault: None,
+            channel_send_buffer: None,
             local_sdks: None,
             dotnet_limit: git::DOTNET_LIMIT,
             fetch_cap: watchdog::FETCH_CAP,
@@ -4307,6 +4392,29 @@ struct Starts {
     sink: Option<RawSink>,
     /// The data channel the sink is filled from instead of the call's standard output, for an outputs call asking one.
     channel: Option<channel::Dial>,
+    /// The data channel a put's archive is sent over instead of the call's standard input, for a put asking one.
+    put: Option<PutDial>,
+}
+
+/// What makes one attempt of an archive call its request: given the data channel the attempt asks for, when it asks
+/// one, a nonce new to the attempt, which its word carries and the box's refusal tags name, and the head fed on the
+/// call's standard input.
+pub(super) type Head<'h> = &'h dyn Fn(Option<&channel::Asked>) -> (String, Arc<str>);
+
+/// The archive a put feeds: the open file, its packed `length`, and its `sha256` when the put may go over the builder's
+/// data channel; `None` keeps it on ssh.
+#[derive(Clone, Copy)]
+pub(super) struct Sent<'f> {
+    pub(super) file: &'f File,
+    pub(super) length: u64,
+    pub(super) sha256: Option<&'f [u8; 32]>,
+}
+
+/// What a put's data channel sends: the channel and what the request declares of the archive, and the archive as
+/// this attempt reads it.
+struct PutDial {
+    put: channel::Put,
+    archive: Archived,
 }
 
 /// What a call of `gate box` is fed on its standard input, `input`, and the `verb` of the call, which the line saying
@@ -4373,6 +4481,8 @@ struct CallOnly {
     wire: Wire,
     /// The data channel the outputs call's archive comes over instead of its standard output, when it asks for one.
     channel: Option<channel::Dial>,
+    /// The data channel a put's archive goes over instead of its standard input, when it asks for one.
+    put: Option<PutDial>,
 }
 
 impl CallOnly {
@@ -4385,6 +4495,7 @@ impl CallOnly {
             sink: None,
             wire: Wire::Plain,
             channel: None,
+            put: None,
         }
     }
 }
@@ -4449,15 +4560,18 @@ impl<W: Write> Write for Counted<'_, W> {
 }
 
 /// Writes what `fed` gives to a call's `stdin` on a thread of its own, through a [`FEED_BUFFER`] buffer, each byte that
-/// reaches it counted in `feeding`, then closes it and marks `feeding` finished; the thread gives back how the write
-/// went, which [`Attempt::fed_out`] reads once the call has ended.
-fn fed(stdin: File, fed: Fed, feeding: Arc<Feeding>) -> Feeder {
+/// reaches it counted in `feeding`, then closes it and, when it `finishes` the call's feeding, marks `feeding`
+/// finished, which a put over a data channel leaves to its channel; the thread gives back how the write went, which
+/// [`Attempt::fed_out`] reads once the call has ended.
+fn fed(stdin: File, fed: Fed, (feeding, finishes): (Arc<Feeding>, bool)) -> Feeder {
     let Fed { verb, input } = fed;
     let thread = thread::spawn(move || {
         let mut stdin = feeder_writer(stdin, &feeding.sent);
         let written = fed_with(&mut stdin, input);
         drop(stdin);
-        feeding.finished.store(true, Ordering::Release);
+        if finishes {
+            feeding.finished.store(true, Ordering::Release);
+        }
         written
     });
     Feeder { verb, thread }
@@ -5128,6 +5242,37 @@ fn relayed(stream: impl Read + Send + 'static, reader: Reader, shared: &Arc<Shar
     });
 }
 
+/// Reads a call's `stdout`: copied raw into the sink when one is given and no data channel fills it, else as lines
+/// through `reader`; and starts the data channel's thread, a pull's into the sink or a put's out of its archive, when
+/// one is asked, the put's counting into `feeding`. The thread a fetch joins before it removes its archive, the raw
+/// copy's or the channel's; `None` for a call with neither.
+fn out_relayed(
+    stdout: impl Read + Send + 'static,
+    (sink, channel, put): (Option<RawSink>, Option<channel::Dial>, Option<PutDial>),
+    reader: Reader,
+    (shared, feeding): (&Arc<Shared>, &Arc<Feeding>),
+    done: &Sender<()>,
+) -> Option<thread::JoinHandle<Option<channel::Dialled>>> {
+    let Some(sink) = sink else {
+        relayed(stdout, reader, shared, done.clone());
+        return put.map(|put| pushing(put, Arc::clone(feeding), shared));
+    };
+    let capped = Capped {
+        inner: sink.file,
+        cap: sink.cap,
+        shared: Arc::clone(shared),
+        written: 0,
+    };
+    Some(match channel {
+        // The archive comes over the channel: the call's standard output is read as lines, as any call's.
+        Some(dial) => {
+            relayed(stdout, reader, shared, done.clone());
+            dialled(dial, capped, sink.shown, shared)
+        }
+        None => relayed_raw(stdout, capped, sink.shown, shared, done.clone()),
+    })
+}
+
 /// Copies `stream` into `sink`, shown as `shown`, on a thread of its own as [`relay_raw`] does, then says so on `done`,
 /// and hands the thread back, so the fetch can join it before it removes the archive the copy wrote to.
 fn relayed_raw(
@@ -5162,14 +5307,8 @@ fn dialled(
 ) -> thread::JoinHandle<Option<channel::Dialled>> {
     let shared = Arc::clone(shared);
     thread::spawn(move || {
-        let port = loop {
-            if let Some(port) = held(&shared.heard).channel_port {
-                break port;
-            }
-            if shared.stopped() {
-                return Some(channel::Dialled::NoPort);
-            }
-            thread::sleep(PAUSE_STEP);
+        let Some(port) = port_heard(&shared) else {
+            return Some(channel::Dialled::NoPort);
         };
         // With no size from the box's run call, the PC cannot tell where the archive ends: it does not dial, and the
         // box's own `channel` refusal at its accept window sends the pull over ssh.
@@ -5184,6 +5323,64 @@ fn dialled(
         let ended = || shared.stopped();
         Some(channel::pulled(&dial.asked, (port, size, dial.fault), &mut fill, &ended))
     })
+}
+
+/// The port the box's line on the call's standard error names once it said it ([`Heard::channel_port`]); `None` once
+/// the call ended first.
+fn port_heard(shared: &Shared) -> Option<u16> {
+    loop {
+        if let Some(port) = held(&shared.heard).channel_port {
+            return Some(port);
+        }
+        if shared.stopped() {
+            return None;
+        }
+        thread::sleep(PAUSE_STEP);
+    }
+}
+
+/// Sends a put's archive over the data channel `dial` on a thread of its own, once the call's standard error said the
+/// box's port line, and hands the thread back; it gives how the channel ended. The connect and the proof exchange
+/// mark the call's progress, each piece written counts into `feeding` as a feeder's write does, and the archive's last
+/// byte written marks `feeding` finished, as a feeder's close does, so the stall watch covers a silent channel up to
+/// then and the wait for the box's ack and verdict after it falls to the transfer ceiling, as the ssh put's does. The thread ends within a
+/// [`channel::pushed`] slice of the call's end ([`Shared::stopped`]), the socket shut down and closed before then; it is
+/// no reader of the call's streams, so it says nothing on their channel.
+fn pushing(dial: PutDial, feeding: Arc<Feeding>, shared: &Arc<Shared>) -> thread::JoinHandle<Option<channel::Dialled>> {
+    let shared = Arc::clone(shared);
+    thread::spawn(move || {
+        let Some(port) = port_heard(&shared) else {
+            return Some(channel::Dialled::NoPort);
+        };
+        let PutDial { put, mut archive } = dial;
+        let mut feed = Pushing {
+            feeding: &feeding,
+            shared: &shared,
+        };
+        let ended = || shared.stopped();
+        Some(channel::pushed(&put, port, &mut archive, &mut feed, &ended))
+    })
+}
+
+/// What a put's data channel tells the call it belongs to: its feeding, which the stall watch reads for a put, and its
+/// shared state, whose progress the exchange's steps mark.
+struct Pushing<'s> {
+    feeding: &'s Feeding,
+    shared: &'s Shared,
+}
+
+impl channel::Feed for Pushing<'_> {
+    fn mark(&mut self) {
+        self.shared.progress.mark();
+    }
+
+    fn sent(&mut self, bytes: u64) {
+        self.feeding.sent.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn finished(&mut self) {
+        self.feeding.finished.store(true, Ordering::Release);
+    }
 }
 
 /// The sink a data channel's thread fills, shown as `shown`, with the call's `shared` state whose progress each step
@@ -6035,6 +6232,7 @@ mod tests {
             one_call: None,
             interrupt_at: None,
             channel_fault: None,
+            channel_send_buffer: None,
             local_sdks: None,
             dotnet_limit: DOTNET_LIMIT,
             fetch_cap: watchdog::FETCH_CAP,

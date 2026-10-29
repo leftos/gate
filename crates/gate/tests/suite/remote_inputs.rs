@@ -633,3 +633,340 @@ fn a_pass_that_sent_inputs_names_them_in_its_split() {
     .expect("the pattern is valid");
     assert!(line.is_match(&outcome.stdout), "{outcome:?}");
 }
+
+/// The variable whose words the stand-in gives every box call as box seams.
+const BOX_SEAMS_VARIABLE: &str = "GATE_FAKE_SSH_BOX_SEAMS";
+
+/// The line a routed run's log gets once a put moved its archive over the data channel.
+const CHANNEL_PUT: &str = r"(?m)^gate: data channel: put (\d+) in \d+\.\d s\r?$";
+
+/// The box's line saying why its data channel did not complete, as the run's log holds it.
+const NOT_COMPLETED: &str = "gate: data channel not completed: ";
+
+/// An [`inputs_case`] whose builder has the loopback `data` address when `data`.
+fn channel_inputs_case(name: &str, data: bool) -> Case {
+    let case = client_case(name);
+    with_input(&case);
+    let leaf = case
+        .folder()
+        .file_name()
+        .expect("the case folder has a name")
+        .to_string_lossy()
+        .into_owned();
+    let repo = repo_name(&leaf);
+    let mut routing = json!({
+        "host": "builder",
+        "slots": 2,
+        "repos": { &repo: ["*tool*"] },
+        "outputs": { &repo: [] },
+        "inputs": { &repo: ["secrets/**"] },
+    });
+    if data {
+        routing["data"] = json!("127.0.0.1");
+    }
+    write_remote_json(&case, &routing.to_string());
+    case
+}
+
+/// The routed run of `case` logging to `log` through the steps file `steps`, given the options `extra`: every box call
+/// is given a data channel on one free loopback port, with accept and idle windows an hour long, so no case here ends
+/// on a box-side window.
+fn channel_gate(case: &Case, log: &str, steps: &Path, extra: &[&str]) -> std::process::Command {
+    let tuned = Tuned { extra, ..Tuned::default() };
+    let mut gate = client_gate_tuned(case, log, steps, &tuned, &RAN);
+    let port = crate::remote_client::free_channel_port();
+    gate.env(
+        BOX_SEAMS_VARIABLE,
+        format!("--test-box-channel-ports {port}-{port} --test-box-channel-accept-ms 3600000 --test-box-channel-idle-ms 3600000"),
+    );
+    gate
+}
+
+/// The request the stand-in of the steps file `steps` kept, `None` while it is not there whole. The input it kept is
+/// read as bytes: a put over ssh carries its archive after the request and the manifest.
+fn kept_request(steps: &Path) -> Option<serde_json::Value> {
+    let input = fs::read(beside(steps, ".input")).ok()?;
+    let word = input.split(|byte| *byte == b'\n').next()?;
+    serde_json::from_slice(&STANDARD.decode(word.trim_ascii()).ok()?).ok()
+}
+
+/// The steps file `name` of a put case: the preflight and the diff, then the put, which the stand-in keeps the request
+/// of, its go file made first, then the run call.
+fn put_kept(case: &Case, name: &str) -> PathBuf {
+    let go = case.folder().join("ssh").join("go");
+    fs::write(&go, "").expect("the go file can be made");
+    ssh_steps(case, name, &["ok", "ok", &format!("fed-hold {}", shown(&go)), "ok"])
+}
+
+/// With `data`, the put goes over the data channel: its request declares the archive's length and SHA-256 beside the
+/// channel, the log says the bytes put, which are that length, and the input lands on the builder.
+#[test]
+fn a_put_with_data_goes_over_the_data_channel_and_installs_what_was_sent() {
+    let case = channel_inputs_case("client-inputs-channel-put", true);
+    let steps = put_kept(&case, "ssh");
+
+    let outcome = finish(channel_gate(&case, "out.log", &steps, &[]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "inputs", "inputs", "run"]);
+    assert_eq!(on_builder(&case).as_deref(), Some("one"));
+    let log = log_of(&case, "out.log");
+    let put = Regex::new(CHANNEL_PUT).expect("the pattern compiles").captures(&log);
+    let bytes = put.map(|found| found[1].to_owned());
+    let sent = kept_request(&steps).expect("the stand-in kept the put's request");
+    assert_eq!(sent["Step"], json!("put"), "{sent}");
+    assert_eq!(sent["Channel"]["Address"], json!("127.0.0.1"), "{sent}");
+    assert_eq!(
+        bytes.as_deref().map(str::parse::<u64>),
+        Some(Ok(sent["Channel"]["Length"].as_u64().expect("the put declares its length"))),
+        "the log says the length declared: {log}"
+    );
+    let sha256 = sent["Channel"]["Sha256"].as_str().expect("the put declares its SHA-256");
+    assert!(
+        sha256.len() == 64 && sha256.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "{sha256}"
+    );
+    assert!(!log.contains("gate: data channel not used"), "{log}");
+    assert!(sent_line().is_match(&outcome.stderr), "{outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+/// With no `data`, the put is today's: its request asks for no channel and the log says nothing of one.
+#[test]
+fn a_put_without_data_asks_for_no_channel_and_logs_none() {
+    let case = channel_inputs_case("client-inputs-channel-none", false);
+    let steps = put_kept(&case, "ssh");
+
+    let outcome = finish(channel_gate(&case, "out.log", &steps, &[]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "inputs", "inputs", "run"]);
+    let sent = kept_request(&steps).expect("the stand-in kept the put's request");
+    assert!(sent.get("Channel").is_none(), "{sent}");
+    assert!(!log_of(&case, "out.log").contains("gate: data channel"), "{}", log_of(&case, "out.log"));
+    assert_eq!(on_builder(&case).as_deref(), Some("one"));
+}
+
+/// A put whose PC side takes the fault `fault`: the box refuses its channel, saying why as `box_why` starts; the PC
+/// logs its not-used line, saying why as `why` starts, and puts again over ssh, which installs the input once, and the
+/// run goes on with no fallback.
+fn assert_put_again_over_ssh(name: &str, fault: &str, (why, box_why): (&str, &str)) {
+    let case = channel_inputs_case(name, true);
+    let steps = ssh_steps(&case, "ssh", &["ok"; 5]);
+
+    let outcome = finish(channel_gate(&case, "out.log", &steps, &["--test-remote-channel-fault", fault]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        calls(&steps),
+        ["preflight", "inputs", "inputs", "inputs", "run"],
+        "the diff, the channel put, the ssh put"
+    );
+    let log = log_of(&case, "out.log");
+    let not_used = format!("gate: data channel not used: {why}");
+    assert!(
+        log.lines().any(|line| line.starts_with(&not_used) && line.ends_with("; sent over ssh")),
+        "{log}"
+    );
+    assert!(log.contains(&format!("{NOT_COMPLETED}{box_why}")), "the box refused the channel: {log}");
+    assert!(!Regex::new(CHANNEL_PUT).expect("the pattern compiles").is_match(&log), "{log}");
+    assert_eq!(on_builder(&case).as_deref(), Some("one"));
+    assert!(sent_line().is_match(&outcome.stderr), "{outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_box_proof_the_pc_refuses_gets_no_byte_and_the_put_goes_again_over_ssh() {
+    assert_put_again_over_ssh(
+        "client-inputs-channel-box-proof",
+        "box-proof",
+        ("the box's proof does not match", "the PC closed the channel before its proof"),
+    );
+}
+
+#[test]
+fn a_truncated_channel_put_installs_nothing_and_the_ssh_put_installs_the_input_once() {
+    assert_put_again_over_ssh(
+        "client-inputs-channel-truncate",
+        "truncate",
+        ("the test seam stopped the put after ", "the PC closed the channel after "),
+    );
+}
+
+#[test]
+fn an_altered_channel_put_is_refused_by_its_digest_and_the_ssh_put_installs_the_input_once() {
+    assert_put_again_over_ssh(
+        "client-inputs-channel-alter",
+        "alter",
+        ("", "the bytes received do not have the SHA-256 declared"),
+    );
+}
+
+/// A PC that sent the whole archive and drops the channel before it reads the box's ack still has its put judged by
+/// the box's verdict over ssh: the box verified and installed it, so there is no second put.
+#[test]
+fn a_put_whose_socket_fails_after_the_box_acked_installs_once_and_makes_no_ssh_put() {
+    let case = channel_inputs_case("client-inputs-channel-no-ack", true);
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(channel_gate(&case, "out.log", &steps, &["--test-remote-channel-fault", "no-ack"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "inputs", "inputs", "run"], "one put alone");
+    let log = log_of(&case, "out.log");
+    assert!(!log.contains("gate: data channel not used"), "{log}");
+    assert!(!log.contains(NOT_COMPLETED), "{log}");
+    assert_eq!(on_builder(&case).as_deref(), Some("one"));
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+/// A channel put whose box never starts sends nothing and hears nothing: its head's feeder closing standard input does
+/// not end the stall watch's look, so the stall watch cuts it, long before the transfer ceiling would.
+#[test]
+fn a_channel_put_that_stalls_is_cut_by_the_stall_watch_not_the_ceiling() {
+    let case = channel_inputs_case("client-inputs-channel-stalled", true);
+    let steps = ssh_steps(
+        &case,
+        "ssh",
+        &["ok", "ok", &format!("hold {}", shown(&case.folder().join("ssh").join("never")))],
+    );
+
+    let outcome = finish(channel_gate(
+        &case,
+        "out.log",
+        &steps,
+        &["--test-remote-watch-call", "inputs", "--test-stall-ms", WATCHED_MS],
+    ));
+
+    assert!(
+        !outcome.stderr.contains("STALLED"),
+        "the cut is the reason's, not a watchdog line: {outcome:?}"
+    );
+    assert!(made_or_cut_early(&steps, &["preflight", "inputs", "inputs"]), "{:?}", calls(&steps));
+    assert_fell_back(&case, &outcome, "out.log", "the put stalled: no bytes sent or received for 1 s");
+}
+
+/// The nonce and the two proofs of a put's request kept by the steps file `steps`.
+fn put_secrets(steps: &Path) -> [String; 3] {
+    let sent = kept_request(steps).expect("the stand-in kept the put's request");
+    let text = |value: &serde_json::Value| value.as_str().expect("the request carries it").to_owned();
+    [
+        text(&sent["Nonce"]),
+        text(&sent["Channel"]["BoxProof"]),
+        text(&sent["Channel"]["PcProof"]),
+    ]
+}
+
+/// What of the put's request kept by the steps file `steps` carries no secret's hex but only the secrets: the
+/// request's base64 word, and for each of its nonce and proofs the 16 characters of the word that encode only its hex
+/// digits.
+fn put_secret_words(steps: &Path) -> Vec<String> {
+    let input = fs::read(beside(steps, ".input")).expect("the stand-in kept the call's input");
+    let word = String::from_utf8_lossy(input.split(|byte| *byte == b'\n').next().expect("the input has a request line"))
+        .trim()
+        .to_owned();
+    let json = STANDARD.decode(&word).expect("the request is base64");
+    let mut words = vec![word.clone()];
+    for secret in put_secrets(steps) {
+        let at = json
+            .windows(secret.len())
+            .position(|window| window == secret.as_bytes())
+            .expect("the request carries the secret's hex");
+        // The first whole group of three bytes inside the secret's 32 digits: its four characters, and the next 12,
+        // encode 12 of those digits alone.
+        let start = at.div_ceil(3) * 4;
+        words.push(word[start..start + 16].to_owned());
+    }
+    words
+}
+
+/// No proof or nonce a channel put's request carried reaches the run's log, its journal or its console, as hex or
+/// inside the request's base64 word.
+#[test]
+fn a_channel_put_s_proofs_and_nonce_appear_in_no_log_journal_or_console() {
+    let case = channel_inputs_case("client-inputs-channel-secret", true);
+    let steps = put_kept(&case, "ssh");
+
+    let outcome = finish(channel_gate(&case, "out.log", &steps, &[]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let log = log_of(&case, "out.log");
+    assert!(
+        Regex::new(CHANNEL_PUT).expect("the pattern compiles").is_match(&log),
+        "the put went over the channel: {log}"
+    );
+    let secrets = put_secrets(&steps);
+    let words = put_secret_words(&steps);
+    let journal = fs::read_to_string(case.root().join("events.jsonl")).expect("the journal was written");
+    for (what, text) in [
+        ("log", &log),
+        ("journal", &journal),
+        ("stdout", &outcome.stdout),
+        ("stderr", &outcome.stderr),
+    ] {
+        for secret in &secrets {
+            assert!(!text.to_ascii_lowercase().contains(secret.as_str()), "the {what} holds no proof or nonce");
+        }
+        for word in &words {
+            assert!(!text.contains(word.as_str()), "the {what} holds no part of the request word");
+        }
+    }
+}
+
+/// Each put draws its own nonce and two proofs: two runs' puts ask with six different ones.
+#[test]
+fn two_puts_carry_different_proofs_and_nonces() {
+    let case = channel_inputs_case("client-inputs-channel-proofs", true);
+    let first_steps = put_kept(&case, "first");
+    let first = finish(channel_gate(&case, "first.log", &first_steps, &[]));
+    write(&case, INPUT, "two!");
+    let second_steps = put_kept(&case, "second");
+
+    let second = finish(channel_gate(&case, "second.log", &second_steps, &[]));
+
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(second.code, Some(0), "{second:?}");
+    let all: Vec<String> = put_secrets(&first_steps).into_iter().chain(put_secrets(&second_steps)).collect();
+    for (at, secret) in all.iter().enumerate() {
+        assert!(
+            all[at + 1..].iter().all(|other| other != secret),
+            "every nonce and proof differs: {all:?}"
+        );
+    }
+    assert_eq!(on_builder(&case).as_deref(), Some("two!"));
+}
+
+/// The ssh put after a refused channel carries a nonce of its own, so its stage is new to the box, and no channel.
+#[test]
+fn a_fallback_put_uses_a_nonce_new_to_the_stage() {
+    let case = channel_inputs_case("client-inputs-channel-fallback-nonce", true);
+    let channel_go = Go(case.folder().join("ssh").join("go-channel"));
+    let ssh_go = Go(case.folder().join("ssh").join("go-ssh"));
+    let channel_held = format!("fed-hold {}", shown(channel_go.path()));
+    let ssh_held = format!("fed-hold {}", shown(ssh_go.path()));
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", &channel_held, &ssh_held, "ok"]);
+    let running = start(channel_gate(&case, "out.log", &steps, &["--test-remote-channel-fault", "box-proof"]));
+    let mut first = None;
+    running.wait_until("the channel put's request", || {
+        first = kept_request(&steps).filter(|_| calls(&steps).len() == 3);
+        first.is_some()
+    });
+    let first = first.expect("the channel put's request was kept");
+    drop(channel_go);
+    let mut second = None;
+    running.wait_until("the ssh put's request", || {
+        second = kept_request(&steps).filter(|sent| calls(&steps).len() == 4 && sent["Nonce"] != first["Nonce"]);
+        second.is_some()
+    });
+    let second = second.expect("the ssh put's request was kept");
+    drop(ssh_go);
+
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(first.get("Channel").is_some(), "the first put asked for the channel: {first}");
+    assert!(second.get("Channel").is_none(), "the ssh put asks for none: {second}");
+    assert_ne!(first["Nonce"], second["Nonce"]);
+    assert_eq!(calls(&steps), ["preflight", "inputs", "inputs", "inputs", "run"]);
+    assert_eq!(on_builder(&case).as_deref(), Some("one"));
+}
