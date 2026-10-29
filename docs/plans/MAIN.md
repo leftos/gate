@@ -7,13 +7,7 @@
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [!] GATE-828 Fix the flaky Unix box test a_clear_refuses_a_volume_mounted_in_the_work_folder_and_keeps_its_files — Urgent · Remote
 - [ ] GATE-871 Carry routed runs' bulk data on a TCP data channel instead of ssh to the Windows builder — Urgent · Remote
-- [/] GATE-939 Fix the boxside LFS skip-download-errors case that hung its checkout for 610 s once — Urgent · Remote
-- [/] GATE-940 Cut the time of the suite's slowest cases (19 cases over 60 s median) — High · Local gate
-- [ ] GATE-943 Seed the hint cases' warm history from one cold run (seed_warm) — High · Local gate
-- [ ] GATE-944 Plant the first fetch-cap hit instead of a routed run in the past-the-cap cases — High · Local gate
-- [ ] GATE-945 Run the routing full-builder case on a 1 ms remote wait, and trim the two tail tests — High · Local gate
-- [ ] GATE-946 Add a box seam that arms the client-gone limit, for the push-undo case — High · Local gate
-- [ ] GATE-947 Trim the pair, builder-switch and junction cases' extra routed runs — High · Local gate
+- [!] GATE-939 Fix the boxside LFS skip-download-errors case that hung its checkout for 610 s once — Urgent · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
@@ -21,11 +15,9 @@
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
 - [/] GATE-461 Make the cold-run raise hold for every first run and keep cold runs out of learned durations — High · Remote
 - [/] GATE-759 Move the rest of the box's shared wire rules into gate-wire (GATE-616 slices 2, 3, 5, 6) — High · Remote
-- [/] GATE-821 Balance routed runs across every builder that can take them, not first-in-file-order — High · Remote
+- [ ] GATE-821 Balance routed runs across every builder that can take them, not first-in-file-order — High · Remote
 - [!] GATE-839 Route race-anywhere's Unreal editor and game runs: a desktop route with a GPU — High · Remote
 - [/] GATE-844 Serve godot-mcp's parallel itest lanes on the builder desktop, and match any --filter-class — High · Remote
-- [/] GATE-925 Route light gates too, keeping one here only when it is provably faster here — High · Remote
-- [ ] GATE-948 End a routed run's preflight when ssh exits at once, not after the stall window — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
@@ -328,6 +320,10 @@
 - [ ] GATE-935 Journal which gitignored-input rule kept a run local, and the input that tripped it
 - [ ] GATE-936 Route godot-mcp's delve import run from the project folder
 - [ ] GATE-937 Let one worktree's routed runs on two different builders not wait on each other's work folder
+- [ ] GATE-949 Tidy the several-pool wait's edges: a retried run's room check, early not-trying notes, one drain-marker note per builder, a non-list alsoPools
+- [ ] GATE-950 Bound git_ran's post-exit reader and feed joins on the Windows box with the forwarders' drain, saying GIT_LEFTOVER
+- [ ] GATE-951 Say the tailscale-path-not-read line only when the read is truly late, not after every routed run
+- [ ] GATE-953 Cut the pair sync-back's chain of about 45 serial git calls on the builder
 
 ## Cutover sweep
 
@@ -453,3 +449,5 @@
 - [ ] GATE-909 Name the archive's kind in the shared reader's over-limit refusal, not always "outputs"
 - [ ] GATE-915 Fix the docs' dead anchors and the Bare lock glossary order
 - [ ] GATE-930 Accept -Builder in the launcher's PowerShell form
+- [ ] GATE-952 End what remote_client::a_bare_ssh_stand_in_name_is_not_searched_in_the_working_folder leaves holding its output (nextest LEAK)
+- [ ] GATE-954 Arm the desktop helper's done wait on a test file, so the never-says-done case needs no 20 s wait
