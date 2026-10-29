@@ -540,14 +540,22 @@ fn a_quiet_command_that_ran_a_short_child_is_still_stalled_and_its_process_lines
     let child: Option<u32> = lines
         .iter()
         .find_map(|line| line.strip_prefix("spawn pid=")?.split_once(&child_head)?.0.parse().ok());
+    // The child's lines are the log's either way: a `spawn pid=N ppid={command} …` line with its `exit pid=N code=0 …`
+    // after it once it ran to its end, or one `spawn pid=N missed (ended before it could be opened)` line alone when it
+    // ended before the job's watcher could open it.
     let ran_to_its_end = |child: u32| {
         exit_of(&lines, child)
             .and_then(|at| lines.get(at))
             .is_some_and(|line| line.starts_with(&format!("exit pid={child} code=0 ")))
     };
+    let missed: Vec<&str> = lines
+        .iter()
+        .map(String::as_str)
+        .filter(|line| line.starts_with("spawn pid=") && line.ends_with(" missed (ended before it could be opened)"))
+        .collect();
     assert!(
-        child.is_some_and(ran_to_its_end),
-        "a spawn and an exit line of the command's child, which ran to its end: {lines:#?}"
+        child.is_some_and(ran_to_its_end) || (child.is_none() && missed.len() == 1),
+        "a spawn and an exit line of the command's child, which ran to its end, or its one missed spawn line when it ended before it could be opened: {lines:#?}"
     );
     // The command's own bytes are its `pid` line on stdout, and it wrote nothing on stderr: every sample counts those,
     // or none yet when it came before the reader had the line, and never the process lines the log holds.
