@@ -3723,6 +3723,7 @@ mod tests {
                 root: sibling_root(&root, "lib"),
                 id: FolderId { volume: 1, file: [2; 16] },
             }],
+            absent_siblings: Vec::new(),
             repo: "app".to_owned(),
             key: KEY.to_owned(),
             subfolder: String::new(),

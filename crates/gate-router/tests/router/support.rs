@@ -132,6 +132,8 @@ pub struct FakeFacts {
     pub windows_change: WindowsChange,
     /// How many times that was asked, kept apart from [`FakeFacts::asked`].
     pub windows_change_asked: Cell<u32>,
+    /// The names of the present siblings and of the absent ones each time that was asked, in order.
+    pub windows_change_named: RefCell<Vec<(Vec<String>, Vec<String>)>>,
     /// The paths, `/`-separated from the root, that name a gitignored project input the snapshot leaves out, each with
     /// the files that carry it.
     pub gitignored: Vec<GitignoredInput>,
@@ -187,6 +189,7 @@ impl FakeFacts {
             cross_targets_asked: RefCell::new(Vec::new()),
             windows_change: WindowsChange::Untouched,
             windows_change_asked: Cell::new(0),
+            windows_change_named: RefCell::new(Vec::new()),
             gitignored: Vec::new(),
             gitignored_asked: RefCell::new(Vec::new()),
             built_here: None,
@@ -274,8 +277,10 @@ impl Facts for FakeFacts {
     }
 
     /// What [`FakeFacts::windows_change`] says.
-    fn windows_change(&self, _place: &Place, _siblings: &[SiblingRoot], _siblings_problem: Option<&str>) -> WindowsChange {
+    fn windows_change(&self, _place: &Place, siblings: &[SiblingRoot], absent: &[String], _siblings_problem: Option<&str>) -> WindowsChange {
         self.windows_change_asked.set(self.windows_change_asked.get() + 1);
+        let present = siblings.iter().map(|sibling| sibling.name.clone()).collect();
+        self.windows_change_named.borrow_mut().push((present, absent.to_vec()));
         self.windows_change.clone()
     }
 

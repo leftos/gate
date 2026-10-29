@@ -333,13 +333,15 @@ pub trait Facts {
     /// ([`RemoteRun::cross_build`]) and whose target is no project or solution file by its extension.
     fn cross_target(&self, place: &Place, target: Option<&str>) -> CrossTarget;
 
-    /// What the change of the worktree at `place`, and of each of its declared `siblings` an entry of its
+    /// What the change of the worktree at `place`, and of each of its present `siblings` an entry of its
     /// `.gate/windows.toml` names, is to that file's paths ([`WindowsChange`]): untouched when there is no such file,
     /// touched with the first changed path a declared path matches, or unknown, with why, when that cannot be told.
-    /// `siblings_problem` is how the lines name the siblings file when it has a problem, and `siblings` then empty.
-    /// Asked only of a macOS pick, whatever the command, which a touched or unknown change sends on to the next builder
-    /// that is no macOS one; the lines name the file as [`Facts::declaration_said`] says.
-    fn windows_change(&self, place: &Place, siblings: &[SiblingRoot], siblings_problem: Option<&str>) -> WindowsChange;
+    /// `siblings` are the present siblings, whose change git reads; `absent` are the declared names with nothing at
+    /// their name beside the root, which an entry may name and whose paths are then untouched. `siblings_problem` is how the lines
+    /// name the siblings file when it has a problem, and `siblings` and `absent` then empty. Asked only of a macOS pick,
+    /// whatever the command, which a touched or unknown change sends on to the next builder that is no macOS one; the
+    /// lines name the file as [`Facts::declaration_said`] says.
+    fn windows_change(&self, place: &Place, siblings: &[SiblingRoot], absent: &[String], siblings_problem: Option<&str>) -> WindowsChange;
 
     /// Whether a file of exactly this name is in the gate's folder.
     fn file_in_folder(&self, name: &str) -> bool;
@@ -399,9 +401,10 @@ pub trait Facts {
 
     /// The folder of the sibling whose root is `root`, which the decision builds as the worktree root's parent and the
     /// sibling's name: its parent opened following links, then the name opened beneath it without following one.
-    /// Missing when nothing is there or it holds no `.git`; refused, with the reason, when it is a link or a junction,
-    /// not a folder, or its `.git` is a link or a junction; else present, with its id. Asked for each declared sibling,
-    /// in declared order, once every name is allowed.
+    /// Missing when nothing is there; refused, with the reason, when it is a link or a junction, not a folder, holds no
+    /// `.git`, or its `.git` is a link or a junction; else present, with its id. A missing sibling is absent,
+    /// dropped from the run. Asked once for each declared sibling whose name the builder can lay out, in declared order,
+    /// as the worktree is opened, before the words are rewritten.
     ///
     /// # Errors
     ///
@@ -409,7 +412,7 @@ pub trait Facts {
     fn sibling_folder(&self, root: &str) -> Result<SiblingFolder, String>;
 
     /// The id of the worktree root's folder, opened following links. Asked for every matched command with no siblings
-    /// file problem, once every declared sibling is present.
+    /// file problem, once every present sibling passes its checks.
     ///
     /// # Errors
     ///
@@ -543,8 +546,6 @@ pub enum LocalReason {
     /// The siblings file `file` ([`Facts::declaration_said`]) cannot be read or has a problem; `problem` is its first,
     /// on one line.
     SiblingsFile { file: String, problem: String },
-    /// The declared sibling `name` has no git worktree beside the worktree root.
-    SiblingMissing { name: String },
     /// The declared sibling `name` is there but cannot be carried, for `reason`, which reads after its name.
     SiblingRefused { name: String, reason: String },
     /// The declared siblings `names`, in declared order, are not among those `remote.json`'s `siblings` allows the
@@ -620,7 +621,6 @@ impl LocalReason {
             Self::GitignoredPair { path } => format!("{} is gitignored, and a sibling pair does not send inputs yet", escaped(path)),
             Self::GitignoredUnsent { path, why } => format!("{} is gitignored and its files cannot be sent: {why}", escaped(path)),
             Self::BuiltHere { project } => format!("the last build of {} ran here; --no-build kept", escaped(project)),
-            Self::SiblingMissing { name } => format!("sibling {name} not found beside the worktree"),
             Self::SiblingRefused { name, reason } => format!("sibling {name} {reason}"),
             Self::SiblingsNotAllowed { names, problem } => not_allowed_reason(names, problem.as_deref()),
             Self::LeafNotLaidOut { leaf } => format!("the worktree folder name {leaf} cannot be laid out on the builder"),
@@ -672,9 +672,12 @@ pub struct RemoteRun {
     pub root_id: FolderId,
     /// The worktree root's folder name: its last segment.
     pub leaf: String,
-    /// The siblings the run carries: those declared, each allowed and checked, in declared order; none for a repo that
-    /// declares none.
+    /// The siblings the run carries: those declared and present, each allowed and checked, in declared order; none for
+    /// a repo that declares none.
     pub siblings: Vec<CarriedSibling>,
+    /// The declared siblings that are absent (nothing at its name beside the root, dropped from the run), by name,
+    /// in declared order.
+    pub absent_siblings: Vec<String>,
     /// The repo name the routing file listed.
     pub repo: String,
     /// The builder's work folder ([`work_folder_key`]).
@@ -847,7 +850,8 @@ impl RemoteRun {
     /// The lines the gate says for this route, in order: [`RemoteRun::program_line`], [`DROPPED_NO_BUILD_LINE`] unless
     /// the run has a send, whose client says it only when the send does not land, [`NO_OUTPUTS_LINE`], then, for a run
     /// carrying siblings, `gate: routed with siblings: {name} ({root}), ...` naming each in declared order, then, for a
-    /// command kept from its cross build ([`RemoteRun::cross_build_blocked`]), why ([`CrossBlocked::line`]).
+    /// run with absent siblings, the line naming them ([`absent_line`]), then, for a command kept from its cross build
+    /// ([`RemoteRun::cross_build_blocked`]), why ([`CrossBlocked::line`]).
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
@@ -868,6 +872,9 @@ impl RemoteRun {
                 .collect();
             lines.push(format!("gate: routed with siblings: {}", named.join(", ")));
         }
+        if let Some(line) = absent_line(&self.absent_siblings) {
+            lines.push(line);
+        }
         if let Some(blocked) = &self.cross_build_blocked {
             lines.push(blocked.line());
         }
@@ -887,6 +894,17 @@ impl RemoteRun {
     }
 }
 
+/// The line naming a routed run's absent siblings `names`, in declared order: `gate: routed without sibling {name}: not
+/// beside the worktree` for one, `gate: routed without siblings {a}, {b}: not beside the worktree` for more, each name
+/// as the `routed with siblings` line shows it; `None` for none.
+fn absent_line(names: &[String]) -> Option<String> {
+    match names {
+        [] => None,
+        [name] => Some(format!("gate: routed without sibling {name}: not beside the worktree")),
+        _ => Some(format!("gate: routed without siblings {}: not beside the worktree", names.join(", "))),
+    }
+}
+
 /// Where a gate's command runs. In order: only a heavy gate routes; a covering or lending parent keeps it here; `--local`
 /// keeps it here saying so; then the routing file is read, and no file keeps it here, an unusable one saying it was
 /// ignored; a git hook whose `hooks` names no repo, no non-empty word, or a first word whose file name without extension
@@ -896,8 +914,9 @@ impl RemoteRun {
 /// or `prek` keeps it here too. A matched command runs here, saying why, when the worktree's `.gate/local.toml`
 /// declares a pattern its words match or has a problem, before any sibling or desktop check. It still runs here, saying
 /// why, when the worktree's `.gate/siblings.toml` has a problem or declares a sibling the routing file's `siblings` does
-/// not allow the repo, or declares siblings from a root folder name the builder cannot lay out, a sibling named like
-/// that folder or one with no git worktree beside the root; when its `.gate/desktop.toml` has a problem, or the first
+/// not allow the repo, or declares present siblings from a root folder name the builder cannot lay out, or a sibling
+/// named like that folder; a declared sibling with nothing at its name beside the root is absent, dropped from the run,
+/// which routes with the present ones and says so. It runs here when its `.gate/desktop.toml` has a problem, or the first
 /// pattern it declares that the words match is not one the routing file's `desktop` allows the repo, listed exactly;
 /// when a word names a path outside the worktree and its siblings; or when the gate's folder holds nothing the snapshot
 /// sends; and so does one whose facts cannot be read. Last, a dotnet `test` or `run --no-build` whose last build ran
@@ -937,8 +956,11 @@ pub struct Target {
     pub leaf: String,
     /// The id of the worktree root's folder ([`Facts::root_id`]).
     pub root_id: FolderId,
-    /// The siblings carried: those declared, each allowed and checked, in declared order.
+    /// The siblings carried: those declared and present, each allowed and checked, in declared order.
     pub siblings: Vec<CarriedSibling>,
+    /// The declared siblings that are absent (nothing at its name beside the root, dropped from the run), by name,
+    /// in declared order.
+    pub absent_siblings: Vec<String>,
     /// The builder's work folder ([`work_folder_key`]).
     pub key: String,
     /// The input globs sent: the repo's `inputs` list, none when it has no entry.
@@ -2257,14 +2279,16 @@ fn macos_windows_change(config: &Config, builder: &Builder, opened: &Opened, fac
     }
     checked_siblings(config, opened, facts).ok()?;
     let siblings_problem = opened.problem.as_ref().map(|_| opened.file.as_str());
+    let roots: Vec<SiblingRoot> = opened.siblings.iter().map(|sibling| sibling.root.clone()).collect();
     facts
-        .windows_change(&opened.place, &opened.siblings, siblings_problem)
+        .windows_change(&opened.place, &roots, &opened.absent, siblings_problem)
         .reason(&facts.declaration_said(&opened.place, WINDOWS_NAME))
 }
 
-/// The opened worktree's declared siblings put through the checks a routed run's siblings pass ([`check_siblings`]:
-/// each folder present and no link or junction, each allowed by the routing file, no two one folder), before the change
-/// read runs git in any of them; none declared, or a siblings file with a problem, which declares none, passes. A
+/// The opened worktree's present siblings put through the checks a routed run's siblings pass ([`check_siblings`]:
+/// each folder no link or junction, each allowed by the routing file, no two one folder), before the change read runs
+/// git in any of them; none present, or a siblings file with a problem, which declares none, passes. An absent sibling
+/// (nothing at its name beside the root, dropped from the run) is not checked. A
 /// failed check steers nothing off a macOS builder: the run is kept here with that reason when [`settle`] checks the
 /// siblings again, whatever builder it would have gone to.
 fn checked_siblings(config: &Config, opened: &Opened, facts: &dyn Facts) -> Result<(), Here> {
@@ -2369,8 +2393,12 @@ struct Opened {
     place: Place,
     repo: String,
     leaf: String,
-    /// The declared siblings, in declared order; none when the file has a problem.
-    siblings: Vec<SiblingRoot>,
+    /// The declared siblings that are not absent, in declared order, each with its declared index and folder answer
+    /// ([`presence`]); none when the file has a problem.
+    siblings: Vec<OpenedSibling>,
+    /// The declared siblings that are absent (nothing at its name beside the root, dropped from the run), by name,
+    /// in declared order ([`presence`]).
+    absent: Vec<String>,
     /// The siblings file's problem, when it has one.
     problem: Option<String>,
     /// How the lines name the siblings file, shown [`escaped`].
@@ -2409,28 +2437,64 @@ impl BuiltHere {
     }
 }
 
-/// The worktree at `place` when `listed` says the routing file lists its repo, with its siblings file read; `Err(None)`
-/// when it does not list it, whose file is then not read at all.
+/// What [`Facts::sibling_folder`] answered for a declared sibling; `None` when it was not asked.
+type FolderAnswer = Option<Result<SiblingFolder, String>>;
+
+/// A declared sibling that is not absent, as the worktree was opened ([`presence`]).
+struct OpenedSibling {
+    /// Its declared name and root.
+    root: SiblingRoot,
+    /// Its position in the siblings file's declared list, absent siblings counted.
+    index: usize,
+    /// What [`Facts::sibling_folder`] answered for it; `None` for a name the builder cannot lay out, which was not
+    /// asked.
+    folder: FolderAnswer,
+}
+
+/// The worktree at `place` when `listed` says the routing file lists its repo, with its siblings file read and each
+/// declared sibling's presence learned ([`presence`]); `Err(None)` when it does not list it, whose file is then not read
+/// at all.
 fn open(place: Place, facts: &dyn Facts, listed: impl FnOnce(&str) -> bool) -> Result<Opened, Here> {
     let repo = repo_name(&place.checkout);
     if !listed(&repo) {
         return Err(None);
     }
     let leaf = split_root(&place.root).2.to_owned();
-    let (siblings, problem) = match facts.siblings(&place) {
+    let (declared, problem) = match facts.siblings(&place) {
         Ok(names) => (sibling_roots(&place.root, names), None),
         Err(problem) => (Vec::new(), Some(problem)),
     };
+    let (siblings, absent) = presence(declared, &leaf, facts);
     let file = escaped(&facts.declaration_said(&place, "siblings.toml"));
     Ok(Opened {
         place,
         repo,
         leaf,
         siblings,
+        absent,
         problem,
         file,
         built_here: BuiltHere::default(),
     })
+}
+
+/// The `declared` siblings split by presence: each whose name the builder can lay out ([`is_layout_name`]) is asked of
+/// [`Facts::sibling_folder`] once, in declared order. One answering missing is absent, by name, unless it is named like
+/// the root's folder `leaf` (ASCII letter case aside), which [`check_leaf`] refuses as for any sibling. Every other
+/// sibling stays, with its declared index and its answer, `None` for a name not asked. With the staying siblings and
+/// the absent names.
+fn presence(declared: Vec<SiblingRoot>, leaf: &str, facts: &dyn Facts) -> (Vec<OpenedSibling>, Vec<String>) {
+    let mut siblings = Vec::with_capacity(declared.len());
+    let mut absent = Vec::new();
+    for (index, root) in declared.into_iter().enumerate() {
+        let folder = is_layout_name(&root.name).then(|| facts.sibling_folder(&root.root));
+        if matches!(folder, Some(Ok(SiblingFolder::Missing))) && !root.name.eq_ignore_ascii_case(leaf) {
+            absent.push(root.name);
+        } else {
+            siblings.push(OpenedSibling { root, index, folder });
+        }
+    }
+    (siblings, absent)
 }
 
 /// `words` rewritten for the builder of the worktree at `place` carrying the siblings `siblings`, each a declared name
@@ -2462,9 +2526,9 @@ fn pick(config: &Config, repo: &str, words: &[String], eligible: impl Fn(&Builde
         .find_map(|(builder, patterns)| first_match(patterns, words).map(|pattern| (builder.clone(), pattern)))
 }
 
-/// The declared siblings as the rewrite reads them: each declared name and its root, borrowed.
-fn declared_pairs(siblings: &[SiblingRoot]) -> impl Iterator<Item = (&str, &str)> {
-    siblings.iter().map(|sibling| (sibling.name.as_str(), sibling.root.as_str()))
+/// The present declared siblings as the rewrite reads them: each declared name and its root, borrowed.
+fn declared_pairs(siblings: &[OpenedSibling]) -> impl Iterator<Item = (&str, &str)> {
+    siblings.iter().map(|sibling| (sibling.root.name.as_str(), sibling.root.root.as_str()))
 }
 
 /// The carried siblings as the rewrite reads them: each declared name and its root, borrowed.
@@ -2479,6 +2543,7 @@ fn settle(config: &Config, opened: Opened, builder: Builder, facts: &dyn Facts) 
         repo,
         leaf,
         siblings,
+        absent,
         problem,
         file,
         ..
@@ -2494,7 +2559,15 @@ fn settle(config: &Config, opened: Opened, builder: Builder, facts: &dyn Facts) 
     let siblings = siblings
         .into_iter()
         .zip(ids)
-        .map(|(SiblingRoot { name, root }, id)| CarriedSibling { name, root, id })
+        .map(
+            |(
+                OpenedSibling {
+                    root: SiblingRoot { name, root },
+                    ..
+                },
+                id,
+            )| CarriedSibling { name, root, id },
+        )
         .collect();
     Ok(Target {
         builder,
@@ -2505,6 +2578,7 @@ fn settle(config: &Config, opened: Opened, builder: Builder, facts: &dyn Facts) 
         leaf,
         root_id,
         siblings,
+        absent_siblings: absent,
     })
 }
 
@@ -2548,18 +2622,19 @@ struct Declared<'a> {
     root: &'a str,
     /// The worktree root's folder name.
     leaf: &'a str,
-    /// The declared siblings, in declared order.
-    siblings: &'a [SiblingRoot],
+    /// The declared siblings that are not absent, in declared order, each with its declared index and folder answer
+    /// ([`Opened::siblings`]).
+    siblings: &'a [OpenedSibling],
 }
 
-/// Keeps a matched command here, saying why, for its siblings, checked in this order: the siblings file's problem,
-/// shown [`escaped`]; a sibling name the builder cannot lay out; a declared sibling `allowed` does not name exactly
+/// Keeps a matched command here, saying why, for its present siblings, checked in this order: the siblings file's
+/// problem, shown [`escaped`]; a sibling name the builder cannot lay out; a sibling `allowed` does not name exactly
 /// (letter case included), or every one when `allowed` is the reason `remote.json`'s `siblings` cannot be used; a root
-/// folder name the builder cannot lay out; a sibling named like that folder (ASCII letter case aside); a sibling with
-/// no git worktree or one refused ([`Facts::sibling_folder`]); a sibling whose folder is the root's or an earlier
-/// sibling's. No sibling is looked for until every name is allowed
-/// and known to be another folder's. With each sibling's folder id, in declared order. The root's own id is read for
-/// every matched command, siblings or none, after the siblings are found ([`Facts::root_id`]): a root whose id cannot be
+/// folder name the builder cannot lay out; a sibling named like that folder (ASCII letter case aside); a sibling
+/// refused, or whose folder could not be read ([`Facts::sibling_folder`]); a sibling whose folder is the root's or an
+/// earlier sibling's. An absent sibling (nothing at its name beside the root, dropped from the run) is none of
+/// these, and needs no consent. With each present sibling's folder id, in declared order. The root's own id is read for
+/// every matched command, siblings or none, after the siblings pass ([`Facts::root_id`]): a root whose id cannot be
 /// read keeps the run here, as its sync-back's lock needs it. With the root's id first.
 fn check_siblings(declared: &Declared<'_>, allowed: Result<&[String], &str>, facts: &dyn Facts) -> Result<(FolderId, Vec<FolderId>), Here> {
     let &Declared {
@@ -2582,7 +2657,7 @@ fn check_siblings(declared: &Declared<'_>, allowed: Result<&[String], &str>, fac
     check_layout_names(siblings, file)?;
     check_consent(siblings, allowed)?;
     check_leaf(siblings, leaf, file)?;
-    let ids = folder_ids(siblings, facts)?;
+    let ids = folder_ids(siblings)?;
     let root_id = root_id()?;
     check_distinct(siblings, &ids, root_id)?;
     Ok((root_id, ids))
@@ -2591,42 +2666,59 @@ fn check_siblings(declared: &Declared<'_>, allowed: Result<&[String], &str>, fac
 /// Keeps the run here for a sibling's name the builder cannot lay out, checked again here whatever the siblings file's
 /// reader checked, so no sibling's root, the root's parent and its name joined, holds a separator or `..`. It reads no
 /// folder and comes before consent, so a bad name is refused as such whatever `remote.json` allows. The line names the
-/// siblings file as `file`.
-fn check_layout_names(siblings: &[SiblingRoot], file: &str) -> Result<(), Here> {
-    if let Some((index, sibling)) = siblings.iter().enumerate().find(|(_, sibling)| !is_layout_name(&sibling.name)) {
+/// siblings file as `file` and the sibling by its index in the declared list, absent siblings counted.
+fn check_layout_names(siblings: &[OpenedSibling], file: &str) -> Result<(), Here> {
+    if let Some(sibling) = siblings.iter().find(|sibling| !is_layout_name(&sibling.root.name)) {
         return Err(Some(LocalReason::SiblingsFile {
             file: file.to_owned(),
-            problem: format!("siblings[{index}] is not a folder name the builder can lay out: {:?}", sibling.name),
+            problem: format!(
+                "siblings[{}] is not a folder name the builder can lay out: {:?}",
+                sibling.index, sibling.root.name
+            ),
         }));
     }
     Ok(())
 }
 
 /// Keeps the run here when the root's folder name `leaf` is no name the builder can lay out, then for a sibling named
-/// like that folder (ASCII letter case aside), the line naming the siblings file as `file`.
-fn check_leaf(siblings: &[SiblingRoot], leaf: &str, file: &str) -> Result<(), Here> {
+/// like that folder (ASCII letter case aside), the line naming the siblings file as `file` and the sibling by its index
+/// in the declared list, absent siblings counted.
+fn check_leaf(siblings: &[OpenedSibling], leaf: &str, file: &str) -> Result<(), Here> {
     if !is_layout_name(leaf) {
         return Err(Some(LocalReason::LeafNotLaidOut { leaf: leaf.to_owned() }));
     }
-    if let Some((index, sibling)) = siblings.iter().enumerate().find(|(_, sibling)| sibling.name.eq_ignore_ascii_case(leaf)) {
+    if let Some(sibling) = siblings.iter().find(|sibling| sibling.root.name.eq_ignore_ascii_case(leaf)) {
         return Err(Some(LocalReason::SiblingsFile {
             file: file.to_owned(),
-            problem: format!("siblings[{index}] is the worktree's own folder: {:?}", sibling.name),
+            problem: format!("siblings[{}] is the worktree's own folder: {:?}", sibling.index, sibling.root.name),
         }));
     }
     Ok(())
 }
 
-/// Each sibling's folder id, in declared order, asked one after another; the first sibling that is missing or refused,
-/// or whose folder cannot be read, keeps the run here, saying so, and no later one is asked.
-fn folder_ids(siblings: &[SiblingRoot], facts: &dyn Facts) -> Result<Vec<FolderId>, Here> {
+/// Each present sibling's folder id, in declared order, from the answer [`open`] kept with each of `siblings`; the
+/// first sibling that is refused, or whose folder could not be read, keeps the run here, saying so. An absent sibling
+/// never reaches here ([`presence`]), nor one with no answer ([`check_layout_names`] refuses it first); either would be
+/// refused as missing.
+fn folder_ids(siblings: &[OpenedSibling]) -> Result<Vec<FolderId>, Here> {
     let mut ids = Vec::with_capacity(siblings.len());
-    for sibling in siblings {
-        let name = sibling.name.clone();
-        match facts.sibling_folder(&sibling.root).map_err(|reason| Some(failed(&reason)))? {
-            SiblingFolder::Missing => return Err(Some(LocalReason::SiblingMissing { name })),
-            SiblingFolder::Refused(reason) => return Err(Some(LocalReason::SiblingRefused { name, reason })),
-            SiblingFolder::Present(id) => ids.push(id),
+    for OpenedSibling { root, folder, .. } in siblings {
+        let name = root.name.clone();
+        match folder {
+            Some(Ok(SiblingFolder::Present(id))) => ids.push(*id),
+            Some(Ok(SiblingFolder::Refused(reason))) => {
+                return Err(Some(LocalReason::SiblingRefused {
+                    name,
+                    reason: reason.clone(),
+                }));
+            }
+            Some(Ok(SiblingFolder::Missing)) | None => {
+                return Err(Some(LocalReason::SiblingRefused {
+                    name,
+                    reason: "is missing".to_owned(),
+                }));
+            }
+            Some(Err(reason)) => return Err(Some(failed(reason))),
         }
     }
     Ok(ids)
@@ -2634,17 +2726,17 @@ fn folder_ids(siblings: &[SiblingRoot], facts: &dyn Facts) -> Result<Vec<FolderI
 
 /// Keeps the run here when a sibling's folder id `ids` holds, in declared order, is the worktree root's `root_id` or an
 /// earlier sibling's: one folder reached by two names.
-fn check_distinct(siblings: &[SiblingRoot], ids: &[FolderId], root_id: FolderId) -> Result<(), Here> {
+fn check_distinct(siblings: &[OpenedSibling], ids: &[FolderId], root_id: FolderId) -> Result<(), Here> {
     for (index, (sibling, id)) in siblings.iter().zip(ids).enumerate() {
         let reason = if *id == root_id {
             "is the worktree's own folder".to_owned()
         } else if let Some(earlier) = ids[..index].iter().position(|other| other == id) {
-            format!("is the same folder as sibling {}", siblings[earlier].name)
+            format!("is the same folder as sibling {}", siblings[earlier].root.name)
         } else {
             continue;
         };
         return Err(Some(LocalReason::SiblingRefused {
-            name: sibling.name.clone(),
+            name: sibling.root.name.clone(),
             reason,
         }));
     }
@@ -2653,15 +2745,15 @@ fn check_distinct(siblings: &[SiblingRoot], ids: &[FolderId], root_id: FolderId)
 
 /// Keeps the run here, naming each declared sibling `allowed` does not name exactly, in declared order; every one when
 /// `allowed` is why `remote.json`'s `siblings` cannot be used, which then allows none.
-fn check_consent(siblings: &[SiblingRoot], allowed: Result<&[String], &str>) -> Result<(), Here> {
+fn check_consent(siblings: &[OpenedSibling], allowed: Result<&[String], &str>) -> Result<(), Here> {
     let (allowed, problem) = match allowed {
         Ok(names) => (names, None),
         Err(problem) => (&[][..], Some(fold_lines(problem))),
     };
     let names: Vec<String> = siblings
         .iter()
-        .filter(|sibling| !allowed.contains(&sibling.name))
-        .map(|sibling| sibling.name.clone())
+        .filter(|sibling| !allowed.contains(&sibling.root.name))
+        .map(|sibling| sibling.root.name.clone())
         .collect();
     if names.is_empty() {
         return Ok(());
@@ -2945,6 +3037,7 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         root_id: target.root_id,
         root: target.place.root,
         siblings: target.siblings,
+        absent_siblings: target.absent_siblings,
         repo: target.repo,
         subfolder,
         pattern,

@@ -1153,16 +1153,35 @@ fn declare_sibling(case: &Case) -> (String, PathBuf) {
 }
 
 #[test]
-fn a_declared_sibling_missing_beside_the_worktree_runs_a_matched_heavy_gate_here_saying_so() {
+fn a_declared_sibling_absent_beside_the_worktree_routes_saying_so() {
     let case = routed_case("routing-sibling-missing");
     let (name, _) = declare_sibling(&case);
-    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "out", "ran here"])));
+    let steps = shown(&stub(&case, &["refuse busy"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "out", "ran here"])));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(
         outcome
             .stderr
-            .contains(&format!("gate: not routed: sibling {name} not found beside the worktree\n")),
+            .contains(&format!("gate: routed without sibling {name}: not beside the worktree\n")),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("not routed"), "{outcome:?}");
+    assert!(outcome.stderr.contains(BUSY_LINE), "the run was routed: {outcome:?}");
+    assert_refused(&events(&case), "busy");
+}
+
+#[test]
+fn a_declared_sibling_folder_with_no_git_keeps_the_run_local_saying_so() {
+    let case = routed_case("routing-sibling-no-git");
+    let (name, beside) = declare_sibling(&case);
+    fs::create_dir_all(&beside).expect("the sibling folder can be made");
+    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "out", "ran here"])));
+    fs::remove_dir_all(&beside).expect("the sibling can be removed");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains(&format!("gate: not routed: sibling {name} has no .git\n")),
         "{outcome:?}"
     );
     assert_local(&events(&case), None);
@@ -1229,20 +1248,21 @@ fn a_siblings_file_in_the_declarations_folder_is_read_when_the_worktree_has_none
     fs::remove_dir_all(case.folder().join(".gate")).expect("the worktree's .gate can be removed");
     let folder = declarations_holding(&case, &[("siblings.toml", &format!("siblings = [\"{name}\"]\n"))]);
     name_declarations(&case, &folder);
-    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "out", "ran here"])));
+    let steps = shown(&stub(&case, &["refuse busy"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "out", "ran here"])));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(
         outcome
             .stderr
-            .contains(&format!("gate: not routed: sibling {name} not found beside the worktree\n")),
+            .contains(&format!("gate: routed without sibling {name}: not beside the worktree\n")),
         "the declared sibling was read: {outcome:?}"
     );
     assert!(!outcome.stderr.contains("read from"), "the line is the log's alone: {outcome:?}");
     let log = log_texts(&case.folder().join("out.log"));
     let read = format!("gate: .gate/siblings.toml read from {}", folder.join("siblings.toml").display());
     assert!(log.lines().any(|line| line == read), "{read}: {log}");
-    assert_local(&events(&case), None);
+    assert_refused(&events(&case), "busy");
 }
 
 #[test]

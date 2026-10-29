@@ -56,6 +56,8 @@ pub(crate) const SIBLING_LINK: &str = "is a link or a junction";
 pub(crate) const SIBLING_NOT_A_FOLDER: &str = "is not a folder";
 /// Why a sibling whose `.git` is a link or a junction is refused, read after its name.
 pub(crate) const SIBLING_GIT_LINK: &str = "has a .git that is a link or a junction";
+/// Why a sibling folder that holds no `.git` is refused, read after its name.
+pub(crate) const SIBLING_NO_GIT: &str = "has no .git";
 /// Why a command that would route runs here when one of its words is not valid Unicode.
 const NOT_UNICODE: &str = "a word of the command is not valid Unicode";
 /// How long a git call of the hint's decision may take while the run still holds its light slot: a call that cannot
@@ -897,21 +899,32 @@ impl<'a> Machine<'a> {
             .collect()
     }
 
-    /// What the change of the worktree at `place`, and of each of `siblings` an entry names, is to the paths its
-    /// `.gate/windows.toml` declares ([`Facts::windows_change`]): untouched with no file or no entry, else the first path
-    /// a declared path matches of the worktree's change, read only when an entry is not a sibling's, then of each named
-    /// sibling's in declared order, its paths prefixed `../{name}/` ([`Machine::touched_in`]). A repo is read only while
-    /// no earlier path is touched. Every git call shares one deadline of [`Machine::change_deadline`].
+    /// What the change of the worktree at `place`, and of each of its present `siblings` an entry names, is to the paths
+    /// its `.gate/windows.toml` declares ([`Facts::windows_change`]): untouched with no file or no entry, else the first
+    /// path a declared path matches of the worktree's change, read only when an entry is not a sibling's, then of each
+    /// named sibling's in declared order, its paths prefixed `../{name}/` ([`Machine::touched_in`]). An entry may name
+    /// an `absent` sibling, whose change is never read, so it matches nothing. A repo is read only while no earlier path
+    /// is touched. Every git call shares one deadline of [`Machine::change_deadline`].
     ///
     /// # Errors
     ///
     /// Why it cannot be told: the file cannot be read or has a problem, git cannot be found, or a repo's change cannot
     /// be read.
-    fn read_change(&self, place: &Place, siblings: &[SiblingRoot], siblings_problem: Option<&str>) -> Result<WindowsChange, String> {
+    fn read_change(
+        &self,
+        place: &Place,
+        siblings: &[SiblingRoot],
+        absent: &[String],
+        siblings_problem: Option<&str>,
+    ) -> Result<WindowsChange, String> {
         let Some(bytes) = self.declaration(place, windows::WINDOWS_NAME)? else {
             return Ok(WindowsChange::Untouched);
         };
-        let names: Vec<&str> = siblings.iter().map(|sibling| sibling.name.as_str()).collect();
+        let names: Vec<&str> = siblings
+            .iter()
+            .map(|sibling| sibling.name.as_str())
+            .chain(absent.iter().map(String::as_str))
+            .collect();
         let declared = siblings_problem.map_or(Ok(names.as_slice()), Err);
         let patterns = windows::read_windows(&bytes, declared)?;
         if patterns.is_empty() {
@@ -1215,9 +1228,9 @@ impl Facts for Machine<'_> {
 
     /// A change that touches a declared path, or cannot be told to, says why in the log ([`Machine::read_change`]).
     /// The hint's machine notes an unknown change apart, which means no hint ([`would_route_on_heavy`]).
-    fn windows_change(&self, place: &Place, siblings: &[SiblingRoot], siblings_problem: Option<&str>) -> WindowsChange {
+    fn windows_change(&self, place: &Place, siblings: &[SiblingRoot], absent: &[String], siblings_problem: Option<&str>) -> WindowsChange {
         let change = self
-            .read_change(place, siblings, siblings_problem)
+            .read_change(place, siblings, absent, siblings_problem)
             .unwrap_or_else(|why| WindowsChange::Unknown { why });
         if matches!(change, WindowsChange::Unknown { .. }) {
             self.change_unknown.set(true);
@@ -1439,9 +1452,9 @@ pub(crate) fn root_id(root: &str) -> Result<FolderId, String> {
 
 /// The folder of the sibling whose root is `root`, the worktree root's parent and the sibling's name: the parent opened
 /// following links, then the name opened inside the folder that handle holds without following a link
-/// ([`gate_win32::open_beneath`]), so it is a direct child of that folder. Missing when nothing has the name or it
-/// holds no `.git`; refused when it is a link or a junction (a name-surrogate reparse point), not a folder, or its
-/// `.git`, a folder or a linked worktree's file, is a link or a junction; else present with its id. Routing and `gate
+/// ([`gate_win32::open_beneath`]), so it is a direct child of that folder. Missing when the parent or anything with the
+/// name is not there; refused when it is a link or a junction (a name-surrogate reparse point), not a folder, holds no
+/// `.git`, or its `.git`, a folder or a linked worktree's file, is a link or a junction; else present with its id. Routing and `gate
 /// check` look for a sibling by this rule.
 ///
 /// # Errors
@@ -1467,7 +1480,7 @@ pub(crate) fn sibling_folder(root: &str) -> Result<SiblingFolder, String> {
         return Ok(SiblingFolder::Refused(SIBLING_NOT_A_FOLDER.to_owned()));
     }
     let Some((_git, git_metadata)) = with_metadata(gate_win32::open_beneath(&folder, ".git", Share::All)).map_err(unreadable)? else {
-        return Ok(SiblingFolder::Missing);
+        return Ok(SiblingFolder::Refused(SIBLING_NO_GIT.to_owned()));
     };
     if git_metadata.file_type().is_symlink() {
         return Ok(SiblingFolder::Refused(SIBLING_GIT_LINK.to_owned()));
@@ -2046,6 +2059,7 @@ mod tests {
                     id,
                 })
                 .collect(),
+            absent_siblings: Vec::new(),
             key: "k".to_owned(),
             inputs: Vec::new(),
         }
@@ -2548,7 +2562,7 @@ mod tests {
 
     /// What the decision's machine reads of the change of the worktree at `root` carrying `siblings`.
     fn change_of(root: &Path, siblings: &[SiblingRoot]) -> WindowsChange {
-        change_machine().windows_change(&place_of(root), siblings, None)
+        change_machine().windows_change(&place_of(root), siblings, &[], None)
     }
 
     /// The decision's machine with its git calls, readers and change deadline under [`git::TEST_HANG_GUARD`], so a read
@@ -2634,7 +2648,7 @@ mod tests {
             listing_cap: 8,
             ..change_machine()
         };
-        let WindowsChange::Unknown { why } = machine.windows_change(&place_of(&root), &[], None) else {
+        let WindowsChange::Unknown { why } = machine.windows_change(&place_of(&root), &[], &[], None) else {
             panic!("a listing past the cap cannot be judged");
         };
         assert!(why.starts_with("git --no-optional-locks ls-files"), "{why}");
@@ -2674,7 +2688,7 @@ mod tests {
         fs::write(root.join(".gate").join("windows.toml"), "paths = ['a/*']\n").expect("the declaration can be written");
         let machine = Machine::hint(None, &seams);
         assert!(matches!(
-            machine.windows_change(&place_of(&root), &[], None),
+            machine.windows_change(&place_of(&root), &[], &[], None),
             WindowsChange::Unknown { .. }
         ));
         assert!(machine.change_unknown.get(), "the hint's decision gives no hint");
@@ -3083,7 +3097,7 @@ mod tests {
         assert_eq!(check("linked"), refused(SIBLING_LINK), "a junction to a real sibling");
         assert_eq!(check("file"), refused(SIBLING_NOT_A_FOLDER), "a file");
         assert_eq!(check("git-linked"), refused(SIBLING_GIT_LINK), "a .git that is a junction");
-        assert_eq!(check("bare"), Ok(SiblingFolder::Missing), "a folder with no .git");
+        assert_eq!(check("bare"), refused("has no .git"), "a folder with no .git");
         assert_eq!(check("gone"), Ok(SiblingFolder::Missing), "nothing");
         assert_eq!(
             sibling_folder(&parent.join("gone").join("b").to_string_lossy()),

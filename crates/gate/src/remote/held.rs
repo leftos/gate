@@ -415,6 +415,7 @@ pub(super) mod tests {
                         id: id_of(&self.folder(name)),
                     })
                     .collect(),
+                absent_siblings: Vec::new(),
                 repo: "app".to_owned(),
                 key: "app-1a2b3c4d".to_owned(),
                 subfolder: String::new(),

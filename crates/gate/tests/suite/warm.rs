@@ -717,13 +717,14 @@ fn allow_sibling(case: &Case, name: &str) {
     write_remote_json(case, &routing.to_string());
 }
 
-/// Starts the warm-up of the case `name` with the cap held and its sibling name allowed in the routing file, waits until
-/// it waits on the cap, runs `meanwhile` on the case, lets the cap go and returns the case, its call path and the
-/// outcome.
-fn waiting_on_the_cap(name: &str, background: bool, meanwhile: impl FnOnce(&Case)) -> (Case, PathBuf, Outcome) {
+/// Starts the warm-up of the case `name` with the cap held and its sibling name allowed in the routing file, after
+/// running `before` on the case, waits until it waits on the cap, runs `meanwhile` on the case, lets the cap go and
+/// returns the case, its call path and the outcome.
+fn waiting_on_the_cap(name: &str, background: bool, before: impl FnOnce(&Case), meanwhile: impl FnOnce(&Case)) -> (Case, PathBuf, Outcome) {
     let case = warm_case(name);
     let (sibling, beside) = sibling_plan(&case);
     allow_sibling(&case, &sibling);
+    before(&case);
     let call = case.folder().join("call.json");
     let cap = held_cap(&case);
     let steps = steps(&case, &[&format!("record {}", shown(&call)), "warmed"]);
@@ -746,11 +747,42 @@ fn waiting_on_the_cap(name: &str, background: bool, meanwhile: impl FnOnce(&Case
 fn a_warm_up_whose_siblings_change_while_it_waits_says_so() {
     for background in [false, true] {
         let name = if background { "warm-siblings-bg" } else { "warm-siblings" };
-        let (case, call, outcome) = waiting_on_the_cap(name, background, |case| {
-            let (sibling, beside) = sibling_plan(case);
-            sibling_folder(&beside);
-            declare_sibling(case, &sibling);
-        });
+        let (case, call, outcome) = waiting_on_the_cap(
+            name,
+            background,
+            |_| {},
+            |case| {
+                let (sibling, beside) = sibling_plan(case);
+                sibling_folder(&beside);
+                declare_sibling(case, &sibling);
+            },
+        );
+
+        let line = format!("gate: warm: the siblings of {} changed while the warm-up waited\n", repo(&case));
+        let expected = if background { (Some(0), String::new()) } else { (Some(2), line) };
+        assert_eq!((outcome.code, outcome.stderr.clone()), expected, "{outcome:?}");
+        assert_eq!(record(&case), None, "the record is deleted");
+        assert!(!call.exists(), "nothing is sent");
+    }
+}
+
+#[test]
+fn a_warm_up_whose_sibling_vanishes_while_it_waits_is_withdrawn() {
+    for background in [false, true] {
+        let name = if background { "warm-sibling-vanish-bg" } else { "warm-sibling-vanish" };
+        let (case, call, outcome) = waiting_on_the_cap(
+            name,
+            background,
+            |case| {
+                let (sibling, beside) = sibling_plan(case);
+                sibling_folder(&beside);
+                declare_sibling(case, &sibling);
+            },
+            |case| {
+                let (_, beside) = sibling_plan(case);
+                fs::remove_dir_all(&beside).expect("the sibling can be removed");
+            },
+        );
 
         let line = format!("gate: warm: the siblings of {} changed while the warm-up waited\n", repo(&case));
         let expected = if background { (Some(0), String::new()) } else { (Some(2), line) };
@@ -764,13 +796,24 @@ fn a_warm_up_whose_siblings_change_while_it_waits_says_so() {
 fn a_warm_up_whose_sibling_check_fails_at_the_recheck_is_refused() {
     for background in [false, true] {
         let name = if background { "warm-sibling-check-bg" } else { "warm-sibling-check" };
-        let (case, call, outcome) = waiting_on_the_cap(name, background, |case| {
-            let (sibling, _) = sibling_plan(case);
-            declare_sibling(case, &sibling);
-        });
+        let (case, call, outcome) = waiting_on_the_cap(
+            name,
+            background,
+            |_| {},
+            |case| {
+                let (sibling, beside) = sibling_plan(case);
+                if fs::symlink_metadata(&beside).is_ok() {
+                    fs::remove_dir(&beside).expect("a junction left by an earlier run can be removed");
+                }
+                let elsewhere = case.folder().join("elsewhere");
+                fs::create_dir_all(elsewhere.join(".git")).expect("the junction's target can be made");
+                junction(&beside, &elsewhere);
+                declare_sibling(case, &sibling);
+            },
+        );
 
         let (sibling, _) = sibling_plan(&case);
-        let line = format!("gate: not routed: sibling {sibling} not found beside the worktree\n");
+        let line = format!("gate: not routed: sibling {sibling} is a link or a junction\n");
         assert_eq!(
             (outcome.code, outcome.stderr.clone()),
             (Some(2), line),

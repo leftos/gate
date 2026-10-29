@@ -85,6 +85,7 @@ fn the_control_command_routes_from_the_root() {
             root_id: fake_id(ROOT),
             leaf: "a".to_owned(),
             siblings: Vec::new(),
+            absent_siblings: Vec::new(),
             repo: "yaat".to_owned(),
             key: work_folder_key(ROOT),
             subfolder: String::new(),
@@ -2542,16 +2543,71 @@ fn a_subst_drive_into_the_worktree_names_a_file_of_the_folder_not_a_program() {
 }
 
 #[test]
-fn a_missing_sibling_keeps_the_run_local_saying_so() {
+fn an_absent_sibling_is_dropped_and_the_run_routes_saying_so() {
     let command = words(&["dotnet", "test"]);
-    let facts = FakeFacts::with_siblings("", &["b", "yaat-server", "c"], &["b"]);
-    let route = decide(&heavy(&command), &facts);
+    let facts = FakeFacts::with_siblings("", &["yaat-server"], &[]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.siblings, Vec::new(), "the absent sibling is not carried");
+    assert_eq!(run.absent_siblings, ["yaat-server"]);
+    assert_eq!(run.lines(), ["gate: routed without sibling yaat-server: not beside the worktree"]);
     assert_eq!(
-        local_line(&route).as_deref(),
-        Some("gate: not routed: sibling yaat-server not found beside the worktree")
+        *facts.presence_asked.borrow(),
+        [sibling_root("yaat-server")],
+        "presence is asked once, as the worktree is opened"
+    );
+    assert_eq!(head_asks(&facts), 1, "HEAD is asked once for the routed run");
+}
+
+#[test]
+fn a_present_and_an_absent_sibling_carry_the_present_one() {
+    let command = words(&["dotnet", "test"]);
+    let facts = FakeFacts::with_siblings("", &["b", "yaat-server"], &["b"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.siblings, [carried("b")]);
+    assert_eq!(run.absent_siblings, ["yaat-server"]);
+    assert_eq!(
+        run.lines(),
+        [
+            format!("gate: routed with siblings: b ({})", sibling_root("b")),
+            "gate: routed without sibling yaat-server: not beside the worktree".to_owned(),
+        ]
     );
     assert_eq!(*facts.presence_asked.borrow(), [sibling_root("b"), sibling_root("yaat-server")]);
-    assert_eq!(head_asks(&facts), 0, "HEAD is not asked for a command that runs here");
+}
+
+#[test]
+fn two_absent_siblings_are_named_in_one_line() {
+    let facts = FakeFacts::with_siblings("", &["yaat-server", "b"], &[]);
+    let run = routed(decide(&heavy(&words(&["dotnet", "test"])), &facts));
+    assert_eq!(run.siblings, Vec::new());
+    assert_eq!(run.absent_siblings, ["yaat-server", "b"]);
+    assert_eq!(
+        run.lines(),
+        ["gate: routed without siblings yaat-server, b: not beside the worktree"],
+        "named in declared order"
+    );
+}
+
+#[test]
+fn a_word_into_an_absent_sibling_is_outside() {
+    let facts = FakeFacts::with_siblings("", &["yaat-server"], &[]);
+    let route = decide(&heavy(&words(&["dotnet", "test", r"..\yaat-server\x"])), &facts);
+    assert_eq!(
+        local_line(&route).as_deref(),
+        Some(r"gate: not routed: ..\yaat-server\x is outside the worktree")
+    );
+    assert_eq!(facts.siblings_read.get(), 1, "the declaration is read once");
+}
+
+#[test]
+fn an_absent_sibling_needs_no_consent() {
+    let facts = FakeFacts {
+        present: Vec::new(),
+        ..consenting(None, &["yaat-server"])
+    };
+    let run = routed(decide(&heavy(&words(&["dotnet", "test"])), &facts));
+    assert_eq!(run.siblings, Vec::new());
+    assert_eq!(run.absent_siblings, ["yaat-server"], "routed though remote.json allows no sibling");
 }
 
 #[test]
@@ -2585,7 +2641,7 @@ fn a_leaf_that_cannot_be_laid_out_keeps_a_run_with_siblings_local() {
             folder: root.to_owned(),
         })),
         siblings: Ok(words(names)),
-        present: vec!["X:/dev/yaat.wt/b".to_owned()],
+        present: names.iter().map(|name| gate_router::sibling_root(root, name)).collect(),
         ..FakeFacts::at_root()
     };
     for (root, leaf) in [
@@ -2698,7 +2754,12 @@ fn only_the_siblings_the_routing_file_allows_are_carried() {
     ] {
         let facts = consenting(siblings, declared);
         assert_eq!(local_line(&decide(&heavy(&command), &facts)).as_deref(), Some(line), "{case}");
-        assert!(facts.presence_asked.borrow().is_empty(), "{case}: no sibling is looked for");
+        let roots: Vec<String> = declared.iter().map(|name| sibling_root(name)).collect();
+        assert_eq!(
+            *facts.presence_asked.borrow(),
+            roots,
+            "{case}: each declared sibling is looked for once, as the worktree is opened"
+        );
         assert_eq!(facts.siblings_read.get(), 1, "{case}");
     }
     let facts = consenting(Some(r#"{"YAAT": ["yaat-server", "b", "c"]}"#), &["b"]);
@@ -2720,7 +2781,11 @@ fn a_declared_name_that_is_no_folder_name_never_reaches_the_folder_check() {
             )),
             "{name:?} keeps the run here, saying why, whatever remote.json allows"
         );
-        assert!(facts.presence_asked.borrow().is_empty(), "{name:?}: no folder is looked for");
+        assert_eq!(
+            *facts.presence_asked.borrow(),
+            [sibling_root("b")],
+            "{name:?}: no folder is looked for under that name"
+        );
     }
 }
 
@@ -2810,17 +2875,19 @@ fn an_unmatched_command_says_nothing_of_the_siblings() {
     let unmatched = words(&["node", "x"]);
     let missing = FakeFacts::with_siblings("", &["yaat-server"], &[]);
     assert_eq!(decide(&heavy(&unmatched), &missing), SILENT, "a missing sibling");
-    assert!(missing.presence_asked.borrow().is_empty(), "no sibling is looked for");
+    assert_eq!(
+        *missing.presence_asked.borrow(),
+        [sibling_root("yaat-server")],
+        "presence is asked as the worktree is opened, and nothing is said of it"
+    );
     let unreadable = broken();
     assert_eq!(decide(&heavy(&unmatched), &unreadable), SILENT, "a broken file");
     assert_eq!(unreadable.siblings_read.get(), 1, "the file is read once all the same");
 
     let matched = words(&["dotnet", "test"]);
     let missing = FakeFacts::with_siblings("", &["yaat-server"], &[]);
-    assert_eq!(
-        local_line(&decide(&heavy(&matched), &missing)).as_deref(),
-        Some("gate: not routed: sibling yaat-server not found beside the worktree")
-    );
+    let run = routed(decide(&heavy(&matched), &missing));
+    assert_eq!(run.lines(), ["gate: routed without sibling yaat-server: not beside the worktree"]);
     assert_eq!(
         local_line(&decide(&heavy(&matched), &broken())).as_deref(),
         Some("gate: not routed: .gate/siblings.toml: line 1, column 13: invalid array")
@@ -2835,7 +2902,33 @@ fn a_sibling_named_like_the_worktree_keeps_the_run_local_saying_so() {
         local_line(&route).as_deref(),
         Some("gate: not routed: .gate/siblings.toml: siblings[1] is the worktree's own folder: \"A\"")
     );
-    assert!(facts.presence_asked.borrow().is_empty(), "no sibling is looked for");
+    assert_eq!(
+        *facts.presence_asked.borrow(),
+        [sibling_root("b"), sibling_root("A")],
+        "each declared sibling is looked for once, as the worktree is opened"
+    );
+}
+
+#[test]
+fn a_leaf_named_sibling_after_an_absent_one_names_its_own_index() {
+    let facts = FakeFacts::with_siblings("", &["gone", "A"], &["A"]);
+    let route = decide(&heavy(&words(&["dotnet", "test"])), &facts);
+    assert_eq!(
+        local_line(&route).as_deref(),
+        Some("gate: not routed: .gate/siblings.toml: siblings[1] is the worktree's own folder: \"A\""),
+        "the index is the sibling's place in the declared list, the absent one counted"
+    );
+}
+
+#[test]
+fn a_bad_layout_name_after_an_absent_one_names_its_own_index() {
+    let facts = FakeFacts::with_siblings("", &["gone", "a/b"], &[]);
+    let route = decide(&heavy(&words(&["dotnet", "test"])), &facts);
+    assert_eq!(
+        local_line(&route).as_deref(),
+        Some("gate: not routed: .gate/siblings.toml: siblings[1] is not a folder name the builder can lay out: \"a/b\""),
+        "the index is the sibling's place in the declared list, the absent one counted"
+    );
 }
 
 #[test]
@@ -2912,14 +3005,18 @@ fn checked(folders: Vec<(String, Result<SiblingFolder, String>)>) -> FakeFacts {
 }
 
 #[test]
-fn a_refused_sibling_folder_keeps_the_run_local_and_asks_no_later_one() {
+fn a_refused_sibling_folder_keeps_the_run_local() {
     let refused = checked(vec![(
         sibling_root("c"),
         Ok(SiblingFolder::Refused("is a link or a junction".to_owned())),
     )]);
     let route = decide(&heavy(&words(&["dotnet", "test"])), &refused);
     assert_eq!(local_line(&route).as_deref(), Some("gate: not routed: sibling c is a link or a junction"));
-    assert_eq!(*refused.presence_asked.borrow(), [sibling_root("b"), sibling_root("c")]);
+    assert_eq!(
+        *refused.presence_asked.borrow(),
+        [sibling_root("b"), sibling_root("c"), sibling_root("yaat-server")],
+        "each declared sibling is looked for once, as the worktree is opened"
+    );
 }
 
 #[test]
@@ -2934,7 +3031,11 @@ fn a_sibling_folder_that_cannot_be_read_keeps_the_run_local_saying_what() {
         Some("gate: not routed: cannot read the sibling folder X:/dev/yaat.wt/c: access denied (os error 5)"),
         "never routed with the second sibling dropped"
     );
-    assert_eq!(*unreadable.presence_asked.borrow(), [sibling_root("b"), sibling_root("c")]);
+    assert_eq!(
+        *unreadable.presence_asked.borrow(),
+        [sibling_root("b"), sibling_root("c"), sibling_root("yaat-server")],
+        "each declared sibling is looked for once, as the worktree is opened"
+    );
     let no_root = FakeFacts {
         root_id: Err("cannot read the worktree folder's id: access denied".to_owned()),
         ..checked(Vec::new())
@@ -3190,7 +3291,11 @@ fn a_declared_local_pattern_wins_over_a_desktop_match_and_sibling_problems() {
         ..local_facts(&["dotnet test*"])
     };
     assert_eq!(local_line(&decide(&heavy(&words(&["dotnet", "test"])), &missing)).as_deref(), line);
-    assert!(missing.presence_asked.borrow().is_empty(), "no sibling is looked for");
+    assert_eq!(
+        *missing.presence_asked.borrow(),
+        [sibling_root("b")],
+        "the sibling is looked for once, as the worktree is opened"
+    );
     let failing = FakeFacts {
         local: Err("bad".to_owned()),
         siblings: Err("worse".to_owned()),
@@ -4078,6 +4183,27 @@ fn a_mac_only_builder_with_a_refused_sibling_and_no_windows_file_says_the_siblin
     assert_eq!(facts.windows_change_asked.get(), 0, "no .gate/windows.toml is read for it");
 }
 
+#[test]
+fn an_absent_sibling_on_a_macos_pick_is_handed_to_the_change_read_as_absent() {
+    let config = Config::parse(&format!(
+        r#"{{"host": "builder-1", "repos": {{"other": ["*"]}}, "builders": {MAC_THEN_WINDOWS_DOTNET}}}"#
+    ))
+    .expect("usable");
+    let facts = FakeFacts {
+        siblings: Ok(words(&["b"])),
+        windows_change: WindowsChange::Untouched,
+        ..FakeFacts::with_config(config)
+    };
+    let run = routed(decide(&heavy(&words(&["dotnet", "build", "tests/X"])), &facts));
+    assert_eq!(run.builder.alias, "mac-1", "an untouched change keeps the Mac");
+    assert_eq!(run.absent_siblings, ["b"]);
+    assert_eq!(
+        *facts.windows_change_named.borrow(),
+        [(Vec::<String>::new(), vec!["b".to_owned()])],
+        "the absent name is handed as absent, never as a sibling git reads"
+    );
+}
+
 /// A gate at the root whose change is `change` to `.gate/windows.toml`'s paths, under a routing file whose `host`
 /// lists `yaat` as `host_repos` says, with the `builders` entries `builders`.
 fn windows_change_facts(host_repos: &str, builders: &str, change: WindowsChange) -> FakeFacts {
@@ -4421,6 +4547,7 @@ fn a_file_without_builders_gives_the_target_it_always_gave() {
             leaf: "a".to_owned(),
             root_id: fake_id(ROOT),
             siblings: Vec::new(),
+            absent_siblings: Vec::new(),
             key: work_folder_key(ROOT),
             inputs: Vec::new(),
         })

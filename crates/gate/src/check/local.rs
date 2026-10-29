@@ -652,11 +652,11 @@ fn sdk_list(root: &Path, limit: Duration, drain: Duration) -> Result<Vec<String>
     Ok(gate_wire::sdk_versions(&listing).into_iter().map(str::to_owned).collect())
 }
 
-/// Each sibling `<root>\.gate\siblings.toml` declares, checked in routing's order: one `allowed` does not name is not
-/// allowed (all are when `allowed` is `None`), one named like the root's folder (ASCII letter case aside) is refused,
-/// and only the rest are looked for beside the worktree root `root`; and whether that file is there but cannot be read
-/// whole. Every problem of the file is added to `problems` ([`read_siblings_file`]), and the names that read are still
-/// checked.
+/// Each sibling `<root>\.gate\siblings.toml` declares, checked in routing's order: one `allowed` does not allow is not
+/// allowed unless it is absent, which needs no consent (all are when `allowed` is `None`), one named like the root's
+/// folder (ASCII letter case aside) is refused, and only the rest are looked for beside the worktree root `root`; and
+/// whether that file is there but cannot be read whole. Every problem of the file is added to `problems`
+/// ([`read_siblings_file`]), and the names that read are still checked.
 fn read_siblings(root: &str, allowed: Option<&[String]>, declarations: &mut Declarations, problems: &mut Vec<Problem>) -> (Vec<Sibling>, bool) {
     let file = read_siblings_file(Path::new(root), declarations, problems);
     let leaf = root_leaf(root);
@@ -665,10 +665,15 @@ fn read_siblings(root: &str, allowed: Option<&[String]>, declarations: &mut Decl
         .into_iter()
         .map(|name| {
             if !allowed.is_none_or(|allowed| allowed.contains(&name)) {
-                Sibling {
-                    path: sibling_root(root, &name),
-                    name,
-                    found: Found::NotAllowed,
+                let found = sibling(root, name);
+                if matches!(&found.found, Found::Folder(Ok(SiblingFolder::Missing))) {
+                    found
+                } else {
+                    Sibling {
+                        path: found.path,
+                        name: found.name,
+                        found: Found::NotAllowed,
+                    }
                 }
             } else if name.eq_ignore_ascii_case(leaf) {
                 Sibling {
@@ -1032,21 +1037,26 @@ mod tests {
         let parent = Folder::new("sibling-beside");
         let root = parent.path().join("app");
         fs::create_dir_all(root.join(".gate")).expect("the root can be made");
-        write(&root.join(".gate").join("siblings.toml"), "siblings = ['here', 'gone', '..']\n");
+        write(&root.join(".gate").join("siblings.toml"), "siblings = ['here', 'nogit', 'gone', '..']\n");
         fs::create_dir_all(parent.path().join("here").join(".git")).expect("the sibling's git can be made");
-        fs::create_dir_all(parent.path().join("gone")).expect("a folder with no git can be made");
+        fs::create_dir_all(parent.path().join("nogit")).expect("a folder with no git can be made");
 
         let mut problems = Vec::new();
         let (found, unreadable) = read_siblings(&root.to_string_lossy(), None, &mut no_declarations(), &mut problems);
         assert!(!unreadable, "the siblings file reads");
 
         let seen: Vec<(&str, bool)> = found.iter().map(|sibling| (sibling.name.as_str(), present(sibling))).collect();
-        assert_eq!(seen, [("here", true), ("gone", false)]);
-        assert_eq!(found[1].found, Found::Folder(Ok(SiblingFolder::Missing)));
+        assert_eq!(seen, [("here", true), ("nogit", false), ("gone", false)]);
+        assert_eq!(
+            found[1].found,
+            Found::Folder(Ok(SiblingFolder::Refused("has no .git".to_owned()))),
+            "a folder with no .git is refused, not absent"
+        );
+        assert_eq!(found[2].found, Found::Folder(Ok(SiblingFolder::Missing)), "nothing at the name");
         assert_eq!(found[0].path, format!("{}\\here", parent.text()));
         let texts: Vec<&str> = problems.iter().map(|problem| problem.text.as_str()).collect();
         assert_eq!(texts.len(), 1, "the bad name is a problem and the rest are looked for: {texts:?}");
-        assert!(texts[0].starts_with("siblings[2] is not a folder name"), "{texts:?}");
+        assert!(texts[0].starts_with("siblings[3] is not a folder name"), "{texts:?}");
     }
 
     #[test]
@@ -1075,6 +1085,9 @@ mod tests {
         let root = parent.path().join("app");
         fs::create_dir_all(root.join(".gate")).expect("the root can be made");
         write(&root.join(".gate").join("siblings.toml"), "siblings = ['here', 'Other', 'gone']\n");
+        for name in ["here", "Other", "gone"] {
+            fs::create_dir_all(parent.path().join(name).join(".git")).expect("each sibling's git can be made");
+        }
         let root = root.to_string_lossy();
         let allowed = |list: Option<&[String]>| -> Vec<bool> {
             read_siblings(&root, list, &mut no_declarations(), &mut Vec::new())
@@ -1091,6 +1104,18 @@ mod tests {
         );
         assert_eq!(allowed(Some(&[])), [false, false, false], "an empty list");
         assert_eq!(allowed(None), [true, true, true], "no consent asked");
+    }
+
+    #[test]
+    fn an_absent_sibling_needs_no_consent() {
+        let parent = Folder::new("sibling-absent");
+        let root = parent.path().join("app");
+        fs::create_dir_all(root.join(".gate")).expect("the root can be made");
+        write(&root.join(".gate").join("siblings.toml"), "siblings = ['gone']\n");
+
+        let (found, _) = read_siblings(&root.to_string_lossy(), Some(&[]), &mut no_declarations(), &mut Vec::new());
+
+        assert_eq!(found[0].found, Found::Folder(Ok(SiblingFolder::Missing)), "absent needs no consent");
     }
 
     /// Whether the folder check found `sibling` present.

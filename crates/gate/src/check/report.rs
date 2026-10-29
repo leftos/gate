@@ -652,7 +652,8 @@ fn builder_sdks(have: &[String]) -> String {
     }
 }
 
-/// The line of a declared sibling; a refused one worded as routing words it, `sibling {name} {reason}`.
+/// The line of a declared sibling; a refused one worded as routing words it, `sibling {name} {reason}`, and an absent one
+/// informs only, as a routed run goes without it.
 fn sibling_item(sibling: &Sibling) -> Item {
     let Sibling { name, path, found } = sibling;
     let folder = match found {
@@ -662,11 +663,7 @@ fn sibling_item(sibling: &Sibling) -> Item {
     match folder {
         Ok(SiblingFolder::Present(_)) => Item::new(format!("sibling {name} ok ({path})"), Kind::Ok),
         Ok(SiblingFolder::Refused(reason)) => Item::new(format!("sibling {name} {reason}"), Kind::Missing),
-        Ok(SiblingFolder::Missing) => Item::hinted(
-            format!("sibling {name} missing (no git worktree at {path})"),
-            Kind::Missing,
-            Some((format!("sibling {name}"), format!("clone it to {path}"))),
-        ),
+        Ok(SiblingFolder::Missing) => Item::new(format!("sibling {name} absent (routed runs go without it; {path})"), Kind::Unchecked),
         Err(why) => Item::new(format!("sibling {name} skipped: {}", escaped(why)), Kind::Skipped),
     }
 }
@@ -970,8 +967,13 @@ mod tests {
         };
         assert_eq!(
             summary(&with_others),
-            "check: here: could not read .gate/toolchain.toml; 1 missing, 0 too old, 1 skipped",
+            "check: here: could not read .gate/toolchain.toml; 0 missing, 0 too old, 1 skipped",
             "the rest is still checked"
+        );
+        assert!(
+            body(&with_others).contains(&"check: here: sibling b absent (routed runs go without it; X:/dev/b)".to_owned()),
+            "the absent sibling still informs: {:?}",
+            body(&with_others)
         );
     }
 
@@ -1141,7 +1143,7 @@ mod tests {
         assert_eq!(said(HERE, &checked(Vec::new())).status, 0);
         assert_eq!(said(HERE, &checked(vec![tool("pnpm", None, Probed::Missing)])).status, 1);
         assert_eq!(said(HERE, &checked(vec![tool("node", Some("24"), found("23.9.9"))])).status, 1);
-        let sibling_missing = Checked {
+        let sibling_absent = Checked {
             siblings: vec![Sibling {
                 name: "b".to_owned(),
                 path: "X:/dev/b".to_owned(),
@@ -1149,7 +1151,7 @@ mod tests {
             }],
             ..checked(Vec::new())
         };
-        assert_eq!(said(HERE, &sibling_missing).status, 1);
+        assert_eq!(said(HERE, &sibling_absent).status, 0, "an absent sibling is not missing");
         let sdk_missing = Checked {
             sdk: Some(Sdk::Checked {
                 version: "10.0.401".to_owned(),
@@ -1209,16 +1211,15 @@ mod tests {
                 "check: here: .NET SDK 10.0.401 (rollForward patch) missing (this PC has 10.0.300, 8.0.404)",
                 "check: here: workloads wasm-tools, maui not checked yet",
                 "check: here: sibling yaat-server ok (X:/dev/yaat-server)",
-                "check: here: sibling b missing (no git worktree at X:/dev/b)",
+                "check: here: sibling b absent (routed runs go without it; X:/dev/b)",
                 "check: here: sibling c skipped: cannot read the sibling folder X:/dev/c: access denied",
                 "check: here: sibling d is a link or a junction",
                 "check: here: sibling e not allowed in remote.json",
                 "install: here: node: winget install OpenJS.NodeJS",
                 "install: here: .NET SDK: winget install Microsoft.DotNet.SDK.10",
-                "install: here: sibling b: clone it to X:/dev/b",
             ]
         );
-        assert_eq!(summary(&checked), "check: here: 5 missing, 0 too old, 1 skipped");
+        assert_eq!(summary(&checked), "check: here: 4 missing, 0 too old, 1 skipped");
     }
 
     #[test]

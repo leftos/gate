@@ -449,9 +449,8 @@ fn check_an_unreadable_manifest_exits_1_and_says_so() {
     assert_eq!(
         lines(&outcome.stdout)[1..],
         [
-            format!("check: here: sibling docs missing (no git worktree at {parent}/docs)"),
-            format!("install: here: sibling docs: clone it to {parent}/docs"),
-            "check: here: could not read .gate/toolchain.toml; 1 missing, 0 too old".to_owned(),
+            format!("check: here: sibling docs absent (routed runs go without it; {parent}/docs)"),
+            "check: here: could not read .gate/toolchain.toml; 0 missing, 0 too old".to_owned(),
         ],
         "{outcome:?}"
     );
@@ -712,8 +711,8 @@ fn check_a_hanging_probe_is_skipped_and_exits_0() {
 }
 
 #[test]
-fn check_lists_a_missing_sibling() {
-    let case = repo_case("check_missing_sibling");
+fn check_reports_an_absent_sibling_without_counting_it() {
+    let case = repo_case("check_absent_sibling");
     write(&case, ".gate/siblings.toml", "siblings = ['server', 'docs']\n");
     fs::create_dir_all(case.folder().join("server").join(".git")).expect("the present sibling's git can be made");
     let stub = stubs(&case, &[]);
@@ -727,13 +726,12 @@ fn check_lists_a_missing_sibling() {
         [
             "check: here: app declares no toolchain".to_owned(),
             format!("check: here: sibling server ok ({parent}/server)"),
-            format!("check: here: sibling docs missing (no git worktree at {parent}/docs)"),
-            format!("install: here: sibling docs: clone it to {parent}/docs"),
-            "check: here: 1 missing, 0 too old".to_owned(),
+            format!("check: here: sibling docs absent (routed runs go without it; {parent}/docs)"),
+            "check: here: nothing missing".to_owned(),
         ],
         "{outcome:?}"
     );
-    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
 }
 
 /// A routing file whose `siblings` value cannot be used says why on a line of its own, counted missing, and allows no
@@ -747,13 +745,15 @@ fn check_a_bad_siblings_value_in_the_routing_file_says_why() {
 
     let outcome = check(&case, &[stub], &[]);
 
+    let root = root(&case);
+    let parent = root.rsplit_once('/').map_or("", |(parent, _)| parent);
     assert_eq!(
         lines(&outcome.stdout)[1..],
         [
-            "check: here: app declares no toolchain",
-            r#"check: here: remote.json: siblings."app"[1] is not a non-empty string"#,
-            "check: here: sibling b not allowed in remote.json",
-            "check: here: 2 missing, 0 too old",
+            "check: here: app declares no toolchain".to_owned(),
+            r#"check: here: remote.json: siblings."app"[1] is not a non-empty string"#.to_owned(),
+            format!("check: here: sibling b absent (routed runs go without it; {parent}/b)"),
+            "check: here: 1 missing, 0 too old".to_owned(),
         ],
         "{outcome:?}"
     );

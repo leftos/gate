@@ -28,7 +28,7 @@ A command run from one worktree that names a path in another worktree of a liste
 
 A command whose word names an existing gitignored project input (a project, solution, `.targets`, `.props`, `.rsp` or `.runsettings` file, or a dotnet folder whose project files are all ignored) that no `inputs` glob covers routes and carries those files to the builder as inputs, with no `inputs` entry needed.
 
-A command whose files hold more than 64 MiB or 2000 files, that runs in a sibling pair, or whose files cannot be sent stays local, saying `gate: not routed: <path> is gitignored ...` with the reason, and is journalled `notRouted: gitignored input` ([design.md, Routing](design.md#routing)).
+A command whose files hold more than 64 MiB or 2000 files, that runs in a sibling pair (a run carrying siblings; declared siblings that are all absent make a single repo), or whose files cannot be sent stays local, saying `gate: not routed: <path> is gitignored ...` with the reason, and is journalled `notRouted: gitignored input` ([design.md, Routing](design.md#routing)).
 
 ## Adding a repo
 
@@ -188,7 +188,7 @@ A repo that wants such a script on the Mac only while no Windows-only project is
 
 A root entry matches only the worktree's own paths, and a sibling's paths match only the entries starting `../<sibling>/`.
 
-A project of a declared sibling is written `../<sibling>/<path>/*`, the sibling being one `.gate/siblings.toml` declares: all three of yaat's Windows-only test projects live in its sibling yaat-server, so yaat lists each project's tool and test folders there: `../yaat-server/tools/Yaat.CrcDriverHook/*`, `../yaat-server/tests/Yaat.CrcDriverHook.Tests/*`, and the same two for `Yaat.ClientDriver.Mcp` and `Yaat.CrcProbeHook`.
+A project of a declared sibling (present or not) is written `../<sibling>/<path>/*`, the sibling being one `.gate/siblings.toml` declares: all three of yaat's Windows-only test projects live in its sibling yaat-server, so yaat lists each project's tool and test folders there: `../yaat-server/tools/Yaat.CrcDriverHook/*`, `../yaat-server/tests/Yaat.CrcDriverHook.Tests/*`, and the same two for `Yaat.ClientDriver.Mcp` and `Yaat.CrcProbeHook`.
 
 No consent in `remote.json` is needed, since the file only keeps runs off the Mac.
 
@@ -200,7 +200,9 @@ The change is what differs from the merge-base of `HEAD` with `refs/remotes/orig
 
 A clone without either ref, a detached `HEAD`, a shallow clone, a merge-base git cannot find, a git call that fails or does not answer in time (10 s in all) or a changed path that is not valid UTF-8 cannot be told, so the run goes to Windows.
 
-A declared sibling that is a link or junction, has no folder or no `.git`, is not allowed in `remote.json` or is the worktree's own folder is checked before any git runs, and steers nothing: the run stays here with the sibling's own reason, `gate: not routed: sibling <name> is a link or a junction`, and a `--builder` pin to the Mac is refused with `gate: --builder <builder> cannot route this run: sibling <name> is a link or a junction`.
+A declared sibling with nothing at its name beside the root is absent: the run routes without it, an entry naming it reads as untouched, and no git runs in it.
+
+A present sibling that is a link or junction, is a folder with no `.git`, is not allowed in `remote.json` or is the worktree's own folder is checked before any git runs, and steers nothing: the run stays here with the sibling's own reason, `gate: not routed: sibling <name> is a link or a junction`, and a `--builder` pin to the Mac is refused with `gate: --builder <builder> cannot route this run: sibling <name> is a link or a junction`.
 
 A `.gate/windows.toml` with a problem (an entry naming a sibling but no path in it, for one) also sends the run to Windows, and the log names the problem. The main repo's change is read only when some entry is not a `../<sibling>/` one, and git runs without taking `.git/index.lock`. A repo with no file, or with `paths = []`, asks no git. The file may sit in the declarations folder; `gate check` does not report it ([design.md](design.md#routing), Windows paths).
 
