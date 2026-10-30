@@ -23,6 +23,7 @@
 ## Local gate
 
 - [ ] GATE-652 Refuse a gate.exe built with its test seams at install
+- [ ] GATE-960 Take Ctrl+C when the gate's starter turned it off
 - [ ] GATE-678 Make pause suite cases fail at once when the gate they wait on exits
 - [ ] GATE-805 Smoke-test a gate install from Git Bash and pwsh, rolling back on failure
 - [ ] GATE-756 Make a light run's load adjustment see contention below saturation
@@ -322,6 +323,13 @@
 - [ ] GATE-951 Say the tailscale-path-not-read line only when the read is truly late, not after every routed run
 - [ ] GATE-953 Cut the pair sync-back's chain of about 45 serial git calls on the builder
 - [ ] GATE-955 Read the durations store once per routing decision, not twice for a light run
+- [ ] GATE-964 Keep a PC-changed output's path from tripping the failure-marker scan on a passing routed run
+- [ ] GATE-965 Clear or replace stale refs/remotes/origin refs in a builder work repo
+- [ ] GATE-966 Set refs/remotes/origin/HEAD in a builder work repo when the PC sends a base
+- [ ] GATE-967 Resolve a repo's default branch in one place for routing and change detection
+- [ ] GATE-968 Delete a key's refs in one git call per bare on the Unix box's keyed prune
+- [ ] GATE-969 Skip history refs for a partial clone in the routed push
+- [ ] GATE-970 Pin a routed run's origin default branch to the base its own push sent
 
 ## Cutover sweep
 
