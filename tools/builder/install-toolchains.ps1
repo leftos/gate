@@ -603,6 +603,27 @@ Invoke-Step 'Godot 4.7.2 mono' {
     }
     Add-BuilderWriteDeny $godotRoot
 }
+# Godot falls back to its Dummy audio driver when no audio render endpoint is active, and the builder's sound cards have
+# nothing plugged in, so a routed Godot run would hear nothing. VB-CABLE adds a virtual render endpoint that is active
+# whatever is plugged in. VB-Audio publishes no checksum: this is the pack's SHA-256 as first fetched for this step.
+Invoke-Step 'VB-CABLE 45 virtual audio output' {
+    if (Get-CimInstance Win32_SoundDevice | Where-Object Name -Like 'VB-Audio*') { Write-InstallLog 'VB-CABLE: already installed'; return }
+    $sha = 'B950E39F01AF1D04EA623C8F6D8EB9B6EA5C477C637295FABF20631C85116BFB'
+    $f = Get-File 'https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip'
+    $got = (Get-FileHash -Path $f -Algorithm SHA256).Hash
+    if ($got -ne $sha) { throw "VBCABLE_Driver_Pack45.zip SHA-256 is $got, expected $sha" }
+    $tmp = Join-Path $dl 'vbcable-extract'
+    Expand-Archive -Path $f -DestinationPath $tmp -Force
+    # The setup has no documented exit codes and may wait on a dialog nobody sees, so the device decides, not its status.
+    $setup = Start-Process -FilePath (Join-Path $tmp 'VBCABLE_Setup_x64.exe') -ArgumentList '-i', '-h' -PassThru
+    if (-not $setup.WaitForExit(300000)) { $setup.Kill(); throw 'VBCABLE_Setup_x64.exe -i -h did not finish in 300 s' }
+    Restart-Service AudioEndpointBuilder -Force
+    Restart-Service Audiosrv -Force
+    Remove-Item $tmp -Recurse -Force
+    if (-not (Get-CimInstance Win32_SoundDevice | Where-Object Name -Like 'VB-Audio*')) {
+        throw "VBCABLE_Setup_x64.exe exited $($setup.ExitCode) and no VB-Audio sound device is present"
+    }
+}
 Invoke-Step 'FFmpeg 9.0.2' {
     $sha = '759D0A9831C436A0EB331AD36F236C06CB04AAA0005DA46571F0E9D3D9206F6B'
     $f = Get-File 'https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-full_build.zip'
