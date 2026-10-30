@@ -4634,6 +4634,7 @@ The rules behind the desktop run (GATE-231) that a later change to the helper, t
 
 - Everything goes through the box's own job handle, so the session does not matter: `gate box stop` opens the job by name from session 0, where the box created it; the kill, the ceiling's accounting, the heartbeat, the leftovers sweep (with no donor to spare), the client-gone path and the panic stopper all use it.
 - The box never calls `IRunningTask::Stop` or `IRegisteredTask::Stop` after adoption, and the task is never registered with `StopExisting`: the Task Scheduler's job sits above the box's, and stopping the instance may end it. A lingering helper is ended with `TerminateProcess` only.
+- A gate the desktop command starts is in-box the same way ([Critical drain and nesting](#critical-drain-and-nesting)): the command is a member of the run's job, which the desktop hand-off made and `GATE_BOX_JOB` names. So a caller's whole script with its own inner gates routes as one desktop run, and the inner gates run without slots, in parallel.
 
 **The desktop lock.**
 

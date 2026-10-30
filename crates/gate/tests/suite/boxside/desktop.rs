@@ -13,9 +13,10 @@ use serde_json::{Value, json};
 
 use super::ReadBack;
 use super::{
-    BoxCall, ENGINE_ENV_NAME, GIT_BIN_STAND_IN, QUIET_CLIENT_GONE_GUARD, STALE_ENGINE_ENV, adjusted_seconds, bare_box_call, box_call, ended_within,
-    engine_env, fake_godot, fake_unreal, field, gate_box, godot_root, let_go, lines_starting, pair_payload, pair_snapshot, path_for_run, path_godot,
-    payload as request_line, refused_line, run_box, snapshot, started_line, stopped_line_for, unreal_root,
+    BoxCall, ENGINE_ENV_NAME, GIT_BIN_STAND_IN, IN_BOX_LINE, QUIET_CLIENT_GONE_GUARD, STALE_ENGINE_ENV, adjusted_seconds, assert_took_no_slot,
+    bare_box_call, box_call, ended_within, engine_env, fake_godot, fake_unreal, field, gate_box, godot_root, inner_gate, let_go, lines_starting,
+    owned, pair_payload, pair_snapshot, path_for_run, path_godot, payload as request_line, refused_line, run_box, snapshot, started_line,
+    stopped_line_for, unreal_root,
 };
 use crate::support::{
     Case, FAKE_TOOL, HeldDesktop, KeptDesktop, Outcome, box_payload, build_version, copy_tool, desktop_payload, desktop_seams, junction, shown,
@@ -261,6 +262,38 @@ fn a_desktop_run_passes_the_commands_status_and_output() {
     assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
     assert!(outcome.stderr.lines().any(|line| line == "e"), "the command's stderr: {outcome:?}");
     ran_its_command(&outcome, &payload);
+}
+
+/// A gate the desktop helper's command starts runs inside the run's job as an in-box gate does in a plain run: it
+/// takes no slot, says so, and never tries to route. It skips in session 0, as a builder's ssh logon runs the suite:
+/// there the helper's command cannot open `WinSta0\Default`, and a gate, which loads user32, fails to start.
+#[test]
+#[expect(clippy::print_stderr, reason = "a case this machine cannot test says so in its output")]
+fn a_gate_started_inside_a_desktop_run_takes_no_slot() {
+    if gate_win32::own_session().is_ok_and(|session| session == 0) {
+        eprintln!("skipped: the suite runs in session 0, where the helper's command cannot load user32");
+        return;
+    }
+    let case = Case::new("desktop_inner_gate");
+    let words = inner_gate(&case, "inner", "heavy", "120", &owned(&[FAKE_TOOL, "out", "inner ran"]));
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let payload = ready_payload(&case, &words);
+
+    let outcome = handed_off(&case, &payload, "ok");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    ran_its_command(&outcome, &payload);
+    let said = format!("{}{}", outcome.stdout, outcome.stderr);
+    assert!(
+        said.lines().any(|line| line == "inner ran"),
+        "the inner gate ran its command: {outcome:?}"
+    );
+    assert!(said.lines().any(|line| line == IN_BOX_LINE), "{outcome:?}");
+    assert!(
+        !said.lines().any(|line| line.starts_with("gate: not routed")),
+        "the inner gate stays here silently: {outcome:?}"
+    );
+    assert_took_no_slot(&case, "inner");
 }
 
 /// Whether the input desktop, as the suite reads it in its own process, is `Default`: an unreadable one is not, as the

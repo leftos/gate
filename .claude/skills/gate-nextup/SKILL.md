@@ -98,6 +98,8 @@ The machine-alone cases also include `remote_inputs::a_put_whose_box_works_silen
 
 `boxside::box_run_lets_an_elevated_session_s_inner_gate_judge_the_box_job` needs an elevated session on a builder: run it by hand over plain ssh with `--run-ignored only`, after a push of the build that carries it.
 
+`boxside::desktop::a_gate_started_inside_a_desktop_run_takes_no_slot` skips in session 0, so every routed run skips it: when a diff touches the desktop hand-off or nesting, run it here with `-Local -Reason "the desktop inner-gate case needs an interactive session"`.
+
 That case proves "not stalled" inside a short window, with an escapee that runs at BelowNormal and can be starved into a false STALLED. When the diff touches the watchdog, also run `-Slot critical -Reason "the watchdog timing case" -TimeoutSeconds 600 -- cargo nextest run -p gate --all-features --cargo-profile test-release --run-ignored only -E 'binary(suite)'`.
 
 `stall::a_stall_kill_ends_a_packaged_app_the_command_started` is machine-dependent: it runs only where the first `pwsh` on PATH is the Store (WindowsApps) alias, and skips on this PC once the Store pwsh is removed. To drive it, run it through `gate.exe` directly with the alias first on PATH.
