@@ -8563,13 +8563,26 @@ fn worktree_text(case: &Case, name: &str) -> String {
     fs::read_to_string(case.folder().join(name)).expect("the worktree file is there")
 }
 
-/// Asserts an install that refused, `outcome`, saying `reason`: a passing run becomes 1, the PC's `bin/both.txt` keeps
-/// `kept`, `bin/new.txt`, which the archive held after it, is not moved, the archive and the stage are removed, and the
-/// marker stays.
-fn assert_refused_install(case: &Case, outcome: &Outcome, reason: &str, kept: &str) {
-    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
+/// The line saying a passing run whose only refused outputs the PC changed ends 0 with nothing brought back.
+const PC_CHANGES_KEPT: &str =
+    "gate: the command passed; none of its outputs were brought back, since the PC changed the files named above during the run";
+
+/// Asserts an install refused only because the PC changed its own file, `outcome`, saying `reason`: the passing run
+/// stays 0 and says the summary line after the reason, the PC's `bin/both.txt` keeps `kept`, `bin/new.txt`, which the
+/// archive held after it, is not moved, the archive and the stage are removed, and the marker stays.
+fn assert_pc_copies_kept(case: &Case, outcome: &Outcome, reason: &str, kept: &str) {
+    assert_eq!(
+        outcome.code,
+        Some(0),
+        "a passing run whose only refusals are PC changes stays 0: {outcome:?}"
+    );
     let line = format!("gate: remote outputs not brought back: {reason}");
-    assert!(outcome.stderr.contains(&line), "{outcome:?}");
+    let said = outcome.stderr.lines().position(|said| said == line);
+    let kept_at = outcome.stderr.lines().position(|said| said == PC_CHANGES_KEPT);
+    assert!(
+        matches!((said, kept_at), (Some(said), Some(kept_at)) if kept_at > said),
+        "the reason is said, then the summary line: {outcome:?}"
+    );
     assert_eq!(worktree_text(case, r"bin\both.txt"), kept);
     assert!(!case.folder().join("bin").join("new.txt").exists(), "nothing is moved: {outcome:?}");
     assert_eq!(outputs_leftovers(case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
@@ -8593,7 +8606,7 @@ fn a_pc_output_edited_during_the_run_is_not_overwritten() {
 
     let outcome = run.finish();
 
-    assert_refused_install(&case, &outcome, "bin/both.txt changed during the run", "edited during the run");
+    assert_pc_copies_kept(&case, &outcome, "bin/both.txt changed during the run", "edited during the run");
 }
 
 /// The PC's `bin/both.txt` is rewritten while the run call is held with the bytes the builder writes, as a local build of
@@ -8678,18 +8691,23 @@ fn every_pc_output_changed_during_the_run_is_named() {
 
     let outcome = run.finish();
 
-    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
-    let refusals: Vec<&str> = outcome
-        .stderr
-        .lines()
-        .filter(|line| line.starts_with("gate: remote outputs not brought back:"))
-        .collect();
     assert_eq!(
-        refusals,
-        [
+        outcome.code,
+        Some(0),
+        "a passing run whose only refusals are PC changes stays 0: {outcome:?}"
+    );
+    let lines: Vec<&str> = outcome.stderr.lines().collect();
+    let first = lines
+        .iter()
+        .position(|line| line.starts_with("gate: remote outputs not brought back:"))
+        .expect("the refusals are said");
+    assert_eq!(
+        &lines[first..first + 3],
+        &[
             "gate: remote outputs not brought back: bin/both.txt changed during the run",
             "gate: remote outputs not brought back: bin/new.txt changed during the run",
-        ],
+            PC_CHANGES_KEPT,
+        ][..],
         "{outcome:?}"
     );
     assert_eq!(worktree_text(&case, r"bin\both.txt"), "edited during the run");

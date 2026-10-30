@@ -67,6 +67,10 @@ pub(super) const MB: f64 = 1024.0 * 1024.0;
 const INSTALL: &str = "install";
 /// The most members whose PC files changed during the run a refusal names, one line each; the rest are counted.
 const CHANGED_NAMED: usize = 10;
+/// The line ending a passing run's outputs install refused only because the PC changed its own copies: the install is
+/// all or nothing, so none of the outputs came back, and the run's own status stands.
+const PC_CHANGES_KEPT: &str =
+    "gate: the command passed; none of its outputs were brought back, since the PC changed the files named above during the run";
 
 /// What the install of a fetched archive needs: the archive, the stage folder beside it, the pending marker (`None` for
 /// a withheld run whose send of the PC's build landed, which records none), the PC's manifest and the run's output
@@ -197,16 +201,19 @@ struct Refused {
     kind: Kind,
 }
 
-/// Whether a refusal would happen again for the same archive. The archive's own members and the run's globs decide one
-/// of the first kind, which leaves the pending marker cleared: a later run of the worktree would refetch everything only
-/// to refuse again, so it is left to send its normal manifest. Any other refusal keeps the marker, since the next fetch
-/// may succeed.
+/// Whether a refusal would happen again for the same archive. The archive's own members and the run's globs decide the
+/// first kind, which leaves the pending marker cleared: a later run of the worktree would refetch everything only to
+/// refuse again, so it is left to send its normal manifest. Any other refusal keeps the marker, since the next fetch may
+/// succeed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     /// The archive's own entries and the globs decide it.
     Deterministic,
     /// Anything else: a refetch may clear it.
     Transient,
+    /// Only members whose PC file changed during the run: the PC's copies are kept, so a passing run's outputs install
+    /// ends 0 on it, and, like [`Kind::Transient`], it keeps the pending marker, since a refetch may clear it.
+    PcChanged,
 }
 
 impl Refused {
@@ -228,17 +235,15 @@ impl Refused {
 
     /// The refusal of the members whose PC files changed during the run or could not be checked, `found` holding why for
     /// each, in archive order: the first [`CHANGED_NAMED`] of them, then one counting the rest when there are more. The
-    /// PC's own worktree decides it, so a refetch may clear it ([`Refused::transient`]).
-    fn changed(mut found: Vec<String>) -> Refused {
+    /// PC's own worktree decides it, so a refetch may clear either kind: [`Kind::PcChanged`] when every reason is a PC
+    /// file that changed during the run, [`Kind::Transient`] when one is instead not a file or cannot be read.
+    fn changed(mut found: Vec<String>, kind: Kind) -> Refused {
         let more = found.len().saturating_sub(CHANGED_NAMED);
         found.truncate(CHANGED_NAMED);
         if more > 0 {
             found.push(format!("{more} more files changed during the run"));
         }
-        Refused {
-            reasons: found,
-            kind: Kind::Transient,
-        }
+        Refused { reasons: found, kind }
     }
 }
 
@@ -265,6 +270,9 @@ enum Unmoved {
     Interrupted { done: usize },
     /// Why a file failed, and how many were moved before it.
     Failed(String),
+    /// The PC's file of a member changed during the run before any file was moved, which [`install`] refuses of the kind
+    /// a passing run's outputs install ends 0 on ([`Kind::PcChanged`]), naming the member.
+    PcChanged(String),
 }
 
 /// A PC root as the install pairs it with its box tree: read against the working directory, with `\` separators. The
@@ -277,10 +285,11 @@ pub(super) fn pc_spelling(root: &str) -> io::Result<PathBuf> {
 /// line and ends 0, clearing the pending marker unless it skipped a file that keeps it ([`Skip::keeps_marker`]): one git
 /// tracks, one in use or read-only, which it says ([`said`]).
 /// A refusal says why the outputs were not brought back and ends the run 1, clearing the marker when a refetch of the
-/// same archive would be refused the same way ([`Kind`]); a Ctrl+C ends it as an interrupt, saying how many files were
-/// installed when any were ([`ending`]). Every end removes the archive and the stage folder this run made, never one
-/// that was there before, saying a removal that fails; only a success that skipped nothing keeps the hashes of the files
-/// it put in place ([`cached`]), which no other end does.
+/// same archive would be refused the same way ([`Kind`]), but one refused only because the PC changed its own copies
+/// leaves a passing run's outputs install 0, keeping those copies ([`Kind::PcChanged`]); a Ctrl+C ends it as an
+/// interrupt, saying how many files were installed when any were ([`ending`]). Every end removes the archive and the
+/// stage folder this run made, never one that was there before, saying a removal that fails; only a success that
+/// skipped nothing keeps the hashes of the files it put in place ([`cached`]), which no other end does.
 /// With the end, whether the install was complete ([`Installed::complete`]): a success whose skips are all ones a
 /// refetch of the same outputs would clear, and so the one whose files the hash cache may keep, and which records this
 /// run's builder as the work folder's last complete outputs pull ([`outputs::recorded`]) before clearing the marker.
@@ -343,17 +352,24 @@ pub(super) fn installed(attempt: &mut Attempt<'_, '_>, fetched: &Fetched<'_>) ->
 
 /// The end of an install of what `bringing` names that did not complete as `unmet` says, and the lines it says: one for
 /// each reason of a refusal, and for a Ctrl+C one count of the files installed before it, `0 of {total}` when it moved
-/// none, so the install's start line always has an end.
+/// none, so the install's start line always has an end. A refusal whose every reason is a PC file changed during the run
+/// ([`Kind::PcChanged`]) ends a passing run's outputs 0, its reasons followed by [`PC_CHANGES_KEPT`]; every other one
+/// ends the run 1.
 fn ending(bringing: Bringing, unmet: Unmet) -> (End, Vec<String>) {
     match unmet {
         Unmet::Interrupted { done, total } => {
             let reason = format!("{done} of {total} files were installed before the interrupt");
             (End::Interrupted, vec![outputs::not_brought_back(bringing, &reason)])
         }
-        Unmet::Refused(refused) => (
-            End::Status(1),
-            refused.reasons.iter().map(|reason| outputs::not_brought_back(bringing, reason)).collect(),
-        ),
+        Unmet::Refused(refused) => {
+            let mut lines: Vec<String> = refused.reasons.iter().map(|reason| outputs::not_brought_back(bringing, reason)).collect();
+            if refused.kind == Kind::PcChanged && bringing == Bringing::Outputs {
+                lines.push(PC_CHANGES_KEPT.to_owned());
+                (End::Status(0), lines)
+            } else {
+                (End::Status(1), lines)
+            }
+        }
     }
 }
 
@@ -426,6 +442,10 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
     .map_err(|unmoved| match unmoved {
         Unmoved::Interrupted { done } => Unmet::Interrupted { done, total },
         Unmoved::Failed(reason) => transient(reason),
+        Unmoved::PcChanged(reason) => Unmet::Refused(Refused {
+            reasons: vec![reason],
+            kind: Kind::PcChanged,
+        }),
     })?;
     skipped.extend(moves.in_use.into_iter().map(|path| (path, Skip::InUse)));
     let moved = moves.moved;
@@ -701,7 +721,9 @@ struct Checked {
 /// one unchanged since `manifest` or in place, a root-recording one whose PC file changed counted so ([`pc_file`]); else
 /// the refusal. The one kind a refetch of the same archive would be refused for again is a member outside the globs
 /// ([`Refused::deterministic`]); the PC's own worktree decides the rest. Every member whose PC file changed otherwise,
-/// is not a file or cannot be read is collected, in archive order, and all are refused together ([`Refused::changed`]).
+/// was deleted during the run, is not a file or cannot be read is collected, in archive order, and all are refused
+/// together ([`Refused::changed`]), of the kind [`Kind::PcChanged`] when every one of them is a PC file that changed
+/// during the run and [`Kind::Transient`] when one was deleted, is not a file or cannot be read.
 /// What the checks found ([`Checked`]).
 fn checked(root: &Path, entries: &[Entry], globs: &Globs, manifest: &Manifest) -> Result<Checked, Refused> {
     if let Some(outside) = entries.iter().find(|entry| !globs.matches(&entry.path)) {
@@ -712,16 +734,28 @@ fn checked(root: &Path, entries: &[Entry], globs: &Globs, manifest: &Manifest) -
     }
     let mut checks = Checked::default();
     let mut found = Vec::new();
+    let mut kind = Kind::PcChanged;
     for entry in entries {
         match pc_file(root, entry, manifest) {
             Ok(Pc::AsHeld) if !writable(root, entry) => checks.in_use.push(entry.path.clone()),
             Ok(Pc::AsHeld) => {}
             Ok(Pc::InPlace) => checks.in_place.push(entry.path.clone()),
             Ok(Pc::Changed) => found.push(format!("{} changed during the run", entry.path)),
-            Err(why) => found.push(why),
+            Ok(Pc::Deleted) => {
+                kind = Kind::Transient;
+                found.push(format!("{} was deleted during the run", entry.path));
+            }
+            Err(why) => {
+                kind = Kind::Transient;
+                found.push(why);
+            }
         }
     }
-    if found.is_empty() { Ok(checks) } else { Err(Refused::changed(found)) }
+    if found.is_empty() {
+        Ok(checks)
+    } else {
+        Err(Refused::changed(found, kind))
+    }
 }
 
 /// What the PC's file of a member is, set against the manifest the run sent.
@@ -737,6 +771,8 @@ enum Pc {
     InPlace,
     /// Changed during the run otherwise.
     Changed,
+    /// The manifest held it and the PC deleted it during the run, as a clean does.
+    Deleted,
 }
 
 /// What the PC's file of `entry` below `root` is against `manifest` ([`Pc`]); else why it cannot be told, which names a
@@ -754,6 +790,7 @@ fn pc_file(root: &Path, entry: &Entry, manifest: &Manifest) -> Result<Pc, String
         (Some(held), Some(stamp)) if held.stamp == stamp => Pc::AsHeld,
         (None, None) => Pc::AsHeld,
         (Some(_), None) if records_a_root(&entry.path) => Pc::AsHeld,
+        (Some(_), None) => Pc::Deleted,
         (_, Some(_)) if records_a_root(&entry.path) => Pc::InPlace,
         (_, Some(stamp)) if holds_the_member(&target, entry, stamp.size) => Pc::InPlace,
         _ => Pc::Changed,
@@ -998,8 +1035,9 @@ struct Moves {
 /// Moves each of `entries` from `stage` into place below `root`, as [`move_one`] does against `manifest`, each file moved
 /// taking as its last write the `snapshot` time, or this PC's clock as the moves begin when that is earlier, asking
 /// `go_on`, given the files moved so far, before each one; else the interrupt once `go_on` says no, or why a file
-/// failed, the files handled before it counted and left in place. What the moves did ([`Moves`]); a member left in place
-/// ([`Placed::InPlace`]) is in neither list.
+/// failed, the files handled before it counted and left in place. A member whose PC file changed after the checks
+/// ([`Placed::Changed`]) ends them as [`Unmoved::PcChanged`] when none was moved yet, and as the failure naming it
+/// otherwise. What the moves did ([`Moves`]); a member left in place ([`Placed::InPlace`]) is in neither list.
 fn moved(
     (stage, root): (&Path, &Path),
     entries: &[Entry],
@@ -1023,6 +1061,17 @@ fn moved(
             Placed::Moved(stamp) => moves.moved.push(Moved { entry: entry.clone(), stamp }),
             Placed::InPlace => {}
             Placed::InUse => moves.in_use.push(entry.path.clone()),
+            Placed::Changed if moves.moved.is_empty() => {
+                return Err(Unmoved::PcChanged(format!("{} changed during the run", entry.path)));
+            }
+            Placed::Changed => {
+                // The text a failure has always had: the files handled before this one are counted as installed.
+                let reason = format!(
+                    "{done} of {total} files were installed before {} failed: {} changed during the run",
+                    entry.path, entry.path
+                );
+                return Err(Unmoved::Failed(reason));
+            }
         }
     }
     Ok(moves)
@@ -1039,13 +1088,16 @@ enum Placed {
     /// Not moved: something holds its PC file open against the rename ([`held_open`], [`held_against_replacing`]),
     /// whatever the member.
     InUse,
+    /// Not moved: the PC's file changed during the run after the checks ([`Pc::Changed`]).
+    Changed,
 }
 
 /// Moves the staged file of `entry` below `stage` to the same path below `root`, replacing a file there, each folder
 /// between `root` and it made when missing and refused when it is a link, a junction or not a folder. Its last write is
 /// set to `stamped` in the stage, before the move, whatever the box wrote; the PC's file is then checked against `manifest`
 /// once more ([`pc_file`]), just before the move, and one in place is left ([`Placed::InPlace`]): one already holding the
-/// member's bytes, or one recording a root that a PC writer changed or made. Any member whose rename is refused because
+/// member's bytes, or one recording a root that a PC writer changed or made. One that changed is [`Placed::Changed`], and
+/// one the PC deleted during the run is the failure saying so. Any member whose rename is refused because
 /// something holds a file open ([`held_open`]) is not moved when its PC file is the one held, as it is when that file
 /// cannot be opened for deletion ([`held_against_replacing`]) ([`Placed::InUse`]); else the rename is tried once more,
 /// and its error, a held staged file's included, is the failure. Any other rename error is the failure at once.
@@ -1069,12 +1121,14 @@ fn move_one(stage: &Path, root: &Path, entry: &Entry, manifest: &Manifest, stamp
         .access_mode(FILE_WRITE_ATTRIBUTES)
         .open(&source)?
         .set_modified(stamped)?;
-    // A file refused here was checked before the moves; one that changed in between is the reason said, of the kind a
-    // refetch may clear ([`Refused::transient`]), and one in place is left as it is.
+    // A file refused here was checked before the moves; one that changed in between is [`Placed::Changed`], which ends a
+    // run whose moves began with none as the checks' own refusal did, one deleted in between is the failure saying so,
+    // and one in place is left as it is.
     match pc_file(root, entry, manifest).map_err(io::Error::other)? {
         Pc::AsHeld => {}
         Pc::InPlace => return Ok(Placed::InPlace),
-        Pc::Changed => return Err(io::Error::other(format!("{path} changed during the run"))),
+        Pc::Changed => return Ok(Placed::Changed),
+        Pc::Deleted => return Err(io::Error::other(format!("{path} was deleted during the run"))),
     }
     // Its attributes alone, every sharing given: the handle neither refuses the move nor any other opener.
     let handle = OpenOptions::new()
@@ -1165,8 +1219,8 @@ mod tests {
 
     use super::outputs::Narrowed;
     use super::{
-        Bringing, Checked, Index, Installed, Moved, Moves, Refused, Skip, Unmet, Unmoved, Unrewritable, cached, checked, ending, install_start_line,
-        moved, own_logs, reasons, rewritten, said, stage_made, success_line, tracked, unmet_of, unpacked,
+        Bringing, Checked, Index, Installed, Kind as RefusalKind, Moved, Moves, Refused, Skip, Unmet, Unmoved, Unrewritable, cached, checked, ending,
+        install_start_line, moved, own_logs, reasons, rewritten, said, stage_made, success_line, tracked, unmet_of, unpacked,
     };
     use crate::boxside::outputs::OUTPUTS_BUDGET;
     use crate::outputs::archive::{Entry, PcFiles, UnpackError, pack};
@@ -1181,6 +1235,9 @@ mod tests {
 
     const BOX_WORK: &str = r"D:\gate-remote\work\app-1a2b3c4d";
     const PC_ROOT: &str = r"C:\src\app";
+    /// The line ending a passing run's outputs install that was refused only because the PC changed its own copies.
+    const KEPT_AS_THE_PC_HAS_THEM: &str =
+        "gate: the command passed; none of its outputs were brought back, since the PC changed the files named above during the run";
 
     /// The trees of a run of one repo: the box's work folder, rewritten to the worktree's root.
     fn one_tree() -> Vec<(String, String)> {
@@ -1426,7 +1483,8 @@ mod tests {
 
         for path in ["bin/size.dll", "bin/time.dll", "bin/new.dll"] {
             let refused = checked(&root, &[entry(path)], &bin_globs(), &manifest);
-            assert_eq!(refused, Err(Refused::transient(format!("{path} changed during the run"))), "{path}");
+            let changed = Refused::changed(vec![format!("{path} changed during the run")], RefusalKind::PcChanged);
+            assert_eq!(refused, Err(changed), "{path}");
         }
         fs::create_dir_all(root.join("bin").join("folder.dll")).expect("a folder in a file's place");
         let folder = checked(&root, &[entry("bin/folder.dll")], &bin_globs(), &manifest);
@@ -1435,6 +1493,24 @@ mod tests {
             checked(&root, &[entry("bin/same.dll"), entry("bin/absent.dll")], &bin_globs(), &manifest),
             Ok(Checked::default())
         );
+    }
+
+    /// A member the manifest held whose PC file the PC deleted during the run is refused as one a refetch may not clear,
+    /// so a passing run still ends 1: the PC has no copy of it at all.
+    #[test]
+    fn a_pc_output_deleted_during_the_run_is_refused_and_keeps_a_passing_run_1() {
+        let root = scratch("deleted");
+        let gone = put(&root, "bin/gone.dll", b"abc");
+        let manifest = manifest_of(&root, &["bin/gone.dll"]);
+        fs::remove_file(&gone).expect("the file can be removed");
+
+        let refused = checked(&root, &[entry("bin/gone.dll")], &bin_globs(), &manifest).expect_err("the file is gone");
+        let expected = Refused::changed(vec!["bin/gone.dll was deleted during the run".to_owned()], RefusalKind::Transient);
+        assert_eq!(refused, expected);
+
+        let (end, lines) = ending(Bringing::Outputs, Unmet::Refused(refused));
+        assert!(matches!(end, End::Status(1)), "{end:?}");
+        assert_eq!(lines, ["gate: remote outputs not brought back: bin/gone.dll was deleted during the run"]);
     }
 
     #[test]
@@ -1983,7 +2059,7 @@ mod tests {
     fn failure(unmoved: Unmoved) -> String {
         match unmoved {
             Unmoved::Failed(reason) => reason,
-            other @ Unmoved::Interrupted { .. } => format!("{other:?}"),
+            other => format!("{other:?}"),
         }
     }
 
@@ -2602,6 +2678,49 @@ mod tests {
     }
 
     #[test]
+    fn a_pc_file_changed_before_the_first_move_ends_like_one_the_checks_found() {
+        let folder = scratch("move-changed-first");
+        let (stage, root) = (folder.join("stage"), folder.join("root"));
+        put(&stage, "bin/a.txt", b"box");
+        let pc = put(&root, "bin/a.txt", b"pc");
+        let manifest = manifest_of(&root, &["bin/a.txt"]);
+        let entries = [entry("bin/a.txt")];
+
+        let unmoved = moved((&stage, &root), &entries, &manifest, an_hour_ago(), |done| {
+            if done == 0 {
+                fs::write(&pc, b"edited after the checks").expect("the file can be written");
+            }
+            true
+        });
+
+        assert_eq!(unmoved, Err(Unmoved::PcChanged("bin/a.txt changed during the run".to_owned())));
+        assert_eq!(fs::read_to_string(&pc).expect("a stays"), "edited after the checks");
+    }
+
+    #[test]
+    fn a_pc_file_changed_after_only_in_place_members_ends_like_one_the_checks_found() {
+        let folder = scratch("move-changed-after-in-place");
+        let (stage, root) = (folder.join("stage"), folder.join("root"));
+        put(&stage, "bin/.msCoverageSourceRootsMapping_X", b"box");
+        put(&stage, "bin/b.txt", b"box");
+        let roots = put(&root, "bin/.msCoverageSourceRootsMapping_X", b"pc");
+        let pc = put(&root, "bin/b.txt", b"pc");
+        let manifest = manifest_of(&root, &["bin/.msCoverageSourceRootsMapping_X", "bin/b.txt"]);
+        fs::write(&roots, b"the PC writer's roots").expect("the file can be written");
+        let entries = [member("bin/.msCoverageSourceRootsMapping_X", b"box"), entry("bin/b.txt")];
+
+        let unmoved = moved((&stage, &root), &entries, &manifest, an_hour_ago(), |done| {
+            if done == 1 {
+                fs::write(&pc, b"edited after the checks").expect("the file can be written");
+            }
+            true
+        });
+
+        assert_eq!(unmoved, Err(Unmoved::PcChanged("bin/b.txt changed during the run".to_owned())));
+        assert_eq!(fs::read_to_string(&pc).expect("b stays"), "edited after the checks");
+    }
+
+    #[test]
     fn a_pc_file_rewritten_with_the_member_s_bytes_after_the_checks_is_left_in_place() {
         let folder = scratch("move-same-bytes");
         let (stage, root) = (folder.join("stage"), folder.join("root"));
@@ -2727,7 +2846,8 @@ mod tests {
         let held = fs::OpenOptions::new().read(true).share_mode(0).open(&both).expect("the file can be held");
         let changed_first = checked(&root, &[entry("bin/both.dll")], &bin_globs(), &manifest);
         drop(held);
-        assert_eq!(changed_first, Err(Refused::transient("bin/both.dll changed during the run".to_owned())));
+        let changed = Refused::changed(vec!["bin/both.dll changed during the run".to_owned()], RefusalKind::PcChanged);
+        assert_eq!(changed_first, Err(changed));
     }
 
     #[test]
@@ -2746,12 +2866,13 @@ mod tests {
         let refused = checked(&root, &entries, &bin_globs(), &manifest).expect_err("every file changed");
         let (end, lines) = ending(Bringing::Outputs, Unmet::Refused(refused));
 
-        assert!(matches!(end, End::Status(1)), "{end:?}");
+        assert!(matches!(end, End::Status(0)), "only PC changes end a passing run 0: {end:?}");
         let mut expected: Vec<String> = paths[..10]
             .iter()
             .map(|path| format!("gate: remote outputs not brought back: {path} changed during the run"))
             .collect();
         expected.push("gate: remote outputs not brought back: 2 more files changed during the run".to_owned());
+        expected.push(KEPT_AS_THE_PC_HAS_THEM.to_owned());
         assert_eq!(lines, expected);
     }
 
@@ -2771,10 +2892,11 @@ mod tests {
         let refused = checked(&root, &entries, &bin_globs(), &manifest).expect_err("every file changed");
         let (_, lines) = ending(Bringing::Outputs, Unmet::Refused(refused));
 
-        let expected: Vec<String> = paths
+        let mut expected: Vec<String> = paths
             .iter()
             .map(|path| format!("gate: remote outputs not brought back: {path} changed during the run"))
             .collect();
+        expected.push(KEPT_AS_THE_PC_HAS_THEM.to_owned());
         assert_eq!(lines, expected);
     }
 
@@ -2802,6 +2924,67 @@ mod tests {
         );
     }
 
+    /// A refusal whose every reason is a PC file changed during the run ends a passing run's outputs 0, saying so after
+    /// the reasons.
+    #[test]
+    fn a_refusal_of_only_pc_changed_outputs_ends_a_passing_run_0() {
+        let refused = Refused::changed(
+            vec![
+                "bin/a.dll changed during the run".to_owned(),
+                "bin/b.dll changed during the run".to_owned(),
+            ],
+            RefusalKind::PcChanged,
+        );
+
+        let (end, lines) = ending(Bringing::Outputs, Unmet::Refused(refused));
+
+        assert!(matches!(end, End::Status(0)), "{end:?}");
+        assert_eq!(
+            lines,
+            [
+                "gate: remote outputs not brought back: bin/a.dll changed during the run",
+                "gate: remote outputs not brought back: bin/b.dll changed during the run",
+                KEPT_AS_THE_PC_HAS_THEM,
+            ]
+        );
+    }
+
+    /// A failed run's reports refused for the PC's changes keep the run's own status, 1, and say nothing of a pass.
+    #[test]
+    fn a_failed_run_s_reports_refused_for_pc_changes_still_end_1() {
+        let refused = Refused::changed(vec!["bin/a.dll changed during the run".to_owned()], RefusalKind::PcChanged);
+
+        let (end, lines) = ending(Bringing::Reports(Narrowed::TestReports), Unmet::Refused(refused));
+
+        assert!(matches!(end, End::Status(1)), "{end:?}");
+        assert_eq!(
+            lines,
+            ["gate: the failed run's test reports not brought back: bin/a.dll changed during the run"]
+        );
+    }
+
+    /// A PC file changed beside one that is not a file leaves the refusal one a refetch may not clear, so a passing run
+    /// still ends 1.
+    #[test]
+    fn a_pc_change_beside_a_file_that_is_not_a_file_is_still_refused() {
+        let root = scratch("changed-and-folder-mixed");
+        put(&root, "bin/a.dll", b"abc");
+        let manifest = manifest_of(&root, &["bin/a.dll"]);
+        put(&root, "bin/a.dll", b"abcd");
+        fs::create_dir_all(root.join("bin").join("b.dll")).expect("a folder in a file's place");
+        let entries = [entry("bin/a.dll"), entry("bin/b.dll")];
+
+        let refused = checked(&root, &entries, &bin_globs(), &manifest).expect_err("a member has no file to be");
+        assert_eq!(refused.kind, RefusalKind::Transient);
+        assert_eq!(
+            refused.reasons,
+            ["bin/a.dll changed during the run".to_owned(), "bin/b.dll is not a file".to_owned()]
+        );
+
+        let (end, _) = ending(Bringing::Outputs, Unmet::Refused(refused));
+        assert!(matches!(end, End::Status(1)), "{end:?}");
+    }
+
     #[test]
     fn a_pc_file_of_the_member_s_size_counts_in_place_only_with_the_member_s_bytes() {
         let root = scratch("same-size");
@@ -2812,7 +2995,8 @@ mod tests {
         put(&root, "bin/same.dll", b"box");
 
         let other = checked(&root, &[member("bin/other.dll", b"box")], &bin_globs(), &manifest);
-        assert_eq!(other, Err(Refused::transient("bin/other.dll changed during the run")));
+        let changed = Refused::changed(vec!["bin/other.dll changed during the run".to_owned()], RefusalKind::PcChanged);
+        assert_eq!(other, Err(changed));
         let same = checked(&root, &[member("bin/same.dll", b"box")], &bin_globs(), &manifest);
         let in_place = Checked {
             in_use: Vec::new(),
@@ -2876,7 +3060,8 @@ mod tests {
 
         assert_eq!(checked(&root, &roots, &bin_globs(), &manifest), Ok(Checked::default()));
         let other = checked(&root, &[member("bin/gone.dll", b"box")], &bin_globs(), &manifest);
-        assert_eq!(other, Err(Refused::transient("bin/gone.dll changed during the run")));
+        let deleted = Refused::changed(vec!["bin/gone.dll was deleted during the run".to_owned()], RefusalKind::Transient);
+        assert_eq!(other, Err(deleted));
     }
 
     #[test]
@@ -3034,22 +3219,27 @@ mod tests {
     fn a_failed_move_counts_a_member_left_in_place_among_the_files_before_it() {
         let folder = scratch("move-count");
         let (stage, root) = (folder.join("stage"), folder.join("root"));
+        put(&stage, "bin/a.txt", b"box");
         put(&stage, "bin/.msCoverageSourceRootsMapping_X", b"box");
         put(&stage, "bin/b.txt", b"box");
         let roots = put(&root, "bin/.msCoverageSourceRootsMapping_X", b"pc");
         let pc = put(&root, "bin/b.txt", b"pc");
         let manifest = manifest_of(&root, &["bin/.msCoverageSourceRootsMapping_X", "bin/b.txt"]);
         fs::write(&roots, b"the PC writer's roots").expect("the file can be written");
-        let entries = [member("bin/.msCoverageSourceRootsMapping_X", b"box"), entry("bin/b.txt")];
+        let entries = [
+            entry("bin/a.txt"),
+            member("bin/.msCoverageSourceRootsMapping_X", b"box"),
+            entry("bin/b.txt"),
+        ];
 
         let unmoved = moved((&stage, &root), &entries, &manifest, an_hour_ago(), |done| {
-            if done == 1 {
+            if done == 2 {
                 fs::write(&pc, b"edited after the checks").expect("the file can be written");
             }
             true
         });
 
-        let reason = "1 of 2 files were installed before bin/b.txt failed: bin/b.txt changed during the run";
+        let reason = "2 of 3 files were installed before bin/b.txt failed: bin/b.txt changed during the run";
         assert_eq!(unmoved, Err(Unmoved::Failed(reason.to_owned())));
     }
 
