@@ -28,7 +28,9 @@ A command run from one worktree that names a path in another worktree of a liste
 
 A command whose word names an existing gitignored project input (a project, solution, `.targets`, `.props`, `.rsp` or `.runsettings` file, or a dotnet folder whose project files are all ignored) that no `inputs` glob covers routes and carries those files to the builder as inputs, with no `inputs` entry needed.
 
-A command whose files hold more than 64 MiB or 2000 files, that runs in a sibling pair (a run carrying siblings; declared siblings that are all absent make a single repo), or whose files cannot be sent stays local, saying `gate: not routed: <path> is gitignored ...` with the reason, and is journalled `notRouted: gitignored input` ([design.md, Routing](design.md#routing)).
+A command whose gitignored inputs hold more than 64 MiB or 2000 files, that carries them in a sibling pair (a run carrying siblings; declared siblings that are all absent make a single repo), or whose files cannot be sent stays local, saying `gate: not routed: <path> is gitignored ...` with the reason, and is journalled `notRouted: gitignored input` ([design.md, Routing](design.md#routing)). A sibling pair with no such inputs routes.
+
+A routed command sees no repo history. The builder's checkout holds the gate's snapshot of the PC worktree, a commit with no parent, and the previous snapshots that builder received: never the repo's own commits, its branches or its remote-tracking refs. A command that names a revision (`git diff origin/main`, `HEAD~1`, a sha from the PC, `git worktree add <sha>`) fails there with `bad revision` or `bad object`. Such a command resolves the revision on the PC first and passes what it selects as words (godot-mcp's itest passes `-Groups a,b,...` picked on the PC), or is declared local ([A repo with a command that stays on this PC](#a-repo-with-a-command-that-stays-on-this-pc)).
 
 ## Adding a repo
 
