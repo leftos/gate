@@ -14,7 +14,6 @@
 - [!] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [!] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
 - [!] GATE-839 Route race-anywhere's Unreal editor and game runs: a desktop route with a GPU — High · Remote
-- [!] GATE-844 Serve godot-mcp's parallel itest lanes on the builder desktop, and match any --filter-class — High · Remote
 - [!] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
