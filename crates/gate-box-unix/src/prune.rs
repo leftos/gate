@@ -93,9 +93,9 @@ const RECORDS_AFTER: [&str; 3] = ["layout", "index", "index.lock"];
 const TEMP_MARK: &str = ".gate-new-";
 /// The seconds in an hour, as the idle time is said.
 const HOUR_SECONDS: u64 = 3600;
-/// The kinds of a key's refs in a bare repository, each `refs/<kind>/<key>`: the PC's snapshot, its bridge, and the
-/// box's back commit.
-const REF_KINDS: [&str; 3] = ["gate", "gate-bridge", "gate-back"];
+/// The kinds of a key's refs in a bare repository, each `refs/<kind>/<key>`: the PC's snapshot, its bridge, the box's
+/// back commit, and the PC's default branch and `HEAD`.
+const REF_KINDS: [&str; 5] = ["gate", "gate-bridge", "gate-back", "gate-base", "gate-head"];
 /// The git step that deletes a key's ref in a bare repository, as its lines name it.
 const REFS_STEP: &str = "update-ref";
 
@@ -1668,14 +1668,15 @@ mod tests {
 
     const OTHER: &str = "other-0123abcd";
 
-    /// A bare repository at `path` holding a commit, with the key's three refs and another key's pointed at it.
+    /// A bare repository at `path` holding a commit, with the key's five refs (snapshot, bridge, back, and the PC's
+    /// default branch and `HEAD`) and another key's snapshot ref pointed at it.
     fn bare_with_refs(path: &Path) -> String {
         let bare = path.to_str().expect("the temp folder is UTF-8").to_owned();
         git(&["init", "--bare", "-q", &bare]);
         let git_dir = format!("--git-dir={bare}");
         let tree = git(&[&git_dir, "mktree", "--missing"]);
         let commit = git(&[&git_dir, "commit-tree", &tree, "-m", "snapshot"]);
-        for reference in ["gate", "gate-bridge", "gate-back"].map(|kind| format!("refs/{kind}/{KEY}")) {
+        for reference in ["gate", "gate-bridge", "gate-back", "gate-base", "gate-head"].map(|kind| format!("refs/{kind}/{KEY}")) {
             git(&[&git_dir, "update-ref", &reference, &commit]);
         }
         git(&[&git_dir, "update-ref", &format!("refs/gate/{OTHER}"), &commit]);
@@ -1691,10 +1692,35 @@ mod tests {
     fn all_refs() -> Vec<String> {
         vec![
             format!("refs/gate-back/{KEY}"),
+            format!("refs/gate-base/{KEY}"),
             format!("refs/gate-bridge/{KEY}"),
+            format!("refs/gate-head/{KEY}"),
             format!("refs/gate/{OTHER}"),
             format!("refs/gate/{KEY}"),
         ]
+    }
+
+    #[test]
+    fn the_keyed_prune_deletes_the_key_s_history_refs_and_keeps_another_key_s() {
+        let case = Case::new("refs-history");
+        let bare = bare_with_refs(&case.root.join("a.git"));
+        let commit = git(&[&bare, "rev-parse", &format!("refs/gate/{OTHER}")]);
+        for kind in ["gate-base", "gate-head"] {
+            git(&[&bare, "update-ref", &format!("refs/{kind}/{OTHER}"), &commit]);
+        }
+
+        let (status, console) = case.keyed(&[KEY]);
+
+        assert_eq!((status, console.out), (0, vec![gone(KEY)]), "{:?}", console.err);
+        assert_eq!(
+            refs(&bare),
+            [
+                format!("refs/gate-base/{OTHER}"),
+                format!("refs/gate-head/{OTHER}"),
+                format!("refs/gate/{OTHER}")
+            ],
+            "the key's base and head refs go with its others; another key's stay"
+        );
     }
 
     #[test]

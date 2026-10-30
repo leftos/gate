@@ -296,6 +296,7 @@ fn laid_out(asked: &Asked<'_>) -> Result<Work, NotLaidOut> {
         tree,
         bare: asked.bare.to_owned(),
         snapshot: "",
+        base: None,
     };
     let laying = Laying {
         work: asked.work,

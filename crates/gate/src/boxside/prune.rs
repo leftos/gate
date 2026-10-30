@@ -11,12 +11,13 @@
 //! there; a rename that fails leaves the layout marked changing, so the next run clears the folder whole. The folder is
 //! removed from `pruned` after the lock is let go; what a removal leaves there the next sweep takes. A key with no
 //! folder has its records removed.
-//! The keyed prune also deletes the key's refs `refs/gate/<key>`, `refs/gate-bridge/<key>` and `refs/gate-back/<key>`,
-//! themselves and never what a symbolic one points to, in every bare repository `<root>\<name>.git`: still under the
-//! lock, once the folder is out of `work` or found absent. A key whose folder could not be renamed aside keeps them, and
-//! so does every key of a root another account may write in ([`gate_win32::check_work_root`]), where no git runs. The
-//! age prune never deletes a ref: a worktree still alive may have pushed one just before the lock was taken. A lock the
-//! keyed prune made for a key is deleted as it is let go, so a key the builder never had leaves nothing behind.
+//! The keyed prune also deletes the key's refs `refs/gate/<key>`, `refs/gate-bridge/<key>`, `refs/gate-back/<key>`,
+//! `refs/gate-base/<key>` and `refs/gate-head/<key>`, themselves and never what a symbolic one points to, in every bare
+//! repository `<root>\<name>.git`: still under the lock, once the folder is out of `work` or found absent. A key whose
+//! folder could not be renamed aside keeps them, and so does every key of a root another account may write in
+//! ([`gate_win32::check_work_root`]), where no git runs. The age prune never deletes a ref: a worktree still alive may
+//! have pushed one just before the lock was taken. A lock the keyed prune made for a key is deleted as it is let go, so
+//! a key the builder never had leaves nothing behind.
 //! Nothing after the root is opened is looked up by path but a bare repository, which git is given by its path: the
 //! root, `work` and `pruned` are opened as themselves and held for the whole sweep, and every name in them is opened
 //! beneath its folder's handle as itself, never followed. A bare repository is opened as itself for reading and listing,
@@ -80,9 +81,9 @@ const HOUR_SECONDS: u64 = 3600;
 /// The access a sweep holds a key's lock with: enough to keep every run, which opens it for reading and writing sharing
 /// nothing, and every other sweep, which asks for `DELETE` sharing no deletion, out while it is held.
 const LOCK_ACCESS: u32 = FILE_GENERIC_READ | DELETE;
-/// The kinds of a key's refs in a bare repository, each `refs/<kind>/<key>`: the PC's snapshot, its bridge, and the
-/// box's back commit.
-const REF_KINDS: [&str; 3] = ["gate", "gate-bridge", "gate-back"];
+/// The kinds of a key's refs in a bare repository, each `refs/<kind>/<key>`: the PC's snapshot, its bridge, the box's
+/// back commit, and the PC's default branch and `HEAD`.
+const REF_KINDS: [&str; 5] = ["gate", "gate-bridge", "gate-back", "gate-base", "gate-head"];
 /// The git step that deletes a key's refs in one bare repository, as its lines and `--test-box-git-limit` name it.
 const REFS_STEP: &str = "update-ref";
 /// The git step that collects one bare repository after the age prune's sweep, as `--test-box-git-limit` names it.

@@ -1574,6 +1574,21 @@ fn short_commit(commit: &str) -> &str {
     commit.get(..8).unwrap_or(commit)
 }
 
+/// Each sibling's name beside one of its values, as the run call's `SiblingSnapshots` and `SiblingBases` carry them.
+type BySibling = Vec<(String, String)>;
+
+/// What the run call says of a pair's siblings, `repos` past the main one, each beside its snapshot in `siblings`: each
+/// sibling's name and its snapshot's commit (`SiblingSnapshots`), and each sibling's name and its default branch, for
+/// the siblings that have one (`SiblingBases`).
+fn sibling_fields(repos: &[Repo], siblings: &[Snapshot]) -> (BySibling, BySibling) {
+    let pairs = || repos.iter().skip(1).zip(siblings);
+    let snapshots = pairs().map(|(repo, sibling)| (repo.name.clone(), sibling.commit.clone())).collect();
+    let bases = pairs()
+        .filter_map(|(repo, sibling)| sibling.base.as_ref().map(|base| (repo.name.clone(), base.name.clone())))
+        .collect();
+    (snapshots, bases)
+}
+
 impl Attempt<'_, '_> {
     /// The profile of the call's builder over the transport ([`super::transport::Transport::profile`]).
     pub(super) fn profile(&self) -> Profile {
@@ -1606,12 +1621,7 @@ impl Attempt<'_, '_> {
         let Some((snapshot, siblings)) = snapshots.split_first() else {
             return Err(End::Failed("the snapshot made no commit".to_owned()));
         };
-        let sibling_snapshots: Vec<(String, String)> = repos
-            .iter()
-            .skip(1)
-            .zip(siblings)
-            .map(|(repo, sibling)| (repo.name.clone(), sibling.commit.clone()))
-            .collect();
+        let (sibling_snapshots, sibling_bases) = sibling_fields(&repos, siblings);
         let trees = self.trees(&repos, &snapshots)?;
         let lfs = self.lfs_sending(&repos, &snapshots, &trees)?;
         let godot_command = self.godot_command();
@@ -1665,6 +1675,8 @@ impl Attempt<'_, '_> {
             engine_env: &chosen.engine_env,
             desktop: self.call.desktop,
             cross_build: self.call.cross_build,
+            base: snapshot.base.as_ref().map(|base| base.name.as_str()),
+            sibling_bases: &sibling_bases,
         };
         self.run_call_started = true;
         let (called, nonce) = self.run_called(&location, &run, &mut sent, withheld)?;
@@ -2812,7 +2824,8 @@ impl Attempt<'_, '_> {
         }
     }
 
-    /// Pushes one repository's snapshot, and its bridge unless its bare repository was created just now, with no hooks
+    /// Pushes one repository's snapshot, its bridge unless its bare repository was created just now, and the PC's
+    /// `HEAD` and default branch as `refs/gate-head/<key>` and `refs/gate-base/<key>` when it has them, with no hooks
     /// and no submodules, then saves the local ref and says the push: `gate: pushed snapshot …` for a run of one
     /// repository, `gate: remote pushed snapshot {name} …` for each of a pair's. The run's first push says it as it
     /// starts, `gate: pushing snapshot {8} to {host}`, or `gate: pushing snapshots to {host}` for a pair's. A push that
@@ -2832,6 +2845,12 @@ impl Attempt<'_, '_> {
         args.extend(["--".to_owned(), target.url.clone(), format!("+{}:refs/gate/{key}", snapshot.commit)]);
         let bridge = snapshot.bridge.as_deref().filter(|_| !created);
         args.extend(bridge.map(|bridge| format!("+{bridge}:refs/gate-bridge/{key}")));
+        if let Some(head) = &snapshot.head {
+            args.push(format!("+{head}:refs/gate-head/{key}"));
+        }
+        if let Some(base) = &snapshot.base {
+            args.push(format!("+{}:refs/gate-base/{key}", base.commit));
+        }
         let git = Git::find(root).map_err(|why| repo_end(at, &repo.name, End::Failed(why)))?;
         let started = Instant::now();
         let ceiling = self.ceiling.clone();
@@ -8791,6 +8810,8 @@ mod tests {
             commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             bridge: None,
             objects: PathBuf::from(r"C:\app\.git\objects"),
+            head: None,
+            base: None,
         };
         let location = Location::under(
             &Profile::new("builder", BuilderOs::Windows, r"C:\builder"),
@@ -10319,12 +10340,14 @@ mod tests {
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
-    /// A snapshot of [`COMMIT`] with no bridge.
+    /// A snapshot of [`COMMIT`] with no bridge, and no history refs.
     fn snapshot() -> Snapshot {
         Snapshot {
             commit: COMMIT.to_owned(),
             bridge: None,
             objects: PathBuf::from(r"C:\app\.git\objects"),
+            head: None,
+            base: None,
         }
     }
 

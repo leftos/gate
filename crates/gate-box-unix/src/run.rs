@@ -84,6 +84,9 @@ pub struct Repo<'p> {
     pub bare: String,
     /// The commit checked out, 40 lower-case hex digits.
     pub snapshot: &'p str,
+    /// The PC's default branch, whose `refs/gate-base/<key>` the fetch names `refs/remotes/origin/<base>` in the tree;
+    /// `None` for a repo the PC sent none of.
+    pub base: Option<&'p str>,
 }
 
 impl Repo<'_> {
@@ -105,8 +108,9 @@ impl Repo<'_> {
 /// The main repo and the siblings of a run in the work folder `work`, as the Windows box reads them: with no `Pair`, the
 /// one repo of `bare` checked out at `snapshot` in `work` itself; with one, the main repo in `<work>/<leaf>` and each
 /// sibling in `<work>/<name>` with its own bare repository and its commit from `SiblingSnapshots` ([`gate_wire::trees`]).
-/// Else the usage line.
+/// Each repo's default branch is the main repo's `Base` or the sibling's from `SiblingBases`. Else the usage line.
 fn repos<'p>(payload: &'p Payload, work: &str, bare: &str, snapshot: &'p str) -> Result<(Repo<'p>, Vec<Repo<'p>>), String> {
+    let base = payload.base()?;
     let Some(pair) = payload.pair()? else {
         let (tree, _) = trees(work, None, PathForm::Unix);
         let main = Repo {
@@ -114,10 +118,12 @@ fn repos<'p>(payload: &'p Payload, work: &str, bare: &str, snapshot: &'p str) ->
             tree,
             bare: bare.to_owned(),
             snapshot,
+            base,
         };
         return Ok((main, Vec::new()));
     };
     let commits = payload.sibling_snapshots(&pair)?;
+    let bases = payload.sibling_bases(&pair)?;
     let names: Vec<&str> = pair.siblings().iter().map(PairSibling::name).collect();
     let (main_tree, sibling_trees) = trees(work, Some((pair.leaf(), &names)), PathForm::Unix);
     let main = Repo {
@@ -125,17 +131,20 @@ fn repos<'p>(payload: &'p Payload, work: &str, bare: &str, snapshot: &'p str) ->
         tree: main_tree,
         bare: bare.to_owned(),
         snapshot,
+        base,
     };
     let siblings = pair
         .siblings()
         .iter()
         .zip(commits)
+        .zip(bases)
         .zip(sibling_trees)
-        .map(|((sibling, commit), tree)| Repo {
+        .map(|(((sibling, commit), base), tree)| Repo {
             name: Some(sibling.name().to_owned()),
             tree,
             bare: sibling.bare().to_owned(),
             snapshot: commit,
+            base,
         })
         .collect();
     Ok((main, siblings))
@@ -1672,22 +1681,22 @@ fn checked_out<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>) -> Resul
 /// The snapshot of `repo` fetched from its bare repository at `refs/gate/<key>`, its commit found, and checked out by
 /// its commit over whatever the last run left, untracked files removed and ignored ones (build output) kept. The commit,
 /// never the ref's tip, is what is checked out, so a later push of the key changes nothing this run runs. Each step is
-/// named for the repo on a pair run ([`Repo::step`]).
+/// named for the repo on a pair run ([`Repo::step`]). A repo with a default branch has `refs/gate-base/<key>` fetched
+/// in the same call as `refs/remotes/origin/<base>`, so the tree's `origin/<base>` names the PC's.
 fn repo_checked_out<S: LineSink>(git: &RunGit<'_, S>, key: &str, repo: &Repo<'_>) -> Result<(), Failed> {
     let tree = repo.git_tree();
     let refname = format!("refs/gate/{key}");
-    git.step_as(
-        &repo.step("fetch"),
-        &tree.args(&[
-            "fetch",
-            "-q",
-            "--no-recurse-submodules",
-            "--upload-pack=git-upload-pack",
-            &repo.bare,
-            &refname,
-        ]),
-        GitClass::Long,
-    )?;
+    let base = repo.base.map(|name| format!("+refs/gate-base/{key}:refs/remotes/origin/{name}"));
+    let mut fetch = vec![
+        "fetch",
+        "-q",
+        "--no-recurse-submodules",
+        "--upload-pack=git-upload-pack",
+        &repo.bare,
+        &refname,
+    ];
+    fetch.extend(base.as_deref());
+    git.step_as(&repo.step("fetch"), &tree.args(&fetch), GitClass::Long)?;
     let commit = format!("{}^{{commit}}", repo.snapshot);
     if !git
         .quiet(&repo.step("cat-file"), &tree.args(&["cat-file", "-e", &commit]), GitClass::Short)?
@@ -3092,6 +3101,50 @@ mod tests {
         assert_eq!(status, 0, "{said:?}");
         assert_eq!(case.head(), a, "the payload's commit is what is checked out");
         assert_eq!(fs::read_to_string(format!("{}/a.txt", case.work())).expect("a.txt is read"), "a\n");
+    }
+
+    /// Points the bare repository's `refs/gate-base/<key>`, the PC's default branch, at `commit`.
+    fn base_pushed(case: &Case, commit: &str) {
+        git(&[
+            &format!("--git-dir={}", case.bare()),
+            "update-ref",
+            &format!("refs/gate-base/{KEY}"),
+            commit,
+        ]);
+    }
+
+    #[test]
+    fn a_payload_s_base_names_the_pushed_default_branch_origin_main_in_the_work_repo() {
+        let case = Case::new("base");
+        let base = case.snapshot(&[("a.txt", "a\n")]);
+        base_pushed(&case, &base);
+        let commit = case.snapshot(&[("a.txt", "b\n")]);
+
+        let (status, said) = ran(&case.json(&commit, &json!({ "Base": "main" })));
+
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(case.head(), commit, "the snapshot is checked out");
+        assert_eq!(
+            git(&["-C", &case.work(), "rev-parse", "refs/remotes/origin/main"]),
+            base,
+            "origin/main is the pushed refs/gate-base/<key>"
+        );
+    }
+
+    #[test]
+    fn a_payload_without_a_base_makes_no_remote_tracking_ref() {
+        let case = Case::new("no-base");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        base_pushed(&case, &commit);
+
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(
+            git(&["-C", &case.work(), "for-each-ref", "refs/remotes/"]),
+            "",
+            "no Base, no refs/remotes/origin/*"
+        );
     }
 
     #[test]

@@ -565,9 +565,10 @@ fn prune_keys(case: &Case, root: &Path, keys: &[&str]) -> Outcome {
     finish(bare_box_command(case, &words))
 }
 
-/// The three refs a builder's bare repository holds for the key `key`.
+/// The refs a builder's bare repository holds for the key `key`: its snapshot, bridge and back refs, and the PC's
+/// default branch and `HEAD`.
 fn key_refs(key: &str) -> Vec<String> {
-    ["gate", "gate-bridge", "gate-back"]
+    ["gate", "gate-bridge", "gate-back", "gate-base", "gate-head"]
         .iter()
         .map(|kind| format!("refs/{kind}/{key}"))
         .collect()
@@ -721,7 +722,7 @@ fn only_the_named_key_s_refs_go_in_every_bare_repository() {
     }
 }
 
-/// A key with only some of its three refs is pruned: a `delete` of a ref the repository lacks is no failure.
+/// A key with only some of its refs is pruned: a `delete` of a ref the repository lacks is no failure.
 #[test]
 fn a_named_key_with_only_some_of_its_refs_is_pruned() {
     let case = Case::new("prune_keys_some_refs");

@@ -180,6 +180,11 @@ pub(crate) struct RunCall<'a> {
     /// The cross build a macOS builder runs after the passing command (`CrossBuild`, its `Rid` and `Words`, sent only
     /// when there is one and the run asks for outputs, as the box takes it only then); a warm-up never sends it.
     pub cross_build: Option<&'a CrossBuild>,
+    /// The main repo's default branch name (`Base`, sent only when it has one); a warm-up never sends it.
+    pub base: Option<&'a str>,
+    /// Each sibling's name and its default branch name, for the siblings that have one (`SiblingBases`, sent only when
+    /// one has); a warm-up never sends them.
+    pub sibling_bases: &'a [(String, String)],
 }
 
 /// The step an inputs call asks the box for: which files the work folder needs (`diff`), or installing them (`put`).
@@ -296,7 +301,8 @@ pub(crate) fn drain_word(root: &str, action: DrainAction) -> String {
 /// The payload word of the run call, with the run's variables (the caller's `--env` pairs and the gate's
 /// `SourceRevisionId`) as `Env` when there is one, and `Desktop: true`
 /// with `DesktopWait` ([`REMOTE_LIMIT`] in whole seconds, which the box caps at the run's `Timeout`) for a run that asks
-/// for the builder's desktop, and `CrossBuild` (`Rid` and `Words`) for a run with a cross build and output globs.
+/// for the builder's desktop, `CrossBuild` (`Rid` and `Words`) for a run with a cross build and output globs, and the
+/// repos' default branches as `Base` and `SiblingBases` when any has one.
 pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
     let mut object = location.object();
     for (name, value) in [
@@ -325,6 +331,17 @@ pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
     }
     if let Some(cross) = run.cross_build.filter(|_| !run.outputs.is_empty()) {
         object.insert("CrossBuild".to_owned(), json!({"Rid": cross.rid, "Words": cross.words}));
+    }
+    if let Some(base) = run.base {
+        object.insert("Base".to_owned(), json!(base));
+    }
+    if !run.sibling_bases.is_empty() {
+        let bases: Map<String, Value> = run
+            .sibling_bases
+            .iter()
+            .map(|(name, base)| (name.clone(), Value::String(base.clone())))
+            .collect();
+        object.insert("SiblingBases".to_owned(), Value::Object(bases));
     }
     insert_siblings_and_inputs(&mut object, run);
     word(&object)
@@ -615,6 +632,8 @@ mod tests {
             timeout: 1,
             host: "builder",
             sibling_snapshots,
+            base: None,
+            sibling_bases: &[],
             inputs_digest: None,
             lfs_digest: None,
             sent_digest: None,
@@ -723,6 +742,68 @@ mod tests {
         );
     }
 
+    /// The pair of `lib` and `tools` the default-branch cases send.
+    fn paired() -> Location {
+        location().with_pair("app", &["lib".to_owned(), "tools".to_owned()])
+    }
+
+    #[test]
+    fn a_run_with_default_branches_sends_base_and_sibling_bases() {
+        let bases = [("lib".to_owned(), "trunk".to_owned())];
+        let run = RunCall {
+            base: Some("main"),
+            sibling_bases: &bases,
+            ..warm_run(&[], None)
+        };
+
+        let word = run_word(&paired(), &run);
+
+        let sent = decoded(&word);
+        assert_eq!(sent["Base"], json!("main"));
+        assert_eq!(sent["SiblingBases"], json!({"lib": "trunk"}), "only the siblings that have one");
+        let payload = on_the_box(&word);
+        let pair = payload.pair().expect("the box takes the pair").expect("the box finds a pair");
+        assert_eq!(payload.base(), Ok(Some("main")), "the box reads Base back");
+        assert_eq!(
+            payload.sibling_bases(&pair),
+            Ok(vec![Some("trunk"), None]),
+            "in the pair's order, none for the sibling without one"
+        );
+    }
+
+    #[test]
+    fn a_run_without_default_branches_sends_neither() {
+        let word = run_call(&[]);
+
+        let sent = decoded(&word);
+        assert!(sent.get("Base").is_none(), "no Base key: {sent}");
+        assert!(sent.get("SiblingBases").is_none(), "no SiblingBases key: {sent}");
+        let payload = on_the_box(&word);
+        let pair = payload.pair().expect("the box takes the pair").expect("the box finds a pair");
+        assert_eq!(payload.base(), Ok(None));
+        assert_eq!(payload.sibling_bases(&pair), Ok(vec![None, None]));
+    }
+
+    #[test]
+    fn a_warm_call_sends_no_base() {
+        let bases = [("lib".to_owned(), "trunk".to_owned())];
+        let run = RunCall {
+            base: Some("main"),
+            sibling_bases: &bases,
+            ..warm_run(&[], None)
+        };
+        let commands = warm_commands();
+        let warm = WarmCall {
+            commands: &commands,
+            hash: WARM_HASH,
+        };
+
+        let sent = decoded(&warm_word(&paired(), &run, &warm));
+
+        assert!(sent.get("Base").is_none(), "a warm-up never sends Base: {sent}");
+        assert!(sent.get("SiblingBases").is_none(), "a warm-up never sends SiblingBases: {sent}");
+    }
+
     #[test]
     fn a_preflight_with_needs_carries_them_in_order_and_one_without_is_the_location_alone() {
         let mut alone = decoded(&location_word(&location()));
@@ -777,6 +858,8 @@ mod tests {
             timeout: 300,
             host: "builder",
             sibling_snapshots: &[],
+            base: None,
+            sibling_bases: &[],
             inputs_digest: None,
             lfs_digest: None,
             sent_digest: None,
@@ -825,6 +908,8 @@ mod tests {
             timeout: 1,
             host: "builder",
             sibling_snapshots: &[],
+            base: None,
+            sibling_bases: &[],
             inputs_digest: Some("ab"),
             lfs_digest: None,
             sent_digest: None,
@@ -898,6 +983,8 @@ mod tests {
             timeout: 1,
             host: "builder",
             sibling_snapshots: &[],
+            base: None,
+            sibling_bases: &[],
             inputs_digest: None,
             lfs_digest: None,
             sent_digest: None,
@@ -939,6 +1026,8 @@ mod tests {
             timeout: 1,
             host: "builder",
             sibling_snapshots: &[],
+            base: None,
+            sibling_bases: &[],
             inputs_digest: None,
             lfs_digest: None,
             sent_digest: None,
@@ -986,6 +1075,8 @@ mod tests {
             timeout: 1,
             host: "builder",
             sibling_snapshots: &[],
+            base: None,
+            sibling_bases: &[],
             inputs_digest: None,
             lfs_digest: None,
             sent_digest: None,
@@ -1034,6 +1125,8 @@ mod tests {
             timeout: 1,
             host: "builder",
             sibling_snapshots: &[],
+            base: None,
+            sibling_bases: &[],
             inputs_digest: None,
             lfs_digest: None,
             sent_digest: None,
@@ -1086,6 +1179,8 @@ mod tests {
             timeout: 300,
             host: "builder",
             sibling_snapshots: &[],
+            base: None,
+            sibling_bases: &[],
             inputs_digest: None,
             lfs_digest: None,
             sent_digest: None,
@@ -1140,6 +1235,8 @@ mod tests {
             timeout: 300,
             host: "builder",
             sibling_snapshots: &[],
+            base: None,
+            sibling_bases: &[],
             inputs_digest: None,
             lfs_digest: None,
             sent_digest: None,
@@ -1207,6 +1304,8 @@ mod tests {
             timeout: 1800,
             host: "builder",
             sibling_snapshots,
+            base: None,
+            sibling_bases: &[],
             inputs_digest,
             lfs_digest: None,
             sent_digest: None,

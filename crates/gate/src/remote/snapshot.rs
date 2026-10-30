@@ -29,14 +29,27 @@ const BRIDGE_MESSAGE: &str = "gate-remote bridge";
 /// ([`snapshot_ref`]), beside the `-back` refs of changes kept from the builder.
 pub(super) const REFS: &str = "refs/gate-remote/";
 pub(super) const BACK: &str = "-back";
+/// Where the PC's `origin`'s remote-tracking refs live, as `for-each-ref` names them.
+const ORIGIN: &str = "refs/remotes/origin/";
 
-/// One worktree's snapshot commit and, when there was a previous snapshot, its bridge commit, both full shas; and the
+/// One worktree's snapshot commit and, when there was a previous snapshot, its bridge commit, both full shas; the
 /// repository's object store, as the snapshot's `git rev-parse --git-path objects` named it, which the sync-back
-/// fetches beside.
+/// fetches beside; and the commits of the PC's `HEAD` and of its default branch, which a shallow clone has neither of.
 pub(crate) struct Snapshot {
     pub commit: String,
     pub bridge: Option<String>,
     pub objects: PathBuf,
+    pub head: Option<String>,
+    pub base: Option<Base>,
+}
+
+/// The PC's default branch as its `origin` names it: the branch's name, the part after `refs/remotes/origin/`, and its
+/// commit.
+pub(crate) struct Base {
+    /// The branch's name.
+    pub name: String,
+    /// The commit at that branch, full.
+    pub commit: String,
 }
 
 /// The snapshot of each of `roots`, in order, under the work-folder `key`, each git call under `bounds` or ended by the
@@ -195,30 +208,81 @@ fn take_one(calls: &Calls<'_>, key: &str, builder: Option<&str>) -> Result<Snaps
         &[
             "for-each-ref",
             "--sort=-committerdate",
-            "--format=%(refname) %(objectname)",
+            "--format=%(refname) %(objectname) %(symref)",
             &builder_refs(builder),
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+            "refs/remotes/origin/master",
         ],
         &[],
         &[],
     )?;
     let previous = previous(&listing, key, builder);
-    let (tree, objects) = worktree_tree(calls)?;
+    let (tree, paths) = worktree_tree(calls)?;
+    // A shallow clone sends no history: a receiver refuses a push from one.
+    let (head, base) = if paths.shallow {
+        (None, None)
+    } else {
+        (paths.head, default_branch(&listing))
+    };
     let commit = calls.committed(&["commit-tree", "--no-gpg-sign", &tree, "-m", SNAPSHOT_MESSAGE])?;
     let bridge = match &previous {
         Some(parent) => Some(calls.committed(&["commit-tree", "--no-gpg-sign", &tree, "-p", parent, "-m", BRIDGE_MESSAGE])?),
         None => None,
     };
-    Ok(Snapshot { commit, bridge, objects })
+    Ok(Snapshot {
+        commit,
+        bridge,
+        objects: paths.objects,
+        head,
+        base,
+    })
 }
 
-/// The snapshot a bridge to the builder `builder` builds on, from `for-each-ref`'s `<ref> <sha>` lines, newest first,
-/// among that builder's own refs only ([`snapshot_ref`]): the key's own, else the newest any worktree of the
+/// The default branch and its commit from `for-each-ref`'s `<ref> <sha> <symref>` lines: the branch the
+/// `refs/remotes/origin/HEAD` symref names when it is under `refs/remotes/origin/`, else `main`, else `master`, else
+/// none. A branch whose name the box would refuse ([`gate_wire::is_branch_name`]) gives none, and no other stands in for
+/// it, so no base is sent for that repository.
+fn default_branch(listing: &str) -> Option<Base> {
+    let refs: Vec<(&str, &str, &str)> = listing
+        .lines()
+        .filter_map(|line| {
+            let (name, rest) = line.split_once(' ')?;
+            let (commit, symref) = rest.split_once(' ').unwrap_or((rest, ""));
+            Some((name, commit, symref))
+        })
+        .collect();
+    let origin_head = format!("{ORIGIN}HEAD");
+    if let Some((_, commit, symref)) = refs.iter().find(|(name, _, _)| *name == origin_head.as_str())
+        && let Some(name) = symref.strip_prefix(ORIGIN)
+    {
+        return gate_wire::is_branch_name(name).then(|| Base {
+            name: name.to_owned(),
+            commit: (*commit).to_owned(),
+        });
+    }
+    ["main", "master"].iter().find_map(|branch| {
+        let wanted = format!("{ORIGIN}{branch}");
+        let (_, commit, _) = refs.iter().find(|(name, _, _)| *name == wanted.as_str())?;
+        Some(Base {
+            name: (*branch).to_owned(),
+            commit: (*commit).to_owned(),
+        })
+    })
+}
+
+/// The snapshot a bridge to the builder `builder` builds on, from `for-each-ref`'s `<ref> <sha> <symref>` lines, newest
+/// first, among that builder's own refs only ([`snapshot_ref`]): the key's own, else the newest any worktree of the
 /// repository sent that builder, never a kept `-back` commit; `None` when there is none.
 fn previous(listing: &str, key: &str, builder: Option<&str>) -> Option<String> {
     let folder = builder_refs(builder);
     let refs: Vec<(&str, &str)> = listing
         .lines()
-        .filter_map(|line| line.split_once(' '))
+        .filter_map(|line| {
+            let (name, rest) = line.split_once(' ')?;
+            let (sha, _) = rest.split_once(' ').unwrap_or((rest, ""));
+            Some((name, sha))
+        })
         .filter(|(name, _)| name.strip_prefix(folder.as_str()).is_some_and(|rest| !rest.contains('/')))
         .collect();
     let own = snapshot_ref(key, builder);
@@ -290,26 +354,41 @@ fn first_line(args: &[&str], text: &str) -> Result<String, GitError> {
 }
 
 /// The tree of the worktree at `root`, written through a copy of its index, which is removed however the write ends,
-/// and the repository's object store.
-fn worktree_tree(calls: &Calls<'_>) -> Result<(String, PathBuf), GitError> {
+/// and the worktree's [`GitPaths`].
+fn worktree_tree(calls: &Calls<'_>) -> Result<(String, GitPaths), GitError> {
     let paths = paths(calls, &copy_name(std::process::id()))?;
     let tree = write_tree(calls, &paths.index, &paths.copy);
     let removed = remove_leftovers(&paths.copy);
     let tree = tree?;
-    removed.map(|()| (tree, paths.objects))
+    removed.map(|()| (tree, paths))
 }
 
-/// The index, the index copy and the object store of the worktree's repository.
+/// The index, the index copy and the object store of the worktree's repository, and what the call that named them says
+/// of its history: whether it is a shallow clone, and the commit of its born `HEAD`, `None` for an unborn one.
 struct GitPaths {
     index: PathBuf,
     copy: PathBuf,
     objects: PathBuf,
+    shallow: bool,
+    head: Option<String>,
 }
 
-/// The worktree's [`GitPaths`], as one `git rev-parse --git-path` call names them.
+/// The worktree's [`GitPaths`], as one `git rev-parse` call names them: three `--git-path` answers, then
+/// `--is-shallow-repository`'s `true` or `false`, then the commit of a born `HEAD`, which git prints for no other.
 fn paths(calls: &Calls<'_>, name: &str) -> Result<GitPaths, GitError> {
     let printed = calls.output(
-        &["rev-parse", "--git-path", "index", "--git-path", name, "--git-path", "objects"],
+        &[
+            "rev-parse",
+            "--git-path",
+            "index",
+            "--git-path",
+            name,
+            "--git-path",
+            "objects",
+            "--is-shallow-repository",
+            "--revs-only",
+            "HEAD^{commit}",
+        ],
         &[],
         &[],
     )?;
@@ -324,11 +403,29 @@ fn paths(calls: &Calls<'_>, name: &str) -> Result<GitPaths, GitError> {
         .next()
         .filter(|objects| !objects.is_empty())
         .ok_or_else(|| GitError::Failed("git rev-parse --git-path objects printed nothing".to_owned()))?;
+    let shallow = match lines.next() {
+        Some("true") => true,
+        Some("false") => false,
+        _ => {
+            return Err(GitError::Failed(format!(
+                "git rev-parse --is-shallow-repository did not print true or false: {}",
+                printed.trim()
+            )));
+        }
+    };
+    let head = lines.next().map(str::to_owned).filter(|head| is_commit(head));
     Ok(GitPaths {
         index: git_path(calls.root, index),
         copy: git_path(calls.root, copy),
         objects: git_path(calls.root, objects),
+        shallow,
+        head,
     })
+}
+
+/// Whether `text` is a whole commit id: 40 or 64 lower-case hex digits.
+fn is_commit(text: &str) -> bool {
+    gate_wire::is_lower_hex(text, 40) || gate_wire::is_lower_hex(text, 64)
 }
 
 /// `git add -A` and `git write-tree` on `copy`, a fresh copy of `index`; with no index, git starts from an empty one.
@@ -408,7 +505,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::slice;
 
-    use super::{Bounded, DATES, IDENTITY, asked, copy_name, git_path, lock_of, place_of, previous, repository, save, snapshot_ref, take, worktree};
+    use super::{
+        Bounded, DATES, IDENTITY, asked, copy_name, default_branch, git_path, lock_of, place_of, previous, repository, save, snapshot_ref, take,
+        worktree,
+    };
     use crate::remote::git::{GIT_BOUNDS, GitError};
 
     const OWN: &str = "app-1a2b3c4d";
@@ -462,6 +562,18 @@ mod tests {
         );
         assert_eq!(previous("refs/gate-remote/app-1a2b3c4d-back aaa\n", OWN, None), None, "only a -back ref");
         assert_eq!(previous("", OWN, None), None, "no snapshot yet");
+    }
+
+    /// A listing that names the symref too leaves an empty third field on every line of a builder's refs: the sha is
+    /// the second field alone.
+    #[test]
+    fn the_previous_snapshot_is_the_sha_before_the_empty_symref() {
+        let listing = "refs/gate-remote/app-1a2b3c4d ccc \n";
+        assert_eq!(
+            previous(listing, OWN, None),
+            Some("ccc".to_owned()),
+            "the second field, never the rest of the line"
+        );
     }
 
     /// The id of a `builders` entry, as [`gate_router::Builder::id`] spells one.
@@ -518,6 +630,86 @@ mod tests {
             previous(listing, OWN, Some(ID)),
             None,
             "host's and another builder's refs are not its own"
+        );
+    }
+
+    /// The `for-each-ref` listing the default branch is chosen from: `%(refname) %(objectname) %(symref)`, the symref
+    /// empty for every ref that is not `refs/remotes/origin/HEAD`.
+    #[test]
+    fn origin_head_s_target_is_the_default_branch() {
+        let listing = "refs/remotes/origin/HEAD aaa refs/remotes/origin/trunk\n\
+                       refs/remotes/origin/main bbb \nrefs/remotes/origin/trunk aaa \n";
+        assert_eq!(
+            default_branch(listing).map(|base| base.name),
+            Some("trunk".to_owned()),
+            "origin/HEAD's target is the default branch, over origin/main"
+        );
+        assert_eq!(
+            default_branch(listing).map(|base| base.commit),
+            Some("aaa".to_owned()),
+            "the branch's commit"
+        );
+    }
+
+    #[test]
+    fn origin_main_stands_in_when_origin_head_is_unset() {
+        let listing = "refs/remotes/origin/main bbb \nrefs/remotes/origin/master ccc \n";
+        assert_eq!(
+            default_branch(listing).map(|base| base.name),
+            Some("main".to_owned()),
+            "origin/main when origin/HEAD is not there"
+        );
+        assert_eq!(
+            default_branch(listing).map(|base| base.commit),
+            Some("bbb".to_owned()),
+            "origin/main's commit"
+        );
+    }
+
+    #[test]
+    fn origin_master_stands_in_when_neither_is_there() {
+        let listing = "refs/remotes/origin/master ccc \n";
+        assert_eq!(
+            default_branch(listing).map(|base| base.name),
+            Some("master".to_owned()),
+            "origin/master alone"
+        );
+        assert_eq!(
+            default_branch(listing).map(|base| base.commit),
+            Some("ccc".to_owned()),
+            "origin/master's commit"
+        );
+    }
+
+    #[test]
+    fn a_default_branch_the_box_would_refuse_is_not_sent() {
+        let alone = "refs/remotes/origin/HEAD aaa refs/remotes/origin/dev@x\nrefs/remotes/origin/dev@x aaa \n";
+        assert_eq!(default_branch(alone).map(|base| base.name), None, "a name the box refuses is no base");
+        let beside_main = format!("{alone}refs/remotes/origin/main bbb \n");
+        assert_eq!(
+            default_branch(&beside_main).map(|base| base.name),
+            None,
+            "origin/HEAD's branch is the default, so origin/main does not stand in for a refused one"
+        );
+    }
+
+    #[test]
+    fn no_origin_ref_gives_no_default_branch() {
+        assert_eq!(default_branch("").map(|base| base.name), None, "no origin ref at all");
+    }
+
+    #[test]
+    fn an_origin_head_pointing_outside_origin_is_ignored() {
+        let listing = "refs/remotes/origin/HEAD aaa refs/heads/x\nrefs/remotes/origin/main bbb \n";
+        assert_eq!(
+            default_branch(listing).map(|base| base.name),
+            Some("main".to_owned()),
+            "a symref outside refs/remotes/origin/ is no default branch, and origin/main stands in"
+        );
+        assert_eq!(
+            default_branch(listing).map(|base| base.commit),
+            Some("bbb".to_owned()),
+            "origin/main's commit"
         );
     }
 

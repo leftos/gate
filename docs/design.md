@@ -2568,6 +2568,14 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   The bridge is what keeps a push small: a snapshot has no parent, so git leaves out only what the bridge's parent reaches, and only when the builder holds that parent. One ref shared by two builders would hand each a parent the other received, and every switch between them would send the whole repository.
 
+  The snapshot also reads two history refs of the PC's repository, so a routed command can name the PC's commits on the builder.
+
+  The head ref is the PC's `HEAD` commit, sent as `refs/gate-head/<key>`: none for an unborn `HEAD`. The base ref is the commit at the PC's origin default branch, sent as `refs/gate-base/<key>`.
+
+  The default branch is the symref target of `refs/remotes/origin/HEAD` when it lies under `refs/remotes/origin/`, else `origin/main`, else `origin/master`, else none; with none there is no base ref and the run sends no `Base`. A shallow clone sends neither ref, since its history stops at the shallow boundary.
+
+  These reads start no git process of their own: the shallow flag and the `HEAD` commit ride the `rev-parse --git-path` call (`--is-shallow-repository --revs-only HEAD^{commit}` added), and the origin refs ride the `for-each-ref` listing (format `%(refname) %(objectname) %(symref)`).
+
   Every git call of the client goes through `remote/git.rs`, which the routing decision's git calls share: it removes the `GIT_*` location variables, applies the call's time limit (`--test-git-limit-ms`, one value for the routing decision's calls, the client's and the `--test-remote-snapshot` client's), starts git through `remote/launch.rs` (suspended, assigned to an anonymous kill-on-close job of its own and resumed, with its output on pipes read by a thread per stream), reads and drops stderr where nothing reads it and ends git's whole job on Ctrl+C.
 
   The calls the client reads (`Git::output`: the sync-back's and the snapshot's) read git's output up to 16 MiB and keep the last 64 KiB of its stderr; a call past the cap is ended and fails with `git <args> failed in <folder>: its output passed 16 MiB`. The routing decision's calls are not capped. A Ctrl+C that ends git is an interrupt.
@@ -2781,7 +2789,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     The project files are every `*.csproj` the snapshot holds, at any depth and in any ASCII letter case: at most 64 files of at most 256 KiB each, read with at most two git calls, the sizes first and then one bounded batch read. A file that cannot be read says `gate: cannot read the Godot pin of <file>: <why>; not checking it` and gives no pin; files past the 64th say `gate: <n> more project files not read for a Godot pin; not checking them`.
 
     `global.json` stays the SDK pin, read by `parity.rs` as above.
-  - **Push.** `git push --no-verify --no-recurse-submodules --progress [--receive-pack=…] -- <host>:<builder root>/<repo>.git +<snapshot>:refs/gate/<key> [+<bridge>:refs/gate-bridge/<key>]`, with `GIT_SSH_COMMAND` carrying the ssh options.
+  - **Push.** `git push --no-verify --no-recurse-submodules --progress [--receive-pack=…] -- <host>:<builder root>/<repo>.git +<snapshot>:refs/gate/<key> [+<bridge>:refs/gate-bridge/<key>] [+<head>:refs/gate-head/<key>] [+<base>:refs/gate-base/<key>]`, with `GIT_SSH_COMMAND` carrying the ssh options.
+
+    The head and base refs ([Routing](#routing), the snapshot) go in the same `git push`, flat and forced, for the main repo and for each sibling into its own bare repository. Because git sends one pack for the push, a repository's first push carries the PC's reachable history, and the `pushed snapshot` size reports it.
 
     A Windows builder's `--receive-pack` is `pwsh -NoProfile -NonInteractive -Command $env:GIT_CONFIG_COUNT='1'; $env:GIT_CONFIG_KEY_0='receive.autogc'; $env:GIT_CONFIG_VALUE_0='false'; git-receive-pack '<path>'`, so a push never starts a gc on the builder.
 
@@ -3839,6 +3849,10 @@ Built verbs:
 
   `SiblingSnapshots`, an object of exactly the pair's sibling names, each a 40 lower-case hex digit commit, is read by `run` alone: `gate: box payload SiblingSnapshots is not an object`, `gate: box payload SiblingSnapshots must name exactly the Pair's siblings: <names>` and `gate: remote run payload's SiblingSnapshots <name> '<value>' is not a 40-hex commit sha`.
 
+  `Base`, the main repo's default branch name, and `SiblingBases`, an object of sibling name to that sibling's default branch name, are read by `run` alone and are never in the warm call. `Base` is sent only when the main repo has a default branch, `SiblingBases` only when a sibling has one and then only with the siblings that have one.
+
+  A branch name is accepted when it is 1 to 200 bytes of ASCII letters, digits, `.`, `_`, `-` and `/`, does not start with `-`, `.` or `/`, does not end with `/`, `.` or `.lock` (any letter case), and holds no `..` or `//`. The refusals are `gate: box payload Base is not a branch name: <shown>`, `gate: box payload SiblingBases is not an object`, `gate: box payload SiblingBases names <name>, which is not a sibling of the Pair` and `gate: box payload SiblingBases <name> is not a branch name: <shown>`.
+
   `Identity` may hold only `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_AUTHOR_DATE`, `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL` and `GIT_COMMITTER_DATE`.
 
   `Env` is the variables for the command, the PC's `--env` pairs ([Command environment](#command-environment)) and the gate's `SourceRevisionId` pair after them, sent only when there is one: an object of texts of at most 64 names and 32 KiB of names and values together, the cap read from the parsed object before any pair is checked. A name is one or more printable ASCII characters (U+0021 to U+007E) but `=`; a value may hold anything but NUL.
@@ -3952,6 +3966,8 @@ Built verbs:
   On a pair run the step is followed by the repo's name (`gate: remote fetch <name> failed (status <n>)`), while the steps that ready a tree say `failed for <name>` as the preflight's do.
 
   After the fetch of `refs/gate/<key>` from the repo's bare repository, the probe runs `git cat-file -e <sha>^{commit}` in its tree. A non-zero exit prints `gate: remote snapshot <sha> is not in the work folder's repository after the fetch` (on a pair run `gate: remote snapshot <sha> is not in the repository of <name> after the fetch`) and exits 1, and a git that cannot start prints `gate: remote cat-file failed: <message>` (`cat-file <name> failed` on a pair run) and exits 1.
+
+  When the payload names a base for a repo (`Base`, or its `SiblingBases` entry), the same `git fetch` also takes `+refs/gate-base/<key>:refs/remotes/origin/<name>`, so `origin/<name>` resolves in that tree. The `HEAD` commit of the PC resolves through the tree's alternates with no fetch. A `refs/remotes/origin/<name>` left by an earlier run stays when a run sends no base.
 
   On a pair run every repo's back ref `refs/gate-back/<key>` is deleted before any checkout, so no repo keeps an earlier run's back commit whatever step of this run fails; a run of one repo deletes it in its checkout step.
 
@@ -4441,7 +4457,7 @@ Built verbs:
 
   The barrier is read before the sweep and again before each key: under a standing one each remaining key says `gate: remote kept {key}: the builder is drained` on stdout, and an unreadable barrier is `gate: remote prune failed: {why}` on stderr and exit 1.
 
-  For each key whose folder it set aside or found absent, still under the lock, it runs one `git update-ref --no-deref --stdin` in each bare repository `{root}\*.git`, deleting `refs/gate/{key}`, `refs/gate-bridge/{key}` and `refs/gate-back/{key}` themselves, never what a symbolic one points to.
+  For each key whose folder it set aside or found absent, still under the lock, it runs one `git update-ref --no-deref --stdin` in each bare repository `{root}\*.git`, deleting `refs/gate/{key}`, `refs/gate-bridge/{key}`, `refs/gate-back/{key}`, `refs/gate-base/{key}` and `refs/gate-head/{key}` themselves, never what a symbolic one points to.
 
   A `*.git` entry is used only when it is a plain folder holding `HEAD`, `objects` and `refs` (checked beneath a handle that is held, without sharing deletion, while git runs, so it cannot be renamed and swapped); a link, a plain file or a folder lacking any of the three is skipped.
 
@@ -4778,7 +4794,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
   **The keyed prune** removes exactly the keys given, in the order given, whatever their last use, makes a missing `work`, and prints `gate: remote pruned <key> (worktree gone)`, `gate: remote kept <key>: in use` (a held lock or a live group record) or `gate: remote could not prune <key>: <why>` on stderr, one line per key and no summary. It exits 1 when any key got a could-not line, else 0.
 
-  Under the key's lock and with its folder out of `work` (or absent) it deletes `refs/gate/<key>`, `refs/gate-bridge/<key>` and `refs/gate-back/<key>` in each `<root>/*.git` that is a plain folder (not a link) holding `HEAD`, `objects` and `refs`, one `git update-ref -d --no-deref <ref>` per ref, so a symbolic ref goes itself, not its target.
+  Under the key's lock and with its folder out of `work` (or absent) it deletes `refs/gate/<key>`, `refs/gate-bridge/<key>`, `refs/gate-back/<key>`, `refs/gate-base/<key>` and `refs/gate-head/<key>` in each `<root>/*.git` that is a plain folder (not a link) holding `HEAD`, `objects` and `refs`, one `git update-ref -d --no-deref <ref>` per ref, so a symbolic ref goes itself, not its target.
 
   Git runs `/usr/bin/git` with `core.hooksPath` pointed at a path that cannot exist and `core.fsmonitor=false`, so nothing in a bare repository runs. Every bare is tried; the first failure is the key's `its refs could not be removed: <why>`, and a key kept for a held lock or a failed rename keeps its refs.
 

@@ -891,6 +891,84 @@ impl Payload {
             .map(|sibling| commit(object.get(&sibling.name)).map_err(|shown| not_a_snapshot(&format!("SiblingSnapshots {}", sibling.name), &shown)))
             .collect()
     }
+
+    /// The main repo's default branch from the run's `Base`: `None` when it is absent or null, else a plain branch name
+    /// ([`is_branch_name`]); else the line saying why, the value shown as [`Payload::sibling_snapshots`] shows one.
+    pub fn base(&self) -> Result<Option<&str>, String> {
+        branch(self.object.get("Base")).map_err(|shown| format!("gate: box payload Base is not a branch name: {}", escaped(&shown)))
+    }
+
+    /// The default branch of each sibling of `pair`, in its order, from the run's `SiblingBases`, an object naming only
+    /// siblings of the pair, each value a plain branch name ([`is_branch_name`]); a sibling it does not name, a null
+    /// value, or no `SiblingBases` at all is `None`. Else the line saying why.
+    pub fn sibling_bases(&self, pair: &Pair) -> Result<Vec<Option<&str>>, String> {
+        let object = match self.object.get("SiblingBases") {
+            None | Some(Value::Null) => return Ok(vec![None; pair.siblings.len()]),
+            Some(Value::Object(object)) => object,
+            Some(_) => return Err("gate: box payload SiblingBases is not an object".to_owned()),
+        };
+        if let Some(name) = object.keys().find(|name| !pair.siblings.iter().any(|sibling| &sibling.name == *name)) {
+            return Err(format!(
+                "gate: box payload SiblingBases names {}, which is not a sibling of the Pair",
+                escaped(name)
+            ));
+        }
+        pair.siblings
+            .iter()
+            .map(|sibling| {
+                branch(object.get(&sibling.name)).map_err(|shown| {
+                    format!(
+                        "gate: box payload SiblingBases {} is not a branch name: {}",
+                        sibling.name,
+                        escaped(&shown)
+                    )
+                })
+            })
+            .collect()
+    }
+}
+
+/// The most bytes a default branch's name may hold.
+const MAX_BRANCH_BYTES: usize = 200;
+/// The ending git keeps for its lock files, which no branch name may end with, in any ASCII case, since a case-blind
+/// file system takes `x.LOCK` for `x.lock`.
+const LOCK_SUFFIX: &str = ".lock";
+
+/// A default branch's name from `value`: `None` when it is absent or null, the name when it is a plain branch name
+/// ([`is_branch_name`]); else the value as its refusal shows it, a string as itself and any other JSON as its text.
+fn branch(value: Option<&Value>) -> Result<Option<&str>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) if is_branch_name(text) => Ok(Some(text)),
+        Some(Value::String(text)) => Err(text.clone()),
+        Some(other) => Err(other.to_string()),
+    }
+}
+
+/// Whether `name` is a plain branch name the box may put under `refs/remotes/origin/`, which the PC checks before it
+/// sends one: 1 to [`MAX_BRANCH_BYTES`] bytes of ASCII letters, digits, `.`, `_`, `-` and `/`, not starting with `-`,
+/// ending with neither `/` nor `.`, holding no `..`, and each `/`-separated component a plain one
+/// ([`is_branch_component`]), as git's `check-ref-format` judges them.
+#[must_use]
+pub fn is_branch_name(name: &str) -> bool {
+    (1..=MAX_BRANCH_BYTES).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/'))
+        && !name.starts_with('-')
+        && !name.ends_with(['/', '.'])
+        && !name.contains("..")
+        && name.split('/').all(is_branch_component)
+}
+
+/// Whether `component`, one `/`-separated part of a branch name, is a plain one: not empty, not starting with `.`, and
+/// not ending with [`LOCK_SUFFIX`] in any ASCII case.
+fn is_branch_component(component: &str) -> bool {
+    !component.is_empty()
+        && !component.starts_with('.')
+        && !component
+            .get(component.len().saturating_sub(LOCK_SUFFIX.len())..)
+            .is_some_and(|end| end.eq_ignore_ascii_case(LOCK_SUFFIX))
 }
 
 /// The box path of every tree a run checks out in the work folder `work`: the main repo's, then each sibling's in the
@@ -3601,6 +3679,101 @@ mod tests {
         assert_eq!(sibling_snapshots(&json!({"lib": SHA, "tools": null})), refusing(""));
         assert_eq!(sibling_snapshots(&json!({"lib": SHA, "tools": 3})), refusing("3"));
         assert_eq!(sibling_snapshots(&json!({"lib": SHA, "tools": "\u{1b}"})), refusing(r"\u{1b}"));
+    }
+
+    /// The main repo's default branch the payload with `base` as its `Base` names; else the line refusing it.
+    fn base(base: &serde_json::Value) -> Result<Option<String>, String> {
+        let mut json = with_pair(json!({"Leaf": "app", "Siblings": ["lib", "tools"]}));
+        json["Base"] = base.clone();
+        let payload = decoded(&json.to_string())?;
+        payload.base().map(|name| name.map(str::to_owned))
+    }
+
+    /// The default branch of each sibling of a pair of `lib` and `tools` that `bases` names; else the line refusing
+    /// them.
+    fn sibling_bases(bases: &serde_json::Value) -> Result<Vec<Option<String>>, String> {
+        let mut json = with_pair(json!({"Leaf": "app", "Siblings": ["lib", "tools"]}));
+        json["SiblingBases"] = bases.clone();
+        let payload = decoded(&json.to_string())?;
+        let pair = payload.pair()?.ok_or("a pair is given")?;
+        payload
+            .sibling_bases(&pair)
+            .map(|names| names.into_iter().map(|name| name.map(str::to_owned)).collect())
+    }
+
+    #[test]
+    fn a_branch_name_is_accepted() {
+        for name in ["main", "release/1.2", "feat-x_y"] {
+            assert_eq!(base(&json!(name)), Ok(Some(name.to_owned())), "{name}");
+            assert_eq!(sibling_bases(&json!({ "tools": name })), Ok(vec![None, Some(name.to_owned())]), "{name}");
+        }
+        assert_eq!(base(&json!(null)), Ok(None), "null is none");
+        let absent = decoded(&with_pair(json!({"Leaf": "app", "Siblings": ["lib"]})).to_string());
+        assert_eq!(absent.map(|payload| payload.base() == Ok(None)), Ok(true), "no Base is none");
+        assert_eq!(sibling_bases(&json!(null)), Ok(vec![None, None]), "null is none for each");
+        assert_eq!(sibling_bases(&json!({"lib": null})), Ok(vec![None, None]), "a null name is none");
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_plain_branch_is_refused() {
+        let long = "a".repeat(201);
+        let bad = [
+            json!("-x"),
+            json!(".x"),
+            json!("/x"),
+            json!("x/"),
+            json!("x."),
+            json!("x.lock"),
+            json!("x.LOCK"),
+            json!("release/.next"),
+            json!("a.lock/b"),
+            json!("a/.b"),
+            json!("a/B.LOCK/c"),
+            json!("a..b"),
+            json!("a//b"),
+            json!("a b"),
+            json!("a:b"),
+            json!("a~1"),
+            json!("a^"),
+            json!(""),
+            json!(long),
+            json!(3),
+        ];
+        for value in bad {
+            let shown = value.as_str().map_or_else(|| value.to_string(), str::to_owned);
+            assert_eq!(
+                base(&value),
+                Err(format!("gate: box payload Base is not a branch name: {shown}")),
+                "{value}"
+            );
+            assert_eq!(
+                sibling_bases(&json!({ "tools": value })),
+                Err(format!("gate: box payload SiblingBases tools is not a branch name: {shown}")),
+                "{value}"
+            );
+        }
+        assert_eq!(
+            base(&json!("a\u{1b}")),
+            Err(r"gate: box payload Base is not a branch name: a\u{1b}".to_owned())
+        );
+        assert_eq!(base(&json!("a".repeat(200))), Ok(Some("a".repeat(200))), "200 bytes is the most");
+        assert_eq!(
+            sibling_bases(&json!(["main"])),
+            Err("gate: box payload SiblingBases is not an object".to_owned())
+        );
+    }
+
+    #[test]
+    fn sibling_bases_naming_a_non_sibling_is_refused() {
+        assert_eq!(
+            sibling_bases(&json!({"lib": "main", "app": "main"})),
+            Err("gate: box payload SiblingBases names app, which is not a sibling of the Pair".to_owned())
+        );
+        assert_eq!(
+            sibling_bases(&json!({"Lib": "main"})),
+            Err("gate: box payload SiblingBases names Lib, which is not a sibling of the Pair".to_owned()),
+            "a sibling's name exactly"
+        );
     }
 
     #[test]

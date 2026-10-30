@@ -523,34 +523,41 @@ fn sent_matched(request: &Request<'_>, held: &File, beat: &Beat<'_>, console: &m
 
 /// The main repo and the siblings of a run in the work folder `work`: with no `Pair`, the one repo of `bare` checked out
 /// at `snapshot` in `work` itself; with one, the main repo in `{work}\{leaf}` and each sibling in `{work}\{name}` with
-/// its own bare repository and its commit from `SiblingSnapshots`. Else the usage line.
+/// its own bare repository and its commit from `SiblingSnapshots`. Each repo's default branch is the main repo's `Base`
+/// or the sibling's from `SiblingBases`. Else the usage line.
 fn repos<'a>(payload: &'a Payload, work: &str, bare: &str, snapshot: &'a str) -> Result<(Repo<'a>, Vec<Repo<'a>>), String> {
+    let base = payload.base()?;
     let Some(pair) = payload.pair()? else {
         let (tree, _) = trees(work, None, PathForm::Windows);
-        return Ok((Repo::new(None, tree, bare, snapshot), Vec::new()));
+        return Ok((Repo::new(None, tree, bare, snapshot).based(base), Vec::new()));
     };
     let commits = payload.sibling_snapshots(&pair)?;
+    let bases = payload.sibling_bases(&pair)?;
     let names: Vec<&str> = pair.siblings().iter().map(PairSibling::name).collect();
     let (main_tree, sibling_trees) = trees(work, Some((pair.leaf(), &names)), PathForm::Windows);
-    let main = Repo::new(Some(pair.leaf()), main_tree, bare, snapshot);
+    let main = Repo::new(Some(pair.leaf()), main_tree, bare, snapshot).based(base);
     let siblings = pair
         .siblings()
         .iter()
         .zip(commits)
+        .zip(bases)
         .zip(sibling_trees)
-        .map(|((sibling, commit), tree)| Repo::new(Some(sibling.name()), tree, sibling.bare(), commit))
+        .map(|(((sibling, commit), base), tree)| Repo::new(Some(sibling.name()), tree, sibling.bare(), commit).based(base))
         .collect();
     Ok((main, siblings))
 }
 
 /// One repo of a run, made once as the payload is read: its name on a pair run, its tree, the bare repository its
-/// snapshot is fetched from and its back commit pushed to, and the commit checked out. Every git call in its tree names
-/// the tree's own `.git` and the tree ([`Repo::at`]), so no `core.worktree` and no repository above it is followed.
+/// snapshot is fetched from and its back commit pushed to, the commit checked out, and the PC's default branch, whose
+/// `refs/gate-base/<key>` the fetch names `refs/remotes/origin/<base>` in the tree, `None` for a repo the PC sent none
+/// of. Every git call in its tree names the tree's own `.git` and the tree ([`Repo::at`]), so no `core.worktree` and no
+/// repository above it is followed.
 struct Repo<'a> {
     name: Option<String>,
     tree: String,
     bare: String,
     snapshot: &'a str,
+    base: Option<&'a str>,
     git_dir: String,
     work_tree: String,
 }
@@ -564,7 +571,13 @@ impl<'a> Repo<'a> {
             tree,
             bare: bare.to_owned(),
             snapshot,
+            base: None,
         }
+    }
+
+    /// This repo with the default branch `base`.
+    fn based(self, base: Option<&'a str>) -> Repo<'a> {
+        Repo { base, ..self }
     }
 
     /// The options that point git at this repo's tree.
@@ -3532,10 +3545,17 @@ impl WorkGit {
     }
 
     /// The snapshot of `repo` fetched from its bare repository at `refs/gate/<key>`, and its commit found; else the
-    /// failure, the box's own line for a commit the repository lacks after the fetch.
+    /// failure, the box's own line for a commit the repository lacks after the fetch. A repo with a default branch has
+    /// `refs/gate-base/<key>` fetched in the same call as `refs/remotes/origin/<base>`, so the tree's `origin/<base>`
+    /// names the PC's.
     fn fetched(&self, request: &Request<'_>, repo: &Repo<'_>, console: &mut Console) -> Result<(), Failed> {
         let refname = format!("refs/gate/{}", request.key);
-        self.step("fetch", GitClass::Long, repo, &["fetch", "-q", &repo.bare, &refname], console)?;
+        let base = repo
+            .base
+            .map(|name| format!("+refs/gate-base/{}:refs/remotes/origin/{name}", request.key));
+        let mut args = vec!["fetch", "-q", &repo.bare, &refname];
+        args.extend(base.as_deref());
+        self.step("fetch", GitClass::Long, repo, &args, console)?;
         let commit = format!("{}^{{commit}}", repo.snapshot);
         let step = repo.step("cat-file");
         match self.quiet(repo, &step, &["cat-file", "-e", &commit], console) {

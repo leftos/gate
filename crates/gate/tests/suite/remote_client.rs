@@ -1482,6 +1482,141 @@ fn a_new_worktree_s_first_push_sends_only_its_difference() {
     );
 }
 
+/// A routed run pushes the PC's `HEAD` and its default branch as refs of the run's key beside the snapshot: the
+/// builder's bare holds each commit, and no branch or remote-tracking ref of the PC's.
+#[test]
+fn a_routed_push_carries_the_pc_head_and_origin_default_as_history_refs() {
+    let case = client_case("client-history-refs");
+    write(&case, "a.txt", "a\n");
+    git(&case, &["add", "-A"]);
+    git(&case, &["commit", "--quiet", "-m", "c1"]);
+    let base = git(&case, &["rev-parse", "HEAD"]);
+    git(&case, &["update-ref", "refs/remotes/origin/main", &base]);
+    git(&case, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
+    write(&case, "a.txt", "b\n");
+    git(&case, &["add", "-A"]);
+    git(&case, &["commit", "--quiet", "-m", "c2"]);
+    let head = git(&case, &["rev-parse", "HEAD"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "a"]));
+    let key = key_of(&events(&case));
+    let bare = bare_of(&case);
+    let pushed_base = builder_ref(&case, &format!("refs/gate-base/{key}"));
+    let pushed_head = builder_ref(&case, &format!("refs/gate-head/{key}"));
+    let branches = git_out(&case, &[], &["--git-dir", &bare, "for-each-ref", "refs/heads/"]);
+    let remotes = git_out(&case, &[], &["--git-dir", &bare, "for-each-ref", "refs/remotes/"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(pushed_base, base, "the builder's bare holds the PC's default branch");
+    assert_eq!(pushed_head, head, "and the PC's HEAD");
+    assert_eq!(branches, "", "no branch ref arrives");
+    assert_eq!(remotes, "", "no remote-tracking ref arrives");
+}
+
+/// Writes the routing file that sends the repo `repo`'s `*tool*` and `cmd *` commands to the builder, with `siblings`
+/// as its siblings when there are any.
+fn routed_with_cmd(case: &Case, repo: &str, siblings: &[&str]) {
+    let mut routing = json!({ "host": HOST, "slots": 2, "repos": { repo: ["*tool*", "cmd *"] }, "outputs": { repo: [] } });
+    if !siblings.is_empty() {
+        routing["siblings"] = json!({ repo: siblings });
+    }
+    write_remote_json(case, &routing.to_string());
+}
+
+/// Asserts the run of `steps` ended passing on the builder: its run call made, and no fallback.
+fn assert_ran_routed(case: &Case, steps: &Path, outcome: &Outcome) {
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(calls(steps).iter().any(|call| call == "run"), "the builder ran it: {outcome:?}");
+    assert_eq!(fallbacks(&events(case)), Vec::<&str>::new(), "no fallback: {outcome:?}");
+}
+
+/// A routed command sees the PC's `origin/main` by its name, at the PC's commit, and finds a commit of the PC's `HEAD`
+/// that `origin/main` lacks, in the builder's work folder.
+#[test]
+fn a_routed_command_resolves_origin_default_and_a_pc_head_commit() {
+    let case = client_case("client-history-resolves");
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    routed_with_cmd(&case, &repo, &[]);
+    write(&case, "a.txt", "a\n");
+    git(&case, &["add", "-A"]);
+    git(&case, &["commit", "--quiet", "-m", "c1"]);
+    let base = git(&case, &["rev-parse", "HEAD"]);
+    git(&case, &["update-ref", "refs/remotes/origin/main", &base]);
+    git(&case, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
+    write(&case, "a.txt", "b\n");
+    git(&case, &["add", "-A"]);
+    git(&case, &["commit", "--quiet", "-m", "c2"]);
+    let head = git(&case, &["rev-parse", "HEAD"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+    let command = [
+        "cmd",
+        "/d",
+        "/c",
+        "git",
+        "rev-parse",
+        "--verify",
+        "origin/main",
+        "&&",
+        "git",
+        "cat-file",
+        "-t",
+        &head,
+    ];
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &command));
+
+    assert_ran_routed(&case, &steps, &outcome);
+    let said: Vec<&str> = outcome.stdout.lines().map(str::trim).collect();
+    assert!(said.contains(&base.as_str()), "origin/main is the PC's: {outcome:?}");
+    assert!(said.contains(&"commit"), "the PC's HEAD is a commit there: {outcome:?}");
+}
+
+/// A repository with no origin ref sends its `HEAD` alone, there being no default branch to name.
+#[test]
+fn a_repo_with_no_origin_ref_pushes_only_its_head() {
+    let case = client_case("client-history-no-origin");
+    write(&case, "a.txt", "a\n");
+    git(&case, &["add", "-A"]);
+    git(&case, &["commit", "--quiet", "-m", "start"]);
+    let head = git(&case, &["rev-parse", "HEAD"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "a"]));
+    let key = key_of(&events(&case));
+    let pushed_base = builder_ref(&case, &format!("refs/gate-base/{key}"));
+    let pushed_head = builder_ref(&case, &format!("refs/gate-head/{key}"));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(pushed_base, "", "no default branch, so no base ref");
+    assert_eq!(pushed_head, head, "the PC's HEAD all the same");
+}
+
+/// A shallow clone sends neither history ref, a receiver refusing a push from one.
+#[test]
+fn a_shallow_repo_pushes_no_history_refs() {
+    let case = client_case("client-history-shallow");
+    write(&case, "a.txt", "a\n");
+    git(&case, &["add", "-A"]);
+    git(&case, &["commit", "--quiet", "-m", "start"]);
+    let head = git(&case, &["rev-parse", "HEAD"]);
+    git(&case, &["update-ref", "refs/remotes/origin/main", &head]);
+    git(&case, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
+    fs::write(case.folder().join(".git").join("shallow"), format!("{head}\n")).expect("the shallow file can be written");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "a"]));
+    let key = key_of(&events(&case));
+    let pushed_base = builder_ref(&case, &format!("refs/gate-base/{key}"));
+    let pushed_head = builder_ref(&case, &format!("refs/gate-head/{key}"));
+    let snapshot = builder_ref(&case, &format!("refs/gate/{key}"));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(is_sha(&snapshot), "the snapshot is pushed all the same: {outcome:?}");
+    assert_eq!(pushed_base, "", "no base ref from a shallow clone");
+    assert_eq!(pushed_head, "", "no head ref from a shallow clone");
+}
+
 /// A worktree whose runs alternate between `builder-a` and `host` bridges each push on the snapshot that builder last
 /// received, kept at a ref of its own: going back to `builder-a` after `host` sends only the difference, never host's
 /// snapshot and its whole tree.
@@ -2984,6 +3119,76 @@ fn a_pair_s_new_sibling_bare_takes_no_bridge_while_the_main_one_does() {
         "",
         "the main one's bridge: {outcome:?}"
     );
+}
+
+/// A pair's each repository sends its own history to its own bare: the sibling's base is its `origin/main` and its head
+/// its `HEAD`, and the main repository's head is its own.
+#[test]
+fn a_pair_pushes_each_repo_s_history_into_its_own_bare() {
+    let (case, _, name, sibling) = pair_case("client-pair-history", &[], sibling_repository);
+    write(&case, "a.txt", "a\n");
+    git(&case, &["add", "-A"]);
+    git(&case, &["commit", "--quiet", "-m", "main"]);
+    let head = git(&case, &["rev-parse", "HEAD"]);
+    let at = shown(&sibling);
+    git(&case, &["-C", &at, "add", "-A"]);
+    git(&case, &["-C", &at, "commit", "--quiet", "-m", "parent"]);
+    let base = git(&case, &["-C", &at, "rev-parse", "HEAD"]);
+    git(&case, &["-C", &at, "update-ref", "refs/remotes/origin/main", &base]);
+    git(
+        &case,
+        &["-C", &at, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+    );
+    fs::write(sibling.join("lib.txt"), "lib b\n").expect("the sibling's file can be changed");
+    git(&case, &["-C", &at, "add", "-A"]);
+    git(&case, &["-C", &at, "commit", "--quiet", "-m", "head"]);
+    let sibling_head = git(&case, &["-C", &at, "rev-parse", "HEAD"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "a"]));
+    let key = key_of(&events(&case));
+    let pushed_base = sibling_builder_ref(&case, &name, &format!("refs/gate-base/{key}"));
+    let pushed_head = sibling_builder_ref(&case, &name, &format!("refs/gate-head/{key}"));
+    let main_head = builder_ref(&case, &format!("refs/gate-head/{key}"));
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(pushed_base, base, "the sibling's origin default is its base");
+    assert_eq!(pushed_head, sibling_head, "and its HEAD its head");
+    assert_eq!(main_head, head, "the main repository's own HEAD, in its own bare");
+}
+
+/// A pair's sibling whose origin's default branch is `trunk` sees its own `origin/trunk` in its tree on the builder,
+/// though the main repository has no origin at all.
+#[test]
+fn a_pair_s_sibling_resolves_its_own_origin_default() {
+    let (case, leaf, name, sibling) = pair_case("client-pair-history-resolves", &[], sibling_repository);
+    routed_with_cmd(&case, &repo_name(&leaf), &[&name]);
+    write(&case, "a.txt", "a\n");
+    git(&case, &["add", "-A"]);
+    git(&case, &["commit", "--quiet", "-m", "main"]);
+    let at = shown(&sibling);
+    git(&case, &["-C", &at, "add", "-A"]);
+    git(&case, &["-C", &at, "commit", "--quiet", "-m", "trunk"]);
+    let trunk = git(&case, &["-C", &at, "rev-parse", "HEAD"]);
+    git(&case, &["-C", &at, "update-ref", "refs/remotes/origin/trunk", &trunk]);
+    git(
+        &case,
+        &["-C", &at, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk"],
+    );
+    fs::write(sibling.join("lib.txt"), "lib b\n").expect("the sibling's file can be changed");
+    git(&case, &["-C", &at, "add", "-A"]);
+    git(&case, &["-C", &at, "commit", "--quiet", "-m", "head"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let tree = format!(r"..\{name}");
+    let command = ["cmd", "/d", "/c", "git", "-C", &tree, "rev-parse", "--verify", "origin/trunk"];
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &command));
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+
+    assert_ran_routed(&case, &steps, &outcome);
+    let said: Vec<&str> = outcome.stdout.lines().map(str::trim).collect();
+    assert!(said.contains(&trunk.as_str()), "the sibling's origin/trunk is its own: {outcome:?}");
 }
 
 /// `--test-remote-snapshot` snapshots every repository of a pair, the main one first: one line a repository, each

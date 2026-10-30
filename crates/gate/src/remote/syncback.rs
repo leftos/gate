@@ -2271,6 +2271,8 @@ mod tests {
             commit: SNAPSHOT.to_owned(),
             bridge: None,
             objects: objects.clone(),
+            head: None,
+            base: None,
         };
         let target = Target::new(routed("app", &root), "app", &snapshot, "app-1a2b3c4d");
         let worktree = Worktree {
@@ -3099,6 +3101,8 @@ mod tests {
             commit: snapshot,
             bridge: None,
             objects,
+            head: None,
+            base: None,
         };
         (root, snapshot, back.trim_end().to_owned(), quarantine)
     }
@@ -3228,6 +3232,8 @@ mod tests {
             commit: SNAPSHOT.to_owned(),
             bridge: None,
             objects: objects.clone(),
+            head: None,
+            base: None,
         };
         let target = Target::new(routed("app", &shown), "app", &snapshot, KEY);
         let worktree = Worktree {
@@ -3310,6 +3316,8 @@ mod tests {
                         commit,
                         bridge: None,
                         objects: root.join(".git/objects"),
+                        head: None,
+                        base: None,
                     },
                 )
             });
