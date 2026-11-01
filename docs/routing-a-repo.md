@@ -242,6 +242,12 @@ Routed runs go to the builder from a new worktree's first run, warm or not: the 
 
 The engine is not in the worktree and not on the builder's `PATH`: the builder holds its engines side by side under `GATE_UNREAL_ROOT`, one subfolder per version named `x.y.z`, each with `Engine\Build\Build.version` ([design.md, Tool probes](design.md#the-box-side)). The engine install is not part of `tools/builder/install-toolchains.ps1`: a session installs an engine by hand over ssh. `gate check --builder` shows the versions it lists.
 
+- **Installing an engine on a Windows builder.** An engine is about 30 GB in about 260,000 files, and a plain `tar` or `scp -r` stream of that many small files crawls (4.5 MB/s against the link's 43 MB/s, measured for 5.8.3).
+  - Copy the PC's install with claude-config's `tools/builder-copy/builder-copy.ps1` (`-Source <the PC's UE_5.x folder> -Dest C:\unreal\<x.y.z>`), or pack it with 7-Zip on the PC (`-mx=1`, 30.3 GB to 11.8 GB), send the one archive, and unpack it on the builder.
+  - A remote unpack run under the gate needs output on its console (7-Zip's `-bsp1`): an ssh command shows no CPU on the PC, so a silent one is killed as `STALLED`, while the remote process runs on.
+  - Before the copy, exclude the root from Defender (`Add-MpPreference -ExclusionPath C:\unreal`, as `C:\godot` is). Once the copy holds, set `GATE_UNREAL_ROOT` machine-wide to the root, and give the root the write-deny for the builder user that the installer's `Add-BuilderWriteDeny` puts on the Godot root.
+  - Check it with `gate check --builder` from a repo whose `.gate/toolchain.toml` pins the version: `unreal <x.y.z> ok (needs <pin> exactly)`.
+
 - **The pin.** The repo pins the engine in `.gate/toolchain.toml`, `unreal = "5.8"`, an exact pin like godot's: `"5.8"` takes any 5.8.x and `""` any version. A builder without a matching engine keeps the run here with the mismatch line. The gate picks the highest matching engine and the box sets `UE_ROOT` to its folder for every command of the run.
 
   A repo whose build reads another variable for the engine (ue-mcp's `UE_MCP_TEST_ENGINE_ROOT`) names it in the manifest's `[env]` table, `UE_MCP_TEST_ENGINE_ROOT = "unreal"`, and the box sets it to the same folder; a PC engine path passed with `--env` is not rewritten for the builder, and `UE_ROOT` itself is refused there. `gate check` shows an `[env]` entry the gate cannot use.
