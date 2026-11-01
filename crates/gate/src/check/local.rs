@@ -301,6 +301,7 @@ fn checked(place: &Place, seams: &CheckSeams) -> Checked {
         (tools, sdk)
     });
     let hooks_problem = hooks_problem(&repo);
+    let commits_problem = commits_problem(&repo);
     let desktop_session_problem = desktop_session_problem(&repo);
     let cross_build_problems = cross_build_problems();
     let (allowed, consent_problem) = match allowed_siblings(&repo) {
@@ -327,6 +328,7 @@ fn checked(place: &Place, seams: &CheckSeams) -> Checked {
         workloads: declared.manifest.workloads,
         consent_problem,
         hooks_problem,
+        commits_problem,
         desktop_session_problem,
         cross_build_problems,
         root_problem: None,
@@ -718,6 +720,16 @@ fn hooks_problem(repo: &str) -> Option<String> {
         return None;
     };
     config.hooks_allowed(repo).err().map(str::to_owned)
+}
+
+/// Why this PC's routing file's `commits` value cannot be used, if it cannot: the reason the router's `commits_allowed`
+/// gives, whatever the repo. A routing file that cannot be read at all is no such problem, as its own line says it.
+fn commits_problem(repo: &str) -> Option<String> {
+    let path = route::remote_json_path(std::env::var_os("LOCALAPPDATA").as_deref())?;
+    let Ok(Some(config)) = route::read_remote_json(&path) else {
+        return None;
+    };
+    config.commits_allowed(repo).err().map(str::to_owned)
 }
 
 /// Why this PC's routing file's `desktopSession` value cannot be used, if it cannot: the reason the router's

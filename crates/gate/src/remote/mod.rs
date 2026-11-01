@@ -53,7 +53,7 @@ pub(crate) mod payload;
 mod retry;
 pub(crate) mod siblings;
 mod snapshot;
-mod syncback;
+pub(crate) mod syncback;
 #[cfg(feature = "test-seams")]
 mod tamper;
 #[cfg_attr(

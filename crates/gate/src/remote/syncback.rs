@@ -1270,12 +1270,24 @@ fn written_blobs(listing: &str) -> Vec<Written<'_>> {
 
 /// Every path a back commit's `diff-tree -r -z --raw` `listing` names, in its order: what it writes, what it deletes,
 /// and a rename's or a copy's source, each of which `git apply` reads from the worktree through its clean filter.
-fn listed_paths(listing: &str) -> Vec<&str> {
+pub(crate) fn listed_paths(listing: &str) -> Vec<&str> {
     entries(listing).into_iter().flat_map(|entry| entry.paths).collect()
 }
 
 /// The attributes `git check-attr` is asked of each listed path, in the order it answers them.
 const ATTRIBUTES: [&str; 6] = ["filter", "ident", "working-tree-encoding", "text", "eol", "crlf"];
+/// The arguments of the `git check-attr` call that reads [`ATTRIBUTES`] of the paths fed on its standard input.
+pub(crate) const CHECK_ATTR_ARGS: [&str; 9] = [
+    "check-attr",
+    "-z",
+    "--stdin",
+    ATTRIBUTES[0],
+    ATTRIBUTES[1],
+    ATTRIBUTES[2],
+    ATTRIBUTES[3],
+    ATTRIBUTES[4],
+    ATTRIBUTES[5],
+];
 /// The bytes `git check-attr -z` is allowed per attribute of a path beside the path itself: two NULs, the attribute's
 /// name and its value, with room to spare, so that each slice of paths it is fed answers well under the runner's cap.
 /// An answer that is larger even so fails closed: the runner's over-cap failure ends the run, the back commit kept.
@@ -1300,7 +1312,7 @@ const ENCODED_WEIGHT: u64 = 4;
 /// The checkout attributes of one listed path, as `git check-attr` gives them: `unspecified`, `set`, `unset` or the
 /// value.
 #[derive(Debug, PartialEq, Eq)]
-struct Attributes {
+pub(crate) struct Attributes {
     filter: String,
     ident: String,
     encoding: String,
@@ -1313,17 +1325,7 @@ struct Attributes {
 /// its own `.git/info/attributes` counts as the apply would read it, fed the paths in slices whose answers stay under
 /// the runner's cap. An answer that does not give each attribute of each path is the run's failure.
 fn attributes(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, paths: &[&str]) -> Result<Vec<Attributes>, End> {
-    let args = [
-        "check-attr",
-        "-z",
-        "--stdin",
-        ATTRIBUTES[0],
-        ATTRIBUTES[1],
-        ATTRIBUTES[2],
-        ATTRIBUTES[3],
-        ATTRIBUTES[4],
-        ATTRIBUTES[5],
-    ];
+    let args = CHECK_ATTR_ARGS;
     let mut read = Vec::with_capacity(paths.len());
     for slice in attribute_slices(paths, SLICE_CAP) {
         let fed: String = slice.iter().flat_map(|path| [*path, "\0"]).collect();
@@ -1340,7 +1342,7 @@ fn attributes(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, paths: &[&str]
 
 /// `paths` cut into slices, in order, each holding as many paths as `git check-attr` can answer within `cap` bytes,
 /// [`ATTRIBUTE_ROOM`] allowed for each attribute beside the path; a path that alone needs more is a slice of its own.
-fn attribute_slices<'a>(paths: &'a [&'a str], cap: usize) -> Vec<&'a [&'a str]> {
+pub(crate) fn attribute_slices<'a>(paths: &'a [&'a str], cap: usize) -> Vec<&'a [&'a str]> {
     slices_asking(paths, ATTRIBUTES.len(), cap)
 }
 
@@ -1369,7 +1371,7 @@ pub(super) fn slices_asking<'a>(paths: &'a [&'a str], attributes: usize, cap: us
 
 /// The attributes of each of `paths` from `git check-attr -z`'s `answer`: a `path`, attribute, value triple for each
 /// attribute of [`ATTRIBUTES`] of each path, in their order; else why the answer cannot be read.
-fn read_attributes(answer: &str, paths: &[&str]) -> Result<Vec<Attributes>, String> {
+pub(crate) fn read_attributes(answer: &str, paths: &[&str]) -> Result<Vec<Attributes>, String> {
     let values = attribute_values(answer, paths, ATTRIBUTES)?;
     Ok(values
         .into_iter()
@@ -1415,14 +1417,14 @@ fn is_given(value: &str) -> bool {
 
 /// Whether the config `git config -z --list` gave as `listed` defines a filter driver named `unspecified` or `unset`,
 /// which a path's `filter` names in the words `git check-attr` says of an attribute not given.
-fn names_odd_driver(listed: &str) -> bool {
+pub(crate) fn names_odd_driver(listed: &str) -> bool {
     listed.split('\0').any(|entry| ODD_DRIVERS.iter().any(|start| entry.starts_with(start)))
 }
 
 /// The first of `paths`, in its order, that the apply would read or write through a checkout filter, with the
 /// attribute `attributes` gives it; `None` when no path is. `odd_driver` says whether the config defines a driver named
 /// as an attribute not given reads.
-fn filtered<'a>(paths: &[&'a str], attributes: &[Attributes], odd_driver: bool) -> Option<(&'a str, String)> {
+pub(crate) fn filtered<'a>(paths: &[&'a str], attributes: &[Attributes], odd_driver: bool) -> Option<(&'a str, String)> {
     paths
         .iter()
         .zip(attributes)
@@ -1830,7 +1832,7 @@ fn advertised(lines: &[String], reference: &str) -> Option<String> {
 /// component whose name starts with `.git`, its letter case aside, a `.lfsconfig` at any depth, which git-lfs reads
 /// from the worktree, either named as Windows opens it or by a name shaped as its 8.3 alias, or one the back commit
 /// makes a symbolic link or a submodule. `None` when every path may be written.
-fn forbidden(listing: &str) -> Option<String> {
+pub(crate) fn forbidden(listing: &str) -> Option<String> {
     entries(listing).into_iter().find_map(|entry| {
         let link = LINK_MODES.contains(&entry.new_mode);
         entry

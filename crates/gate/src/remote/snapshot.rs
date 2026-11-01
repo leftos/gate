@@ -363,6 +363,21 @@ fn worktree_tree(calls: &Calls<'_>) -> Result<(String, GitPaths), GitError> {
     removed.map(|()| (tree, paths))
 }
 
+/// The tree of the worktree's staged index at `root`, written by `git write-tree` through a copy of the index with
+/// nothing added, which is removed however the write ends: the real index is never written. A repository with no index
+/// gives the empty tree.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "nothing outside the tests writes the tree of a worktree's staged index yet")
+)]
+fn index_tree(calls: &Calls<'_>) -> Result<String, GitError> {
+    let paths = paths(calls, &stage_copy_name(std::process::id()))?;
+    let tree = staged_tree(calls, &paths.index, &paths.copy);
+    let removed = remove_leftovers(&paths.copy);
+    let tree = tree?;
+    removed.map(|()| tree)
+}
+
 /// The index, the index copy and the object store of the worktree's repository, and what the call that named them says
 /// of its history: whether it is a shallow clone, and the commit of its born `HEAD`, `None` for an unborn one.
 struct GitPaths {
@@ -430,21 +445,36 @@ fn is_commit(text: &str) -> bool {
 
 /// `git add -A` and `git write-tree` on `copy`, a fresh copy of `index`; with no index, git starts from an empty one.
 fn write_tree(calls: &Calls<'_>, index: &Path, copy: &Path) -> Result<String, GitError> {
-    remove_leftovers(copy)?;
-    match fs::copy(index, copy) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound && !index.exists() => {}
-        Err(error) => {
-            return Err(GitError::Failed(format!(
-                "cannot copy the index {} to {}: {error}",
-                index.display(),
-                copy.display()
-            )));
-        }
-    }
+    copy_index(index, copy)?;
     let env: [(&str, &OsStr); 1] = [("GIT_INDEX_FILE", copy.as_os_str())];
     calls.output(&["add", "-A"], &env, &[])?;
     calls.first_line(&["write-tree"], &env, &[])
+}
+
+/// `git write-tree` on `copy`, a fresh copy of `index`, with nothing added; with no index, git starts from an empty one.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "only the staged index's tree, which nothing outside the tests asks for, writes it")
+)]
+fn staged_tree(calls: &Calls<'_>, index: &Path, copy: &Path) -> Result<String, GitError> {
+    copy_index(index, copy)?;
+    let env: [(&str, &OsStr); 1] = [("GIT_INDEX_FILE", copy.as_os_str())];
+    calls.first_line(&["write-tree"], &env, &[])
+}
+
+/// Copies `index` to `copy`, removing any copy and lock left there first; a missing index leaves no copy, which git
+/// reads as an empty index.
+fn copy_index(index: &Path, copy: &Path) -> Result<(), GitError> {
+    remove_leftovers(copy)?;
+    match fs::copy(index, copy) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !index.exists() => Ok(()),
+        Err(error) => Err(GitError::Failed(format!(
+            "cannot copy the index {} to {}: {error}",
+            index.display(),
+            copy.display()
+        ))),
+    }
 }
 
 /// Removes the index copy `copy` and the lock git makes beside it: a git killed at its limit would leave a lock that
@@ -470,6 +500,16 @@ fn lock_of(copy: &Path) -> PathBuf {
 /// The index copy's name in the git folder, for the process `pid`.
 fn copy_name(pid: u32) -> String {
     format!("gate-remote-{pid}.index")
+}
+
+/// The staged index copy's name in the git folder, for the process `pid`: another than [`copy_name`]'s, so the two
+/// never share a file.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "only the staged index's tree, which nothing outside the tests asks for, names it")
+)]
+fn stage_copy_name(pid: u32) -> String {
+    format!("gate-remote-{pid}-stage.index")
 }
 
 /// A path `git rev-parse --git-path` printed, read against the worktree `root` it was asked in.
@@ -506,10 +546,10 @@ mod tests {
     use std::slice;
 
     use super::{
-        Bounded, DATES, IDENTITY, asked, copy_name, default_branch, git_path, lock_of, place_of, previous, repository, save, snapshot_ref, take,
-        worktree,
+        Bounded, Calls, DATES, IDENTITY, asked, copy_name, default_branch, git_path, index_tree, lock_of, place_of, previous, repository, save,
+        snapshot_ref, take, worktree,
     };
-    use crate::remote::git::{GIT_BOUNDS, GitError};
+    use crate::remote::git::{GIT_BOUNDS, Git, GitError};
 
     const OWN: &str = "app-1a2b3c4d";
 
@@ -792,6 +832,62 @@ mod tests {
         );
         fs::write(root.join("b.txt"), "c\n").expect("a file can be changed");
         assert_ne!(worktree(&root, GIT_BOUNDS, None).expect("the tree is written again"), tree, "read afresh");
+        fs::remove_dir_all(&root).expect("the repository can be removed");
+    }
+
+    /// The tree of the staged index of the repository at `root`.
+    fn staged_index_tree(root: &Path) -> String {
+        let git = Git::find(root).expect("git is found");
+        index_tree(&Calls::new(&git, root, &[], GIT_BOUNDS, None)).expect("the index's tree is written")
+    }
+
+    /// The staged index's tree holds what is staged, not the worktree's unstaged edits or untracked files, and leaves the
+    /// real index and no copy of it behind.
+    #[test]
+    fn the_index_tree_is_what_is_staged_and_leaves_the_index_as_it_was() {
+        let root = repository("index-tree");
+        asked(&root, &["add", "a.txt"]).expect("a.txt is staged");
+        fs::write(root.join("a.txt"), "b\n").expect("a file can be changed");
+        fs::write(root.join("c.txt"), "c\n").expect("a file can be written");
+        let index = root.join(".git").join("index");
+        let before = fs::read(&index).expect("the index can be read");
+
+        let tree = staged_index_tree(&root);
+
+        fs::write(root.join("staged.txt"), "a\n").expect("a file can be written");
+        let blob = asked(&root, &["hash-object", "--no-filters", "staged.txt"]).expect("git hashes the text");
+        let listed = asked(&root, &["ls-tree", &tree]).expect("git lists the tree");
+        assert_eq!(
+            listed.trim_end(),
+            format!("100644 blob {}\ta.txt", blob.trim_end()),
+            "a.txt as staged, no c.txt"
+        );
+        assert_ne!(
+            worktree(&root, GIT_BOUNDS, None).expect("the worktree tree is written"),
+            tree,
+            "the worktree's tree holds the unstaged edit"
+        );
+        assert_eq!(fs::read(&index).expect("the index can be read"), before, "the real index is unchanged");
+        assert_eq!(stage_copies_left(&root), Vec::<String>::new(), "no index copy or lock is left behind");
+        fs::remove_dir_all(&root).expect("the repository can be removed");
+    }
+
+    /// The files in the git folder of the repository at `root` named as a staged index copy or its lock.
+    fn stage_copies_left(root: &Path) -> Vec<String> {
+        fs::read_dir(root.join(".git"))
+            .expect("the git folder can be listed")
+            .map(|entry| entry.expect("an entry can be read").file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("gate-remote-") && name.contains("-stage.index"))
+            .collect()
+    }
+
+    #[test]
+    fn a_repository_with_no_index_has_the_empty_tree_staged() {
+        let root = repository("index-tree-none");
+        assert!(!root.join(".git").join("index").exists(), "a new repository has no index");
+
+        assert_eq!(staged_index_tree(&root), "4b825dc642cb6eb9a060e54bf8d69288fbee4904");
+        assert_eq!(stage_copies_left(&root), Vec::<String>::new(), "no index copy or lock is left behind");
         fs::remove_dir_all(&root).expect("the repository can be removed");
     }
 

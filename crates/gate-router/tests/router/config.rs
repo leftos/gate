@@ -544,6 +544,55 @@ fn hooks_absent_consents_no_repo() {
     assert!(!config.hooks_name_a_repo(), "no key names no repo");
 }
 
+/// The routing file listing `g` with `commits` holding `value`.
+fn commits_file(value: &str) -> Config {
+    Config::parse(&format!(
+        r#"{{"host": "builder-1", "slots": 2, "repos": {{"g": ["x"]}}, "siblings": {{"g": ["b"]}}, "commits": {value}}}"#
+    ))
+    .expect("routing reads the file whatever commits holds")
+}
+
+#[test]
+fn commits_names_a_repo_in_any_letter_case() {
+    let config = commits_file(r#"["Yaat", "gate"]"#);
+
+    assert_eq!(config.commits_allowed("yaat"), Ok(true), "the repo name in any case");
+    assert_eq!(config.commits_allowed("GATE"), Ok(true), "the repo name in any case");
+    assert_eq!(config.commits_allowed("g"), Ok(false), "a repo it does not list");
+    assert_eq!(config.hooks_allowed("yaat"), Ok(false), "commits is no hooks consent");
+    let empty = commits_file("[]");
+    assert_eq!(empty.commits_allowed("g"), Ok(false), "an empty list");
+    let keyed = Config::parse(r#"{"host": "builder-1", "repos": {}, "Commits": ["g"]}"#).expect("usable");
+    assert_eq!(keyed.commits_allowed("g"), Ok(true), "the key in any case");
+}
+
+#[test]
+fn commits_absent_consents_no_repo() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"g": ["x"]}, "hooks": ["g"]}"#).expect("usable");
+
+    assert_eq!(config.commits_allowed("g"), Ok(false), "hooks is no commits consent");
+}
+
+#[test]
+fn an_unusable_commits_value_consents_no_repo_and_keeps_the_rest_of_the_file() {
+    for (value, problem) in [
+        (r#"{"g": true}"#, "commits must be an array of repo names"),
+        (r#""g""#, "commits must be an array of repo names"),
+        ("null", "commits must be an array of repo names"),
+        (r#"["g", ""]"#, "commits[1] is not a non-empty string"),
+        (r#"["g", 3]"#, "commits[1] is not a non-empty string"),
+        (r#"[["g"]]"#, "commits[0] is not a non-empty string"),
+    ] {
+        let config = commits_file(value);
+        assert_eq!(config.commits_allowed("g"), Err(problem), "{value}");
+        assert_eq!(config.host(), "builder-1", "{value}");
+        assert_eq!(config.slots(), 2, "{value}");
+        assert_eq!(pattern_texts(&config, "g"), ["x"], "{value}");
+        assert_eq!(config.allowed_siblings("g"), Ok(&["b".to_owned()][..]), "{value}");
+        assert_eq!(config.hooks_allowed("g"), Ok(false), "{value}");
+    }
+}
+
 /// The routing file listing `g` with `sendBuild` holding `value`.
 fn send_build_file(value: &str) -> Config {
     Config::parse(&format!(

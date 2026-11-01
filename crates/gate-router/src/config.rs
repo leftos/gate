@@ -107,6 +107,9 @@ pub struct Config {
     /// The repo names whose gates started inside a git hook may route, or why `hooks` cannot be used, which consents to
     /// none.
     hooks: Result<Vec<String>, String>,
+    /// The repo names whose commits' pre-commit hook stage may route, or why `commits` cannot be used, which consents to
+    /// none.
+    commits: Result<Vec<String>, String>,
     /// The repo names whose routed `dotnet test --no-build` may send the PC's build, or why `sendBuild` cannot be used,
     /// which lets none.
     send_build: Result<Vec<String>, String>,
@@ -156,7 +159,8 @@ impl Config {
     /// [`Config::warmup_consented`] gives its reason, and a bad `desktop`, allowing no desktop pattern, and
     /// [`Config::allowed_desktop`] gives its reason, and a bad `desktopSession`, allowing no session pattern, and
     /// [`Config::allowed_desktop_session`] gives its reason, and a bad `hooks`, consenting to no hook routing, and
-    /// [`Config::hooks_allowed`] gives its reason, and a bad `sendBuild`, letting no repo send its build, and
+    /// [`Config::hooks_allowed`] gives its reason, and a bad `commits`, consenting to no commit's hook stage routing, and
+    /// [`Config::commits_allowed`] gives its reason, and a bad `sendBuild`, letting no repo send its build, and
     /// [`Config::send_build_allowed`] gives its reason, and a bad `declarations`, naming no folder, and
     /// [`Config::declarations_folder`] gives its reason. A `builders` entry's bad `crossBuild` (no object, on an entry
     /// whose `os` is not `macos`, a value that is no string or no runtime identifier, or a repo without a non-empty
@@ -206,6 +210,7 @@ impl Config {
             desktop: read_desktop_consent(&data, "desktop"),
             desktop_session: read_desktop_consent(&data, "desktopSession"),
             hooks: read_hooks_consent(&data),
+            commits: read_commits_consent(&data),
             send_build: read_names(&data, "sendBuild"),
             declarations: read_declarations(&data),
         })
@@ -282,6 +287,20 @@ impl Config {
     /// the file is read whatever it holds.
     pub fn hooks_allowed(&self, repo: &str) -> Result<bool, &str> {
         match &self.hooks {
+            Err(problem) => Err(problem),
+            Ok(names) => Ok(names.iter().any(|name| eq_ignoring_case(name, repo))),
+        }
+    }
+
+    /// Whether `commits` lets a commit of `repo` route its pre-commit hook stage, its repo name matched in any letter
+    /// case: `false` when it does not name the repo or there is no such key.
+    ///
+    /// # Errors
+    ///
+    /// Why `commits` cannot be used: not an array of non-empty strings. Such a value consents to no repo, and the rest of
+    /// the file is read whatever it holds.
+    pub fn commits_allowed(&self, repo: &str) -> Result<bool, &str> {
+        match &self.commits {
             Err(problem) => Err(problem),
             Ok(names) => Ok(names.iter().any(|name| eq_ignoring_case(name, repo))),
         }
@@ -1013,6 +1032,12 @@ fn read_warmup_consent(data: &Map<String, Value>) -> Result<Vec<String>, String>
 /// is missing.
 fn read_hooks_consent(data: &Map<String, Value>) -> Result<Vec<String>, String> {
     read_names(data, "hooks")
+}
+
+/// The `commits` list: the repo names whose commits' pre-commit hook stage may route, in file order; none when the key
+/// is missing.
+fn read_commits_consent(data: &Map<String, Value>) -> Result<Vec<String>, String> {
+    read_names(data, "commits")
 }
 
 /// The list of repo names at `key`, in file order; none when the key is missing. A value that is no array, or an entry

@@ -238,6 +238,8 @@ A heavy gate started inside a git hook stays local silently unless `remote.json`
 
 The key is for check-only hook commands (a build, clippy, a format check). A routed fixer's patch comes back to the worktree under prek's stash, so a fixing hook stays local.
 
+A second array, `commits`, names the repos whose commit's pre-commit hook stage may route as one run, read like `hooks` (a bad value consents to no repo and `gate check` says it). No commit routes by it yet ([design.md, remote.json](design.md#remotejson)).
+
 The hook entry calls the repo's launcher, `pwsh -NoProfile -File tools/gate.ps1 run ... -- <heavy command>`, never a bare `gate run`, as every other call does (scripts, docs and agents' own commands alike): a hook runs on every machine that commits, and on a clone without gate.exe the launcher runs the command directly. The repo's patterns must match that command.
 
 The `git commit` that runs the hook is gated on `--slot heavy` when its hooks build or run analyzers, else on `--slot light`: the commit holds that slot for all its hooks, and a `--slot none` commit runs on a light slot and says to pass one of the two.

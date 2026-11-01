@@ -430,7 +430,7 @@ Each sibling the repo declares is checked as routing checks it, and gets one lin
 
 When the repo declares siblings and `remote.json` lists the repo but its `siblings` value cannot be used, the line `check: here: remote.json: <problem>` (control characters escaped, counted missing) comes before the sibling lines, and every sibling is not allowed. A repo that declares none says nothing of it.
 
-A `desktopSession` value of `remote.json` that cannot be used is said the same way, `check: <where>: remote.json: <problem>` counted missing, whatever the repo.
+A `desktopSession` value of `remote.json` that cannot be used is said the same way, `check: <where>: remote.json: <problem>` counted missing, whatever the repo. So is a `commits` value that cannot be used, right after the `hooks` one.
 
 #### The warm-up items
 
@@ -1495,7 +1495,7 @@ Two rolls within one second collide on the archive name: the second archive fail
 
 ### remote.json
 
-`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos`, the optional `data`, the optional `builders` and the optional per-repo `outputs`, `failureOutputs`, `inputs`, `siblings` and `desktop` and the optional `warmup`, `hooks`, `sendBuild` and `declarations`, read afresh by each routed gate and ignored as a whole with one line when unusable.
+`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos`, the optional `data`, the optional `builders` and the optional per-repo `outputs`, `failureOutputs`, `inputs`, `siblings` and `desktop` and the optional `warmup`, `hooks`, `commits`, `sendBuild` and `declarations`, read afresh by each routed gate and ignored as a whole with one line when unusable.
 
 A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`).
 
@@ -1541,6 +1541,24 @@ A value that is not an array of non-empty strings consents to none and leaves th
 `hooks` is an array of repo names, matched in any letter case, whose heavy gates started inside a git hook (`GIT_INDEX_FILE` set and non-empty) may route (`Config::hooks_allowed`, `Config::hooks_name_a_repo`). A hook gate of a repo it names routes like any heavy gate, with the remote-tagged `queue`, `take` and `release` and the usual routed lines. One of a repo it does not name stays local silently, as does every hook gate when the key is absent, empty or unusable.
 
 A value that is not an array (`hooks must be an array of repo names`) or holds an item that is not a non-empty string (`hooks[N] is not a non-empty string`) consents to no repo and leaves the rest of the file usable; routing says nothing about it, and `gate check` says it as a missing item, `check: here: remote.json: <problem>`. A hook gate whose place git cannot read stays local silently too. A consented hook run whose first word is `git` or `prek` still stays local silently.
+
+`commits` is an array of repo names, matched in any letter case, whose commit's pre-commit hook stage may route as a [commit stage](GLOSSARY.md) (`Config::commits_allowed`). It reads like `hooks`: a value that is not an array (`commits must be an array of repo names`) or holds an item that is not a non-empty string (`commits[N] is not a non-empty string`) consents to no repo and leaves the rest of the file usable, and `gate check` says it as a missing item right after the `hooks` one, `check: here: remote.json: <problem>`, so the check exits 1.
+
+No run routes a commit's stage yet.
+
+The judge of whether a commit's stage may route is `stage_eligible` in `crates/gate/src/commit/stage.rs`, over the commit's words, its environment and the repo's facts; nothing calls it yet, and each refusal has a reason line that nothing prints yet. It refuses:
+
+- a command that is not a plain `git commit` with only these options: `-m`/`--message`, `-F`/`--file`, `--author`, `--date`, `--cleanup`, `-t`/`--template` and `--trailer` with a value; `-s`/`--signoff`, `--no-signoff`, `-q`/`--quiet`, `-v`/`--verbose`, `-e`/`--edit`, `--no-edit`, `--no-gpg-sign`, `--allow-empty`, `--allow-empty-message`, `--no-post-rewrite`, `--status` and `--no-status` as flags; `-S`, `--gpg-sign`, `--untracked-files` and `-u` with a joined value only.
+
+  Any other word refuses (`--`, a pathspec, a short cluster, `-a`, `--amend`, `-n`/`--no-verify`). A git option before `commit` refuses when it is `-C`, `--git-dir`, `--work-tree`, or `-c` or `--config-env` of `core.hooksPath`.
+- an environment with any of `GIT_INDEX_FILE`, `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `SKIP` or `PREK_SKIP` set.
+- a slot other than heavy or light, a covering parent gate, or a repo `commits` does not name.
+- a merge, cherry-pick, revert or rebase in progress, an unborn `HEAD` or a shallow clone.
+- a pre-commit hook that is not prek's shim, found through the repo's own `core.hooksPath` setting (read from git config, never the command line's, which the gate's own git calls set) else `{git-common-dir}/hooks`, or a `pre-commit.legacy` beside it.
+- unstaged or untracked changes to `prek.toml` or `.pre-commit-config.y(a)ml`; a config whose times alone changed counts as changed.
+- a staged path the sync-back never writes (`.git*`, `.lfsconfig`, a gitlink, a symlink) or one through a checkout filter, judged with the sync-back's own functions.
+
+The staged listing and the prek-config check use plumbing (`diff-index --cached`, `diff-files`), so the user's diff config does not change them and they never write the real index.
 
 The key is for check-only hook commands (a build, clippy, a format check): a routed fixer's patch comes back to the worktree under prek's stash. The hook entry calls `gate run ... -- <heavy command>`.
 
@@ -2567,6 +2585,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   The seam a routed run calls is `RemoteClient` in `crates/gate/src/remote/mod.rs` (the call, the outcome, the scripted client); part A, the snapshot, and part B1, the transport, the routed lock, the preflight, the push and the run call, and part B2, the sync-back, part C1, the watchdog, the stop, Ctrl+C, the sync-back's deadlines and the output cap, and part C2, the lost connection and the reboot, are built, and every routed run uses them (The remote client's run, below).
 
   The snapshot copies the real index to `<git path>/gate-remote-<pid>.index` (a leftover copy and its `.index.lock` are removed first; the copy is empty when the repo has no index). With `GIT_INDEX_FILE` on the copy it runs `git add -A`, `git write-tree` and `git commit-tree --no-gpg-sign` with no parent, under the identity `gate-remote <gate-remote@localhost>` and with `GIT_AUTHOR_DATE` and `GIT_COMMITTER_DATE` removed.
+
+  The staged tree, `index_tree` in `snapshot.rs`, is the tree of what is staged: `git write-tree` on a copy of the index at `<git path>/gate-remote-<pid>-stage.index`, with no `add -A`, removed afterwards like the snapshot's copy. No run takes it yet.
 
   The copy is always removed, and the real index and the worktree are never touched, so both are byte-identical before and after a snapshot. The snapshot takes a list of roots, one a repository: the main one, then a pair's siblings in declared order.
 

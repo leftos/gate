@@ -1220,6 +1220,30 @@ fn check_says_an_unusable_hooks_value() {
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
 }
 
+/// A routing file whose `commits` is no array of repo names.
+const BAD_COMMITS_ROUTING: &str = r#"{"host": "builder-1", "repos": {"app": ["*"]}, "commits": "app"}"#;
+
+/// A `commits` value that cannot be used fails the check once, saying why.
+#[test]
+fn check_says_an_unusable_commits_value() {
+    let case = repo_case("check_bad_commits_value");
+    write_remote_json(&case, BAD_COMMITS_ROUTING);
+
+    let outcome = check(&case, &[], &[]);
+
+    assert_eq!(
+        lines(&outcome.stdout),
+        [
+            format!("check: here: app at {}", root(&case)).as_str(),
+            "check: here: app declares no toolchain",
+            "check: here: remote.json: commits must be an array of repo names",
+            "check: here: 1 missing, 0 too old",
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
 /// A `warmup` value that cannot be used says nothing for a repo with no warm-up file, so one bad value never fails
 /// the check of every repo on the PC.
 #[test]

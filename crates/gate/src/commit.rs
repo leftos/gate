@@ -8,6 +8,12 @@ use std::ffi::OsString;
 
 use gate_args::{RunRequest, Slot};
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "nothing outside the tests asks yet whether a commit's stage may route")
+)]
+mod stage;
+
 /// The line a commit run asked for on no slot says once, before it waits for the light slot it takes in its place.
 pub(crate) const NO_SLOT_LINE: &str = "gate: a commit's hooks take a slot: pass --slot heavy or --slot light";
 
