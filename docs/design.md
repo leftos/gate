@@ -1501,6 +1501,25 @@ Two rolls within one second collide on the archive name: the second archive fail
 
 `remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos`, the optional `data`, the optional `builders` and the optional per-repo `outputs`, `failureOutputs`, `inputs`, `siblings` and `desktop` and the optional `warmup`, `hooks`, `commits`, `sendBuild` and `declarations`, read afresh by each routed gate and ignored as a whole with one line when unusable.
 
+A minimal file, at `%LOCALAPPDATA%\gate\remote.json`, routes one repo's builds and tests to one Windows builder:
+
+```json
+{
+  "host": "{builder}",
+  "slots": 2,
+  "repos": {
+    "{repo}": ["dotnet build*", "dotnet test*"]
+  },
+  "outputs": {
+    "{repo}": ["**/bin/**", "tests/*/bin/*/*/TestResults/*.trx"]
+  }
+}
+```
+
+`{builder}` is the builder's ssh alias (or `user@host`), whose work root is `D:\gate-remote`. `{repo}` is the folder name of the repo's main checkout. `slots` is how many routed runs this PC sends the builder at once, and `gate push` writes it to the builder as its own slot count.
+
+A command whose words match one of the repo's `-like` patterns routes, and `outputs` lists the ignored files a passing routed run brings back. A repo with no `outputs` entry brings back `**/bin/**` and `**/.godot/mono/temp/bin/**`, or a cargo command's `target/*/*.exe`, `target/*/*.dll` and `target/*/*.pdb`.
+
 A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`).
 
 The optional top-level `data` is the `host` builder's tailnet IPv4 address, read exactly as a `builders` entry's `data` is below, with the reasons worded `data must be an IPv4 address` and `data must be a unicast IPv4 address`.
@@ -5317,6 +5336,8 @@ The remote client compares the builder's whole version text with its own ([Routi
 
 ## Cutover
 
+The PowerShell gate is `gate.exe`'s predecessor: a fresh machine never needs it, and `gate cutover` is only for migrating a machine that runs it.
+
 The PowerShell gate and `gate.exe` share slot mutexes and never share files.
 
 The default root's mutex names are the PowerShell gate's, so a PowerShell gate still running and a new `gate.exe` gate take turns on one set of slots and the machine is never over-subscribed; each generation writes its claims, tickets and journal in its own folder and format, and once the drain is over ops-tower reads `gate.exe`'s, plus the PowerShell claims of a slot whose mutex is open. Moving a machine to `gate.exe` is a drained cutover:
@@ -5334,7 +5355,7 @@ The default root's mutex names are the PowerShell gate's, so a PowerShell gate s
 
    It ends only when every scan across a 5 s confirmation window finds no gate, because the PowerShell gate deletes its ticket when it takes a slot and writes its claim up to about 2 s later, and a single empty scan could fall in that gap. The lines are in [`gate cutover`](#gate-cutover).
 
-   It ends by printing the flag's path and saying that deleting it goes back to the PowerShell gate. That line is stale: the launcher never reads the flag and the PowerShell gate is gone, so the take-back is reinstalling the previous commit (`tools/install.ps1` from it).
+   It ends by printing the flag's path and saying that deleting it goes back to the PowerShell gate. That line is stale: the launcher never reads the flag, so the take-back is reinstalling the previous commit (`tools/install.ps1` from it).
 
    A `gate cutover` stopped part way is run again: the rerun rewrites the flag and goes back to waiting, and it copies the slot counts only when the default root's `slot-counts.json` is absent, so a Gates-tab edit made since is kept.
 
@@ -5368,7 +5389,7 @@ ops-tower follows the flag: it reads the PowerShell gate's files until the flag 
 
 The caller sweep keeps each repo's `tools/gate.ps1` as the slim pass-through ([The launcher's hand-over](#the-launchers-hand-over)), so a clone on a machine without `gate.exe` still runs its commands, and switches that repo's docs and scripts to `tools/gate.ps1 run` where they call the gate directly.
 
-Every caller runs the gate through its repo's `tools/gate.ps1`: `pwsh -NoProfile -File tools/gate.ps1 run --log <path> --timeout <s> --slot <kind> -- <command>` (`--stall`, `--tail`, `--no-markers`, `--local`; `tools/gate.ps1 stop-tree <pid>`). Nothing calls `gate.exe` directly or by a path. `tools/install.ps1` builds with a plain `cargo build`, not through a gate, so a broken installed gate can always be replaced.
+Every caller runs the gate through its repo's `tools/gate.ps1`: `pwsh -NoProfile -File tools/gate.ps1 run --log <path> --timeout <s> --slot <kind> -- <command>` (`--stall`, `--tail`, `--no-markers`, `--local`; `tools/gate.ps1 stop-tree <pid>`). Nothing calls `gate.exe` directly or by a path. `tools/install.ps1` builds through the launcher too, on a heavy slot with `-Local` ([Install](#install)), and on a machine with no installed `gate.exe` the launcher runs that build directly.
 
 A caller that runs `gate ...` on PATH gets "command not found" on a machine without it, and each repo's docs name the install script; a caller that runs the launcher gets the launcher's direct run there, not `gate.exe`'s.
 

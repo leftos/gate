@@ -1,5 +1,7 @@
 # Docs
 
+- Getting started: [getting-started.md](getting-started.md), for people: the prerequisites, the install, the first gated command, wiring a repo, preparing and routing to builders, and the common refusal lines.
+- Calling gate from an agent: [agents.md](agents.md), for agents and scripts: the call, the slot, `--local` and `--reason`, worktrees, sequences, reading the verdict and the hints, and a block to paste into a repo's CLAUDE.md or AGENTS.md.
 - Design: [design.md](design.md), the source for the gate's CLI, output lines, formats, slots, crate layout and test harness, with the owner's rulings folded in.
 - Architecture: [ARCHITECTURE.md](ARCHITECTURE.md), the Task Index, layers, integration footguns and test locations.
 - Test map: [test-map.md](test-map.md), which tests each source area reaches, as cargo-nextest filtersets.

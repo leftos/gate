@@ -55,12 +55,16 @@ A repo's first routed run to a builder pushes its reachable history in one pack,
 
 ## Builder setup
 
-A builder's setup has two halves. claude-config's private provisioning does the machine: first boot, the WSL platform and its reboot, Defender, Developer Mode, the Application event log ACL, autologon, the D: Dev Drive, OpenSSH and the tailnet, the Windows Update policy, RustDesk and Process Explorer.
+A builder's setup has two halves. The machine half is the builder prep, `tools/builder/prep-windows.ps1` (or `prep-macos.sh` for a Mac): a checklist of step scripts for the builder account, OpenSSH, the network, the `C:\build-box` ACL, the WSL platform and its reboot, Developer Mode, the Application event log ACL, autologon, Defender, the Dev Drive and sleep.
+
+Each step, its default and what skipping it costs are in [getting-started.md, Prepare the machine](getting-started.md#prepare-the-machine).
+
+The owner's builders were provisioned by a private variant of the same half, which also covers machine policy gate does not need (the Windows Update policy, remote desktop and diagnostic tools).
 
 This repo's `tools/builder/install-toolchains.ps1` does the rest: the toolchains and tools, the sccache server and WSL keep-alive tasks, the git config for gate runs, the MSYS keeper task, the gate work root and the work-folder prune task.
 
-- **Order on a new builder:** claude-config's provisioning, then the installer, then `gate push`.
-- **Copy:** `scp tools/builder/* {builder}:C:/Users/{builder user}/` puts the scripts in the builder user's home, since claude-config's provisioning leaves `C:\build-box` writable by Administrators and SYSTEM only. From the elevated session, copy the exact files (`install-toolchains.ps1` and `wsl-setup.sh`, never a wildcard) into `C:\build-box\gate\` before running the installer. `wsl-setup.sh` must sit beside the script.
+- **Order on a new builder:** the prep, then the installer, then `gate push`.
+- **Copy:** `scp tools/builder/* {builder}:C:/Users/{builder user}/` puts the scripts in the builder user's home, since the prep's `C:\build-box ACL` step leaves `C:\build-box` writable by Administrators and SYSTEM only. From the elevated session, copy the exact files (`install-toolchains.ps1` and `wsl-setup.sh`, never a wildcard) into `C:\build-box\gate\` before running the installer. `wsl-setup.sh` must sit beside the script.
 - **Run:** over ssh, elevated (an administrator's ssh session), under Windows PowerShell 5.1: `powershell -NoProfile -ExecutionPolicy Bypass -File C:\build-box\gate\install-toolchains.ps1 -User {builder user} [-GateRoot D:\gate-remote] [-SccacheDir D:\sccache] [-SccacheCapBytes N] [-Only {step prefix},...]`.
 - **Parameters:** `-User` is required and names the builder user: the scheduled tasks run as it and the write-deny ACLs name it. `-GateRoot` is the gate's work root, `-SccacheDir` sccache's disk cache and `-SccacheCapBytes` its size cap. `-Only` runs just the steps whose names start with one of the given prefixes, then the version summary (`-Only Summary` runs only the summary).
 - **As the builder user:** run it in the builder user's own ssh session, since the user-profile installs go to the running user. Run it only while no gate is running on the builder.
@@ -85,9 +89,9 @@ This repo's `tools/builder/install-toolchains.ps1` does the rest: the toolchains
   It says `gate: the builder's work root is not locked down: <why>; run the installer's "Gate work root" step (install-toolchains.ps1 -Only "Gate work root")`, and a routed run then runs here (`gate check --builder` says it as a missing item). A root open in another process with delete access is only busy: retry when it is closed.
 
   It then reads the security back and fails unless it is exactly that, owner included; when it already is, it logs `already protected` and changes nothing. A routed command's restricted token passes access checks through the builder user's own SID, so neither Authenticated Users nor Users needs a grant.
-- **claude-config's `C:\build-box` rules:** its provisioning re-asserts the `C:\build-box` DACL on every run and strips explicit ACEs under it. The gate half therefore re-applies anything it needs under `C:\build-box\gate` on every run: an ACE set on the root that inherits survives, an explicit ACE on a child does not.
+- **The `C:\build-box` rules:** the prep's `C:\build-box ACL` step gives `C:\build-box` a protected DACL: Administrators and SYSTEM with full control, the builder user with read and execute, inherited by files and folders. The owner's private variant also re-asserts that DACL on every run and strips explicit ACEs under it, so the gate half re-applies anything it needs under `C:\build-box\gate` on every run: an ACE set on the root that inherits survives, an explicit ACE on a child does not.
 
-  Any SYSTEM or highest-run-level task the gate half adds whose action names a script under `C:\build-box` goes through claude-config's `C:\Program Files\build-box\run-pinned.ps1`; the gate half adds none today.
+  The gate half adds no SYSTEM or highest-run-level task whose action names a script under `C:\build-box`. A new one needs that script kept where a routed command cannot replace it, since routed commands run as the builder user.
 - **Smart App Control off:** in Evaluation, Smart App Control asks the cloud for the reputation of every unsigned image the first time it is mapped, whatever the Defender exclusions, so each freshly built exe in the work root waited 1.5-16 s before its first start (0.05 s with it off).
 
   The step sets `VerifiedAndReputablePolicyState` to 0 and refreshes the policies with `CiTool`; Defender's real-time, cloud and behaviour protection stay as they are. A policy still enforced after the refresh asks for a restart of the drained builder.
@@ -130,7 +134,9 @@ A word that still holds a `\` (a regex, a list, script text after `bash -c` or `
   The step runs as `{builder admin}` with `sudo`; it checks the log folder and log, then that `<root>` and `<root>/bin` are the builder's own folders at mode 700, before it writes the plist, so run the Gate work root step as `{builder user}` first and give an absolute `--root` with `--system`.
 
   A builder without `<root>/bin/gate-box` yet gets the job and a log line saying it fails until `gate push` installs the box. To check the job after a push, run `sudo launchctl kickstart system/dev.gate.prune-work`, then read `/Library/Logs/gate/prune-work.log`: it ends with `gate: remote prune removed <n> of <m> work folders`.
-- **Not in the installer:** FileVault off and automatic login for the builder user, so the Mac logs in and comes back by itself after a reboot or a power cut. `sysadminctl -autologin set` fails with error 22 on macOS 27, so automatic login is set through `/etc/kcpassword` and the `autoLoginUser` login-window preference; claude-config's private provisioning holds the commands. After a reboot, `stat -f %Su /dev/console` names the builder user once it has logged in.
+- **Not in the installer:** FileVault off and automatic login for the builder user, so the Mac logs in and comes back by itself after a reboot or a power cut.
+
+  `sysadminctl -autologin set` fails with error 22 on macOS 27, so automatic login is set through `/etc/kcpassword` and the `autoLoginUser` login-window preference; the prep's `filevault-off` and `autologin` steps (`tools/builder/prep-macos.sh`) do both. After a reboot, `stat -f %Su /dev/console` names the builder user once it has logged in.
 - **Flags and exits** follow the Windows installer: `--only <prefix>,...` (case-insensitive prefixes, then the summary; `--only Summary` alone), `--list`, exit 2 on a bad argument or a prefix that matches no step, exit 1 when a step failed. Every step logs `OK`, `SKIP` or `FAIL` to stdout and `<prefix>/install.log`.
 - **Slots:** the entry's `slots` is set by memory, not cores. Several copies of yaat-server's whole `dotnet test` suite (about 4,900 tests, 1.2-1.3 GB each), started together on a 15-core, 24 GB Mac mini, gave 1.64x one run's throughput at 2, 2.66x at 4, 3.3x at 6 and 3.74x at 8, with memory pressure normal and no swap throughout; but at 8 the Mac had under 300 MB unused against about 2 GB at 6, and one run took 2.1 times as long as alone (1.8 times at 6).
 
@@ -238,7 +244,7 @@ A heavy gate started inside a git hook stays local silently unless `remote.json`
 
 The key is for check-only hook commands (a build, clippy, a format check). A routed fixer's patch comes back to the worktree under prek's stash, so a fixing hook stays local. A commit stage, which runs the whole `prek run --hook-stage pre-commit` on a builder, is the exception: its fixes are applied to the index and the worktree by the stage's own rule (design.md, Sync-back).
 
-A second array, `commits`, names the repos whose commit's pre-commit hook stage may route as one run, read like `hooks` (a bad value consents to no repo and `gate check` says it). No commit routes by it yet ([design.md, remote.json](design.md#remotejson)).
+A second array, `commits`, names the repos whose commit's pre-commit hook stage may route as one run, read like `hooks` (a bad value consents to no repo and `gate check` says it; [design.md, remote.json](design.md#remotejson)).
 
 The hook entry calls the repo's launcher, `pwsh -NoProfile -File tools/gate.ps1 run ... -- <heavy command>`, never a bare `gate run`, as every other call does (scripts, docs and agents' own commands alike): a hook runs on every machine that commits, and on a clone without gate.exe the launcher runs the command directly. The repo's patterns must match that command.
 

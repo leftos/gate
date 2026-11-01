@@ -6,64 +6,57 @@ gate is a Windows tool that queues heavy commands (builds, test suites, formatte
 gate run --slot heavy --timeout 900 --log .tmp/test.log -- cargo test --workspace
 ```
 
+It can also send heavy and light commands to builders, other Windows machines or Macs that this PC reaches over ssh, and bring their results back.
+
 ## Status
 
-Pre-release. Nothing here is ready to use yet, and gate is not yet a replacement for anything. The design is written ([docs/design.md](docs/design.md)); the code is being built slice by slice.
+gate is in daily use on its author's machines and builders, and it is still changing: the CLI, the output lines and the file formats can change between commits, and there are no releases yet. It runs on Windows 11; its pure crates (formats, watchdog arithmetic, routing and quoting rules) also build and test on Linux, and a Mac builder runs its own box, built from this repo.
 
-So far `gate` reads its command line (`--version`, `--help`, and the argument checks for `run`, `stop-tree`, `cutover`, `push`, `drain`, `prune`, `check`, `burn` and `expect`), and `gate run` starts a command under a slot, logs its output, prints the tail and a verdict line, and exits with the command's status.
+gate replaces a PowerShell gate, its predecessor: a fresh machine never needs it, and `gate cutover` is only for migrating from it.
 
-The watchdog kills a stalled command, one past its ceiling and one past the backstop, and Ctrl+C stops a run; routing is not built yet. `gate stop-tree <pid>` stops a process tree and the gate jobs inside it. `gate push` copies the installed `gate.exe` and desktop helper to the builders and registers the desktop task there, and writes each builder's slot count.
+## Install
 
-`gate drain` raises a drain barrier on a builder and waits until no routed run is going there, so it can be redeployed; `gate drain --lift` lifts the barrier and `gate drain --status` says how the drain stands. `gate prune --builders` marks the worktree records of worktrees that are gone and, for each that has been gone an hour, prunes its work folder on every builder `remote.json` lists, then removes what this PC keeps of its key: the files, the `refs/gate-remote` refs and last the record.
+Needs Windows 11, PowerShell 7.3 or later and git. Then:
 
-`gate check` says what this PC lacks for the repo in the current folder (the tools its `.gate/toolchain.toml` names, the SDK its `global.json` pins, the sibling worktrees `.gate/siblings.toml` declares) and the command that installs each; it installs nothing, and exits 1 when something is missing or the check could not run (not in a git repository, or a `.gate/toolchain.toml`, `.gate/siblings.toml` or `global.json` it cannot read).
+```
+git clone https://github.com/leftos/gate.git
+cd gate
+pwsh tools/install.ps1
+```
 
-For a repo with a `.gate/warmup.toml` or `remote.json` consent to warm-ups, it also says whether the builder's work folder is warm, and prints the file's problems.
+The script offers to install a missing Rust toolchain and the Visual Studio C++ Build Tools with winget, builds `gate.exe` and its desktop helper, installs them in `%LOCALAPPDATA%\gate\bin` and puts that folder on your user PATH. Open a new terminal afterwards.
 
-`gate check --builder <host>` asks one builder from `remote.json` the same question over ssh (for example `gate check --builder builder-1`): it runs the builder's preflight once, so it creates the folders a routed run would, and prints the same kind of lines and `install: builder-1:` hints; it also exits 1 when the builder is unreachable, runs a different gate build, or `remote.json` is missing or unusable.
+## A first command
 
-`gate burn [--cores <n>] --seconds <s>` spins the CPU on `n` threads for up to 180 s, for the load-burn tool, and ends early if the process that started it ends. `gate expect -- <command>` prints the expected time of a command in the current folder, here and on each builder, from the durations store, or `no history`; the launcher maps no `-Expect`, so callers run `gate.exe expect -- <command>` directly.
+```
+gate run --slot light --timeout 60 --log .tmp/hello.log -- git --version
+```
 
-`gate cutover` copies the PowerShell gate's slot counts, writes the cutover flag that ops-tower reads, and waits for the PowerShell gates still running. Each repo's `tools/gate.ps1` hands every call to the installed `gate.exe`, and runs the command directly where none is installed. It succeeds a PowerShell gate its author runs today, which stays in use until gate can take its place.
+gate waits for a light slot, runs the command with its output going to `.tmp/hello.log`, prints the log's last lines (git's `git version ...`) and a verdict line, and exits with the command's status. `gate --help` lists every subcommand and option.
 
-## How it will work
+A repo calls gate through a committed copy of [tools/gate.ps1](tools/gate.ps1), which hands every call to the installed `gate.exe` and runs the command directly on a machine without one:
 
-- **Install.** `pwsh tools/install.ps1` builds a Release `gate.exe` and its desktop helper `gate-desktop-helper.exe`, puts both in `%LOCALAPPDATA%\gate\bin` and adds that folder to your user PATH; open a new terminal afterwards to use `gate`.
+```
+pwsh -NoProfile -File tools/gate.ps1 run --log .tmp/test.log --timeout 900 --slot heavy -- cargo nextest run
+```
 
-  Reinstalling while gates are running is safe: the running copy is renamed aside, and the script prints the version it replaced and the version it installed (or that the same build is already installed); if anything fails, the previous pair stays. It installs on this machine only.
+## What it does
 
-  An owner with builders then runs `gate push`, which copies the installed `gate.exe` and desktop helper to each builder their `remote.json` names (`host`, then the optional `hosts`) the same way, into the builder's admin-owned `C:\Program Files\gate\bin` (so the builder's ssh session must be an elevated administrator's; a folder or file anyone else owns or may write is refused), registers the desktop task there and prints a line per builder.
-
-  A macOS builder (an entry of `builders` with `"os": "macos"`) gets no copy: `gate push` sends it the commit the installed gate was built from (recorded in `source.json` by `tools/install.ps1`, which must be clean) and builds `gate-box` from it there.
-- **Call.** `gate run --slot heavy|light|critical|none --timeout <seconds>|auto:<seconds> --log <path> -- <command>`. `heavy` is for work that fills several cores, `light` for one or two, and `critical` for a timing-sensitive run that needs the machine to itself.
-
-  `--slot critical --alone` also takes the light slots a plain critical gate leaves beside it, for a profiling run: it waits for every running gate and later gates queue behind it, but a process outside any gate keeps running, so the load it logs before and after the command is the evidence, not a guarantee. `--cd <folder>` runs the command in `<folder>` and routes from it, for a caller in a main checkout whose command names another worktree's files.
-
-  `--env NAME=value` (or bare `--env NAME`, which forwards the gate's own value and keeps a secret off the command line) sets a variable for the command, local or routed, and is repeatable. A routed command finds `GATE_BOX_JOB` set, which a local one never does, so a test that needs the PC itself can skip there.
-
-  `--reason "<why>"` states why a run needs `--local`, a critical slot or `--alone`; it is required with any of the three, accepted on any run, and recorded in the journal, the claim and the ticket so ops-tower's Gates page can show it. The command's output goes to the log; gate prints its tail and a one-line verdict, and exits with the command's status, or 124 when it killed the command.
-
-  `--builder <host>` routes a heavy or light run to the builder `<host>` alone, never another and never here: a run that cannot be routed there exits 2, and a builder that refuses or cannot be reached fails the run with exit 1, which is how a new builder is trialled.
-
-  `--timeout auto:900` makes 900 a floor: from the command's recorded runs the ceiling rises to three times its adjusted p99 when that is longer, and the gate says so, warns when the ceiling is below the command's load-adjusted p90, and says once when a run goes past three times its usual wall-clock p90. With no history the ceiling is the 900. The old `-TimeoutSeconds` takes whole numbers only.
-
-  `none` is for a command that only dispatches or watches remote work, such as `gh run watch`, a deploy script polling a server or a remote image build. A remote-only watcher uses `none`: it takes no slot, never waits, starts at once even while a critical gate holds the machine, and keeps the log, the ceiling, the stall window and the kill.
-
-  A critical gate does not wait for a `none` run and does not protect it.
-
-  The gate tells the caller when a run's slot did not fit it: for example, `gate: used 7.4 cores on average … on a light slot; work that keeps more than 2 busy belongs on heavy`. Act on that line: the next run of the same command uses the slot it names. The hint is how the slot gets chosen right; ignoring it keeps a heavy command on light, where it competes for the light slots.
-
-  A gated `git commit` takes a slot for all its hooks: pass `--slot heavy` when the hooks build or run analyzers, else `--slot light` (`--slot none` runs on a light slot and says so). Its hint reads `gate: the commit's hooks used … cores on average … on a light slot; hooks that keep more than 2 busy belong on --slot heavy`. A gate in its hooks that asks for `--slot critical` or `--alone` is refused.
-
-  A light run routes to a builder as a heavy one does, unless its learned local time proves it faster here: `gate: not routed: faster here: about 8 s here, builder-1 about 15 s`. A routed run gets no cores hint.
-- **Slots.** The number of slots per kind comes from the machine's core count and can be changed in `%LOCALAPPDATA%\gate\v1\slot-counts.json`.
-- **Remote builders (optional).** A machine can send allowlisted heavy and light commands to other Windows machines it names in its own `%LOCALAPPDATA%\gate\v1\remote.json`. Builders are configured only there, on your machine; nothing about them lives in this repo. With no such file, gate runs everything locally.
-
-gate runs on Windows. Its pure crates (formats, watchdog arithmetic, routing and quoting rules) also build and test on Linux.
+- **Slots.** `--slot heavy` for work that fills several cores, `light` for one or two, `none` for a command that only watches remote work, and `critical` for a timing run that needs the machine to itself. The counts come from the core count and can be set in `%LOCALAPPDATA%\gate\v1\slot-counts.json`.
+- **Watchdog.** A command past its `--timeout` (load-adjusted seconds), quiet for the stall window, or past the wall-time backstop is killed with its whole process tree, and the gate exits 124.
+- **Verdicts.** A command that exits 0 but whose log holds a failure marker (`Build FAILED.`, `error CS1234`) fails. After a run whose slot did not fit, gate says which slot the command belongs on.
+- **Learned durations.** With `--timeout auto:<seconds>` the ceiling rises from the command's own history, and a run says what to expect and when it is far past its usual time.
+- **Builders (optional).** With a `%LOCALAPPDATA%\gate\remote.json`, matching commands run on a builder and their changes and outputs come back to the worktree. `gate push` deploys gate to the builders, `gate check --builder <host>` asks one what it lacks, and `tools/builder/` holds the scripts that prepare one.
 
 ## Docs
 
-Docs start at [docs/README.md](docs/README.md): the design, the architecture and the glossary.
+- [Getting started](docs/getting-started.md): from a bare Windows PC to gated commands, then to routed runs on a builder.
+- [Calling gate from an agent](docs/agents.md): the rules for agents and scripts, with a block to paste into a repo's CLAUDE.md or AGENTS.md.
+- [docs/README.md](docs/README.md): the design, the architecture, the glossary and the routing procedure.
+
+## Feedback
+
+Report problems and questions as [GitHub issues](https://github.com/leftos/gate/issues).
 
 ## License
 
