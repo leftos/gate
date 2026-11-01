@@ -15,6 +15,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use gate_args::TestSeams;
+use gate_router::desktop::DesktopMode;
 use gate_router::{Builder, CrossBuild, FolderId, SendPlan, Target, escaped};
 use gate_state::v1::WarmFailure;
 use gate_state::{FallbackReason, StateRoot, Verdict};
@@ -236,8 +237,9 @@ pub(crate) struct RemoteCall<'a> {
     pub cross_build: Option<&'a CrossBuild>,
     /// The input globs the run sends: the repo's `inputs` list, none when it has no entry.
     pub inputs: &'a [String],
-    /// Whether the run asks for the builder's desktop, as the route's decision judged it; a warm-up never does.
-    pub desktop: bool,
+    /// How the run uses the builder's desktop, `None` for not at all, as the route's decision judged it; a warm-up
+    /// never does.
+    pub desktop: Option<DesktopMode>,
     /// The `--bring-tracked` globs: a fetched output git tracks is installed only when one matches it.
     pub bring_tracked: &'a [String],
     /// The variables sent in the run call's `Env` for the command on the builder: the caller's `--env` pairs, then the
@@ -581,7 +583,7 @@ mod snapshot_only {
                 failure_outputs: &[],
                 dropped_no_build: false,
                 send: None,
-                desktop: false,
+                desktop: None,
                 inputs: &[],
                 log,
                 timeout: 3600,
@@ -1068,7 +1070,7 @@ mod scripted {
             "words": call.words,
             "outputs": call.outputs,
             "inputs": call.inputs,
-            "desktop": call.desktop,
+            "desktop": call.desktop.is_some(),
             "log": call.log.to_string_lossy(),
             "timeout": call.timeout,
             "stall": call.stall,

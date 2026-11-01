@@ -725,7 +725,7 @@ fn call_of<'a>(
         failure_outputs: &[],
         dropped_no_build: false,
         send: None,
-        desktop: false,
+        desktop: None,
         inputs: &target.inputs,
         bring_tracked: &[],
         env: &[],

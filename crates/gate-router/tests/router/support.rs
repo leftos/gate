@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 
 use gate_router::balance::{self, BuilderFigures};
+use gate_router::desktop::DesktopDeclaration;
 use gate_router::windows::WindowsChange;
 use gate_router::{
     Builder, CarriedSibling, Config, ConfigProblem, CrossTarget, Facts, FolderId, GitignoredInput, Inputs, Pattern, Place, SiblingFolder,
@@ -108,7 +109,7 @@ pub struct FakeFacts {
     /// How many times the siblings file was read, kept apart from [`FakeFacts::asked`].
     pub siblings_read: Cell<u32>,
     /// What `.gate/desktop.toml` gives.
-    pub desktop: Result<Vec<Pattern>, String>,
+    pub desktop: Result<DesktopDeclaration, String>,
     /// How many times the desktop file was read, kept apart from [`FakeFacts::asked`].
     pub desktop_read: Cell<u32>,
     /// What `.gate/local.toml` gives.
@@ -190,7 +191,7 @@ impl FakeFacts {
             root_id: Ok(fake_id(ROOT)),
             asked: RefCell::new(Vec::new()),
             siblings_read: Cell::new(0),
-            desktop: Ok(Vec::new()),
+            desktop: Ok(DesktopDeclaration::default()),
             desktop_read: Cell::new(0),
             local: Ok(Vec::new()),
             local_read: Cell::new(0),
@@ -376,7 +377,7 @@ impl Facts for FakeFacts {
         self.siblings.clone()
     }
 
-    fn desktop(&self, _place: &Place) -> Result<Vec<Pattern>, String> {
+    fn desktop(&self, _place: &Place) -> Result<DesktopDeclaration, String> {
         self.desktop_read.set(self.desktop_read.get() + 1);
         self.desktop.clone()
     }

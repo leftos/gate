@@ -66,7 +66,7 @@ use crate::run::{ERROR_FILE_NOT_FOUND, Written, end_leftovers, find_program, wri
 
 mod desktop_run;
 
-use desktop_run::DesktopEnd;
+use desktop_run::{DesktopEnd, DesktopTake};
 
 /// The status of a run refused: another run holds the work folder, the work folder's dotnet tools could not be
 /// restored, or the run asked for the builder's desktop and could not have it.
@@ -184,14 +184,13 @@ pub(super) struct Request<'a> {
     pub(super) nonce: &'a str,
     /// The run's ceiling in whole seconds of load-adjusted time, `None` for a run the box gives none.
     timeout: Option<u64>,
-    /// Whether the run asks for the builder's desktop, its `Desktop` key; a run without one runs on the box's own
-    /// session.
-    desktop: bool,
-    /// How long the run may wait for the builder's desktop, in whole seconds; `None` on a run that does not ask for
-    /// one, whatever its `DesktopWait` said.
-    desktop_wait: Option<u64>,
-    /// The run's repository, its `Repo`, which the record of a run holding the builder's desktop names; the work
-    /// folder's key when the payload gives none, and on a run that does not ask for the desktop, whatever it gives.
+    /// How the run takes the builder's desktop, from its `Desktop`, `DesktopSession` and `DesktopWait` keys: a locked
+    /// run with the whole seconds it may wait for the lock, or a session run; `None` for a run on the box's own
+    /// session, whatever its `DesktopWait` and `DesktopSession` said.
+    desktop: Option<DesktopTake>,
+    /// The run's repository, its `Repo`, which the record of a run holding the builder's desktop lock names; the work
+    /// folder's key when the payload gives none, and on a run that takes no lock (a session run, or one that does not
+    /// ask for the desktop), whatever it gives.
     repo: &'a str,
     /// The PC's name for the builder, which the box's kill line names, empty when the payload gives none.
     host: &'a str,
@@ -221,21 +220,28 @@ impl Request<'_> {
         let (timeout, host) = (payload.timeout()?, payload.optional_text("Host")?);
         // A run of the builder's desktop has to say how long it may wait for one; a wait no run asks for is ignored,
         // whatever it says.
-        let desktop = payload.desktop()?;
-        let desktop_wait = if desktop {
-            Some(payload.desktop_wait()?.ok_or_else(|| "gate: box payload lacks DesktopWait".to_owned())?)
+        let asked = payload.desktop()?;
+        // A session run says its wait too, which it never spends: it takes no lock.
+        let session = payload.desktop_session()?;
+        let desktop = if asked {
+            let wait = payload.desktop_wait()?.ok_or_else(|| "gate: box payload lacks DesktopWait".to_owned())?;
+            Some(if session { DesktopTake::Session } else { DesktopTake::Locked { wait } })
         } else {
             None
         };
-        // Only a desktop run's holder record names it, so no other run reads it.
-        let repo = if desktop { payload.repo()?.unwrap_or(key) } else { key };
+        // Only a locked run's holder record names it, so no other run reads it.
+        let repo = if matches!(desktop, Some(DesktopTake::Locked { .. })) {
+            payload.repo()?.unwrap_or(key)
+        } else {
+            key
+        };
         let bare = payload.path("Bare")?;
         let lock = payload.beside_work("Lock", work, "lock")?;
         let index = payload.beside_work("Index", work, "index")?;
         let job = payload.job(key)?;
         let commands = payload.commands()?;
         // A warm-up's commands run on the box's own session alone.
-        if desktop && commands.warm_hash.is_some() {
+        if asked && commands.warm_hash.is_some() {
             return Err("gate: box payload asks a warm-up for the desktop".to_owned());
         }
         let subfolder = payload.optional_text("Subfolder")?;
@@ -272,7 +278,6 @@ impl Request<'_> {
             nonce,
             timeout,
             desktop,
-            desktop_wait,
             repo,
             host,
             inputs_digest,
@@ -678,7 +683,7 @@ pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) ->
     // its session is held: the session's builder slot is let go.
     let _slot = claimed.then(|| slots::Release::at_end(request.work, payload));
     // A run the console cannot take is refused before the checkout; the stage before the command reads it again.
-    if request.desktop
+    if request.desktop.is_some()
         && let Err(status) = desktop_run::console_takes_it(&request, seams, console)
     {
         return status;
@@ -1056,10 +1061,10 @@ fn reports_brought_back(
 /// ends before it, its lines said: a refusal of the builder's desktop, 75, says no back commits line; any other end is
 /// followed by the box's back commits `failed` line on a pair run ([`back_commits_failed`]).
 fn ran_command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<Ran, u32> {
-    let Some(wait) = request.desktop_wait else {
+    let Some(mode) = request.desktop else {
         return command(request, one, beat, console).inspect_err(|_| back_commits_failed(request, beat, console));
     };
-    match desktop_run::desktop_command(request, one, wait, beat, console) {
+    match desktop_run::desktop_command(request, one, mode, beat, console) {
         Ok(ran) => Ok(ran),
         Err(DesktopEnd::Refused) => Err(REFUSED_STATUS),
         Err(DesktopEnd::Ended(status)) => Err(ended_before(status, request, beat, console)),
@@ -4026,9 +4031,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        BackGit, CLOSED_STATUS, GIT_CONFIG_COUNT, GODOT_PATH, Look, Of, One, PATH_VARIABLE, Payload, Request, SHARING_VIOLATION, STARTING_COMMAND,
-        StopSignal, UE_ROOT, WorkGit, before_the_job, client_gone, command_spent, command_variables, gap_spent, handed_job, look, prepared,
-        remaining_budget, resolved_command, with_git_bin_first, with_path_first, with_safe_directory, with_unreal, without_engine, written_retrying,
+        BackGit, CLOSED_STATUS, DesktopTake, GIT_CONFIG_COUNT, GODOT_PATH, Look, Of, One, PATH_VARIABLE, Payload, Request, SHARING_VIOLATION,
+        STARTING_COMMAND, StopSignal, UE_ROOT, WorkGit, before_the_job, client_gone, command_spent, command_variables, gap_spent, handed_job, look,
+        prepared, remaining_budget, resolved_command, with_git_bin_first, with_path_first, with_safe_directory, with_unreal, without_engine,
+        written_retrying,
     };
     use gate_args::{EnvRefusal, env_refusal};
     use gate_wire::engine_env_name_refused;
@@ -4297,13 +4303,22 @@ mod tests {
 
         let waited = run_payload(&json!({ "Desktop": true, "DesktopWait": 30 }));
         let request = Request::read(&waited).expect("a run of the builder's desktop is read");
-        assert!(request.desktop, "the payload asks for the builder's desktop");
-        assert_eq!(request.desktop_wait, Some(30), "the whole seconds it gives");
+        assert_eq!(
+            request.desktop,
+            Some(DesktopTake::Locked { wait: 30 }),
+            "a locked run of the builder's desktop, with the whole seconds it gives"
+        );
+
+        let session = run_payload(&json!({ "Desktop": true, "DesktopWait": 30, "DesktopSession": true }));
+        let request = Request::read(&session).expect("a session run of the builder's desktop is read");
+        assert_eq!(request.desktop, Some(DesktopTake::Session), "a session run takes no lock");
 
         let ignored = run_payload(&json!({ "DesktopWait": "30" }));
         let request = Request::read(&ignored).expect("a run that asks for no desktop is read");
-        assert!(!request.desktop, "the payload asks for no desktop");
-        assert_eq!(request.desktop_wait, None, "a wait no run asks for is ignored");
+        assert_eq!(
+            request.desktop, None,
+            "the payload asks for no desktop, and a wait no run asks for is ignored"
+        );
     }
 
     #[test]

@@ -1,9 +1,9 @@
 //! A run that asks for the builder's desktop: the console's session read before the checkout, the stage between the
 //! run's readiness and its command, which resolves the program, takes the builder's desktop lock within the wait the
-//! run gave and reads the console's session once more while it holds the lock, and then the hand-off of the command to
-//! the desktop helper ([`hand_off`]). Every failure of the desktop's machinery before the command's start marker is a
-//! refusal: the box's `desktop` tag and its line, exit 75, and never a back commits line, so the PC runs the command
-//! itself.
+//! run gave (a locked run; a session run takes none) and reads the console's session once more, and then the
+//! hand-off of the command to the desktop helper ([`hand_off`]). Every failure of the desktop's machinery before the
+//! command's start marker is a refusal: the box's `desktop` tag and its line, exit 75, and never a back commits line,
+//! so the PC runs the command itself.
 
 mod hand_off;
 
@@ -45,12 +45,14 @@ pub(super) enum DesktopEnd {
     Ended(u32),
 }
 
-/// What a desktop run holds once the stage passed: the builder's desktop lock, the console session it read while it
-/// held the lock, and the limits of its waits.
-struct DesktopHold<'m> {
-    _guard: MutexGuard<'m>,
-    session_id: u32,
-    limits: Limits,
+/// How a desktop run takes the builder's desktop, as its payload asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DesktopTake {
+    /// It holds the builder's desktop lock for its whole run, waiting at most `wait` seconds for it.
+    Locked { wait: u64 },
+    /// It needs only the console's logon session: it never opens, waits for or holds the lock, and keeps no holder
+    /// record.
+    Session,
 }
 
 /// Why the console's session could not be read whole.
@@ -103,30 +105,67 @@ pub(super) fn console_takes_it(request: &Request<'_>, seams: &BoxSeams, console:
     }
 }
 
-/// The run's command on the builder's desktop, which may wait `wait` seconds for it: the stage, then the hand-off.
-/// The stage resolves the program first, so a command that cannot start (127, or 2 for a batch word refused) never
-/// holds the desktop; looks at the stop signal; takes the builder's desktop lock within the run's wait
-/// ([`wait_for_desktop`]); and reads the console's session again while it holds the lock. The hand-off
-/// ([`hand_off::hand_off`]) then runs the command in that session and sees it to its end; the lock is released once it
-/// is over, however it ended.
-pub(super) fn desktop_command(request: &Request<'_>, one: &One<'_>, wait: u64, beat: &Beat<'_>, console: &mut Console) -> Result<Ran, DesktopEnd> {
+/// The run's command on the builder's desktop, taken as `take` says: the stage, then the hand-off. The stage resolves
+/// the program first, so a command that cannot start (127, or 2 for a batch word refused) never holds the desktop, and
+/// looks at the stop signal. A locked run then takes the builder's desktop lock within its wait ([`locked`]); a
+/// session run takes no lock. Either reads the console's session again, and the hand-off ([`hand_off::hand_off`]) runs
+/// the command in that session and sees it to its end.
+pub(super) fn desktop_command(
+    request: &Request<'_>,
+    one: &One<'_>,
+    take: DesktopTake,
+    beat: &Beat<'_>,
+    console: &mut Console,
+) -> Result<Ran, DesktopEnd> {
     let prepared = match prepared(request, one, console) {
         Ok(prepared) => prepared,
         Err(answer) => return answer.map_err(DesktopEnd::Ended),
     };
     // Looked at before the lock is opened, so a run already stopped never opens it.
     before_the_job(beat.stop.look(STARTING_COMMAND), beat.stop.job, beat.lock, console).map_err(DesktopEnd::Ended)?;
+    let limits = run_limits(beat.seams);
+    let hand = |session: u32, console: &mut Console| {
+        let here = hand_off::Here {
+            request,
+            one,
+            prepared: &prepared,
+            beat,
+            limits,
+            session,
+        };
+        hand_off::hand_off(&here, console)
+    };
+    match take {
+        DesktopTake::Locked { wait } => {
+            let turns = Turns {
+                total: capped_wait(Duration::from_secs(wait), request.timeout.map(Duration::from_secs)),
+                step: limits.wait_step,
+                now: Instant::now,
+            };
+            locked(request, &turns, beat, console, hand)
+        }
+        DesktopTake::Session => {
+            let session = account_and_console(beat.seams).map_err(|refused| desktop_refused(request, &refused, beat, console))?;
+            hand(session, console)
+        }
+    }
+}
+
+/// The stage's lock for a locked run: the builder's desktop lock taken within the run's wait, cut into `turns`
+/// ([`wait_for_desktop`]), the holder record written and the console's session read again while it is held, then
+/// `hand` given that session. The record is removed and the lock released once the hand-off is over, however it ended.
+fn locked(
+    request: &Request<'_>,
+    turns: &Turns<impl Fn() -> Instant>,
+    beat: &Beat<'_>,
+    console: &mut Console,
+    hand: impl FnOnce(u32, &mut Console) -> Result<Ran, DesktopEnd>,
+) -> Result<Ran, DesktopEnd> {
     let mutex = desktop_name(beat.seams)
         .and_then(|name| PrivateMutex::open(&name))
         .map_err(|error| desktop_refused(request, &DesktopRefusal::DesktopLock(error.to_string()).into(), beat, console))?;
-    let limits = run_limits(beat.seams);
-    let turns = Turns {
-        total: capped_wait(Duration::from_secs(wait), request.timeout.map(Duration::from_secs)),
-        step: limits.wait_step,
-        now: Instant::now,
-    };
     let record = HolderRecord::of(request);
-    let guard = match wait_for_desktop(&mutex, &turns, &record, beat, console) {
+    let guard = match wait_for_desktop(&mutex, turns, &record, beat, console) {
         Ok(guard) => guard,
         Err(Unheld::Ended(status)) => return Err(DesktopEnd::Ended(status)),
         Err(Unheld::Busy) => return Err(said_refused(request, &[busy_timeout_line(turns.total)], beat, console)),
@@ -139,22 +178,9 @@ pub(super) fn desktop_command(request: &Request<'_>, one: &One<'_>, wait: u64, b
     let mut say = |line: &str| beat.say(console, line);
     let session = held_session(&record, request.repo, || account_and_console(beat.seams), &mut say);
     let session_id = session.map_err(|refused| desktop_refused(request, &refused, beat, console))?;
-    let hold = DesktopHold {
-        _guard: guard,
-        session_id,
-        limits,
-    };
-    let here = hand_off::Here {
-        request,
-        one,
-        prepared: &prepared,
-        beat,
-        limits: hold.limits,
-        session: hold.session_id,
-    };
-    let ran = hand_off::hand_off(&here, console);
+    let ran = hand(session_id, console);
     record.remove(&mut |line: &str| beat.say(console, line));
-    drop(hold);
+    drop(guard);
     ran
 }
 

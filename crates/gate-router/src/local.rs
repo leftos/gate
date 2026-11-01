@@ -21,7 +21,7 @@ pub const MOST_PATTERNS: usize = 32;
 /// `patterns`, no `patterns`, a `patterns` that is not an array, an entry that is not a string, is empty or is no
 /// valid wildcard pattern, or more than [`MOST_PATTERNS`] entries.
 pub fn read_local(bytes: &[u8]) -> Result<Vec<Pattern>, String> {
-    read_list(bytes, "patterns", MOST_PATTERNS, pattern_of)
+    read_list(bytes, "patterns", MOST_PATTERNS, |index, text| pattern_of("patterns", index, text))
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
-//! The hand-off of a desktop run's command to the desktop helper, once the run holds the builder's desktop: the run's
-//! kill-on-close job, the control pipe, the helper started through its task in the console's session and checked to be
-//! the helper the box started, the command sent to it and reported back, checked and taken into the run's job, the
+//! The hand-off of a desktop run's command to the desktop helper, once the stage passed (a locked run holding the
+//! builder's desktop lock, a session run with none): the run's kill-on-close job, the control pipe, the helper started
+//! through its task in the console's session and checked to be the helper the box started, the command sent to it and
+//! reported back, checked and taken into the run's job, the
 //! start marker, and the command watched to its end as any run's command is.
 //!
 //! Before the marker every failure is a refusal. Once the box has sent the command, the helper may hold a child, so a
@@ -59,6 +60,9 @@ const NOT_A_MESSAGE: &str = "it sent a message the box cannot read";
 
 /// Why the helper did not start when it sent a message the hand-off was not at.
 const OUT_OF_TURN: &str = "it sent a message the box did not expect";
+
+/// Why the helper did not start when the process the task gave runs with another run's `Arg0`.
+const ANOTHER_RUNS: &str = "the process that answered is another run's helper";
 
 /// Why the helper did not start when it closed the control pipe and had not ended by itself within the end limit.
 const CLOSED: &str = "it closed the control pipe";
@@ -151,16 +155,27 @@ impl Fault {
     }
 }
 
-/// The helper the Task Scheduler started for the run, checked to be the box's: the control pipe it serves, the handle
-/// the box opened of it at once, its pid, when it was created, whether the box has sent it the command, from when it
-/// may hold a child, and the deadline its connect shares with the task start.
+/// The helper the Task Scheduler started for the run, checked to be the box's: the control pipe it serves, the `Arg0`
+/// the box started it with, the handle the box opened of it at once, its pid, when it was created, whether it is
+/// proved this run's (its command line named the run's `Arg0` at the pin, or it connected the run's pipe), whether the
+/// box has sent it the command, from when it may hold a child, and the deadline its connect shares with the task start.
 struct Pinned {
     server: PipeServer,
+    arg0: String,
     process: RemoteProcess,
     pid: u32,
     created: Timestamp,
+    owned: Cell<bool>,
     spawned: Cell<bool>,
     connect_by: Instant,
+}
+
+impl Pinned {
+    /// The run's `Arg0` while the helper is not proved the run's, which every end of it checks its command line
+    /// against before it ends it ([`end_within`]); `None` once it is proved.
+    fn unproved(&self) -> Option<String> {
+        (!self.owned.get()).then(|| self.arg0.clone())
+    }
 }
 
 /// How the exchange with the helper ended, where it did not fail.
@@ -310,22 +325,64 @@ fn pinned_helper(here: &Here<'_, '_>, job: &Job, console: &mut Console) -> Resul
         image: image_identity,
         user: &user,
     };
-    match verify_helper(&PinnedFacts(&process), &expected) {
-        Ok(created) => Ok((
+    // The command line is read through the pid while the pinned handle is held, so the pid cannot have been reused.
+    let checked = verify_helper(&PinnedFacts(&process), &expected)
+        .map_err(|refused| DesktopRefusal::HelperDidNotStart(refused.why()))
+        .and_then(|created| pin_owned(proc_table::command_line_of(pid).as_deref(), argument.as_str()).map(|owned| (created, owned)));
+    match checked {
+        Ok((created, owned)) => Ok((
             Pinned {
                 server,
+                arg0: argument.as_str().to_owned(),
                 process,
                 pid,
                 created,
+                owned: Cell::new(owned),
                 spawned: Cell::new(false),
                 connect_by,
             },
             stand_in,
         )),
-        Err(refused) => {
+        Err(refusal) => {
             drop(server);
-            Err(here.refused(DesktopRefusal::HelperDidNotStart(refused.why()), console))
+            Err(here.refused(refusal, console))
         }
+    }
+}
+
+/// What the helper's `command_line` says of whose it is, for the run's `arg0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    /// Its last word is the run's `Arg0`, as both the helper's task and the stand-in start it.
+    Ours,
+    /// It is another run's: its command line names another `Arg0`.
+    Another,
+    /// Its command line cannot be read.
+    Unread,
+}
+
+/// Whose the helper with `command_line` is, for the run's `arg0` ([`Owner`]).
+fn owner_of(command_line: Option<&str>, arg0: &str) -> Owner {
+    match command_line {
+        None => Owner::Unread,
+        Some(line) if line.split_whitespace().last().map(unquoted) == Some(arg0) => Owner::Ours,
+        Some(_) => Owner::Another,
+    }
+}
+
+/// `word` without one pair of double quotes around it, when it has them.
+fn unquoted(word: &str) -> &str {
+    word.strip_prefix('"').and_then(|inner| inner.strip_suffix('"')).unwrap_or(word)
+}
+
+/// The pin's verdict on the helper with `command_line`, for the run's `arg0`: true when it is proved this run's, false
+/// when its command line cannot be read, which the end checks again; another run's refuses the hand-off at once
+/// ([`ANOTHER_RUNS`]), so the run falls back rather than watch it.
+fn pin_owned(command_line: Option<&str>, arg0: &str) -> Result<bool, DesktopRefusal> {
+    match owner_of(command_line, arg0) {
+        Owner::Ours => Ok(true),
+        Owner::Unread => Ok(false),
+        Owner::Another => Err(DesktopRefusal::HelperDidNotStart(ANOTHER_RUNS.to_owned())),
     }
 }
 
@@ -335,6 +392,8 @@ fn pinned_helper(here: &Here<'_, '_>, job: &Job, console: &mut Console) -> Resul
 fn exchange(here: &Here<'_, '_>, pinned: &Pinned, job: &Job, program: FileIdentity) -> Result<Exchanged, Fault> {
     let wake = [here.stop(), pinned.process.handle()];
     connected(pinned, &wake)?;
+    // Its connect proves it the run's: only the pinned pid's connect to the run's own pipe is taken.
+    pinned.owned.set(true);
     hello(read(pinned, here.limits, &wake)?)?;
     let OutputPipes {
         stdout_read,
@@ -494,8 +553,15 @@ fn taken(helper: &RemoteProcess, values: (u64, u64), job: &Job, reported: &Repor
 /// Lets the helper go once the exchange is over: it is given the end limit to end by itself, the wait ended at once by
 /// a stop, then ended if it still runs; its pipe is dropped once that is over.
 fn release_helper(here: &Here<'_, '_>, pinned: Pinned, console: &mut Console) {
+    let unproved = pinned.unproved();
     let Pinned { server, process, pid, .. } = pinned;
-    let ended = end_within(&Watched::new(here, &process), here.limits.end, Instant::now, true);
+    let ended = end_within(
+        &Watched::new(here, &process, pid),
+        here.limits.end,
+        Instant::now,
+        true,
+        unproved.as_deref(),
+    );
     drop(server);
     say_unended(here, pid, &ended, console);
 }
@@ -503,6 +569,7 @@ fn release_helper(here: &Here<'_, '_>, pinned: Pinned, console: &mut Console) {
 /// Ends a hand-off whose helper reported that it could not create the command: the same ending as any failure after
 /// the command was sent ([`ended_on`]), then the start marker and the command's start failure; 127.
 fn not_created(here: &Here<'_, '_>, pinned: Pinned, code: u32, console: &mut Console) -> Ran {
+    let unproved = pinned.unproved();
     let Pinned {
         server,
         process,
@@ -511,7 +578,13 @@ fn not_created(here: &Here<'_, '_>, pinned: Pinned, code: u32, console: &mut Con
         ..
     } = pinned;
     drop(server);
-    let ended = end_within(&Watched::new(here, &process), here.limits.end, Instant::now, true);
+    let ended = end_within(
+        &Watched::new(here, &process, pid),
+        here.limits.end,
+        Instant::now,
+        true,
+        unproved.as_deref(),
+    );
     say_unended(here, pid, &ended, console);
     sweep(here, pid, created, console);
     here.beat.say_protocol(console, &started_line(here.request.nonce));
@@ -521,9 +594,12 @@ fn not_created(here: &Here<'_, '_>, pinned: Pinned, code: u32, console: &mut Con
 
 /// Ends the hand-off on `fault`: the pipe dropped without `Done`; the helper given one end limit to end by itself
 /// (and so its own child) once the command was sent or once it was gone already, else ended at once, as it holds no
-/// child; once the command was sent, every process left that is provably the helper's ended ([`sweep`]). Then the
-/// refusal is said, or, for a stop, the run's job stopped and its line said.
+/// child; once the command was sent, every process left that is provably the helper's ended ([`sweep`]). A helper not
+/// proved the run's ([`Pinned`]) has its command line read again, and is ended only when it names the run's `Arg0`:
+/// with several hand-offs at once, the pid the Task Scheduler gave may be another run's helper, which passes the pin's
+/// other checks. Then the refusal is said, or, for a stop, the run's job stopped and its line said.
 fn ended_on(here: &Here<'_, '_>, fault: Fault, pinned: Pinned, job: &Job, console: &mut Console) -> DesktopEnd {
+    let unproved = pinned.unproved();
     let Pinned {
         server,
         process,
@@ -535,10 +611,11 @@ fn ended_on(here: &Here<'_, '_>, fault: Fault, pinned: Pinned, job: &Job, consol
     let spawned = spawned.get();
     drop(server);
     let ended = end_within(
-        &Watched::new(here, &process),
+        &Watched::new(here, &process, pid),
         here.limits.end,
         Instant::now,
         spawned || matches!(fault, Fault::Gone),
+        unproved.as_deref(),
     );
     let refusal = match fault {
         Fault::Refused(refusal) => Some(refusal),
@@ -556,16 +633,32 @@ fn ended_on(here: &Here<'_, '_>, fault: Fault, pinned: Pinned, job: &Job, consol
 }
 
 /// Why a helper that closed its pipe or ended is refused: the exit code it ended with, when it ended by itself; else
-/// that it closed the pipe.
+/// as [`unexited`] says.
 fn gone(helper: &RemoteProcess, ended: &HelperEnd) -> DesktopRefusal {
     match ended {
         HelperEnd::Exited => match helper.exit_code() {
             Ok(code) => DesktopRefusal::HelperFailed(code),
             Err(error) => DesktopRefusal::HelperDidNotStart(with_error(EXIT_CODE_UNREAD, &error)),
         },
-        HelperEnd::Ended | HelperEnd::NotEnded(_) => DesktopRefusal::HelperDidNotStart(CLOSED.to_owned()),
+        other => unexited(other),
     }
 }
+
+/// Why a helper gone without ending by itself is refused: that it closed the pipe, when the box ended it or could not;
+/// that it is not this run's, or that its command line could not be read, when the box left it.
+fn unexited(ended: &HelperEnd) -> DesktopRefusal {
+    match ended {
+        HelperEnd::LeftAnother => DesktopRefusal::Machinery(LEFT_ANOTHER.to_owned()),
+        HelperEnd::LeftUnread => DesktopRefusal::Machinery(LEFT_UNREAD.to_owned()),
+        HelperEnd::Exited | HelperEnd::Ended | HelperEnd::NotEnded(_) => DesktopRefusal::HelperDidNotStart(CLOSED.to_owned()),
+    }
+}
+
+/// Why the run is refused when the box left the helper the Task Scheduler named, its command line another run's.
+const LEFT_ANOTHER: &str = "the desktop helper the Task Scheduler named is not this run's";
+
+/// Why the run is refused when the box left the helper, its command line unread.
+const LEFT_UNREAD: &str = "the desktop helper's command line could not be read";
 
 /// How the helper came to its end.
 #[derive(Debug)]
@@ -576,6 +669,10 @@ enum HelperEnd {
     Ended,
     /// The box could not end it, for this error.
     NotEnded(io::Error),
+    /// The box left it running: its command line names another run's `Arg0`.
+    LeftAnother,
+    /// The box left it running: it was not proved the run's, and its command line cannot be read.
+    LeftUnread,
 }
 
 /// The helper as the box waits for its end and ends it.
@@ -585,22 +682,34 @@ trait EndingHelper {
 
     /// Ends it, and waits at most `bound` to see it ended: true once it has.
     fn end(&self, bound: Duration) -> io::Result<bool>;
+
+    /// Its command line, `None` when it cannot be read.
+    fn command_line(&self) -> Option<String>;
 }
 
-/// The pinned helper's process, and the run's stop signal its wait watches.
+/// The pinned helper's process and pid, and the run's stop signal its wait watches.
 struct Watched<'w> {
     process: &'w RemoteProcess,
+    pid: u32,
     stop: BorrowedHandle<'w>,
 }
 
 impl<'w> Watched<'w> {
-    /// `process` watched with `here`'s stop signal.
-    fn new(here: &'w Here<'_, '_>, process: &'w RemoteProcess) -> Watched<'w> {
-        Watched { process, stop: here.stop() }
+    /// `process`, of pid `pid`, watched with `here`'s stop signal.
+    fn new(here: &'w Here<'_, '_>, process: &'w RemoteProcess, pid: u32) -> Watched<'w> {
+        Watched {
+            process,
+            pid,
+            stop: here.stop(),
+        }
     }
 }
 
 impl EndingHelper for Watched<'_> {
+    fn command_line(&self) -> Option<String> {
+        proc_table::command_line_of(self.pid)
+    }
+
     fn wait_for_end(&self, bound: Duration) -> io::Result<EndWait> {
         self.process.wait_or_woken(bound, &[self.stop])
     }
@@ -624,12 +733,20 @@ fn end_slice(limit: Duration) -> Duration {
 /// Brings `helper` to its end within `limit` in total, on the clock `now`: when `wait_first`, a wait for it to end by
 /// itself, which a stop ends at once, given the limit less [`end_slice`], then, if it still runs or the wait failed,
 /// its end by the box, given what is left of the limit and never less than that slice. A failed wait is not said: the
-/// end that follows it is.
-fn end_within(helper: &impl EndingHelper, limit: Duration, now: impl Fn() -> Instant, wait_first: bool) -> HelperEnd {
+/// end that follows it is. With `unproved`, the run's `Arg0` of a helper not yet proved the run's, the box ends it only
+/// when its command line names that `Arg0` ([`owner_of`]), and else leaves it.
+fn end_within(helper: &impl EndingHelper, limit: Duration, now: impl Fn() -> Instant, wait_first: bool, unproved: Option<&str>) -> HelperEnd {
     let deadline = now() + limit;
     let slice = end_slice(limit);
     if wait_first && matches!(helper.wait_for_end(limit.saturating_sub(slice)), Ok(EndWait::Ended)) {
         return HelperEnd::Exited;
+    }
+    if let Some(arg0) = unproved {
+        match owner_of(helper.command_line().as_deref(), arg0) {
+            Owner::Ours => {}
+            Owner::Another => return HelperEnd::LeftAnother,
+            Owner::Unread => return HelperEnd::LeftUnread,
+        }
     }
     match helper.end(deadline.saturating_duration_since(now()).max(slice)) {
         Ok(true) => HelperEnd::Ended,
@@ -638,10 +755,20 @@ fn end_within(helper: &impl EndingHelper, limit: Duration, now: impl Fn() -> Ins
     }
 }
 
-/// Says the one line for a helper of pid `pid` the box could not end, when `ended` says so.
+/// Says the one line for a helper of pid `pid` the box could not end or left, when `ended` says so.
 fn say_unended(here: &Here<'_, '_>, pid: u32, ended: &HelperEnd, console: &mut Console) {
-    if let HelperEnd::NotEnded(error) = ended {
-        here.beat.say(console, &helper_not_ended(pid, error));
+    if let Some(line) = unended_line(pid, ended) {
+        here.beat.say(console, &line);
+    }
+}
+
+/// The box's line for a helper of pid `pid` that `ended` says the box could not end or left; `None` for one that ended.
+fn unended_line(pid: u32, ended: &HelperEnd) -> Option<String> {
+    match ended {
+        HelperEnd::NotEnded(error) => Some(helper_not_ended(pid, error)),
+        HelperEnd::LeftAnother => Some(format!("gate: remote left a desktop helper {pid} that is not this run's")),
+        HelperEnd::LeftUnread => Some(format!("gate: remote left a desktop helper {pid} whose command line could not be read")),
+        HelperEnd::Exited | HelperEnd::Ended => None,
     }
 }
 
@@ -968,22 +1095,22 @@ fn run_helper_task(
     deadline: Instant,
     wake: &[BorrowedHandle<'_>],
 ) -> (Result<StartedTask, TaskError>, Option<Job>) {
-    use gate_args::DesktopMode;
+    use gate_args::DesktopMode as SeamFault;
 
     let Some(mode) = seams.desktop else {
         return (gate_win32::run_task(task, deadline, wake), None);
     };
     let fault = match mode {
-        DesktopMode::TaskNotRegistered => return (Err(TaskError::NotRegistered), None),
-        DesktopMode::TaskSetUpWrong => return (Err(TaskError::SetUpWrong("the desktop seam's definition".to_owned())), None),
-        DesktopMode::TaskFailed => return (Err(TaskError::Failed("the desktop seam's start failed".to_owned())), None),
-        DesktopMode::TaskNoPid => return (Ok(StartedTask::NoPid), None),
-        DesktopMode::Ok => "",
-        DesktopMode::ExitBeforeHello => "exit-before-hello",
-        DesktopMode::Hang => "hang",
-        DesktopMode::WrongVersion => "wrong-version",
-        DesktopMode::LieHandle => "lie-handle",
-        DesktopMode::ExitAfterCreate => "exit-after-create",
+        SeamFault::TaskNotRegistered => return (Err(TaskError::NotRegistered), None),
+        SeamFault::TaskSetUpWrong => return (Err(TaskError::SetUpWrong("the desktop seam's definition".to_owned())), None),
+        SeamFault::TaskFailed => return (Err(TaskError::Failed("the desktop seam's start failed".to_owned())), None),
+        SeamFault::TaskNoPid => return (Ok(StartedTask::NoPid), None),
+        SeamFault::Ok => "",
+        SeamFault::ExitBeforeHello => "exit-before-hello",
+        SeamFault::Hang => "hang",
+        SeamFault::WrongVersion => "wrong-version",
+        SeamFault::LieHandle => "lie-handle",
+        SeamFault::ExitAfterCreate => "exit-after-create",
     };
     match stand_in(fault, task.argument, seams.desktop_ms) {
         Ok((pid, job)) => (Ok(StartedTask::Process(pid)), job),
@@ -1136,6 +1263,7 @@ mod tests {
         bounds: RefCell<Vec<Duration>>,
         wait: io::Result<EndWait>,
         late: Duration,
+        command_line: Option<String>,
     }
 
     impl Stubborn {
@@ -1159,6 +1287,10 @@ mod tests {
             self.spend(bound);
             Ok(false)
         }
+
+        fn command_line(&self) -> Option<String> {
+            self.command_line.clone()
+        }
     }
 
     /// A [`Stubborn`] helper whose wait answers `wait`, on time.
@@ -1168,7 +1300,116 @@ mod tests {
             bounds: RefCell::new(Vec::new()),
             wait,
             late: Duration::ZERO,
+            command_line: None,
         }
+    }
+
+    /// The `Arg0` of the run in the pin cases: the box's pid and its pipe's random part.
+    const OURS: &str = "4242:0123456789abcdef0123456789abcdef";
+
+    /// The command line of a helper started with another run's `Arg0`: another pipe's random part.
+    const ANOTHER: &str = r#""C:\gate\gate-desktop-helper.exe" 4242:fedcba9876543210fedcba9876543210"#;
+
+    #[test]
+    fn a_pin_whose_command_line_names_another_runs_arg0_is_refused_before_the_pipe_wait() {
+        let refused = super::pin_owned(Some(ANOTHER), OURS).expect_err("another run's helper is refused at the pin");
+        assert_eq!(
+            refused.line(),
+            "gate: not routed: the builder has no desktop session: the desktop helper did not start: the process that answered is another run's \
+             helper"
+        );
+        assert_eq!(
+            super::pin_owned(Some(&format!("helper.exe {OURS}")), OURS),
+            Ok(true),
+            "the run's own is owned"
+        );
+        assert_eq!(super::pin_owned(None, OURS), Ok(false), "an unread command line goes on, unowned");
+        assert_eq!(
+            super::pin_owned(Some(&format!(r#""C:\gate\gate-desktop-helper.exe" "{OURS}""#)), OURS),
+            Ok(true),
+            "an Arg0 in one pair of double quotes is the run's"
+        );
+        assert!(
+            super::pin_owned(Some(&format!(r#"helper.exe ""{OURS}"""#)), OURS).is_err(),
+            "only one pair of quotes is taken off"
+        );
+    }
+
+    #[test]
+    fn a_helper_the_box_left_is_refused_without_saying_it_closed_the_pipe() {
+        let no_desktop = "gate: not routed: the builder has no desktop session: ";
+        assert_eq!(
+            super::unexited(&HelperEnd::LeftAnother).line(),
+            format!("{no_desktop}the desktop helper the Task Scheduler named is not this run's")
+        );
+        assert_eq!(
+            super::unexited(&HelperEnd::LeftUnread).line(),
+            format!("{no_desktop}the desktop helper's command line could not be read")
+        );
+        assert_eq!(
+            super::unexited(&HelperEnd::Ended).line(),
+            format!("{no_desktop}the desktop helper did not start: it closed the control pipe"),
+            "a helper the box ended still closed the pipe"
+        );
+    }
+
+    #[test]
+    fn an_unowned_helper_whose_command_line_names_another_pipe_is_left_and_said() {
+        let limit = Duration::from_secs(10);
+        let helper = Stubborn {
+            command_line: Some(ANOTHER.to_owned()),
+            ..stubborn(Ok(EndWait::Running))
+        };
+
+        let ended = end_within(&helper, limit, || helper.clock.get(), false, Some(OURS));
+
+        assert!(matches!(ended, HelperEnd::LeftAnother), "{ended:?}");
+        assert!(helper.bounds.borrow().is_empty(), "the box never ended it");
+        assert_eq!(
+            super::unended_line(77, &ended).as_deref(),
+            Some("gate: remote left a desktop helper 77 that is not this run's")
+        );
+    }
+
+    #[test]
+    fn an_unowned_helper_whose_command_line_cannot_be_read_at_the_end_is_left_and_said() {
+        let limit = Duration::from_secs(10);
+        let helper = stubborn(Ok(EndWait::Running));
+
+        let ended = end_within(&helper, limit, || helper.clock.get(), false, Some(OURS));
+
+        assert!(matches!(ended, HelperEnd::LeftUnread), "{ended:?}");
+        assert!(helper.bounds.borrow().is_empty(), "the box never ended it");
+        assert_eq!(
+            super::unended_line(77, &ended).as_deref(),
+            Some("gate: remote left a desktop helper 77 whose command line could not be read")
+        );
+    }
+
+    #[test]
+    fn a_pinned_helper_whose_command_line_names_the_runs_arg0_is_ended() {
+        let limit = Duration::from_secs(10);
+        for command_line in [
+            format!(r#""C:\gate\gate-desktop-helper.exe" {OURS}"#),
+            format!(r"C:\gate\gate-desktop-helper.exe {OURS}"),
+        ] {
+            let helper = Stubborn {
+                command_line: Some(command_line.clone()),
+                ..stubborn(Ok(EndWait::Running))
+            };
+
+            let ended = end_within(&helper, limit, || helper.clock.get(), false, Some(OURS));
+
+            assert_eq!(helper.bounds.borrow().as_slice(), [limit], "{command_line}: the box ended it");
+            assert!(matches!(ended, HelperEnd::NotEnded(_)), "{command_line}: {ended:?}");
+        }
+        let unread = stubborn(Ok(EndWait::Running));
+        end_within(&unread, limit, || unread.clock.get(), false, None);
+        assert_eq!(
+            unread.bounds.borrow().as_slice(),
+            [limit],
+            "a helper proved the run's by its connect is ended unread"
+        );
     }
 
     #[test]
@@ -1179,7 +1420,7 @@ mod tests {
             ..stubborn(Ok(EndWait::Running))
         };
 
-        end_within(&helper, limit, || helper.clock.get(), true);
+        end_within(&helper, limit, || helper.clock.get(), true, None);
 
         assert_eq!(
             helper.bounds.borrow().as_slice(),
@@ -1193,7 +1434,7 @@ mod tests {
         let limit = Duration::from_secs(1);
         let helper = stubborn(Ok(EndWait::Running));
 
-        end_within(&helper, limit, || helper.clock.get(), true);
+        end_within(&helper, limit, || helper.clock.get(), true, None);
 
         assert_eq!(
             helper.bounds.borrow().as_slice(),
@@ -1208,7 +1449,7 @@ mod tests {
         for wait in [Ok(EndWait::Running), Ok(EndWait::Woken(0)), Err(io::Error::other("the wait failed"))] {
             let helper = stubborn(wait);
 
-            let ended = end_within(&helper, limit, || helper.clock.get(), true);
+            let ended = end_within(&helper, limit, || helper.clock.get(), true, None);
 
             let bounds = helper.bounds.borrow();
             assert_eq!(bounds.len(), 2, "one wait, then one end: {bounds:?}");
@@ -1221,7 +1462,7 @@ mod tests {
         }
 
         let helper = stubborn(Ok(EndWait::Running));
-        let ended = end_within(&helper, limit, || helper.clock.get(), false);
+        let ended = end_within(&helper, limit, || helper.clock.get(), false, None);
         assert_eq!(
             helper.bounds.borrow().as_slice(),
             [limit],
@@ -1230,7 +1471,7 @@ mod tests {
         assert!(matches!(ended, HelperEnd::NotEnded(_)), "{ended:?}");
 
         let helper = stubborn(Ok(EndWait::Ended));
-        let ended = end_within(&helper, limit, || helper.clock.get(), true);
+        let ended = end_within(&helper, limit, || helper.clock.get(), true, None);
         assert_eq!(helper.bounds.borrow().len(), 1, "a helper that ended by itself is not ended again");
         assert!(matches!(ended, HelperEnd::Exited), "{ended:?}");
     }

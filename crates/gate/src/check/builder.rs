@@ -638,6 +638,7 @@ impl Answer<'_> {
             workloads: declared.manifest.workloads,
             consent_problem: None,
             hooks_problem: None,
+            desktop_session_problem: None,
             cross_build_problems: Vec::new(),
             root_problem: None,
             read_from: Vec::new(),

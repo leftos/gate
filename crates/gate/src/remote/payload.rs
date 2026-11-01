@@ -10,6 +10,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use gate_args::{BoxVerb, DrainAction, MAX_WHOLE_NUMBER};
 use gate_router::CrossBuild;
+use gate_router::desktop::DesktopMode;
 use gate_wire::{PathForm, lower_hex};
 use serde_json::{Map, Value, json};
 
@@ -174,10 +175,10 @@ pub(crate) struct RunCall<'a> {
     /// (`EngineEnv`, an object of each name and `"unreal"`, sent only when there is one, whether or not a version is
     /// chosen, so the box removes a value it inherited), which a warm-up sends too.
     pub engine_env: &'a [String],
-    /// Whether the run asks for the builder's desktop (`Desktop: true` and `DesktopWait`, the run's desktop wait in
-    /// whole seconds ([`desktop_wait`]), sent only then); a warm-up never sends them, as the box refuses a warm-up on
-    /// the desktop.
-    pub desktop: bool,
+    /// How the run uses the builder's desktop, `None` for not at all (`Desktop: true` and `DesktopWait`, the run's
+    /// desktop wait in whole seconds ([`desktop_wait`]), sent only for a desktop run, with `DesktopSession: true` for a
+    /// session one); a warm-up never sends them, as the box refuses a warm-up on the desktop.
+    pub desktop: Option<DesktopMode>,
     /// The usual p90 of the run's remote take in seconds, which a desktop run's `DesktopWait` grows to; `None` without
     /// history.
     pub usual_p90: Option<f64>,
@@ -320,7 +321,8 @@ fn desktop_wait(usual_p90: Option<f64>) -> u64 {
 /// The payload word of the run call, with the run's variables (the caller's `--env` pairs and the gate's
 /// `SourceRevisionId`) as `Env` when there is one, and `Desktop: true`
 /// with `DesktopWait` ([`desktop_wait`], which the box caps at the run's `Timeout`) for a run that asks for the
-/// builder's desktop, `CrossBuild` (`Rid` and `Words`) for a run with a cross build and output globs, and the
+/// builder's desktop, with `DesktopSession: true` beside them for a session run, which takes no desktop lock (a box
+/// that does not know the key takes the lock), `CrossBuild` (`Rid` and `Words`) for a run with a cross build and output globs, and the
 /// repos' default branches as `Base` and `SiblingBases` when any has one.
 pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
     let mut object = location.object();
@@ -344,9 +346,12 @@ pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
     if !run.failure_outputs.is_empty() {
         object.insert("FailureOutputs".to_owned(), json!(run.failure_outputs));
     }
-    if run.desktop {
+    if let Some(mode) = run.desktop {
         object.insert("Desktop".to_owned(), json!(true));
         object.insert("DesktopWait".to_owned(), json!(desktop_wait(run.usual_p90)));
+        if mode == DesktopMode::Session {
+            object.insert("DesktopSession".to_owned(), json!(true));
+        }
     }
     if let Some(cross) = run.cross_build.filter(|_| !run.outputs.is_empty()) {
         object.insert("CrossBuild".to_owned(), json!({"Rid": cross.rid, "Words": cross.words}));
@@ -660,7 +665,7 @@ mod tests {
             godot_version: None,
             unreal_version: None,
             engine_env: &[],
-            desktop: false,
+            desktop: None,
             usual_p90: None,
         };
         run_word(&location().with_pair("app", &["lib".to_owned(), "tools".to_owned()]), &run)
@@ -887,7 +892,7 @@ mod tests {
             godot_version: None,
             unreal_version: None,
             engine_env: &[],
-            desktop: false,
+            desktop: None,
             usual_p90: None,
         };
         let mut expected = preflight;
@@ -938,7 +943,7 @@ mod tests {
             godot_version: None,
             unreal_version: None,
             engine_env: &[],
-            desktop: false,
+            desktop: None,
             usual_p90: None,
         };
 
@@ -1014,7 +1019,7 @@ mod tests {
             godot_version: None,
             unreal_version: None,
             engine_env: &[],
-            desktop: false,
+            desktop: None,
             usual_p90: None,
         };
 
@@ -1058,7 +1063,7 @@ mod tests {
             godot_version: Some("4.7.2"),
             unreal_version: None,
             engine_env: &[],
-            desktop: false,
+            desktop: None,
             usual_p90: None,
         };
         let commands = warm_commands();
@@ -1108,7 +1113,7 @@ mod tests {
             godot_version: None,
             unreal_version: Some("5.8.0"),
             engine_env: &[],
-            desktop: false,
+            desktop: None,
             usual_p90: None,
         };
         let commands = warm_commands();
@@ -1159,7 +1164,7 @@ mod tests {
             godot_version: None,
             unreal_version: None,
             engine_env: &names,
-            desktop: false,
+            desktop: None,
             usual_p90: None,
         };
         let commands = warm_commands();
@@ -1214,7 +1219,7 @@ mod tests {
             godot_version: None,
             unreal_version: None,
             engine_env: &[],
-            desktop: true,
+            desktop: Some(gate_router::desktop::DesktopMode::Locked),
             usual_p90: None,
         };
         let commands = warm_commands();
@@ -1226,12 +1231,32 @@ mod tests {
         let word = run_word(&location(), &run);
         let sent = decoded(&word);
         assert_eq!((&sent["Desktop"], &sent["DesktopWait"]), (&json!(true), &json!(60)));
+        assert!(sent.get("DesktopSession").is_none(), "a locked run sends no DesktopSession: {sent}");
         assert_eq!(on_the_box(&word).desktop(), Ok(true), "the box reads Desktop back");
         assert_eq!(on_the_box(&word).desktop_wait(), Ok(Some(60)), "the box reads DesktopWait back");
+        assert_eq!(on_the_box(&word).desktop_session(), Ok(false), "the box takes the lock");
         let warm_sent = decoded(&warm_word(&location(), &run, &warm));
         assert!(
             warm_sent.get("Desktop").is_none() && warm_sent.get("DesktopWait").is_none(),
             "a warm-up never asks for the desktop: {warm_sent}"
+        );
+
+        let session = RunCall {
+            desktop: Some(gate_router::desktop::DesktopMode::Session),
+            ..run
+        };
+        let word = run_word(&location(), &session);
+        let sent = decoded(&word);
+        assert_eq!(
+            (&sent["Desktop"], &sent["DesktopWait"], &sent["DesktopSession"]),
+            (&json!(true), &json!(60), &json!(true)),
+            "a session run sends the same Desktop and DesktopWait as a locked one, and DesktopSession"
+        );
+        assert_eq!(on_the_box(&word).desktop_session(), Ok(true), "the box reads DesktopSession back");
+        let warm_sent = decoded(&warm_word(&location(), &session, &warm));
+        assert!(
+            warm_sent.get("DesktopSession").is_none(),
+            "a warm-up never asks for the session: {warm_sent}"
         );
 
         for (usual_p90, wait) in [(None, 60), (Some(40.0), 60), (Some(240.3), 241), (Some(1e12), 2_147_483_647)] {
@@ -1243,10 +1268,10 @@ mod tests {
             );
         }
 
-        run.desktop = false;
+        run.desktop = None;
         let sent = decoded(&run_word(&location(), &run));
         assert!(
-            sent.get("Desktop").is_none() && sent.get("DesktopWait").is_none(),
+            sent.get("Desktop").is_none() && sent.get("DesktopWait").is_none() && sent.get("DesktopSession").is_none(),
             "a run without the desktop sends neither key: {sent}"
         );
     }
@@ -1280,7 +1305,7 @@ mod tests {
             godot_version: None,
             unreal_version: None,
             engine_env: &[],
-            desktop: false,
+            desktop: None,
             usual_p90: None,
         };
         let commands = warm_commands();
@@ -1350,7 +1375,7 @@ mod tests {
             godot_version: None,
             unreal_version: None,
             engine_env: &[],
-            desktop: false,
+            desktop: None,
             usual_p90: None,
         }
     }

@@ -2278,7 +2278,7 @@ mod tests {
                 dropped_no_build: false,
                 send: None,
                 cross_build: None,
-                desktop: false,
+                desktop: None,
                 inputs: &[],
                 log,
                 timeout: 60,

@@ -520,6 +520,22 @@ impl Payload {
         }
     }
 
+    /// Whether the desktop run is a session run, `DesktopSession`, which needs only the builder's console session and
+    /// takes no desktop lock: true or false, false when the key is absent or null; else the usage line saying it is not
+    /// true or false. A true one without `Desktop: true` is the usage line saying it needs `Desktop`, and so is a
+    /// `Desktop` that is not true or false.
+    pub fn desktop_session(&self) -> Result<bool, String> {
+        let session = match self.object.get("DesktopSession") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(session)) => *session,
+            Some(_) => return Err("gate: box payload DesktopSession is not true or false".to_owned()),
+        };
+        if session && self.desktop() != Ok(true) {
+            return Err("gate: box payload DesktopSession needs Desktop".to_owned());
+        }
+        Ok(session)
+    }
+
     /// The run's drain session id, `Session`: 1 to [`MOST_SESSION_CHARS`] ASCII letters, digits, `_` and `-`; `None`
     /// when the key is absent or null, as a PC older than the drain sends it. Else the usage line, the value shown with
     /// its control characters escaped.
@@ -3331,6 +3347,35 @@ mod tests {
         assert_eq!(
             head(json!({ "CommitStage": "yes", "Head": sha })),
             Err("gate: box payload CommitStage is not true or false".to_owned())
+        );
+    }
+
+    #[test]
+    fn desktop_session_is_true_or_false_false_when_absent_and_needs_desktop() {
+        let session = |json: serde_json::Value| decoded(&json.to_string()).and_then(|payload| payload.desktop_session());
+        assert_eq!(session(json!({})), Ok(false), "absent");
+        assert_eq!(session(json!({ "Desktop": true, "DesktopSession": null })), Ok(false), "null");
+        assert_eq!(session(json!({ "Desktop": true, "DesktopSession": true })), Ok(true));
+        assert_eq!(session(json!({ "Desktop": true, "DesktopSession": false })), Ok(false));
+        assert_eq!(session(json!({ "DesktopSession": false })), Ok(false), "false needs no Desktop");
+        for bad in [json!("true"), json!(1), json!([true])] {
+            assert_eq!(
+                session(json!({ "Desktop": true, "DesktopSession": bad })),
+                Err("gate: box payload DesktopSession is not true or false".to_owned()),
+                "{bad}"
+            );
+        }
+        for desktop in [json!(null), json!(false), json!("true")] {
+            assert_eq!(
+                session(json!({ "Desktop": desktop, "DesktopSession": true })),
+                Err("gate: box payload DesktopSession needs Desktop".to_owned()),
+                "{desktop}"
+            );
+        }
+        assert_eq!(
+            session(json!({ "DesktopSession": true })),
+            Err("gate: box payload DesktopSession needs Desktop".to_owned()),
+            "absent Desktop"
         );
     }
 

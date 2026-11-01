@@ -535,11 +535,10 @@ fn a_refused_child_report_leaves_nothing_running() {
     let case = Case::new("desktop_lie_handle");
     let mark = case.folder().join("marked");
     let mark_word = shown(&mark);
-    let record = case.folder().join("children");
     let payload = ready_payload(&case, &[FAKE_TOOL, "mark", &mark_word, "out", "ran"]);
     // The stand-in records its child and runs in no job of the box's, so only the box's own ending ends the child.
     let mut call = desktop_call(&case, &payload, "lie-handle", &[]);
-    call.env("GATE_DESKTOP_TEST_RECORD", &record);
+    let record = recorded(&case, &mut call, "box");
 
     let outcome = call.finish_read();
 
@@ -561,6 +560,18 @@ fn a_refused_child_report_leaves_nothing_running() {
         &format!("{NO_DESKTOP}the desktop helper failed: the command it started is not the process it reported: {INVALID_HANDLE}"),
     );
     assert!(!mark.exists(), "the command never ran: {outcome:?}");
+}
+
+/// The stand-in helper's seam naming the file it records its own pid and each child's to, and which keeps it in no job
+/// of the box's.
+const RECORD_VARIABLE: &str = "GATE_DESKTOP_TEST_RECORD";
+
+/// Sets the record of the box `call` of `case`, its own file named for the box's `name`, and returns its path: each box
+/// of a case gets its own record, so two boxes of one case never share one.
+fn recorded(case: &Case, call: &mut BoxCall, name: &str) -> PathBuf {
+    let record = case.folder().join(format!("children-{name}"));
+    call.env(RECORD_VARIABLE, &record);
+    record
 }
 
 /// The system's error for a handle value the helper's table does not hold, as the box says it.
@@ -666,11 +677,10 @@ fn a_helper_that_dies_after_creating_the_child_leaves_no_suspended_process() {
     let case = Case::new("desktop_exit_after_create");
     let mark = case.folder().join("marked");
     let mark_word = shown(&mark);
-    let record = case.folder().join("children");
     let payload = ready_payload(&case, &[FAKE_TOOL, "mark", &mark_word, "out", "ran"]);
     // The stand-in records its child and runs in no job of the box's, so only the box's sweep ends the child it left.
     let mut call = desktop_call(&case, &payload, "exit-after-create", &[]);
-    call.env("GATE_DESKTOP_TEST_RECORD", &record);
+    let record = recorded(&case, &mut call, "box");
 
     let outcome = call.finish_read();
 
@@ -959,6 +969,89 @@ fn a_desktop_run_that_lets_the_lock_go_leaves_no_holder_record() {
     assert!(!record.exists(), "the run that let the desktop go removed its holder record: {outcome:?}");
 }
 
+/// The payload of a session run of `case`'s work folder `key` running `command`, its snapshot made. Its wait, which a
+/// session run never spends, is a second, so a run taken for a locked one beside a held lock ends refused at once.
+fn session_payload(case: &Case, key: &str, command: &[&str]) -> Value {
+    let mut payload = desktop_payload(case, key, command, 1);
+    payload["DesktopSession"] = json!(true);
+    snapshot(case, &mut payload, &[("a.txt", "a\n")]);
+    payload
+}
+
+#[test]
+fn two_session_runs_run_beside_a_held_desktop_lock() {
+    let case = Case::new("desktop_session_beside_held");
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let first = session_payload(&case, "a", &[FAKE_TOOL, "out", "holding", "wait", &go_word]);
+    let second = session_payload(&case, "b", COMMAND);
+    let held = HeldDesktop::hold(&case);
+
+    let mut first_call = desktop_call(&case, &first, "ok", &[]);
+    let first_record = recorded(&case, &mut first_call, "first");
+    let running = first_call.start();
+    running.wait_for_stdout("holding");
+    let mut second_call = desktop_call(&case, &second, "ok", &[]);
+    let second_record = recorded(&case, &mut second_call, "second");
+    let beside = second_call.finish_read();
+    let record_while_running = holder_record(&first).exists();
+    let_go(&go);
+    let outcome = running.finish_read();
+    drop(held);
+
+    let runs = [("first", &outcome, &first, &first_record), ("second", &beside, &second, &second_record)];
+    for (run, said, payload, record) in runs {
+        assert_eq!(said.code, Some(0), "the {run} session run ran beside the held lock: {said:?}");
+        ran_its_command(said, payload);
+        assert!(lines_starting(said, BUSY_WAIT_PREFIX).is_empty(), "the {run} run never waited: {said:?}");
+        let left = left_by(record);
+        assert!(
+            left.children.is_empty() && !left.stand_in_running,
+            "the {run} run left nothing running: {said:?}"
+        );
+    }
+    assert_eq!(beside.stdout, "ran\n", "the second ran while the first still ran: {beside:?}");
+    assert!(!record_while_running, "no session run writes a holder record: {outcome:?}");
+    assert!(!holder_record(&first).exists(), "no holder record is left: {outcome:?}");
+}
+
+#[test]
+fn a_session_run_writes_no_holder_record() {
+    let case = Case::new("desktop_session_no_record");
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let payload = session_payload(&case, "k", &[FAKE_TOOL, "out", "holding", "wait", &go_word]);
+    let record = holder_record(&payload);
+
+    let running = desktop_call(&case, &payload, "ok", &[]).start();
+    running.wait_for_stdout("holding");
+    let kept = record.exists();
+    let_go(&go);
+    let outcome = running.finish_read();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    ran_its_command(&outcome, &payload);
+    assert!(!kept, "a session run keeps no holder record while its command runs: {outcome:?}");
+    assert!(!record.exists(), "a session run leaves no holder record: {outcome:?}");
+}
+
+#[test]
+fn a_locked_run_still_waits_behind_a_held_lock() {
+    let case = Case::new("desktop_locked_waits");
+    let mut payload = ready_payload(&case, COMMAND);
+    payload["DesktopSession"] = json!(false);
+    let held = HeldDesktop::hold(&case);
+
+    let running = desktop_call(&case, &payload, "ok", &[]).start();
+    running.wait_for_stderr(BUSY_WAIT);
+    drop(held);
+    let outcome = running.finish_read();
+
+    assert_eq!(outcome.code, Some(0), "the locked run took the desktop once it was free: {outcome:?}");
+    assert_eq!(lines_starting(&outcome, BUSY_WAIT), [BUSY_WAIT], "the busy line, once: {outcome:?}");
+    ran_its_command(&outcome, &payload);
+}
+
 #[test]
 fn a_desktop_wait_is_capped_at_the_runs_timeout() {
     let case = Case::new("desktop_wait_capped");
@@ -1180,7 +1273,6 @@ fn a_warm_up_that_asks_for_the_desktop_exits_2() {
 #[test]
 fn a_killed_box_ends_its_desktop_command_and_the_next_run_takes_the_abandoned_lock() {
     let case = Case::new("desktop_killed_box");
-    let record = case.folder().join("children");
     // A sleep longer than the suite's hang guard, so nothing but the run's job can end the command inside the case.
     let payload = ready_payload(&case, &[FAKE_TOOL, "pid", "sleep", "620000"]);
     // Open across both runs, so the lock the killed box held is still there for the second run to find abandoned.
@@ -1188,7 +1280,7 @@ fn a_killed_box_ends_its_desktop_command_and_the_next_run_takes_the_abandoned_lo
     // The record seam keeps the stand-in helper in no job of the box's, so the command is only ever in the run's own
     // job, and only that job's kill-on-close can end it once the box is gone.
     let mut call = desktop_call(&case, &payload, "ok", &[]);
-    call.env("GATE_DESKTOP_TEST_RECORD", &record);
+    let record = recorded(&case, &mut call, "killed");
     let running = call.start();
     let pid = printed_pid(&running.wait_for_stdout("pid "));
     let created = started_at(pid);

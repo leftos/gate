@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use gate_router::balance::{Balanced, BalancedEntry, BuilderFigures};
+use gate_router::desktop::{DesktopDeclaration, DesktopMode};
 use gate_router::windows::WindowsChange;
 use gate_router::{
     BuildSettings, BuildTarget, Builder, BuilderOs, CARRIED_INPUT, Config, ConfigProblem, CrossBlocked, CrossTarget, DROPPED_NO_BUILD_LINE,
@@ -100,7 +101,7 @@ fn the_control_command_routes_from_the_root() {
             dropped_no_build: false,
             send: None,
             outputs_withheld: false,
-            desktop: false,
+            desktop: None,
             source_revision: Some(HEAD.to_owned()),
             later: Vec::new(),
             balanced: None,
@@ -3302,13 +3303,32 @@ fn patterns(texts: &[&str]) -> Vec<Pattern> {
     texts.iter().map(|text| Pattern::parse(text).expect("a valid pattern")).collect()
 }
 
+/// The desktop declaration whose `patterns` are `locked` and whose `session` patterns are `session`.
+fn declaration(locked: &[&str], session: &[&str]) -> DesktopDeclaration {
+    DesktopDeclaration {
+        patterns: patterns(locked),
+        session: patterns(session),
+    }
+}
+
 /// A gate at the root whose `.gate/desktop.toml` declares `declared`, under a routing file routing `dotnet *` and
 /// `tool *` of `yaat` whose `desktop` value is `desktop` (no key at all for `None`).
 fn desktop_facts(desktop: Option<&str>, declared: &[&str]) -> FakeFacts {
+    session_facts(desktop, None, declaration(declared, &[]))
+}
+
+/// A gate at the root whose `.gate/desktop.toml` declares `declared`, under a routing file routing `dotnet *` and
+/// `tool *` of `yaat` whose `desktop` value is `desktop` and whose `desktopSession` value is `session` (no key at all
+/// for `None`).
+fn session_facts(desktop: Option<&str>, session: Option<&str>, declared: DesktopDeclaration) -> FakeFacts {
     let key = desktop.map_or_else(String::new, |value| format!(r#", "desktop": {value}"#));
-    let config = Config::parse(&format!(r#"{{"host": "builder-1", "repos": {{"yaat": ["dotnet *", "tool *"]}}{key}}}"#)).expect("usable");
+    let session_key = session.map_or_else(String::new, |value| format!(r#", "desktopSession": {value}"#));
+    let config = Config::parse(&format!(
+        r#"{{"host": "builder-1", "repos": {{"yaat": ["dotnet *", "tool *"]}}{key}{session_key}}}"#
+    ))
+    .expect("usable");
     FakeFacts {
-        desktop: Ok(patterns(declared)),
+        desktop: Ok(declared),
         ..FakeFacts::with_config(config)
     }
 }
@@ -3317,7 +3337,11 @@ fn desktop_facts(desktop: Option<&str>, declared: &[&str]) -> FakeFacts {
 fn a_command_matching_a_consented_desktop_pattern_asks_for_the_desktop() {
     let facts = desktop_facts(Some(r#"{"YAAT": ["dotnet build*", "dotnet test*"]}"#), &["dotnet test*", "dotnet build*"]);
     let run = routed(decide(&heavy(&words(&["dotnet", "test"])), &facts));
-    assert!(run.desktop, "the first declared pattern that matches is listed");
+    assert_eq!(
+        run.desktop,
+        Some(DesktopMode::Locked),
+        "the first declared pattern that matches is listed"
+    );
     assert_eq!(run.pattern, "dotnet *", "the repos pattern still names the route");
     assert_eq!(facts.desktop_read.get(), 1);
 }
@@ -3326,7 +3350,67 @@ fn a_command_matching_a_consented_desktop_pattern_asks_for_the_desktop() {
 fn a_routed_command_matching_no_declared_pattern_routes_without_the_desktop() {
     let facts = desktop_facts(Some(r#"{"yaat": ["dotnet test*"]}"#), &["dotnet test*"]);
     let run = routed(decide(&heavy(&words(&["tool", "x"])), &facts));
-    assert!(!run.desktop);
+    assert_eq!(run.desktop, None);
+}
+
+#[test]
+fn a_session_pattern_consented_by_desktop_session_gives_a_session_run() {
+    let facts = session_facts(None, Some(r#"{"Yaat": ["tool *"]}"#), declaration(&["dotnet test*"], &["tool *"]));
+    let run = routed(decide(&heavy(&words(&["tool", "x"])), &facts));
+    assert_eq!(run.desktop, Some(DesktopMode::Session));
+    assert_eq!(facts.desktop_read.get(), 1);
+}
+
+#[test]
+fn a_session_pattern_consented_only_by_desktop_is_not_allowed() {
+    let facts = session_facts(Some(r#"{"yaat": ["tool *"]}"#), None, declaration(&[], &["tool *"]));
+    assert_eq!(
+        local_line(&decide(&heavy(&words(&["tool", "x"])), &facts)).as_deref(),
+        Some("gate: not routed: desktop session pattern 'tool *' not allowed in remote.json desktopSession"),
+        "the line names the consent a session pattern lacks"
+    );
+    let facts = session_facts(Some(r#"{"yaat": ["tool *"]}"#), Some(r#"["tool *"]"#), declaration(&[], &["tool *"]));
+    assert_eq!(
+        local_line(&decide(&heavy(&words(&["tool", "x"])), &facts)).as_deref(),
+        Some("gate: not routed: desktop session pattern 'tool *' not allowed in remote.json desktopSession: desktopSession must be a JSON object"),
+        "an unusable desktopSession consents to no session pattern"
+    );
+}
+
+#[test]
+fn a_locked_pattern_consented_only_by_desktop_session_is_not_allowed() {
+    let facts = session_facts(None, Some(r#"{"yaat": ["tool *"]}"#), declaration(&["tool *"], &[]));
+    assert_eq!(
+        local_line(&decide(&heavy(&words(&["tool", "x"])), &facts)).as_deref(),
+        Some("gate: not routed: desktop pattern 'tool *' not allowed in remote.json")
+    );
+}
+
+#[test]
+fn a_locked_pattern_wins_over_a_session_pattern_the_command_also_matches() {
+    let facts = session_facts(
+        Some(r#"{"yaat": ["tool x*"]}"#),
+        Some(r#"{"yaat": ["tool *"]}"#),
+        declaration(&["tool x*"], &["tool *"]),
+    );
+    assert_eq!(routed(decide(&heavy(&words(&["tool", "x"])), &facts)).desktop, Some(DesktopMode::Locked));
+    assert_eq!(routed(decide(&heavy(&words(&["tool", "y"])), &facts)).desktop, Some(DesktopMode::Session));
+}
+
+#[test]
+fn a_command_matching_a_session_pattern_is_never_picked_by_a_macos_builder() {
+    let command = words(&["dotnet", "build"]);
+    let text = format!(
+        r#"{{"host": "builder-1", "repos": {{"yaat": ["dotnet *"]}}, "builders": {MAC_BUILD},
+            "desktopSession": {{"yaat": ["dotnet build*"]}}}}"#
+    );
+    let facts = FakeFacts {
+        desktop: Ok(declaration(&[], &["dotnet build*"])),
+        ..FakeFacts::with_config(Config::parse(&text).expect("usable"))
+    };
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "builder-1", "the pick goes on to host");
+    assert_eq!(run.desktop, Some(DesktopMode::Session));
 }
 
 #[test]
@@ -3371,11 +3455,12 @@ fn a_declared_desktop_pattern_remote_json_does_not_list_keeps_its_commands_here(
         );
     }
     let facts = desktop_facts(Some(r#"{"yaat": ["tool *"]}"#), &["dotnet test*", "tool *"]);
-    assert!(
+    assert_eq!(
         routed(decide(&heavy(&words(&["tool", "x"])), &facts)).desktop,
+        Some(DesktopMode::Locked),
         "an unlisted pattern stops only the commands it matches"
     );
-    assert!(!routed(decide(&heavy(&words(&["dotnet", "build"])), &facts)).desktop);
+    assert_eq!(routed(decide(&heavy(&words(&["dotnet", "build"])), &facts)).desktop, None);
 }
 
 #[test]
@@ -3535,7 +3620,7 @@ fn a_command_the_repos_patterns_do_not_route_reads_no_local_file() {
 
 #[test]
 fn a_command_the_repos_patterns_do_not_route_reads_no_desktop_file() {
-    for desktop in [Ok(patterns(&["cargo *"])), Err("bad".to_owned())] {
+    for desktop in [Ok(declaration(&["cargo *"], &[])), Err("bad".to_owned())] {
         let facts = FakeFacts {
             desktop,
             ..desktop_facts(Some(r#"{"yaat": ["cargo *"]}"#), &[])
@@ -4329,7 +4414,7 @@ fn a_mac_candidate_is_left_out_of_a_desktop_command() {
     assert_eq!(later_aliases(&run), ["mac-1", "builder-1"]);
     assert_eq!(later_of(&run, 0, &command, &facts), Err(None), "a Mac has no desktop, which says nothing");
     let host = later_of(&run, 1, &command, &facts).expect("host can be tried");
-    assert!(host.desktop);
+    assert_eq!(host.desktop, Some(DesktopMode::Locked));
 }
 
 #[test]
@@ -4434,7 +4519,7 @@ fn builder_desktop_facts(host_repos: &str, builders: &str, declared: &[&str], lo
             "desktop": {{"yaat": ["dotnet build*", "dotnet build src\\Duel.sln"]}}}}"#
     );
     FakeFacts {
-        desktop: Ok(patterns(declared)),
+        desktop: Ok(declaration(declared, &[])),
         local: Ok(patterns(local)),
         ..FakeFacts::with_config(Config::parse(&text).expect("usable"))
     }
@@ -4446,7 +4531,7 @@ fn a_command_matching_a_desktop_pattern_is_never_picked_by_a_macos_builder() {
     let facts = builder_desktop_facts(r#"{"yaat": ["dotnet *"]}"#, MAC_BUILD, &["dotnet build*"], &[]);
     let run = routed(decide(&heavy(&command), &facts));
     assert_eq!(run.builder.alias, "builder-1", "the pick goes on to host");
-    assert!(run.desktop);
+    assert_eq!(run.desktop, Some(DesktopMode::Locked));
     assert_eq!(facts.desktop_read.get(), 1, "the desktop file is read once");
 
     let mac_then_windows = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["dotnet *"]}},
@@ -4464,7 +4549,7 @@ fn a_command_matching_a_desktop_pattern_is_never_picked_by_a_macos_builder() {
     let facts = builder_desktop_facts(r#"{"yaat": ["dotnet *"]}"#, MAC_BUILD, &["dotnet test*"], &[]);
     let run = routed(decide(&heavy(&command), &facts));
     assert_eq!(run.builder.alias, "mac-1", "a command no desktop pattern matches stays on the Mac");
-    assert!(!run.desktop);
+    assert_eq!(run.desktop, None);
     assert_eq!(facts.desktop_read.get(), 1, "the desktop file is read once");
 }
 
@@ -4485,7 +4570,7 @@ fn on_a_macos_pick_a_desktop_pattern_written_with_backslashes_still_matches() {
     let command = words(&["dotnet", "build", r"X:\dev\yaat.wt\a\src\Duel.sln"]);
     let facts = builder_desktop_facts(r#"{"yaat": ["dotnet *"]}"#, MAC_BUILD, &[r"dotnet build src\Duel.sln"], &[]);
     let run = routed(decide(&heavy(&command), &facts));
-    assert!(run.desktop);
+    assert_eq!(run.desktop, Some(DesktopMode::Locked));
     assert_eq!(run.builder.alias, "builder-1", "the desktop command leaves the Mac");
     assert_eq!(run.words, stamped(&["dotnet", "build", r"src\Duel.sln"]));
 }

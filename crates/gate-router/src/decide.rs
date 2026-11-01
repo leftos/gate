@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::balance::{self, Balanced, BalancedEntry, BuilderFigures};
 use crate::config::{Builder, BuilderOs, CARGO_OUTPUTS, Config, ConfigProblem, DEFAULT_OUTPUTS, ignored_line};
+use crate::desktop::{DesktopDeclaration, DesktopMode};
 use crate::escape::escaped;
 use crate::key::{is_layout_name, repo_name, work_folder_key};
 use crate::like::{Pattern, eq_ignoring_case};
@@ -377,14 +378,15 @@ pub trait Facts {
     /// saying so.
     fn siblings(&self, place: &Place) -> Result<Vec<String>, String>;
 
-    /// The patterns the worktree root's `.gate/desktop.toml` declares, read from disk as it stands; none when there is
-    /// no such file. Asked only of a command one of its repo's patterns matched, once its siblings pass their checks.
+    /// The patterns the worktree root's `.gate/desktop.toml` declares, of each desktop mode, read from disk as it
+    /// stands; none when there is no such file. Asked only of a command one of its repo's patterns matched, once its
+    /// siblings pass their checks.
     ///
     /// # Errors
     ///
     /// The file's first problem, when it cannot be read, does not parse or has any problem; the gate then runs here,
     /// saying so.
-    fn desktop(&self, place: &Place) -> Result<Vec<Pattern>, String>;
+    fn desktop(&self, place: &Place) -> Result<DesktopDeclaration, String>;
 
     /// The patterns the worktree root's `.gate/local.toml` declares, read from disk as it stands; none when there is no
     /// such file. Asked only of a command one of its repo's patterns matched, before its siblings are checked.
@@ -578,9 +580,14 @@ pub enum LocalReason {
     /// The desktop file `file` ([`Facts::declaration_said`]) cannot be read or has a problem; `problem` is its first,
     /// on one line.
     DesktopFile { file: String, problem: String },
-    /// The first declared desktop pattern the command matches, `pattern`, is not among those `remote.json`'s `desktop`
-    /// allows the repo; `problem` is why that value cannot be used, when it cannot.
-    DesktopNotAllowed { pattern: String, problem: Option<String> },
+    /// The first declared desktop pattern the command matches, `pattern`, of the mode `mode`, is not among those
+    /// `remote.json` allows the repo: its `desktop` for a locked (`patterns`) entry, its `desktopSession` for a session
+    /// one; `problem` is why that value cannot be used, when it cannot.
+    DesktopNotAllowed {
+        pattern: String,
+        mode: DesktopMode,
+        problem: Option<String>,
+    },
     /// The local file `file` ([`Facts::declaration_said`]) cannot be read or has a problem; `problem` is its first, on
     /// one line.
     LocalFile { file: String, problem: String },
@@ -655,9 +662,17 @@ impl LocalReason {
             Self::SiblingRefused { name, reason } => format!("sibling {name} {reason}"),
             Self::SiblingsNotAllowed { names, problem } => not_allowed_reason(names, problem.as_deref()),
             Self::LeafNotLaidOut { leaf } => format!("the worktree folder name {leaf} cannot be laid out on the builder"),
-            Self::DesktopNotAllowed { pattern, problem } => {
+            Self::DesktopNotAllowed { pattern, mode, problem } => {
                 let problem = problem.as_ref().map_or_else(String::new, |problem| format!(": {problem}"));
-                format!("desktop pattern '{}' not allowed in remote.json{problem}", escaped(pattern))
+                match mode {
+                    DesktopMode::Locked => format!("desktop pattern '{}' not allowed in remote.json{problem}", escaped(pattern)),
+                    DesktopMode::Session => {
+                        format!(
+                            "desktop session pattern '{}' not allowed in remote.json desktopSession{problem}",
+                            escaped(pattern)
+                        )
+                    }
+                }
             }
         }
     }
@@ -748,9 +763,9 @@ pub struct RemoteRun {
     pub send: Option<SendPlan>,
     /// Whether outputs were withheld from a `--no-build` command.
     pub outputs_withheld: bool,
-    /// Whether the run asks for the builder's desktop: the first `.gate/desktop.toml` pattern its rewritten words match
-    /// is one `remote.json`'s `desktop` allows the repo.
-    pub desktop: bool,
+    /// How the run uses the builder's desktop, `None` for not at all: the mode of the first `.gate/desktop.toml` pattern
+    /// its rewritten words match, which `remote.json` allows the repo ([`check_desktop`]).
+    pub desktop: Option<DesktopMode>,
     /// The worktree's `HEAD` sha, read once for every routed run, which the run sends the builder as the
     /// `SourceRevisionId` variable so any build there is pinned to it; `None` when the branch is unborn or git cannot
     /// read it.
@@ -1063,8 +1078,8 @@ struct Matched {
     outside_path: Option<PathBuf>,
     /// Whether the rewrite sent the command's first word as a program's name ([`Rewritten::program_named`]).
     program_named: bool,
-    /// Whether the command asks for the builder's desktop ([`check_desktop`]).
-    desktop: bool,
+    /// How the command uses the builder's desktop, if at all ([`check_desktop`]).
+    desktop: Option<DesktopMode>,
     /// The builders the run may try next, in try order ([`later_candidates`]).
     later: Vec<LaterCandidate>,
     /// The scored builders, the pick first ([`RemoteRun::balanced`]).
@@ -2273,15 +2288,17 @@ fn check_local(place: &Place, words: &[String], facts: &dyn Facts) -> Result<(),
 }
 
 /// The first pattern of the worktree's `.gate/desktop.toml` at `place` that the rewritten `words` match, joined by single
-/// spaces; `None` when none does. Keeps the command here, saying why, when the file has a problem, shown [`escaped`].
-fn desktop_pattern(place: &Place, words: &[String], facts: &dyn Facts) -> Result<Option<String>, Here> {
+/// spaces, with its mode: the `patterns` key's first, which take the desktop lock, then the `session` key's; `None` when
+/// none does. Keeps the command here, saying why, when the file has a problem, shown [`escaped`].
+fn desktop_pattern(place: &Place, words: &[String], facts: &dyn Facts) -> Result<Option<(String, DesktopMode)>, Here> {
     let declared = facts.desktop(place).map_err(|problem| {
         Some(LocalReason::DesktopFile {
             file: escaped(&facts.declaration_said(place, "desktop.toml")),
             problem: escaped(&fold_lines(&problem)),
         })
     })?;
-    Ok(first_match(&declared, words))
+    let locked = first_match(&declared.patterns, words).map(|pattern| (pattern, DesktopMode::Locked));
+    Ok(locked.or_else(|| first_match(&declared.session, words).map(|pattern| (pattern, DesktopMode::Session))))
 }
 
 /// The pick `first` of the opened worktree's command `words`, kept unless it is a macOS builder and a declared desktop
@@ -2417,41 +2434,46 @@ fn macos_built_here(builder: &Builder, opened: &Opened, facts: &dyn Facts) -> Op
 enum DesktopRead {
     /// The pick did not read it.
     NotRead,
-    /// The first declared pattern the command matches, if any.
-    Read(Option<String>),
+    /// The first declared pattern the command matches, with its mode, if any.
+    Read(Option<(String, DesktopMode)>),
 }
 
 impl DesktopRead {
-    /// Whether the pick goes off the macOS builder it read the file for ([`macos_desktop`]): a declared pattern
-    /// matches the command, and a macOS builder has no desktop to run it on.
+    /// Whether the pick goes off the macOS builder it read the file for ([`macos_desktop`]): a declared pattern of
+    /// either mode matches the command, and a macOS builder has no desktop or console session to run it in.
     fn steers_off(&self) -> bool {
         matches!(self, DesktopRead::Read(Some(_)))
     }
 }
 
-/// Whether a matched command asks for the builder's desktop: the first pattern of the worktree's `.gate/desktop.toml`
-/// that its rewritten `words` match, joined by single spaces as the repo's patterns see them, is one `remote.json`'s
-/// `desktop` allows the repo, listed exactly (letter case included); `false` when no declared pattern matches. Keeps the
-/// command here, saying why, when the file has a problem, shown [`escaped`], or when that pattern is not allowed, every
-/// one when `desktop` cannot be used.
+/// How a matched command uses the builder's desktop: the mode of the first pattern of the worktree's
+/// `.gate/desktop.toml` that its rewritten `words` match ([`desktop_pattern`]), joined by single spaces as the repo's
+/// patterns see them, when `remote.json` allows the repo that pattern, listed exactly (letter case included): its
+/// `desktop` for a locked pattern, its `desktopSession` for a session one; `None` when no declared pattern matches.
+/// Keeps the command here, saying why, when the file has a problem, shown [`escaped`], or when that pattern is not
+/// allowed, every one of a mode when its key cannot be used.
 ///
 /// `read` is what the pick already read of the file ([`steer_off_macos`]); a file it did not read is read here.
-fn check_desktop(config: &Config, target: &Target, read: DesktopRead, words: &[String], facts: &dyn Facts) -> Result<bool, Here> {
+fn check_desktop(config: &Config, target: &Target, read: DesktopRead, words: &[String], facts: &dyn Facts) -> Result<Option<DesktopMode>, Here> {
     let found = match read {
         DesktopRead::Read(found) => found,
         DesktopRead::NotRead => desktop_pattern(&target.place, words, facts)?,
     };
-    let Some(pattern) = found else {
-        return Ok(false);
+    let Some((pattern, mode)) = found else {
+        return Ok(None);
     };
-    let (allowed, problem) = match config.allowed_desktop(&target.repo) {
+    let consent = match mode {
+        DesktopMode::Locked => config.allowed_desktop(&target.repo),
+        DesktopMode::Session => config.allowed_desktop_session(&target.repo),
+    };
+    let (allowed, problem) = match consent {
         Ok(patterns) => (patterns, None),
         Err(problem) => (&[][..], Some(fold_lines(problem))),
     };
     if allowed.contains(&pattern) {
-        return Ok(true);
+        return Ok(Some(mode));
     }
-    Err(Some(LocalReason::DesktopNotAllowed { pattern, problem }))
+    Err(Some(LocalReason::DesktopNotAllowed { pattern, mode, problem }))
 }
 
 /// A worktree whose repo the routing file lists, with the siblings its siblings file declares, not yet checked.

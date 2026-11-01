@@ -430,6 +430,8 @@ Each sibling the repo declares is checked as routing checks it, and gets one lin
 
 When the repo declares siblings and `remote.json` lists the repo but its `siblings` value cannot be used, the line `check: here: remote.json: <problem>` (control characters escaped, counted missing) comes before the sibling lines, and every sibling is not allowed. A repo that declares none says nothing of it.
 
+A `desktopSession` value of `remote.json` that cannot be used is said the same way, `check: <where>: remote.json: <problem>` counted missing, whatever the repo.
+
 #### The warm-up items
 
 Each is one line `check: here: warm-up: <text>`. The state root, where the work folder's warm-up record and lock are, is found as the other commands find it, `GATE_STATE_DIR` and then `%LOCALAPPDATA%\gate\v1`; `gate check` takes no `--state-dir`.
@@ -437,8 +439,7 @@ Each is one line `check: here: warm-up: <text>`. The state root, where the work 
 Consent is asked only of a repo `remote.json` lists in `repos`, whatever its `warmup` value: an unlisted repo has none, and so has one with no usable `remote.json`. A repo with neither `.gate/warmup.toml` nor consent, or whose `.gate` is not a folder, says nothing of warm-ups.
 
 - With the file and no consent: `.gate/warmup.toml is there, but remote.json does not consent to warm-ups for <repo>`. With consent and no file: `remote.json consents, but the repo has no .gate/warmup.toml`. Both only inform.
-- `remote.json: <problem>`, counted missing, when `remote.json` lists the repo, its `warmup` value cannot be used and the file is there.
-- `.gate/warmup.toml has problems, so gate warm cannot prewarm a new worktree`, counted missing, with consent and a file that has problems.
+- `remote.json: <problem>`, counted missing, when `remote.json` lists the repo, its `warmup` value cannot be used and the file is there.- `.gate/warmup.toml has problems, so gate warm cannot prewarm a new worktree`, counted missing, with consent and a file that has problems.
 - With consent and a file that parsed, the work folder's record and lock are judged for where its warm-up stands ([remote.json](#remotejson)), the lock probed and never taken. `the state root cannot be found: <why>` is skipped, and `warm on <host>` is ok.
 - `<host> is warming the work folder` (the lock is held), `the warm-up on <host> failed <n> min ago: <reason>; run gate warm to try again` (a failure inside its backoff; an age under a minute, zero included, says 1 min), `not warm on <host>; gate warm warms it` and `not warm on <host>; the last warm-up ended without a verdict; gate warm warms it` (a `warming` record whose lock is free) only inform.
 - `the warm-up record <path> cannot be read: <error>; gate warm overwrites it, and only a layout fallback's delete reads it` and `the warm-up lock <path> cannot be read: <error>; gate warm and a routed run waiting on the work folder read it` only inform: a routed run does not read the record or the lock for its route.
@@ -844,7 +845,7 @@ The lines of a run that starts its command:
 
   A command the repo's `.gate/local.toml` keeps here says `gate: not routed: .gate/local.toml keeps it here (<pattern>)`, the first pattern its words match, escaped; a file the gate cannot use says `gate: not routed: .gate/local.toml: <problem>`, escaped, and keeps every routed command of the repo here ([Routing](#routing), the decision).
 
-  For the builder's desktop: a problem with the repo's `.gate/desktop.toml` (`gate: not routed: .gate/desktop.toml: <problem>`, escaped), and the first declared pattern the command matches when `remote.json` does not allow it (`gate: not routed: desktop pattern '<pattern>' not allowed in remote.json`, with `: <problem>` added when the `desktop` value cannot be used).
+  For the builder's desktop: a problem with the repo's `.gate/desktop.toml` (`gate: not routed: .gate/desktop.toml: <problem>`, escaped), and the first declared pattern the command matches when `remote.json` does not allow it (`gate: not routed: desktop pattern '<pattern>' not allowed in remote.json`, or for a `session` pattern `gate: not routed: desktop session pattern '<pattern>' not allowed in remote.json desktopSession`, with `: <problem>` added when the `desktop` value, or `desktopSession` for a `session` pattern, cannot be used).
 
   A sibling folder that cannot be carried says `gate: not routed: sibling <name> <reason>`, `<reason>` being `is a link or a junction`, `is not a folder`, `has no .git`, `has a .git that is a link or a junction`, `is the worktree's own folder` or `is the same folder as sibling <other>`.
 
@@ -1569,9 +1570,9 @@ A routed client that cannot use `remote.json` logs `gate: ignored <path>: <reaso
 
 ops-tower reads only `slots`.
 
-A repo's `.gate/desktop.toml`, which declares the commands that need the builder's desktop, is read by `gate_router::desktop::read_desktop`: one key, `patterns`, an array of at most 32 non-empty `-like` patterns (`patterns = []` declares none). A leading byte order mark is skipped and any other key is a problem.
+A repo's `.gate/desktop.toml`, which declares the commands that need the builder's desktop, is read by `gate_router::desktop::read_desktop`: two optional keys, at least one present, `patterns` (commands that hold the desktop lock for their run) and `session` (commands that need only the console session and take no lock), each an array of at most 32 non-empty `-like` patterns (`= []` declares none). A leading byte order mark is skipped and any other key is a problem.
 
-The first problem wins, the count checked before the entries: `declares no patterns`, `patterns is not an array (TOML <type>)`, `patterns[<i>] is not a string (TOML <type>)`, `patterns[<i>] is empty`, `patterns[<i>] is not a valid wildcard pattern: "<text>"`, `declares more than 32 patterns`, `<key> is not a key (patterns)`, plus the UTF-8 and parse failures. Routing reads it for a matched command ([Routing](#routing)).
+The first problem wins, each key's count checked before its entries: `declares no patterns or session`, `<key> is not an array (TOML <type>)`, `<key>[<i>] is not a string (TOML <type>)`, `<key>[<i>] is empty`, `<key>[<i>] is not a valid wildcard pattern: "<text>"`, `declares more than 32 <key>` (the cap is per key), `<key> is not a key (patterns, session)`, `"<p>" is in both patterns and session` (compared without letter case), plus the UTF-8 and parse failures, with `<key>` `patterns` or `session`. Routing reads it for a matched command ([Routing](#routing)).
 
 A repo's `.gate/windows.toml`, which declares the paths whose change keeps a run off a macOS builder, is read by `gate_router::windows::read_windows`: one key, `paths`, an array of at most 32 non-empty `-like` patterns matched against a whole root-relative `/` path, letter case ignored and `*` crossing `/`; an entry `../<sibling>/...` matches that declared sibling's changed paths. A leading byte order mark is skipped and any other key is a problem.
 
@@ -2441,13 +2442,13 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A command that needs the builder's desktop is declared in the repo's `.gate/desktop.toml` and consented to in `remote.json`'s `desktop` ([remote.json](#remotejson)); the check runs after the siblings checks and before the outside-path and nothing-sent checks, on a command the `repos` patterns matched, and the file is read from disk as it stands, through the same guarded read as `siblings.toml` (`.gate` and the file not followed as links, at most 64 KiB), or, when the worktree has no such file, from the repo's declarations folder ([remote.json](#remotejson), Declarations folder).
 
-  The first declared pattern the command's rewritten words match decides, matched against the same words joined by single spaces as the repo's `repos` patterns. No file, `patterns = []` or no matching pattern asks for nothing.
+  The first declared pattern the command's rewritten words match decides, matched against the same words joined by single spaces as the repo's `repos` patterns; a `patterns` entry is looked at before a `session` one, so a command matching both is a locked run. No file, empty lists or no matching pattern asks for nothing.
 
-  A matching pattern that `remote.json` does not list for the repo, letter case included, keeps the run here with `gate: not routed: desktop pattern '<pattern>' not allowed in remote.json` (escaped), the line ending `: <problem>` when the `desktop` value cannot be used.
+  A matching pattern that `remote.json` does not list for the repo, letter case included, keeps the run here with `gate: not routed: desktop pattern '<pattern>' not allowed in remote.json` (escaped), or for a `session` entry `gate: not routed: desktop session pattern '<pattern>' not allowed in remote.json desktopSession`, the line ending `: <problem>` when the value cannot be used. A `patterns` entry is listed in `desktop`, a `session` entry in `desktopSession`, and `desktop` never allows a session pattern.
 
   A file that cannot be used keeps every routed command of the repo here with `gate: not routed: .gate/desktop.toml: <problem>`, the first problem, on one line and escaped; a copy read from the declarations folder is named by its full path in place of `.gate/desktop.toml`.
 
-  A consented match makes the run a desktop run: `RemoteRun.desktop` is true and the run call asks for the desktop (the client's Desktop bullet, below).
+  A consented match makes the run a desktop run: `RemoteRun.desktop` is the match's mode, locked or session, and the run call asks for the desktop (the client's Desktop bullet, below). A session run is a desktop run that needs the builder's console session but not the desktop lock.
 
   git is found along the gate's own `PATH` (absolute entries only) and run by its full path from the gate's folder, with the `GIT_*` variables that point it at another repository, index or config removed and `core.fsmonitor` off and `core.hooksPath` pointing at a folder that cannot exist (inside the git program's own file), so a gate in a hook that exports `GIT_DIR` is judged by the repo it is in (it routes when `hooks` names that repo, [remote.json](#remotejson)) and no hook a repository's config names runs.
 
@@ -2500,6 +2501,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   `desktop` is an optional object mapping a repo name, matched in any letter case, to an array of the `.gate/desktop.toml` patterns the machine lets that repo run on the builder's desktop (`Config::allowed_desktop`); a declared pattern is consented only when listed exactly, letter case included. A repo with no entry is allowed none.
 
   A `desktop` that is not an object, or holds a value that is not an array of non-empty strings, never refuses the file: it consents to none and the rest is read as usual. The reasons are `desktop must be a JSON object`, `desktop."<repo>" is not an array of strings` and `desktop."<repo>"[<i>] is not a non-empty string`, which the routed run's not-allowed line appends.
+
+  `desktopSession` is the same table for the `.gate/desktop.toml` `session` patterns (`Config::allowed_desktop_session`), read and consented the same way, with the reasons `desktopSession must be a JSON object`, `desktopSession."<repo>" is not an array of strings` and `desktopSession."<repo>"[<i>] is not a non-empty string`; [`gate check`](#gate-check) says such a reason as `check: <where>: remote.json: <problem>`, counted missing.
 
   `declarations` is an optional object mapping a repo name, matched in any letter case, to the absolute folder holding that repo's `.gate` files it cannot commit (`Config::declarations_folder`); see [remote.json](#remotejson), Declarations folder. A `declarations` that is not an object, or holds a value that is not a non-empty string, never refuses the file: it names no folder and the rest is read as usual.
 
@@ -2918,9 +2921,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     The wait is no part of the run's time: on admission the run's start and its slot's hold restart, so the recorded duration, `--timeout auto` and the hang hint leave it out, and no journal format changes. What stays counted: the slot claim's `started`, which other waiters' holder ETA reads, and a pinned run's `heldSeconds` after a fallback past the lapse.
 
     A warm-up that meets the drain says `gate: warm: the builder is drained; this warm-up ends without warming` ([gate warm](#gate-warm)), and `gate check --builder` reports it ([With `--builder`](#with---builder)).
-  - **Desktop.** A routed run whose `RemoteRun.desktop` is true (Routing, the desktop paragraphs) sends `Desktop: true` and `DesktopWait` in its run call's payload (`payload::run_word`), `DesktopWait` being the larger of the usual remote wait, `REMOTE_LIMIT` (60 s), and the run's usual routed p90 rounded up to whole seconds (60 for a run with no history), at most 2147483647, which the box caps at the run's `Timeout`. No other call sends either key, a warm-up included; the scripted test client's recorded call has a `desktop` key.
+  - **Desktop.** A routed run whose `RemoteRun.desktop` is true (Routing, the desktop paragraphs) sends `Desktop: true` and `DesktopWait` in its run call's payload (`payload::run_word`), with `DesktopSession: true` beside them for a session run, `DesktopWait` being the larger of the usual remote wait, `REMOTE_LIMIT` (60 s), and the run's usual routed p90 rounded up to whole seconds (60 for a run with no history), at most 2147483647, which the box caps at the run's `Timeout`. No other call sends either key, a warm-up included; the scripted test client's recorded call has a `desktop` key.
 
-    A desktop run holds a normal remote slot while it waits for the builder's desktop, so other routed runs of this PC can fall back `full` meanwhile, and the wait counts against the client's backstop.
+    A desktop run holds a normal remote slot while it waits for the builder's desktop (a session run never waits), so other routed runs of this PC can fall back `full` meanwhile, and the wait counts against the client's backstop.
   - **Warm-up call.** A call whose `warmth` is a warm-up (`Warmth::WarmUp` in `remote/mod.rs`) runs the phases above with the run call's payload built by `payload::warm_word`: the run's keys, `Timeout` always among them, with `WarmCommands` and `WarmHash` in place of `Command` and no `Outputs`, `FailureOutputs` or `OutputsFull` key.
 
     Its limits are a run's, from the call's `timeout`. `gate warm` makes such a call. A routed run's call of a repo whose warm-up is set up carries `warmth: {"consented": <hash>}` instead, which only words the cold note.
@@ -3570,7 +3573,7 @@ Unknown keys are ignored, and `Outputs`, `OutputsFull` and `OutputFolder`, which
 
 `Timeout` is the run's ceiling in whole seconds, 1 to 2147483647, which the box counts in load-adjusted time; absent or null means no box ceiling and no adjusted line, and anything else is refused before the lock with `gate: box payload Timeout is not a whole number of seconds` and exit 2. `Host` is the PC's `remote.json` name for the builder, which the box's kill lines name, control characters escaped; absent leaves it out of them.
 
-A `run` payload may also hold `Desktop` (true or false, false when absent or null, else `gate: box payload Desktop is not true or false` and exit 2) and `DesktopWait` (whole seconds, 1 to 2147483647, else `gate: box payload DesktopWait is not a whole number of seconds` and exit 2), which together ask for a desktop run, the command on the builder's logged-on desktop (The desktop run, below).
+A `run` payload may also hold `Desktop` (true or false, false when absent or null, else `gate: box payload Desktop is not true or false` and exit 2) and `DesktopWait` (whole seconds, 1 to 2147483647, else `gate: box payload DesktopWait is not a whole number of seconds` and exit 2), which together ask for a desktop run, the command on the builder's logged-on desktop (The desktop run, below). `DesktopSession` (true or false, false when absent or null, else `gate: box payload DesktopSession is not true or false`; true without `Desktop` true, `gate: box payload DesktopSession needs Desktop`, both exit 2) makes it a session run, which takes no desktop lock.
 
 A warm-up payload with `Desktop` true is refused with `gate: box payload asks a warm-up for the desktop` and exit 2.
 
@@ -4054,6 +4057,8 @@ Built verbs:
   The shared batch refusal (a `.cmd` or `.bat` word, [Command launching](#command-launching)) exits 2.
 
   The desktop run (a `run` payload with `Desktop` true, `DesktopWait` its wait in seconds) reads the console session twice and takes the builder's desktop lock between the reads.
+
+  A session run (`DesktopSession` true beside them) reads the session in the same two places but never opens, waits for or holds `gate\desktop`: it says no busy-wait, abandoned-lock or busy-timeout line and writes no holder record, and several session runs and one locked run may run at once. Its `DesktopWait` is read and never spent. The rest of this section describes a locked run.
 
   The first, cheap read comes right after the work-folder lock is held, before the layout and the checkout: when the console cannot take the command the run is refused with `gate-remote-refused: <nonce> desktop` then `gate: not routed: the builder has no desktop session: <why>`, said together under the output lock, the command never started, and exit 75.
 
@@ -4664,6 +4669,7 @@ The rules behind the desktop run (GATE-231) that a later change to the helper, t
 
 **The desktop lock.**
 
+- A session run (`DesktopSession`) takes no desktop lock and writes no holder record: the lock serialises only the commands that need the desktop itself, and a session command promises to leave it alone (no window on the console desktop from any descendant, no UAC prompt, per-run credential and named-object names; [routing-a-repo.md](routing-a-repo.md#a-repo-with-a-command-that-needs-the-builders-desktop)). The console checks (logged on, unlocked, `Default` input desktop) still apply to it, and the task's `Parallel` instances let several hand-offs run at once.
 - The order is the work-folder lock, then the desktop lock, never the other way round. The desktop lock is taken after the checkout and the restores, so it is held only while the command runs, and on the run's main thread, which also releases it, since a mutex belongs to its thread; it is released once the job is empty and the output drained, before the back commit.
 - The holder record `desktop-holder.json`, `{"repo": "<repo>", "since": "<UTC RFC 3339>"}`, sits in the box's work root (the folder of the run's work folder). The run writes it once it holds the lock (staged as `desktop-holder.json.tmp`, then renamed) and removes it just before it lets the lock go, since removing it after would race the next holder's write. A waiting run reads it for its busy-wait line only, through an open that shares read, write and delete so it never blocks the holder's rename or removal; it decides nothing, and a missing or unreadable record only changes the line. The record and its stage are never followed through a link or a second name: the stage is written as the box's other records are, and a link at either name is refused. A record that cannot be written or removed prints `gate: the builder's desktop holder record <path> could not be written: <error>` or `... could not be removed: <error>` (path and error escaped) and the run goes on; a failed write also removes the earlier holder's record, so no stale holder is named. A record that exists but cannot be read prints `... could not be read: <error>`, or `... could not be read: it is not a holder record` for one that does not parse, once, before the plain busy line; a missing record says nothing.
 - The wait watches the stop event and has a deadline, and the heartbeats keep beating meanwhile, so the PC's stall check stays quiet. A lock found abandoned is a take: the dead holder's kill-on-close job is ending its command too, and a brief overlap is possible, since abandonment can come before the dead box's handles close.
@@ -4680,6 +4686,7 @@ The rules behind the desktop run (GATE-231) that a later change to the helper, t
 | Case | What happens |
 |---|---|
 | Dies before connecting | The box's wait includes the helper's process handle, so it returns at once and refuses `desktop` with the exit status. |
+| The pid is another run's helper | With several hand-offs at once the pid the Task Scheduler gave can be another run's helper, which passes the pin's other checks. The box reads the pinned helper's command line while it holds the pin: a line whose last word is not the run's `Arg0` (the box's pid and the pipe's random part) refuses the hand-off at once with the `desktop` tag, `gate: not routed: the builder has no desktop session: the desktop helper did not start: the process that answered is another run's helper` and exit 75; a line naming it, or a connect on the run's own pipe, makes the pin the run's own. A pin left unowned (its line could not be read and it never connected) is ended on a fault only when a second read names the run's `Arg0`; else the box leaves it and says once `gate: remote left a desktop helper <pid> that is not this run's`, or `... whose command line could not be read`. |
 | Hangs | Deadlines: connect 10 s, each message 5 s. Then `TerminateProcess`, the sweep and a refusal. |
 | Lies (bad handle values, a pid that does not match, a running process) | Verification fails, the sweep runs, the box refuses. A helper's copy can never carry more access than the helper had. |
 | Impersonated (another client connects first) | Pid mismatch, disconnect, keep listening. Endless reconnects run out the deadline and refuse: a denial of service that ends in a local run. |

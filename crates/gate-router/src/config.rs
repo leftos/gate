@@ -6,7 +6,9 @@
 //! repo name's globs for the ignored files a routed run sends) and the optional `siblings` (each repo name's list of
 //! the sibling folder names a routed run of it may carry) and the optional `warmup` (the repo names whose
 //! `.gate/warmup.toml` may warm their builder work folders) and the optional `desktop` (each repo name's list of the
-//! `.gate/desktop.toml` patterns whose commands may run on the builder's desktop) and the optional `hooks` (the repo
+//! `.gate/desktop.toml` patterns whose commands may run on the builder's desktop) and the optional `desktopSession`
+//! (each repo name's list of the `.gate/desktop.toml` `session` patterns whose commands may run in the builder's
+//! console session without the desktop lock) and the optional `hooks` (the repo
 //! names whose gates started inside a git hook may route) and the optional `sendBuild` (the repo names whose routed
 //! `dotnet test --no-build` may send the PC's build) and the optional `declarations` (each repo name's folder
 //! holding the `.gate` files the repo has none of) and the optional `builders` (further builders a routed run may go
@@ -100,6 +102,8 @@ pub struct Config {
     warmup: Result<Vec<String>, String>,
     /// Each repo name's allowed desktop patterns, or why `desktop` cannot be used, which allows none.
     desktop: Result<Vec<(String, Vec<String>)>, String>,
+    /// Each repo name's allowed desktop session patterns, or why `desktopSession` cannot be used, which allows none.
+    desktop_session: Result<Vec<(String, Vec<String>)>, String>,
     /// The repo names whose gates started inside a git hook may route, or why `hooks` cannot be used, which consents to
     /// none.
     hooks: Result<Vec<String>, String>,
@@ -150,7 +154,8 @@ impl Config {
     /// [`Config::builders`] gives its reason. A bad `siblings` leaves it usable too, allowing no sibling, and
     /// [`Config::allowed_siblings`] gives its reason. So does a bad `warmup`, consenting to no warm-up, and
     /// [`Config::warmup_consented`] gives its reason, and a bad `desktop`, allowing no desktop pattern, and
-    /// [`Config::allowed_desktop`] gives its reason, and a bad `hooks`, consenting to no hook routing, and
+    /// [`Config::allowed_desktop`] gives its reason, and a bad `desktopSession`, allowing no session pattern, and
+    /// [`Config::allowed_desktop_session`] gives its reason, and a bad `hooks`, consenting to no hook routing, and
     /// [`Config::hooks_allowed`] gives its reason, and a bad `sendBuild`, letting no repo send its build, and
     /// [`Config::send_build_allowed`] gives its reason, and a bad `declarations`, naming no folder, and
     /// [`Config::declarations_folder`] gives its reason. A `builders` entry's bad `crossBuild` (no object, on an entry
@@ -198,7 +203,8 @@ impl Config {
             inputs,
             siblings: read_siblings(&data),
             warmup: read_warmup_consent(&data),
-            desktop: read_desktop_consent(&data),
+            desktop: read_desktop_consent(&data, "desktop"),
+            desktop_session: read_desktop_consent(&data, "desktopSession"),
             hooks: read_hooks_consent(&data),
             send_build: read_names(&data, "sendBuild"),
             declarations: read_declarations(&data),
@@ -232,6 +238,22 @@ impl Config {
     /// pattern, and the rest of the file is read whatever it holds.
     pub fn allowed_desktop(&self, repo: &str) -> Result<&[String], &str> {
         match &self.desktop {
+            Err(problem) => Err(problem),
+            Ok(table) => Ok(find(table, repo).unwrap_or(&[])),
+        }
+    }
+
+    /// The `.gate/desktop.toml` `session` patterns `desktopSession` allows `repo`'s commands to run in the builder's
+    /// console session without the desktop lock, its repo name matched in any letter case: none when it does not name
+    /// the repo. A declared session pattern is allowed only when it is listed exactly, letter case included; `desktop`
+    /// never allows one.
+    ///
+    /// # Errors
+    ///
+    /// Why `desktopSession` cannot be used: not an object of arrays of non-empty strings. Such a value allows no session
+    /// pattern, and the rest of the file is read whatever it holds.
+    pub fn allowed_desktop_session(&self, repo: &str) -> Result<&[String], &str> {
+        match &self.desktop_session {
             Err(problem) => Err(problem),
             Ok(table) => Ok(find(table, repo).unwrap_or(&[])),
         }
@@ -1031,28 +1053,28 @@ fn read_declarations(data: &Map<String, Value>) -> Result<Vec<(String, String)>,
         .collect()
 }
 
-/// The `desktop` table: each repo name's allowed desktop patterns, in file order, each a non-empty string kept as
-/// written; an empty table when the key is missing. A problem writes the repo name quoted and escaped, so no control
-/// character in it reaches the console.
-fn read_desktop_consent(data: &Map<String, Value>) -> Result<Vec<(String, Vec<String>)>, String> {
-    let Some(value) = property(data, "desktop") else {
+/// The `desktop` or `desktopSession` table, `key`: each repo name's allowed patterns, in file order, each a non-empty
+/// string kept as written; an empty table when the key is missing. A problem writes the repo name quoted and escaped,
+/// so no control character in it reaches the console.
+fn read_desktop_consent(data: &Map<String, Value>, key: &str) -> Result<Vec<(String, Vec<String>)>, String> {
+    let Some(value) = property(data, key) else {
         return Ok(Vec::new());
     };
     let Value::Object(table) = value else {
-        return Err("desktop must be a JSON object".to_owned());
+        return Err(format!("{key} must be a JSON object"));
     };
     table
         .iter()
         .map(|(repo, list)| {
             let Value::Array(items) = list else {
-                return Err(format!("desktop.{repo:?} is not an array of strings"));
+                return Err(format!("{key}.{repo:?} is not an array of strings"));
             };
             let patterns = items
                 .iter()
                 .enumerate()
                 .map(|(index, item)| match item {
                     Value::String(pattern) if !pattern.is_empty() => Ok(pattern.clone()),
-                    _ => Err(format!("desktop.{repo:?}[{index}] is not a non-empty string")),
+                    _ => Err(format!("{key}.{repo:?}[{index}] is not a non-empty string")),
                 })
                 .collect::<Result<Vec<String>, String>>()?;
             Ok((repo.clone(), patterns))

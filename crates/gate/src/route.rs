@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use gate_args::{GATE_SET_NAMES, RunRequest, Slot, TestSeams, env_refusal};
 use gate_router::balance::{Balanced, BalancedEntry, BuilderFigures};
+use gate_router::desktop::DesktopDeclaration;
 use gate_router::warm::FileRead;
 use gate_router::windows::{self, WindowsChange};
 use gate_router::{
@@ -1362,7 +1363,7 @@ impl Facts for Machine<'_> {
         read_siblings(self.declaration(place, "siblings.toml"))
     }
 
-    fn desktop(&self, place: &Place) -> Result<Vec<Pattern>, String> {
+    fn desktop(&self, place: &Place) -> Result<DesktopDeclaration, String> {
         read_patterns(self.declaration(place, "desktop.toml"), gate_router::desktop::read_desktop)
     }
 
@@ -1648,10 +1649,10 @@ struct Refused {
 /// The patterns a pattern file (`desktop.toml` or `local.toml`) declares, from its `read` ([`read_declaration`]) and
 /// its file's reader `parse`: no file declares none, and a file that cannot be read, does not parse or has any problem
 /// gives its first problem.
-fn read_patterns(read: Result<Option<Vec<u8>>, String>, parse: fn(&[u8]) -> Result<Vec<Pattern>, String>) -> Result<Vec<Pattern>, String> {
+fn read_patterns<T: Default>(read: Result<Option<Vec<u8>>, String>, parse: fn(&[u8]) -> Result<T, String>) -> Result<T, String> {
     match read? {
         Some(bytes) => parse(&bytes),
-        None => Ok(Vec::new()),
+        None => Ok(T::default()),
     }
 }
 

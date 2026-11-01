@@ -176,6 +176,20 @@ Without the consent the command runs here with `gate: not routed: desktop patter
 
 A `.gate/desktop.toml` the gate cannot use keeps every routed command of the repo here with `gate: not routed: .gate/desktop.toml: <problem>`, so fix it before relying on routing. A desktop run holds a remote slot while it waits for the desktop, up to the larger of 60 s and its usual routed p90, and the waiting box names the run that holds the desktop. Format and rules: [design.md](design.md#remotejson).
 
+### A command that needs only the console session
+
+A command that needs the builder's console session (its logon session, where MSYS programs and a GUI-capable process start) but never touches the desktop itself is declared under a second key, `session = ["dotnet test *Headless*"]`, beside `patterns` (either may be absent, at most 32 each, no pattern in both, letter case aside). The PC consents under its own key, `"desktopSession": {"<repo>": ["dotnet test *Headless*"]}`, each pattern exact; without it the command runs here with `gate: not routed: desktop session pattern '<pattern>' not allowed in remote.json desktopSession`. A command matching both a `patterns` and a `session` pattern is a locked run.
+
+A session run is handed to the console session like a desktop run but never takes the desktop lock, so several session runs, and one locked run, can run on the builder at once and none waits for another. In return the repo promises, for every command a `session` pattern matches:
+
+- It opens no window on the console desktop from any descendant. A window on a desktop the command creates itself (godot-mcp's hidden-desktop itests do) is fine.
+- It raises no UAC prompt.
+- It uses per-run names for credentials and named objects (mutexes, pipes, ports, temp folders), since two worktrees or PCs of one repo can now overlap where the lock queued them.
+
+A locked console or an input desktop other than `Default` still refuses a session run, which then runs here. Concurrent session runs' MSYS programs start reliably because the builder's console-session MSYS keeper task (`build-box-msys-console-keeper`, in the builder steps above) keeps an MSYS process alive in that session.
+
+Commit a `session` key only after the reinstall that carries this change, on the PC and (through `gate push`) on the builders: an older gate.exe reads the key as a `.gate/desktop.toml` problem (`session is not a key (patterns)`) and keeps all of the repo's runs here.
+
 ## A repo with a command that stays on this PC
 
 A repo with a command that needs this PC (its WSL state, a service or device only this PC has) declares its `-like` patterns in a tracked `.gate/local.toml`, `patterns = ["dotnet test *Lan*"]`, at most 32, matched against the same rewritten words as the repo's `repos` patterns. No consent in `remote.json` is needed, since the file only keeps commands here.

@@ -175,6 +175,8 @@ pub(crate) struct Checked {
     pub consent_problem: Option<String>,
     /// Why this PC's routing file's `hooks` value cannot be used, when it cannot.
     pub hooks_problem: Option<String>,
+    /// Why this PC's routing file's `desktopSession` value cannot be used, when it cannot.
+    pub desktop_session_problem: Option<String>,
     /// Why each `builders` entry's `crossBuild` in this PC's routing file cannot be used, one per such entry in file
     /// order; none for a builder.
     pub cross_build_problems: Vec<String>,
@@ -351,6 +353,9 @@ fn items(at: At<'_>, checked: &Checked) -> Vec<Item> {
         items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
     }
     if let Some(problem) = &checked.hooks_problem {
+        items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
+    }
+    if let Some(problem) = &checked.desktop_session_problem {
         items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
     }
     for problem in &checked.cross_build_problems {
@@ -748,6 +753,7 @@ mod tests {
             workloads: Vec::new(),
             consent_problem: None,
             hooks_problem: None,
+            desktop_session_problem: None,
             cross_build_problems: Vec::new(),
             root_problem: None,
             siblings: Vec::new(),
@@ -1592,6 +1598,24 @@ mod tests {
             Said {
                 lines: one_item(
                     r"check: here: remote.json: hooks[0] is not a non-empty string\u{202e}",
+                    "check: here: 1 missing, 0 too old"
+                ),
+                status: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_desktop_session_value_that_cannot_be_used_is_an_escaped_missing_line() {
+        let checked = Checked {
+            desktop_session_problem: Some("desktopSession must be a JSON object\u{202e}".to_owned()),
+            ..checked(Vec::new())
+        };
+        assert_eq!(
+            said(HERE, &checked),
+            Said {
+                lines: one_item(
+                    r"check: here: remote.json: desktopSession must be a JSON object\u{202e}",
                     "check: here: 1 missing, 0 too old"
                 ),
                 status: 1,

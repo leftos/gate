@@ -429,7 +429,7 @@ pub(super) mod tests {
                 send: None,
                 outputs_withheld: false,
                 failure_outputs: Vec::new(),
-                desktop: false,
+                desktop: None,
                 source_revision: None,
                 later: Vec::new(),
                 balanced: None,

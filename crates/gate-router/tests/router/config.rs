@@ -657,6 +657,33 @@ fn an_unusable_hooks_value_consents_no_repo_and_keeps_the_rest_of_the_file() {
     }
 }
 
+#[test]
+fn desktop_session_gives_each_repo_s_allowed_session_patterns_apart_from_desktop() {
+    let config =
+        Config::parse(r#"{"host": "builder-1", "repos": {}, "desktop": {"g": ["a*"]}, "DesktopSession": {"G": ["b*", "C*"]}}"#).expect("usable");
+    assert_eq!(config.allowed_desktop_session("g"), Ok(&["b*".to_owned(), "C*".to_owned()][..]));
+    assert_eq!(config.allowed_desktop("g"), Ok(&["a*".to_owned()][..]), "desktop keeps its own list");
+    assert_eq!(config.allowed_desktop_session("missing"), Ok(&[][..]));
+    let none = Config::parse(r#"{"host": "builder-1", "repos": {}}"#).expect("usable");
+    assert_eq!(none.allowed_desktop_session("g"), Ok(&[][..]), "no desktopSession key consents to none");
+}
+
+#[test]
+fn a_bad_desktop_session_value_consents_to_none_and_leaves_desktop_alone() {
+    for (value, problem) in [
+        (r#"["x"]"#, "desktopSession must be a JSON object"),
+        (r#"{"g": "x"}"#, r#"desktopSession."g" is not an array of strings"#),
+        (r#"{"g": ["x", ""]}"#, r#"desktopSession."g"[1] is not a non-empty string"#),
+    ] {
+        let config = Config::parse(&format!(
+            r#"{{"host": "builder-1", "repos": {{"g": ["x"]}}, "desktop": {{"g": ["y"]}}, "desktopSession": {value}}}"#
+        ))
+        .expect("routing reads the file whatever desktopSession holds");
+        assert_eq!(config.allowed_desktop_session("g"), Err(problem), "{value}");
+        assert_eq!(config.allowed_desktop("g"), Ok(&["y".to_owned()][..]), "{value}");
+    }
+}
+
 /// The routing file listing `g` with `desktop` holding `value`.
 fn desktop_file(value: &str) -> Config {
     Config::parse(&format!(
