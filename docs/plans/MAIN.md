@@ -4,6 +4,7 @@
 
 ## Do first
 
+- [ ] GATE-996 Keep suite cases from judging the outer launcher's orphan state, and stop the orphan line advising a self-kill — Urgent · Local gate
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [!] GATE-828 Fix the flaky Unix box test a_clear_refuses_a_volume_mounted_in_the_work_folder_and_keeps_its_files — Urgent · Remote
 - [ ] GATE-871 Carry routed runs' bulk data on a TCP data channel instead of ssh to the Windows builder — Urgent · Remote
@@ -14,15 +15,15 @@
 - [!] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [!] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
 - [ ] GATE-634 Route a commit's whole pre-commit hook stage to a builder as one run — High · Remote
+- [ ] GATE-987 Read the commits consent, judge a commit's stage eligible and snapshot the index tree — High · Remote
+- [ ] GATE-989 Route an eligible commit's pre-commit stage and apply its fixes to the index and worktree — High · Remote
+- [ ] GATE-990 Skip the local hooks a routed stage ran through a gate-owned forwarder hooks folder — High · Remote
 - [!] GATE-839 Route race-anywhere's Unreal editor and game runs: a desktop route with a GPU — High · Remote
 - [!] GATE-974 Route rustling-tulip's whole rt.ps1 native-e2e over the builder's desktop route — High · Remote
-- [ ] GATE-975 Say why a command naming another worktree's file stays local, and route it with --cd — High · Remote
-- [ ] GATE-976 Route rustling-tulip's native-shot on the builder's desktop, with .tmp/shots outputs — High · Remote
-- [ ] GATE-977 Install NSIS 3 on the builders so rustling-tulip's rt.ps1 installer routes — High · Remote
+- [!] GATE-976 Route rustling-tulip's native-shot on the builder's desktop, with .tmp/shots outputs — High · Remote
 - [ ] GATE-978 Send the gitignored .tmp files a routed dotnet probe names as inputs — High · Remote
-- [ ] GATE-979 Route yaat's PrecomputeCache and GuideCapture runs and delve's strikes rewrite with their tracked outputs — High · Remote
-- [ ] GATE-980 Find why heavy filtered dotnet test runs say faster here and never route — High · Remote
 - [ ] GATE-982 Queue a desktop run behind the builder's busy desktop, and run session-only commands without the desktop lock — High · Remote
+- [ ] GATE-991 Route yaat's GuideCapture once its capture no longer reads this PC's CRC aliases — High · Remote
 - [!] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
@@ -341,6 +342,11 @@
 - [ ] GATE-981 Name nested repos, git -C commits and light commits correctly in the local-run census
 - [ ] GATE-983 Restore a routed dotnet build's project here when it is named by its folder
 - [ ] GATE-984 Bring back less than every bin after a routed yaat test-all
+- [ ] GATE-992 Keep the desktop holder record in one box-wide place, not each payload's work root
+- [ ] GATE-993 Clear a refused desktop holder stage, and never name a killed holder from its stale record
+- [ ] GATE-994 Say an unusable remote.json desktop value in gate check, and read remote.json once per check
+- [ ] GATE-995 Say --cd for a matched command only when the other tree's patterns match its rewritten words
+- [ ] GATE-997 Judge a junction to a present sibling as the run's own tree when the root's id cannot be read
 
 ## Cutover sweep
 
