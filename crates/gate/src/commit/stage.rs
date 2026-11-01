@@ -407,15 +407,32 @@ fn git_places(asked: &Asked<'_>) -> Result<Places, GitError> {
     })
 }
 
-/// The pre-commit hook the commit would run: in the folder the repository's own config last sets `core.hooksPath` to,
-/// read against the worktree root, else in the `hooks` folder of its `common` git folder. Every git call of the gate is
-/// given a `core.hooksPath` of its own on the command line, so `--git-path hooks/pre-commit` would name that one; the
-/// config's values are read with their origins instead, and the command line's left out.
+/// The hooks folder a commit in the worktree at `root` runs its hooks from ([`hooks_folder`]), each git call of `git`
+/// under `bounds`.
+///
+/// # Errors
+///
+/// Why a git call failed.
+pub(crate) fn real_hooks_folder(root: &Path, git: &Git, bounds: GitBounds) -> Result<PathBuf, GitError> {
+    let asked = Asked { git, root, bounds };
+    let places = git_places(&asked)?;
+    hooks_folder(&asked, &places.common)
+}
+
+/// The pre-commit hook the commit would run, in its [`hooks_folder`].
 fn hook_path(asked: &Asked<'_>, common: &Path) -> Result<PathBuf, GitError> {
+    Ok(hooks_folder(asked, common)?.join("pre-commit"))
+}
+
+/// The folder the commit's hooks run from: the one the repository's own config last sets `core.hooksPath` to, read
+/// against the worktree root, else the `hooks` folder of its `common` git folder. Every git call of the gate is given a
+/// `core.hooksPath` of its own on the command line, so `--git-path hooks` would name that one; the config's values are
+/// read with their origins instead, and the command line's left out.
+fn hooks_folder(asked: &Asked<'_>, common: &Path) -> Result<PathBuf, GitError> {
     let listed = hooks_listing(asked)?;
     Ok(match configured_hooks(listed.as_deref()) {
-        Some(folder) => asked.root.join(folder).join("pre-commit"),
-        None => common.join("hooks").join("pre-commit"),
+        Some(folder) => asked.root.join(folder),
+        None => common.join("hooks"),
     })
 }
 
@@ -887,6 +904,20 @@ mod tests {
         stage_facts(&root, &git, git::GIT_BOUNDS).expect("the facts can be read");
 
         assert_eq!(fs::read(&index).expect("the index can be read"), before, "the real index is unchanged");
+        removed(&root);
+    }
+
+    #[test]
+    fn the_real_hooks_folder_is_the_configured_one_read_against_the_root_else_the_common_folder_s() {
+        let root = repository("hooks-folder");
+        let git = Git::find(&root).expect("git is found");
+
+        let default = super::real_hooks_folder(&root, &git, git::GIT_BOUNDS).expect("the folder is read");
+        git_in(&root, &["config", "core.hooksPath", "my-hooks"]);
+        let configured = super::real_hooks_folder(&root, &git, git::GIT_BOUNDS).expect("the folder is read");
+
+        assert_eq!(default, root.join(".git").join("hooks"), "the common git folder's hooks");
+        assert_eq!(configured, root.join("my-hooks"), "the configured folder, read against the worktree root");
         removed(&root);
     }
 

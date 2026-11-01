@@ -1768,18 +1768,32 @@ What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K
   - The remote slot is taken into a hold of its own, so the PC's routed-run count stays bounded; it writes no `take` or `release` line, and the run is remote-tagged only while the stage runs.
   - The stage's main repo sends the staged tree, with no bridge, and saves no `refs/gate-remote/<key>` snapshot ref, so no later run's bridge builds on it. A sibling sends its worktree with a bridge, as any run's. The payload carries `CommitStage: true` and `Head`, the PC's `HEAD` commit; a snapshot with no `HEAD` fails the stage before the run call with `a commit stage needs the commit of the PC's HEAD`.
   - The stage's wait and run count against the commit's one `--timeout`: the child commit gets the ceiling less the stage's whole seconds, at least 1 s.
-  - `GATE_COMMIT_SLOT` goes to the child commit only, never to the stage's command.
+  - `GATE_COMMIT_SLOT` goes to the child commit only, never to the stage's command, as do `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0`, `GIT_CONFIG_VALUE_0`, `GATE_STAGE_HEAD` and `GATE_STAGE_TREE` (below). Every run's plan strips an inherited `GATE_STAGE_HEAD` and `GATE_STAGE_TREE`.
 
   The stage ends in one of these ways:
   - It fell back before its command started (any fallback reason; the usual fallback line is said and the other Windows candidates are tried first): the commit runs as it would without a stage, its hooks here. The release's `stage.outcome` is `fellBack`.
   - The command started. A fallback is then no longer possible, so any later failure refuses the commit, a lost connection or an unreachable builder included, and the hooks are never re-run here. The sync-back applies the stage's rule ([Sync-back](#routing), A commit stage's sync-back).
-  - Hooks passed and changed nothing: `gate: the hooks passed on <host>; committing`, then the child commit starts here (`clean`).
-  - Hooks passed with fixes: the fixes are applied to the index and the worktree, `gate: staged the hooks' fixes to <n> files from <host>; committing`, then the child commit starts (`applied`).
+  - Hooks passed and changed nothing: `gate: the hooks passed on <host>; committing`, then the child commit starts here (`clean`), with the hooks skipped as below.
+  - Hooks passed with fixes: the fixes are applied to the index and the worktree, `gate: staged the hooks' fixes to <n> files from <host>; committing`, then the child commit starts (`applied`), with the hooks skipped as below.
   - Hooks failed: the commit ends with prek's status and output, with no child commit (`hooksFailed`).
   - Refused or an apply that failed: the commit ends with status 1, no child commit and no verdict (`refused`).
   - The result never came back: `gate: commit refused: the hooks ran on <host> but their result could not be brought back; nothing was written`, status 1, or `STATUS_CONTROL_C_EXIT` while a Ctrl+C is raised.
 
-  A Ctrl+C raised after the apply and before the child starts ends the commit with `gate: the run was interrupted; the hooks' fixes are applied and staged`. The child commit still runs the repo's own hooks here.
+  A Ctrl+C raised after the apply and before the child starts ends the commit with `gate: the run was interrupted; the hooks' fixes are applied and staged`.
+
+  **The hooks run once.** After a passed stage the child commit does not run the pre-commit hook the builder already ran. The run computes the checked tree, the index tree after the stage's fixes, on a copy of the index inside the worktree lock, and writes a forwarder hooks folder `{state root}\hooks\{gate pid}-{gate start ms}\` (`commit/forward.rs`).
+
+  The folder holds one `sh` forwarder per real hook whose file starts `#!`, each execing the real hook; `*.sample` files are ignored. Any other hook-named entry (a folder, a file with no `#!`, an `MZ` executable) refuses the folder, since git would run something the forwarder cannot forward.
+
+  The child starts with `GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=core.hooksPath`, `GIT_CONFIG_VALUE_0=<folder>`, `GATE_STAGE_HEAD=<the HEAD sent>` and `GATE_STAGE_TREE=<the checked tree>`.
+
+  The forwarder `pre-commit` exits 0 only while `HEAD` and the tree of a copy of `$GIT_INDEX_FILE` equal those two values. Otherwise, and on any error, it unsets both variables and execs the real hook, so a changed index or a moved `HEAD` runs the local hooks as without a stage.
+
+  When no skip can be made the run says `gate: cannot skip the hooks the builder ran (<why>); the local hooks run again` and starts the child with its own environment. The whys: `the hooks folder <path> holds a hook git would run but gate cannot forward: <name>`, `the hook <name> holds a quote, a newline or a NUL`, `the hooks folder <path> holds a quote, a newline or a NUL`, `cannot read the hooks folder <path>: <error>`, `cannot write the forwarder hooks folder <path>: <error>` and `GIT_CONFIG_COUNT is already set`.
+
+  After the child, a new commit whose parent is not the sent `HEAD` or whose tree is not the checked tree makes the run say `gate: commit <short> is not what the routed hooks checked: expected parent <sent> and tree <checked>, got parent <parent> and tree <tree>` (or `gate: cannot check the commit against the routed hooks' tree (<error>)`) before the verdict, and end 1; the commit is kept.
+
+  The forwarder folder is left after the run. A commit run that writes its folder first sweeps the folders of a gate that is gone and that are over 7 days old; a failure there is only logged: `gate: cannot read the forwarder hooks folders in <path>: <error>` or `gate: cannot sweep the forwarder hooks folder <path>: <error>`.
 
   The stage runs only for a plain slot take: a commit lent a slot or covered by a parent is not eligible. A stage sends the whole index through the check ([Sync-back](#routing)), so an unrelated `git add` made while the hooks run refuses the commit.
 

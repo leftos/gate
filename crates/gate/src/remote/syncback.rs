@@ -44,6 +44,7 @@ use super::retry::GIT_SSH_FAILED;
 use super::snapshot::{self, BACK, REFS, Snapshot};
 use super::watchdog::{self, Cut};
 use super::worktree_lock::{self, Folder};
+use crate::commit::forward::Checked;
 use crate::outputs::names::{is_git_s, is_lfs_config};
 use crate::slots::{self, Liveness};
 
@@ -230,7 +231,8 @@ pub(crate) enum Fixes {
 /// A commit stage's end and the run's end beside it.
 type StageEnd = (Staged, End);
 
-/// What a test does with a stage's patch once the stage tried to write its fixes ([`AFTER_STAGE_WRITE`]).
+/// What a test does with a path of a stage's: its patch once the stage tried to write its fixes
+/// ([`AFTER_STAGE_WRITE`]), or its worktree root before its checked tree is read ([`BEFORE_CHECKED_TREE`]).
 #[cfg(test)]
 type PatchHook = Box<dyn FnMut(&Path)>;
 
@@ -365,11 +367,50 @@ fn stage_main(attempt: &mut Attempt<'_, '_>, target: &Target<'_>, status: i64) -
             })?,
             None => None,
         };
-        match received {
-            Some(ended) => Ok(ended),
-            None => stage_unchanged(attempt, worktree, status),
+        let ended = match received {
+            Some(ended) => ended,
+            None => stage_unchanged(attempt, worktree, status)?,
+        };
+        if matches!(ended.0, Staged::Applied(_) | Staged::Clean) {
+            // The stage's end stands whatever becomes of its checked tree: one that cannot be read is carried as why,
+            // and the commit's child runs the local hooks again. An interrupt leaves nothing checked, the fixes being
+            // written already: the run sees the raised interrupt once the stage ends and starts no commit.
+            attempt.checked = match checked_of(attempt, worktree) {
+                Ok(checked) => Some(Ok(checked)),
+                Err(End::Failed(why)) => Some(Err(why)),
+                Err(End::Interrupted) => None,
+                Err(other) => return Err(other),
+            };
         }
+        Ok(ended)
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What a test does with a stage's worktree root just before its checked tree is read.
+    static BEFORE_CHECKED_TREE: std::cell::RefCell<Option<PatchHook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// What a stage whose hooks passed checked, read under its worktree lock once its fixes, if any, were written: the
+/// `HEAD` it sent, and the checked tree, `git write-tree` of a fresh copy of the worktree's index, never the real one.
+fn checked_of(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>) -> Result<Checked, End> {
+    #[cfg(test)]
+    BEFORE_CHECKED_TREE.with_borrow_mut(|hook| {
+        if let Some(hook) = hook {
+            hook(worktree.root());
+        }
+    });
+    let Some(head) = worktree.target.snapshot.head.clone() else {
+        return Err(End::Failed("a commit stage's snapshot names no HEAD".to_owned()));
+    };
+    let copy = snapshot::IndexCopy::made(worktree.root(), attempt.git, attempt.call.interrupt).map_err(escaped_end)?;
+    let set = [("GIT_INDEX_FILE", copy.path().as_os_str())];
+    let tree = line(attempt, worktree, &["write-tree"], &set);
+    let removed = copy.removed().map_err(escaped_end);
+    let tree = tree?;
+    removed?;
+    Ok(Checked { head, tree })
 }
 
 /// How a stage whose hooks ended `status` is refused: refused when they passed, and their failure with what became of
@@ -2617,6 +2658,7 @@ mod tests {
         read_attributes, receive, refused_end, see_diff, swept, sync_back, sync_back_ended_line, synced_line, syncing_line, total, touched_line,
         tree_removed, unmoved_line, weight, written_blobs, written_line,
     };
+    use crate::commit::forward::Checked;
     use crate::remote::RemoteCall;
     use crate::remote::client::{Attempt, End};
     use crate::remote::git::{self, Git};
@@ -4675,13 +4717,27 @@ mod tests {
     /// app's commit stage through `transport` for hooks that ended `status`: how its sync-back ended, and how the stage
     /// did.
     fn staged_through(case: &PairCase, transport: &dyn Transport, status: i64) -> (Result<Synced, End>, Option<Staged>) {
+        let (ended, staged, _) = checked_through(case, transport, status);
+        (ended, staged)
+    }
+
+    /// How a commit stage's sync-back ended, how the stage did, and what it checked or why that could not be read.
+    type StagedChecked = (Result<Synced, End>, Option<Staged>, Option<Result<Checked, String>>);
+
+    /// [`staged_through`], with what the stage checked.
+    fn checked_through(case: &PairCase, transport: &dyn Transport, status: i64) -> StagedChecked {
         let target = Target::new(routed(PAIR[0], &case.roots[0]), PAIR[0], &case.snapshots[0], KEY);
         let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
         let mut call = call_in(&case.roots[0], &case.log, &state);
         call.commit_stage = true;
         let mut attempt = Attempt::for_tests(&call, transport);
         let ended = sync_back(&mut attempt, &[target], None, status);
-        (ended, attempt.staged)
+        (ended, attempt.staged, attempt.checked)
+    }
+
+    /// The `HEAD` app's stage sent.
+    fn sent_head(case: &PairCase) -> String {
+        case.snapshots[0].head.clone().expect("a stage's snapshot names its HEAD")
     }
 
     /// The local transport whose upload-pack runs the shell words `then` from its second call on, the fetch's: after the
@@ -4720,7 +4776,7 @@ mod tests {
         let case = stage_case("stage-applied", &[]);
         case.plant(0, &[("a.txt", "fixed\n")]);
 
-        let (ended, staged) = staged_through(&case, &case.local(), 0);
+        let (ended, staged, checked) = checked_through(&case, &case.local(), 0);
 
         assert!(matches!(&ended, Ok(Synced { end: End::Status(0), .. })), "{ended:?}");
         assert_eq!(staged, Some(Staged::Applied(1)));
@@ -4729,6 +4785,15 @@ mod tests {
         let unstaged = asked(case.root(0), &[], &["diff", "--name-only"]).expect("the unstaged names are listed");
         assert_eq!(unstaged, "", "the worktree and the index agree");
         assert_eq!(case.kept(0), None, "an applied back commit is not kept");
+        let tree = asked(case.root(0), &[], &["write-tree"]).expect("the real index's tree is written");
+        assert_eq!(
+            checked,
+            Some(Ok(Checked {
+                head: sent_head(&case),
+                tree: tree.trim_end().to_owned()
+            })),
+            "the checked tree is the real index's once the fixes are applied"
+        );
         case.remove();
     }
 
@@ -4736,15 +4801,25 @@ mod tests {
     fn a_stage_with_no_back_commit_still_checks_head_and_the_index() {
         let case = stage_case("stage-none", &[]);
 
-        let (clean, clean_staged) = staged_through(&case, &case.local(), 0);
+        let (clean, clean_staged, clean_checked) = checked_through(&case, &case.local(), 0);
         put(&case.root(0).join("b.txt"), "b\n");
         asked(case.root(0), &[], &["add", "b.txt"]).expect("b.txt is staged");
-        let (moved, moved_staged) = staged_through(&case, &case.local(), 0);
+        let (moved, moved_staged, moved_checked) = checked_through(&case, &case.local(), 0);
 
         assert!(matches!(&clean, Ok(Synced { end: End::Status(0), .. })), "{clean:?}");
         assert_eq!(clean_staged, Some(Staged::Clean));
+        let sent = asked(case.root(0), &[], &["rev-parse", &format!("{}^{{tree}}", case.snapshots[0].commit)]).expect("the sent tree reads");
+        assert_eq!(
+            clean_checked,
+            Some(Ok(Checked {
+                head: sent_head(&case),
+                tree: sent.trim_end().to_owned()
+            })),
+            "a clean stage's checked tree is the one sent"
+        );
         assert!(matches!(&moved, Ok(Synced { end: End::Status(1), .. })), "{moved:?}");
         assert_eq!(moved_staged, Some(Staged::Refused));
+        assert_eq!(moved_checked, None, "a refused stage checked nothing");
         let refused = "gate: commit refused: the index changed while the hooks ran on builder; nothing was written";
         assert!(case.said().iter().any(|line| line == refused), "{:?}", case.said());
         case.remove();
@@ -4757,10 +4832,11 @@ mod tests {
         let head = case.root(0).join(".git").join("HEAD").to_string_lossy().replace('\\', "/");
         let through = on_fetch(&case, &format!("echo 'ref: refs/heads/moved' > '{head}'"));
 
-        let (ended, staged) = staged_through(&case, &through, 0);
+        let (ended, staged, checked) = checked_through(&case, &through, 0);
 
         assert!(matches!(&ended, Ok(Synced { end: End::Status(1), .. })), "{ended:?}");
         assert_eq!(staged, Some(Staged::Refused));
+        assert_eq!(checked, None, "a refused stage checked nothing");
         let refused = "gate: commit refused: HEAD moved while the hooks ran on builder; nothing was written";
         assert!(case.said().iter().any(|line| line == refused), "{:?}", case.said());
         assert_eq!(text_of(&case, "a.txt"), "a\n", "the worktree is as it was");
@@ -4833,7 +4909,7 @@ mod tests {
         let case = stage_case("stage-failed", &[]);
         case.plant(0, &[("a.txt", "fixed\n")]);
 
-        let (ended, staged) = staged_through(&case, &case.local(), 3);
+        let (ended, staged, checked) = checked_through(&case, &case.local(), 3);
 
         assert!(matches!(&ended, Ok(Synced { end: End::Status(3), .. })), "{ended:?}");
         assert_eq!(
@@ -4843,6 +4919,7 @@ mod tests {
                 fixes: Fixes::Worktree
             })
         );
+        assert_eq!(checked, None, "hooks that failed checked nothing");
         let said = "gate: the hooks failed on builder (status 3); their fixes are in the worktree, unstaged";
         assert!(case.said().iter().any(|line| line == said), "{:?}", case.said());
         assert_eq!(text_of(&case, "a.txt"), "fixed\n", "the worktree holds the fix");
@@ -4896,11 +4973,12 @@ mod tests {
         let back = case.plant(0, &[("a.txt", "fixed\n"), ("b.txt", "fixed\n")]);
         let handle = held_open(&case.root(0).join("a.txt"));
 
-        let (ended, staged) = staged_through(&case, &case.local(), 0);
+        let (ended, staged, checked) = checked_through(&case, &case.local(), 0);
 
         drop(handle);
         assert!(matches!(&ended, Ok(Synced { end: End::Status(1), .. })), "{ended:?}");
         assert_eq!(staged, Some(Staged::ApplyFailed { status: 0 }));
+        assert_eq!(checked, None, "a failed apply checked nothing");
         let said = case.said();
         let failed = said
             .iter()
@@ -4917,6 +4995,86 @@ mod tests {
         }
         assert_eq!(staged_names(&case), "", "nothing is staged");
         assert_eq!(case.kept(0), Some(back), "the fixes are kept");
+        case.remove();
+    }
+
+    /// [`checked_through`] for passed hooks, app's index held open with no sharing while its checked tree is read.
+    fn checked_with_the_index_held(case: &PairCase) -> StagedChecked {
+        let held: std::rc::Rc<std::cell::RefCell<Option<File>>> = std::rc::Rc::default();
+        let holder = std::rc::Rc::clone(&held);
+        super::BEFORE_CHECKED_TREE.set(Some(Box::new(move |root: &Path| {
+            let index = OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(root.join(".git").join("index"))
+                .expect("the index can be held");
+            holder.replace(Some(index));
+        })));
+
+        let through = checked_through(case, &case.local(), 0);
+
+        super::BEFORE_CHECKED_TREE.set(None);
+        drop(held.take().expect("the stage read its checked tree"));
+        through
+    }
+
+    #[test]
+    fn a_clean_stage_whose_checked_tree_cannot_be_read_still_passes_and_carries_why() {
+        let case = stage_case("stage-clean-unchecked", &[]);
+
+        let (ended, staged, checked) = checked_with_the_index_held(&case);
+
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(0), .. })), "{ended:?}");
+        assert_eq!(staged, Some(Staged::Clean), "the stage's end stands");
+        let why = checked
+            .expect("a passed stage carries its checked tree or why")
+            .expect_err("the copy failed");
+        assert!(why.starts_with("cannot copy the index "), "{why}");
+        case.remove();
+    }
+
+    #[test]
+    fn an_applied_stage_whose_checked_tree_cannot_be_read_still_applies_and_carries_why() {
+        let case = stage_case("stage-applied-unchecked", &[]);
+        case.plant(0, &[("a.txt", "fixed\n")]);
+
+        let (ended, staged, checked) = checked_with_the_index_held(&case);
+
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(0), .. })), "{ended:?}");
+        assert_eq!(staged, Some(Staged::Applied(1)), "the stage's end stands");
+        assert_eq!(staged_names(&case).trim_end(), "a.txt", "the index stages the fix");
+        let why = checked
+            .expect("a passed stage carries its checked tree or why")
+            .expect_err("the copy failed");
+        assert!(why.starts_with("cannot copy the index "), "{why}");
+        case.remove();
+    }
+
+    #[test]
+    fn an_interrupt_while_the_checked_tree_is_read_leaves_the_applied_stage_standing_and_nothing_checked() {
+        let case = stage_case("stage-applied-interrupted", &[]);
+        case.plant(0, &[("a.txt", "fixed\n")]);
+        let interrupt = Interrupt::install().expect("the console handler is installed");
+        super::BEFORE_CHECKED_TREE.set(Some(Box::new(move |_: &Path| interrupt.raise())));
+        let target = Target::new(routed(PAIR[0], &case.roots[0]), PAIR[0], &case.snapshots[0], KEY);
+        let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
+        let mut call = call_in(&case.roots[0], &case.log, &state);
+        call.commit_stage = true;
+        call.interrupt = Some(interrupt);
+        let transport = case.local();
+        let mut attempt = Attempt::for_tests(&call, &transport);
+
+        let ended = sync_back(&mut attempt, &[target], None, 0);
+
+        super::BEFORE_CHECKED_TREE.set(None);
+        assert!(
+            matches!(&ended, Ok(Synced { end: End::Status(0), .. })),
+            "the stage's end stands: {ended:?}"
+        );
+        assert_eq!(attempt.staged, Some(Staged::Applied(1)), "the fixes are applied and staged");
+        assert_eq!(attempt.checked, None, "nothing is checked");
+        assert!(interrupt.is_raised(), "the interrupt is left for the run to see");
+        assert_eq!(staged_names(&case).trim_end(), "a.txt", "the index stages the fix");
         case.remove();
     }
 

@@ -8,6 +8,7 @@ use std::ffi::OsString;
 
 use gate_args::{RunRequest, Slot};
 
+pub(crate) mod forward;
 pub(crate) mod stage;
 
 /// The line a commit run asked for on no slot says once, before it waits for the light slot it takes in its place.

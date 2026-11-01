@@ -77,6 +77,7 @@ use super::{
     adjusted_prefix, install_why, killed_line, refused_line, root_busy_why, root_why, started_line,
 };
 use crate::boxside::outputs::{NAMES_SKIPPED, OUTPUTS_BUDGET};
+use crate::commit::forward::Checked;
 use crate::durations::{Usual, hang_hint, routed_usual};
 use crate::environment::Variables;
 use crate::no_build;
@@ -488,6 +489,7 @@ impl RustClient {
             marker_seen: false,
             run_call_started: false,
             staged: None,
+            checked: None,
             raised: None,
             backstop_seam: self.backstop_ms.map(Duration::from_millis),
             carried: match phases {
@@ -1537,6 +1539,9 @@ pub(super) struct Attempt<'c, 'a> {
     run_call_started: bool,
     /// How a commit stage's sync-back ended, once it has; `None` before, and for a call that is no stage.
     pub(super) staged: Option<syncback::Staged>,
+    /// What a commit stage whose hooks passed checked, its fixes applied: the `HEAD` it sent and the checked tree, or why
+    /// they could not be read; `None` before, and for every other end ([`syncback::Staged`]).
+    pub(super) checked: Option<Result<Checked, String>>,
     /// The run call's ceiling, in whole seconds, once it was raised for a work tree the preflight found new
     /// ([`Attempt::raise_ceiling`]); `None` while it is the call's own.
     raised: Option<u64>,
@@ -3951,6 +3956,7 @@ impl Attempt<'_, '_> {
             run_called: self.run_call_started,
             command_started: self.marker_seen,
             staged: self.staged,
+            checked: self.checked,
         }
     }
 
@@ -4017,6 +4023,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             marker_seen: false,
             run_call_started: false,
             staged: None,
+            checked: None,
             raised: None,
             backstop_seam: None,
             carried: Carried::default(),
@@ -6404,6 +6411,7 @@ mod tests {
             marker_seen: false,
             run_call_started: false,
             staged: None,
+            checked: None,
             raised: None,
             backstop_seam: None,
             carried: Carried::default(),

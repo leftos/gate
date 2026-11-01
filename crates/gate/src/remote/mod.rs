@@ -23,6 +23,7 @@ use gate_win32::{Interrupt, OwnedMutexGuard};
 use gate_wire::stamp::{self, Tag};
 use gate_wire::{ROOT_BUSY, ROOT_STATUS, ROOT_UNSAFE};
 
+use crate::commit::forward::Checked;
 use crate::durations::Usual;
 
 #[cfg(feature = "test-seams")]
@@ -347,6 +348,10 @@ pub(crate) struct RemoteOutcome {
     /// How a commit stage's sync-back ended; `None` for a call that is no stage, and for a stage whose sync-back did
     /// not run.
     pub staged: Option<syncback::Staged>,
+    /// What a commit stage whose hooks passed checked, its fixes applied: the `HEAD` it sent and the checked tree, which
+    /// the commit's child is given so the forwarder pre-commit hook can skip the real one, or why they could not be read,
+    /// for which the child runs the local hooks again; `None` for any other end.
+    pub checked: Option<Result<Checked, String>>,
 }
 
 /// How long a routed run's parts took: the run call, the command's own time, which its ceiling counts; the push; and the

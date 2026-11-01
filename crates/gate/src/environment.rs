@@ -20,6 +20,12 @@ pub(crate) const SLOT_HELD_VARIABLE: &str = "GATE_SLOT_HELD";
 /// The variable a commit run gives its command holding its own slot marker, so a gate in its hooks that the marker's
 /// slot covers knows it runs under a commit run ([`crate::nesting::Nesting::under_commit`]).
 pub(crate) const COMMIT_SLOT_VARIABLE: &str = "GATE_COMMIT_SLOT";
+/// The variable a commit run whose stage passed on a builder gives its child holding the `HEAD` the builder checked,
+/// which the forwarder pre-commit hook compares ([`crate::commit::forward`]).
+pub(crate) const STAGE_HEAD_VARIABLE: &str = "GATE_STAGE_HEAD";
+/// The variable a commit run whose stage passed on a builder gives its child holding the checked tree, which the
+/// forwarder pre-commit hook compares ([`crate::commit::forward`]).
+pub(crate) const STAGE_TREE_VARIABLE: &str = "GATE_STAGE_TREE";
 
 /// The variables a command is started with.
 pub(crate) struct Variables(Vec<(OsString, OsString)>);

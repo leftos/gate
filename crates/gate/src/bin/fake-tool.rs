@@ -56,8 +56,9 @@
 //! for a Godot install a case can tell the running of from what it answers;
 //! `--hook-stage <stage>` runs the steps of the file `hook-steps.txt` beside this program, one a line, and ends with
 //! their status, so a copy named `prek.exe` stands in for `prek run --hook-stage pre-commit`; `hook-impl` adds the line
-//! `run` to the file `local-hooks.ran` beside this program and ends, so the same copy stands in for the hook shim's
-//! `prek hook-impl` and a case can tell that a commit's hooks ran here.
+//! `run` to the file `local-hooks.ran` beside this program, says `fake-tool: hook-impl ran` on stderr and ends, so the
+//! same copy stands in for the hook shim's `prek hook-impl` and a case can tell that, and when, a commit's hooks ran
+//! here.
 //! With no `exit` step it exits 0. For example `fake-tool out hi err oops exit 3`.
 
 #![expect(
@@ -212,13 +213,15 @@ fn run(args: &[OsString]) -> Result<i32, String> {
 
 /// The steps a stand-in for the box's MSYS keeper and the command watching it take: `echo`, `swallow`, `pid-to` and
 /// `alive`; `commit`, which does nothing, so a copy named `git.exe` stands in for `git commit`; and `hook-impl`, which
-/// marks `local-hooks.ran` beside this program, its words after it skipped; any other step is unknown.
+/// marks `local-hooks.ran` beside this program and says `fake-tool: hook-impl ran` on stderr, its words after it
+/// skipped; any other step is unknown.
 fn keeper_step<'a>(step: &str, steps: &mut impl Iterator<Item = &'a OsString>, stdout: &mut impl Write) -> Result<(), String> {
     match step {
         "commit" => Ok(()),
         "hook-impl" => {
             for _ in steps.by_ref() {}
-            mark(&own_folder()?.join(LOCAL_HOOKS_RAN).to_string_lossy())
+            mark(&own_folder()?.join(LOCAL_HOOKS_RAN).to_string_lossy())?;
+            writeln!(io::stderr().lock(), "fake-tool: hook-impl ran").map_err(|error| write_failed(&error))
         }
         "echo" => echo(stdout),
         "swallow" => io::copy(&mut io::stdin().lock(), &mut io::sink())

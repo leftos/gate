@@ -12047,6 +12047,88 @@ fn local_hooks_ran(case: &Case) -> bool {
     prek_bin(case).join("local-hooks.ran").exists()
 }
 
+/// The names in the case's state root's `hooks` folder, where a commit run keeps its forwarder hooks folder for the
+/// sweep.
+fn forwarder_folders(case: &Case) -> Vec<String> {
+    let hooks = case.root().join("hooks");
+    if !hooks.exists() {
+        return Vec::new();
+    }
+    fs::read_dir(&hooks)
+        .expect("the hooks folder lists")
+        .map(|entry| entry.expect("an entry lists").file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Asserts a stage case's commit was made on `base` without its local hooks, and kept its one forwarder hooks folder,
+/// named `{pid}-{start}` for the gate that wrote it, for the sweep.
+fn committed_without_local_hooks(case: &Case, base: &str, outcome: &Outcome) {
+    assert_eq!(
+        git_out(case, &[], &["rev-parse", "HEAD~1"]),
+        base,
+        "the commit was made on the base: {outcome:?}"
+    );
+    assert!(!local_hooks_ran(case), "the hooks the builder ran do not run again here: {outcome:?}");
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    let folders = forwarder_folders(case);
+    let owned = folders
+        .iter()
+        .filter(|name| name.split_once('-').is_some_and(|(pid, start)| digits(pid) && digits(start)))
+        .count();
+    assert_eq!((folders.len(), owned), (1, 1), "the run's forwarder hooks folder is kept: {folders:?}");
+}
+
+/// A post-commit hook that amends the commit with one more file, once.
+const AMENDING_HOOK: &str = "#!/bin/sh\n[ -n \"$SUITE_AMENDED\" ] && exit 0\necho more > more.txt\ngit add more.txt\n\
+                             SUITE_AMENDED=1 git commit --amend --no-edit --no-verify --no-gpg-sign --quiet\n";
+
+#[test]
+fn a_routed_commit_stage_whose_hooks_cannot_be_forwarded_says_why_and_runs_the_local_hooks() {
+    let case = stage_case("client-stage-no-skip", &["write", "a.txt", "fixed"]);
+    let hooks = case.folder().join(".git").join("hooks");
+    fs::write(hooks.join("it's-hook"), "#!/bin/sh\nexit 0\n").expect("a hook with a quote in its name can be written");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let base = git_out(&case, &[], &["rev-parse", "HEAD"]);
+
+    let outcome = finish(stage_gate(&case, &steps));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let line = "gate: cannot skip the hooks the builder ran (the hook it's-hook holds a quote, a newline or a NUL); the local hooks run again";
+    assert!(outcome.stderr.contains(line), "{outcome:?}");
+    let log = log_texts(&case.folder().join("out.log"));
+    assert_in_order(&log, &[line, "fake-tool: hook-impl ran"]);
+    assert!(local_hooks_ran(&case), "the local hooks ran again: {outcome:?}");
+    assert_eq!(git_out(&case, &[], &["rev-parse", "HEAD~1"]), base, "the commit was made: {outcome:?}");
+}
+
+#[test]
+fn a_routed_commit_stage_whose_commit_tree_differs_from_the_checked_tree_fails_the_run_with_the_commit_kept() {
+    let case = stage_case("client-stage-amended", &["write", "a.txt", "fixed"]);
+    let hooks = case.folder().join(".git").join("hooks");
+    fs::write(hooks.join("post-commit"), AMENDING_HOOK).expect("the amending hook can be written");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let base = git_out(&case, &[], &["rev-parse", "HEAD"]);
+
+    let outcome = finish(stage_gate(&case, &steps));
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let head = git_out(&case, &[], &["rev-parse", "HEAD"]);
+    // The commit the child made before its post-commit hook amended it holds the staged index, the checked tree.
+    let checked = git_out(&case, &[], &["rev-parse", "HEAD@{1}^{tree}"]);
+    let parent = git_out(&case, &[], &["rev-parse", "HEAD^"]);
+    let tree = git_out(&case, &[], &["rev-parse", "HEAD^{tree}"]);
+    let said = format!(
+        "gate: commit {} is not what the routed hooks checked: expected parent {base} and tree {checked}, got parent {parent} and tree {tree}",
+        &head[..12]
+    );
+    assert!(outcome.stderr.contains(&said), "{outcome:?}");
+    let log = log_texts(&case.folder().join("out.log"));
+    assert_in_order(&log, &[said.as_str(), "gate: FAILED"]);
+    assert_eq!(git_out(&case, &[], &["rev-parse", "HEAD~1"]), base, "the commit is kept: {outcome:?}");
+    assert_eq!(git_out(&case, &[], &["show", "HEAD:more.txt"]), "more", "the amend's file is in it");
+    assert!(!local_hooks_ran(&case), "the pre-commit hooks were still skipped: {outcome:?}");
+}
+
 /// The refs the case's worktree keeps that end in `-back`.
 fn kept_backs(case: &Case) -> Vec<String> {
     let refs = git_out(case, &[], &["for-each-ref", "--format=%(refname)", "refs/gate-remote/"]);
@@ -12074,6 +12156,8 @@ fn a_routed_commit_stage_stages_the_hooks_fixes_then_commits() {
     assert_eq!(git_out(&case, &[], &["show", "HEAD:a.txt"]), "fixed", "the commit's tree holds the fix");
     assert_eq!(fs::read_to_string(case.folder().join("a.txt")).expect("a.txt is there"), "fixed");
     assert_eq!(calls(&steps), ["preflight", "run"]);
+    committed_without_local_hooks(&case, &base, &outcome);
+    assert!(!outcome.stderr.contains("cannot skip the hooks"), "{outcome:?}");
 }
 
 #[test]
@@ -12288,11 +12372,13 @@ fn a_commit_stage_saves_no_snapshot_ref_for_later_runs() {
     let saved = snapshot_refs(&case);
     assert!(!saved.is_empty(), "the routed run saved its snapshot ref");
     let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let base = git_out(&case, &[], &["rev-parse", "HEAD"]);
 
     let outcome = finish(stage_gate(&case, &steps));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(snapshot_refs(&case), saved, "the stage's staged tree is no bridge for a later run");
+    committed_without_local_hooks(&case, &base, &outcome);
 }
 
 /// Through the stand-in as git's own ssh, the preflight, the push and the run call pass, and every call after the
@@ -12324,10 +12410,12 @@ fn a_commit_stage_whose_result_cannot_be_brought_back_refuses_the_commit() {
 fn a_routed_commit_stage_journals_its_stage() {
     let case = stage_case("client-stage-journal", &["write", "a.txt", "fixed"]);
     let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let base = git_out(&case, &[], &["rev-parse", "HEAD"]);
 
     let outcome = finish(stage_gate(&case, &steps));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    committed_without_local_hooks(&case, &base, &outcome);
     let events = events(&case);
     let names: Vec<&str> = events.iter().map(|event| event["event"].as_str().unwrap_or_default()).collect();
     assert_eq!(

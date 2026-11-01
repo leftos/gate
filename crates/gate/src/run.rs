@@ -16,7 +16,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use std::{fs, io};
 
 use gate_wire::stamp::{self, Tag};
@@ -47,12 +47,13 @@ use crate::acquire;
 use crate::answer::USAGE_STATUS;
 use crate::boxside::forward::{DRAIN, Forwarders, OutputBytes, Sink, Stamping};
 use crate::commit;
+use crate::commit::forward::Checked;
 use crate::console::Console;
 use crate::covered::Covered;
 use crate::durations::{
     Resolved, RunDurations, RunIdentity, Usual, ceiling_hint, expected_field, expected_line, raised_ceiling_line, resolve_ceiling, span_text,
 };
-use crate::environment::{self, BOX_JOB_VARIABLE, COMMIT_SLOT_VARIABLE, SLOT_HELD_VARIABLE, Variables};
+use crate::environment::{self, BOX_JOB_VARIABLE, COMMIT_SLOT_VARIABLE, SLOT_HELD_VARIABLE, STAGE_HEAD_VARIABLE, STAGE_TREE_VARIABLE, Variables};
 use crate::escaped::{self, Found, Reach, Reached, Recorded};
 use crate::journal::{self, RunJournal};
 use crate::late::{Late, LateOf, LateSlot};
@@ -82,6 +83,9 @@ use crate::worktree_record;
 const GATE_FAILED: i64 = 1;
 /// The status of a command that exited 0 with a failure marker in its log.
 const LOG_FAILURE: i64 = 1;
+/// The status of a commit run whose child exited 0 but whose commit is not the one its stage's hooks checked, or could
+/// not be checked against it ([`Run::check_commit`]).
+const COMMIT_UNCHECKED: i64 = 1;
 /// The status of a command that could not be started.
 const NOT_STARTED: i64 = 127;
 /// The exit code the job's processes are ended with when the gate stops the command.
@@ -213,6 +217,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         tailscale_read: None,
         would: None,
         staging: None,
+        forwarded: None,
         arrived: epoch_ms(Timestamp::now()),
         queued_at: None,
         lent: false,
@@ -615,6 +620,8 @@ struct Plan {
     /// The file the first word was found as, as a full path.
     resolved: Option<String>,
     launch: Result<Launch, String>,
+    /// The words the plan was made of, which a plan made again for the same command is made of too.
+    words: Vec<OsString>,
 }
 
 /// How a found program is started.
@@ -635,15 +642,21 @@ impl Plan {
     ///
     /// A refused batch word (status 2), or a working folder or environment the gate cannot read or pass on (status 1).
     fn prepare(request: &RunRequest, words: &[OsString], at: &Where<'_>, console: &mut Console) -> Result<Plan, NotRun> {
-        Plan::prepare_without(request, words, at, &[], console)
+        Plan::prepare_without(request, words, at, Adjusted::NONE, console)
     }
 
-    /// [`Plan::prepare`], with the variables named `withheld` left out of the command's environment.
+    /// [`Plan::prepare`], with the command's environment `adjusted`.
     ///
     /// # Errors
     ///
     /// As [`Plan::prepare`].
-    fn prepare_without(request: &RunRequest, words: &[OsString], at: &Where<'_>, withheld: &[&str], console: &mut Console) -> Result<Plan, NotRun> {
+    fn prepare_without(
+        request: &RunRequest,
+        words: &[OsString],
+        at: &Where<'_>,
+        adjusted: Adjusted<'_>,
+        console: &mut Console,
+    ) -> Result<Plan, NotRun> {
         let Where { root, gate, nesting } = *at;
         let folder = std::env::current_dir().map_err(|error| NotRun::failed(format!("gate: cannot read the working directory: {error}")))?;
         // A covered gate hands on the marker of the parent whose slot its command runs under. Any other hands on its own,
@@ -671,7 +684,7 @@ impl Plan {
         } else {
             variables.without(COMMIT_SLOT_VARIABLE)
         };
-        let variables = withheld.iter().fold(variables, |variables, name| variables.without(name));
+        let variables = adjusted.applied(variables);
         let environment = variables
             .block()
             .map_err(|error| NotRun::failed(format!("gate: cannot build the command's environment: {error}")))?;
@@ -687,6 +700,7 @@ impl Plan {
                     word,
                     resolved: None,
                     launch,
+                    words: words.to_vec(),
                 });
             }
         };
@@ -702,14 +716,41 @@ impl Plan {
                 directory: folder,
                 environment,
                 output: LaunchOutput::Pipes,
-                priority: priority(nesting.runs_as(request.slot), console),
+                priority: priority(nesting.runs_as(request.slot), adjusted.quiet, console),
             }),
         };
         Ok(Plan {
             word,
             resolved: Some(program.to_string_lossy().into_owned()),
             launch,
+            words: words.to_vec(),
         })
+    }
+}
+
+/// What a plan changes past what every plan gets: the variables it leaves out of its command's environment, then the
+/// ones it sets, and whether it is a plan made again that says nothing its first plan said already.
+#[derive(Clone, Copy)]
+struct Adjusted<'e> {
+    withheld: &'e [&'e str],
+    set: &'e [(&'e str, &'e str)],
+    quiet: bool,
+}
+
+impl Adjusted<'_> {
+    /// No change.
+    const NONE: Adjusted<'static> = Adjusted {
+        withheld: &[],
+        set: &[],
+        quiet: false,
+    };
+
+    /// `variables` with an inherited checked `HEAD` and tree unset, so they reach only a commit's child that is given
+    /// them, then the variables `withheld` unset and the variables `set` set.
+    fn applied(self, variables: Variables) -> Variables {
+        let variables = variables.without(STAGE_HEAD_VARIABLE).without(STAGE_TREE_VARIABLE);
+        let variables = self.withheld.iter().fold(variables, |variables, name| variables.without(name));
+        self.set.iter().fold(variables, |variables, (name, value)| variables.with(name, value))
     }
 }
 
@@ -757,7 +798,8 @@ pub(crate) fn written(program: &Path, rest: &[OsString], variables: &Variables) 
 
 /// The priority class of a command run as `slot`: high for a critical gate and a gate under a critical parent's slot;
 /// otherwise below normal, unless the gate's own class is already below normal or idle, which the command then inherits.
-fn priority(slot: Slot, console: &mut Console) -> Option<PriorityClass> {
+/// A class that cannot be read is said unless the plan is `quiet`.
+fn priority(slot: Slot, quiet: bool, console: &mut Console) -> Option<PriorityClass> {
     if slot == Slot::Critical {
         return Some(PriorityClass::High);
     }
@@ -765,9 +807,11 @@ fn priority(slot: Slot, console: &mut Console) -> Option<PriorityClass> {
         Ok(true) => None,
         Ok(false) => Some(PriorityClass::BelowNormal),
         Err(error) => {
-            console.err(&format!(
-                "gate: cannot read this gate's priority class, so the command runs below normal: {error}"
-            ));
+            if !quiet {
+                console.err(&format!(
+                    "gate: cannot read this gate's priority class, so the command runs below normal: {error}"
+                ));
+            }
             Some(PriorityClass::BelowNormal)
         }
     }
@@ -815,6 +859,9 @@ struct Run<'a> {
     /// The commit's own figures while its pre-commit stage runs on a builder ([`Run::stage`]), which the stage's call
     /// runs under in place of its remote take's; `None` at any other time.
     staging: Option<Figures>,
+    /// A commit run's forwarder hooks folder and what its stage checked, from the folder's write before the child
+    /// starts until the child's commit is checked ([`Run::check_commit`]); `None` for every other run.
+    forwarded: Option<Forwarded>,
     /// The run's first arrival in Unix epoch milliseconds, which every ticket it writes keeps.
     arrived: u64,
     /// The moment of the run's `queue` line: the moment the local `take` of a run the full remote pool sent back counts
@@ -1659,10 +1706,18 @@ enum Remotely {
     Staged(Box<RemoteOutcome>),
 }
 
+/// A commit run's forwarder hooks folder, what its stage checked, and the worktree its child commits in.
+struct Forwarded {
+    forwarders: commit::forward::Forwarders,
+    checked: Checked,
+    root: PathBuf,
+}
+
 /// How a commit goes on after its pre-commit stage on a builder ([`Run::stage`]).
 enum Staging {
-    /// It starts, under these figures.
-    Commit(Figures),
+    /// It starts, under these figures; once hooks that passed there, with what they checked or why that could not be
+    /// read.
+    Commit(Figures, Option<Result<Checked, String>>),
     /// It ended without starting, as this says.
     Ended(Ended),
 }
@@ -2183,12 +2238,7 @@ impl Run<'_> {
             match self.take_own(hold, console) {
                 Taking::Took(took, figures) => {
                     hold.took = Some(took);
-                    let figures = match stage.map(|remote| self.stage(remote, figures, console)) {
-                        None => figures,
-                        Some(Staging::Commit(figures)) => figures,
-                        Some(Staging::Ended(ended)) => return Some(ended),
-                    };
-                    return Some(self.command(plan, figures, console));
+                    return Some(self.staged_command(plan, stage, figures, console));
                 }
                 Taking::Lent(figures) => return Some(self.lent_as_it_waited(plan, hold, figures, console)),
                 Taking::Interrupted => return None,
@@ -2243,7 +2293,7 @@ impl Run<'_> {
             Remotely::Ended(ended) => Staging::Ended(ended),
             Remotely::Here => {
                 self.open_log(console);
-                Staging::Commit(figures)
+                Staging::Commit(figures, None)
             }
             Remotely::Staged(called) => {
                 self.open_log(console);
@@ -2273,7 +2323,91 @@ impl Run<'_> {
         if self.host.interrupt.is_some_and(Interrupt::is_raised) {
             return Staging::Ended(self.stage_ended(i64::from(CONTROL_C_EXIT.cast_signed()), Some(interrupted), console));
         }
-        Staging::Commit(figures)
+        Staging::Commit(figures, outcome.checked.clone())
+    }
+
+    /// Runs the command under `figures` once the run holds its slot: a commit with a `stage` first runs its pre-commit
+    /// hooks on that builder ([`Run::stage`]) and starts only as the stage says, its child pointed at the forwarder
+    /// hooks folder once the hooks passed there ([`Run::skip_hooks`]).
+    fn staged_command(&mut self, plan: Plan, stage: Option<&RemoteRun>, figures: Figures, console: &mut Console) -> Ended {
+        let Some(remote) = stage else {
+            return self.command(plan, figures, console);
+        };
+        let (plan, figures) = match self.stage(remote, figures, console) {
+            Staging::Ended(ended) => return ended,
+            Staging::Commit(figures, None) => (plan, figures),
+            Staging::Commit(figures, Some(Err(why))) => {
+                console.err(&commit::forward::no_skip_line(&why));
+                (plan, figures)
+            }
+            Staging::Commit(figures, Some(Ok(checked))) => match self.skip_hooks(plan, remote, checked, console) {
+                Ok(plan) => (plan, figures),
+                Err(ended) => return ended,
+            },
+        };
+        self.command(plan, figures, console)
+    }
+
+    /// The plan of a commit's child once its stage on `remote` passed, having `checked` what it did: the old forwarder
+    /// folders swept first ([`commit::forward::sweep`]), their failures noted in the log alone, then the real hooks
+    /// folder read and this run's forwarder folder written ([`commit::forward::skip`]), and the child planned again with
+    /// the variables that point it there. When no skip can be made, says why, and the child of `plan` runs the local
+    /// hooks again.
+    fn skip_hooks(&mut self, plan: Plan, remote: &RemoteRun, checked: Checked, console: &mut Console) -> Result<Plan, Ended> {
+        for line in commit::forward::sweep(&self.root.path, SystemTime::now()) {
+            console.note(&line);
+        }
+        let root = PathBuf::from(&remote.root);
+        let bounds = git::GitBounds::of(&self.request.test_seams);
+        let real = git::Git::find(&root)
+            .map_err(git::GitError::Failed)
+            .and_then(|found| commit::stage::real_hooks_folder(&root, &found, bounds))
+            .map_err(String::from);
+        let config_count_set = Variables::from_process().is_set("GIT_CONFIG_COUNT");
+        let owner = (self.gate.pid, self.gate.start_ms);
+        let skip = match commit::forward::skip(&self.root.path, owner, config_count_set, real, &checked) {
+            Ok(skip) => skip,
+            Err(why) => {
+                console.err(&commit::forward::no_skip_line(&why));
+                return Ok(plan);
+            }
+        };
+        let set: Vec<(&str, &str)> = skip.variables.iter().map(|(name, value)| (*name, value.as_str())).collect();
+        // The first plan said what it had to of the command's priority; this one says it no more.
+        let adjusted = Adjusted {
+            withheld: &[],
+            set: &set,
+            quiet: true,
+        };
+        let plan = self.replan_with(&plan.words, adjusted, console)?;
+        self.forwarded = Some(Forwarded {
+            forwarders: skip.forwarders,
+            checked,
+            root,
+        });
+        Ok(plan)
+    }
+
+    /// The status of a run whose command exited `exited`: for a commit run whose child was pointed at a forwarder
+    /// folder, once the commit it made is checked against what its stage checked ([`commit::forward::commit_checked`]),
+    /// a passing one is [`COMMIT_UNCHECKED`] when the commit is not the one checked or cannot be checked, its line said.
+    /// The commit is never undone, and the folder is kept for the sweep. Any other run's is `exited`.
+    fn check_commit(&mut self, exited: i64, console: &mut Console) -> i64 {
+        let Some(forwarded) = self.forwarded.take() else {
+            return exited;
+        };
+        let bounds = git::GitBounds::of(&self.request.test_seams);
+        let checked = git::Git::find(&forwarded.root)
+            .map_err(|why| commit::forward::cannot_check_line(&why))
+            .and_then(|found| commit::forward::commit_checked(&forwarded.root, &found, bounds, &forwarded.checked));
+        if let Err(line) = &checked {
+            console.err(line);
+        }
+        forwarded.forwarders.end();
+        match checked {
+            Err(_) if exited == 0 => COMMIT_UNCHECKED,
+            _ => exited,
+        }
     }
 
     /// Ends a commit whose stage's command ran on `host` but whose result never came back, saying so: failed, or as an
@@ -3041,7 +3175,12 @@ impl Run<'_> {
             nesting,
         };
         let withheld: &[&str] = if nesting.covering().is_none() { &[SLOT_HELD_VARIABLE] } else { &[] };
-        let planned = Plan::prepare_without(self.request, &words, &at, withheld, console)
+        let adjusted = Adjusted {
+            withheld,
+            set: &[],
+            quiet: false,
+        };
+        let planned = Plan::prepare_without(self.request, &words, &at, adjusted, console)
             .map_err(|NotRun { line, .. }| line.strip_prefix("gate: ").map(str::to_owned).unwrap_or(line))?;
         planned.launch
     }
@@ -3745,12 +3884,17 @@ impl Run<'_> {
     /// A plan of `words`, which a run here runs in place of the command as given; else how the run ended when they
     /// cannot be planned.
     fn replan(&self, words: &[OsString], console: &mut Console) -> Result<Plan, Ended> {
+        self.replan_with(words, Adjusted::NONE, console)
+    }
+
+    /// [`Run::replan`], with the command's environment `adjusted`.
+    fn replan_with(&self, words: &[OsString], adjusted: Adjusted<'_>, console: &mut Console) -> Result<Plan, Ended> {
         let at = Where {
             root: self.root,
             gate: &self.gate,
             nesting: self.nesting,
         };
-        Plan::prepare(self.request, words, &at, console).map_err(|NotRun { status, line }| {
+        Plan::prepare_without(self.request, words, &at, adjusted, console).map_err(|NotRun { status, line }| {
             console.err(&line);
             Ended {
                 status: i64::from(status),
@@ -4460,13 +4604,14 @@ impl Run<'_> {
     fn ended(&mut self, outcome: &Outcome<'_>, unscanned: bool, diagnostics: &[String], started: Started<'_>, console: &mut Console) -> Ended {
         self.end_streams(Some(started.job), console);
         self.log_load(When::End, Some(started.job), console);
+        let exited = self.check_commit(outcome.exited, console);
         let timing = self.without_nested_cores(outcome.timing, console);
         let passing = Passing {
             pass: Pass::Here(timing),
             ceiling: started.figures.ceiling,
             stale: &[],
         };
-        match self.verdict(outcome.exited, Some(passing), unscanned, diagnostics, console) {
+        match self.verdict(exited, Some(passing), unscanned, diagnostics, console) {
             Ok(status) => Ended {
                 status,
                 facts: Some(RunFacts {
@@ -4475,7 +4620,7 @@ impl Run<'_> {
                     avg_cores: timing.cores.map(|cores| cores.avg),
                     peak_cores: timing.cores.map(|cores| cores.peak),
                     free_cores: timing.cores.map(|cores| cores.free),
-                    verdict: Verdict::of(outcome.kill, outcome.exited, status),
+                    verdict: Verdict::of(outcome.kill, exited, status),
                 }),
             },
             Err(problem) => self.gate_failed(&problem, Some(started), console),
@@ -5542,6 +5687,7 @@ mod tests {
         stop, takes_own_slot,
     };
     use crate::console::Console;
+    use crate::environment::Variables;
     use crate::escaped::{Found, Look, Reached, Recorded};
     use crate::nesting::{Nesting, Parent};
     use crate::remote::drain::Drain;
@@ -5551,6 +5697,36 @@ mod tests {
     use gate_state::v1::{Claim, ClaimKind};
     use jiff::Timestamp;
     use serde_json::{Map, Value};
+
+    #[test]
+    fn every_plan_unsets_an_inherited_checked_head_and_tree_and_only_a_set_one_reaches_the_command() {
+        let inherited = Variables::from_process()
+            .with("gate_stage_head", "inherited")
+            .with("GATE_STAGE_TREE", "inherited")
+            .with("KEPT", "1");
+
+        let plain = super::Adjusted::NONE.applied(inherited);
+        let given = super::Adjusted {
+            withheld: &["KEPT"],
+            set: &[("GATE_STAGE_HEAD", "h"), ("GATE_STAGE_TREE", "t")],
+            quiet: false,
+        }
+        .applied(Variables::from_process().with("GATE_STAGE_HEAD", "inherited").with("KEPT", "1"));
+
+        assert_eq!(
+            (plain.get("GATE_STAGE_HEAD"), plain.get("GATE_STAGE_TREE")),
+            (None, None),
+            "inherited ones are unset"
+        );
+        assert_eq!(plain.get("KEPT").and_then(|value| value.to_str()), Some("1"), "others pass through");
+        assert_eq!(
+            given.get("GATE_STAGE_HEAD").and_then(|value| value.to_str()),
+            Some("h"),
+            "a set one replaces it"
+        );
+        assert_eq!(given.get("GATE_STAGE_TREE").and_then(|value| value.to_str()), Some("t"));
+        assert!(!given.is_set("KEPT"), "a withheld one is unset");
+    }
 
     /// The waits after a routed run's call ([`super::after_waits`]), driven by a client of the unit tests' own.
     #[cfg(feature = "test-seams")]
