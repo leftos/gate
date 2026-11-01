@@ -94,6 +94,9 @@ enum NotCheckedOut {
     Refused(String),
     /// The run's LFS scratch folder could not be made, for this reason: refused `lfs`, so the PC runs it.
     NoScratch(String),
+    /// A commit stage's `Head` commit is not in its repo after the fetch, as this line says ([`no_head`]): refused
+    /// `layout`, so the PC runs the stage's hooks itself.
+    NoHead(String),
 }
 
 impl From<Failed> for NotCheckedOut {
@@ -530,18 +533,20 @@ fn sent_matched(request: &Request<'_>, held: &File, beat: &Beat<'_>, console: &m
 /// The main repo and the siblings of a run in the work folder `work`: with no `Pair`, the one repo of `bare` checked out
 /// at `snapshot` in `work` itself; with one, the main repo in `{work}\{leaf}` and each sibling in `{work}\{name}` with
 /// its own bare repository and its commit from `SiblingSnapshots`. Each repo's default branch is the main repo's `Base`
-/// or the sibling's from `SiblingBases`. Else the usage line.
+/// or the sibling's from `SiblingBases`. Only the main repo is a commit stage's, with the PC's `HEAD` from the payload's
+/// `Head`, when its `CommitStage` says so. Else the usage line.
 fn repos<'a>(payload: &'a Payload, work: &str, bare: &str, snapshot: &'a str) -> Result<(Repo<'a>, Vec<Repo<'a>>), String> {
     let base = payload.base()?;
+    let head = payload.commit_stage_head()?;
     let Some(pair) = payload.pair()? else {
         let (tree, _) = trees(work, None, PathForm::Windows);
-        return Ok((Repo::new(None, tree, bare, snapshot).based(base), Vec::new()));
+        return Ok((Repo::new(None, tree, bare, snapshot).based(base).staged(head), Vec::new()));
     };
     let commits = payload.sibling_snapshots(&pair)?;
     let bases = payload.sibling_bases(&pair)?;
     let names: Vec<&str> = pair.siblings().iter().map(PairSibling::name).collect();
     let (main_tree, sibling_trees) = trees(work, Some((pair.leaf(), &names)), PathForm::Windows);
-    let main = Repo::new(Some(pair.leaf()), main_tree, bare, snapshot).based(base);
+    let main = Repo::new(Some(pair.leaf()), main_tree, bare, snapshot).based(base).staged(head);
     let siblings = pair
         .siblings()
         .iter()
@@ -556,7 +561,9 @@ fn repos<'a>(payload: &'a Payload, work: &str, bare: &str, snapshot: &'a str) ->
 /// One repo of a run, made once as the payload is read: its name on a pair run, its tree, the bare repository its
 /// snapshot is fetched from and its back commit pushed to, the commit checked out, and the PC's default branch, whose
 /// `refs/gate-base/<key>` the fetch names `refs/remotes/origin/<base>` in the tree, `None` for a repo the PC sent none
-/// of. Every git call in its tree names the tree's own `.git` and the tree ([`Repo::at`]), so no `core.worktree` and no
+/// of, and on a commit stage's repo the PC's `HEAD` commit, fetched with the snapshot ([`WorkGit::fetched`]), to which
+/// its `HEAD` is soft-reset after the checkout ([`WorkGit::at_pc_head`]), its back commit made on the snapshot
+/// ([`Repo::back_parent`]); `None` on any other repo. Every git call in its tree names the tree's own `.git` and the tree ([`Repo::at`]), so no `core.worktree` and no
 /// repository above it is followed.
 struct Repo<'a> {
     name: Option<String>,
@@ -564,6 +571,7 @@ struct Repo<'a> {
     bare: String,
     snapshot: &'a str,
     base: Option<&'a str>,
+    head: Option<&'a str>,
     git_dir: String,
     work_tree: String,
 }
@@ -578,12 +586,24 @@ impl<'a> Repo<'a> {
             bare: bare.to_owned(),
             snapshot,
             base: None,
+            head: None,
         }
     }
 
     /// This repo with the default branch `base`.
     fn based(self, base: Option<&'a str>) -> Repo<'a> {
         Repo { base, ..self }
+    }
+
+    /// This repo as a commit stage's on the PC's `HEAD` commit `head`, or as no commit stage's when `None`.
+    fn staged(self, head: Option<&'a str>) -> Repo<'a> {
+        Repo { head, ..self }
+    }
+
+    /// What the back commit is made on and compared with: the snapshot on a commit stage's repo, whose `HEAD` is the
+    /// PC's, so the PC's sync-back finds it made from the snapshot; else `HEAD`.
+    fn back_parent(&self) -> &str {
+        if self.head.is_some() { self.snapshot } else { "HEAD" }
     }
 
     /// The options that point git at this repo's tree.
@@ -1485,6 +1505,7 @@ fn ready(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Bea
         Err(NotCheckedOut::Failed(failed)) => return Err(ended_before(said(console, &failed), request, beat, console)),
         Err(NotCheckedOut::Refused(why)) => return Err(lfs_refused(request, &lfs::not_the_snapshots(request.key, &why), beat, console)),
         Err(NotCheckedOut::NoScratch(why)) => return Err(lfs_refused(request, &lfs::no_scratch_line(&why), beat, console)),
+        Err(NotCheckedOut::NoHead(line)) => return Err(head_refused(request, &line, beat, console)),
     };
     // Released before the command, which may change the work folder as it likes.
     drop(held);
@@ -1504,6 +1525,25 @@ fn lfs_refused(request: &Request<'_>, line: &str, beat: &Beat<'_>, console: &mut
     stamping::protocol(console, &lfs::refused_line(request.nonce));
     stamping::err(console, line);
     REFUSED_STATUS
+}
+
+/// Refuses a commit stage's run `layout` with `line`, its `Head` not sent ([`no_head`]): its refusal tag, then the line,
+/// said together under the box's output lock, so the PC runs the stage's hooks itself; 75.
+fn head_refused(request: &Request<'_>, line: &str, beat: &Beat<'_>, console: &mut Console) -> u32 {
+    let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
+    stamping::protocol(console, &refused_line(request.nonce, Refusal::Layout));
+    stamping::err(console, line);
+    REFUSED_STATUS
+}
+
+/// The line of a commit stage's `repo` whose PC's `HEAD` commit `head` is not in its repository after the fetch, the
+/// commit shown by its first 8 digits, the repo named on a pair run as [`missing_snapshot`] names it.
+fn no_head(repo: &Repo<'_>, head: &str) -> String {
+    let short = head.get(..8).unwrap_or(head);
+    match &repo.name {
+        None => format!("gate: remote commit stage: the PC's HEAD {short} was not sent"),
+        Some(name) => format!("gate: remote commit stage: the PC's HEAD {short} of {name} was not sent"),
+    }
 }
 
 /// The run after its checkout and up to its command: the subfolder found, the repo's dotnet tools restored and, for a
@@ -3547,26 +3587,55 @@ impl WorkGit {
         if request.siblings.is_empty() {
             self.clear_back_ref(request, repo, console)?;
         }
+        if let Some(head) = repo.head {
+            self.at_pc_head(request, repo, head, console)?;
+        }
         Ok(())
+    }
+
+    /// A commit stage's `repo` with its `HEAD` moved to the PC's commit `head`, which the fetch found
+    /// ([`WorkGit::fetched`]), the index and the tree left as the snapshot's (`reset --soft`), so a command sees what
+    /// the PC staged as staged on the PC's `HEAD`; then the fetched `refs/gate-head/<key>` deleted from the tree's
+    /// repository, `HEAD` keeping the commit reachable, so no PC head of this run stays behind. Else a git step's failure.
+    fn at_pc_head(&self, request: &Request<'_>, repo: &Repo<'_>, head: &str, console: &mut Console) -> Result<(), Failed> {
+        self.step("reset", GitClass::Short, repo, &["reset", "-q", "--soft", head], console)?;
+        let fetched = format!("refs/gate-head/{}", request.key);
+        self.step("head ref delete", GitClass::Short, repo, &["update-ref", "-d", &fetched], console)
     }
 
     /// The snapshot of `repo` fetched from its bare repository at `refs/gate/<key>`, and its commit found; else the
     /// failure, the box's own line for a commit the repository lacks after the fetch. A repo with a default branch has
     /// `refs/gate-base/<key>` fetched in the same call as `refs/remotes/origin/<base>`, so the tree's `origin/<base>`
-    /// names the PC's.
-    fn fetched(&self, request: &Request<'_>, repo: &Repo<'_>, console: &mut Console) -> Result<(), Failed> {
+    /// names the PC's. A commit stage's repo has `refs/gate-head/<key>` fetched in it too, under the same name, and its
+    /// `Head` commit found: one the repository lacks after the fetch refuses the run `layout` ([`no_head`]), whatever
+    /// the ref names, as only the `Head` commit is ever read.
+    fn fetched(&self, request: &Request<'_>, repo: &Repo<'_>, console: &mut Console) -> Result<(), NotCheckedOut> {
         let refname = format!("refs/gate/{}", request.key);
         let base = repo
             .base
             .map(|name| format!("+refs/gate-base/{}:refs/remotes/origin/{name}", request.key));
+        let head = repo
+            .head
+            .map(|_| format!("+refs/gate-head/{key}:refs/gate-head/{key}", key = request.key));
         let mut args = vec!["fetch", "-q", &repo.bare, &refname];
         args.extend(base.as_deref());
+        args.extend(head.as_deref());
         self.step("fetch", GitClass::Long, repo, &args, console)?;
-        let commit = format!("{}^{{commit}}", repo.snapshot);
+        if !self.has_commit(repo, repo.snapshot, console)? {
+            return Err(missing_snapshot(repo).into());
+        }
+        match repo.head {
+            Some(head) if !self.has_commit(repo, head, console)? => Err(NotCheckedOut::NoHead(no_head(repo, head))),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether the repository of `repo` holds the commit `sha` (`cat-file -e`); else the step's failure.
+    fn has_commit(&self, repo: &Repo<'_>, sha: &str, console: &mut Console) -> Result<bool, Failed> {
+        let commit = format!("{sha}^{{commit}}");
         let step = repo.step("cat-file");
         match self.quiet(repo, &step, &["cat-file", "-e", &commit], console) {
-            Ok(0) => Ok(()),
-            Ok(_) => Err(missing_snapshot(repo)),
+            Ok(code) => Ok(code == 0),
             Err(failure) => Err(failure.of_step(&step)),
         }
     }
@@ -3718,7 +3787,8 @@ impl WorkGit {
         back.status(("push", GitClass::LongBare), &["push", "-q", &repo.bare, &target], false, console)
     }
 
-    /// The tree the command left in `repo`, committed on `HEAD`, unpushed; nothing when the tree is unchanged. It
+    /// The tree the command left in `repo`, committed on its back parent ([`Repo::back_parent`]), unpushed; nothing when
+    /// the tree is the back parent's. It
     /// starts from a copy of the repo's index, which the checkout just refreshed, so `add -A` skips every unchanged
     /// file; a copy that cannot be removed afterwards is said and fails nothing. The run's one `Index` file is used by
     /// each repo in turn. The commit, `None` when the tree is unchanged; else why it failed.
@@ -3758,20 +3828,22 @@ impl WorkGit {
             _ => {}
         }
         let tree = tree?;
-        if tree == back.line(("rev-parse", GitClass::Short), &["rev-parse", "HEAD^{tree}"], false, console)? {
+        let parent = repo.back_parent();
+        let parent_tree = format!("{parent}^{{tree}}");
+        if tree == back.line(("rev-parse", GitClass::Short), &["rev-parse", &parent_tree], false, console)? {
             return Ok(None);
         }
         let commit = back.line(
             ("commit-tree", GitClass::Short),
-            &["commit-tree", &tree, "-p", "HEAD", "-m", "gate-remote back"],
+            &["commit-tree", &tree, "-p", parent, "-m", "gate-remote back"],
             false,
             console,
         )?;
         Ok(Some(commit))
     }
 
-    /// The `/`-separated paths the main repo's back commit `commit` changes against `HEAD`; else why they could not be
-    /// read.
+    /// The `/`-separated paths the main repo's back commit `commit` changes against its back parent
+    /// ([`Repo::back_parent`]); else why they could not be read.
     fn back_paths(&self, request: &Request<'_>, commit: &str, console: &mut Console) -> Result<Vec<String>, BackFailed> {
         let program = self
             .git
@@ -3867,11 +3939,12 @@ impl BackGit<'_> {
             .ok_or_else(|| BackFailed::Step(format!("{} printed nothing", self.repo.step(step))))
     }
 
-    /// The `/`-separated paths `commit` changes against `HEAD`; else why they could not be read.
+    /// The `/`-separated paths `commit` changes against the repo's back parent ([`Repo::back_parent`]); else why they
+    /// could not be read.
     fn changed(&self, commit: &str, console: &mut Console) -> Result<Vec<String>, BackFailed> {
         let stdout = self.stdout(
             ("diff-tree", GitClass::Short),
-            &["diff-tree", "--name-only", "-r", "-z", "HEAD", commit],
+            &["diff-tree", "--name-only", "-r", "-z", self.repo.back_parent(), commit],
             false,
             console,
         )?;

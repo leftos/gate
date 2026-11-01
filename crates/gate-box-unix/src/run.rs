@@ -201,7 +201,7 @@ pub struct Request<'p> {
 impl<'p> Request<'p> {
     /// Reads `payload` in the order the Windows box reads it, each key checked as it does, the outputs asked for
     /// ([`Asked::new`]) read once the output folder is; then notes the first thing asking for what this builder does not
-    /// build: `Desktop`, a warm-up's `WarmCommands`, `EngineEnv`, `UnrealVersion`, `SentDigest` or `LfsDigest`; then,
+    /// build: `Desktop`, `CommitStage`, a warm-up's `WarmCommands`, `EngineEnv`, `UnrealVersion`, `SentDigest` or `LfsDigest`; then,
     /// last, the repos ([`repos`]), a sibling pair as `gate-wire` checks it. A work root holding a `:` is refused just
     /// after the work folder is read ([`work_layout`]).
     ///
@@ -241,10 +241,13 @@ impl<'p> Request<'p> {
         let inputs_digest = payload.inputs_digest()?;
         let sent = payload.sent_digest()?.is_some();
         let lfs = payload.lfs_digest()?.is_some();
+        // Just before the repos, where the Windows box reads it beside the repos' default branch.
+        let commit_stage = payload.commit_stage_head()?.is_some();
         // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
         let (main, siblings) = repos(payload, work, bare, snapshot)?;
         let unbuilt = [
             (desktop, Refusal::Desktop, "Desktop"),
+            (commit_stage, Refusal::Layout, "CommitStage"),
             (warm, Refusal::Layout, "WarmCommands"),
             (engine_env, Refusal::Layout, "EngineEnv"),
             (unreal, Refusal::Layout, "UnrealVersion"),
@@ -3796,6 +3799,13 @@ mod tests {
         let case = Case::new("desktop");
         let desktop = json!({ "Desktop": true, "DesktopWait": 60 });
         assert_refused(&case, &desktop, Refusal::Desktop, "gate: remote Desktop is not built on this builder");
+    }
+
+    #[test]
+    fn a_commit_stage_run_is_refused_layout() {
+        let case = Case::new("commit-stage");
+        let stage = json!({ "CommitStage": true, "Head": "c".repeat(40) });
+        assert_refused(&case, &stage, Refusal::Layout, &unbuilt_layout("CommitStage"));
     }
 
     /// The `inputs` refusal of `why`: its tag, then the inputs line.

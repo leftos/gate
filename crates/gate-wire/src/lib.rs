@@ -497,6 +497,29 @@ impl Payload {
         }
     }
 
+    /// Whether the run is a commit's pre-commit hook stage, `CommitStage`: true or false, false when the key is absent
+    /// or null; else the usage line saying it is not true or false.
+    pub fn commit_stage(&self) -> Result<bool, String> {
+        match self.object.get("CommitStage") {
+            None | Some(Value::Null) => Ok(false),
+            Some(Value::Bool(commit_stage)) => Ok(*commit_stage),
+            Some(_) => Err("gate: box payload CommitStage is not true or false".to_owned()),
+        }
+    }
+
+    /// The PC's `HEAD` commit of a commit stage's run, its `Head`, a 40-hex commit sha; `None` on a run that is not a
+    /// commit stage ([`Payload::commit_stage`]), whatever its `Head` says. Else the usage line: `CommitStage` that is not
+    /// true or false, a commit stage without `Head`, or a `Head` that is not a commit sha.
+    pub fn commit_stage_head(&self) -> Result<Option<&str>, String> {
+        if !self.commit_stage()? {
+            return Ok(None);
+        }
+        match self.object.get("Head") {
+            None | Some(Value::Null) => Err("gate: box payload CommitStage needs Head".to_owned()),
+            head => commit(head).map(Some).map_err(|shown| not_a_snapshot("Head", &shown)),
+        }
+    }
+
     /// The run's drain session id, `Session`: 1 to [`MOST_SESSION_CHARS`] ASCII letters, digits, `_` and `-`; `None`
     /// when the key is absent or null, as a PC older than the drain sends it. Else the usage line, the value shown with
     /// its control characters escaped.
@@ -3257,6 +3280,58 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn commit_stage_is_true_or_false_and_false_when_absent() {
+        let stage = |json: serde_json::Value| decoded(&json.to_string()).and_then(|payload| payload.commit_stage());
+        assert_eq!(stage(json!({})), Ok(false), "absent");
+        assert_eq!(stage(json!({ "CommitStage": null })), Ok(false), "null");
+        assert_eq!(stage(json!({ "CommitStage": true })), Ok(true));
+        assert_eq!(stage(json!({ "CommitStage": false })), Ok(false));
+        for bad in [json!("true"), json!(1), json!([true])] {
+            assert_eq!(
+                stage(json!({ "CommitStage": bad })),
+                Err("gate: box payload CommitStage is not true or false".to_owned()),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_commit_stage_s_head_is_a_commit_sha_and_no_other_run_reads_one() {
+        let head =
+            |json: serde_json::Value| decoded(&json.to_string()).and_then(|payload| payload.commit_stage_head().map(|head| head.map(str::to_owned)));
+        let sha = "c".repeat(40);
+        assert_eq!(head(json!({ "CommitStage": true, "Head": sha })), Ok(Some(sha.clone())));
+        assert_eq!(head(json!({ "Head": sha })), Ok(None), "no commit stage");
+        assert_eq!(
+            head(json!({ "CommitStage": false, "Head": "not a sha" })),
+            Ok(None),
+            "not read off a commit stage"
+        );
+        for lacking in [json!({ "CommitStage": true }), json!({ "CommitStage": true, "Head": null })] {
+            assert_eq!(
+                head(lacking.clone()),
+                Err("gate: box payload CommitStage needs Head".to_owned()),
+                "{lacking}"
+            );
+        }
+        for (bad, shown) in [
+            (json!("C".repeat(40)), "C".repeat(40)),
+            (json!("c".repeat(39)), "c".repeat(39)),
+            (json!(1), "1".to_owned()),
+        ] {
+            assert_eq!(
+                head(json!({ "CommitStage": true, "Head": bad })),
+                Err(format!("gate: remote run payload's Head '{shown}' is not a 40-hex commit sha")),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            head(json!({ "CommitStage": "yes", "Head": sha })),
+            Err("gate: box payload CommitStage is not true or false".to_owned())
+        );
     }
 
     #[test]

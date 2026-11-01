@@ -5169,6 +5169,197 @@ fn box_run_a_cmd_target_runs_through_cmd_and_what_it_wrote_is_committed_back() {
     assert_eq!(git(&[&bare, "show", "refs/gate-back/k:new.txt"]), "x");
 }
 
+/// Readies a commit-stage run of `payload` as the PC sends one: commits `head` in the case's source repository as the
+/// PC's HEAD, then stages `staged` over it ([`staged_snapshot`]). The PC's HEAD and the snapshot.
+fn commit_stage_snapshot(case: &Case, payload: &mut Value, head: &[(&str, &str)], staged: &[(&str, &str)]) -> (String, String) {
+    let head_commit = snapshot(case, payload, head);
+    let snapshot_commit = staged_snapshot(case, payload, &head_commit, staged);
+    (head_commit, snapshot_commit)
+}
+
+/// Makes the main repo of `payload` a commit stage's on the PC's HEAD `head_commit`, the source repository's HEAD, as
+/// the PC sends one: pushes it to `refs/gate-head/<key>`, stages `staged` over it and pushes a parentless commit of the
+/// staged tree to `refs/gate/<key>`, recorded as the payload's `Snapshot`, with `CommitStage` true and `head_commit`
+/// as its `Head`. The snapshot.
+fn staged_snapshot(case: &Case, payload: &mut Value, head_commit: &str, staged: &[(&str, &str)]) -> String {
+    let source = case.folder().join("source");
+    let source = source.to_str().expect("the case folder is Unicode");
+    let (bare, key) = (field(payload, "Bare").to_owned(), field(payload, "Key").to_owned());
+    git(&["-C", source, "push", "-q", "--force", &bare, &format!("HEAD:refs/gate-head/{key}")]);
+    for (name, content) in staged {
+        fs::write(Path::new(source).join(name), content).expect("a staged file can be written");
+    }
+    git(&["-C", source, "add", "-A"]);
+    let tree = git(&["-C", source, "write-tree"]);
+    let mut commit_tree = vec!["-C", source];
+    commit_tree.extend(SUITE_IDENTITY);
+    commit_tree.extend(["commit-tree", &tree, "-m", "snapshot"]);
+    let snapshot_commit = git(&commit_tree);
+    git(&[
+        "-C",
+        source,
+        "push",
+        "-q",
+        "--force",
+        &bare,
+        &format!("{snapshot_commit}:refs/gate/{key}"),
+    ]);
+    payload["Snapshot"] = json!(snapshot_commit);
+    payload["CommitStage"] = json!(true);
+    payload["Head"] = json!(head_commit);
+    snapshot_commit
+}
+
+/// The identity a suite commit is made with.
+const SUITE_IDENTITY: [&str; 4] = ["-c", "user.name=gate suite", "-c", "user.email=suite@example.invalid"];
+
+/// The `refs/gate-head` refs the repository of the tree `tree` holds, one per line; empty when it holds none.
+fn gate_head_refs(tree: &str) -> String {
+    git(&["-C", tree, "for-each-ref", "refs/gate-head"])
+}
+
+#[test]
+fn a_commit_stage_run_sees_the_pc_s_head_with_the_snapshot_staged() {
+    let case = Case::new("box_run_commit_stage_head");
+    let mut payload = box_payload(&case, "k", &[r".\stage.cmd"]);
+    let head = [
+        ("stage.cmd", "@git rev-parse HEAD\r\n@git diff --cached --name-only\r\n"),
+        ("a.txt", "a\n"),
+    ];
+    let staged = [("a.txt", "b\n"), ("s.txt", "s\n")];
+    let (head, _) = commit_stage_snapshot(&case, &mut payload, &head, &staged);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout,
+        format!("{head}\na.txt\ns.txt\n"),
+        "HEAD is the PC's, the staged names are the snapshot's"
+    );
+    assert_eq!(gate_head_refs(field(&payload, "Work")), "", "no PC head ref stays in the tree");
+}
+
+#[test]
+fn a_commit_stage_run_resets_to_its_head_whatever_the_head_ref_names() {
+    let case = Case::new("box_run_commit_stage_moved_ref");
+    let mut payload = box_payload(&case, "k", &[r".\stage.cmd"]);
+    let head = [("stage.cmd", "@git rev-parse HEAD\r\n"), ("a.txt", "a\n")];
+    let (head, _) = commit_stage_snapshot(&case, &mut payload, &head, &[("a.txt", "b\n")]);
+    let source = case.folder().join("source");
+    let source = source.to_str().expect("the case folder is Unicode");
+    let mut later = vec!["-C", source];
+    later.extend(SUITE_IDENTITY);
+    later.extend(["commit", "-q", "--allow-empty", "-m", "later"]);
+    git(&later);
+    let moved = format!("HEAD:refs/gate-head/{}", field(&payload, "Key"));
+    git(&["-C", source, "push", "-q", "--force", field(&payload, "Bare"), &moved]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, format!("{head}\n"), "HEAD is the payload's Head, not the ref's later tip");
+    assert_eq!(gate_head_refs(field(&payload, "Work")), "", "no PC head ref stays in the tree");
+}
+
+#[test]
+fn a_commit_stage_run_s_back_commit_is_parented_on_the_snapshot() {
+    let case = Case::new("box_run_commit_stage_back");
+    let mut payload = box_payload(&case, "k", &[r".\stage.cmd"]);
+    let head = [("stage.cmd", "@echo changed>s.txt\r\n@git add s.txt\r\n"), ("a.txt", "a\n")];
+    let (_, snapshot) = commit_stage_snapshot(&case, &mut payload, &head, &[("s.txt", "s\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let bare = format!("--git-dir={}", field(&payload, "Bare"));
+    assert_eq!(
+        git(&[&bare, "rev-parse", "refs/gate-back/k^@"]),
+        snapshot,
+        "the snapshot is the back commit's only parent"
+    );
+    assert_eq!(git(&[&bare, "show", "refs/gate-back/k:s.txt"]), "changed");
+}
+
+#[test]
+fn a_commit_stage_run_that_changes_nothing_leaves_no_back_commit() {
+    let case = Case::new("box_run_commit_stage_unchanged");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "exit", "0"]);
+    commit_stage_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[("a.txt", "b\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        !has_ref(&payload, "refs/gate-back/k"),
+        "a tree the command left as the snapshot gets no back commit"
+    );
+}
+
+#[test]
+fn a_commit_stage_run_whose_head_commit_was_not_sent_is_refused_layout_before_its_command() {
+    let case = Case::new("box_run_commit_stage_no_head");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    commit_stage_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[("a.txt", "b\n")]);
+    payload["Head"] = json!("d".repeat(40));
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "the command never ran");
+    assert_eq!(
+        after_checkout_start(&payload, &outcome.stderr),
+        format!(
+            "{}\ngate: remote commit stage: the PC's HEAD dddddddd was not sent\n",
+            refused_line(&payload, "layout")
+        )
+    );
+    assert!(!has_ref(&payload, "refs/gate-back/k"), "no back commit");
+}
+
+#[test]
+fn a_commit_stage_pair_run_resets_only_the_main_repo() {
+    let case = Case::new("box_run_commit_stage_pair");
+    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "exit", "0"]);
+    let lib: &[(&str, &str)] = &[("b.txt", "b\n")];
+    let commits = pair_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[("lib", lib)]);
+    staged_snapshot(&case, &mut payload, &commits[0], &[("a.txt", "b\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let app = pair_tree(&payload, "app");
+    assert_eq!(git(&["-C", &app, "rev-parse", "HEAD"]), commits[0], "the main repo's HEAD is the PC's");
+    assert_eq!(
+        git(&["-C", &pair_tree(&payload, "lib"), "rev-parse", "HEAD"]),
+        commits[1],
+        "the sibling's HEAD stays its snapshot"
+    );
+    assert_eq!(gate_head_refs(&app), "", "no PC head ref stays in the main repo's tree");
+}
+
+#[test]
+fn a_run_without_commit_stage_still_parents_its_back_commit_on_head() {
+    let case = Case::new("box_run_no_commit_stage_back");
+    let mut payload = box_payload(&case, "k", &[r".\move.cmd"]);
+    let commit = "@git -c user.name=suite -c user.email=suite@example.invalid -c commit.gpgsign=false commit -q --no-verify --allow-empty -m moved";
+    let script = format!("{commit}\r\n@echo x>new.txt\r\n");
+    let snapshot = snapshot(&case, &mut payload, &[("move.cmd", &script)]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let moved = git(&["-C", field(&payload, "Work"), "rev-parse", "HEAD"]);
+    assert_ne!(moved, snapshot, "the command moved HEAD");
+    let bare = format!("--git-dir={}", field(&payload, "Bare"));
+    assert_eq!(
+        git(&[&bare, "rev-parse", "refs/gate-back/k^@"]),
+        moved,
+        "the back commit's only parent is HEAD"
+    );
+    assert_eq!(git(&[&bare, "show", "refs/gate-back/k:new.txt"]), "x");
+}
+
 #[test]
 fn box_run_refuses_a_batch_word_cmd_would_expand() {
     let case = Case::new("box_run_batch_refusal");

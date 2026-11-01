@@ -3548,7 +3548,7 @@ A routed run therefore moves to one long-lived connection carrying every verb, `
 
 The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`.
 
-A `run` payload also holds `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, the optional `FailureOutputs` (a list of globs read like `Outputs`; an older box ignores it), `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, `SentDigest`, `LfsDigest`, `GodotVersion`, `EngineEnv` and `CrossBuild` (a macOS builder's key: an object of `Rid` and `Words`, with `Outputs`; [The Unix box](#the-unix-box)).
+A `run` payload also holds `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, the optional `FailureOutputs` (a list of globs read like `Outputs`; an older box ignores it), `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, `SentDigest`, `LfsDigest`, `GodotVersion`, `EngineEnv`, `CrossBuild` (a macOS builder's key: an object of `Rid` and `Words`, with `Outputs`; [The Unix box](#the-unix-box)) and the commit stage's `CommitStage` and `Head` (below).
 
 An `outputs` payload also holds `Name`.
 
@@ -3573,6 +3573,8 @@ Unknown keys are ignored, and `Outputs`, `OutputsFull` and `OutputFolder`, which
 A `run` payload may also hold `Desktop` (true or false, false when absent or null, else `gate: box payload Desktop is not true or false` and exit 2) and `DesktopWait` (whole seconds, 1 to 2147483647, else `gate: box payload DesktopWait is not a whole number of seconds` and exit 2), which together ask for a desktop run, the command on the builder's logged-on desktop (The desktop run, below).
 
 A warm-up payload with `Desktop` true is refused with `gate: box payload asks a warm-up for the desktop` and exit 2.
+
+A `run` payload may also hold `CommitStage` (true or false, false when absent or null, else `gate: box payload CommitStage is not true or false` and exit 2), which asks for a commit stage: a gated commit's pre-commit hooks run as one routed run (GATE-634). With it true the payload needs `Head`, the PC's `HEAD` commit, 40 lowercase hex characters, which the box reads only then: a `Head` missing or null is refused with `gate: box payload CommitStage needs Head` and exit 2, and one that is not a commit sha with `gate: remote run payload's Head '<value>' is not a 40-hex commit sha` and exit 2. The PC does not send these keys yet. What the box does for a commit stage is in the run's checkout and back commit, below.
 
 For `run` the payload also needs a `Snapshot` key: exactly 40 lowercase hex characters, the commit the run checks out. Anything else is refused before the lock and the checkout with `gate: remote run payload's Snapshot '<value>' is not a 40-hex commit sha` and exit 2.
 
@@ -3686,7 +3688,7 @@ Built verbs:
 
   On a pair run a step's line names its repo after the step: `gate: remote git init --bare failed for <leaf|sibling>` (status `n` and message forms as above), `gate: remote git init failed for <name>`, `gate: remote git remote add failed for <name>`, `gate: remote git config core.autocrlf failed for <name> (status <n>)`; a run of one repo says them as above.
 
-  Every git step the box runs has a bound: 5 minutes for a step that reads or writes refs, config or a listing (`init`, `config`, `remote add`, `cat-file`, `grep`, `check-ignore`, `write-tree`, `commit-tree`, `rev-parse`, `diff-tree`, `update-ref`, the LFS listing), 30 minutes for one that moves content (`fetch`, `checkout`, `lfs checkout`, `clean`, `add -A`, `push`).
+  Every git step the box runs has a bound: 5 minutes for a step that reads or writes refs, config or a listing (`init`, `config`, `remote add`, `cat-file`, `grep`, `check-ignore`, `write-tree`, `commit-tree`, `rev-parse`, `diff-tree`, `update-ref`, `reset`, the LFS listing), 30 minutes for one that moves content (`fetch`, `checkout`, `lfs checkout`, `clean`, `add -A`, `push`).
 
   A git that does not answer in time is ended with its process tree and the step says `gate: remote <step> failed: git did not answer within <n> s` and exits 1 (a sync-back step says it in the `gate: remote sync-back failed: <message>` form, after the command). A git that cannot be waited on says `gate: remote <step> failed: cannot wait for git: <error>`.
 
@@ -3959,7 +3961,7 @@ Built verbs:
 
   Otherwise the line is git's own `gate: remote checkout failed (status <n>)`.
 
-  The steps are the layout, fetch, the commit probe, checkout, clean and the back ref reset (each of the three git steps once per repo on a pair run, the main repo first), the dotnet tool restore, the package restore (pnpm, bun or npm), then the command, then the sync-back. A failing step prints `gate: remote <fetch|checkout|clean|back ref reset> failed (status <n>)` and exits `n`.
+  The steps are the layout, fetch, the commit probe, checkout, clean and the back ref reset (each of the three git steps once per repo on a pair run, the main repo first), the dotnet tool restore, the package restore (pnpm, bun or npm), then the command, then the sync-back. A failing step prints `gate: remote <fetch|checkout|clean|back ref reset|reset|head ref delete> failed (status <n>)` and exits `n`.
 
   The clean is `git clean -fdq`, with no `-x`, so a work folder keeps its ignored files between runs; a Godot project's `.godot` folder is one, so it persists from one routed run to the next.
 
@@ -3970,6 +3972,10 @@ Built verbs:
   When the payload names a base for a repo (`Base`, or its `SiblingBases` entry), the same `git fetch` also takes `+refs/gate-base/<key>:refs/remotes/origin/<name>`, so `origin/<name>` resolves in that tree. The `HEAD` commit of the PC resolves through the tree's alternates with no fetch. A `refs/remotes/origin/<name>` left by an earlier run stays when a run sends no base.
 
   On a pair run every repo's back ref `refs/gate-back/<key>` is deleted before any checkout, so no repo keeps an earlier run's back commit whatever step of this run fails; a run of one repo deletes it in its checkout step.
+
+  A commit stage's main repo (`CommitStage` true; only the main repo on a pair run) has `+refs/gate-head/<key>:refs/gate-head/<key>` taken in the same fetch, and the probe then also looks for the payload's `Head` commit. One the repository lacks refuses the run `layout` before the command (`gate-remote-refused: <nonce> layout`, then `gate: remote commit stage: the PC's HEAD <first 8 digits> was not sent`, on a pair run `... <first 8 digits> of <name> was not sent`, status 75), so the PC runs the hooks itself. Only the `Head` commit is read, whatever `refs/gate-head/<key>` names.
+
+  After the checkout, the clean and the back ref reset, a commit stage's main repo is soft-reset to `Head` (`reset -q --soft <Head>`): its `HEAD` is the PC's, and its index and files stay the snapshot, the tree the PC staged. The fetched `refs/gate-head/<key>` is then deleted from the work folder's repository (`update-ref -d`), `HEAD` keeping the commit reachable.
 
   The checkout is `checkout -q --force --detach <sha>`, the payload's commit and not `FETCH_HEAD`, so a later push of the key changes nothing a running run runs. The box's git calls for preflight, the probe and the run's own steps share one start and wait path (`preflight::Git`), which carries the bounds, the gone-client probe, the stop and the lock sweep of the preflight section above.
 
@@ -4223,7 +4229,7 @@ Built verbs:
 
   On stderr, best effort, it says `gate: remote the client closed the connection; stopped job <name>` once the job is empty. Otherwise it says `gate: remote the client closed the connection; stopping job <name>` followed by the could-not-stop line or the `still has <n> process(es)` line of `stop`. The stdin closing is not the signal. A command that itself exits 255 is indistinguishable from a lost connection, as with the PowerShell wrapper.
 
-  After the command, the sync-back commits the tree when it changed: a copy of the index at `<Work>.index` is staged, and the commit (message `gate-remote back`, parent HEAD) is written to `refs/gate-back/<key>` in `Bare`. A sync-back that fails prints `gate: remote sync-back failed: <message>` and turns a 0 status into 1; an index copy that cannot be removed prints `gate: remote could not remove <index>: <error>` and changes no status.
+  After the command, the sync-back commits the tree when it changed: a copy of the index at `<Work>.index` is staged, and the commit (message `gate-remote back`, parent HEAD, or the snapshot on a commit stage's main repo, whose `HEAD` is the PC's; the no-change test and the paths the outputs leave out compare with that parent too) is written to `refs/gate-back/<key>` in `Bare`. A sync-back that fails prints `gate: remote sync-back failed: <message>` and turns a 0 status into 1; an index copy that cannot be removed prints `gate: remote could not remove <index>: <error>` and changes no status.
 
   The back commit's `add -A` takes the checkout's pins (Routing, Git LFS) with the run's `lfs.storage`, so a clean writes nothing into the store or the work folder's `.git\lfs`; a changed LFS path is refused at the PC's sync-back as before.
 
@@ -4737,7 +4743,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
   A pair run brings back from its main tree only. `OutputsFull` with no globs is taken and does nothing. `--test-outputs-budget-bytes` reaches the run. Every other verb (`inflight`, `lfs`, `register-desktop`) says `gate: box <verb> is not built on this builder` and exits 2.
 
-  The run checks a payload's `InputsDigest` as the Windows box does ([The box side](#the-box-side)), and refuses a `SentDigest` or `LfsDigest` as not built (`gate-remote-refused: <nonce> <tag>`, then `gate: remote <key> is not built on this builder`, status 75), so the PC runs such a run itself.
+  The run checks a payload's `InputsDigest` as the Windows box does ([The box side](#the-box-side)), and refuses a `SentDigest` or `LfsDigest` as not built (`gate-remote-refused: <nonce> <tag>`, then `gate: remote <key> is not built on this builder`, status 75), so the PC runs such a run itself. A payload with `CommitStage` true is refused `layout` the same way, naming `CommitStage` in the line.
 
   It has no install tripwire, no desktop helper and no MSYS keeper. Its `test-seams` feature passes `gate-args`' hidden `--test-*` seams through, given before the verb; `--test-heartbeat-ms`, `--test-box-sample-ms`, `--test-box-sampler-fail` and `--test-box-free-percent` reach `box run`.
 - **`boot`** reads `kern.boottime` and prints the same line, with the same format.
