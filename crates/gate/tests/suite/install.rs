@@ -1519,3 +1519,628 @@ fn a_second_install_with_a_source_records_the_new_commit() {
         "the same files installed again record the commit they would now be built from: {text}"
     );
 }
+
+/// The stand-in toolchain a case starts with: `.cmd` stand-ins for `rustup`, `cargo`, `rustc`, `vswhere` and `winget`
+/// in a `stubs` folder of the case, each adding its words to the file `STUB_CALLS` names.
+#[derive(Clone, Copy)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each switch names one starting state of one stand-in, which a case sets on its own"
+)]
+struct Stubs {
+    /// Whether rustup, cargo and rustc are on PATH; when not, they wait in `stubs\staged` and winget's Rustup install
+    /// puts them in place.
+    rustup: bool,
+    /// The toolchains `rustup toolchain list` names.
+    toolchains: &'static [&'static str],
+    /// The toolchain `rustup show active-toolchain` names, or none, which it fails for.
+    active: Option<&'static str>,
+    /// What `rustc --version` names.
+    rustc: &'static str,
+    /// Whether `rustup toolchain install` adds the toolchain and `rustup default` makes it active.
+    rust_installs: bool,
+    /// Whether every `rustup` call but the reads fails with exit 1.
+    rustup_fails: bool,
+    /// Whether vswhere finds an instance of any product.
+    instance: bool,
+    /// Whether vswhere finds an instance with the C++ tools and a Windows SDK.
+    vc: bool,
+    /// Whether winget's Build Tools install adds an instance with the C++ tools.
+    tools_install: bool,
+    /// winget's exit code for the Build Tools install, or no winget on PATH.
+    winget: Option<i32>,
+    /// Whether cargo is in a folder of its own after the stubs folder instead of rustup's.
+    stale_cargo: bool,
+}
+
+impl Stubs {
+    /// A toolchain with every piece in place, and winget there.
+    const READY: Stubs = Stubs {
+        rustup: true,
+        toolchains: &["stable-x86_64-pc-windows-msvc (default)"],
+        active: Some("stable-x86_64-pc-windows-msvc"),
+        rustc: "1.91.0",
+        rust_installs: true,
+        rustup_fails: false,
+        instance: true,
+        vc: true,
+        tools_install: true,
+        winget: Some(0),
+        stale_cargo: false,
+    };
+    /// No Rust at all, rustup put in place by winget and the toolchain by rustup.
+    const NO_RUST: Stubs = Stubs {
+        rustup: false,
+        toolchains: &[],
+        active: None,
+        ..Stubs::READY
+    };
+    /// No Visual Studio, the Build Tools put in place by winget.
+    const NO_TOOLS: Stubs = Stubs {
+        instance: false,
+        vc: false,
+        ..Stubs::READY
+    };
+}
+
+/// The programs a case's PATH leaves out, so no case reaches this PC's own winget, rustup, cargo, rustc or vswhere.
+const TOOLCHAIN_PROGRAMS: [&str; 5] = ["winget.exe", "rustup.exe", "cargo.exe", "rustc.exe", "vswhere.exe"];
+
+const RUSTUP_CMD: &str = "@echo off\r\n>>\"%STUB_CALLS%\" echo rustup %*\r\n\
+    if \"%1\"==\"show\" goto show\r\n\
+    if \"%1 %2\"==\"toolchain list\" goto list\r\n\
+    if exist \"%~dp0rustup.fails\" exit /b 1\r\n\
+    if not exist \"%~dp0rust.installs\" exit /b 0\r\n\
+    if \"%1\"==\"toolchain\" >>\"%~dp0toolchains.txt\" echo %3\r\n\
+    if \"%1\"==\"toolchain\" >\"%~dp0rustc-version.txt\" echo 1.91.0\r\n\
+    if \"%1\"==\"default\" >\"%~dp0active.txt\" echo %2\r\n\
+    exit /b 0\r\n\
+    :show\r\n\
+    if not exist \"%~dp0active.txt\" (\r\n  echo error: no active toolchain 1>&2\r\n  exit /b 1\r\n)\r\n\
+    set /p ACTIVE=<\"%~dp0active.txt\"\r\n\
+    echo %ACTIVE% (default)\r\n\
+    exit /b 0\r\n\
+    :list\r\n\
+    if exist \"%~dp0toolchains.txt\" type \"%~dp0toolchains.txt\"\r\n\
+    exit /b 0\r\n";
+const CARGO_CMD: &str = "@echo off\r\n>>\"%STUB_CALLS%\" echo cargo %*\r\nexit /b 1\r\n";
+const RUSTC_CMD: &str = "@echo off\r\n>>\"%STUB_CALLS%\" echo rustc %*\r\n\
+    set /p VERSION=<\"%~dp0rustc-version.txt\"\r\necho rustc %VERSION% (0000000 2026-01-01)\r\nexit /b 0\r\n";
+const VSWHERE_CMD: &str = "@echo off\r\n>>\"%STUB_CALLS%\" echo vswhere %*\r\n\
+    echo %* | findstr /c:\"-requires\" >nul\r\n\
+    if errorlevel 1 goto any\r\n\
+    if exist \"%~dp0vc.present\" echo C:\\BuildTools\r\n\
+    exit /b 0\r\n\
+    :any\r\n\
+    if exist \"%~dp0instance.present\" echo C:\\BuildTools\r\n\
+    exit /b 0\r\n";
+const WINGET_CMD: &str = "@echo off\r\n>>\"%STUB_CALLS%\" echo winget %*\r\n\
+    if \"%3\"==\"Rustlang.Rustup\" (\r\n  copy /y \"%~dp0staged\\*.cmd\" \"%~dp0\" >nul\r\n  exit /b 0\r\n)\r\n\
+    if exist \"%~dp0tools.installs\" (\r\n  type nul > \"%~dp0instance.present\"\r\n  type nul > \"%~dp0vc.present\"\r\n)\r\n\
+    set /p CODE=<\"%~dp0winget-code.txt\"\r\n\
+    exit /b %CODE%\r\n";
+
+/// Writes `text` to `path`, its folder made when missing.
+fn write_stub(path: &Path, text: &str) {
+    fs::create_dir_all(path.parent().expect("a stub has a folder")).expect("the stub's folder can be made");
+    fs::write(path, text).expect("the stub can be written");
+}
+
+/// Lays out `stubs` in the case's `stubs` folder and returns it.
+fn toolchain_stubs(case: &Case, stubs: Stubs) -> PathBuf {
+    let folder = case.folder().join("stubs");
+    let rust_folder = if stubs.rustup { folder.clone() } else { folder.join("staged") };
+    write_stub(&rust_folder.join("rustup.cmd"), RUSTUP_CMD);
+    write_stub(&rust_folder.join("rustc.cmd"), RUSTC_CMD);
+    let cargo_folder = if stubs.stale_cargo { case.folder().join("stale") } else { rust_folder };
+    write_stub(&cargo_folder.join("cargo.cmd"), CARGO_CMD);
+    write_stub(&folder.join("vswhere.cmd"), VSWHERE_CMD);
+    write_stub(&folder.join("rustc-version.txt"), &format!("{}\r\n", stubs.rustc));
+    let listed: String = stubs.toolchains.iter().flat_map(|line| [*line, "\r\n"]).collect();
+    write_stub(&folder.join("toolchains.txt"), &listed);
+    if let Some(active) = stubs.active {
+        write_stub(&folder.join("active.txt"), &format!("{active}\r\n"));
+    }
+    for (marker, on) in [
+        ("rust.installs", stubs.rust_installs),
+        ("rustup.fails", stubs.rustup_fails),
+        ("instance.present", stubs.instance),
+        ("vc.present", stubs.vc),
+        ("tools.installs", stubs.tools_install),
+    ] {
+        if on {
+            write_stub(&folder.join(marker), "");
+        }
+    }
+    if let Some(code) = stubs.winget {
+        write_stub(&folder.join("winget.cmd"), WINGET_CMD);
+        write_stub(&folder.join("winget-code.txt"), &format!("{code}\r\n"));
+    }
+    folder
+}
+
+/// The folder holding the pwsh this suite runs, which a case's PATH always keeps.
+fn pwsh_folder() -> Option<PathBuf> {
+    let own = std::env::var_os("PATH").expect("PATH is set");
+    std::env::split_paths(&own).find(|folder| folder.join("pwsh.exe").is_file())
+}
+
+/// Points `command` at the stand-ins in `stubs`: the stubs folder leads its PATH, then the case's `stale` folder, then
+/// this process's PATH without any folder holding one of [`TOOLCHAIN_PROGRAMS`] but the pwsh folder; the Visual Studio
+/// installer folder is looked for under the case folder, and the launcher finds no gate.exe, so a build runs the
+/// stand-in `cargo` directly.
+fn with_toolchain(command: &mut Command, case: &Case, stubs: &Path) {
+    let own = std::env::var_os("PATH").expect("PATH is set");
+    let pwsh = pwsh_folder();
+    let kept = std::env::split_paths(&own).filter(|folder| {
+        pwsh.as_ref() == Some(folder)
+            || !TOOLCHAIN_PROGRAMS
+                .iter()
+                .any(|program| fs::symlink_metadata(folder.join(program)).is_ok())
+    });
+    let lead = [stubs.to_path_buf(), case.folder().join("stale")];
+    let path = std::env::join_paths(lead.into_iter().chain(kept)).expect("the PATH can be joined");
+    command
+        .env("PATH", path)
+        .env("STUB_CALLS", stubs.join("calls.txt"))
+        .env("ProgramFiles(x86)", case.folder().join("program-files-x86"))
+        .env("GATE_LAUNCHER_PROGRAM_FILES", case.folder().join("program-files"));
+}
+
+/// The build-path install script for `case` with `args`, its toolchain the stand-ins in `stubs`.
+fn build_install(case: &Case, key: &EnvironmentKey, stubs: &Path, args: &[&str]) -> Outcome {
+    let mut command = bare_install_command(case, key, args);
+    with_toolchain(&mut command, case, stubs);
+    finish(command)
+}
+
+/// The calls the stand-ins in `stubs` saw, one line each, in order; none when no stand-in ran.
+fn stub_calls(stubs: &Path) -> Vec<String> {
+    let calls = stubs.join("calls.txt");
+    if !calls.exists() {
+        return Vec::new();
+    }
+    let text = fs::read_to_string(calls).expect("the stand-ins' calls can be read");
+    unix(&text).lines().map(|line| line.trim_end().to_owned()).collect()
+}
+
+/// The calls that install something, in order: every `winget` call and every `rustup` call but its two reads.
+fn install_calls(stubs: &Path) -> Vec<String> {
+    let reads = ["rustup show active-toolchain", "rustup toolchain list"];
+    stub_calls(stubs)
+        .into_iter()
+        .filter(|call| call.starts_with("winget ") || (call.starts_with("rustup ") && !reads.contains(&call.as_str())))
+        .collect()
+}
+
+/// What `cargo` is given by the release build.
+const BUILD_CALL: &str = "cargo build --release -p gate -p gate-desktop";
+const MISSING_RUST: &str = "install: missing: Rust (rustup with the stable MSVC toolchain)";
+const MISSING_BUILD_TOOLS: &str = "install: missing: Visual Studio C++ Build Tools (about 6 GB; Windows asks for admin rights)";
+const QUESTION: &str = "install: install them now with winget? [y/N]";
+const WINGET_BUILD_TOOLS: &str = "winget install --id Microsoft.VisualStudio.2022.BuildTools -e --accept-package-agreements \
+    --accept-source-agreements --override \"--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools \
+    --includeRecommended\"";
+const WINGET_RUSTUP: &str = "winget install --id Rustlang.Rustup -e --accept-package-agreements --accept-source-agreements";
+const RUSTUP_INSTALL: &str = "rustup toolchain install stable-x86_64-pc-windows-msvc";
+const RUSTUP_DEFAULT: &str = "rustup default stable-x86_64-pc-windows-msvc";
+
+/// Asserts the stand-in cargo was given the release build, which ends the install with its exit 1.
+fn assert_built(outcome: &Outcome, stubs: &Path) {
+    assert_eq!(outcome.code, Some(1), "the stand-in cargo fails the build: {outcome:?}");
+    assert_eq!(
+        stub_calls(stubs).last().map(String::as_str),
+        Some(BUILD_CALL),
+        "the build ran last: {:?} {outcome:?}",
+        stub_calls(stubs)
+    );
+    assert!(
+        unix(&outcome.stderr).contains("install: cargo build --release failed; see .tmp/install-build.log"),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn a_build_with_rust_and_build_tools_present_asks_nothing() {
+    let case = Case::new("a_build_with_rust_and_build_tools_present_asks_nothing");
+    let key = EnvironmentKey::new("a_build_with_rust_and_build_tools_present_asks_nothing");
+    let stubs = toolchain_stubs(&case, Stubs::READY);
+
+    let outcome = build_install(&case, &key, &stubs, &[]);
+
+    let stdout = unix(&outcome.stdout);
+    assert!(!stdout.contains("install: missing"), "nothing is missing: {outcome:?}");
+    assert!(!stdout.contains(QUESTION), "nothing is asked: {outcome:?}");
+    assert!(install_calls(&stubs).is_empty(), "nothing is installed: {:?}", stub_calls(&stubs));
+    assert_built(&outcome, &stubs);
+}
+
+#[test]
+fn a_build_missing_rust_without_yes_and_no_console_exits_1_and_names_it() {
+    let case = Case::new("a_build_missing_rust_without_yes_and_no_console_exits_1_and_names_it");
+    let key = EnvironmentKey::new("a_build_missing_rust_without_yes_and_no_console_exits_1_and_names_it");
+    let stubs = toolchain_stubs(&case, Stubs::NO_RUST);
+
+    let outcome = build_install(&case, &key, &stubs, &[]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(unix(&outcome.stdout), format!("{MISSING_RUST}\n"), "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        "install: no console to ask; pass -Yes to install them\n",
+        "{outcome:?}"
+    );
+    assert!(install_calls(&stubs).is_empty(), "nothing is installed: {:?}", stub_calls(&stubs));
+    assert!(
+        !stub_calls(&stubs).contains(&BUILD_CALL.to_owned()),
+        "nothing is built: {:?}",
+        stub_calls(&stubs)
+    );
+}
+
+#[test]
+fn a_build_missing_both_with_yes_installs_build_tools_then_rust_then_the_stable_toolchain() {
+    let name = "a_build_missing_both_with_yes_installs_build_tools_then_rust_then_the_stable_toolchain";
+    let case = Case::new(name);
+    let key = EnvironmentKey::new(name);
+    let stubs = toolchain_stubs(
+        &case,
+        Stubs {
+            instance: false,
+            vc: false,
+            ..Stubs::NO_RUST
+        },
+    );
+
+    let outcome = build_install(&case, &key, &stubs, &["-Yes"]);
+
+    let stdout = unix(&outcome.stdout);
+    assert!(stdout.starts_with(&format!("{MISSING_RUST}\n{MISSING_BUILD_TOOLS}\n")), "{outcome:?}");
+    assert!(!stdout.contains(QUESTION), "-Yes asks nothing: {outcome:?}");
+    assert!(
+        stdout.contains("install: made stable-x86_64-pc-windows-msvc your default Rust toolchain (was none)\n"),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        install_calls(&stubs),
+        [WINGET_BUILD_TOOLS, WINGET_RUSTUP, RUSTUP_INSTALL, RUSTUP_DEFAULT],
+        "{outcome:?}"
+    );
+    assert!(!unix(&outcome.stderr).contains("still missing"), "{outcome:?}");
+    assert_built(&outcome, &stubs);
+}
+
+#[test]
+fn a_build_missing_a_piece_without_winget_names_the_manual_installers() {
+    let case = Case::new("a_build_missing_a_piece_without_winget_names_the_manual_installers");
+    let key = EnvironmentKey::new("a_build_missing_a_piece_without_winget_names_the_manual_installers");
+    let stubs = toolchain_stubs(
+        &case,
+        Stubs {
+            winget: None,
+            ..Stubs::NO_RUST
+        },
+    );
+
+    let outcome = build_install(&case, &key, &stubs, &[]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(unix(&outcome.stdout), format!("{MISSING_RUST}\n"), "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        "install: winget is not available; install App Installer from the Microsoft Store, or install Rust from \
+         https://rustup.rs and the Build Tools from https://visualstudio.microsoft.com/visual-cpp-build-tools/\n",
+        "{outcome:?}"
+    );
+    assert!(install_calls(&stubs).is_empty(), "nothing is installed: {:?}", stub_calls(&stubs));
+}
+
+#[test]
+fn an_install_of_a_given_exe_checks_no_toolchain() {
+    let case = Case::new("an_install_of_a_given_exe_checks_no_toolchain");
+    let key = EnvironmentKey::new("an_install_of_a_given_exe_checks_no_toolchain");
+    let stubs = toolchain_stubs(
+        &case,
+        Stubs {
+            instance: false,
+            vc: false,
+            winget: None,
+            ..Stubs::NO_RUST
+        },
+    );
+    let exe = copy_gate(&case, "gate-a.exe");
+    let mut command = install_command(&case, &key, &default_helper(&case), &["-Exe", &shown(&exe)]);
+    with_toolchain(&mut command, &case, &stubs);
+
+    let outcome = finish(command);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!unix(&outcome.stdout).contains("install: missing"), "{outcome:?}");
+    assert!(stub_calls(&stubs).is_empty(), "no toolchain piece is looked at: {:?}", stub_calls(&stubs));
+    assert_same_bytes(&installed_gate(&case), &exe);
+}
+
+#[test]
+fn a_toolchain_still_missing_after_install_exits_1_and_names_it() {
+    let case = Case::new("a_toolchain_still_missing_after_install_exits_1_and_names_it");
+    let key = EnvironmentKey::new("a_toolchain_still_missing_after_install_exits_1_and_names_it");
+    let stubs = toolchain_stubs(
+        &case,
+        Stubs {
+            rust_installs: false,
+            ..Stubs::NO_RUST
+        },
+    );
+
+    let outcome = build_install(&case, &key, &stubs, &["-Yes"]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(
+        unix(&outcome.stderr).ends_with("install: still missing after the install: Rust (rustup with the stable MSVC toolchain)\n"),
+        "{outcome:?}"
+    );
+    assert_eq!(install_calls(&stubs), [WINGET_RUSTUP, RUSTUP_INSTALL, RUSTUP_DEFAULT], "{outcome:?}");
+    assert!(
+        !stub_calls(&stubs).contains(&BUILD_CALL.to_owned()),
+        "nothing is built: {:?}",
+        stub_calls(&stubs)
+    );
+}
+
+#[test]
+fn a_build_tools_install_winget_says_is_in_place_counts_as_installed() {
+    let case = Case::new("a_build_tools_install_winget_says_is_in_place_counts_as_installed");
+    let key = EnvironmentKey::new("a_build_tools_install_winget_says_is_in_place_counts_as_installed");
+    let stubs = toolchain_stubs(
+        &case,
+        Stubs {
+            winget: Some(-1_978_335_189),
+            ..Stubs::NO_TOOLS
+        },
+    );
+
+    let outcome = build_install(&case, &key, &stubs, &["-Yes"]);
+
+    assert_eq!(install_calls(&stubs), [WINGET_BUILD_TOOLS], "{outcome:?}");
+    assert!(!unix(&outcome.stderr).contains("failed with exit code"), "{outcome:?}");
+    assert_built(&outcome, &stubs);
+}
+
+#[test]
+fn a_build_tools_install_that_needs_a_restart_says_restart() {
+    let case = Case::new("a_build_tools_install_that_needs_a_restart_says_restart");
+    let key = EnvironmentKey::new("a_build_tools_install_that_needs_a_restart_says_restart");
+    let stubs = toolchain_stubs(
+        &case,
+        Stubs {
+            winget: Some(-1_978_334_967),
+            tools_install: false,
+            ..Stubs::NO_TOOLS
+        },
+    );
+
+    let outcome = build_install(&case, &key, &stubs, &["-Yes"]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        "install: the Build Tools need a restart to finish; restart Windows, then run install.ps1 again\n",
+        "{outcome:?}"
+    );
+    assert_eq!(install_calls(&stubs), [WINGET_BUILD_TOOLS], "{outcome:?}");
+    assert!(
+        !stub_calls(&stubs).contains(&BUILD_CALL.to_owned()),
+        "nothing is built: {:?}",
+        stub_calls(&stubs)
+    );
+}
+
+#[test]
+fn a_build_tools_install_that_fails_names_its_exit_code() {
+    let case = Case::new("a_build_tools_install_that_fails_names_its_exit_code");
+    let key = EnvironmentKey::new("a_build_tools_install_that_fails_names_its_exit_code");
+    let stubs = toolchain_stubs(
+        &case,
+        Stubs {
+            winget: Some(5),
+            tools_install: false,
+            ..Stubs::NO_TOOLS
+        },
+    );
+
+    let outcome = build_install(&case, &key, &stubs, &["-Yes"]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        "install: winget install --id Microsoft.VisualStudio.2022.BuildTools failed with exit code 0x00000005; run it \
+         yourself to see why, then run install.ps1 again\n",
+        "{outcome:?}"
+    );
+    assert!(
+        !stub_calls(&stubs).contains(&BUILD_CALL.to_owned()),
+        "nothing is built: {:?}",
+        stub_calls(&stubs)
+    );
+}
+
+#[test]
+fn a_rustup_that_fails_names_the_call() {
+    let case = Case::new("a_rustup_that_fails_names_the_call");
+    let key = EnvironmentKey::new("a_rustup_that_fails_names_the_call");
+    let stubs = toolchain_stubs(
+        &case,
+        Stubs {
+            toolchains: &[],
+            active: None,
+            rustup_fails: true,
+            ..Stubs::READY
+        },
+    );
+
+    let outcome = build_install(&case, &key, &stubs, &["-Yes"]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        "install: rustup toolchain install stable-x86_64-pc-windows-msvc failed with exit code 1\n",
+        "{outcome:?}"
+    );
+    assert_eq!(install_calls(&stubs), [RUSTUP_INSTALL], "{outcome:?}");
+}
+
+#[test]
+fn build_tools_without_the_cpp_tools_are_refused_before_any_install() {
+    let case = Case::new("build_tools_without_the_cpp_tools_are_refused_before_any_install");
+    let key = EnvironmentKey::new("build_tools_without_the_cpp_tools_are_refused_before_any_install");
+    let stubs = toolchain_stubs(&case, Stubs { vc: false, ..Stubs::READY });
+
+    let outcome = build_install(&case, &key, &stubs, &["-Yes"]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        "install: Visual Studio Build Tools at C:\\BuildTools lacks the C++ tools; add \"Desktop development with C++\" \
+         in the Visual Studio Installer, then run install.ps1 again\n",
+        "{outcome:?}"
+    );
+    assert!(install_calls(&stubs).is_empty(), "nothing is installed: {:?}", stub_calls(&stubs));
+}
+
+#[test]
+fn a_cargo_outside_rustups_folder_is_refused() {
+    let case = Case::new("a_cargo_outside_rustups_folder_is_refused");
+    let key = EnvironmentKey::new("a_cargo_outside_rustups_folder_is_refused");
+    let stubs = toolchain_stubs(
+        &case,
+        Stubs {
+            stale_cargo: true,
+            ..Stubs::READY
+        },
+    );
+
+    let outcome = build_install(&case, &key, &stubs, &[]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        format!(
+            "install: cargo at {} is not rustup's; remove it from PATH, then run install.ps1 again\n",
+            shown(&case.folder().join("stale").join("cargo.cmd"))
+        ),
+        "{outcome:?}"
+    );
+    assert!(install_calls(&stubs).is_empty(), "nothing is installed: {:?}", stub_calls(&stubs));
+    assert!(
+        !stub_calls(&stubs).contains(&BUILD_CALL.to_owned()),
+        "nothing is built: {:?}",
+        stub_calls(&stubs)
+    );
+}
+
+#[test]
+fn an_active_gnu_toolchain_counts_as_missing_and_installs_msvc() {
+    let case = Case::new("an_active_gnu_toolchain_counts_as_missing_and_installs_msvc");
+    let key = EnvironmentKey::new("an_active_gnu_toolchain_counts_as_missing_and_installs_msvc");
+    let stubs = toolchain_stubs(
+        &case,
+        Stubs {
+            toolchains: &["stable-x86_64-pc-windows-gnu (default)", "stable-x86_64-pc-windows-msvc"],
+            active: Some("stable-x86_64-pc-windows-gnu"),
+            ..Stubs::READY
+        },
+    );
+
+    let outcome = build_install(&case, &key, &stubs, &["-Yes"]);
+
+    let stdout = unix(&outcome.stdout);
+    assert!(stdout.starts_with(&format!("{MISSING_RUST}\n")), "{outcome:?}");
+    assert!(
+        stdout.contains("install: made stable-x86_64-pc-windows-msvc your default Rust toolchain (was stable-x86_64-pc-windows-gnu)\n"),
+        "{outcome:?}"
+    );
+    assert_eq!(install_calls(&stubs), [RUSTUP_INSTALL, RUSTUP_DEFAULT], "{outcome:?}");
+    assert_built(&outcome, &stubs);
+}
+
+#[test]
+fn rustup_without_the_stable_msvc_toolchain_skips_winget() {
+    let case = Case::new("rustup_without_the_stable_msvc_toolchain_skips_winget");
+    let key = EnvironmentKey::new("rustup_without_the_stable_msvc_toolchain_skips_winget");
+    let stubs = toolchain_stubs(
+        &case,
+        Stubs {
+            toolchains: &[],
+            active: None,
+            ..Stubs::READY
+        },
+    );
+
+    let outcome = build_install(&case, &key, &stubs, &["-Yes"]);
+
+    assert_eq!(install_calls(&stubs), [RUSTUP_INSTALL, RUSTUP_DEFAULT], "no winget call: {outcome:?}");
+    assert!(
+        unix(&outcome.stdout).contains("install: made stable-x86_64-pc-windows-msvc your default Rust toolchain (was none)\n"),
+        "{outcome:?}"
+    );
+    assert_built(&outcome, &stubs);
+}
+
+#[test]
+fn an_old_stable_is_updated_and_stays_the_default() {
+    let case = Case::new("an_old_stable_is_updated_and_stays_the_default");
+    let key = EnvironmentKey::new("an_old_stable_is_updated_and_stays_the_default");
+    // A stable older than edition 2024 needs; the stand-in's toolchain install updates it to 1.91.0.
+    let stubs = toolchain_stubs(
+        &case,
+        Stubs {
+            rustc: "1.80.1",
+            ..Stubs::READY
+        },
+    );
+
+    let outcome = build_install(&case, &key, &stubs, &["-Yes"]);
+
+    assert!(unix(&outcome.stdout).starts_with(&format!("{MISSING_RUST}\n")), "{outcome:?}");
+    assert!(
+        !unix(&outcome.stdout).contains("your default Rust toolchain"),
+        "the default is kept: {outcome:?}"
+    );
+    assert_eq!(install_calls(&stubs), [RUSTUP_INSTALL], "{outcome:?}");
+    assert_built(&outcome, &stubs);
+}
+
+#[test]
+fn install_whatif_lists_every_toolchain_install_and_installs_nothing() {
+    let case = Case::new("install_whatif_lists_every_toolchain_install_and_installs_nothing");
+    let key = EnvironmentKey::new("install_whatif_lists_every_toolchain_install_and_installs_nothing");
+    let stubs = toolchain_stubs(
+        &case,
+        Stubs {
+            instance: false,
+            vc: false,
+            winget: None,
+            ..Stubs::NO_RUST
+        },
+    );
+
+    let outcome = build_install(&case, &key, &stubs, &["-WhatIf"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let stdout = unix(&outcome.stdout);
+    let expected = format!(
+        "{MISSING_RUST}\n{MISSING_BUILD_TOOLS}\nWhat if: winget is not available; the installs would fail\n\
+         What if: Performing the operation \"winget install\" on target \"Microsoft.VisualStudio.2022.BuildTools\".\n\
+         What if: Performing the operation \"winget install\" on target \"Rustlang.Rustup\".\n\
+         What if: Performing the operation \"rustup toolchain install\" on target \"stable-x86_64-pc-windows-msvc\".\n\
+         What if: Performing the operation \"rustup default\" on target \"stable-x86_64-pc-windows-msvc\".\n"
+    );
+    assert!(stdout.starts_with(&expected), "{outcome:?}");
+    assert!(install_calls(&stubs).is_empty(), "nothing is installed: {:?}", stub_calls(&stubs));
+    assert!(
+        !stub_calls(&stubs).contains(&BUILD_CALL.to_owned()),
+        "nothing is built: {:?}",
+        stub_calls(&stubs)
+    );
+}

@@ -1,4 +1,4 @@
-#Requires -Version 7.2
+#Requires -Version 7.3
 
 <#
 .SYNOPSIS
@@ -28,6 +28,17 @@
     was built from no commit, and it never touches the state root's files. Run with -WhatIf to list every step without
     taking it.
 
+    Before a build it checks the toolchain the build needs: rustup and its own cargo on PATH, the
+    stable-x86_64-pc-windows-msvc toolchain installed, and an active MSVC toolchain in the repo whose rustc is 1.85 or
+    newer; and an instance of Visual Studio with the x64 C++ tools and a Windows SDK, which vswhere (on PATH, or the
+    Visual Studio Installer's own copy) must find. A cargo outside rustup's folder, and Visual Studio without the C++
+    tools, are refused. It names each missing piece, asks once whether to install them, installs the Build Tools with
+    winget, then rustup with winget when it is not on PATH, the stable MSVC toolchain, and makes it the default when the
+    active toolchain is not a stable MSVC one, and checks again. An install of a given -Exe checks nothing.
+
+.PARAMETER Yes
+    Installs a missing toolchain without asking.
+
 .PARAMETER Exe
     Installs this prebuilt executable instead of building one; the build is skipped. Given only with -HelperExe. For
     tests only.
@@ -56,7 +67,8 @@ param(
     [string]$HelperExe,
     [string]$Source,
     [string]$EnvironmentKey = 'HKCU:\Environment',
-    [switch]$PrintBuild
+    [switch]$PrintBuild,
+    [switch]$Yes
 )
 
 Set-StrictMode -Version Latest
@@ -732,6 +744,292 @@ function Add-UserPath {
     if (-not $WhatIfPreference) { $env:Path = "$Folder;$env:Path" }
 }
 
+# The toolchain a build needs, as the missing lines name each piece.
+$rustToolchain = 'stable-x86_64-pc-windows-msvc'
+# The oldest rustc that builds the workspace: edition 2024 sets it.
+$minimumRust = [version]'1.85'
+$rustPiece = 'Rust (rustup with the stable MSVC toolchain)'
+$buildToolsPiece = 'Visual Studio C++ Build Tools (about 6 GB; Windows asks for admin rights)'
+$buildToolsId = 'Microsoft.VisualStudio.2022.BuildTools'
+$buildToolsOverride = '--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended'
+# What vswhere must find in one instance: the x64 C++ tools and a Windows 10 or 11 SDK, the `?` matching either digit.
+$buildToolsComponents = @('Microsoft.VisualStudio.Component.VC.Tools.x86.x64', 'Microsoft.VisualStudio.Component.Windows1?SDK.*')
+# The codes winget ends with when the package is in place already, each counted as a success: 0x8A150061
+# PACKAGE_ALREADY_INSTALLED, 0x8A15002B UPDATE_NOT_APPLICABLE, 0x8A15010D INSTALL_ALREADY_INSTALLED and 0x8A15010E
+# INSTALL_DOWNGRADE (a higher version is installed).
+$wingetInPlace = @(-1978335135, -1978335189, -1978334963, -1978334962)
+# 0x8A150109 INSTALL_REBOOT_REQUIRED_TO_FINISH: installed, but in use only after a restart.
+$wingetRestart = -1978334967
+# Whether a winget install of this run ended asking for a restart.
+$script:restartPending = $false
+
+# One line on standard output, written at once, so the missing lines and the question come out in order.
+function Write-InstallLine {
+    param([string]$Line)
+
+    [Console]::Out.WriteLine($Line)
+}
+
+# Whether a program named $Name is on PATH.
+function Test-OnPath {
+    param([string]$Name)
+
+    return [bool](Get-Command -Name $Name -CommandType Application -ErrorAction SilentlyContinue)
+}
+
+# The full path of the program named $Name that PATH finds first, or $null.
+function Get-OnPath {
+    param([string]$Name)
+
+    $found = Get-Command -Name $Name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $found) { return $null }
+    return $found.Source
+}
+
+# The major and minor version `rustc --version` names, or $null when rustc is not on PATH or says something else.
+function Get-RustcVersion {
+    $rustc = Get-OnPath 'rustc'
+    if ($null -eq $rustc) { return $null }
+    $said = @(& $rustc --version 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $said.Count -eq 0) { return $null }
+    if ([string]$said[0] -notmatch '^rustc (\d+)\.(\d+)') { return $null }
+    return [version]::new([int]$Matches[1], [int]$Matches[2])
+}
+
+# What the build's Rust is in $Root: Rustup and Cargo, the programs PATH finds or $null; Active, the toolchain
+# `rustup show active-toolchain` names there or $null; Ready, whether cargo is there, the stable MSVC toolchain is
+# installed, the active toolchain is an MSVC one and its rustc is at least $minimumRust.
+function Get-RustState {
+    param([string]$Root)
+
+    $state = @{ Rustup = (Get-OnPath 'rustup'); Cargo = (Get-OnPath 'cargo'); Active = $null; Ready = $false }
+    if ($null -eq $state.Rustup) { return $state }
+    Push-Location -LiteralPath $Root
+    try {
+        $active = @(& $state.Rustup show active-toolchain 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $active.Count -gt 0) { $state.Active = ([string]$active[0] -split '\s+')[0] }
+        $listed = @(& $state.Rustup toolchain list 2>$null)
+        $stable = ($LASTEXITCODE -eq 0) -and
+            @($listed | Where-Object { ([string]$_).StartsWith($rustToolchain, [StringComparison]::Ordinal) }).Count -gt 0
+        $version = Get-RustcVersion
+    }
+    finally {
+        Pop-Location
+    }
+    $msvc = $state.Active -like '*-pc-windows-msvc'
+    $state.Ready = ($null -ne $state.Cargo) -and $stable -and $msvc -and ($null -ne $version) -and ($version -ge $minimumRust)
+    return $state
+}
+
+# The vswhere to ask: the one on PATH, else the Visual Studio Installer's own copy, else $null.
+function Get-VsWhere {
+    $onPath = Get-OnPath 'vswhere'
+    if ($null -ne $onPath) { return $onPath }
+    $root = ${env:ProgramFiles(x86)}
+    if ([string]::IsNullOrEmpty($root)) { return $null }
+    $installed = Join-Path $root 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path -LiteralPath $installed -PathType Leaf) { return $installed }
+    return $null
+}
+
+# The non-blank lines vswhere prints for $Arguments, none when it fails.
+function Invoke-VsWhere {
+    param([string]$VsWhere, [string[]]$Arguments)
+
+    $said = @(& $VsWhere @Arguments 2>$null)
+    if ($LASTEXITCODE -ne 0) { return @() }
+    return @($said | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { ([string]$_).Trim() })
+}
+
+# What vswhere says of Visual Studio here: Instance, the folder of the first instance of any product or $null; Ready,
+# whether an instance holds the x64 C++ tools and a Windows SDK.
+function Get-BuildToolsState {
+    $state = @{ Instance = $null; Ready = $false }
+    $vswhere = Get-VsWhere
+    if ($null -eq $vswhere) { return $state }
+    $instances = @(Invoke-VsWhere -VsWhere $vswhere -Arguments '-products', '*', '-property', 'installationPath')
+    if ($instances.Count -gt 0) { $state.Instance = $instances[0] }
+    $arguments = @('-products', '*', '-requires') + $buildToolsComponents + @('-property', 'installationPath')
+    $state.Ready = @(Invoke-VsWhere -VsWhere $vswhere -Arguments $arguments).Count -gt 0
+    return $state
+}
+
+# Exits 1 when the cargo PATH finds is not in rustup's folder, so a build would not run rustup's toolchain.
+function Assert-RustupCargo {
+    param([hashtable]$Rust)
+
+    if ($null -eq $Rust.Rustup -or $null -eq $Rust.Cargo) { return }
+    if ((Split-Path -Parent $Rust.Cargo) -ieq (Split-Path -Parent $Rust.Rustup)) { return }
+    Write-InstallError "install: cargo at $($Rust.Cargo) is not rustup's; remove it from PATH, then run install.ps1 again"
+    exit 1
+}
+
+# The toolchain here: Rust, Tools and Missing, the pieces missing as their lines name them, Rust first. Refuses a cargo
+# that is not rustup's and, with $Initial, Build Tools without the C++ tools, which no winget install adds.
+function Read-Toolchain {
+    param([string]$Root, [switch]$Initial)
+
+    $rust = Get-RustState -Root $Root
+    Assert-RustupCargo -Rust $rust
+    $tools = Get-BuildToolsState
+    if ($Initial -and (-not $tools.Ready) -and ($null -ne $tools.Instance)) {
+        Write-InstallError ("install: Visual Studio Build Tools at $($tools.Instance) lacks the C++ tools; add " +
+            '"Desktop development with C++" in the Visual Studio Installer, then run install.ps1 again')
+        exit 1
+    }
+    $missing = @()
+    if (-not $rust.Ready) { $missing += $rustPiece }
+    if (-not $tools.Ready) { $missing += $buildToolsPiece }
+    return @{ Rust = $rust; Tools = $tools; Missing = $missing }
+}
+
+# Exits 1 when an install the $Toolchain needs takes winget and winget is not here; a -WhatIf run says so and goes on.
+function Assert-Winget {
+    param([hashtable]$Toolchain)
+
+    $needed = (-not $Toolchain.Tools.Ready) -or ($null -eq $Toolchain.Rust.Rustup)
+    if ((-not $needed) -or (Test-OnPath 'winget')) { return }
+    if ($WhatIfPreference) {
+        Write-InstallLine 'What if: winget is not available; the installs would fail'
+        return
+    }
+    Write-InstallError ('install: winget is not available; install App Installer from the Microsoft Store, or install Rust from ' +
+        'https://rustup.rs and the Build Tools from https://visualstudio.microsoft.com/visual-cpp-build-tools/')
+    exit 1
+}
+
+# Asks once whether to install the missing pieces, unless $Yes says so already. Exits 1 on any answer but yes, or when
+# there is no console to ask on.
+function Confirm-ToolchainInstall {
+    param([bool]$Yes)
+
+    if ($Yes) { return }
+    if ([Console]::IsInputRedirected) {
+        Write-InstallError 'install: no console to ask; pass -Yes to install them'
+        exit 1
+    }
+    [Console]::Out.Write('install: install them now with winget? [y/N] ')
+    $answer = [Console]::In.ReadLine()
+    if (($null -eq $answer) -or ($answer.Trim() -notmatch '^(y|yes)$')) {
+        Write-InstallError 'install: not installed; install the pieces above and run install.ps1 again'
+        exit 1
+    }
+}
+
+# Runs `winget install` for the package $Id with $Extra after the agreement switches, and exits 1 when it fails; a
+# package already in place counts as installed, and one that needs a restart to finish is noted and counts too.
+function Invoke-WingetInstall {
+    param([string]$Id, [string[]]$Extra)
+
+    & winget install --id $Id -e --accept-package-agreements --accept-source-agreements @Extra
+    $code = $LASTEXITCODE
+    if ($code -eq $wingetRestart) { $script:restartPending = $true }
+    if ($code -eq 0 -or $code -eq $wingetRestart -or $wingetInPlace -contains $code) { return }
+    $hex = '0x{0:X8}' -f $code
+    Write-InstallError "install: winget install --id $Id failed with exit code $hex; run it yourself to see why, then run install.ps1 again"
+    exit 1
+}
+
+# Runs rustup with $Arguments and exits 1 when it cannot be found or fails.
+function Invoke-Rustup {
+    param([string[]]$Arguments)
+
+    if (-not (Test-OnPath 'rustup')) {
+        Write-InstallError 'install: rustup is not on PATH after its install; open a new terminal and run install.ps1 again'
+        exit 1
+    }
+    & rustup @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        Write-InstallError "install: rustup $($Arguments -join ' ') failed with exit code $LASTEXITCODE"
+        exit 1
+    }
+}
+
+# Adds the machine PATH and the user PATH in $Key to this session's PATH, behind the entries it holds already, so a
+# program an install just put on either is found.
+function Update-SessionPath {
+    param([string]$Key)
+
+    $user = $null
+    $item = Get-Item -LiteralPath $Key -ErrorAction SilentlyContinue
+    if ($null -ne $item) {
+        $user = $item.GetValue('Path', $null)
+        $item.Dispose()
+    }
+    $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $entries = [System.Collections.Generic.List[string]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in (@($env:Path, $machine, $user) -join ';') -split ';') {
+        if ([string]::IsNullOrWhiteSpace($entry) -or -not $seen.Add($entry)) { continue }
+        $entries.Add($entry)
+    }
+    $env:Path = $entries -join ';'
+}
+
+# Installs what $Toolchain lacks: the Build Tools with winget first; then for Rust, rustup with winget when it is not on
+# PATH (the session's PATH read again from the user PATH in $Key and the machine's after it), the stable MSVC
+# toolchain, and, when the active toolchain is not a stable MSVC one already, that toolchain made the default.
+function Install-Toolchain {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([hashtable]$Toolchain, [string]$Key)
+
+    if ((-not $Toolchain.Tools.Ready) -and $PSCmdlet.ShouldProcess($buildToolsId, 'winget install')) {
+        Invoke-WingetInstall -Id $buildToolsId -Extra '--override', $buildToolsOverride
+    }
+    $rust = $Toolchain.Rust
+    if ($rust.Ready) { return }
+    if (($null -eq $rust.Rustup) -and $PSCmdlet.ShouldProcess('Rustlang.Rustup', 'winget install')) {
+        Invoke-WingetInstall -Id 'Rustlang.Rustup' -Extra @()
+        Update-SessionPath -Key $Key
+    }
+    if ($PSCmdlet.ShouldProcess($rustToolchain, 'rustup toolchain install')) {
+        Invoke-Rustup -Arguments 'toolchain', 'install', $rustToolchain
+    }
+    if ($rust.Active -like 'stable-*-pc-windows-msvc') { return }
+    if ($PSCmdlet.ShouldProcess($rustToolchain, 'rustup default')) {
+        Invoke-Rustup -Arguments 'default', $rustToolchain
+        $was = if ($null -eq $rust.Active) { 'none' } else { $rust.Active }
+        Write-InstallLine "install: made $rustToolchain your default Rust toolchain (was $was)"
+    }
+}
+
+# Checks the toolchain in $Root again after the installs and exits 1 naming each piece still missing; Build Tools whose
+# install asked for a restart get the restart line instead.
+function Assert-Installed {
+    param([string]$Root)
+
+    $after = Read-Toolchain -Root $Root
+    if ($after.Missing.Count -eq 0) { return }
+    foreach ($piece in $after.Missing) {
+        if (($piece -eq $buildToolsPiece) -and $script:restartPending) {
+            Write-InstallError 'install: the Build Tools need a restart to finish; restart Windows, then run install.ps1 again'
+            continue
+        }
+        Write-InstallError "install: still missing after the install: $piece"
+    }
+    exit 1
+}
+
+# Makes sure the toolchain a build in $Root needs is here: names each missing piece, refuses without winget when an
+# install needs it, asks once unless $Yes, installs, and checks again. Exits 1 when a piece is refused, declined,
+# cannot be installed or is still missing. A -WhatIf run lists the installs and takes none.
+function Assert-Toolchain {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([switch]$Yes, [string]$Key, [string]$Root)
+
+    $toolchain = Read-Toolchain -Root $Root -Initial
+    if ($toolchain.Missing.Count -eq 0) { return }
+    foreach ($piece in $toolchain.Missing) { Write-InstallLine "install: missing: $piece" }
+    Assert-Winget -Toolchain $toolchain
+    if ($WhatIfPreference) {
+        Install-Toolchain -Toolchain $toolchain -Key $Key -WhatIf
+        return
+    }
+    Confirm-ToolchainInstall -Yes $Yes.IsPresent
+    Install-Toolchain -Toolchain $toolchain -Key $Key
+    Assert-Installed -Root $Root
+}
+
 if ([string]::IsNullOrEmpty($Exe) -ne [string]::IsNullOrEmpty($HelperExe)) {
     Write-InstallError 'install: -Exe and -HelperExe are given together or not at all'
     exit 1
@@ -757,6 +1055,7 @@ $dest = Join-Path $installDir 'gate.exe'
 $helperDest = Join-Path $installDir 'gate-desktop-helper.exe'
 
 if ([string]::IsNullOrEmpty($Exe)) {
+    Assert-Toolchain -Yes:$Yes -Key $EnvironmentKey -Root $repoRoot -WhatIf:$WhatIfPreference
     $built = Join-Path $repoRoot 'target\release\gate.exe'
     $builtHelper = Join-Path $repoRoot 'target\release\gate-desktop-helper.exe'
     # Read before the preview decides, so a -WhatIf run lists the source.json a real run would write.

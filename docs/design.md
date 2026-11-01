@@ -5251,7 +5251,30 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
   A helper built with its test seams is refused before anything is changed: `install: the desktop helper at '<path>' was built with its test seams; build it without features`.
 - The script holds `push.lock` in the install folder, open and unshared, from the confirmed Install step to its end, the same lock `gate push` takes on a builder and on this PC ([`gate push`](#gate-push)). While a push holds it the script stops with `install: another gate push is installing; nothing was changed` and exit 1.
 
-  The script needs pwsh 7.2 or later (`#Requires -Version 7.2`); `install: could not prepare the install: <message>` says its small C# type for the file checks could not be added.
+  The script needs pwsh 7.3 or later (`#Requires -Version 7.3`), the version `tools/gate.ps1` needs; `install: could not prepare the install: <message>` says its small C# type for the file checks could not be added.
+
+- Before a build (never with `-Exe`), the script checks the toolchain:
+  - Rust is ready when rustup and cargo are on PATH, cargo is in rustup's folder, a `stable-x86_64-pc-windows-msvc` toolchain is installed, and the active toolchain in the repo root is an MSVC one whose `rustc` is 1.85 or newer (edition 2024 sets the floor).
+  - The C++ Build Tools are ready when vswhere finds an instance with `Microsoft.VisualStudio.Component.VC.Tools.x86.x64` and a Windows SDK component.
+
+  Each missing piece is named on its own line (`install: missing: Rust (rustup with the stable MSVC toolchain)`, `install: missing: Visual Studio C++ Build Tools (about 6 GB; Windows asks for admin rights)`), and the script asks once: `install: install them now with winget? [y/N]`.
+
+  `-Yes` answers yes. With no console and no `-Yes` it exits 1 with `install: no console to ask; pass -Yes to install them`; a no exits 1 with `install: not installed; install the pieces above and run install.ps1 again`.
+
+  On yes it installs:
+  1. the Build Tools (`winget install --id Microsoft.VisualStudio.2022.BuildTools` with `--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended`, which asks for admin rights);
+  2. rustup (`Rustlang.Rustup`), skipped when rustup is already there;
+  3. `rustup toolchain install stable-x86_64-pc-windows-msvc`;
+  4. `rustup default` for that toolchain, run only when the active one is not a stable MSVC toolchain, and said with the toolchain it replaced.
+
+  Then it checks again. The refusals:
+  - no winget;
+  - a cargo outside rustup's folder;
+  - Visual Studio without the C++ tools;
+  - an install that needs a restart (`install: the Build Tools need a restart to finish; restart Windows, then run install.ps1 again`);
+  - a failed winget or rustup call.
+
+  Each names its fix and exits 1. winget's already-installed and restart-needed codes count as success. `-WhatIf` lists each install and runs none.
 
   A `push.lock` that is a link, a folder, a junction or a second name of another file gives `install: <dir>\push.lock is a link; nothing was changed`, a folder it cannot make `install: could not create <dir>: <message>`, and any other refusal `install: could not lock <dir>: <message>`. Declined (`-Confirm` "No") and `-WhatIf` create no folder and no lock.
 - The installed copy is verified when it answers `--version` with `gate <version>` (the script's version reads are bounded at 30 s).
