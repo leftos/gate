@@ -35,6 +35,7 @@ tools/gate/*
 remote-wrapper.ps1
 remote-bridge.ps1
 tools/sync-launchers.ps1
+tools/builder-copy/builder-copy.ps1
 
 # Placeholders.
 X.rs
