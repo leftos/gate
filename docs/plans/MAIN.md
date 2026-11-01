@@ -14,14 +14,12 @@
 - [!] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [!] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
 - [ ] GATE-634 Route a commit's whole pre-commit hook stage to a builder as one run — High · Remote
-- [ ] GATE-989 Route an eligible commit's pre-commit stage and apply its fixes to the index and worktree — High · Remote
 - [ ] GATE-990 Skip the local hooks a routed stage ran through a gate-owned forwarder hooks folder — High · Remote
 - [!] GATE-839 Route race-anywhere's Unreal editor and game runs: a desktop route with a GPU — High · Remote
-- [!] GATE-974 Route rustling-tulip's whole rt.ps1 native-e2e over the builder's desktop route — High · Remote
-- [!] GATE-976 Route rustling-tulip's native-shot on the builder's desktop, with .tmp/shots outputs — High · Remote
 - [ ] GATE-978 Send the gitignored .tmp files a routed dotnet probe names as inputs — High · Remote
 - [ ] GATE-982 Queue a desktop run behind the builder's busy desktop, and run session-only commands without the desktop lock — High · Remote
 - [ ] GATE-991 Route yaat's GuideCapture once its capture no longer reads this PC's CRC aliases — High · Remote
+- [ ] GATE-1011 Say on the console when a routed run changed no tracked file on the builder — High · Remote
 - [!] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
@@ -347,6 +345,11 @@
 - [ ] GATE-995 Say --cd for a matched command only when the other tree's patterns match its rewritten words
 - [ ] GATE-997 Judge a junction to a present sibling as the run's own tree when the root's id cannot be read
 - [ ] GATE-999 Refuse a commit stage for include configs, prek subproject configs and config-based hooks
+- [ ] GATE-1000 Harden the commit stage's apply: index writes that outlive the gate, staged back tree, refused deletions
+- [ ] GATE-1001 Give a routed output installed on the PC its real write time, not the run's start
+- [ ] GATE-1002 Say when a desktop run takes the session route with no desktop lock
+- [ ] GATE-1003 Cover the commit stage's remaining paths with tests: slot variable, later candidate, shared ceiling, partway index bytes
+- [ ] GATE-1004 Tidy the commit stage's leftover log, journal and test-name gaps from GATE-989's review
 
 ## Cutover sweep
 
@@ -363,6 +366,13 @@
 - [ ] GATE-306 Cap how many of a repo's full suites run at once, per repo, queued by the gate
 - [ ] GATE-635 Close the remaining secret forms the journaled command-line redaction misses
 - [ ] GATE-636 Bound the trace naming thread's command-line read and free its queue at job end
+- [ ] GATE-1005 Write the from-scratch setup guides for people and agents, with scripted builder prep and a toolchain-installing install.ps1
+  - [ ] GATE-1008 Point claude-config's gate.md, agent-standards and build-box README at the public guides
+  - [ ] GATE-1010 Rewrite the README and add docs/getting-started.md and docs/agents.md
+- [ ] GATE-1012 Harden the Windows builder prep's disk and event-log edges: RAW disks with data, the event log reboot, ReFS on Pro
+- [ ] GATE-1013 Close the install.ps1 toolchain check's leftover gaps: rustc beside rustup, toolchain overrides, test PATH shims
+- [ ] GATE-1014 Close the macOS builder prep's leftover gaps: root-side home reads, sshd -T re-read, tailscale ownership
+- [ ] GATE-1015 Close the Windows builder prep's leftover gaps: Public fallback at reboot, stock ssh rule after a late OpenSSH install
 
 ## Backlog
 
@@ -476,3 +486,9 @@
 - [ ] GATE-954 Arm the desktop helper's done wait on a test file, so the never-says-done case needs no 20 s wait
 - [ ] GATE-956 Escape the outside text the Windows box's remaining preflight and tools lines print raw
 - [ ] GATE-957 Keep gate check --builder from cutting an escaped created path mid-escape
+
+## Design files
+
+- [desktop-session.md](desktop-session.md) — GATE-385, GATE-561
+- [remote-cutover.md](remote-cutover.md) — GATE-192, Remote
+- [remote-inputs.md](remote-inputs.md) — GATE-332, GATE-334, GATE-335, GATE-337
