@@ -655,7 +655,10 @@ $makensis = Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'
 Invoke-Step 'NSIS 3.13' {
     if ((Test-Path $makensis) -and ((& $makensis /VERSION) -eq 'v3.13')) { Write-InstallLog 'NSIS: v3.13 already installed'; return }
     $sha = 'DB9A1038BBC0E53FEF24F423FD609979BD578E942F1BE1198DB186D1C42652A3'
-    $f = Get-File 'https://downloads.sourceforge.net/project/nsis/NSIS%203/3.13/nsis-3.13-setup.exe'
+    # SourceForge answers Invoke-WebRequest with its HTML download page; curl.exe gets the installer itself.
+    $f = Join-Path $dl 'nsis-3.13-setup.exe'
+    & curl.exe -sSfL -o $f 'https://downloads.sourceforge.net/project/nsis/NSIS%203/3.13/nsis-3.13-setup.exe'
+    if ($LASTEXITCODE) { throw "curl.exe exited $LASTEXITCODE downloading nsis-3.13-setup.exe" }
     $got = (Get-FileHash -Path $f -Algorithm SHA256).Hash
     if ($got -ne $sha) { throw "nsis-3.13-setup.exe SHA-256 is $got, expected $sha" }
     Invoke-Installer $f @('/S')
