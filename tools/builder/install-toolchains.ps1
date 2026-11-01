@@ -649,6 +649,18 @@ Invoke-Step 'zstd 1.5.7' {
     Copy-Item $exe.FullName -Destination $tools -Force
     Remove-Item $tmp -Recurse -Force
 }
+# rustling-tulip's rt.ps1 installer packages its release exes with makensis, which it looks for under the default
+# install folder before PATH. Upstream publishes no checksum; this one matches the winget manifest NSIS.NSIS 3.13.
+$makensis = Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'
+Invoke-Step 'NSIS 3.13' {
+    if ((Test-Path $makensis) -and ((& $makensis /VERSION) -eq 'v3.13')) { Write-InstallLog 'NSIS: v3.13 already installed'; return }
+    $sha = 'DB9A1038BBC0E53FEF24F423FD609979BD578E942F1BE1198DB186D1C42652A3'
+    $f = Get-File 'https://downloads.sourceforge.net/project/nsis/NSIS%203/3.13/nsis-3.13-setup.exe'
+    $got = (Get-FileHash -Path $f -Algorithm SHA256).Hash
+    if ($got -ne $sha) { throw "nsis-3.13-setup.exe SHA-256 is $got, expected $sha" }
+    Invoke-Installer $f @('/S')
+    if (-not (Test-Path $makensis)) { throw "nsis-3.13-setup.exe /S exited 0 and left no $makensis" }
+}
 Sync-SessionPath
 Invoke-Step 'pnpm 12.5.1' {
     & npm.cmd install -g pnpm@12.5.1
@@ -889,6 +901,7 @@ $checks = [ordered]@{
     'python' = @('--version'); 'python3' = @('--version'); 'rustup' = @('toolchain', 'list')
     'cargo' = @('--version'); 'cargo-nextest' = @('nextest', '--version'); 'just' = @('--version'); $godotConsole = @('--version', '--headless')
     'ffmpeg' = @('-version'); 'ffprobe' = @('-version'); 'zstd' = @('--version'); 'bun' = @('--revision'); 'sccache' = @('--version')
+    $makensis = @('/VERSION')
 }
 foreach ($exe in $checks.Keys) {
     $out = try { (& $exe @($checks[$exe]) 2>&1) -join ' | ' } catch { "error: $($_.Exception.Message)" }
