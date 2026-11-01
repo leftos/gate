@@ -784,6 +784,156 @@ fn a_command_in_another_worktree_of_an_unlisted_repo_keeps_the_outside_line() {
     }
 }
 
+/// The routing file of the cases whose command names another worktree's file: repo `rt` with one pattern, which only
+/// the script's rewritten relative form matches.
+const RT_ROUTING: &str = r#"{"host": "builder-1", "repos": {"rt": ["pwsh -NoProfile -File rt.ps1 test"]}}"#;
+
+/// A gate at the root of the main checkout of `rt`, whose routing file is [`RT_ROUTING`], knowing the worktree `tree`
+/// as one of `checkout`'s.
+fn with_rt_tree(tree: &str, checkout: &str) -> FakeFacts {
+    FakeFacts {
+        config: Ok(Some(Config::parse(RT_ROUTING).expect("usable"))),
+        place: Ok(Some(place("", "rt"))),
+        trees: vec![PathBuf::from(tree)],
+        checkouts: vec![(PathBuf::from(tree), checkout.to_owned())],
+        ..FakeFacts::at_root()
+    }
+}
+
+#[test]
+fn a_command_naming_a_file_in_another_worktree_that_matches_there_stays_here_naming_cd() {
+    let other = r"X:\dev\yaat.wt\rt-780";
+    let script = format!(r"{other}\rt.ps1");
+    let command = words(&["pwsh", "-NoProfile", "-File", &script, "test"]);
+    let facts = with_rt_tree(other, "rt");
+    let line = format!("gate: not routed: the command works in {other}; run it with --cd {other}");
+
+    assert_eq!(local_line(&decide(&heavy(&command), &facts)), Some(line));
+    assert_eq!(*facts.trees_asked.borrow(), [PathBuf::from(&script)], "the word's path, asked once");
+}
+
+#[test]
+fn a_command_naming_a_file_in_another_worktree_that_matches_nothing_there_stays_silent() {
+    let other = r"X:\dev\yaat.wt\rt-780";
+    let script = format!(r"{other}\rt.ps1");
+    let command = words(&["pwsh", "-NoProfile", "-File", &script, "build"]);
+    let facts = with_rt_tree(other, "rt");
+
+    assert_eq!(decide(&heavy(&command), &facts), SILENT);
+    assert_eq!(*facts.trees_asked.borrow(), [PathBuf::from(&script)], "the word's path, asked once");
+}
+
+#[test]
+fn a_command_naming_a_file_in_another_repo_s_tree_stays_silent() {
+    // The words rewritten against that tree match the pattern; only the repo the routing file lists keeps the command
+    // silent.
+    let other = r"X:\dev\yaat.wt\tools-1";
+    let script = format!(r"{other}\rt.ps1");
+    let command = words(&["pwsh", "-NoProfile", "-File", &script, "test"]);
+    let facts = with_rt_tree(other, "tools");
+
+    assert_eq!(decide(&heavy(&command), &facts), SILENT);
+}
+
+/// [`with_rt_tree`] with the routing file `routing` in place of [`RT_ROUTING`].
+fn with_rt_tree_routed(tree: &str, checkout: &str, routing: &str) -> FakeFacts {
+    FakeFacts {
+        config: Ok(Some(Config::parse(routing).expect("usable"))),
+        ..with_rt_tree(tree, checkout)
+    }
+}
+
+#[test]
+fn a_command_naming_a_file_in_another_worktree_is_matched_by_that_tree_s_repo() {
+    let other = r"X:\dev\tools.wt\tools-1";
+    let script = format!(r"{other}\rt.ps1");
+    let routing = r#"{"host": "builder-1", "repos": {"rt": ["pwsh -NoProfile -File rt.ps1 build"],
+        "tools": ["pwsh -NoProfile -File rt.ps1 test"]}}"#;
+    let test = words(&["pwsh", "-NoProfile", "-File", &script, "test"]);
+    let build = words(&["pwsh", "-NoProfile", "-File", &script, "build"]);
+    let line = format!("gate: not routed: the command works in {other}; run it with --cd {other}");
+
+    assert_eq!(
+        local_line(&decide(&heavy(&test), &with_rt_tree_routed(other, "tools", routing))),
+        Some(line),
+        "the tree's repo's pattern"
+    );
+    assert_eq!(
+        decide(&heavy(&build), &with_rt_tree_routed(other, "tools", routing)),
+        SILENT,
+        "the run's own repo's pattern is not that tree's"
+    );
+}
+
+#[test]
+fn a_command_naming_files_in_another_worktree_and_in_its_own_stays_silent() {
+    // Run from that tree, the word in the run's own tree would be outside it: no --cd routes the command.
+    let other = r"X:\dev\yaat.wt\rt-780";
+    let script = format!(r"{other}\rt.ps1");
+    let routing = r#"{"host": "builder-1", "repos": {"rt": ["pwsh -NoProfile -File rt.ps1 test *"]}}"#;
+    let command = words(&["pwsh", "-NoProfile", "-File", &script, "test", r"X:\dev\yaat.wt\a\x.txt"]);
+
+    assert_eq!(decide(&heavy(&command), &with_rt_tree_routed(other, "rt", routing)), SILENT);
+}
+
+#[test]
+fn a_relative_word_climbing_into_another_worktree_stays_silent() {
+    // Rerun from that tree as written, the word climbs out of it too: no --cd routes the command.
+    let other = r"X:\dev\yaat.wt\rt-780";
+    let command = words(&["pwsh", "-NoProfile", "-File", r"..\rt-780\rt.ps1", "test"]);
+    let facts = with_rt_tree(other, "rt");
+
+    assert_eq!(decide(&heavy(&command), &facts), SILENT);
+    assert_eq!(*facts.trees_asked.borrow(), [PathBuf::from(r"X:\dev\yaat.wt\rt-780\rt.ps1")]);
+}
+
+#[test]
+fn a_command_another_worktree_s_local_file_keeps_here_stays_silent() {
+    let other = r"X:\dev\yaat.wt\rt-780";
+    let script = format!(r"{other}\rt.ps1");
+    let command = words(&["pwsh", "-NoProfile", "-File", &script, "test"]);
+    let facts = FakeFacts {
+        local: Ok(patterns(&["pwsh -NoProfile -File rt.ps1 *"])),
+        ..with_rt_tree(other, "rt")
+    };
+
+    assert_eq!(decide(&heavy(&command), &facts), SILENT);
+    assert_eq!(facts.local_read.get(), 1, "the tree's .gate/local.toml, read as a run there reads it");
+}
+
+#[test]
+fn a_command_naming_the_own_root_by_another_spelling_is_not_matched_there() {
+    // A junction to the root: another spelling, the root's folder id.
+    let junction = r"X:\links\yaat-a";
+    let script = format!(r"{junction}\rt.ps1");
+    let command = words(&["pwsh", "-NoProfile", "-File", &script, "test"]);
+    let facts = FakeFacts {
+        ids: vec![(junction.to_owned(), Ok(fake_id(ROOT)))],
+        ..with_rt_tree(junction, "rt")
+    };
+    assert_eq!(decide(&heavy(&command), &facts), SILENT, "a junction to the root");
+    assert_eq!(
+        local_line(&decide(&heavy(&command), &with_rt_tree(junction, "rt"))),
+        Some(format!("gate: not routed: the command works in {junction}; run it with --cd {junction}")),
+        "the same folder with an id of its own is another tree"
+    );
+
+    // When an id cannot be read the spellings are compared, and another tree's is no own root's.
+    let other = r"X:\dev\yaat.wt\rt-780";
+    let command = words(&["pwsh", "-NoProfile", "-File", r"X:\dev\yaat.wt\rt-780\rt.ps1", "test"]);
+    let line = Some(format!("gate: not routed: the command works in {other}; run it with --cd {other}"));
+    let tree_unreadable = FakeFacts {
+        ids: vec![(other.to_owned(), Err("access denied".to_owned()))],
+        ..with_rt_tree(other, "rt")
+    };
+    let root_unreadable = FakeFacts {
+        root_id: Err("access denied".to_owned()),
+        ..with_rt_tree(other, "rt")
+    };
+    assert_eq!(local_line(&decide(&heavy(&command), &tree_unreadable)), line, "the tree's id");
+    assert_eq!(local_line(&decide(&heavy(&command), &root_unreadable)), line, "the root's id");
+}
+
 #[test]
 fn another_spelling_of_the_own_root_is_not_told_to_cd() {
     // A junction to the root: another spelling, the root's folder id.

@@ -627,6 +627,57 @@ fn a_command_in_another_worktree_is_told_to_cd_and_journals_why() {
     assert!(log.contains(&line), "{log}");
 }
 
+#[test]
+fn a_gate_naming_a_script_in_another_worktree_says_why_it_stays_here() {
+    // The case folder is the main checkout; the other tree is a linked worktree of its repo. The pattern matches only
+    // the script's path as rewritten against that tree, never as the main checkout leaves it, absolute.
+    let case = routed_case("routing-other-worktree-script");
+    let git_folder = case.folder().join(".git").join("worktrees").join("other");
+    fs::create_dir_all(&git_folder).expect("the main checkout's git folder for the worktree can be made");
+    fs::write(git_folder.join("commondir"), "../..\n").expect("the commondir file can be written");
+    let other = beside_case(&case, ".other");
+    let gitdir = shown(&git_folder).replace('\\', "/");
+    fs::write(other.join(".git"), format!("gitdir: {gitdir}\n")).expect("a linked worktree's .git file can be written");
+    let routing = json!({ "host": HOST, "repos": { repo(&case): ["*tool* out rt.ps1"] } });
+    write_remote_json(&case, &routing.to_string());
+    let script = shown(&other.join("rt.ps1"));
+    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "out", &script])));
+
+    let line = cd_line(&other);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(&format!("{line}\n")), "{outcome:?}");
+    assert!(!outcome.stderr.contains("is outside the worktree"), "one line, not both: {outcome:?}");
+    assert!(outcome.stdout.contains(&script), "the command ran here: {outcome:?}");
+    assert_local(&events(&case), Some(ANOTHER_WORKTREE));
+}
+
+#[test]
+fn the_local_file_another_worktree_is_judged_by_leaves_no_note_in_the_log() {
+    // The other tree has no .gate/local.toml of its own, so its repo's declarations folder supplies one.
+    let case = routed_case("routing-other-worktree-local");
+    let git_folder = case.folder().join(".git").join("worktrees").join("other");
+    fs::create_dir_all(&git_folder).expect("the main checkout's git folder for the worktree can be made");
+    fs::write(git_folder.join("commondir"), "../..\n").expect("the commondir file can be written");
+    let other = beside_case(&case, ".other");
+    let gitdir = shown(&git_folder).replace('\\', "/");
+    fs::write(other.join(".git"), format!("gitdir: {gitdir}\n")).expect("a linked worktree's .git file can be written");
+    let routing = json!({ "host": HOST, "repos": { repo(&case): ["*tool* out rt.ps1"] } });
+    write_remote_json(&case, &routing.to_string());
+    let folder = declarations_holding(&case, &[("local.toml", "patterns = ['*matches nothing*']\n")]);
+    name_declarations(&case, &folder);
+    let script = shown(&other.join("rt.ps1"));
+    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "out", &script])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains(&cd_line(&other)),
+        "the tree was judged, its local file read: {outcome:?}"
+    );
+    let log = log_texts(&case.folder().join("out.log"));
+    assert!(!log.contains("local.toml read from"), "{log}");
+    assert!(!outcome.stderr.contains("local.toml read from"), "{outcome:?}");
+}
+
 /// The line a routed run says for the caller's watched variables it does not send, as far as its first name.
 const DROPPED_LINE: &str = "gate: a routed run does not send the caller's ";
 

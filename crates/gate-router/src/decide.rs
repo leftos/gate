@@ -389,7 +389,9 @@ pub trait Facts {
     fn desktop(&self, place: &Place) -> Result<DesktopDeclaration, String>;
 
     /// The patterns the worktree root's `.gate/local.toml` declares, read from disk as it stands; none when there is no
-    /// such file. Asked only of a command one of its repo's patterns matched, before its siblings are checked.
+    /// such file. Asked only of a command one of its repo's patterns matched, before its siblings are checked; and of
+    /// another worktree's root for an unmatched command that one of that tree's repo's patterns matches as rewritten
+    /// there, as a run from that root would ask it.
     ///
     /// # Errors
     ///
@@ -416,7 +418,8 @@ pub trait Facts {
     fn sibling_folder(&self, root: &str) -> Result<SiblingFolder, String>;
 
     /// The id of the worktree root's folder, opened following links. Asked for every matched command with no siblings
-    /// file problem, once every present sibling passes its checks.
+    /// file problem, once every present sibling passes its checks; and, of the tree and the run's root, when a command's
+    /// outside path lies in a worktree of a listed repo ([`Facts::worktree_of`]), to tell it from the run's own.
     ///
     /// # Errors
     ///
@@ -425,13 +428,14 @@ pub trait Facts {
 
     /// The folder taken as the git worktree `path` lies in: the nearest of `path` and the folders above it that holds a
     /// `.git` file or folder, read from metadata alone with no git started; `None` when none on the way holds one, and
-    /// when `path` is not absolute or lies on a drive that is remote or not there. Asked only of a matched command whose
-    /// outside word names a path ([`Rewritten::outside_path`]).
+    /// when `path` is not absolute or lies on a drive that is remote or not there. Asked only of a command whose outside
+    /// word names a path ([`Rewritten::outside_path`]), once: as the matched command ends, or, when none of its repo's
+    /// patterns matches it, to match it again as rewritten against the tree it lies in.
     fn worktree_of(&self, path: &Path) -> Option<PathBuf>;
 
     /// The folder name of the main checkout of the worktree at `tree`, as [`Place::checkout`] names the run's own: the
     /// parent of its common git folder, read from its `.git` alone with no git started; `None` when it cannot be read.
-    /// Asked only of a tree [`Facts::worktree_of`] found that is not the run's own.
+    /// Asked only of a tree [`Facts::worktree_of`] found that is not the run's own, matched or not.
     fn checkout_of(&self, tree: &Path) -> Option<String>;
 
     /// What the PC knows of each of `builders` for the command `words`, rewritten for Windows, of the worktree at
@@ -1102,34 +1106,117 @@ fn outside_reason(config: &Config, word: String, matched: &Matched, facts: &dyn 
     let tree = matched
         .outside_path
         .as_deref()
-        .and_then(|path| facts.worktree_of(path))
-        .filter(|tree| !is_own_tree(tree, &matched.target, facts))
-        .filter(|tree| facts.checkout_of(tree).is_some_and(|checkout| config.is_routed(&repo_name(&checkout))));
+        .and_then(|path| listed_tree(config, path, |tree| is_own_tree(tree, &matched.target, facts), facts));
     match tree {
-        Some(tree) => LocalReason::OtherWorktree { tree },
+        Some((tree, _)) => LocalReason::OtherWorktree { tree },
         None => LocalReason::Outside { word },
     }
 }
 
-/// Whether `tree` is the root of `target` or of one of its carried siblings: its folder id ([`Facts::root_id`]) is the
-/// root's or a sibling's, so a junction, a short name or any other spelling of them is caught. When its id cannot be
-/// read, the spellings are compared instead ([`spelled_as_own`]): a tree that cannot be opened is no folder to name a
-/// different one by.
+/// The git worktree `path` lies in ([`Facts::worktree_of`]) when there is one, `is_own` says it is not the run's own
+/// root nor a sibling's, and the routing file `config` lists its repo, named from its main checkout's folder
+/// ([`Facts::checkout_of`]) as the run names its own; with that folder name. What [`outside_reason`] and
+/// [`another_worktree`] both look the tree up by.
+fn listed_tree(config: &Config, path: &Path, is_own: impl FnOnce(&Path) -> bool, facts: &dyn Facts) -> Option<(PathBuf, String)> {
+    let tree = facts.worktree_of(path)?;
+    let checkout = facts.checkout_of(&tree).filter(|checkout| config.is_routed(&repo_name(checkout)))?;
+    (!is_own(&tree)).then_some((tree, checkout))
+}
+
+/// What the unmatched command is judged by in [`another_worktree`]: the worktree it was opened in, its words as
+/// rewritten there and as given, and the subst table they were rewritten under.
+struct Unmatched<'a> {
+    opened: &'a Opened,
+    sent: &'a Rewritten,
+    words: &'a [String],
+    drives: &'a [(char, String)],
+}
+
+/// Why the command `words`, which none of its repo's patterns matched as the worktree `opened` rewrote them (`sent`),
+/// runs here: the `--cd` line ([`LocalReason::OtherWorktree`]) when its outside path ([`Rewritten::outside_path`]) lies
+/// in another git worktree of a repo the routing file lists ([`listed_tree`]) and a run from that tree's root would
+/// route it: its words as given, rewritten against that root with no siblings, name nothing outside it (a relative
+/// word climbing out of the gate's folder climbs out of that root too), their first word names no program that stays
+/// here ([`stays_local`]), a gate in a git hook has `hooks` consent for that repo, one of the repo's patterns matches
+/// them, and that tree's `.gate/local.toml` does not keep them here ([`check_local`]). Else silently. A command with
+/// no outside path asks nothing.
+fn another_worktree(config: &Config, unmatched: &Unmatched<'_>, git_hook: bool, facts: &dyn Facts) -> Here {
+    let Unmatched { opened, sent, words, drives } = *unmatched;
+    let path = sent.outside_path.as_deref()?;
+    let (tree, checkout) = listed_tree(config, path, |tree| is_opened_tree(tree, opened, facts), facts)?;
+    let repo = repo_name(&checkout);
+    if git_hook && config.hooks_allowed(&repo) != Ok(true) {
+        return None;
+    }
+    // Spelled with `/`, as git's `--show-toplevel` gives every other place's root.
+    let root = tree.to_string_lossy().replace('\\', "/");
+    let place = Place {
+        root: root.clone(),
+        prefix: String::new(),
+        checkout,
+        folder: root,
+    };
+    let there = rewritten(&place, std::iter::empty(), words, drives, Separators::AsWritten);
+    let routes_there = there.outside.is_none()
+        && !(there.program_named && stays_local(&there.words))
+        && config
+            .routes(&repo)
+            .into_iter()
+            .any(|(_, patterns)| first_match(patterns, &there.words).is_some())
+        && check_local(&place, &there.words, facts).is_ok();
+    routes_there.then_some(LocalReason::OtherWorktree { tree })
+}
+
+/// Whether `tree` is the root of `target` or of one of its carried siblings ([`is_root_or_sibling`]).
 fn is_own_tree(tree: &Path, target: &Target, facts: &dyn Facts) -> bool {
-    match facts.root_id(&tree.to_string_lossy()) {
-        Ok(id) => id == target.root_id || target.siblings.iter().any(|sibling| sibling.id == id),
-        Err(_) => spelled_as_own(tree, target),
+    is_root_or_sibling(
+        tree,
+        (|| Some(target.root_id), target.siblings.iter().map(|sibling| sibling.id)),
+        std::iter::once(target.place.root.as_str()).chain(target.siblings.iter().map(|sibling| sibling.root.as_str())),
+        facts,
+    )
+}
+
+/// Whether `tree` is the root of the worktree `opened`, not yet settled, or of one of its present siblings
+/// ([`SiblingFolder::Present`]) ([`is_root_or_sibling`]), the root's id read of [`Facts::root_id`].
+fn is_opened_tree(tree: &Path, opened: &Opened, facts: &dyn Facts) -> bool {
+    let sibling_ids = opened.siblings.iter().filter_map(|sibling| match sibling.folder {
+        Some(Ok(SiblingFolder::Present(id))) => Some(id),
+        _ => None,
+    });
+    is_root_or_sibling(
+        tree,
+        (|| facts.root_id(&opened.place.root).ok(), sibling_ids),
+        std::iter::once(opened.place.root.as_str()).chain(declared_pairs(&opened.siblings).map(|(_, root)| root)),
+        facts,
+    )
+}
+
+/// Whether `tree` is a worktree's root or one of its siblings': its folder id ([`Facts::root_id`]) is the root's, as
+/// the first of `ids` reads it, or one of the siblings' ids, so a junction, a short name or any other spelling of them
+/// is caught. When either the tree's or the root's id cannot be read, the spellings `roots` are compared instead
+/// ([`spelled_as_any`]): a tree that cannot be opened is no folder to name a different one by.
+fn is_root_or_sibling<'r>(
+    tree: &Path,
+    (root_id, mut sibling_ids): (impl FnOnce() -> Option<FolderId>, impl Iterator<Item = FolderId>),
+    roots: impl Iterator<Item = &'r str>,
+    facts: &dyn Facts,
+) -> bool {
+    let ids = facts
+        .root_id(&tree.to_string_lossy())
+        .ok()
+        .and_then(|id| root_id().map(|root_id| (id, root_id)));
+    match ids {
+        Some((id, root_id)) => id == root_id || sibling_ids.any(|sibling_id| sibling_id == id),
+        None => spelled_as_any(tree, roots),
     }
 }
 
-/// Whether `tree` spells the root of `target` or of one of its carried siblings, compared in any letter case and with
-/// either separator, trailing ones aside.
-fn spelled_as_own(tree: &Path, target: &Target) -> bool {
+/// Whether `tree` spells one of `roots`, compared in any letter case and with either separator, trailing ones aside.
+fn spelled_as_any<'r>(tree: &Path, mut roots: impl Iterator<Item = &'r str>) -> bool {
     let folded = |path: &str| path.replace('\\', "/").trim_end_matches('/').to_owned();
     let tree = folded(&tree.to_string_lossy());
-    std::iter::once(target.place.root.as_str())
-        .chain(target.siblings.iter().map(|sibling| sibling.root.as_str()))
-        .any(|root| eq_ignoring_case(&folded(root), &tree))
+    roots.any(|root| eq_ignoring_case(&folded(root), &tree))
 }
 
 /// Whether a gate of `slot` may route at all: a heavy or light one, never a critical or no-slot one.
@@ -1526,7 +1613,13 @@ fn matched(config: &Config, inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Ma
         opened_and_sent(config, git_hook, words, facts, |repo| config.is_routed(repo)).map_err(|unopened| unopened.here(git_hook))?;
     let matching = matching(config, &opened.repo, &sent.words);
     if matching.is_empty() {
-        return Err(None);
+        let unmatched = Unmatched {
+            opened: &opened,
+            sent: &sent,
+            words,
+            drives: &drives,
+        };
+        return Err(another_worktree(config, &unmatched, git_hook, facts));
     }
     check_local(&opened.place, &sent.words, facts)?;
     let local_p50 = (inputs.slot == Slot::Light)

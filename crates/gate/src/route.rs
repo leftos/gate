@@ -840,10 +840,16 @@ impl<'a> Machine<'a> {
     }
 
     /// The declaration file `name` of the repo at `place` ([`read_declaration`]), its declarations folder the one the
-    /// routing file the decision read names, its log lines kept among the notes and how the lines name it kept.
+    /// routing file the decision read names, its log lines kept among the notes and how the lines name it kept. A file
+    /// of a worktree other than the gate's own (another worktree's `.gate/local.toml`, read only to judge whether a
+    /// command is told to `--cd` there) keeps neither: this run's log and lines are about its own worktree.
     fn declaration(&self, place: &Place, name: &str) -> Result<Option<Vec<u8>>, String> {
         let repo = repo_name(&place.checkout);
         let (read, source) = read_declaration(Path::new(&place.root), &repo, self.config.borrow().as_ref(), name);
+        let own = self.found.borrow().place().is_none_or(|own| own.root == place.root);
+        if !own {
+            return read;
+        }
         self.notes.borrow_mut().extend(source.log_lines(&repo, name));
         let mut said = self.said.borrow_mut();
         said.retain(|(read_name, _)| read_name != name);
