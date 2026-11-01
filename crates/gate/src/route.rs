@@ -132,6 +132,8 @@ pub(crate) struct Decision {
     local: bool,
     git_hook: bool,
     words: Vec<String>,
+    /// The words as the caller wrote them, for a run that dropped its `--no-build` before its decision.
+    given: Option<Vec<String>>,
     unicode: bool,
     local_app_data: Option<OsString>,
     /// `--builder <host>`, the one builder the run is pinned to.
@@ -150,6 +152,7 @@ impl Decision {
             local: request.local,
             git_hook: environment.git_index_file.as_deref().is_some_and(|value| !value.is_empty()),
             words: request.command.iter().map(|word| word.to_string_lossy().into_owned()).collect(),
+            given: None,
             unicode: request.command.iter().all(|word| word.to_str().is_some()),
             local_app_data: environment.local_app_data.clone(),
             pin: request.builder.clone(),
@@ -164,6 +167,7 @@ impl Decision {
             local: self.local,
             git_hook: self.git_hook,
             words: &self.words,
+            given: self.given.as_deref(),
             pin: self.pin.as_deref(),
         }
     }
@@ -173,17 +177,20 @@ impl Decision {
 /// here when there is a reason to say, or the lines of a routed run, then the problem of its repo's `.gate/env.toml`
 /// when it has one ([`declared_prefixes`]), and the line of the watched variables it does not send ([`dropped_line`]),
 /// the names the repo's declared prefixes start among them, after them. A command that would route but has a word that
-/// is not valid Unicode runs here, saying so. A gate under a `covering_parent`'s slot runs here, saying nothing. With
+/// is not valid Unicode runs here, saying so. A gate under a `covering_parent`'s slot runs here, saying nothing. A run
+/// that dropped its `--no-build` before its decision names the words the caller wrote as `given`, which the repo's
+/// `.gate/local.toml` is matched against too ([`Inputs::given`]). With
 /// the route, what the decision learnt of the gate's place in its git worktree, and, for a routed run of a repo whose
 /// warm-up is set up, the hash of its warm-up file ([`consented_hash`]).
 pub(crate) fn route(
     request: &RunRequest,
     environment: &Environment,
-    covering_parent: bool,
+    (covering_parent, given): (bool, Option<&[String]>),
     (root, gate): (&ResolvedRoot, &ThisGate),
     console: &mut Console,
 ) -> Decided {
-    let decision = Decision::of(request, environment, covering_parent, &root.path);
+    let mut decision = Decision::of(request, environment, covering_parent, &root.path);
+    decision.given = given.map(<[String]>::to_vec);
     let mut machine = Machine::new(environment, &request.test_seams)
         .with_state(&decision)
         .reading_figures(FigureReader::of(request, root, gate));

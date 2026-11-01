@@ -230,13 +230,8 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         closing: Vec::new(),
         builder_call: BuilderCall::NotEnded,
     };
-    let (route, placed) = run.route(environment, console);
-    if let Some(status) = ended_at_route(&route, request, &run.log, console) {
-        return status;
-    }
-    run.route_beside_commit(&route, &mut beside);
-    let local = match run.take_local(&route, &placed, console) {
-        Ok(local) => local,
+    let (route, local) = match run.settle_route(environment, &mut beside, console) {
+        Ok(settled) => settled,
         Err(status) => return status,
     };
     say_nesting(run.nesting, run.request, console);
@@ -1681,6 +1676,35 @@ struct Ended {
 }
 
 impl<'a> Run<'a> {
+    /// The route the run goes by, decided by `environment` ([`Run::route`]), and the words it runs here
+    /// ([`Run::take_local`]). A light run here that would drop its `--no-build` drops it first and is decided as a heavy
+    /// run of the words it left ([`Run::drop_before_route`]), its repo's `.gate/local.toml` matched against the words as
+    /// given too. A routed gate a commit run's slot covers then routes beside
+    /// that run, its nesting kept in `beside` ([`Run::route_beside_commit`]), and the run reads its durations
+    /// ([`Run::open_durations`]).
+    ///
+    /// # Errors
+    ///
+    /// The status a refused route ends the run with ([`ended_at_route`]), or the one [`Run::take_local`] ends it with.
+    fn settle_route(
+        &mut self,
+        environment: &Environment,
+        beside: &'a mut Option<Nesting>,
+        console: &mut Console,
+    ) -> Result<(Route, Option<HereWords>), u32> {
+        let given = unicode_words(&self.request.command);
+        let dropped = self.drop_before_route(console);
+        let given = given.filter(|_| dropped.is_some());
+        let (route, placed) = self.route(environment, given.as_deref(), console);
+        if let Some(status) = ended_at_route(&route, self.request, &self.log, console) {
+            return Err(status);
+        }
+        let local = self.take_local(&route, &placed, dropped, console)?;
+        self.route_beside_commit(&route, beside);
+        self.durations = self.open_durations(&placed);
+        Ok((route, local))
+    }
+
     /// Has a routed gate a commit run's slot covers route beside that run, its nesting kept in `beside`: it queues,
     /// takes and releases a remote slot of its own as a gate under no covering parent does, its lines naming the commit
     /// run as its parent. Once it falls back here it runs under the commit run's slot again
@@ -1802,7 +1826,9 @@ impl Run<'_> {
     /// is not routed ([`Run::on_parent`]); a run pinned with `--builder` asks for no lend, so it routes whatever a
     /// critical request is doing. The route, and what the decision learnt of the gate's place in its worktree.
     /// The hash of the warm-up file the route asks the builder's work folder to be warm with is kept for the call.
-    fn route(&mut self, environment: &Environment, console: &mut Console) -> (Route, Placed) {
+    /// `given` holds the words as the caller wrote them for a run that dropped its `--no-build` before its route
+    /// ([`route::route`]).
+    fn route(&mut self, environment: &Environment, given: Option<&[String]>, console: &mut Console) -> (Route, Placed) {
         if self.request.builder.is_none() && self.lend_before_queue(console) {
             self.lent = true;
             return (Route::Local { reason: None }, Placed::NotAsked);
@@ -1815,7 +1841,7 @@ impl Run<'_> {
             placed: place,
             warm_hash,
             decision,
-        } = route::route(self.request, environment, covering, (self.root, &self.gate), console);
+        } = route::route(self.request, environment, (covering, given), (self.root, &self.gate), console);
         self.warm_hash = warm_hash;
         self.would = Some(decision);
         self.may_reroute = !matches!(route, Route::Routed(_));
@@ -1832,6 +1858,23 @@ impl Run<'_> {
             self.routing.balanced = remote.balanced.take();
         }
         (route, place)
+    }
+
+    /// The words a light run here would run once it dropped its `--no-build` ([`Run::here_words`]), worked out before
+    /// its route, which the run then decides as a heavy run of those words: the run takes the request and nesting of a
+    /// run here that runs them and asks for a heavy slot ([`Run::as_heavy`], [`Run::run_as`]). The proof of speed that
+    /// keeps a light run here is of the `--no-build` words, not of the build the run would make. `None`, the run left
+    /// as it is, for a run of any other slot, an `--alone` run (refused when it would drop, [`alone_refused`]), a run
+    /// pinned with `--builder`, which routes as given, and a run that keeps its words.
+    fn drop_before_route(&mut self, console: &mut Console) -> Option<HereWords> {
+        if self.request.slot != Slot::Light || self.request.alone || self.request.builder.is_some() {
+            return None;
+        }
+        let here = self.here_words(None, console)?;
+        here.dropped.as_ref()?;
+        let heavy = self.as_heavy(&here.words, console);
+        self.run_as(heavy);
+        Some(here)
     }
 
     /// The durations of a run that takes a slot of its own, read once it knows the command it journals and before it
@@ -2024,7 +2067,10 @@ impl Run<'_> {
             Route::Routed(remote) => match self.routed(remote, hold, console) {
                 Remotely::Ended(ended) => return Some((ended, None)),
                 Remotely::Interrupted => return None,
-                Remotely::Here => self.plan_here(remote, plan, console),
+                // A light run that dropped its `--no-build` before its route falls back to the words it left.
+                Remotely::Here => self
+                    .plan_local(plan, local, console)
+                    .and_then(|(plan, _)| self.plan_here(remote, plan, console)),
             },
             Route::Refused(_) => unreachable!("run returns a refused pin's usage status before the run goes through"),
         };
@@ -3016,15 +3062,28 @@ impl Run<'_> {
     }
 
     /// The words of a run here from the start ([`Run::local_words`]), once the run took the words it left when it
-    /// dropped its `--no-build` ([`take_dropped`]) and read its durations, as it now knows the command it journals
-    /// ([`Run::open_durations`]). An `--alone` run not pinned with `--builder` readies its log here, once its
-    /// `--no-build` is known to stand ([`readies_log_first`]).
+    /// dropped its `--no-build` ([`take_dropped`]), so it now knows the command it journals and reads its durations by
+    /// ([`Run::open_durations`]). A light run that dropped the word before its route (`dropped`,
+    /// [`Run::drop_before_route`]) keeps those words, which a fallback here runs too, and says its drop line now: as a
+    /// run here does when its route kept it here, else without where it builds ([`Run::dropped_line`]). An `--alone`
+    /// run not pinned with `--builder` readies its log here, once its `--no-build` is known to stand
+    /// ([`readies_log_first`]).
     ///
     /// # Errors
     ///
     /// The usage status of an `--alone` run whose `--no-build` would be dropped, refused with its line said
     /// ([`alone_refused`]), or the failed status of a log that cannot be readied ([`prepare_log`]).
-    fn take_local(&mut self, route: &Route, placed: &Placed, console: &mut Console) -> Result<Option<HereWords>, u32> {
+    fn take_local(&mut self, route: &Route, placed: &Placed, dropped: Option<HereWords>, console: &mut Console) -> Result<Option<HereWords>, u32> {
+        if let Some(here) = dropped {
+            if let Some(reason) = &here.dropped {
+                let line = match route {
+                    Route::Routed(_) => format!("gate: dropped --no-build: {reason}"),
+                    Route::Local { .. } | Route::Refused(_) => self.dropped_line(reason),
+                };
+                console.err(&line);
+            }
+            return Ok(Some(here));
+        }
         let local = self.local_words(route, placed.place(), console);
         if self.request.alone {
             if alone_refused(local.as_ref(), console) {
@@ -3035,7 +3094,6 @@ impl Run<'_> {
             }
         }
         take_dropped(self, local.as_ref(), console);
-        self.durations = self.open_durations(placed);
         Ok(local)
     }
 
@@ -3047,6 +3105,13 @@ impl Run<'_> {
         if matches!(route, Route::Routed(_)) {
             return None;
         }
+        self.here_words(place, console)
+    }
+
+    /// The words of a run here, its worktree when it is known, and why its `--no-build` was dropped, as
+    /// [`Run::local_words`] says them of a run its route kept here. `None` for a command with a word that is not valid
+    /// Unicode.
+    fn here_words(&self, place: Option<&Place>, console: &mut Console) -> Option<HereWords> {
         let words = unicode_words(&self.request.command)?;
         let mut found = place.map(|place| Worktree {
             root: place.root.clone(),

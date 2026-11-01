@@ -6185,6 +6185,160 @@ fn a_light_gate_proven_faster_here_says_so_and_journals_faster_here() {
 }
 
 #[test]
+fn a_light_no_build_run_that_drops_its_no_build_is_routed_as_heavy() {
+    let case = routed_case("routing-light-dropped-routes");
+    dotnet_cmd(&case);
+    tracked_project(&case, "app/App.csproj", false);
+    let command = [r".\dotnet.cmd", "test", "--no-build"];
+    seed_faster_here(&case, &command, &[HOST], 1.0, 100.0);
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let mut before = vec!["--test-remote-client", steps.as_str()];
+    before.extend(GIT_HANG_GUARDS);
+
+    let running = case.start(&run_words("out.log", &before, &command));
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(DROPPED), "the run said it dropped the word: {outcome:?}");
+    assert!(
+        !outcome.stderr.contains("building on"),
+        "a routed run builds on no slot here: {outcome:?}"
+    );
+    assert!(call.exists(), "the words the run left match a pattern and route: {outcome:?}");
+    let sent = recorded(&call);
+    let words = recorded_words(&sent);
+    assert!(
+        words.contains(&"test") && !words.contains(&"--no-build"),
+        "the builder ran the words the run left: {words:?}"
+    );
+    let events = own(&case, pid);
+    assert_eq!(took_on(&case, pid), [HOST], "the run took a slot of the builder: {events:#?}");
+    let queue = events.iter().find(|event| event["event"] == "queue").expect("the run queued");
+    assert!(queue.get("notRouted").is_none(), "a run the builder takes names no reason: {queue}");
+}
+
+#[test]
+fn a_dropped_no_build_run_that_stays_here_carries_no_faster_here_reason() {
+    let case = routed_case("routing-light-dropped-stays");
+    dotnet_cmd(&case);
+    tracked_project(&case, "app/App.csproj", false);
+    let command = [r".\dotnet.cmd", "test", "--no-build"];
+    write_remote_json(
+        &case,
+        &json!({ "host": HOST, "repos": { repo(&case): [r".\dotnet.cmd test --no-build"] } }).to_string(),
+    );
+    seed_faster_here(&case, &command, &[HOST], 1.0, 100.0);
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let mut before = vec!["--test-remote-client", steps.as_str()];
+    before.extend(GIT_HANG_GUARDS);
+
+    let running = case.start(&run_words("out.log", &before, &command));
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!call.exists(), "no pattern matches the words the run left: {outcome:?}");
+    assert_eq!(command_lines(&outcome.stdout), ["test"], "the run here left the word: {outcome:?}");
+    let events = own(&case, pid);
+    assert_eq!(took_on(&case, pid), ["here"], "the run stayed here: {events:#?}");
+    let queue = events.iter().find(|event| event["event"] == "queue").expect("the run queued");
+    assert!(queue.get("notRouted").is_none(), "the heavy decision kept it here for no reason: {queue}");
+}
+
+#[test]
+fn a_later_builder_after_a_dropped_no_build_gets_the_words_the_run_left() {
+    let case = routed_case("routing-dropped-next-builder");
+    dotnet_cmd(&case);
+    tracked_project(&case, "app/App.csproj", false);
+    let routing = json!({
+        "host": HOST,
+        "repos": { repo(&case): ["*dotnet.cmd*"] },
+        "builders": [{ "host": SLOT_FIRST, "os": "windows", "repos": { repo(&case): ["*dotnet.cmd*"] } }],
+    });
+    write_remote_json(&case, &routing.to_string());
+    let (first, next) = (case.folder().join("first.json"), case.folder().join("next.json"));
+    let (record_first, record_next) = (format!("record {}", shown(&first)), format!("record {}", shown(&next)));
+    let (on_first, on_next) = (format!("on {SLOT_FIRST}"), format!("on {HOST}"));
+    let steps = shown(&stub(
+        &case,
+        &[&on_first, &record_first, "refuse version", &on_next, &record_next, "status 0"],
+    ));
+
+    let outcome = finish(case.gate(&light_routed_words("out.log", &steps, &NO_BUILD_TEST)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains(" version; trying "),
+        "the run went on to the next builder: {outcome:?}"
+    );
+    for call in [&first, &next] {
+        let sent = recorded(call);
+        let words = recorded_words(&sent);
+        assert!(
+            words.contains(&"test") && !words.contains(&"--no-build"),
+            "each builder got the words left: {words:?}"
+        );
+    }
+}
+
+#[test]
+fn a_local_light_no_build_run_that_drops_says_its_local_line_once() {
+    let case = routed_case("routing-dropped-local-once");
+    dotnet_cmd(&case);
+    tracked_project(&case, "app/App.csproj", false);
+
+    let outcome = finish(case.gate(&run_words("here.log", &KEPT_HERE, &NO_BUILD_TEST)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let local = outcome.stderr.lines().filter(|line| *line == "gate: not routed: --local").count();
+    assert_eq!(local, 1, "the one decision says why it stays here once: {outcome:?}");
+    let line = r"gate: dropped --no-build: app/App.csproj has no obj\project.assets.json here; building on a heavy slot";
+    assert!(outcome.stderr.contains(line), "{outcome:?}");
+    assert_eq!(command_lines(&outcome.stdout), ["test"], "{outcome:?}");
+}
+
+#[test]
+fn a_repo_that_declares_the_no_build_spelling_local_keeps_a_dropped_run_here() {
+    let case = routed_case("routing-dropped-declared-local");
+    dotnet_cmd(&case);
+    tracked_project(&case, "app/App.csproj", false);
+    declare_local(&case, "patterns = ['*dotnet.cmd test --no-build*']\n");
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+
+    let outcome = finish(case.gate(&light_routed_words("out.log", &steps, &NO_BUILD_TEST)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!call.exists(), "the repo keeps the words as written here: {outcome:?}");
+    let declared = "gate: not routed: .gate/local.toml keeps it here (*dotnet.cmd test --no-build*)";
+    let said = outcome.stderr.lines().filter(|line| *line == declared).count();
+    assert_eq!(said, 1, "the one decision says why it stays here once: {outcome:?}");
+    assert_eq!(command_lines(&outcome.stdout), ["test"], "{outcome:?}");
+}
+
+#[test]
+fn a_dropped_no_build_run_the_builder_refuses_runs_the_words_it_left_here() {
+    let case = routed_case("routing-dropped-fallback");
+    dotnet_cmd(&case);
+    tracked_project(&case, "app/App.csproj", false);
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "refuse busy"]));
+
+    let outcome = finish(case.gate(&light_routed_words("out.log", &steps, &NO_BUILD_TEST)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(call.exists(), "the run routed first: {outcome:?}");
+    assert_eq!(
+        command_lines(&outcome.stdout),
+        ["test"],
+        "the fallback ran the words the run left: {outcome:?}"
+    );
+}
+
+#[test]
 fn a_builder_with_a_free_slot_wins_over_a_full_builder_listed_first() {
     let case = balance_case("routing-balance-free-slot");
     let go = case.folder().join("go");

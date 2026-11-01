@@ -223,8 +223,11 @@ pub struct Inputs<'a> {
     pub local: bool,
     /// Whether `GIT_INDEX_FILE` is set to a non-empty value: the gate runs inside a git hook.
     pub git_hook: bool,
-    /// The command's words as given.
+    /// The command's words: as given, or as the gate runs them once it dropped a `--no-build` from them.
     pub words: &'a [String],
+    /// The words as given when the gate dropped a `--no-build` from them before its decision: a `.gate/local.toml`
+    /// pattern that matches either these or `words` keeps the run here. `None` when `words` are the words as given.
+    pub given: Option<&'a [String]>,
     /// `--builder <host>`: the one builder the run may go to, as given; `None` for a run the pick routes.
     pub pin: Option<&'a str>,
 }
@@ -1163,7 +1166,7 @@ fn another_worktree(config: &Config, unmatched: &Unmatched<'_>, git_hook: bool, 
             .routes(&repo)
             .into_iter()
             .any(|(_, patterns)| first_match(patterns, &there.words).is_some())
-        && check_local(&place, &there.words, facts).is_ok();
+        && check_local(&place, &[&there.words], facts).is_ok();
     routes_there.then_some(LocalReason::OtherWorktree { tree })
 }
 
@@ -1621,7 +1624,8 @@ fn matched(config: &Config, inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Ma
         };
         return Err(another_worktree(config, &unmatched, git_hook, facts));
     }
-    check_local(&opened.place, &sent.words, facts)?;
+    let given = inputs.given.map(|given| written(&opened, given, facts)).unwrap_or_default();
+    check_local(&opened.place, &[&sent.words, &given], facts)?;
     let local_p50 = (inputs.slot == Slot::Light)
         .then(|| facts.local_p50(&opened.place, &sent.words))
         .flatten();
@@ -2020,7 +2024,7 @@ enum Unkept {
 fn kept_run(config: &Config, sent: OpenedAndSent, chosen: (Builder, String), given: &[String], facts: &dyn Facts) -> Result<RemoteRun, Unkept> {
     let (opened, drives, sent) = sent;
     let (builder, pattern) = chosen;
-    check_local(&opened.place, &sent.words, facts).map_err(Unkept::Here)?;
+    check_local(&opened.place, &[&sent.words], facts).map_err(Unkept::Here)?;
     let (found, unkept) = macos_kept_off(config, &builder, &opened, &sent.words, facts).map_err(Unkept::Here)?;
     if let Some(unkept) = unkept {
         return Err(unkept);
@@ -2360,18 +2364,29 @@ fn judged_path(slashed: &str) -> Option<&str> {
     (!path.is_empty()).then_some(path)
 }
 
-/// Keeps a matched command here, saying why, when the worktree's `.gate/local.toml` at `place` declares a pattern its
-/// rewritten `words` match, joined by single spaces as the repo's patterns see them, naming the first that matches, or
-/// when the file has a problem, shown [`escaped`]: a command the repo keeps here must not route because its file
-/// cannot be read.
-fn check_local(place: &Place, words: &[String], facts: &dyn Facts) -> Result<(), Here> {
+/// `given`, the words as the caller wrote them, rewritten for the `opened` worktree as [`opened_and_sent`] rewrites the
+/// words a decision sends.
+fn written(opened: &Opened, given: &[String], facts: &dyn Facts) -> Vec<String> {
+    let drives = subst_drives(&opened.place.root, given, facts);
+    rewritten(&opened.place, declared_pairs(&opened.siblings), given, &drives, Separators::AsWritten).words
+}
+
+/// Keeps a matched command here, saying why, when the worktree's `.gate/local.toml` at `place` declares a pattern one of
+/// its rewritten `spellings` matches, each joined by single spaces as the repo's patterns see them, naming the first
+/// pattern the first spelling that matches any matches, or when the file has a problem, shown [`escaped`]: a command
+/// the repo keeps here must not route because its file cannot be read. An empty spelling matches nothing.
+fn check_local(place: &Place, spellings: &[&[String]], facts: &dyn Facts) -> Result<(), Here> {
     let declared = facts.local(place).map_err(|problem| {
         Some(LocalReason::LocalFile {
             file: escaped(&facts.declaration_said(place, "local.toml")),
             problem: escaped(&fold_lines(&problem)),
         })
     })?;
-    match first_match(&declared, words) {
+    let matched = spellings
+        .iter()
+        .filter(|words| !words.is_empty())
+        .find_map(|words| first_match(&declared, words));
+    match matched {
         Some(pattern) => Err(Some(LocalReason::DeclaredLocal {
             file: escaped(&facts.declaration_said(place, "local.toml")),
             pattern,
