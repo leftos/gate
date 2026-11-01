@@ -142,7 +142,7 @@ Never suspend a thread during its start-up: it holds the loader lock, and the ri
 
 The Windows builder's Win32-OpenSSH blocks forever writing its first stderr line when stderr is a pipe, so a suite case that reached the machine's real ssh there sat out the whole 120 s stall window; the suite puts a fake-ssh guard first on every case's PATH for that reason (GATE-948). On this PC the same ssh exits at once.
 
-To probe a builder without writing files there, pipe a script into `ssh {builder} "pwsh -NoProfile -NonInteractive -Command -"`. To read a builder process's stacks, write a minidump there with `MiniDumpWriteDump` from PowerShell, scp it back, delete it there, and read it here with `cdb -z` and the Win32-OpenSSH release's symbols zip.
+To probe a builder without writing files there, pass the script as `ssh {builder} "pwsh -NoProfile -NonInteractive -EncodedCommand {base64 of the UTF-16LE script}"`; a script piped into `-Command -` runs only up to its first multi-line statement and prints nothing after it. To read a builder process's stacks, write a minidump there with `MiniDumpWriteDump` from PowerShell, scp it back, delete it there, and read it here with `cdb -z` and the Win32-OpenSSH release's symbols zip.
 
 A hold rig on a box LFS case roots on `box run`: the box's LFS checkout starts two `sh.exe` and `uname.exe`, which git-lfs waits on with no limit. `GIT_TRACE2_EVENT` reaches box children through `-Env` with an absolute builder path. Keep a hanging routed run's log before its worktree is removed: it records every process start and exit, so a hung process shows as a start with no exit (GATE-939).
 
