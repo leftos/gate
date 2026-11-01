@@ -4,7 +4,6 @@
 
 ## Do first
 
-- [ ] GATE-996 Keep suite cases from judging the outer launcher's orphan state, and stop the orphan line advising a self-kill — Urgent · Local gate
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [!] GATE-828 Fix the flaky Unix box test a_clear_refuses_a_volume_mounted_in_the_work_folder_and_keeps_its_files — Urgent · Remote
 - [ ] GATE-871 Carry routed runs' bulk data on a TCP data channel instead of ssh to the Windows builder — Urgent · Remote
@@ -15,7 +14,6 @@
 - [!] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [!] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
 - [ ] GATE-634 Route a commit's whole pre-commit hook stage to a builder as one run — High · Remote
-- [ ] GATE-987 Read the commits consent, judge a commit's stage eligible and snapshot the index tree — High · Remote
 - [ ] GATE-989 Route an eligible commit's pre-commit stage and apply its fixes to the index and worktree — High · Remote
 - [ ] GATE-990 Skip the local hooks a routed stage ran through a gate-owned forwarder hooks folder — High · Remote
 - [!] GATE-839 Route race-anywhere's Unreal editor and game runs: a desktop route with a GPU — High · Remote
@@ -43,6 +41,7 @@
 - [ ] GATE-860 Keep the stall watchdog from killing a job starved by a busy machine
 - [ ] GATE-941 Read process CPU from one system list per sample in the watch and the load report
 - [ ] GATE-972 Settle a thread-less job member once its handle is signalled
+- [ ] GATE-998 Journal the process chain an orphan refusal walked
 
 ## Remote
 
@@ -347,6 +346,7 @@
 - [ ] GATE-994 Say an unusable remote.json desktop value in gate check, and read remote.json once per check
 - [ ] GATE-995 Say --cd for a matched command only when the other tree's patterns match its rewritten words
 - [ ] GATE-997 Judge a junction to a present sibling as the run's own tree when the root's id cannot be read
+- [ ] GATE-999 Refuse a commit stage for include configs, prek subproject configs and config-based hooks
 
 ## Cutover sweep
 
