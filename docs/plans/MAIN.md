@@ -13,7 +13,16 @@
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
 - [!] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [!] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
+- [ ] GATE-634 Route a commit's whole pre-commit hook stage to a builder as one run — High · Remote
 - [!] GATE-839 Route race-anywhere's Unreal editor and game runs: a desktop route with a GPU — High · Remote
+- [!] GATE-974 Route rustling-tulip's whole rt.ps1 native-e2e over the builder's desktop route — High · Remote
+- [ ] GATE-975 Say why a command naming another worktree's file stays local, and route it with --cd — High · Remote
+- [ ] GATE-976 Route rustling-tulip's native-shot on the builder's desktop, with .tmp/shots outputs — High · Remote
+- [ ] GATE-977 Install NSIS 3 on the builders so rustling-tulip's rt.ps1 installer routes — High · Remote
+- [ ] GATE-978 Send the gitignored .tmp files a routed dotnet probe names as inputs — High · Remote
+- [ ] GATE-979 Route yaat's PrecomputeCache and GuideCapture runs and delve's strikes rewrite with their tracked outputs — High · Remote
+- [ ] GATE-980 Find why heavy filtered dotnet test runs say faster here and never route — High · Remote
+- [ ] GATE-982 Queue a desktop run behind the builder's busy desktop, and run session-only commands without the desktop lock — High · Remote
 - [!] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
@@ -32,6 +41,7 @@
 - [ ] GATE-819 Reorder the other stall-window suite cases that need a step inside the window
 - [ ] GATE-860 Keep the stall watchdog from killing a job starved by a busy machine
 - [ ] GATE-941 Read process CPU from one system list per sample in the watch and the load report
+- [ ] GATE-972 Settle a thread-less job member once its handle is signalled
 
 ## Remote
 
@@ -40,6 +50,7 @@
 - [ ] GATE-885 Close GATE-873's remaining launch-window and path-read gaps
 - [ ] GATE-879 Release a builder slot a passing preflight took when the PC falls back on its own judgement
 - [ ] GATE-792 Read a work folder's idleness from its stamped lock alone in the Windows box prune
+- [ ] GATE-971 Support pwsh as the builder's sshd default shell
 - [ ] GATE-804 Refuse or flag a timing or burn run whose local build is missing
 - [ ] GATE-614 Lock the Unix box's work root down: held open, ACLs, the folders above it, a pinned root
   - [ ] GATE-775 Judge the Unix box's login PATH folders and the folder xcode-select names
@@ -155,7 +166,6 @@
 - [ ] GATE-438 Stop the elevated ssh session trusting the builder user's profile (bare pwsh, HKCU environment, cmd AutoRun)
 - [ ] GATE-446 Judge the builder's installed gate.exe before the push runs it elevated
 - [ ] GATE-448 Read a Godot --script path against --path when deciding a route
-- [ ] GATE-958 Measure fairly whether routing commit-hook builds makes commits slower (sub-issue of GATE-449)
 - [ ] GATE-455 Escape the command word in the outside-the-worktree line
 - [ ] GATE-456 End or re-slot a gate that outlives its box run
 - [ ] GATE-460 Judge the --cd tree lookup by final paths, not spellings
@@ -211,7 +221,6 @@
 - [ ] GATE-626 Journal the rest of where a run's time went: phase bytes, nested gates, ready time
 - [ ] GATE-627 Read a repo's outputs, inputs and routed-command wishes from its tracked .gate/, not remote.json
 - [ ] GATE-633 Give a commit hook gate's heavy fallback build its durations
-- [ ] GATE-634 Route a commit's whole pre-commit hook stage to a builder as one run
 - [ ] GATE-639 Test the macOS snapshot from a subfolder and list the repo once per decision
 - [ ] GATE-640 Refuse a macOS builder root holding ':' when remote.json is read
 - [ ] GATE-642 Give the remaining suite probe and git reads seam windows above load
@@ -242,7 +251,6 @@
 - [ ] GATE-713 Close three low edge cases in the Unix box's inputs verb
 - [ ] GATE-720 Bridge each push on a snapshot the builder still advertises
 - [ ] GATE-733 Say a descendant's exec on the Unix box when its image changes after spawn
-- [ ] GATE-736 Route rustling-tulip's rt.ps1 native-e2e to the builder
 - [ ] GATE-737 Routed Godot --build-solutions fails on the builder: no .godot/imported in its copy
 - [ ] GATE-744 Say why a local project build adds no key to the nothing-back record
 - [ ] GATE-746 Pin a failing routed command's written tracked files coming back
@@ -330,6 +338,9 @@
 - [ ] GATE-968 Delete a key's refs in one git call per bare on the Unix box's keyed prune
 - [ ] GATE-969 Skip history refs for a partial clone in the routed push
 - [ ] GATE-970 Pin a routed run's origin default branch to the base its own push sent
+- [ ] GATE-981 Name nested repos, git -C commits and light commits correctly in the local-run census
+- [ ] GATE-983 Restore a routed dotnet build's project here when it is named by its folder
+- [ ] GATE-984 Bring back less than every bin after a routed yaat test-all
 
 ## Cutover sweep
 
