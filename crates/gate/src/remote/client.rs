@@ -1674,6 +1674,7 @@ impl Attempt<'_, '_> {
             unreal_version: chosen.unreal.as_deref(),
             engine_env: &chosen.engine_env,
             desktop: self.call.desktop,
+            usual_p90: self.call.usual.map(|usual| usual.p90),
             cross_build: self.call.cross_build,
             base: snapshot.base.as_ref().map(|base| base.name.as_str()),
             sibling_bases: &sibling_bases,

@@ -3,7 +3,7 @@
 //! payloads refused with exit 2, and the command handed to the seam's stand-in helper and run in the run's job.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use gate_win32::{OpenedJob, StoppableProcess};
 use gate_wire::stamp::unstamped;
@@ -54,6 +54,12 @@ const BUSY_FOR_1_S: &str = "gate: not routed: the builder's desktop stayed busy 
 
 /// The line the box says once when another run holds the builder's desktop as it starts waiting.
 const BUSY_WAIT: &str = "gate: remote waiting for the builder's desktop: another run holds it";
+
+/// The start of every line the box says once when another run holds the builder's desktop as it starts waiting.
+const BUSY_WAIT_PREFIX: &str = "gate: remote waiting for the builder's desktop: ";
+
+/// The start of the busy-wait line naming a holder of the repo `yaat`, before the seconds it has held the desktop.
+const HELD_BY_YAAT: &str = "gate: remote waiting for the builder's desktop: held by yaat for ";
 
 /// The line the box says when it takes the builder's desktop from a run that ended holding it.
 const ABANDONED: &str = "gate: remote took the builder's desktop from a run that ended without releasing it";
@@ -895,6 +901,62 @@ fn a_second_desktop_run_waits_for_the_first_and_then_runs() {
         at(BUSY_WAIT).zip(at(&marker)).is_some_and(|(busy, marker)| busy < marker),
         "the marker comes after the busy line: {outcome:?}"
     );
+}
+
+/// The box's record of the run holding the builder's desktop, in the folder of `payload`'s work folder.
+fn holder_record(payload: &Value) -> PathBuf {
+    Path::new(field(payload, "Work"))
+        .parent()
+        .expect("the work folder is in a folder")
+        .join("desktop-holder.json")
+}
+
+#[test]
+fn a_run_waiting_for_the_desktop_names_the_run_that_holds_it() {
+    let case = Case::new("desktop_wait_names_holder");
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let mut holding = desktop_payload(&case, "a", &[FAKE_TOOL, "out", "holding", "wait", &go_word], 600);
+    holding["Repo"] = json!("yaat");
+    snapshot(&case, &mut holding, &[("a.txt", "a\n")]);
+    let mut waiting = desktop_payload(&case, "b", COMMAND, 600);
+    snapshot(&case, &mut waiting, &[("a.txt", "a\n")]);
+
+    let holder = desktop_call(&case, &holding, "ok", &[]).start();
+    holder.wait_for_stdout("holding");
+    let waiter = desktop_call(&case, &waiting, "ok", &[]).start();
+    waiter.wait_for_stderr(HELD_BY_YAAT);
+    let_go(&go);
+    let held = holder.finish_read();
+    let waited = waiter.finish_read();
+
+    assert_eq!(held.code, Some(0), "the holder ran: {held:?}");
+    assert_eq!(waited.code, Some(0), "the waiter took the desktop once it was free: {waited:?}");
+    let named = Regex::new(r"^gate: remote waiting for the builder's desktop: held by yaat for \d+ s$").expect("the pattern compiles");
+    let said = lines_starting(&waited, BUSY_WAIT_PREFIX);
+    assert!(
+        said.len() == 1 && named.is_match(said[0]),
+        "the busy line names the holder, once: {waited:?}"
+    );
+    ran_its_command(&waited, &waiting);
+}
+
+#[test]
+fn a_desktop_run_that_lets_the_lock_go_leaves_no_holder_record() {
+    let case = Case::new("desktop_holder_record_removed");
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let payload = ready_payload(&case, &[FAKE_TOOL, "out", "holding", "wait", &go_word]);
+    let record = holder_record(&payload);
+
+    let running = desktop_call(&case, &payload, "ok", &[]).start();
+    running.wait_for_stdout("holding");
+    assert!(record.is_file(), "the run holding the desktop keeps its holder record");
+    let_go(&go);
+    let outcome = running.finish_read();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!record.exists(), "the run that let the desktop go removed its holder record: {outcome:?}");
 }
 
 #[test]

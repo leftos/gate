@@ -187,6 +187,9 @@ pub(super) struct Request<'a> {
     /// How long the run may wait for the builder's desktop, in whole seconds; `None` on a run that does not ask for
     /// one, whatever its `DesktopWait` said.
     desktop_wait: Option<u64>,
+    /// The run's repository, its `Repo`, which the record of a run holding the builder's desktop names; the work
+    /// folder's key when the payload gives none, and on a run that does not ask for the desktop, whatever it gives.
+    repo: &'a str,
     /// The PC's name for the builder, which the box's kill line names, empty when the payload gives none.
     host: &'a str,
     /// The digest of the inputs manifest the client installed the run's inputs from, `None` when it sent none.
@@ -221,6 +224,8 @@ impl Request<'_> {
         } else {
             None
         };
+        // Only a desktop run's holder record names it, so no other run reads it.
+        let repo = if desktop { payload.repo()?.unwrap_or(key) } else { key };
         let bare = payload.path("Bare")?;
         let lock = payload.beside_work("Lock", work, "lock")?;
         let index = payload.beside_work("Index", work, "index")?;
@@ -265,6 +270,7 @@ impl Request<'_> {
             timeout,
             desktop,
             desktop_wait,
+            repo,
             host,
             inputs_digest,
             sent_digest,

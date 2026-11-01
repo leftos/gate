@@ -7,22 +7,34 @@
 
 mod hand_off;
 
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read};
+use std::os::windows::fs::OpenOptionsExt;
+use std::path::Path;
 use std::sync::PoisonError;
 use std::time::{Duration, Instant};
 
 use gate_args::{BoxSeams, DesktopSession};
 use gate_router::escaped;
 use gate_win32::{Account, AcquireError, ConnectState, LockState, MutexGuard, PrivateMutex, PrivateName, QueryOnlyProcess, SessionState};
+use jiff::Timestamp;
+use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
-use crate::boxside::desktop::lines::{DesktopRefusal, Limits, abandoned_line, busy_timeout_line, busy_wait_line, capped_wait, session_verdict};
+use crate::boxside::desktop::lines::{
+    DesktopHolder, DesktopRefusal, Limits, abandoned_line, busy_timeout_line, busy_wait_line, capped_wait, session_verdict,
+};
+use crate::boxside::run::FILE_FLAG_OPEN_REPARSE_POINT;
 use crate::boxside::run::{Beat, CLOSED_STATUS, One, REFUSED_STATUS, Ran, Request, STARTING_COMMAND, before_the_job, prepared};
 use crate::boxside::stamping;
+use crate::boxside::tools::write_record_file;
 use crate::console::Console;
 use crate::remote::{Refusal, refused_line};
 
 /// The user name the session seam `other-user` puts at the console: one no account of the box has.
 const OTHER_USER: &str = "gate-seam-other-user";
+
+/// The name of the record of the run holding the builder's desktop, in the box's work root ([`HolderRecord`]).
+const HOLDER_RECORD: &str = "desktop-holder.json";
 
 /// How a desktop run that did not run its command ended, its lines said.
 pub(super) enum DesktopEnd {
@@ -108,17 +120,25 @@ pub(super) fn desktop_command(request: &Request<'_>, one: &One<'_>, wait: u64, b
         .and_then(|name| PrivateMutex::open(&name))
         .map_err(|error| desktop_refused(request, &DesktopRefusal::DesktopLock(error.to_string()).into(), beat, console))?;
     let limits = run_limits(beat.seams);
-    let total = capped_wait(Duration::from_secs(wait), request.timeout.map(Duration::from_secs));
-    let guard = match wait_for_desktop(&mutex, total, limits.wait_step, beat, console) {
+    let turns = Turns {
+        total: capped_wait(Duration::from_secs(wait), request.timeout.map(Duration::from_secs)),
+        step: limits.wait_step,
+        now: Instant::now,
+    };
+    let record = HolderRecord::of(request);
+    let guard = match wait_for_desktop(&mutex, &turns, &record, beat, console) {
         Ok(guard) => guard,
         Err(Unheld::Ended(status)) => return Err(DesktopEnd::Ended(status)),
-        Err(Unheld::Busy) => return Err(said_refused(request, &[busy_timeout_line(total)], beat, console)),
+        Err(Unheld::Busy) => return Err(said_refused(request, &[busy_timeout_line(turns.total)], beat, console)),
         Err(Unheld::Failed(error)) => {
             let refusal = DesktopRefusal::Machinery(format!("the builder's desktop lock cannot be waited for: {error}"));
             return Err(desktop_refused(request, &refusal.into(), beat, console));
         }
     };
-    let session_id = account_and_console(beat.seams).map_err(|refused| desktop_refused(request, &refused, beat, console))?;
+    // Written while the lock is held and removed before it is let go, so no run ever removes the next holder's record.
+    let mut say = |line: &str| beat.say(console, line);
+    let session = held_session(&record, request.repo, || account_and_console(beat.seams), &mut say);
+    let session_id = session.map_err(|refused| desktop_refused(request, &refused, beat, console))?;
     let hold = DesktopHold {
         _guard: guard,
         session_id,
@@ -133,8 +153,122 @@ pub(super) fn desktop_command(request: &Request<'_>, one: &One<'_>, wait: u64, b
         session: hold.session_id,
     };
     let ran = hand_off::hand_off(&here, console);
+    record.remove(&mut |line: &str| beat.say(console, line));
     drop(hold);
     ran
+}
+
+/// The record of the run holding the builder's desktop, which a run waiting for it names in its busy-wait line and
+/// decides nothing from: [`HOLDER_RECORD`] in the box's work root, the folder of the run's work folder. It is written,
+/// its `.tmp` stage included, and read without following a link there and only as a plain file ([`write_record_file`],
+/// [`shared_record`]). Each failure is said once on stderr through `say`, and none fails the run.
+struct HolderRecord {
+    /// The record's path; `None` for a work folder in no folder, which keeps none.
+    path: Option<String>,
+}
+
+impl HolderRecord {
+    /// The holder record of the work root of `request`'s work folder.
+    fn of(request: &Request<'_>) -> HolderRecord {
+        HolderRecord::in_root(Path::new(request.work).parent())
+    }
+
+    /// The holder record in the work root `root`.
+    fn in_root(root: Option<&Path>) -> HolderRecord {
+        HolderRecord {
+            path: root.and_then(|root| root.join(HOLDER_RECORD).to_str().map(str::to_owned)),
+        }
+    }
+
+    /// The holder the record names; `None` when there is none, said through `say` when the record cannot be read or is
+    /// not a holder record.
+    fn holder(&self, say: &mut impl FnMut(&str)) -> Option<DesktopHolder> {
+        let path = self.path.as_deref()?;
+        let text = match shared_record(path).and_then(|file| file.map(read_whole).transpose()) {
+            Ok(text) => text?,
+            Err(error) => {
+                say(&record_failed_line(path, "read", &error.to_string()));
+                return None;
+            }
+        };
+        let holder = DesktopHolder::read(&text);
+        if holder.is_none() {
+            say(&record_failed_line(path, "read", "it is not a holder record"));
+        }
+        holder
+    }
+
+    /// Writes the record of a run of `repo` that takes the builder's desktop now, whole: to a `.tmp` stage first, then
+    /// renamed over the record, which replaces a link there rather than following it. When the write fails, the record
+    /// an earlier holder left is removed, so this run's hold is never said to be another's.
+    fn write(&self, repo: &str, say: &mut impl FnMut(&str)) {
+        let Some(path) = self.path.as_deref() else { return };
+        let holder = DesktopHolder {
+            repo: repo.to_owned(),
+            since: Timestamp::now(),
+        };
+        let staged = format!("{path}.tmp");
+        if let Err(error) = write_record_file(&staged, &holder.record()).and_then(|()| fs::rename(&staged, path)) {
+            say(&record_failed_line(path, "written", &error.to_string()));
+            self.remove(say);
+        }
+    }
+
+    /// Removes the record; one already gone is left so.
+    fn remove(&self, say: &mut impl FnMut(&str)) {
+        let Some(path) = self.path.as_deref() else { return };
+        match fs::remove_file(path) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => say(&record_failed_line(path, "removed", &error.to_string())),
+            _ => {}
+        }
+    }
+}
+
+/// The holder record at `path` opened to be read, `Ok(None)` when there is none: without following a link there and
+/// checked a plain file, as [`crate::boxside::tools::read_record`] opens a record, but sharing read, write and delete, so a waiter reading it
+/// never stops the holder's rename over it or its removal, nor another waiter's read.
+fn shared_record(path: &str) -> io::Result<Option<File>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    gate_win32::check_plain_file(&file)?;
+    Ok(Some(file))
+}
+
+/// The whole text of `file`.
+fn read_whole(mut file: File) -> io::Result<String> {
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// The box's line saying the holder record at `path` could not be `done` (written, read or removed), and why.
+fn record_failed_line(path: &str, done: &str, why: &str) -> String {
+    format!(
+        "gate: the builder's desktop holder record {} could not be {done}: {}",
+        escaped(path),
+        escaped(why)
+    )
+}
+
+/// The console's session read again while the run holds the builder's desktop (`read`), its holder `record` of a run
+/// of `repo` written first; a session that refuses the run removes the record before the lock is let go. Failures of
+/// the record are said through `say`.
+fn held_session(
+    record: &HolderRecord,
+    repo: &str,
+    read: impl FnOnce() -> Result<u32, ConsoleRefused>,
+    say: &mut impl FnMut(&str),
+) -> Result<u32, ConsoleRefused> {
+    record.write(repo, say);
+    read().inspect_err(|_| record.remove(say))
 }
 
 /// Why the builder's desktop lock was not taken.
@@ -147,23 +281,18 @@ enum Unheld {
     Failed(io::Error),
 }
 
-/// Takes the builder's desktop lock `mutex`, waiting in turns of at most `step`, and never past `total`: the run's
-/// client-gone flag and then the stop signal are looked at before each turn, a gone client ending the wait with
-/// [`CLOSED_STATUS`] and no line, the busy-wait line is said once when another run holds the lock and some of the wait
-/// is left, and a lock taken from a run that ended holding it is said. A `total` of zero is one try, with no wait and
-/// no busy-wait line.
+/// Takes the builder's desktop lock `mutex`, waiting in `turns`: the run's client-gone flag and then the stop signal
+/// are looked at before each turn, a gone client ending the wait with [`CLOSED_STATUS`] and no line, the busy-wait
+/// line, naming the holder `record` names when it names one, is said once when another run holds the lock and some of
+/// the wait is left, and a lock taken from a run that ended holding it is said. A total of zero is one try, with no
+/// wait and no busy-wait line.
 fn wait_for_desktop<'m>(
     mutex: &'m PrivateMutex,
-    total: Duration,
-    step: Duration,
+    turns: &Turns<impl Fn() -> Instant>,
+    record: &HolderRecord,
     beat: &Beat<'_>,
     console: &mut Console,
 ) -> Result<MutexGuard<'m>, Unheld> {
-    let turns = Turns {
-        total,
-        step,
-        now: Instant::now,
-    };
     let look = |console: &mut Console| {
         // Nothing has started yet, and the box's output that found the client gone is no place for a line.
         if beat.client_gone() {
@@ -171,8 +300,11 @@ fn wait_for_desktop<'m>(
         }
         before_the_job(beat.stop.look(STARTING_COMMAND), beat.stop.job, beat.lock, console)
     };
-    let busy = |console: &mut Console| beat.say(console, &busy_wait_line());
-    let guard = waited(&turns, console, look, |bound| mutex.acquire(bound), busy)?;
+    let busy = |console: &mut Console| {
+        let holder = record.holder(&mut |line: &str| beat.say(console, line));
+        beat.say(console, &busy_wait_line(holder.as_ref(), Timestamp::now()));
+    };
+    let guard = waited(turns, console, look, |bound| mutex.acquire(bound), busy)?;
     if guard.abandoned() {
         beat.say(console, &abandoned_line());
     }
@@ -331,12 +463,16 @@ fn seam_name(_unique: &str) -> io::Result<PrivateName> {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::fs;
     use std::io;
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     use gate_win32::{Account, AcquireError, ConnectState, LockState, SessionState};
 
-    use super::{ConsoleRefused, Turns, Unheld, Unread, read_console, settled, waited};
+    use super::{
+        ConsoleRefused, HOLDER_RECORD, HolderRecord, Turns, Unheld, Unread, held_session, read_console, read_whole, settled, shared_record, waited,
+    };
     use crate::boxside::desktop::lines::DesktopRefusal;
     use crate::console::Console;
     use gate_router::escaped;
@@ -502,5 +638,153 @@ mod tests {
     #[test]
     fn a_refusal_without_a_system_error_is_one_line() {
         assert_eq!(ConsoleRefused::from(DesktopRefusal::Locked).lines().len(), 1);
+    }
+
+    /// A work root of its own for the holder record cases, removed when dropped.
+    struct Root(PathBuf);
+
+    impl Root {
+        #[expect(clippy::expect_used, reason = "a case whose folder cannot be made must fail loudly")]
+        fn new(test: &str) -> Root {
+            let folder = crate::test_support::temp_dir().join(format!("gate-holder-{}-{test}", std::process::id()));
+            let _ = fs::remove_dir_all(&folder);
+            fs::create_dir_all(&folder).expect("the work root can be made");
+            Root(folder)
+        }
+
+        fn record(&self) -> HolderRecord {
+            HolderRecord::in_root(Some(&self.0))
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_holder_record_is_written_named_and_removed_saying_nothing() {
+        let root = Root::new("round_trip");
+        let record = root.record();
+        let mut said = Vec::new();
+        let mut say = |line: &str| said.push(line.to_owned());
+
+        assert_eq!(record.holder(&mut say), None, "no record names no holder");
+        record.write("yaat", &mut say);
+        assert_eq!(record.holder(&mut say).map(|holder| holder.repo), Some("yaat".to_owned()));
+        record.remove(&mut say);
+        record.remove(&mut say);
+        assert_eq!(record.holder(&mut say), None, "a removed record names no holder");
+        assert!(said.is_empty(), "nothing failed, and a record already gone is no failure: {said:?}");
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a case whose files cannot be made must fail loudly")]
+    fn a_holder_record_that_is_no_record_or_a_second_name_names_no_holder_and_says_so() {
+        let root = Root::new("unread");
+        let record = root.record();
+        let mut said = Vec::new();
+
+        fs::write(root.path(HOLDER_RECORD), "{").expect("the record is planted");
+        assert_eq!(record.holder(&mut |line: &str| said.push(line.to_owned())), None);
+        fs::remove_file(root.path(HOLDER_RECORD)).expect("the planted record is removed");
+        let other = root.path("other.json");
+        fs::write(&other, r#"{"repo": "other", "since": "2026-11-01T12:00:00Z"}"#).expect("the other file is made");
+        fs::hard_link(&other, root.path(HOLDER_RECORD)).expect("the second name is made");
+        assert_eq!(
+            record.holder(&mut |line: &str| said.push(line.to_owned())),
+            None,
+            "a second name is not read"
+        );
+
+        let prefix = "gate: the builder's desktop holder record ";
+        assert_eq!(said.len(), 2, "each failed read is said once: {said:?}");
+        assert!(
+            said[0].starts_with(prefix) && said[0].ends_with("could not be read: it is not a holder record"),
+            "{said:?}"
+        );
+        assert!(said[1].starts_with(prefix) && said[1].contains("could not be read: "), "{said:?}");
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a case whose files cannot be made must fail loudly")]
+    fn a_failed_write_is_said_removes_the_earlier_record_and_the_run_goes_on() {
+        let root = Root::new("write_failed");
+        let record = root.record();
+        fs::write(root.path(HOLDER_RECORD), r#"{"repo": "earlier", "since": "2026-11-01T12:00:00Z"}"#).expect("the record is planted");
+        // A second name at the stage, which the write refuses rather than write through.
+        let other = root.path("other.txt");
+        fs::write(&other, "kept").expect("the other file is made");
+        fs::hard_link(&other, root.path(&format!("{HOLDER_RECORD}.tmp"))).expect("the second name is made");
+        let mut said = Vec::new();
+
+        let session = held_session(&record, "yaat", || Ok(3), &mut |line: &str| said.push(line.to_owned()));
+
+        assert_eq!(session.ok(), Some(3), "the run goes on to its session");
+        assert_eq!(said.len(), 1, "the failed write, said once: {said:?}");
+        assert!(said[0].contains("could not be written: "), "{said:?}");
+        assert!(!root.path(HOLDER_RECORD).exists(), "the earlier holder's record is removed");
+        assert_eq!(
+            fs::read_to_string(&other).expect("the other file reads"),
+            "kept",
+            "nothing is written through the link"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a case whose record cannot be opened must fail loudly")]
+    fn a_waiter_reading_the_holder_record_never_stops_the_holder_or_another_waiter() {
+        let root = Root::new("shared");
+        let record = root.record();
+        let path = root.path(HOLDER_RECORD).to_str().expect("the path is Unicode").to_owned();
+        let mut said = Vec::new();
+        record.write("first", &mut |line: &str| said.push(line.to_owned()));
+
+        let held = shared_record(&path).expect("the record opens").expect("the record is there");
+        let second = shared_record(&path).expect("a second waiter opens it too").expect("the record is there");
+        assert!(
+            read_whole(second).expect("the second waiter reads it").contains("first"),
+            "the second waiter reads the record"
+        );
+        record.write("yaat", &mut |line: &str| said.push(line.to_owned()));
+        let renamed = shared_record(&path).expect("the new record opens").expect("the new record is there");
+        assert!(
+            read_whole(renamed).expect("the new record reads").contains("yaat"),
+            "the rename replaced the record"
+        );
+        let held_new = shared_record(&path).expect("the new record opens").expect("the new record is there");
+        record.remove(&mut |line: &str| said.push(line.to_owned()));
+        drop((held, held_new));
+
+        assert!(said.is_empty(), "the rename over the open record and its removal both succeed: {said:?}");
+        assert!(!root.path(HOLDER_RECORD).exists(), "the removed record is gone");
+    }
+
+    #[test]
+    fn a_session_refused_under_the_lock_removes_the_holder_record() {
+        let root = Root::new("refused");
+        let record = root.record();
+        let mut said = Vec::new();
+        let mut written = false;
+
+        let session = held_session(
+            &record,
+            "yaat",
+            || {
+                written = root.path(HOLDER_RECORD).is_file();
+                Err(DesktopRefusal::Locked.into())
+            },
+            &mut |line: &str| said.push(line.to_owned()),
+        );
+
+        assert!(session.is_err(), "the locked console refuses the run");
+        assert!(written, "the record was written before the session was read");
+        assert!(!root.path(HOLDER_RECORD).exists(), "the refused run removed its record");
+        assert!(said.is_empty(), "{said:?}");
     }
 }

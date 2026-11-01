@@ -131,7 +131,7 @@ Worst case: the protocol code is new, unsafe-heavy Win32 work. It is testable en
   - `the desktop helper is not on the console's Default desktop`
   - `the desktop helper handed back <what>`
   - `the box cannot put the desktop command in its job: <error>`
-- Busy desktop: tag `busy` with `gate: remote the builder's desktop is busy; waited <n> s`. It is load, not a fault, which matters for GATE-27's per-host failure record. If it were `desktop`, a busy desktop would mark the builder as broken.
+- Busy desktop: tag `desktop` with `gate: not routed: the builder's desktop stayed busy for <n> s`.
 
 Worst case: the journal's `busy` mixes a busy worktree with a busy desktop, and only the line tells them apart.
 

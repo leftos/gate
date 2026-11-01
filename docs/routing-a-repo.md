@@ -174,7 +174,7 @@ The PC consents in `remote.json`: `"desktop": {"<repo>": ["dotnet test *Ui*"]}`,
 
 Without the consent the command runs here with `gate: not routed: desktop pattern '<pattern>' not allowed in remote.json`.
 
-A `.gate/desktop.toml` the gate cannot use keeps every routed command of the repo here with `gate: not routed: .gate/desktop.toml: <problem>`, so fix it before relying on routing. A desktop run holds a remote slot while it waits for the desktop, up to the usual 60 s remote wait. Format and rules: [design.md](design.md#remotejson).
+A `.gate/desktop.toml` the gate cannot use keeps every routed command of the repo here with `gate: not routed: .gate/desktop.toml: <problem>`, so fix it before relying on routing. A desktop run holds a remote slot while it waits for the desktop, up to the larger of 60 s and its usual routed p90, and the waiting box names the run that holds the desktop. Format and rules: [design.md](design.md#remotejson).
 
 ## A repo with a command that stays on this PC
 

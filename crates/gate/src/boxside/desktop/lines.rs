@@ -9,6 +9,8 @@ use std::time::Duration;
 use gate_desktop::HelperExit;
 use gate_router::escaped;
 use gate_win32::{ConnectState, EndReport, LockState, SessionState, StartedTask, TaskError};
+use jiff::Timestamp;
+use serde_json::{Value, json};
 
 use crate::boxside::desktop::verify::{Unproved, WrongFact};
 
@@ -258,10 +260,45 @@ impl Limits {
     }
 }
 
-/// The box's line, said once, when it starts waiting for the builder's desktop and another run holds it.
+/// The run holding the builder's desktop, as its holder record names it: the run's repo and when it took the lock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DesktopHolder {
+    pub(crate) repo: String,
+    pub(crate) since: Timestamp,
+}
+
+impl DesktopHolder {
+    /// The holder record's text, `{"repo": "<repo>", "since": "<UTC ISO 8601>"}`.
+    #[must_use]
+    pub(crate) fn record(&self) -> String {
+        json!({"repo": self.repo, "since": self.since.to_string()}).to_string()
+    }
+
+    /// The holder a holder record's text names; `None` for text that is not such a record.
+    #[must_use]
+    pub(crate) fn read(text: &str) -> Option<DesktopHolder> {
+        let record: Value = serde_json::from_str(text).ok()?;
+        let repo = record.get("repo")?.as_str()?.to_owned();
+        let since = record.get("since")?.as_str()?.parse().ok()?;
+        Some(DesktopHolder { repo, since })
+    }
+}
+
+/// The box's line, said once, when it starts waiting for the builder's desktop and another run holds it: the holder
+/// its record names and the whole seconds it has held the desktop at `now`, 0 for a start still to come, or no holder
+/// without a record.
 #[must_use]
-pub(crate) fn busy_wait_line() -> String {
-    "gate: remote waiting for the builder's desktop: another run holds it".to_owned()
+pub(crate) fn busy_wait_line(holder: Option<&DesktopHolder>, now: Timestamp) -> String {
+    match holder {
+        Some(holder) => {
+            let held = now.duration_since(holder.since).as_secs().max(0);
+            format!(
+                "gate: remote waiting for the builder's desktop: held by {} for {held} s",
+                escaped(&holder.repo)
+            )
+        }
+        None => "gate: remote waiting for the builder's desktop: another run holds it".to_owned(),
+    }
 }
 
 /// The box's line refusing a run that waited `wait` for the builder's desktop with another run still holding it: the
@@ -311,10 +348,11 @@ mod tests {
 
     use gate_desktop::HelperExit;
     use gate_win32::{ConnectState, EndReport, LockState, SessionState, StartedTask, TaskError};
+    use jiff::{SignedDuration, Timestamp};
 
     use super::{
-        CONNECT_LIMIT, DesktopRefusal, END_LIMIT, Limits, MESSAGE_LIMIT, TaskVerdict, WAIT_STEP, abandoned_line, busy_timeout_line, busy_wait_line,
-        capped_wait, could_not_end_line, end_report, session_verdict, task_verdict,
+        CONNECT_LIMIT, DesktopHolder, DesktopRefusal, END_LIMIT, Limits, MESSAGE_LIMIT, TaskVerdict, WAIT_STEP, abandoned_line, busy_timeout_line,
+        busy_wait_line, capped_wait, could_not_end_line, end_report, session_verdict, task_verdict,
     };
     use gate_router::escaped;
 
@@ -495,8 +533,63 @@ mod tests {
     }
 
     #[test]
+    fn a_holder_record_reads_back_as_written_and_anything_else_names_no_holder() {
+        let holder = DesktopHolder {
+            repo: "yaat".to_owned(),
+            since: "2026-11-01T12:00:00.25Z".parse().expect("the time parses"),
+        };
+        assert_eq!(
+            DesktopHolder::read(&holder.record()),
+            Some(holder),
+            "a record reads back as it was written"
+        );
+
+        for text in [
+            "",
+            "{",
+            "[]",
+            "null",
+            r#"{"repo": "yaat"}"#,
+            r#"{"since": "2026-11-01T12:00:00Z"}"#,
+            r#"{"repo": 7, "since": "2026-11-01T12:00:00Z"}"#,
+            r#"{"repo": "yaat", "since": 1767268800}"#,
+            r#"{"repo": "yaat", "since": "yesterday"}"#,
+        ] {
+            assert_eq!(DesktopHolder::read(text), None, "not a holder record: {text}");
+        }
+    }
+
+    #[test]
+    fn the_busy_wait_line_names_the_holder_and_how_long_it_has_held_the_desktop() {
+        let since: Timestamp = "2026-11-01T12:00:00Z".parse().expect("the time parses");
+        let holder = DesktopHolder {
+            repo: "yaat".to_owned(),
+            since,
+        };
+        let now = since + SignedDuration::from_millis(12_700);
+        assert_eq!(
+            busy_wait_line(Some(&holder), now),
+            "gate: remote waiting for the builder's desktop: held by yaat for 12 s",
+            "the time held is said in whole seconds"
+        );
+        assert_eq!(
+            busy_wait_line(Some(&holder), since - SignedDuration::from_secs(5)),
+            "gate: remote waiting for the builder's desktop: held by yaat for 0 s",
+            "a holder whose start is still to come has held it for 0 s"
+        );
+        assert_eq!(
+            busy_wait_line(None, now),
+            "gate: remote waiting for the builder's desktop: another run holds it",
+            "without a holder record the line names no holder"
+        );
+    }
+
+    #[test]
     fn the_three_lines_of_the_desktop_mutex_are_these() {
-        assert_eq!(busy_wait_line(), "gate: remote waiting for the builder's desktop: another run holds it");
+        assert_eq!(
+            busy_wait_line(None, Timestamp::UNIX_EPOCH),
+            "gate: remote waiting for the builder's desktop: another run holds it"
+        );
         assert_eq!(
             busy_timeout_line(Duration::from_mins(2)),
             "gate: not routed: the builder's desktop stayed busy for 120 s",
