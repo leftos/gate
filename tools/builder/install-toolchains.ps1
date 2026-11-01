@@ -751,6 +751,33 @@ Invoke-Step "keeper: MSYS sleep task $keeperTask" {
     }
     Write-InstallLog "task $keeperTask running: $keeperExe infinity as $User (S4U, Limited)"
 }
+# Every MSYS program of one user in one session shares one section, and the keeper above lives in session 0. Desktop
+# runs hand their commands to the console session, where several session-only runs may now start MSYS programs at once,
+# so a second keeper holds that session's section open from the console logon on.
+$consoleKeeperTask = 'build-box-msys-console-keeper'
+Invoke-Step "keeper: MSYS console sleep task $consoleKeeperTask" {
+    if (-not (Test-Path -LiteralPath $keeperExe)) { throw "$keeperExe does not exist; install Git for Windows first" }
+    $action = New-ScheduledTaskAction -Execute $keeperExe -Argument 'infinity'
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $User
+    $principal = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Limited
+    $settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) -DontStopOnIdleEnd -MultipleInstances IgnoreNew
+    Register-ScheduledTask -TaskName $consoleKeeperTask -Action $action -Trigger $trigger -Principal $principal `
+        -Settings $settings -Force | Out-Null
+    Stop-ScheduledTask -TaskName $consoleKeeperTask
+    for ($try = 1; $try -le 10 -and (Get-ScheduledTask -TaskName $consoleKeeperTask).State -eq 'Running'; $try++) {
+        Start-Sleep -Seconds 1
+    }
+    Start-ScheduledTask -TaskName $consoleKeeperTask
+    Start-Sleep -Seconds 2
+    $task = Get-ScheduledTask -TaskName $consoleKeeperTask
+    if ($task.State -ne 'Running') {
+        $result = ($task | Get-ScheduledTaskInfo).LastTaskResult
+        throw ("task $consoleKeeperTask is $($task.State) after Start-ScheduledTask (last result $result): it runs in $User's " +
+            "console session, so log $User on at the console (autologon), then rerun -Only ""keeper: MSYS console""")
+    }
+    Write-InstallLog "task $consoleKeeperTask running: $keeperExe infinity as $User (Interactive, Limited)"
+}
 # Throws unless $Path is a plain folder: New-Item -Force returns an existing junction or symbolic link, and icacls and
 # Get-Acl would then act on its target.
 function Assert-GateRootNotLink([string]$Path) {
