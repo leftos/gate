@@ -1,8 +1,9 @@
 //! The refusal of a gate started under an orphaned script: at start, a gate with no live parent gate walks its own
 //! ancestors to the first one whose parent is gone, stepping over Git Bash's fork stub to a live MSYS parent as the
 //! MSYS runtime records it, and refuses when that one is a shell running a script or a command, whose caller was killed
-//! and left the script stepping on alone. An elevated gate is not judged: an agent's killed sequence never runs
-//! elevated, and `sudo`'s elevated side exits once it has started its command.
+//! and left the script stepping on alone. The walk ends at a live gate, refusing nothing: a gate under a live gate was
+//! started by that gate's command, and that gate judged its own caller when it started. An elevated gate is not judged:
+//! an agent's killed sequence never runs elevated, and `sudo`'s elevated side exits once it has started its command.
 
 use std::io;
 
@@ -27,7 +28,7 @@ impl Orphan {
         let Orphan { image, pid, parent_pid } = self;
         format!(
             "gate: refused: the script that started this gate lost its caller ({image} {pid}, whose parent {parent_pid} is gone); \
-             stop the sequence with gate.ps1 stop-tree {pid}"
+             the gates it starts are refused, and its tree may hold whoever reads this line"
         )
     }
 }
@@ -68,6 +69,11 @@ fn orphan_unless_elevated(elevated: io::Result<bool>, walk: impl FnOnce() -> Opt
 /// program, `None` when they cannot be read) show running a script or a command. `arguments` is called only for a
 /// process whose image is a listed shell.
 ///
+/// The walk ends at the first live gate among the ancestors, refusing nothing: a gate under a live gate was started by
+/// that gate's command, and that gate judged its own caller when it started. A gate whose nesting markers were taken
+/// from it (a test suite's case under a gated suite run) counts as un-nested and walks, so without this stop it would
+/// climb past the live gate above it to whatever orphaned script runs the whole sequence.
+///
 /// A last process whose parent is gone is first asked of `msys`, the MSYS runtime's record of its parent by Windows
 /// pid: a live MSYS parent in the snapshot, started no later than it, continues the walk from that parent (at most
 /// [`MSYS_STEPS`] times, past which nothing is refused), as Git Bash's fork stub leaves every script's bash with a gone
@@ -80,7 +86,7 @@ pub(crate) fn orphan_of(
     msys: impl Fn(u32) -> MsysParent,
 ) -> Option<Orphan> {
     let tree = ProcessTree::new(processes);
-    let mut last = tree.ancestors(own).last().or_else(|| tree.get(own))?;
+    let mut last = climb(&tree, own)?;
     let mut steps = 0;
     while parent_gone(&tree, last) {
         let parent = match msys(last.pid) {
@@ -95,9 +101,22 @@ pub(crate) fn orphan_of(
             return None;
         }
         steps += 1;
-        last = tree.ancestors(parent.pid).last().unwrap_or(parent);
+        last = climb(&tree, parent.pid)?;
     }
     None
+}
+
+/// The last of `from`'s ancestors in `tree` ([`ProcessTree::ancestors`]), or `from` itself when it has none: `None` at
+/// the first live gate among them, which judged its own caller when it started, or when `from` is missing from `tree`.
+fn climb(tree: &ProcessTree, from: u32) -> Option<&ProcessInfo> {
+    let mut last = tree.get(from)?;
+    for ancestor in tree.ancestors(from) {
+        if crate::escaped::is_gate(&ancestor.name) {
+            return None;
+        }
+        last = ancestor;
+    }
+    Some(last)
 }
 
 /// Whether `process`'s parent is missing from `tree` or started after it.
@@ -408,7 +427,7 @@ mod tests {
             found.map(|orphan| orphan.line()).as_deref(),
             Some(
                 "gate: refused: the script that started this gate lost its caller (cmd.exe 80, whose parent 70 is gone); \
-                 stop the sequence with gate.ps1 stop-tree 80"
+                 the gates it starts are refused, and its tree may hold whoever reads this line"
             )
         );
         assert_eq!(walk(chain("Cmd.exe"), GATE, |_| words(&["/D", "/R", "x.cmd"])), orphan("Cmd.exe"));
@@ -484,6 +503,66 @@ mod tests {
             walk(chain("cmd.exe"), 4242, |_| words(&["/c", "x"])),
             None,
             "a gate missing from its own snapshot"
+        );
+    }
+
+    /// The pid of a live gate between this gate and an orphaned launcher.
+    const OUTER_GATE: u32 = 85;
+    /// The pid of the test runner between the outer gate and this gate.
+    const SUITE: u32 = 95;
+
+    #[test]
+    fn a_live_gate_between_this_gate_and_an_orphaned_launcher_ends_the_walk() {
+        let processes = vec![
+            process(SHELL, CALLER, "pwsh.exe", "2026-10-01T10:00:00Z"),
+            process(OUTER_GATE, SHELL, "gate.exe", "2026-10-01T10:00:01Z"),
+            process(SUITE, OUTER_GATE, "suite-6e3e901d1b5f439a.exe", "2026-10-01T10:00:01Z"),
+            process(GATE, SUITE, "gate.exe", "2026-10-01T10:00:02Z"),
+        ];
+        assert_eq!(
+            walk(processes, GATE, |_| words(&["-NoProfile", "-File", "tools/gate.ps1"])),
+            None,
+            "a live gate above this one ends the walk"
+        );
+    }
+
+    #[test]
+    fn a_gate_that_took_the_pid_of_a_gone_parent_does_not_end_the_walk() {
+        // The script's real parent is gone and a gate started after the script took its pid: that gate is no ancestor,
+        // so the walk ends at the script and refuses.
+        let processes = vec![
+            process(SHELL, OUTER_GATE, "pwsh.exe", "2026-10-01T10:00:00Z"),
+            process(OUTER_GATE, 1, "gate.exe", "2026-10-01T11:00:00Z"),
+            process(LAUNCHER, SHELL, "pwsh.exe", "2026-10-01T10:00:01Z"),
+            process(GATE, LAUNCHER, "gate.exe", "2026-10-01T10:00:02Z"),
+        ];
+        assert_eq!(
+            walk(processes, GATE, |_| words(&["-NoProfile", "-File", "tools/test-all.ps1"])),
+            Some(Orphan {
+                image: "pwsh.exe".to_owned(),
+                pid: SHELL,
+                parent_pid: OUTER_GATE,
+            })
+        );
+    }
+
+    #[test]
+    fn a_live_gate_above_a_live_msys_parent_ends_the_walk() {
+        // The script bash's MSYS parent `OUTER` lives under a live gate, itself under a pwsh script whose caller is
+        // gone: the walk from `OUTER` ends at that gate.
+        let mut processes = chain("bash.exe");
+        processes.push(process(OUTER, OUTER_GATE, "bash.exe", "2026-10-01T09:00:00Z"));
+        processes.push(process(OUTER_GATE, TOP, "gate.exe", "2026-10-01T08:30:00Z"));
+        processes.push(process(TOP, 40, "pwsh.exe", "2026-10-01T08:00:00Z"));
+        assert_eq!(
+            orphan_of(
+                processes,
+                GATE,
+                |_| words(&["-NoProfile", "-File", "tools/gate.ps1"]),
+                msys_of(SHELL, MsysParent::Alive(OUTER))
+            ),
+            None,
+            "a live gate above the MSYS parent ends the walk"
         );
     }
 

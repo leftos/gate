@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use crate::support::{Case, FAKE_TOOL, GATE, said_pid, shown, start, wait_for_file};
+use crate::support::{Case, FAKE_TOOL, GATE, INHERITED, said_pid, shown, start, wait_for_file, wait_until};
 
 /// The case's `step.cmd` and the files it waits on and writes.
 struct Step {
@@ -91,7 +91,7 @@ fn a_gate_whose_script_lost_its_caller_refuses_to_start() {
         stderr.trim_end(),
         format!(
             "gate: refused: the script that started this gate lost its caller (cmd.exe {cmd_pid}, whose parent {helper_pid} is gone); \
-             stop the sequence with gate.ps1 stop-tree {cmd_pid}"
+             the gates it starts are refused, and its tree may hold whoever reads this line"
         )
     );
 }
@@ -182,15 +182,7 @@ impl BashStep {
     /// over the status file, so the case never reads it torn.
     fn write(case: &Case, waits: bool, reach: Reach) -> BashStep {
         let folder = case.folder();
-        let step = BashStep {
-            script: folder.join("step.sh"),
-            go: folder.join("go"),
-            ready: folder.join("ready"),
-            status: folder.join("status"),
-            stdout: folder.join("bash.out"),
-            stderr: folder.join("bash.err"),
-            log: folder.join("step.log"),
-        };
+        let step = BashStep::at(case);
         let fake = posix(Path::new(FAKE_TOOL));
         let wait = if waits {
             let ready = posix(&folder.join("ready.tmp"));
@@ -218,17 +210,55 @@ impl BashStep {
                 fake = FAKE_TOOL,
             ),
         };
-        let written = posix(&folder.join("status.tmp"));
-        let body = format!(
-            "PATH=/usr/bin:$PATH\n\
-             {wait}\
-             {run}\
-             echo $? > '{written}'\n\
-             mv '{written}' '{status}'\n",
-            status = posix(&step.status),
-        );
+        let body = format!("PATH=/usr/bin:$PATH\n{wait}{run}{tail}", tail = step.status_tail());
         fs::write(&step.script, body).expect("the step script can be written");
         step
+    }
+
+    /// The step's files in `case`'s folder, its script not yet written.
+    fn at(case: &Case) -> BashStep {
+        let folder = case.folder();
+        BashStep {
+            script: folder.join("step.sh"),
+            go: folder.join("go"),
+            ready: folder.join("ready"),
+            status: folder.join("status"),
+            stdout: folder.join("bash.out"),
+            stderr: folder.join("bash.err"),
+            log: folder.join("step.log"),
+        }
+    }
+
+    /// The script's last lines: `$?` written to a file moved over the status file, so the case never reads it torn.
+    fn status_tail(&self) -> String {
+        let written = posix(&self.status.with_file_name("status.tmp"));
+        format!("echo $? > '{written}'\nmv '{written}' '{status}'\n", status = posix(&self.status))
+    }
+
+    /// Waits under the hang guard for the ready file, failing at once with the outer bash's status, its output and the
+    /// gate's log when `bash` ends before the file appears.
+    fn wait_ready(&self, bash: &mut Child) {
+        let mut ended = None;
+        wait_until(&format!("{} appearing", self.ready.display()), || {
+            ended = bash.try_wait().expect("the outer bash's status can be read");
+            self.ready.exists() || ended.is_some()
+        });
+        assert!(
+            self.ready.exists(),
+            "the outer bash ended with {ended:?} before the ready file appeared: {}",
+            self.said()
+        );
+    }
+
+    /// The outer bash's stdout and stderr and the gate's log, each as far as it was written.
+    fn said(&self) -> String {
+        let read = |path: &Path| fs::read_to_string(path).unwrap_or_default();
+        format!(
+            "stdout:\n{}\nstderr:\n{}\nlog:\n{}",
+            read(&self.stdout),
+            read(&self.stderr),
+            read(&self.log)
+        )
     }
 
     /// Starts Git's bash running the script as `bash -c "/usr/bin/bash step.sh; true"`, so the outer bash forks the
@@ -288,7 +318,7 @@ fn a_gate_whose_git_bash_script_lost_its_shell_refuses_to_start() {
     let case = Case::new("a_gate_whose_git_bash_script_lost_its_shell_refuses_to_start");
     let step = BashStep::write(&case, true, Reach::Straight);
     let mut bash = step.spawn(&case);
-    wait_for_file(&step.ready);
+    step.wait_ready(&mut bash);
     let script_pid = fs::read_to_string(&step.ready).expect("the ready file can be read");
     let script_pid = script_pid.trim().to_owned();
     bash.kill().expect("the outer bash can be killed");
@@ -301,7 +331,60 @@ fn a_gate_whose_git_bash_script_lost_its_shell_refuses_to_start() {
     let refused = format!("gate: refused: the script that started this gate lost its caller (bash.exe {script_pid}, whose parent ");
     assert!(said.contains(&refused), "the refusal names the script's bash {script_pid}: {said}");
     assert!(
-        said.contains(&format!("stop the sequence with gate.ps1 stop-tree {script_pid}")),
-        "the refusal says to stop the script's bash {script_pid}: {said}"
+        said.contains("is gone); the gates it starts are refused, and its tree may hold whoever reads this line"),
+        "the refusal says what refusing means: {said}"
     );
+    assert!(!said.contains("stop-tree"), "the refusal advises no stop-tree: {said}");
+}
+
+/// Writes `case`'s `step.sh` for a gate under a live gate: `/usr/bin` put on its PATH, then an outer gate run on a
+/// `pwsh -Command` that writes the ready file, waits for the go file with `fake-tool wait`, removes every variable a
+/// gate around the suite may set, the nesting markers among them, from its own environment and runs an inner gate on a
+/// trivial command, ending with the inner gate's status; the outer gate's status, written to a file moved over the
+/// status file, and its log carry the inner gate's.
+fn write_nested(case: &Case) -> BashStep {
+    let folder = case.folder();
+    let step = BashStep::at(case);
+    let ready = shown(&folder.join("ready.tmp"));
+    let markers = INHERITED.map(|name| format!("'{name}'")).join(",");
+    let command = format!(
+        "[IO.File]::WriteAllText('{ready}', [string]\\$PID); Move-Item -Force '{ready}' '{whole}'; & '{fake}' wait '{go}'; \
+         foreach (\\$name in {markers}) {{ [Environment]::SetEnvironmentVariable(\\$name, \\$null) }}; \
+         & '{gate}' run --state-dir '{root}' --slot light --timeout 3600 --log '{inner}' --test-poll-ms 20 -- '{fake}' out hi; \
+         exit \\$LASTEXITCODE",
+        whole = shown(&step.ready),
+        fake = FAKE_TOOL,
+        go = shown(&step.go),
+        gate = GATE,
+        root = shown(&case.root()),
+        inner = shown(&folder.join("inner.log")),
+    );
+    let body = format!(
+        "PATH=/usr/bin:$PATH\n\
+         MSYS_NO_PATHCONV=1 '{gate}' run --state-dir '{root}' --slot none --timeout 3600 --log '{log}' --test-poll-ms 20 \
+         -- pwsh -NoProfile -Command \"{command}\"\n\
+         {tail}",
+        gate = posix(Path::new(GATE)),
+        root = posix(&case.root()),
+        log = posix(&step.log),
+        tail = step.status_tail(),
+    );
+    fs::write(&step.script, body).expect("the step script can be written");
+    step
+}
+
+#[test]
+fn a_gate_under_a_live_gate_whose_script_lost_its_shell_runs() {
+    let case = Case::new("a_gate_under_a_live_gate_whose_script_lost_its_shell_runs");
+    let step = write_nested(&case);
+    let mut bash = step.spawn(&case);
+    step.wait_ready(&mut bash);
+    bash.kill().expect("the outer bash can be killed");
+    bash.wait().expect("the killed outer bash can be waited for");
+    fs::write(&step.go, "").expect("the go file can be written");
+
+    let (status, said) = step.status();
+
+    assert_eq!(status, "0", "the inner gate runs under a live gate whose script lost its shell: {said}");
+    assert!(!said.contains("refused"), "the inner gate refuses nothing: {said}");
 }

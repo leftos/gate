@@ -535,7 +535,7 @@ It makes no OS calls, builds and tests on any OS, and must never depend on `gate
 
   And `nesting.rs`: the slot marker a gate was started under, its parse, the parent's liveness, the covered, refused or own-slot decision, and the search for a stand-in when the parent has ended.
 
-  `orphan.rs` is the start check of a gate with no live parent gate: it walks the gate's ancestors (`proc_table::ancestors`) and, when the walk ends at a shell that was running a script or a command (`bash`, `sh`, `zsh`, `dash`, `pwsh`, `powershell`, `cmd`, read through `gate_state::split_words`) whose parent is gone or reused, returns the `Orphan` that `run.rs` refuses with exit 2.
+  `orphan.rs` is the start check of a gate with no live parent gate: it walks the gate's ancestors (`proc_table::ancestors`), ending the walk with no refusal at the first live `gate.exe` among them, and, when the walk ends at a shell that was running a script or a command (`bash`, `sh`, `zsh`, `dash`, `pwsh`, `powershell`, `cmd`, read through `gate_state::split_words`) whose parent is gone or reused, returns the `Orphan` that `run.rs` refuses with exit 2.
 
   Where the walk meets a process whose Windows parent is gone it first asks `gate_win32::msys_parent` (`crates/gate-win32/src/msys.rs`, which reads the MSYS runtime's `winpid` links and `cygpid` sections under `\BaseNamedObjects`, trusting only objects owned as `token.rs` `own_object_owners` gives) and continues from a live MSYS parent's Windows pid, at most 16 steps. An interactive shell, a non-shell, an unreadable MSYS record or an unreadable command line refuses nothing.
 
