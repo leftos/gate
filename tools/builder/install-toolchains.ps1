@@ -635,6 +635,20 @@ Invoke-Step 'FFmpeg 9.0.2' {
     foreach ($exe in 'ffmpeg.exe', 'ffprobe.exe') { Copy-Item (Join-Path $src.FullName "bin\$exe") -Destination $tools -Force }
     Remove-Item $tmp -Recurse -Force
 }
+# zstd lets an ad-hoc copy to the builder stream tar | zstd | ssh | zstd -d | tar; the gate's own transfers compress
+# without it. Upstream publishes no checksum for the zip; this one matches the winget manifest Meta.Zstandard 1.5.7.
+Invoke-Step 'zstd 1.5.7' {
+    $sha = 'ACB4E8111511749DC7A3EBEDCA9B04190E37A17AFEB73F55D4425DBF0B90FAD9'
+    $f = Get-File 'https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-v1.5.7-win64.zip'
+    $got = (Get-FileHash -Path $f -Algorithm SHA256).Hash
+    if ($got -ne $sha) { throw "zstd-v1.5.7-win64.zip SHA-256 is $got, expected $sha" }
+    $tmp = Join-Path $dl 'zstd-extract'
+    Expand-Archive -Path $f -DestinationPath $tmp -Force
+    $exe = Get-ChildItem $tmp -Recurse -Filter 'zstd.exe' | Select-Object -First 1
+    if (-not $exe) { throw 'zstd-v1.5.7-win64.zip holds no zstd.exe' }
+    Copy-Item $exe.FullName -Destination $tools -Force
+    Remove-Item $tmp -Recurse -Force
+}
 Sync-SessionPath
 Invoke-Step 'pnpm 12.5.1' {
     & npm.cmd install -g pnpm@12.5.1
@@ -874,7 +888,7 @@ $checks = [ordered]@{
     'pnpm.cmd' = @('--version'); 'uv' = @('--version'); 'prek' = @('--version')
     'python' = @('--version'); 'python3' = @('--version'); 'rustup' = @('toolchain', 'list')
     'cargo' = @('--version'); 'cargo-nextest' = @('nextest', '--version'); 'just' = @('--version'); $godotConsole = @('--version', '--headless')
-    'ffmpeg' = @('-version'); 'ffprobe' = @('-version'); 'bun' = @('--revision'); 'sccache' = @('--version')
+    'ffmpeg' = @('-version'); 'ffprobe' = @('-version'); 'zstd' = @('--version'); 'bun' = @('--revision'); 'sccache' = @('--version')
 }
 foreach ($exe in $checks.Keys) {
     $out = try { (& $exe @($checks[$exe]) 2>&1) -join ' | ' } catch { "error: $($_.Exception.Message)" }

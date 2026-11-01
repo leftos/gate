@@ -409,8 +409,9 @@ case_admin_steps_dry_run() {
         expect has 'would download https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh' &&
         expect has 'run it with NONINTERACTIVE=1 /bin/bash' &&
         expect has 'would run: /opt/homebrew/bin/brew analytics off' &&
-        expect has 'would run: HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 /opt/homebrew/bin/brew install ffmpeg' &&
+        expect has 'would run: HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 /opt/homebrew/bin/brew install ffmpeg zstd' &&
         expect has 'would run: /opt/homebrew/bin/ffmpeg -version' &&
+        expect has 'would run: /opt/homebrew/bin/zstd --version' &&
         expect has 'SKIP Homebrew: run with --admin as an admin account' &&
         expect has 'SKIP FFmpeg: run with --admin as an admin account' &&
         expect grep -qF 'SKIP Homebrew: run with --admin as an admin account' "$p/install.log" &&

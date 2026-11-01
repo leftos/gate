@@ -359,6 +359,7 @@ step_bun() {
 
 brew_bin='/opt/homebrew/bin/brew'
 ffmpeg_bin='/opt/homebrew/bin/ffmpeg'
+zstd_bin='/opt/homebrew/bin/zstd'
 # Homebrew's documented install method. Unlike this script's other downloads it is unpinned by nature: the installer
 # always fetches Homebrew's current HEAD.
 homebrew_url='https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh'
@@ -395,18 +396,25 @@ step_homebrew() {
     "$brew_bin" analytics off </dev/null || fail "$brew_bin analytics off failed"
 }
 
+# The FFmpeg step also installs zstd, for ad-hoc copies that stream tar | zstd | ssh | zstd -d | tar; FFmpeg pulls it
+# in as a dependency today, and naming it keeps it when that changes.
 step_ffmpeg() {
     local out
     if [ "$admin" != 1 ]; then
-        log "would run: HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 $brew_bin install ffmpeg"
+        log "would run: HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 $brew_bin install ffmpeg zstd"
         log "would run: $ffmpeg_bin -version"
+        log "would run: $zstd_bin --version"
         skip 'run with --admin as an admin account'
     fi
     [ -x "$brew_bin" ] || fail "$brew_bin is missing: run the Homebrew step first"
-    HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 "$brew_bin" install ffmpeg </dev/null ||
-        fail "$brew_bin install ffmpeg failed"
+    HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 "$brew_bin" install ffmpeg zstd </dev/null ||
+        fail "$brew_bin install ffmpeg zstd failed"
     if ! out=$("$ffmpeg_bin" -version 2>&1 </dev/null); then
         fail "$ffmpeg_bin -version failed: ${out%%$'\n'*}"
+    fi
+    log "${out%%$'\n'*}"
+    if ! out=$("$zstd_bin" --version 2>&1 </dev/null); then
+        fail "$zstd_bin --version failed: ${out%%$'\n'*}"
     fi
     log "${out%%$'\n'*}"
 }
