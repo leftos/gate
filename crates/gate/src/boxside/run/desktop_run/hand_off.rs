@@ -589,7 +589,7 @@ fn not_created(here: &Here<'_, '_>, pinned: Pinned, code: u32, console: &mut Con
     sweep(here, pid, created, console);
     here.beat.say_protocol(console, &started_line(here.request.nonce));
     let message = gate_win32::win32_message(code);
-    Ran::Exited(not_started(console, here.prepared.word, Some(&here.prepared.program), &message))
+    Ran::NotStarted(not_started(console, here.prepared.word, Some(&here.prepared.program), &message))
 }
 
 /// Ends the hand-off on `fault`: the pipe dropped without `Done`; the helper given one end limit to end by itself

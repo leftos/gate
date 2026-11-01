@@ -17,8 +17,8 @@ use gate_inputs::failure::Caps;
 use gate_inputs::manifest::{Listing, Manifest};
 use gate_wire::drain::refused_lines;
 use gate_wire::{
-    BACK_COMMITS_FAILED, CROSS_STEP_START, CrossBuild, LAYOUT_CHANGING, PairSibling, PathForm, Payload, Refusal, back_commits_line, bare_stem,
-    busy_line, checkout_done_line, checkout_start_line, escaped, layout_line, layout_text, names_another_layout, refused_line, trees,
+    BACK_COMMIT_NONE, BACK_COMMITS_FAILED, CROSS_STEP_START, CrossBuild, LAYOUT_CHANGING, PairSibling, PathForm, Payload, Refusal, back_commits_line,
+    bare_stem, busy_line, checkout_done_line, checkout_start_line, escaped, layout_line, layout_text, names_another_layout, refused_line, trees,
 };
 
 use gate_watchdog::Pump;
@@ -893,6 +893,9 @@ fn synced_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>
             .map(|(repo, commit)| (repo.name.as_deref().unwrap_or_default(), commit.as_deref()))
             .collect();
         said(output, &[&back_commits_line(&named)], status);
+    } else if commits.first().is_none_or(Option::is_none) {
+        // A run of one repo whose command left the tree as the snapshot had it: nothing for the PC to bring back.
+        said(output, &[BACK_COMMIT_NONE], status);
     }
     let main = commits.first().and_then(Option::as_deref);
     match (&request.outputs, &ready.outputs) {
@@ -2303,6 +2306,10 @@ mod tests {
                 .is_some_and(|line| line.starts_with("gate: remote sync-back failed: push failed")),
             "{err:?}"
         );
+        assert!(
+            !err.iter().any(|line| line.as_str() == gate_wire::BACK_COMMIT_NONE),
+            "a back commit that failed says nothing of a command that changed nothing: {err:?}"
+        );
     }
 
     #[test]
@@ -2321,6 +2328,52 @@ mod tests {
             back_commits_said(said.iter().map(|(_, line)| line.as_str())),
             0,
             "a run of one repo: {said:?}"
+        );
+    }
+
+    #[test]
+    fn a_run_whose_command_changes_nothing_says_its_back_commit_was_not_made() {
+        let case = Case::new("back-none");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+
+        let (status, said) = whole_run(&case.commanded(&commit, &["/bin/sh", "-c", "true"]));
+
+        assert_eq!(status, 0, "{said:?}");
+        let err: Vec<&str> = said
+            .iter()
+            .filter(|(stream, _)| *stream == Stream::Err)
+            .map(|(_, line)| line.as_str())
+            .collect();
+        assert_eq!(
+            err.iter().filter(|line| **line == gate_wire::BACK_COMMIT_NONE).count(),
+            1,
+            "one line says the back commit was not made: {said:?}"
+        );
+        assert_eq!(case.back_commit(), None, "no back ref was pushed");
+    }
+
+    #[test]
+    fn a_run_whose_command_changes_a_file_says_no_back_commit_none_line() {
+        let case = Case::new("back-changed");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+
+        let (status, said) = whole_run(&case.commanded(&commit, &["/bin/sh", "-c", "echo c > c.txt"]));
+
+        assert_eq!(status, 0, "{said:?}");
+        assert!(case.back_commit().is_some(), "the back ref is pushed");
+        assert!(!said.iter().any(|(_, line)| line.as_str() == gate_wire::BACK_COMMIT_NONE), "{said:?}");
+    }
+
+    #[test]
+    fn a_pair_run_says_no_back_commit_none_line() {
+        let case = Case::new("back-pair-none");
+
+        let (_, _, status, said) = case.pair_ran("true");
+
+        assert_eq!(status, 0, "{said:?}");
+        assert!(
+            !said.iter().any(|line| line.as_str() == gate_wire::BACK_COMMIT_NONE),
+            "a pair says its own line: {said:?}"
         );
     }
 

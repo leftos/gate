@@ -1987,6 +1987,10 @@ pub const BACK_COMMITS_PREFIX: &str = "gate: remote back commits: ";
 /// them: the PC applies nothing.
 pub const BACK_COMMITS_FAILED: &str = "gate: remote back commits: failed";
 
+/// What a single repository's run says once its command ended and its back commit was not made because the command
+/// left the tree as the snapshot had it: there is nothing for the PC to bring back.
+pub const BACK_COMMIT_NONE: &str = "gate: remote back commit: none";
+
 /// The line a pair run says once every back commit is pushed: [`BACK_COMMITS_PREFIX`] and, for each repo of `commits`,
 /// the main one first, its name and its back commit, or `none` for a repo whose tree is unchanged, comma-separated.
 #[must_use]
@@ -2005,9 +2009,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        BACK_COMMITS_FAILED, CROSS_BUILD_START, CROSS_NOT_BROUGHT_BACK, CROSS_STEP_START, CrossBuild, NEW_WORK_TREE, PathForm, Payload, Probed,
-        back_commits_line, created_line, escaped, first_version, is_cross_not_brought_back, is_cross_step_start, probed, root_busy_line,
-        root_unsafe_line, runs_probe, sdk_list, sdks_line, tool_line, version_line, version_of, version_text, warm_line, work_root,
+        BACK_COMMIT_NONE, BACK_COMMITS_FAILED, CROSS_BUILD_START, CROSS_NOT_BROUGHT_BACK, CROSS_STEP_START, CrossBuild, NEW_WORK_TREE, PathForm,
+        Payload, Probed, back_commits_line, created_line, escaped, first_version, is_cross_not_brought_back, is_cross_step_start, probed,
+        root_busy_line, root_unsafe_line, runs_probe, sdk_list, sdks_line, tool_line, version_line, version_of, version_text, warm_line, work_root,
     };
 
     #[test]
@@ -4195,6 +4199,7 @@ mod tests {
             "gate: remote back commits: app none, lib none"
         );
         assert_eq!(BACK_COMMITS_FAILED, "gate: remote back commits: failed");
+        assert_eq!(BACK_COMMIT_NONE, "gate: remote back commit: none");
     }
 
     #[test]

@@ -4685,6 +4685,10 @@ fn box_run_a_failed_sync_back_turns_a_pass_into_status_1() {
         outcome.stderr.lines().any(|line| line.starts_with("gate: remote sync-back failed: ")),
         "{outcome:?}"
     );
+    assert!(
+        !outcome.stderr.contains(BACK_COMMIT_NONE),
+        "a back commit that failed says nothing of a command that changed nothing: {outcome:?}"
+    );
 }
 
 #[test]
@@ -4814,8 +4818,8 @@ fn box_run_says_the_checkout_start_and_done_lines_before_its_start_marker() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(
         after_checkout(&payload, &outcome.stderr),
-        format!("{}\nran\n", started_line(&payload)),
-        "the start and done lines, in order, then the marker: {outcome:?}"
+        format!("{}\nran\n{BACK_COMMIT_NONE}\n", started_line(&payload)),
+        "the start and done lines, in order, then the marker, then the command's line changed nothing: {outcome:?}"
     );
 }
 
@@ -4848,7 +4852,10 @@ fn box_run_forwards_each_stream_line_by_line_ending_each_line_lf() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stdout, "a1\na2\nb\nc\nd\n", "CR LF and a lone CR each end a line");
-    assert_eq!(after_checkout(&payload, &outcome.stderr), format!("{}\ne1\ne2\n", started_line(&payload)));
+    assert_eq!(
+        after_checkout(&payload, &outcome.stderr),
+        format!("{}\ne1\ne2\n{BACK_COMMIT_NONE}\n", started_line(&payload))
+    );
 }
 
 #[test]
@@ -5391,6 +5398,10 @@ fn box_run_an_unknown_program_exits_127() {
         after_checkout(&payload, &outcome.stderr),
         format!("gate: could not start gate-suite-no-such-program: {}\n", gate_win32::win32_message(2))
     );
+    assert!(
+        !outcome.stderr.contains(BACK_COMMIT_NONE),
+        "a command that never started did not leave the tree unchanged: {outcome:?}"
+    );
 }
 
 /// A bare name holding a dot that is not a `PATHEXT` extension, the shape a versioned Godot exe's derived name has, is
@@ -5436,8 +5447,8 @@ fn box_run_gives_the_command_a_utf8_console() {
     assert_eq!(outcome.stdout, "Active code page: 65001\n", "{outcome:?}");
     assert_eq!(
         after_checkout(&payload, &outcome.stderr),
-        format!("{}\n", started_line(&payload)),
-        "the marker, no fallback: {outcome:?}"
+        format!("{}\n{BACK_COMMIT_NONE}\n", started_line(&payload)),
+        "the marker, no fallback, and the command changed nothing: {outcome:?}"
     );
 
     let mut bytes = renamed(&payload, 1);
@@ -5448,7 +5459,7 @@ fn box_run_gives_the_command_a_utf8_console() {
     assert_eq!(outcome.raw_stdout, "é€\n".as_bytes(), "non-ASCII bytes arrive intact: {outcome:?}");
     assert_eq!(
         after_checkout(&bytes, &outcome.stderr),
-        format!("{}\n", started_line(&bytes)),
+        format!("{}\n{BACK_COMMIT_NONE}\n", started_line(&bytes)),
         "{outcome:?}"
     );
 }
@@ -5465,8 +5476,8 @@ fn the_commands_token(name: &str) -> Vec<String> {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(
         after_checkout(&payload, &outcome.stderr),
-        format!("{}\n", started_line(&payload)),
-        "the marker, no line saying the command keeps the box's token: {outcome:?}"
+        format!("{}\n{BACK_COMMIT_NONE}\n", started_line(&payload)),
+        "the marker, no line saying the command keeps the box's token, and nothing changed: {outcome:?}"
     );
     outcome.stdout.lines().map(str::to_owned).collect()
 }
@@ -5506,8 +5517,8 @@ fn box_run_falls_back_to_its_own_token_when_the_restricted_start_is_refused() {
     );
     assert_eq!(
         after_checkout(&payload, &outcome.stderr),
-        format!("{}\n{fallback}\n", started_line(&payload)),
-        "the marker, then the line saying the command keeps the box's token: {outcome:?}"
+        format!("{}\n{fallback}\n{BACK_COMMIT_NONE}\n", started_line(&payload)),
+        "the marker, then the line saying the command keeps the box's token, then nothing changed: {outcome:?}"
     );
     assert_eq!(marks(&count), "run\n", "the command ran once");
 }
@@ -5656,8 +5667,8 @@ fn box_run_falls_back_before_the_start_and_runs_the_command() {
     let said: Vec<&str> = after_checkout(&payload, &outcome.stderr).lines().collect();
     let marker = started_line(&payload);
     assert!(
-        matches!(said[..], [first, line] if first == marker && is_console_fallback(line)),
-        "the marker, then one fallback line: {outcome:?}"
+        matches!(said[..], [first, line, none] if first == marker && is_console_fallback(line) && none == BACK_COMMIT_NONE),
+        "the marker, then one fallback line, then nothing changed: {outcome:?}"
     );
     assert_eq!(marks(&count), "run\n", "the command ran once");
 }
@@ -6776,6 +6787,8 @@ fn box_run_that_fails_a_sibling_s_push_leaves_no_back_ref_in_either_bare() {
 const BACK_COMMITS: &str = "gate: remote back commits: ";
 /// The box's back commits line for a pair run whose back commits failed or were never made.
 const BACK_COMMITS_FAILED: &str = "gate: remote back commits: failed";
+/// The box's line for a single-repo run whose command left the tree as the snapshot had it.
+const BACK_COMMIT_NONE: &str = "gate: remote back commit: none";
 
 /// A back commits line a command prints to pass for the box's, naming the pair `app`, `lib` and `tools`.
 fn forged_back_commits() -> String {
@@ -6843,6 +6856,68 @@ fn box_run_with_a_pair_names_each_repo_s_back_commit() {
         1,
         "one line names each repo's back commit: {outcome:?}"
     );
+}
+
+#[test]
+fn box_run_whose_command_changes_nothing_says_its_back_commit_was_not_made() {
+    let case = Case::new("box_run_nothing_changed");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran there"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        lines(&outcome.stderr).iter().filter(|said| **said == BACK_COMMIT_NONE).count(),
+        1,
+        "one line says the back commit was not made: {outcome:?}"
+    );
+}
+
+#[test]
+fn box_run_whose_command_changes_a_file_says_no_back_commit_none_line() {
+    let case = Case::new("box_run_file_changed");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran there"]);
+    // The file the command writes inside the work folder, which is what makes its back commit.
+    let made = shown(&Path::new(field(&payload, "Work")).join("made-on-box.txt"));
+    payload["Command"] = json!([FAKE_TOOL, "mark", made]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains(BACK_COMMIT_NONE), "the command changed a file: {outcome:?}");
+}
+
+#[test]
+fn box_run_with_a_pair_says_no_back_commit_none_line() {
+    let case = Case::new("box_run_pair_no_none_line");
+    let (payload, _) = changing_pair(&case);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains(BACK_COMMIT_NONE), "a pair says its own line: {outcome:?}");
+}
+
+/// A pair whose command changes nothing in either repo says the pair's line naming both `none`, and no single-repo
+/// `none` line beside it.
+#[test]
+fn box_run_with_a_pair_that_changes_nothing_says_both_none() {
+    let case = Case::new("box_run_pair_nothing_changed");
+    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "out", "ran there"]);
+    pair_snapshot(&case, &mut payload, &[("a.txt", "main\n")], &[("lib", &[("b.txt", "lib\n")])]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said = "gate: remote back commits: app none, lib none";
+    assert_eq!(
+        lines(&outcome.stderr).iter().filter(|line| **line == said).count(),
+        1,
+        "one line names both repos as none: {outcome:?}"
+    );
+    assert!(!outcome.stderr.contains(BACK_COMMIT_NONE), "a pair says its own line: {outcome:?}");
 }
 
 #[test]
@@ -9684,8 +9759,8 @@ fn a_payload_with_no_timeout_gives_the_command_no_ceiling_on_the_box() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(
         after_checkout(&payload, &outcome.stderr),
-        format!("{}\n", started_line(&payload)),
-        "no kill and no adjusted line: {outcome:?}"
+        format!("{}\n{BACK_COMMIT_NONE}\n", started_line(&payload)),
+        "no kill, no adjusted line, and the command changed nothing: {outcome:?}"
     );
     wait_until_closed(Path::new(field(&payload, "Lock")));
 }

@@ -30,7 +30,7 @@ mod unix {
     use gate_inputs::manifest::{Held, Manifest, Stamp, read_sent};
     use gate_inputs::pack::Packer;
     use gate_wire::stamp::{Tag, unstamped};
-    use gate_wire::{BoxKill, Refusal, adjusted_prefix, busy_line, escaped, killed_line, refused_line, started_line};
+    use gate_wire::{BACK_COMMIT_NONE, BoxKill, Refusal, adjusted_prefix, busy_line, escaped, killed_line, refused_line, started_line};
     use serde_json::{Value, json};
 
     const KEY: &str = "repo-0123abcd";
@@ -470,8 +470,14 @@ mod unix {
             !ended
                 .err_texts()
                 .iter()
-                .any(|line| line.starts_with("gate: ") && !line.starts_with(unread_path)),
-            "no gate line: {:?}",
+                .any(|line| line.starts_with("gate: ") && !line.starts_with(unread_path) && *line != BACK_COMMIT_NONE),
+            "no gate line but the one saying nothing changed: {:?}",
+            ended.err
+        );
+        assert_eq!(
+            ended.err_texts().iter().filter(|line| **line == BACK_COMMIT_NONE).count(),
+            1,
+            "the box says the command changed nothing: {:?}",
             ended.err
         );
         assert_eq!(case.back(), None, "nothing changed, so the earlier back ref is gone and none is pushed");

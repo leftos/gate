@@ -19,8 +19,8 @@ use super::channel_pc::{
     BOX_PROOF, PC_PROOF, assert_no_proof, channel_line, free_port, listening, not_completed, pc_connected, proved, with_windows,
 };
 use super::{
-    Does, after_checkout, after_checkout_start, box_call, field, gate_box, git, has_ref, lines, pair_payload, pair_snapshot, passed, path_for_run,
-    payload, refused_line, renamed, run_box, run_box_with_env, run_box_with_path, snapshot, started_line, stub_git_doing,
+    BACK_COMMIT_NONE, Does, after_checkout, after_checkout_start, box_call, field, gate_box, git, has_ref, lines, pair_payload, pair_snapshot,
+    passed, path_for_run, payload, refused_line, renamed, run_box, run_box_with_env, run_box_with_path, snapshot, started_line, stub_git_doing,
 };
 use crate::support::{Case, FAKE_TOOL, Outcome, Running, box_payload, shown};
 
@@ -1461,8 +1461,8 @@ fn a_run_with_no_pointers_runs_as_before() {
     assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
     assert_eq!(
         after_checkout(&payload, &outcome.stderr),
-        format!("{}\n", started_line(&payload)),
-        "only the checkout's lines and the marker: {outcome:?}"
+        format!("{}\n{BACK_COMMIT_NONE}\n", started_line(&payload)),
+        "only the checkout's lines, the marker and the line saying nothing changed: {outcome:?}"
     );
     assert!(!store(&payload).exists(), "no store is touched: {outcome:?}");
     assert!(scratch_left(&payload).is_empty(), "the scratch folder is removed: {outcome:?}");

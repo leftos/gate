@@ -46,8 +46,8 @@ use regex::Regex;
 
 use gate_router::{Config, DROPPED_NO_BUILD_LINE, SendPlan, build_settings, escaped, repo_name};
 use gate_wire::{
-    CREATED_PREFIX, NEW_WORK_TREE, PairRefused, Payload, SDKS_PREFIX, SHA256_DIGITS, VERSION_PREFIX, WARM_PREFIX, channel_prefix, checkout_prefix,
-    is_cross_not_brought_back, is_lower_hex, warm_line,
+    BACK_COMMIT_NONE, CREATED_PREFIX, NEW_WORK_TREE, PairRefused, Payload, SDKS_PREFIX, SHA256_DIGITS, VERSION_PREFIX, WARM_PREFIX, channel_prefix,
+    checkout_prefix, is_cross_not_brought_back, is_lower_hex, warm_line,
 };
 
 use super::channel;
@@ -1248,6 +1248,9 @@ pub(super) struct Called {
     outputs: Option<outputs::OutputsLines>,
     /// Its last standard error line that is the box's back commits line, however many lines came after it.
     back_commits: Option<String>,
+    /// Whether it said on standard error, stamped as the box's own line, that the run's command left its tree as the
+    /// snapshot had it ([`BACK_COMMIT_NONE`]).
+    back_commit_none: bool,
     /// Whether it said on standard error that the box skipped outputs for names this PC cannot take.
     names_skipped: bool,
     /// Whether the box said on standard error, stamped as its own line, that the run's cross build brought no Windows
@@ -1372,6 +1375,7 @@ impl Called {
             lines: Vec::new(),
             outputs: None,
             back_commits: None,
+            back_commit_none: false,
             names_skipped: false,
             cross_not_brought_back: false,
             started: false,
@@ -1565,12 +1569,18 @@ struct Landed {
 
 /// How a run call ended ([`Attempt::run_call`]): its end, the last standard error lines of the call that counts that
 /// are the box's outputs line, its outputs size line and its back commits line, whether that call said on standard
-/// error that the box skipped outputs for names this PC cannot take, whether the box said the run's start marker, and
-/// the call's last standard error line that is neither a heartbeat nor one of the box's protocol lines.
+/// error that the run's command left its tree as the snapshot had it or that the box skipped outputs for names this PC
+/// cannot take, whether the box said the run's start marker, and the call's last standard error line that is neither a
+/// heartbeat nor one of the box's protocol lines.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent fact the call's streams said, read by name; no two form a state machine"
+)]
 struct RunEnd {
     end: End,
     outputs: Option<outputs::OutputsLines>,
     back_commits: Option<String>,
+    back_commit_none: bool,
     names_skipped: bool,
     cross_not_brought_back: bool,
     started: bool,
@@ -1708,7 +1718,7 @@ impl Attempt<'_, '_> {
             End::Status(status) => {
                 let back_commits = called.back_commits.as_deref().and_then(syncback::back_commits);
                 let synced = match syncback::targets(self.call, snapshot, siblings) {
-                    Some(targets) => syncback::sync_back(self, &targets, back_commits.as_deref(), status),
+                    Some(targets) => syncback::sync_back(self, &targets, back_commits.as_deref(), status, called.back_commit_none),
                     None => Ok(syncback::unmatched(self, status)),
                 };
                 let end = synced.map(|synced| {
@@ -3007,6 +3017,7 @@ impl Attempt<'_, '_> {
         let nonce: Arc<str> = Arc::from(nonce);
         let mut heard = None;
         let mut back_commits = None;
+        let mut back_commit_none = false;
         let mut names_skipped = false;
         let mut cross_not_brought_back = false;
         let mut adjusted = None;
@@ -3028,6 +3039,7 @@ impl Attempt<'_, '_> {
             let called = attempt.ssh(BoxVerb::Run, Echo::Console, Watch::Run(limits), raise, run)?;
             heard.clone_from(&called.outputs);
             back_commits.clone_from(&called.back_commits);
+            back_commit_none = called.back_commit_none;
             names_skipped = called.names_skipped;
             cross_not_brought_back = called.cross_not_brought_back;
             adjusted = called.adjusted;
@@ -3042,6 +3054,7 @@ impl Attempt<'_, '_> {
             end,
             outputs: heard,
             back_commits,
+            back_commit_none,
             names_skipped,
             cross_not_brought_back,
             started,
@@ -4104,6 +4117,7 @@ fn called_of(ended: CallEnd, raised: Raised, mut heard: Heard) -> Result<Called,
         lines: heard.kept.into_lines(),
         outputs: heard.outputs,
         back_commits: heard.back_commits,
+        back_commit_none: heard.back_commit_none,
         names_skipped: heard.names_skipped,
         cross_not_brought_back: heard.cross_not_brought_back,
         started: heard.started,
@@ -4730,7 +4744,8 @@ fn git_end(error: GitError) -> End {
 
 /// What one call's two streams said so far, kept for the call's end, each line cut to the cap: whether it wrote on
 /// standard output, its first and last standard error lines, its last standard error lines that are the box's outputs
-/// line and its back commits line, whether a standard error line said the box skipped outputs for names
+/// line and its back commits line, whether a standard error line said the box's run left its tree as the snapshot had
+/// it, whether a standard error line said the box skipped outputs for names
 /// ([`NAMES_SKIPPED`]), whether the box said the run's start marker and the refusal its first tag named, its last
 /// lines, and the first problem reading them.
 #[derive(Default)]
@@ -4745,6 +4760,7 @@ struct Heard {
     last_error: Option<String>,
     outputs: Option<outputs::OutputsLines>,
     back_commits: Option<String>,
+    back_commit_none: bool,
     names_skipped: bool,
     cross_not_brought_back: bool,
     started: bool,
@@ -5208,7 +5224,8 @@ impl Reader {
     /// stops, `false`. The box's heartbeat, start marker and refusal tag, matched on the line as it came, are kept but
     /// never passed on. Every other line is read once without its stamp: the log gets it as it came, stamped `gat` now
     /// when it came with none, and the console and what is kept get its text. A process line is logged alone: it is
-    /// neither echoed nor kept, and marks no progress.
+    /// neither echoed nor kept, and marks no progress. So is the box's line saying its command left the tree unchanged,
+    /// whose text it keeps as the fact the PC's own line for it waits on.
     fn line_ended(&mut self, bytes: &[u8], shared: &Shared) -> bool {
         if self.reading.capped && watchdog::too_long(bytes) {
             shared.progress.cut_too_long();
@@ -5235,6 +5252,12 @@ impl Reader {
         let read = stamp::unstamped(&line);
         if read.tag == Some(Tag::Gat) && stamp::is_process_line(read.text) {
             self.passed(&line, None, true, shared);
+            return true;
+        }
+        // The box's line saying its command left the tree unchanged is the log's alone: the PC says its own line for it.
+        if self.error && read.tag == Some(Tag::Gat) && read.text == BACK_COMMIT_NONE {
+            self.passed(&line, None, true, shared);
+            held(&shared.heard).back_commit_none = true;
             return true;
         }
         self.mark_line(shared);
@@ -6908,6 +6931,7 @@ mod tests {
             lines: vec![first_error.to_owned()],
             outputs: None,
             back_commits: None,
+            back_commit_none: false,
             names_skipped: false,
             cross_not_brought_back: false,
             started: false,
@@ -9571,6 +9595,7 @@ mod tests {
             end,
             outputs: None,
             back_commits: None,
+            back_commit_none: false,
             names_skipped: false,
             cross_not_brought_back: false,
             started,
@@ -10490,7 +10515,7 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         use gate_wire::stamp::{self, Tag};
-        use gate_wire::{CROSS_BUILD_START, CROSS_NOT_BROUGHT_BACK};
+        use gate_wire::{BACK_COMMIT_NONE, CROSS_BUILD_START, CROSS_NOT_BROUGHT_BACK};
 
         use super::super::{BoxKill, Echo, End, ProtocolLines, Reader, Reading, Shared, held, killed_line, relay};
         use super::{Chunks, Step, UNMARKED, outputs_worktree, passed, said_after};
@@ -10553,6 +10578,32 @@ mod tests {
             assert!(heard_cross_not_back(&stamp::stamped(&at, Tag::Gat, &cross_line())), "the box's own line");
             assert!(!heard_cross_not_back(&stamp::stamped(&at, Tag::Err, &cross_line())), "the command's copy");
             assert!(!heard_cross_not_back(&cross_line()), "an unstamped copy");
+        }
+
+        /// Whether a run call that heard `line` with its own line `error` on that stream heard the box say its back
+        /// commit was not made.
+        fn heard_back_commit_none(error: bool, line: &str) -> bool {
+            let shared = Shared::new();
+            relay(format!("{line}\n").as_bytes(), Reader::new(error, run_reading(), None), &shared);
+            held(&shared.heard).back_commit_none
+        }
+
+        #[test]
+        fn only_the_box_s_own_stamped_none_back_commit_line_is_heard() {
+            let at = stamp::now();
+            assert!(
+                heard_back_commit_none(true, &stamp::stamped(&at, Tag::Gat, BACK_COMMIT_NONE)),
+                "the box's own line"
+            );
+            assert!(
+                !heard_back_commit_none(true, &stamp::stamped(&at, Tag::Err, BACK_COMMIT_NONE)),
+                "the command's copy"
+            );
+            assert!(!heard_back_commit_none(true, BACK_COMMIT_NONE), "an unstamped copy");
+            assert!(
+                !heard_back_commit_none(false, &stamp::stamped(&at, Tag::Gat, BACK_COMMIT_NONE)),
+                "a line on standard output is the command's own"
+            );
         }
 
         #[test]

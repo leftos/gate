@@ -3104,6 +3104,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     A single repository's sync-back says `gate: syncing back from <builder>` as soon as the builder holds a back commit (after the check that one exists), and `gate: sync-back from <builder> ended in <s.s> s` on every end after that: a worktree lock timeout or Ctrl+C, an unreadable gate start, a quarantine that cannot be made, a refusal, a stopped fetch and success. The seconds run from the start line, the lock wait, fetch and apply included. A run with no back commit says neither line.
 
+    When the box said, stamped as its own line, `gate: remote back commit: none` (its command started, ended and left the tree as the snapshot had it) and the builder then advertises no back commit, the run says `gate: the command changed no tracked file on <builder>; nothing to bring back` on the console and in the log, in place of the two lines. The box's own line goes to the run's log only. Without it (an older box, a failed back commit, a killed run, a command that never started) the run says nothing, since none of those says the tree is clean.
+
     The sync-back runs no `git rev-parse --git-path objects`: the real object store's path comes from the snapshot, whose `rev-parse --git-path` call also asks for `objects`. It reads it even when there turns out to be no back commit, and sweeps the quarantines of earlier gates (below).
 
     Then `git ls-remote -- <url> refs/gate-back/<key>` then `git -c fetch.fsckObjects=true -c maintenance.auto=false -c gc.auto=0 fetch --progress --no-recurse-submodules --no-tags -- <url> <ref>` run with the push's `GIT_SSH_COMMAND` and `--upload-pack=pwsh -NoProfile -NonInteractive -Command git-upload-pack`; a bare repository on this machine names no pack command.
@@ -3151,7 +3153,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
       Either refuse only when a path the returned changes touch also changed locally, a true conflict, and apply the rest; or refuse only when a changed path is under the gate's subfolder or a project the command builds. Bazel's `--guard_against_concurrent_changes` defaults to `lite`, which checks only the main repository's source files, because full checking gave false positives.
     - Otherwise the diff from the snapshot to the back commit is written by `git diff-tree -p --binary --full-index -r` (plumbing, so no diff setting or `GIT_EXTERNAL_DIFF` shapes it) to `<git dir>/gate-remote-<pid>-<nonce>.patch`, a file the gate creates new, applied with `git -c core.protectNTFS=true apply --whitespace=nowarn -- <patch>`, and the patch is removed whether or not it applied.
 
-      The run says `gate: synced back <n> file(s): <names joined by ", ">`, names from `git diff-tree -r -z --name-only` with control characters escaped; it reads `0 file(s): ` with nothing after the colon when no files changed.
+      The run says `gate: synced back <n> file(s): <names joined by ", ">`, names from `git diff-tree -r -z --name-only` with control characters escaped; the client says it only when the patch lists a file, so a back commit that changes no file ends without it.
     - A git failure here ends the run with status 1 and `gate: the remote run failed: ...`, with no fallback, except a failure as a connection fails, which is retried as below.
     - **Retry of the transfers after the command.** The `ls-remote`, the `fetch` and the outputs pull (a failed run's pull included) are each made up to 3 times in all, after pauses of 5 s and then 15 s, saying before each retry `gate: bringing the results back from <host> failed (<reason>); trying again (<n> of 2)`. `<reason>` is the failure's own text without its `gate: ` prefix. The pre-banner retry of each call nests inside each attempt.
 
@@ -3194,6 +3196,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     - **A pair's sync-back** (a run that carries siblings, built in `remote/syncback.rs` and the box) is all or nothing across its repos. It applies only the back commits of the box's last stderr line `gate: remote back commits: <name> <sha|none>, ...` (a standard output line never counts), which must name exactly the pair's repos, the main one first, in order.
 
       A pair says one `gate: syncing back from <builder>` before its first named repository's work (its lock wait included) and one `gate: sync-back from <builder> ended in <s.s> s` after the last, whatever happened, so every `gate: remote changes not applied: ...` line naming a repository falls between them. A back-commits line naming no repository says neither.
+
+      Before that start line, a pair says one line per repository the back commits line calls `none`, in pair order: `gate: the command changed no tracked file in <repo> on <builder>; nothing to bring back`. A pair whose repositories are all `none` says only those lines.
 
       A line that is missing, malformed or names other repos says `gate: remote changes not applied: the builder did not say which commits it made`; a pair whose sibling snapshots do not match its siblings says `gate: remote changes not applied: the run's sibling snapshots do not match its siblings`. Either applies nothing and a passing run becomes 1; its outputs are then not brought back, `gate: remote outputs not brought back: the pair's remote changes were not applied`.
 
@@ -4366,6 +4370,8 @@ Built verbs:
 
   A client that closed the connection during that undo ends the run with 255 instead. After all pushes, a pair run says under the output lock `gate: remote back commits: <name> <sha|none>, ...`, the main repo first and `none` for a repo whose tree is unchanged. The outputs step packs the main repo's tree only.
 
+  A single-repo run whose command started, ended and left the tree as the snapshot had it (no back commit made) says once on standard error, stamped `gat`, `gate: remote back commit: none`. A failed back commit, a killed run, a refusal, a warm-up and a command that never started (program not found, no shell, variables that cannot be built, a desktop hand-off not created) say nothing of it.
+
   A pair run that does not push every back commit says `gate: remote back commits: failed` instead, under the output lock so it is the last such line and a line the command printed itself never stands for it: after a failed lock, stop event, back ref clear, layout step, checkout, subfolder check or tools restore, a command that cannot be waited for or that the ceiling killed, and a failed commit or push (after the undo above).
 
   A failed wait ends the job and drains its output first, so no line of the command follows. A refusal (`busy`, `layout`, `tools`) says no such line, and a run of one repo never does. The PC applies nothing of a `failed` pair.
@@ -5195,7 +5201,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
   A pair run prints `gate: remote back commits: repo <sha>, lib <sha>` (`<name> none` for an unchanged repo) once all are pushed. A failed one prints `gate: remote back commits: failed` and then `gate: remote sync-back failed: push lib failed…` last, with status 1 for a command that exited 0.
 
-  A pair run that ends before its back commit says `gate: remote back commits: failed` last, so the PC applies nothing: after the lock whenever it ends without a refusal (a box kill among them), and before the lock when it fails with status 1 (the lock cannot be opened, or the root check fails). A refusal (75) says no such line. A single-repo run says no back commits line.
+  A pair run that ends before its back commit says `gate: remote back commits: failed` last, so the PC applies nothing: after the lock whenever it ends without a refusal (a box kill among them), and before the lock when it fails with status 1 (the lock cannot be opened, or the root check fails). A refusal (75) says no such line. A single-repo run says no back commits line; it says `gate: remote back commit: none` instead when its command started and left the tree unchanged.
 - **The tool restore.** After the place checks and with the heartbeat on, before the command, `run` runs `dotnet tool restore` in the place folder when the dotnet tool manifests differ from the record `<Work>.tools`.
 
   The manifests are found by walking from the place's physical folder (links resolved, as `dotnet` reads it) up to the work folder's (on a pair, up to the main tree, and the tools-resolve error line names the main tree), each folder contributing its `.config/dotnet-tools.json`, else its `dotnet-tools.json`; no manifest, or a record equal to their hash, runs nothing.

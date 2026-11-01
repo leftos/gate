@@ -187,18 +187,20 @@ impl Worktree<'_> {
 /// Fetches and applies the builder's changes for `targets`, the main repository first, or ends the run as `status`
 /// when there is nothing to do, the run's own when the changes were ignored, and 1 when a passing run's changes could
 /// not be applied. A single repository's back commit is the one the builder's ref advertises, and `back_commits` is
-/// not read; a pair's are only those the box's line, `back_commits`, names ([`pair`]).
+/// not read; a pair's are only those the box's line, `back_commits`, names ([`pair`]). `back_commit_none` says the
+/// box's run call said its command left the tree as the snapshot had it, so a single repository's run says so too.
 pub(super) fn sync_back(
     attempt: &mut Attempt<'_, '_>,
     targets: &[Target<'_>],
     back_commits: Option<&[BackCommit]>,
     status: i64,
+    back_commit_none: bool,
 ) -> Result<Synced, End> {
     if attempt.call.commit_stage {
         return stage(attempt, targets, status);
     }
     match targets {
-        [target] => one(attempt, target, status).map(|end| Synced { end, reason: None }),
+        [target] => one(attempt, target, status, back_commit_none).map(|end| Synced { end, reason: None }),
         _ => pair(attempt, targets, back_commits, status),
     }
 }
@@ -718,8 +720,10 @@ fn apply_failed_line(failed: &End, names: &[String], kept: &str, lock_held: bool
 
 /// The sync-back of a single repository, `target`, as [`sync_back`] ends it: its step's start line said once a back
 /// commit is known, and its end line said however every step after that ends, the lock's refusal, the gate's own start
-/// or the quarantine's failure, a refusal, an interrupted fetch and success among them.
-fn one(attempt: &mut Attempt<'_, '_>, target: &Target<'_>, status: i64) -> Result<End, End> {
+/// or the quarantine's failure, a refusal, an interrupted fetch and success among them. A box that said its command
+/// left the tree as the snapshot had it, `back_commit_none`, changed nothing, and the line saying so is said in its
+/// place; a box that said nothing of its back commit says nothing, since a failed one leaves the files where they are.
+fn one(attempt: &mut Attempt<'_, '_>, target: &Target<'_>, status: i64, back_commit_none: bool) -> Result<End, End> {
     attempt.go_on()?;
     let profile = attempt.profile();
     let pushed = attempt.transport.push_target(&profile, &target.repo).map_err(End::Failed)?;
@@ -740,6 +744,11 @@ fn one(attempt: &mut Attempt<'_, '_>, target: &Target<'_>, status: i64) -> Resul
         attempt.say(line);
     }
     let Some(advertised) = has_back(attempt, &worktree, &remote)? else {
+        // Only the box's own line says the command left the tree as the snapshot had it; its absence means a back
+        // commit that failed, a killed run or one that ended before its command, none of which says the tree is clean.
+        if back_commit_none {
+            attempt.say(unchanged_line(attempt.call.host()));
+        }
         return Ok(End::Status(status));
     };
     attempt.say(syncing_line(attempt.call.host()));
@@ -843,6 +852,12 @@ fn pair(attempt: &mut Attempt<'_, '_>, targets: &[Target<'_>], back_commits: Opt
         attempt.say(format!("{NOT_APPLIED}the builder did not say which commits it made"));
         return Ok(not_applied(status));
     };
+    // A repository the box called `none` changed nothing there: each says so in pair order, before the step opens.
+    for (target, commit) in targets.iter().zip(&commits) {
+        if commit.is_none() {
+            attempt.say(pair_unchanged_line(target.name, attempt.call.host()));
+        }
+    }
     let backed: Vec<Repo<'_, '_>> = targets
         .iter()
         .zip(&commits)
@@ -2418,6 +2433,20 @@ fn syncing_line(builder: &str) -> String {
     format!("gate: syncing back from {builder}")
 }
 
+/// The line a sync-back of a single repository says when the box made no back commit: the command changed nothing in
+/// the worktree `builder` ran it in.
+fn unchanged_line(builder: &str) -> String {
+    format!("gate: the command changed no tracked file on {builder}; nothing to bring back")
+}
+
+/// The line a sync-back of a pair says for `name`, a repository whose back commit the box called `none` on `builder`.
+fn pair_unchanged_line(name: &str, builder: &str) -> String {
+    format!(
+        "gate: the command changed no tracked file in {} on {builder}; nothing to bring back",
+        escaped(name)
+    )
+}
+
 /// The line a sync-back from `builder` says once it ended, `took` after its start line: the fetch and every file it
 /// wrote, applied or refused, included.
 fn sync_back_ended_line(builder: &str, took: Duration) -> String {
@@ -2655,8 +2684,8 @@ mod tests {
         ATTRIBUTE_ROOM, ATTRIBUTES, Attributes, AutoCrlf, Back, BackCommit, FETCH_WORDS, Fixes, LineEnds, Quarantine, Remote, Staged, Synced, Target,
         Worktree, advertised, after_keep, alternates, attribute_slices, auto_crlf, converts_to_crlf, entries, fetch, filtered, forbidden,
         from_snapshot, has_back, ignored_line, incoming_name, incoming_owner, listed_paths, move_plan, names_odd_driver, not_applied_line,
-        read_attributes, receive, refused_end, see_diff, swept, sync_back, sync_back_ended_line, synced_line, syncing_line, total, touched_line,
-        tree_removed, unmoved_line, weight, written_blobs, written_line,
+        pair_unchanged_line, read_attributes, receive, refused_end, see_diff, swept, sync_back, sync_back_ended_line, synced_line, syncing_line,
+        total, touched_line, tree_removed, unchanged_line, unmoved_line, weight, written_blobs, written_line,
     };
     use crate::commit::forward::Checked;
     use crate::remote::RemoteCall;
@@ -2683,6 +2712,24 @@ mod tests {
             "{end:?}"
         );
         assert_eq!(said, None, "the failure's own line says it");
+    }
+
+    /// The lines a sync-back says when the command changed nothing, the builder and the pair's repository named in each.
+    #[test]
+    fn a_sync_back_that_changed_nothing_says_so() {
+        assert_eq!(
+            unchanged_line("builder"),
+            "gate: the command changed no tracked file on builder; nothing to bring back"
+        );
+        assert_eq!(
+            pair_unchanged_line("app", "builder"),
+            "gate: the command changed no tracked file in app on builder; nothing to bring back"
+        );
+        assert_eq!(
+            pair_unchanged_line("a\r\nb", "builder"),
+            r"gate: the command changed no tracked file in a\r\nb on builder; nothing to bring back",
+            "a name from the builder cannot break the line"
+        );
     }
 
     /// The two lines a sync-back says around its work, the builder that made the back commit named in each.
@@ -3907,7 +3954,7 @@ mod tests {
             let targets = [0, 1].map(|at| Target::new(routed(PAIR[at], &self.roots[at]), PAIR[at], &self.snapshots[at], KEY));
             self.with_attempt(transport, None, |attempt| {
                 tweak(attempt);
-                sync_back(attempt, &targets, line, 0)
+                sync_back(attempt, &targets, line, 0, false)
             })
         }
 
@@ -3970,6 +4017,12 @@ mod tests {
 
     /// The start line of every sync-back a pair makes from the tests' builder, [`crate::test_support::HOST`].
     const SYNCING: &str = "gate: syncing back from builder";
+
+    /// The line a pair says for `app`, a repository whose back commit the box called `none`.
+    const UNCHANGED_APP: &str = "gate: the command changed no tracked file in app on builder; nothing to bring back";
+
+    /// The same for `lib`.
+    const UNCHANGED_LIB: &str = "gate: the command changed no tracked file in lib on builder; nothing to bring back";
 
     /// The lines `case` said, less the sync-back's start line and its end line: a pair that fetched a back commit says
     /// one of each, first and last, and the end line's figure is any.
@@ -4420,7 +4473,7 @@ mod tests {
 
         let ended = case.with_attempt(&transport, Some(interrupt), |attempt| {
             attempt.interrupt_at = Some("apply");
-            sync_back(attempt, &targets, Some(&line), 0)
+            sync_back(attempt, &targets, Some(&line), 0, false)
         });
 
         assert!(matches!(&ended, Err(End::Interrupted)), "{ended:?}");
@@ -4454,7 +4507,7 @@ mod tests {
         let targets = [0, 1].map(|at| Target::new(routed(PAIR[at], &case.roots[at]), PAIR[at], &case.snapshots[at], KEY));
         let line = line_of([Some(&app), Some(&lib)]);
 
-        let ended = case.with_attempt(&through, Some(interrupt), |attempt| sync_back(attempt, &targets, Some(&line), 0));
+        let ended = case.with_attempt(&through, Some(interrupt), |attempt| sync_back(attempt, &targets, Some(&line), 0, false));
 
         assert!(matches!(&ended, Err(End::Interrupted)), "{ended:?}");
         assert!(
@@ -4491,7 +4544,7 @@ mod tests {
 
         let ended = case.with_attempt(&transport, None, |attempt| {
             attempt.lock_wait = Duration::ZERO;
-            sync_back(attempt, &[target], None, 0)
+            sync_back(attempt, &[target], None, 0, false)
         });
 
         release.send(()).expect("the other run is still there");
@@ -4529,7 +4582,7 @@ mod tests {
         case.plant(0, &[(".gitmodules", "x\n")]);
         let target = Target::new(routed(PAIR[0], &case.roots[0]), PAIR[0], &case.snapshots[0], KEY);
 
-        let ended = case.with_attempt(&case.local(), None, |attempt| sync_back(attempt, &[target], None, 0));
+        let ended = case.with_attempt(&case.local(), None, |attempt| sync_back(attempt, &[target], None, 0, false));
 
         assert!(
             matches!(
@@ -4576,16 +4629,17 @@ mod tests {
         let said = case.said();
         assert_eq!(
             said.len(),
-            3,
-            "the start line, the line saying the commit was not applied, and the end line: {said:?}"
+            4,
+            "lib's none line, the start line, the line saying the commit was not applied, and the end line: {said:?}"
         );
-        assert_eq!(said[0], SYNCING, "the step opens before the first named repo's work");
+        assert_eq!(said[0], UNCHANGED_LIB, "lib's back commit is none, said before the step opens");
+        assert_eq!(said[1], SYNCING, "the step opens before the first named repo's work");
         assert!(
-            said[1].starts_with("gate: remote changes not applied: app: the builder does not have the commit it named"),
+            said[2].starts_with("gate: remote changes not applied: app: the builder does not have the commit it named"),
             "{said:?}"
         );
         assert!(
-            said[2].starts_with("gate: sync-back from builder ended in ") && said[2].ends_with(" s"),
+            said[3].starts_with("gate: sync-back from builder ended in ") && said[3].ends_with(" s"),
             "the end line closes the step, its figure any: {said:?}"
         );
         case.remove();
@@ -4628,14 +4682,20 @@ mod tests {
         let said = case.said();
         assert_eq!(
             said.len(),
-            6,
-            "each attempt opens and closes a step of its own, the refused one's around the lock's line: {said:?}"
+            8,
+            "each attempt says lib's none line, opens and closes a step of its own, the refused one's around the lock's \
+             line: {said:?}"
         );
-        assert_eq!(said[0], SYNCING, "the refused attempt opens its step before its lock is waited for");
-        assert_eq!(said[1], APP_WAITED);
-        assert_eq!(said[3], SYNCING);
-        assert_eq!(said[4], "gate: synced back 1 file(s) in app: b.txt");
-        for end in [&said[2], &said[5]] {
+        assert_eq!(said[0], UNCHANGED_LIB, "lib's back commit is none, said before the step opens");
+        assert_eq!(said[1], SYNCING, "the refused attempt opens its step before its lock is waited for");
+        assert_eq!(said[2], APP_WAITED);
+        assert_eq!(
+            said[4], UNCHANGED_LIB,
+            "the second attempt says lib's none line again, before its own step"
+        );
+        assert_eq!(said[5], SYNCING);
+        assert_eq!(said[6], "gate: synced back 1 file(s) in app: b.txt");
+        for end in [&said[3], &said[7]] {
             assert!(
                 end.starts_with("gate: sync-back from builder ended in ") && end.ends_with(" s"),
                 "each attempt's step ends after its own lines, its figure any: {said:?}"
@@ -4665,7 +4725,101 @@ mod tests {
         assert!(case.root(0).join("b.txt").exists(), "app's change is applied");
         assert!(!case.root(1).join("c.txt").exists(), "lib's advertised ref is not fetched");
         assert_eq!(case.quarantines(1), 0);
-        assert_eq!(without_sync_back(&case), ["gate: synced back 1 file(s) in app: b.txt"]);
+        let said = case.said();
+        assert_eq!(
+            said.len(),
+            4,
+            "lib's none line, the start line, app's synced line and the end line: {said:?}"
+        );
+        assert_eq!(said[0], UNCHANGED_LIB, "lib's back commit is none, said before the step opens");
+        assert_eq!(said[1], SYNCING);
+        assert_eq!(said[2], "gate: synced back 1 file(s) in app: b.txt");
+        assert!(
+            said[3].starts_with("gate: sync-back from builder ended in ") && said[3].ends_with(" s"),
+            "the end line closes the step, its figure any: {said:?}"
+        );
+        case.remove();
+    }
+
+    /// A single repository whose box said its command left the tree as the snapshot had it says the command changed
+    /// nothing there, and nothing else: no step opens without a back commit.
+    #[test]
+    fn a_single_sync_back_the_box_says_made_no_back_commit_says_the_command_changed_nothing() {
+        let case = PairCase::new("single-unchanged");
+        let target = Target::new(routed(PAIR[0], &case.roots[0]), PAIR[0], &case.snapshots[0], KEY);
+
+        let ended = case.with_attempt(&case.local(), None, |attempt| sync_back(attempt, &[target], None, 0, true));
+
+        assert!(
+            matches!(
+                &ended,
+                Ok(Synced {
+                    end: End::Status(0),
+                    reason: None
+                })
+            ),
+            "{ended:?}"
+        );
+        assert_eq!(
+            case.said(),
+            ["gate: the command changed no tracked file on builder; nothing to bring back"],
+            "the run says the command changed nothing on the builder"
+        );
+        case.remove();
+    }
+
+    /// A single repository whose box said nothing of a back commit says nothing of a command that changed nothing
+    /// there: a back commit that failed, a killed run and a run that ended before its command all leave the files
+    /// where they are, and none of them means the command changed nothing.
+    #[test]
+    fn a_single_sync_back_the_box_says_nothing_of_stays_silent() {
+        let case = PairCase::new("single-back-silent");
+        let target = Target::new(routed(PAIR[0], &case.roots[0]), PAIR[0], &case.snapshots[0], KEY);
+
+        let ended = case.with_attempt(&case.local(), None, |attempt| sync_back(attempt, &[target], None, 0, false));
+
+        assert!(
+            matches!(
+                &ended,
+                Ok(Synced {
+                    end: End::Status(0),
+                    reason: None
+                })
+            ),
+            "{ended:?}"
+        );
+        assert_eq!(
+            case.said(),
+            Vec::<String>::new(),
+            "the box said nothing of a back commit; nothing here says it changed nothing"
+        );
+        case.remove();
+    }
+
+    /// A pair whose line calls every repository `none` says one line for each, in pair order, and neither the step's
+    /// start nor its end line, the run ending as its command did.
+    #[test]
+    fn a_pair_the_box_says_changed_nothing_says_one_line_for_each_repo() {
+        let case = PairCase::new("all-none");
+
+        let ended = case.synced(Some(&line_of([None, None])));
+
+        assert!(
+            matches!(
+                &ended,
+                Ok(Synced {
+                    end: End::Status(0),
+                    reason: None
+                })
+            ),
+            "{ended:?}"
+        );
+        assert_eq!(
+            case.said(),
+            [UNCHANGED_APP, UNCHANGED_LIB],
+            "one line per repo, in pair order, and no step"
+        );
+        assert_eq!(case.quarantines(0) + case.quarantines(1), 0, "nothing is fetched");
         case.remove();
     }
 
@@ -4731,7 +4885,7 @@ mod tests {
         let mut call = call_in(&case.roots[0], &case.log, &state);
         call.commit_stage = true;
         let mut attempt = Attempt::for_tests(&call, transport);
-        let ended = sync_back(&mut attempt, &[target], None, status);
+        let ended = sync_back(&mut attempt, &[target], None, status, false);
         (ended, attempt.staged, attempt.checked)
     }
 
@@ -5064,7 +5218,7 @@ mod tests {
         let transport = case.local();
         let mut attempt = Attempt::for_tests(&call, &transport);
 
-        let ended = sync_back(&mut attempt, &[target], None, 0);
+        let ended = sync_back(&mut attempt, &[target], None, 0, false);
 
         super::BEFORE_CHECKED_TREE.set(None);
         assert!(
@@ -5187,7 +5341,7 @@ mod tests {
         let local = case.local();
         let mut attempt = Attempt::for_tests(&call, &local);
 
-        let ended = sync_back(&mut attempt, &targets, None, 0);
+        let ended = sync_back(&mut attempt, &targets, None, 0, false);
 
         assert!(matches!(&ended, Ok(Synced { end: End::Status(1), .. })), "{ended:?}");
         assert_eq!(attempt.staged, Some(Staged::Refused));

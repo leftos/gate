@@ -34,8 +34,8 @@ use gate_win32::{
 };
 use gate_wire::stamp::Tag;
 use gate_wire::{
-    BACK_COMMITS_FAILED, LAYOUT_CHANGING, PairSibling, PathForm, Payload, bare_stem, checkout_done_line, checkout_start_line, layout_text,
-    names_another_layout, ordinal_upper, trees, warm_line,
+    BACK_COMMIT_NONE, BACK_COMMITS_FAILED, LAYOUT_CHANGING, PairSibling, PathForm, Payload, bare_stem, checkout_done_line, checkout_start_line,
+    layout_text, names_another_layout, ordinal_upper, trees, warm_line,
 };
 
 use crate::answer::USAGE_STATUS;
@@ -1002,15 +1002,17 @@ fn commanded(
     let record = command_record(request.work);
     let ran = ran_command(request, &one, beat, console)?;
     removed_if_clean(&record, &ran, beat, console);
-    let status = match ran {
-        Ran::Exited(status) => status,
+    let (status, started) = match ran {
+        Ran::Exited(status) => (status, true),
+        // A command that never started left the tree as it found it: it says nothing of a back commit it did not make.
+        Ran::NotStarted(status) => (status, false),
         // The PC applies nothing of a run the box killed, and a process its kill could not end may still be writing.
         Ran::Killed => {
             back_commits_failed(request, beat, console);
             return Ok(KILLED);
         }
     };
-    let commit = match git.back_commit(request, lfs, console) {
+    let commit = match git.back_commit(request, lfs, started, console) {
         Ok(commit) => commit,
         Err(failed) => {
             back_commits_failed(request, beat, console);
@@ -1137,7 +1139,7 @@ fn warm_commands(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: 
         let ran = warm_command(request, &one, beat, console)?;
         spent += command_spent(beat.adjusted.get(), began.elapsed());
         let status = match ran {
-            Ran::Exited(status) => status,
+            Ran::Exited(status) | Ran::NotStarted(status) => status,
             Ran::Killed => KILLED,
         };
         if status != 0 {
@@ -1276,7 +1278,7 @@ fn ended_clean(beat: &Beat<'_>) -> bool {
 /// Removes the interrupted-command record `record` once the command that `ran` ended clean ([`ended_clean`]); a removal
 /// that fails is said under the box's output lock and changes nothing else.
 fn removed_if_clean(record: &str, ran: &Ran, beat: &Beat<'_>, console: &mut Console) {
-    if matches!(ran, Ran::Exited(_)) && ended_clean(beat) {
+    if matches!(ran, Ran::Exited(_) | Ran::NotStarted(_)) && ended_clean(beat) {
         // Said when it fails; the run's status stands.
         let _ = record_step(preflight::remove_entry(Path::new(record)), "remove", record, beat, console);
     }
@@ -1889,7 +1891,7 @@ fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut 
     };
     let launched = match start_command(&mut start, donor.as_ref().map_err(String::as_str), beat, console) {
         Ok(launched) => launched,
-        Err(answer) => return answer.map(Ran::Exited),
+        Err(answer) => return answer.map(Ran::NotStarted),
     };
     ran_written(request.work, beat, console);
     let mut stopper = Stopper { job: &job, armed: true };
@@ -1950,7 +1952,7 @@ fn prepared<'w>(request: &Request<'_>, one: &One<'w>, console: &mut Console) -> 
         Ok(variables) => variables,
         Err(line) => {
             stamping::err(console, &line);
-            return Err(Ok(Ran::Exited(NOT_STARTED)));
+            return Err(Ok(Ran::NotStarted(NOT_STARTED)));
         }
     };
     let environment = variables
@@ -1959,14 +1961,14 @@ fn prepared<'w>(request: &Request<'_>, one: &One<'w>, console: &mut Console) -> 
     let rest: Vec<OsString> = rest.iter().map(OsString::from).collect();
     let program = match found {
         Ok(program) => program,
-        Err(message) => return Err(Ok(Ran::Exited(not_started(console, word, None, &message)))),
+        Err(message) => return Err(Ok(Ran::NotStarted(not_started(console, word, None, &message)))),
     };
     match written(&program, &rest, &variables) {
         Written::Refused(line) => {
             stamping::err(console, &line);
             Err(Err(u32::from(USAGE_STATUS)))
         }
-        Written::NoShell(message) => Err(Ok(Ran::Exited(not_started(console, word, Some(&program), &message)))),
+        Written::NoShell(message) => Err(Ok(Ran::NotStarted(not_started(console, word, Some(&program), &message)))),
         Written::Line(application, command_line) => Ok(Prepared {
             word,
             program,
@@ -2706,9 +2708,13 @@ fn watch(started: Started<'_, '_>, console: &mut Console) -> Result<Ran, u32> {
     }
 }
 
-/// How a command the box started came to its end: it exited with its status, or the box's ceiling killed it.
+/// How a command came to its end: it exited with its status, the box's ceiling killed it, or it never started.
 pub(super) enum Ran {
+    /// The command ran and exited with its status.
     Exited(u32),
+    /// The command never started: its program was not found, no shell could run it, its variables could not be built,
+    /// or the box could not create its process. `u32` is the start failure's status, as [`not_started`] gives it.
+    NotStarted(u32),
     Killed,
 }
 
@@ -3748,9 +3754,11 @@ impl WorkGit {
     /// back ref this run pushed and, on a pair run, the failing repo's own ([`WorkGit::undo_pushes`]), so the PC finds
     /// a back commit of every changed repo or of none. A pair run then says each repo's commit, or none, on one line
     /// ([`back_commits_line`]). The main repo's commit, `None` when its tree is unchanged; else why one failed.
+    /// A run of one repo says [`BACK_COMMIT_NONE`] once its command ended unchanged and `started`; a command that
+    /// never started changed nothing of its own, so it says nothing of a back commit it did not make.
     /// Each repo's `add -A` takes the run's pins ([`RunLfs::pins`]), so a clean writes nothing into the store
     /// or the work folder's `.git\lfs`.
-    fn back_commit(&self, request: &Request<'_>, lfs: &RunLfs, console: &mut Console) -> Result<Option<String>, BackFailed> {
+    fn back_commit(&self, request: &Request<'_>, lfs: &RunLfs, started: bool, console: &mut Console) -> Result<Option<String>, BackFailed> {
         let mut commits = Vec::with_capacity(1 + request.siblings.len());
         for repo in request.repos() {
             commits.push(self.repo_back_commit(request, repo, lfs, console)?);
@@ -3771,6 +3779,10 @@ impl WorkGit {
         if !request.siblings.is_empty() {
             let _held = self.output.lock().unwrap_or_else(PoisonError::into_inner);
             stamping::err(console, &back_commits_line(request, &commits));
+        } else if started && commits.first().is_none_or(Option::is_none) {
+            // A run of one repo whose command left the tree as the snapshot had it: nothing for the PC to bring back.
+            let _held = self.output.lock().unwrap_or_else(PoisonError::into_inner);
+            stamping::err(console, BACK_COMMIT_NONE);
         }
         Ok(commits.into_iter().next().flatten())
     }

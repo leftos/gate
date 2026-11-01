@@ -5000,6 +5000,7 @@ fn a_back_commit_under_the_apply_cap_syncs_back() {
 fn a_command_that_changes_nothing_syncs_nothing_back() {
     let case = client_case("client-nothing-back");
     let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let unchanged = "gate: the command changed no tracked file on builder; nothing to bring back";
 
     let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there"]));
 
@@ -5008,6 +5009,22 @@ fn a_command_that_changes_nothing_syncs_nothing_back() {
     assert!(
         !outcome.stderr.contains("gate: syncing back"),
         "a run with nothing to sync back says no start line: {outcome:?}"
+    );
+    assert_eq!(
+        outcome.stderr.matches(unchanged).count(),
+        1,
+        "the run says once that the command changed nothing on the builder: {outcome:?}"
+    );
+    let passed = Regex::new(r"(?m)^gate: passed in \d+ s on builder ").expect("the pattern is valid");
+    assert!(passed.is_match(&outcome.stdout), "the run passed, and says so: {outcome:?}");
+    assert_in_order(&log_texts(&case.folder().join("out.log")), &[unchanged, "gate: passed in "]);
+    assert!(
+        !outcome.stderr.contains(gate_wire::BACK_COMMIT_NONE),
+        "the box's line saying it made no back commit is the log's alone: {outcome:?}"
+    );
+    assert!(
+        log_texts(&case.folder().join("out.log")).contains(gate_wire::BACK_COMMIT_NONE),
+        "the log keeps the box's line saying it made no back commit"
     );
     let key = key_of(&events(&case));
     assert_eq!(builder_ref(&case, &format!("refs/gate-back/{key}")), "", "the box wrote no back commit");
