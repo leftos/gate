@@ -28,6 +28,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     GetDriveTypeW,
 };
 
+use crate::commit::stage;
 use crate::console::Console;
 use crate::dotnet_projects;
 use crate::no_build;
@@ -220,7 +221,7 @@ pub(crate) fn route(
     };
     let (warm_hash, declared) = match &route {
         Route::Routed(remote) => (consented_hash(remote, &machine), declared_prefixes(remote, &machine)),
-        Route::Local { .. } | Route::Refused(_) => (None, Ok(Vec::new())),
+        Route::Local { .. } | Route::Refused(_) | Route::Stage(_) => (None, Ok(Vec::new())),
     };
     // A refused pin never readies its log, so the notes it would have written there are said now.
     let refused = matches!(route, Route::Refused(_));
@@ -233,7 +234,7 @@ pub(crate) fn route(
     }
     match &route {
         Route::Local { reason: Some(reason) } => console.err(&reason.line()),
-        Route::Local { reason: None } => {}
+        Route::Local { reason: None } | Route::Stage(_) => {}
         Route::Refused(refusal) => console.err(&refusal.line()),
         Route::Routed(run) => say_routed(request, run, declared, console),
     }
@@ -352,7 +353,10 @@ fn balanced_figures(entry: &BalancedEntry, has_duration: bool) -> String {
 /// its root, which keeps the run here like a run that stays local and notes the refusal line ([`log_in_other_worktree`]).
 /// With the run, the hash of its repo's warm-up file when its warm-up is set up ([`consented_hash`]).
 pub(crate) fn route_as_heavy(request: &RunRequest, decision: &Decision, by: u32, console: &mut Console) -> Option<(RemoteRun, Option<String>)> {
-    let machine = Machine::of(decision.local_app_data.as_deref(), &request.test_seams).with_state(decision);
+    // A commit's stage is judged once, under the commit's own slot: the judge is not asked again as heavy.
+    let machine = Machine::of(decision.local_app_data.as_deref(), &request.test_seams)
+        .with_state(decision)
+        .judging_no_stage();
     let mut refusal = None;
     let routed = match decide(&decision.inputs(gate_router::Slot::Heavy), &machine) {
         Route::Routed(run) if decision.unicode => match log_in_other_worktree(run_log(request).as_deref(), &run) {
@@ -362,7 +366,8 @@ pub(crate) fn route_as_heavy(request: &RunRequest, decision: &Decision, by: u32,
             }
             None => Some(run),
         },
-        Route::Routed(_) | Route::Local { .. } | Route::Refused(_) => None,
+        // These facts judge no stage, so a commit is never a stage here.
+        Route::Routed(_) | Route::Local { .. } | Route::Refused(_) | Route::Stage(_) => None,
     };
     let Some(run) = routed else {
         for line in machine.unsaid_notes() {
@@ -400,6 +405,22 @@ pub(crate) fn later_run(
 ) -> Result<RemoteRun, Option<String>> {
     let machine = Machine::of(decision.local_app_data.as_deref(), &request.test_seams).with_state(decision);
     let run = gate_router::later_run(&decision.inputs(slot(asked)), &machine, candidate);
+    for line in machine.unsaid_notes() {
+        console.note(&line);
+    }
+    run
+}
+
+/// The commit stage of the later builder `candidate` of a stage's route under the routing `decision`
+/// ([`gate_router::later_stage_run`]), the decision's notes noted in the log.
+pub(crate) fn later_stage_run(
+    request: &RunRequest,
+    decision: &Decision,
+    candidate: &LaterCandidate,
+    console: &mut Console,
+) -> Result<RemoteRun, Option<String>> {
+    let machine = Machine::of(decision.local_app_data.as_deref(), &request.test_seams).with_state(decision);
+    let run = gate_router::later_stage_run(&decision.inputs(slot(request.slot)), &machine, candidate);
     for line in machine.unsaid_notes() {
         console.note(&line);
     }
@@ -637,6 +658,16 @@ fn input_files(root: &Path, path: &str) -> Result<Vec<String>, String> {
     Ok(files)
 }
 
+/// The slot of the gate's arguments that the router's `slot` stands for.
+fn gate_slot(slot: gate_router::Slot) -> Slot {
+    match slot {
+        gate_router::Slot::Heavy => Slot::Heavy,
+        gate_router::Slot::Light => Slot::Light,
+        gate_router::Slot::Critical => Slot::Critical,
+        gate_router::Slot::None => Slot::None,
+    }
+}
+
 fn slot(slot: Slot) -> gate_router::Slot {
     match slot {
         Slot::Heavy => gate_router::Slot::Heavy,
@@ -674,6 +705,12 @@ pub(crate) fn remote_json_path(local_app_data: Option<&OsStr>) -> Option<PathBuf
 /// routing file, how long each of the decision's git calls may take, how long its readers get once git has exited, and
 /// what git said of the gate's place when the decision asked.
 pub(crate) struct Machine<'a> {
+    /// The variables that keep a commit's stage here that the gate's environment sets ([`Environment::stage_blocking`]);
+    /// none for facts not read for a run.
+    stage_blocking: &'a [&'static str],
+    /// Whether these facts judge a commit's stage ([`Facts::commit_stage`]); not for a decision asked again of a run
+    /// whose stage was judged once already ([`route_as_heavy`]).
+    judges_stage: bool,
     folder: io::Result<PathBuf>,
     local_app_data: Option<&'a OsStr>,
     git_limit: Duration,
@@ -784,7 +821,10 @@ impl<'a> Machine<'a> {
     /// The facts of the gate's working folder now, with `environment`'s LOCALAPPDATA and the git limits and remote
     /// transport `seams` set.
     pub(crate) fn new(environment: &'a Environment, seams: &TestSeams) -> Machine<'a> {
-        Machine::of(environment.local_app_data.as_deref(), seams)
+        Machine {
+            stage_blocking: &environment.stage_blocking,
+            ..Machine::of(environment.local_app_data.as_deref(), seams)
+        }
     }
 
     /// The facts of the gate's working folder now, reading `local_app_data`'s routing file, with the git limits and
@@ -815,7 +855,14 @@ impl<'a> Machine<'a> {
             run_log: None,
             state: None,
             figures: Figures::Unread,
+            stage_blocking: &[],
+            judges_stage: true,
         }
+    }
+
+    /// These facts judging no commit's stage, for a decision asked again of a run whose stage was judged once.
+    fn judging_no_stage(self) -> Machine<'a> {
+        Machine { judges_stage: false, ..self }
     }
 
     /// These facts reading each scored builder's figures through `reader`, as the machine of a run's routing decision
@@ -1195,6 +1242,55 @@ impl<'a> Machine<'a> {
 }
 
 impl Facts for Machine<'_> {
+    /// A plain `git commit` of a repo `commits` names whose stage the commit's judge accepts ([`stage::stage_eligible`])
+    /// on its worktree's facts ([`stage::stage_facts`]), read under the decision's git bounds. The judge's reason for a
+    /// stage it keeps here, and why the facts could not be read, go to the log alone.
+    fn commit_stage(&self, config: &Config, inputs: &Inputs<'_>) -> bool {
+        let words: Vec<OsString> = inputs.words.iter().map(OsString::from).collect();
+        if !self.judges_stage || !crate::commit::is_commit(&words) {
+            return false;
+        }
+        let Ok(Some(place)) = self.place() else {
+            return false;
+        };
+        if config.commits_allowed(&repo_name(&place.checkout)) != Ok(true) {
+            return false;
+        }
+        let is_set = |name: &str| self.stage_blocking.contains(&name);
+        let input = stage::StageInput {
+            words: &words,
+            is_set: &is_set,
+            slot: gate_slot(inputs.slot),
+            covered: inputs.covering_parent,
+            consented: true,
+        };
+        let root = Path::new(&place.root);
+        let bounds = git::GitBounds {
+            limit: self.git_limit,
+            drain: self.git_drain,
+        };
+        let read = git::Git::find(root)
+            .map_err(git::GitError::Failed)
+            .and_then(|found| stage::stage_facts(root, &found, bounds));
+        let line = match read {
+            Ok(facts) => match stage::stage_eligible(&input, &facts) {
+                Ok(()) => return true,
+                Err(reason) => format!("gate: the commit's hooks run here: {reason}"),
+            },
+            Err(error) => format!(
+                "gate: cannot judge whether the commit's hooks may run on a builder: {}",
+                String::from(error)
+            ),
+        };
+        self.notes.borrow_mut().push(line);
+        false
+    }
+
+    /// Notes for the log alone why a commit judged a stage runs its hooks here, as the judge's own reason is noted.
+    fn stage_kept_here(&self, why: &str) {
+        self.notes.borrow_mut().push(format!("gate: the commit's hooks run here: {why}"));
+    }
+
     /// `<LOCALAPPDATA>\gate\remote.json`; with LOCALAPPDATA unset, empty or relative there is no routing file. A file
     /// that reads is kept for the warm-up's judgement, so the route reads it once.
     fn config(&self) -> Result<Option<Config>, ConfigProblem> {
@@ -2966,6 +3062,101 @@ mod tests {
         fs::remove_dir_all(&gate).expect("the real .gate can be removed");
         junction(&gate, &elsewhere.join(".gate"));
         assert_eq!(read_siblings(&root), Err(".gate is a link or a junction".to_owned()), "a junction");
+    }
+
+    /// A scratch repository for the case `name` with one commit, a staged change and prek's pre-commit shim as its hook.
+    fn stage_repo(name: &str) -> (PathBuf, Removed) {
+        let (root, removed) = scratch(name);
+        git_in(&root, &["init", "--quiet"]);
+        fs::write(root.join("a.txt"), "a\n").expect("a.txt can be written");
+        git_in(&root, &["add", "a.txt"]);
+        let identity = [
+            "-c",
+            "user.name=gate test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=.no-hooks",
+        ];
+        git_in(&root, &[&identity[..], &["commit", "--quiet", "-m", "base"]].concat());
+        fs::write(root.join("a.txt"), "b\n").expect("a.txt can be changed");
+        git_in(&root, &["add", "a.txt"]);
+        let shim = "#!/bin/sh\n# File generated by prek: https://github.com/j178/prek\n\
+                    exec prek hook-impl --hook-dir \"$HERE\" --script-version 4 --hook-type=pre-commit -- \"$@\"\n";
+        fs::create_dir_all(root.join(".git").join("hooks")).expect("the hooks folder can be made");
+        fs::write(root.join(".git").join("hooks").join("pre-commit"), shim).expect("the hook can be written");
+        (root, removed)
+    }
+
+    /// The routing file of a builder for the repo of the worktree `machine` is in, its `commits` naming it when
+    /// `consented`.
+    fn stage_config(machine: &Machine<'_>, consented: bool) -> Config {
+        let place = machine.place().expect("git finds the place").expect("the folder is in a worktree");
+        let repo = gate_router::repo_name(&place.checkout);
+        let commits: Vec<&str> = if consented { vec![&repo] } else { Vec::new() };
+        let text = serde_json::json!({"host": "builder-1", "repos": {&repo: ["x"]}, "commits": commits}).to_string();
+        Config::parse(&text).expect("the routing file is usable")
+    }
+
+    /// Whether `machine` judges a heavy `git commit -m staged` a commit stage under `config`.
+    fn judged_stage(machine: &Machine<'_>, config: &Config) -> bool {
+        let words: Vec<String> = ["git", "commit", "-m", "staged"].map(str::to_owned).to_vec();
+        let inputs = gate_router::Inputs {
+            slot: gate_router::Slot::Heavy,
+            covering_parent: false,
+            local: false,
+            git_hook: false,
+            words: &words,
+            given: None,
+            pin: None,
+        };
+        machine.commit_stage(config, &inputs)
+    }
+
+    #[test]
+    fn a_commit_of_a_repo_commits_does_not_list_is_not_a_stage() {
+        let (root, _removed) = stage_repo("stage-unlisted");
+        let machine = Machine {
+            folder: Ok(root),
+            ..Machine::of(None, &TestSeams::default())
+        };
+        let config = stage_config(&machine, false);
+
+        assert!(!judged_stage(&machine, &config), "a repo commits does not name keeps its hooks here");
+    }
+
+    #[test]
+    fn a_commit_with_skip_set_is_not_a_stage() {
+        let (root, _removed) = stage_repo("stage-skip");
+        let machine = Machine {
+            folder: Ok(root),
+            stage_blocking: &["SKIP"],
+            ..Machine::of(None, &TestSeams::default())
+        };
+        let config = stage_config(&machine, true);
+
+        assert!(!judged_stage(&machine, &config), "SKIP keeps the hooks here");
+        let notes = machine.unsaid_notes();
+        assert!(
+            notes
+                .iter()
+                .any(|line| line.starts_with("gate: the commit's hooks run here: ") && line.contains("SKIP")),
+            "the log says why: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn an_eligible_commit_is_a_stage() {
+        let (root, _removed) = stage_repo("stage-eligible");
+        let machine = Machine {
+            folder: Ok(root),
+            ..Machine::of(None, &TestSeams::default())
+        };
+        let config = stage_config(&machine, true);
+
+        assert!(judged_stage(&machine, &config), "{:?}", machine.unsaid_notes());
     }
 
     /// A routing file whose `declarations` names `folder` for the repo `g`.

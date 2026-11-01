@@ -22,6 +22,9 @@ pub(crate) struct Environment {
     pub box_job: Option<OsString>,
     /// `GATE_COMMIT_SLOT`, the slot marker of the commit run this gate may run in the hooks of, if any.
     pub commit_slot: Option<OsString>,
+    /// The variables among those that keep a commit's stage here ([`crate::commit::stage::BLOCKING_VARIABLES`]) that
+    /// the gate's environment sets, to any value.
+    pub stage_blocking: Vec<&'static str>,
 }
 
 impl Environment {
@@ -33,6 +36,10 @@ impl Environment {
             slot_held: std::env::var_os(SLOT_HELD_VARIABLE),
             box_job: std::env::var_os(BOX_JOB_VARIABLE),
             commit_slot: std::env::var_os(COMMIT_SLOT_VARIABLE),
+            stage_blocking: crate::commit::stage::BLOCKING_VARIABLES
+                .into_iter()
+                .filter(|name| std::env::var_os(name).is_some())
+                .collect(),
         }
     }
 }
@@ -122,6 +129,7 @@ mod tests {
             slot_held: None,
             box_job: None,
             commit_slot: None,
+            stage_blocking: Vec::new(),
         };
         let variable = Environment {
             state_dir: Some(given.clone().into_os_string()),
@@ -130,6 +138,7 @@ mod tests {
             slot_held: None,
             box_job: None,
             commit_slot: None,
+            stage_blocking: Vec::new(),
         };
 
         assert_eq!(root(None, &no_root).err().as_deref(), Some("gate: cannot read the LOCALAPPDATA variable"));

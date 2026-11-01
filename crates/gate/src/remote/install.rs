@@ -2261,6 +2261,7 @@ mod tests {
         /// A call running in `root`, its state under `state` and its lines written to `log`.
         fn call_in<'a>(root: &'a str, state: &'a Path, log: &'a Path) -> RemoteCall<'a> {
             RemoteCall {
+                commit_stage: false,
                 builder: &crate::test_support::HOST,
                 key: "app-1a2b3c4d",
                 session: "0123456789abcdef0123456789abcdef",

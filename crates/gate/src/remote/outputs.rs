@@ -2279,6 +2279,7 @@ mod tests {
         /// A call running in `root`, its state under `state` and its lines written to `log`.
         fn call_in<'a>(root: &'a str, state: &'a Path, log: &'a Path) -> RemoteCall<'a> {
             RemoteCall {
+                commit_stage: false,
                 builder: &crate::test_support::HOST,
                 key: KEY,
                 session: "0123456789abcdef0123456789abcdef",
@@ -2316,6 +2317,7 @@ mod tests {
         /// A call of [`call_in`]'s on `builder`, its output globs `globs`.
         fn on<'a>(builder: &'a Builder, root: &'a str, globs: &'a [String], state: &'a Path, log: &'a Path) -> RemoteCall<'a> {
             RemoteCall {
+                commit_stage: false,
                 builder,
                 outputs: globs,
                 ..call_in(root, state, log)
@@ -2385,6 +2387,7 @@ mod tests {
                 let log = scratch(&format!("{name}-log")).join("out.log");
                 let root = root.to_string_lossy().into_owned();
                 let call = RemoteCall {
+                    commit_stage: false,
                     bins_withheld: withheld,
                     ..on(&crate::test_support::HOST, &root, &globs, &state, &log)
                 };
@@ -2520,6 +2523,7 @@ mod tests {
             let root = root.to_string_lossy().into_owned();
             let transport = nowhere();
             let held = RemoteCall {
+                commit_stage: false,
                 outputs_withheld: true,
                 bins_withheld: false,
                 ..on(&crate::test_support::HOST, &root, &globs, &state, &log)
@@ -2585,6 +2589,7 @@ mod tests {
             let place = location();
             let root = root.to_string_lossy().into_owned();
             let call = RemoteCall {
+                commit_stage: false,
                 failure_outputs: &failure,
                 ..call_in(&root, &state, &log)
             };
@@ -2693,6 +2698,7 @@ mod tests {
             let failure = ["**/TestResults/**".to_owned()];
             let root = root.to_string_lossy().into_owned();
             let call = RemoteCall {
+                commit_stage: false,
                 failure_outputs: &failure,
                 ..call_in(&root, &state, &log)
             };

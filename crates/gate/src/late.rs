@@ -438,6 +438,7 @@ mod tests {
                     journal: &mut self.journal,
                     parent_pid: Some(self.parent.pid),
                     expected: None,
+                    journals: true,
                 },
                 held: &mut self.held,
                 covered: &mut self.marker,

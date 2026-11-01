@@ -22,7 +22,7 @@ fn routed(route: Route) -> RemoteRun {
     assert!(matches!(route, Route::Routed(_)), "the command runs here: {:?}", local_line(&route));
     match route {
         Route::Routed(run) => *run,
-        Route::Local { .. } | Route::Refused(_) => unreachable!("asserted to route"),
+        Route::Local { .. } | Route::Refused(_) | Route::Stage(_) => unreachable!("asserted to route"),
     }
 }
 
@@ -31,6 +31,7 @@ fn local_line(route: &Route) -> Option<String> {
         Route::Local { reason } => reason.as_ref().map(LocalReason::line),
         Route::Refused(refusal) => Some(refusal.line()),
         Route::Routed(_) => Some("routed".to_owned()),
+        Route::Stage(_) => Some("staged".to_owned()),
     }
 }
 
@@ -4289,7 +4290,7 @@ fn refused(route: Route) -> PinRefusal {
     assert!(matches!(route, Route::Refused(_)), "expected a refused pin, got {route:?}");
     match route {
         Route::Refused(refusal) => refusal,
-        Route::Local { .. } | Route::Routed(_) => unreachable!("asserted to be refused"),
+        Route::Local { .. } | Route::Routed(_) | Route::Stage(_) => unreachable!("asserted to be refused"),
     }
 }
 
@@ -6185,4 +6186,72 @@ fn the_current_runtime_switch_in_either_spelling_builds_out_of_place() {
     assert!(build(&[]), "the plain build builds in place");
     assert!(!build(&["--ucr"]));
     assert!(!build(&["--use-current-runtime"]));
+}
+
+/// `yaat` routed on `host` and named by `commits`, with the routing file's `rest` after them.
+fn commits_config(host_repos: &str, rest: &str) -> Config {
+    Config::parse(&format!(r#"{{"host": "builder-1", "repos": {host_repos}, "commits": ["yaat"]{rest}}}"#)).expect("usable")
+}
+
+/// The commit stage `route` decided on, which must be one.
+fn staged(route: Route) -> RemoteRun {
+    assert!(matches!(route, Route::Stage(_)), "the commit has no stage: {:?}", local_line(&route));
+    match route {
+        Route::Stage(run) => *run,
+        Route::Local { .. } | Route::Refused(_) | Route::Routed(_) => unreachable!("asserted to stage"),
+    }
+}
+
+#[test]
+fn a_commit_stage_routes_before_stays_local() {
+    let command = words(&["git", "commit", "-m", "x"]);
+    let facts = FakeFacts {
+        commit_stage: true,
+        ..FakeFacts::with_config(commits_config(r#"{"yaat": ["dotnet *"]}"#, ""))
+    };
+
+    let run = staged(decide(&heavy(&command), &facts));
+
+    assert_eq!(run.words, ["prek", "run", "--hook-stage", "pre-commit"], "no file list");
+    assert_eq!(run.builder.alias, "builder-1");
+    assert_eq!(run.subfolder, "", "the hooks run at the worktree's root");
+    assert!(
+        run.outputs.is_empty() && run.failure_outputs.is_empty() && run.inputs.is_empty(),
+        "{run:?}"
+    );
+    assert!(run.send.is_none() && run.desktop.is_none(), "{run:?}");
+}
+
+#[test]
+fn an_ineligible_commit_stays_local() {
+    let command = words(&["git", "commit", "-m", "x"]);
+    let facts = FakeFacts::with_config(commits_config(r#"{"yaat": ["dotnet *"]}"#, ""));
+
+    assert_eq!(decide(&heavy(&command), &facts), SILENT);
+}
+
+#[test]
+fn a_commit_stage_never_picks_a_macos_builder() {
+    let command = words(&["git", "commit", "-m", "x"]);
+    let mac_then_windows = r#", "builders": [{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["*"]}},
+        {"host": "win-2", "os": "windows", "repos": {"yaat": ["*"]}}]"#;
+    let both = FakeFacts {
+        commit_stage: true,
+        ..FakeFacts::with_config(commits_config(r#"{"other": ["*"]}"#, mac_then_windows))
+    };
+    let mac_only = r#", "builders": [{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["*"]}}]"#;
+    let only_mac = FakeFacts {
+        commit_stage: true,
+        ..FakeFacts::with_config(commits_config(r#"{"other": ["*"]}"#, mac_only))
+    };
+
+    let run = staged(decide(&heavy(&command), &both));
+
+    assert_eq!(run.builder.alias, "win-2", "the Mac listed first is passed over");
+    assert!(run.later.is_empty(), "no Mac is a later candidate: {:?}", run.later);
+    assert_eq!(
+        decide(&heavy(&command), &only_mac),
+        SILENT,
+        "with only a Mac, the commit runs as it would with no stage"
+    );
 }

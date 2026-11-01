@@ -31,8 +31,8 @@ use gate_router::{
     dotnet_target, sdk_build_target, without_no_build, work_folder_key,
 };
 use gate_state::{
-    Estimate, FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RoutingFacts, RunFacts, RunTrace, StateRoot, Verdict, key_hash,
-    log_hash, v1,
+    Estimate, FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RoutingFacts, RunFacts, RunTrace, StageFacts, StageOutcome,
+    StateRoot, Verdict, key_hash, log_hash, v1,
 };
 use gate_watchdog::{Cores, Hint, SlotKind, hint};
 use gate_win32::{
@@ -65,6 +65,7 @@ use crate::no_build::{self, NothingBack, Unfound, Worktree};
 use crate::orphan::{self, Orphan};
 use crate::outputs::{stale, walk::walk};
 use crate::remote::drain::{self, Drain, utc_clock};
+use crate::remote::syncback::Staged;
 use crate::remote::{self, KEY_WAIT_SLICE, KeyWait, RemoteCall, RemoteClient, RemoteOutcome, Split, git};
 use crate::resolve::{Environment, ResolvedRoot};
 use crate::restore::{self, NotRestoring, RestorePlan};
@@ -211,6 +212,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         cold: false,
         tailscale_read: None,
         would: None,
+        staging: None,
         arrived: epoch_ms(Timestamp::now()),
         queued_at: None,
         lent: false,
@@ -810,6 +812,9 @@ struct Run<'a> {
     /// decision again as a heavy gate would ([`route::route_as_heavy`]). `None` for a run whose light parent lent it its
     /// slot, which never asked.
     would: Option<route::Decision>,
+    /// The commit's own figures while its pre-commit stage runs on a builder ([`Run::stage`]), which the stage's call
+    /// runs under in place of its remote take's; `None` at any other time.
+    staging: Option<Figures>,
     /// The run's first arrival in Unix epoch milliseconds, which every ticket it writes keeps.
     arrived: u64,
     /// The moment of the run's `queue` line: the moment the local `take` of a run the full remote pool sent back counts
@@ -944,6 +949,9 @@ pub(crate) struct Taker<'t> {
     pub journal: &'t mut RunJournal,
     pub parent_pid: Option<u32>,
     pub expected: Option<&'t Map<String, Value>>,
+    /// Whether the take is journalled: not for the remote slot of a commit's pre-commit stage, whose commit journals
+    /// only its own.
+    pub journals: bool,
 }
 
 impl Taker<'_> {
@@ -981,8 +989,10 @@ impl Taker<'_> {
             }
         }
         slots::write_claim(&taken.held, pool.claim_kind(), &of, console);
-        self.journal
-            .write(&take_event(vec![name], waited, abandoned, self.parent_pid), self.tag, console);
+        if self.journals {
+            self.journal
+                .write(&take_event(vec![name], waited, abandoned, self.parent_pid), self.tag, console);
+        }
         taken.beside = None;
         slots::wake_waiters(self.root, survey, console);
     }
@@ -1055,6 +1065,8 @@ struct CallParts<'r> {
     env: &'r [(String, String)],
     /// The run's drain session, made once before its first attempt.
     session: &'r str,
+    /// Whether the call is a commit's pre-commit stage ([`RemoteCall::commit_stage`]).
+    commit_stage: bool,
 }
 
 /// The outcome a routed run of `request` goes on with once `first`, the outcome of its `call`, ended: `first` itself,
@@ -1492,8 +1504,10 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         warmth,
         env,
         session,
+        commit_stage,
     } = parts;
     Ok(RemoteCall {
+        commit_stage,
         builder: &remote.builder,
         key: &remote.key,
         session,
@@ -1587,6 +1601,17 @@ impl Attempt {
             held,
         })
     }
+
+    /// How a commit stage's call with the client's `outcome` ended: handed back to the commit once the box said it
+    /// started the command ([`RemoteOutcome::command_started`]); else a refusal for the client, whatever kept it from
+    /// starting, with the stage's remote slot from `hold`.
+    fn staged(outcome: RemoteOutcome, hold: &mut Hold) -> Attempt {
+        if outcome.command_started {
+            return Attempt::Done(Remotely::Staged(Box::new(outcome)));
+        }
+        let reason = outcome.fallback().unwrap_or(FallbackReason::Client);
+        Attempt::refused(reason, outcome, hold.taken.take())
+    }
 }
 
 /// A builder's refusal of a routed run's attempt: the reason, the client's outcome and the remote slot still held.
@@ -1629,6 +1654,48 @@ enum Remotely {
     Interrupted,
     /// The run falls back here.
     Here,
+    /// A commit's pre-commit stage ran its command on the builder, and ended as the client's outcome says
+    /// ([`Run::stage`]).
+    Staged(Box<RemoteOutcome>),
+}
+
+/// How a commit goes on after its pre-commit stage on a builder ([`Run::stage`]).
+enum Staging {
+    /// It starts, under these figures.
+    Commit(Figures),
+    /// It ended without starting, as this says.
+    Ended(Ended),
+}
+
+/// prek's status as the release's `stage` journals it, and how the stage ended, from the client's `outcome` of a stage
+/// whose command started: no status when its result never came back, which refuses the commit.
+fn stage_outcome(outcome: &RemoteOutcome) -> (Option<i64>, StageOutcome) {
+    match outcome.staged {
+        Some(Staged::Applied(_)) => (Some(0), StageOutcome::Applied),
+        Some(Staged::Clean) => (Some(0), StageOutcome::Clean),
+        Some(Staged::Refused) => (Some(0), StageOutcome::Refused),
+        Some(Staged::ApplyFailed { status }) => (Some(status), StageOutcome::Refused),
+        Some(Staged::HooksFailed { status, .. }) => (Some(status), StageOutcome::HooksFailed),
+        None => (None, StageOutcome::Refused),
+    }
+}
+
+/// The status of a commit that does not start after its stage ended `staged`: the hooks' own when they failed, a failed
+/// write's included, else a failed gate's.
+fn unstarted_status(staged: Staged) -> i64 {
+    match staged {
+        Staged::HooksFailed { status, .. } | Staged::ApplyFailed { status } if status != 0 => status,
+        _ => GATE_FAILED,
+    }
+}
+
+/// `figures` with `spent` taken off the ceiling, whole seconds, at least one left: a commit's stage and the commit
+/// share the commit's one ceiling.
+fn left_after(figures: Figures, spent: Duration) -> Figures {
+    Figures {
+        ceiling: figures.ceiling.saturating_sub(spent.as_secs()).max(1),
+        ..figures
+    }
 }
 
 /// What a passed line says of how long the command ran: here, by the wall clock and load-adjusted, or on a builder,
@@ -1851,7 +1918,8 @@ impl Run<'_> {
                 key: remote.key.clone(),
                 critical_pid: None,
             }),
-            Route::Local { .. } | Route::Refused(_) => None,
+            // A commit's stage runs beside the commit, which stays the run here.
+            Route::Local { .. } | Route::Refused(_) | Route::Stage(_) => None,
         };
         // The balanced pick was said with the route lines; nothing reads it off the run again.
         if let Route::Routed(remote) = &mut route {
@@ -2063,7 +2131,7 @@ impl Run<'_> {
         console: &mut Console,
     ) -> Option<(Ended, Option<HereWords>)> {
         let planned = match route {
-            Route::Local { .. } => self.plan_local(plan, local, console),
+            Route::Local { .. } | Route::Stage(_) => self.plan_local(plan, local, console),
             Route::Routed(remote) => match self.routed(remote, hold, console) {
                 Remotely::Ended(ended) => return Some((ended, None)),
                 Remotely::Interrupted => return None,
@@ -2071,6 +2139,7 @@ impl Run<'_> {
                 Remotely::Here => self
                     .plan_local(plan, local, console)
                     .and_then(|(plan, _)| self.plan_here(remote, plan, console)),
+                Remotely::Staged(_) => unreachable!("only a commit's stage ends staged"),
             },
             Route::Refused(_) => unreachable!("run returns a refused pin's usage status before the run goes through"),
         };
@@ -2078,7 +2147,11 @@ impl Run<'_> {
             Ok(planned) => planned,
             Err(ended) => return Some((ended, None)),
         };
-        let ended = self.here(plan, hold, console)?;
+        let stage = match route {
+            Route::Stage(remote) => Some(remote.as_ref()),
+            Route::Local { .. } | Route::Routed(_) | Route::Refused(_) => None,
+        };
+        let ended = self.here(plan, stage, hold, console)?;
         // A light run a critical request sent to a builder ran its words there; one that came back keeps them, since
         // its fallback cleared its tag ([`Run::give_up`]).
         Some((ended, here.filter(|_| self.tag.is_none())))
@@ -2090,9 +2163,10 @@ impl Run<'_> {
     /// its start decision kept here that a critical request holds back with no place beside it asks once whether its
     /// command would route on heavy ([`route::route_as_heavy`]): when it would, it says so, closes its log and runs on
     /// the builder ([`Run::routed`]), its remote tag naming the request; a refusal or fallback, or a command that would
-    /// not route, sends it back to its wait here, keeping the instant it queued. How the run ended; `None` when a Ctrl+C ended the wait for a slot
-    /// or for the remote client to start.
-    fn here(&mut self, plan: Plan, hold: &mut Hold, console: &mut Console) -> Option<Ended> {
+    /// not route, sends it back to its wait here, keeping the instant it queued. A commit with a `stage` runs its
+    /// pre-commit hooks on that builder once it holds its own slot, and starts only as the stage says ([`Run::stage`]).
+    /// How the run ended; `None` when a Ctrl+C ended the wait for a slot or for the remote client to start.
+    fn here(&mut self, plan: Plan, stage: Option<&RemoteRun>, hold: &mut Hold, console: &mut Console) -> Option<Ended> {
         self.open_log(console);
         let nesting = self.nesting;
         let floor = Figures::floor(self.request.timeout);
@@ -2109,6 +2183,11 @@ impl Run<'_> {
             match self.take_own(hold, console) {
                 Taking::Took(took, figures) => {
                     hold.took = Some(took);
+                    let figures = match stage.map(|remote| self.stage(remote, figures, console)) {
+                        None => figures,
+                        Some(Staging::Commit(figures)) => figures,
+                        Some(Staging::Ended(ended)) => return Some(ended),
+                    };
                     return Some(self.command(plan, figures, console));
                 }
                 Taking::Lent(figures) => return Some(self.lent_as_it_waited(plan, hold, figures, console)),
@@ -2120,9 +2199,123 @@ impl Run<'_> {
                     Remotely::Interrupted => return None,
                     // Back to its wait, in its first place.
                     Remotely::Here => {}
+                    Remotely::Staged(_) => unreachable!("only a commit's stage ends staged"),
                 },
             }
         }
+    }
+
+    /// Runs the commit's pre-commit hooks on the builder of its `stage` before the commit starts here, the commit's own
+    /// slot held throughout: says so, then tries the stage's builders as a routed run tries its own
+    /// ([`Run::try_builders`]), under the commit's `figures`. Its remote slot is taken into a hold of its own, whose take
+    /// and release are not journalled; the run names the stage's builder as its remote tag only while the stage runs,
+    /// and its log is closed while the client writes to it. The release's `stage` is set for a stage that fell back or
+    /// whose command started ([`Run::journal_stage`]). The commit starts under what is left of its ceiling once a stage
+    /// fell back before its command ran, or once its hooks passed ([`Run::after_stage`]); a Ctrl+C before its command
+    /// started ends it as one before a command started does, its log reopened, so its slot is released as any run's.
+    fn stage(&mut self, remote: &RemoteRun, figures: Figures, console: &mut Console) -> Staging {
+        console.err(&format!("gate: running the commit's pre-commit hooks on {}", remote.builder.alias));
+        let started = Instant::now();
+        self.close_log(console);
+        self.staging = Some(figures);
+        self.tag = Some(RemoteTag {
+            host: remote.builder.alias.clone(),
+            key: remote.key.clone(),
+            critical_pid: None,
+        });
+        let mut hold = Hold::nothing();
+        let (remotely, _) = self.try_builders(remote, &mut hold, console);
+        self.staging = None;
+        // A fallback took the tag; the stage then names the builder it was decided for.
+        let host = self.tag.take().map_or_else(|| remote.builder.alias.clone(), |tag| tag.host);
+        if let Some(taken) = hold.taken.take() {
+            slots::delete_claim(&taken.held, console);
+            drop(taken);
+            slots::wake_waiters(self.root, &mut self.survey, console);
+        }
+        self.journal_stage(&remotely, &host, &remote.key, started);
+        let figures = left_after(figures, started.elapsed());
+        match remotely {
+            Remotely::Interrupted => {
+                self.open_log(console);
+                Staging::Ended(self.interrupted_before_start(console))
+            }
+            Remotely::Ended(ended) => Staging::Ended(ended),
+            Remotely::Here => {
+                self.open_log(console);
+                Staging::Commit(figures)
+            }
+            Remotely::Staged(called) => {
+                self.open_log(console);
+                self.after_stage(&called, &host, figures, console)
+            }
+        }
+    }
+
+    /// How the commit goes on once its stage's command ran on `host`, as the client's `outcome` says: it starts under
+    /// `figures` once the hooks passed, saying so, unless a Ctrl+C came by then, which ends it with the fixes staged.
+    /// It ends without starting when the stage was refused or its apply failed, as a failed gate, the sync-back having
+    /// said why, when the hooks failed, with their status, and when their result never came back, saying so.
+    fn after_stage(&mut self, outcome: &RemoteOutcome, host: &str, figures: Figures, console: &mut Console) -> Staging {
+        let (line, interrupted) = match outcome.staged {
+            Some(Staged::Applied(files)) => (
+                format!("gate: staged the hooks' fixes to {files} files from {host}; committing"),
+                "gate: the run was interrupted; the hooks' fixes are applied and staged",
+            ),
+            Some(Staged::Clean) => (
+                format!("gate: the hooks passed on {host}; committing"),
+                "gate: the run was interrupted; the hooks passed and nothing was changed",
+            ),
+            Some(other) => return Staging::Ended(self.stage_ended(unstarted_status(other), None, console)),
+            None => return Staging::Ended(self.not_brought_back(host, console)),
+        };
+        console.err(&line);
+        if self.host.interrupt.is_some_and(Interrupt::is_raised) {
+            return Staging::Ended(self.stage_ended(i64::from(CONTROL_C_EXIT.cast_signed()), Some(interrupted), console));
+        }
+        Staging::Commit(figures)
+    }
+
+    /// Ends a commit whose stage's command ran on `host` but whose result never came back, saying so: failed, or as an
+    /// interrupt when a Ctrl+C is raised.
+    fn not_brought_back(&mut self, host: &str, console: &mut Console) -> Ended {
+        let line = format!("gate: commit refused: the hooks ran on {host} but their result could not be brought back; nothing was written");
+        let status = if self.host.interrupt.is_some_and(Interrupt::is_raised) {
+            i64::from(CONTROL_C_EXIT.cast_signed())
+        } else {
+            GATE_FAILED
+        };
+        self.stage_ended(status, Some(&line), console)
+    }
+
+    /// Sets the release's `stage` for a stage of `host` and `key` that began at `started` and fell back, or whose
+    /// command started, as `remotely` says it ended; a stage a Ctrl+C or a pinned end stopped before then sets none.
+    fn journal_stage(&mut self, remotely: &Remotely, host: &str, key: &str, started: Instant) {
+        let (status, outcome) = match remotely {
+            Remotely::Interrupted | Remotely::Ended(_) => return,
+            Remotely::Here => (None, StageOutcome::FellBack),
+            Remotely::Staged(called) => stage_outcome(called),
+        };
+        self.routing.stage = Some(StageFacts {
+            host: host.to_owned(),
+            key: key.to_owned(),
+            status,
+            outcome,
+            seconds: started.elapsed().as_secs_f64(),
+        });
+    }
+
+    /// Ends a commit that never starts after its stage with `status`, no verdict, saying `line` when there is one, and
+    /// completes the log.
+    fn stage_ended(&mut self, status: i64, line: Option<&str>, console: &mut Console) -> Ended {
+        if let Some(line) = line {
+            console.err(line);
+        }
+        self.log_owed_end_load(None, console);
+        if let Err(error) = self.log.finish(console) {
+            console.err(&format!("gate: could not write to {}: {error}", self.log.path().display()));
+        }
+        Ended { status, facts: None }
     }
 
     /// Asks once whether the light run the critical request of gate `by` held back, out of the queue it joined at
@@ -2378,7 +2571,11 @@ impl Run<'_> {
     /// skipped, noting in the log why, naming it, when the skip says why.
     fn build_candidate(&self, decision: &route::Decision, candidate: &LaterCandidate, console: &mut Console) -> Option<RemoteRun> {
         let asked = if self.rerouted_for.is_some() { Slot::Heavy } else { self.request.slot };
-        let built = route::later_run(self.request, decision, candidate, asked, console);
+        let built = if self.staging.is_some() {
+            route::later_stage_run(self.request, decision, candidate, console)
+        } else {
+            route::later_run(self.request, decision, candidate, asked, console)
+        };
         // The seam raises the console interrupt once the walk has built a candidate, before the run tries it.
         if self.request.test_seams.interrupt_before_later
             && let Some(interrupt) = self.host.interrupt
@@ -2442,6 +2639,8 @@ impl Run<'_> {
         if self.host.interrupt.is_some_and(Interrupt::is_raised) {
             return Attempt::Done(Remotely::Ended(self.interrupted_before_start(console)));
         }
+        // A commit's stage runs within the commit's own ceiling, not one of the builder's.
+        let figures = self.staging.unwrap_or(figures);
         self.call_builder(run, hold, (figures, &walk.session, &mut walk.waited), console)
     }
 
@@ -2572,6 +2771,7 @@ impl Run<'_> {
             warmth: warmth_of(self.warm_hash.as_deref()),
             env: &env,
             session,
+            commit_stage: self.staging.is_some(),
         };
         let call = match call_of(parts, remote) {
             Ok(call) => call,
@@ -2603,6 +2803,15 @@ impl Run<'_> {
             hold.took = Some(admitted);
         }
         let interrupted = self.host.interrupt.is_some_and(Interrupt::is_raised);
+        // A Ctrl+C before the box started a stage's command ends the stage as an interrupt, never as a fallback.
+        if self.staging.is_some() && interrupted && !outcome.command_started {
+            return Attempt::Done(Remotely::Interrupted);
+        }
+        // A commit's stage hands its outcome back to the commit, which acts on it; only a refusal before the box started
+        // its command falls back, as any run's does, a refusal at the run call included.
+        if self.staging.is_some() && (outcome.command_started || outcome.fallback().is_none()) {
+            return Attempt::staged(outcome, hold);
+        }
         // The path is read for every builder call that returned, a refused one that falls back here included, but for
         // one a Ctrl+C ended.
         if !interrupted {
@@ -2857,6 +3066,7 @@ impl Run<'_> {
             env: &env,
             // The key lock sends nothing, so it names no session.
             session: "",
+            commit_stage: self.staging.is_some(),
         };
         let call = match call_of(parts, remote) {
             Ok(call) => call,
@@ -2954,13 +3164,16 @@ impl Run<'_> {
             "gate: interrupted while waiting for this worktree's work folder on {}",
             remote.builder.alias
         ));
-        self.journal.write(
-            &JournalEvent::Abandon {
-                waited_seconds: waited.as_secs_f64(),
-            },
-            self.tag.as_ref(),
-            console,
-        );
+        // A commit's stage writes no journal lines of its own.
+        if self.staging.is_none() {
+            self.journal.write(
+                &JournalEvent::Abandon {
+                    waited_seconds: waited.as_secs_f64(),
+                },
+                self.tag.as_ref(),
+                console,
+            );
+        }
         Remotely::Interrupted
     }
 
@@ -3002,6 +3215,9 @@ impl Run<'_> {
     /// the next builder runs under that raised ceiling, and a next builder that raises its own says its own note. The
     /// host the tag named, which the fallback line names.
     fn give_up(&mut self, reason: FallbackReason, outcome: &RemoteOutcome, held: Option<Taken>, console: &mut Console) -> String {
+        if self.staging.is_some() {
+            return self.stage_given_up(held, console);
+        }
         self.routing.fell_back.push(reason);
         let tag = self.tag.take();
         self.journal.write(&JournalEvent::Fallback { reason }, tag.as_ref(), console);
@@ -3023,6 +3239,20 @@ impl Run<'_> {
                 continue;
             }
             console.note(line);
+        }
+        tag.map_or_else(String::new, |tag| tag.host)
+    }
+
+    /// Gives up a commit stage's attempt ([`Run::give_up`]), which is no remote run of the commit's: lets the remote
+    /// slot `held` go, its claim deleted and the waiters woken, with no line in the journal, no fallback among the
+    /// commit's routing facts, and the commit's log kept as the client left it, which holds the attempt's lines. The
+    /// host the stage's tag named, which the fallback line names.
+    fn stage_given_up(&mut self, held: Option<Taken>, console: &mut Console) -> String {
+        let tag = self.tag.take();
+        if let Some(taken) = held {
+            slots::delete_claim(&taken.held, console);
+            drop(taken);
+            slots::wake_waiters(self.root, &mut self.survey, console);
         }
         tag.map_or_else(String::new, |tag| tag.host)
     }
@@ -3078,7 +3308,7 @@ impl Run<'_> {
             if let Some(reason) = &here.dropped {
                 let line = match route {
                     Route::Routed(_) => format!("gate: dropped --no-build: {reason}"),
-                    Route::Local { .. } | Route::Refused(_) => self.dropped_line(reason),
+                    Route::Local { .. } | Route::Refused(_) | Route::Stage(_) => self.dropped_line(reason),
                 };
                 console.err(&line);
             }
@@ -3593,6 +3823,7 @@ impl Run<'_> {
             journal: &mut self.journal,
             parent_pid,
             expected,
+            journals: self.staging.is_none(),
         };
         (taker, &mut self.survey)
     }
@@ -3612,6 +3843,7 @@ impl Run<'_> {
             journal: &mut self.journal,
             parent_pid,
             expected: None,
+            journals: true,
         };
         (taker, &mut self.late, &mut self.covered)
     }
@@ -3863,7 +4095,10 @@ impl Run<'_> {
         slots::wake_waiters(self.root, &mut self.survey, console);
         console.err(&format!("gate: interrupted while waiting for a {} slot", pool.name()));
         let waited_seconds = queued.elapsed().as_secs_f64();
-        self.journal.write(&JournalEvent::Abandon { waited_seconds }, self.tag.as_ref(), console);
+        // A commit's stage writes no journal lines of its own.
+        if self.staging.is_none() {
+            self.journal.write(&JournalEvent::Abandon { waited_seconds }, self.tag.as_ref(), console);
+        }
     }
 
     /// After a panic from the moment the slot was taken: completes the log as far as it can, the `.err` file and the
@@ -5381,6 +5616,7 @@ mod tests {
         /// The call of a routed run of `HOST` under the scratch root `scratch`, logging to `log`, seeing `interrupt`.
         fn waiting_call<'a>(scratch: &'a Scratch, log: &'a Path, interrupt: Interrupt) -> RemoteCall<'a> {
             RemoteCall {
+                commit_stage: false,
                 cross_build: None,
                 builder: &crate::test_support::HOST,
                 key: "app-1a2b3c4d",

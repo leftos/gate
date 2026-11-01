@@ -262,6 +262,10 @@ pub(crate) struct RemoteCall<'a> {
     pub state_dir: &'a Path,
     /// What the call asks of the work folder's warm-up.
     pub warmth: Warmth<'a>,
+    /// Whether the call is a commit's pre-commit stage: its main repository's snapshot is the staged index's tree,
+    /// never saved as a bridge for a later run, and its sync-back applies the hooks' fixes to the index and the
+    /// worktree ([`syncback::Staged`]).
+    pub commit_stage: bool,
 }
 
 impl<'a> RemoteCall<'a> {
@@ -337,6 +341,12 @@ pub(crate) struct RemoteOutcome {
     /// Whether the client began the box run call, after a passing preflight and the snapshot push, however the call
     /// ended, a refusal at it included.
     pub run_called: bool,
+    /// Whether a call of the attempt said the box's start marker, however the call ended: the box started the command.
+    /// A commit's stage counts as started only then.
+    pub command_started: bool,
+    /// How a commit stage's sync-back ended; `None` for a call that is no stage, and for a stage whose sync-back did
+    /// not run.
+    pub staged: Option<syncback::Staged>,
 }
 
 /// How long a routed run's parts took: the run call, the command's own time, which its ceiling counts; the push; and the
@@ -513,7 +523,13 @@ mod snapshot_only {
                 .chain(call.siblings.iter().map(super::Sibling::root))
                 .map(PathBuf::from)
                 .collect();
-            let (status, lines) = match snapshot::take(&roots, call.key, call.builder.id.as_deref(), self.bounds, call.interrupt) {
+            let (status, lines) = match snapshot::take(
+                &roots,
+                call.key,
+                snapshot::Sent::Worktree(call.builder.id.as_deref()),
+                self.bounds,
+                call.interrupt,
+            ) {
                 Ok(snapshots) => (0, snapshots.iter().map(said).collect()),
                 // An interrupt is no failure, so it says no line: the run is the interrupt, as the client's `wait`.
                 Err(GitError::Interrupted) => (i64::from(CONTROL_C_EXIT.cast_signed()), Vec::new()),
@@ -566,6 +582,7 @@ mod snapshot_only {
         /// call before it starts.
         fn call<'a>(root: &'a str, log: &'a Path, interrupt: Option<Interrupt>) -> RemoteCall<'a> {
             RemoteCall {
+                commit_stage: false,
                 cross_build: None,
                 builder: &crate::test_support::HOST,
                 key: "app-1a2b3c4d",

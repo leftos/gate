@@ -276,6 +276,16 @@ pub trait Facts {
     /// Only when git cannot be started or its output cannot be read; the gate then runs here, saying so.
     fn place(&self) -> Result<Option<Place>, String>;
 
+    /// Whether the command of `inputs`, a gate's whose first word is `git`, is a commit whose pre-commit hooks may run
+    /// on a builder ([`Route::Stage`]): a plain `git commit` the caller's judge of a commit stage accepts, of a repo the
+    /// routing file `config`'s `commits` names. Asked only of a heavy or light gate under no covering or lending parent,
+    /// without `--local` or `--builder`, before any rule that keeps a `git` command here.
+    fn commit_stage(&self, config: &Config, inputs: &Inputs<'_>) -> bool;
+
+    /// Notes, for the log alone, that a commit judged a stage ([`Facts::commit_stage`]) runs its hooks here after all,
+    /// for `why`: its worktree could not be opened or settled for its builder.
+    fn stage_kept_here(&self, why: &str);
+
     /// Whether the gate's folder holds a file the snapshot sends, tracked or untracked and not ignored. Asked only
     /// below the root.
     ///
@@ -494,6 +504,9 @@ pub enum Route {
     Local { reason: Option<LocalReason> },
     /// On the builder.
     Routed(Box<RemoteRun>),
+    /// Here, a commit whose pre-commit hooks ([`STAGE_WORDS`]) run first on the Windows builder of this run, their
+    /// fixes brought back to the index and the worktree before the commit itself runs here ([`commit_stage`]).
+    Stage(Box<RemoteRun>),
     /// Nowhere: a run pinned to one builder that cannot go to it, which the gate refuses before anything runs.
     Refused(PinRefusal),
 }
@@ -997,9 +1010,122 @@ pub fn decide(inputs: &Inputs<'_>, facts: &dyn Facts) -> Route {
         };
     }
     match route(inputs, facts) {
-        Ok(run) => Route::Routed(Box::new(run)),
+        Ok(Decided::Routed(run)) => Route::Routed(Box::new(run)),
+        Ok(Decided::Stage(run)) => Route::Stage(Box::new(run)),
         Err(reason) => Route::Local { reason },
     }
+}
+
+/// What a decision that does not run here decided: the run on its builder, or a commit's stage there.
+enum Decided {
+    Routed(RemoteRun),
+    Stage(RemoteRun),
+}
+
+/// The words a commit stage's builder runs: the repo's pre-commit hooks, over what the commit stages, with no file list.
+pub const STAGE_WORDS: [&str; 4] = ["prek", "run", "--hook-stage", "pre-commit"];
+
+/// The run of a commit's pre-commit hooks on a Windows builder, for a gate whose command's first word is `git` and that
+/// the facts judge a commit whose stage may route ([`Facts::commit_stage`]), in a worktree the routing file lists for a
+/// Windows builder: [`STAGE_WORDS`] at the worktree's root on the best of those builders by score, the others its later
+/// candidates, with no outputs, failure outputs, inputs, send or desktop, its siblings carried as any run's are. The
+/// repo's patterns, `.gate/local.toml`, a light run's local p50 and the backslash steer-off are never asked. A worktree
+/// that cannot be opened or settled for the builder is noted ([`Facts::stage_kept_here`]). `None` when the run is no stage, and the decision goes on as
+/// for any other.
+fn commit_stage(config: &Config, inputs: &Inputs<'_>, facts: &dyn Facts) -> Option<RemoteRun> {
+    let is_git = first_word(inputs.words).is_some_and(|(_, word)| eq_ignoring_case(file_stem(word), "git"));
+    if !is_git || !facts.commit_stage(config, inputs) {
+        return None;
+    }
+    let place = facts.place().ok().flatten()?;
+    let words = stage_words();
+    let windows = windows_builders(config, &repo_name(&place.checkout));
+    let Scored { order, balanced, .. } = scored(windows, &place, &words, facts, None);
+    let (builder, _) = order.first()?.clone();
+    let later = later_candidates(&order, &builder);
+    let balanced = balanced.map(|balanced| picked_first(balanced, &builder));
+    let mut run = match stage_run(config, place, builder, facts) {
+        Ok(run) => run,
+        Err(why) => {
+            facts.stage_kept_here(&why);
+            return None;
+        }
+    };
+    run.later = later;
+    run.balanced = balanced;
+    Some(run)
+}
+
+/// The commit stage of the later Windows builder `candidate` of a stage's route ([`commit_stage`]), for a fallback
+/// before the stage's command ran on an earlier one: built as the first builder's was, the repo's patterns never asked.
+///
+/// # Errors
+///
+/// Why the builder is skipped, `None` when it is skipped without a word: the routing file no longer routes the gate,
+/// or no longer lists the builder as a Windows builder for the repo, or the worktree can no longer be found or opened.
+pub fn later_stage_run(inputs: &Inputs<'_>, facts: &dyn Facts, candidate: &LaterCandidate) -> Result<RemoteRun, Option<String>> {
+    let config = configured(inputs, facts).map_err(|here| Some(kept_here(here)))?;
+    let place = facts
+        .place()
+        .map_err(Some)?
+        .ok_or_else(|| Some("git no longer finds the worktree".to_owned()))?;
+    let repo = repo_name(&place.checkout);
+    let (builder, _) = windows_builders(&config, &repo)
+        .into_iter()
+        .find(|(builder, _)| builder.alias == candidate.alias)
+        .ok_or_else(|| Some(format!("remote.json no longer lists it as a Windows builder for {repo}")))?;
+    stage_run(&config, place, builder, facts).map_err(Some)
+}
+
+/// [`STAGE_WORDS`], owned.
+fn stage_words() -> Vec<String> {
+    STAGE_WORDS.iter().map(|word| (*word).to_owned()).collect()
+}
+
+/// Every Windows builder the routing file `config` lists the repo `repo` for, in [`Config::routes`] order, each with no
+/// pattern: a commit stage's candidates.
+fn windows_builders(config: &Config, repo: &str) -> Vec<(Builder, String)> {
+    config
+        .routes(repo)
+        .into_iter()
+        .filter(|(builder, _)| builder.os == BuilderOs::Windows)
+        .map(|(builder, _)| (builder.clone(), String::new()))
+        .collect()
+}
+
+/// A commit stage's run of the worktree at `place` on `builder`, its target settled as any run's ([`settle`]), with no
+/// later candidates; else why the worktree cannot be opened or settled, and the commit runs as it would with no stage.
+fn stage_run(config: &Config, place: Place, builder: Builder, facts: &dyn Facts) -> Result<RemoteRun, String> {
+    let opened = open(place, facts, |repo| config.is_routed(repo)).map_err(kept_here)?;
+    let target = settle(config, opened, builder, facts).map_err(kept_here)?;
+    Ok(RemoteRun {
+        builder: target.builder,
+        key: target.key,
+        leaf: target.leaf,
+        root_id: target.root_id,
+        root: target.place.root,
+        siblings: target.siblings,
+        absent_siblings: target.absent_siblings,
+        repo: target.repo,
+        subfolder: String::new(),
+        pattern: String::new(),
+        words: stage_words(),
+        fallback: stage_words(),
+        program_named: false,
+        outputs: Vec::new(),
+        failure_outputs: Vec::new(),
+        inputs: Vec::new(),
+        dropped_no_build: false,
+        send: None,
+        outputs_withheld: false,
+        desktop: None,
+        source_revision: None,
+        later: Vec::new(),
+        balanced: None,
+        cross_build: None,
+        cross_build_blocked: None,
+        bins_withheld: false,
+    })
 }
 
 /// A decision to run here: the reason to say, if any.
@@ -1095,10 +1221,14 @@ struct Matched {
     built_here: BuiltHere,
 }
 
-fn route(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<RemoteRun, Here> {
-    let config = eligible(inputs, facts)?;
+fn route(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Decided, Here> {
+    let config = configured(inputs, facts)?;
+    if let Some(run) = commit_stage(&config, inputs, facts) {
+        return Ok(Decided::Stage(run));
+    }
+    let config = routable(config, inputs)?;
     let matched = matched(&config, inputs, facts)?;
-    ended(&config, matched, inputs.words, facts)
+    ended(&config, matched, inputs.words, facts).map(Decided::Routed)
 }
 
 /// Why the `matched` command whose `word` names a path outside the worktree runs here: the git worktree its outside
@@ -1230,16 +1360,27 @@ fn routes_on(slot: Slot) -> bool {
 /// The routing file when the gate may route at all, before any git fact is asked; the file is read only after the
 /// slot, parent and `--local` checks.
 fn eligible(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Config, Here> {
+    routable(configured(inputs, facts)?, inputs)
+}
+
+/// The routing file when the gate may route at all, read only after the slot, parent and `--local` checks: what a
+/// commit stage is judged under ([`commit_stage`]) before the rules of [`routable`].
+fn configured(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Config, Here> {
     if !routes_on(inputs.slot) || inputs.covering_parent {
         return Err(None);
     }
     if inputs.local {
         return Err(Some(LocalReason::LocalFlag));
     }
-    let config = facts
+    facts
         .config()
         .map_err(|ConfigProblem { path, reason }| Some(LocalReason::Ignored { path, reason }))?
-        .ok_or(None)?;
+        .ok_or(None)
+}
+
+/// The routing file `config` once the command is no `git`, `prek` or empty one ([`stays_local`]) and, for a gate in a
+/// git hook, `hooks` names a repo.
+fn routable(config: Config, inputs: &Inputs<'_>) -> Result<Config, Here> {
     if stays_local(inputs.words) {
         return Err(None);
     }

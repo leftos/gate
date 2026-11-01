@@ -167,6 +167,8 @@ pub struct FakeFacts {
     pub local_p50: Option<f64>,
     /// How many times the local p50 was asked, kept apart from [`FakeFacts::asked`].
     pub local_p50_asked: Cell<usize>,
+    /// Whether the commit's stage may route, as the gate's judge would say; `false` unless a case says otherwise.
+    pub commit_stage: bool,
 }
 
 impl FakeFacts {
@@ -220,6 +222,7 @@ impl FakeFacts {
             figures_asked: Cell::new(0),
             local_p50: None,
             local_p50_asked: Cell::new(0),
+            commit_stage: false,
         }
     }
 
@@ -256,6 +259,12 @@ impl FakeFacts {
 }
 
 impl Facts for FakeFacts {
+    fn commit_stage(&self, _config: &Config, _inputs: &Inputs<'_>) -> bool {
+        self.commit_stage
+    }
+
+    fn stage_kept_here(&self, _why: &str) {}
+
     fn config(&self) -> Result<Option<Config>, ConfigProblem> {
         self.ask("config".to_owned());
         self.config.clone()

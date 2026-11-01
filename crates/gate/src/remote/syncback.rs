@@ -193,10 +193,486 @@ pub(super) fn sync_back(
     back_commits: Option<&[BackCommit]>,
     status: i64,
 ) -> Result<Synced, End> {
+    if attempt.call.commit_stage {
+        return stage(attempt, targets, status);
+    }
     match targets {
         [target] => one(attempt, target, status).map(|end| Synced { end, reason: None }),
         _ => pair(attempt, targets, back_commits, status),
     }
+}
+
+/// How a commit stage's sync-back ended, which the commit's run reads to choose what comes next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Staged {
+    /// The hooks passed, and their fixes to this many files were applied to the index and the worktree.
+    Applied(usize),
+    /// The hooks passed and changed nothing.
+    Clean,
+    /// The hooks passed but the stage was refused before any write to the index or the worktree; its line was said.
+    Refused,
+    /// The hooks failed with `status`; what became of their fixes.
+    HooksFailed { status: i64, fixes: Fixes },
+    /// Writing the fixes failed after every check passed, for hooks that ended `status`; its line was said, and the
+    /// fixes are kept unless that line says they could not be.
+    ApplyFailed { status: i64 },
+}
+
+/// What became of the fixes of hooks that failed: there were none, they are in the worktree, unstaged, or they are kept
+/// at the run's `-back` ref, their line said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fixes {
+    None,
+    Worktree,
+    Kept,
+}
+
+/// A commit stage's end and the run's end beside it.
+type StageEnd = (Staged, End);
+
+/// What a test does with a stage's patch once the stage tried to write its fixes ([`AFTER_STAGE_WRITE`]).
+#[cfg(test)]
+type PatchHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// What a test does with a stage's patch once the stage tried to write its fixes, before the patch is removed.
+    static AFTER_STAGE_WRITE: std::cell::RefCell<Option<PatchHook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The sync-back of a commit stage for `targets`, the main repository first: under the worktree locks of every target,
+/// each sibling whose hooks changed it refuses the stage, its back commit kept; then the main repository's fixes are
+/// checked and applied ([`stage_main`]). How the stage ended is left on the attempt ([`Attempt::staged`]); the run's end
+/// is the hooks' `status`, a passing one as 1 when the stage was refused or its apply failed. Its step's start line and
+/// end line are said around it, whatever happened.
+fn stage(attempt: &mut Attempt<'_, '_>, targets: &[Target<'_>], status: i64) -> Result<Synced, End> {
+    attempt.go_on()?;
+    let Some((main, siblings)) = targets.split_first() else {
+        return Err(End::Failed("a commit stage has no repository to sync back".to_owned()));
+    };
+    let call = attempt.call;
+    let folders: Vec<Folder<'_>> = targets.iter().map(Target::folder).collect();
+    attempt.say(syncing_line(call.host()));
+    let started = Instant::now();
+    let ended = (|| -> Result<StageEnd, End> {
+        let _locks = worktree_lock::held(call.state, &folders, attempt.lock_wait, call.interrupt, |line| attempt.say(line))?;
+        for sibling in siblings {
+            if let Some(refused) = sibling_changed(attempt, sibling, status)? {
+                return Ok(refused);
+            }
+        }
+        stage_main(attempt, main, status)
+    })();
+    attempt.say(sync_back_ended_line(call.host(), started.elapsed()));
+    let (staged, end) = ended?;
+    attempt.staged = Some(staged);
+    Ok(Synced { end, reason: None })
+}
+
+/// What `act` makes of `target`'s worktree and of the builder's repository it fetches from, once the quarantines gates
+/// that ended left in its store are swept; `pair` when the target is a sibling, whose lines name it.
+fn with_remote<R>(
+    attempt: &mut Attempt<'_, '_>,
+    target: &Target<'_>,
+    pair: bool,
+    act: impl FnOnce(&mut Attempt<'_, '_>, &Worktree<'_>, &Remote<'_>) -> Result<R, End>,
+) -> Result<R, End> {
+    let profile = attempt.profile();
+    let pushed = attempt.transport.push_target(&profile, &target.repo).map_err(End::Failed)?;
+    let pack = attempt.transport.upload_pack(&profile);
+    let remote = Remote {
+        url: &pushed.url,
+        pack: pack.as_deref(),
+        ssh: pushed.ssh_command.as_deref(),
+        reference: &target.reference,
+    };
+    let worktree = Worktree {
+        target,
+        git: Git::find(Path::new(target.root)).map_err(End::Failed)?,
+        pair,
+    };
+    for line in swept(worktree.objects(), SystemTime::now(), slots::gate_liveness) {
+        attempt.say(line);
+    }
+    act(attempt, &worktree, &remote)
+}
+
+/// Fetches the back commit `advertised` into a quarantine of its own and gives it to `act` when it is the one fetched
+/// and was made from the worktree's snapshot; a stale one is said and is `None` to `act`, as no back commit is. A fetch
+/// stopped at its cap or its ceiling refuses the stage. The quarantine goes however it ended, unless a move that failed
+/// kept it.
+fn fetched_back(
+    attempt: &mut Attempt<'_, '_>,
+    (worktree, remote): (&Worktree<'_>, &Remote<'_>),
+    advertised: &str,
+    status: i64,
+    act: impl FnOnce(&mut Attempt<'_, '_>, Option<&Back<'_>>) -> Result<Option<StageEnd>, End>,
+) -> Result<Option<StageEnd>, End> {
+    let name = incoming_name(std::process::id(), own_start(attempt.own_start_fails)?, &payload::job_nonce());
+    let quarantine = Quarantine::made(worktree.objects(), &name).map_err(End::Failed)?;
+    let back = Back {
+        commit: advertised,
+        quarantine: &quarantine,
+    };
+    let ended = fetch(attempt, worktree, remote, &quarantine, status).and_then(|stopped| {
+        if let Some(stopped) = stopped {
+            return Ok(Some((refused(status, Fixes::None), stopped)));
+        }
+        let fetched = line(attempt, worktree, &["rev-parse", "FETCH_HEAD"], &[])?;
+        if fetched == back.commit && made_from(attempt, worktree, &back)? {
+            act(attempt, Some(&back))
+        } else {
+            attempt.say(ignored_line(&fetched, worktree.snapshot()));
+            act(attempt, None)
+        }
+    });
+    if let Some(line) = quarantine.removed(KILL_WAIT, || {}) {
+        attempt.say(line);
+    }
+    ended
+}
+
+/// How a stage whose sibling `target` holds a back commit ends: refused, the commit kept at the sibling's `-back` ref;
+/// `None` when the sibling's hooks changed nothing.
+fn sibling_changed(attempt: &mut Attempt<'_, '_>, target: &Target<'_>, status: i64) -> Result<Option<StageEnd>, End> {
+    with_remote(attempt, target, true, |attempt, worktree, remote| {
+        let Some(advertised) = has_back(attempt, worktree, remote)? else {
+            return Ok(None);
+        };
+        fetched_back(attempt, (worktree, remote), &advertised, status, |attempt, back| {
+            let Some(back) = back else {
+                return Ok(None);
+            };
+            let said = format!(
+                "gate: commit refused: a sibling's hooks changed {}; the fixes are kept at {}",
+                escaped(target.name),
+                target.kept
+            );
+            Ok(Some(stage_refused_end(attempt, worktree, back, said, status)))
+        })
+    })
+}
+
+/// The main repository's part of a commit stage: its back commit, when the builder holds one made from this snapshot,
+/// is checked and applied ([`stage_receive`]); with none, the checks that the worktree's `HEAD` and index are still the
+/// snapshot's run all the same ([`stage_unchanged`]).
+fn stage_main(attempt: &mut Attempt<'_, '_>, target: &Target<'_>, status: i64) -> Result<StageEnd, End> {
+    with_remote(attempt, target, false, |attempt, worktree, remote| {
+        let received = match has_back(attempt, worktree, remote)? {
+            Some(advertised) => fetched_back(attempt, (worktree, remote), &advertised, status, |attempt, back| match back {
+                Some(back) => stage_receive(attempt, worktree, back, status).map(Some),
+                None => Ok(None),
+            })?,
+            None => None,
+        };
+        match received {
+            Some(ended) => Ok(ended),
+            None => stage_unchanged(attempt, worktree, status),
+        }
+    })
+}
+
+/// How a stage whose hooks ended `status` is refused: refused when they passed, and their failure with what became of
+/// their `fixes` when they failed.
+fn refused(status: i64, fixes: Fixes) -> Staged {
+    if status == 0 {
+        Staged::Refused
+    } else {
+        Staged::HooksFailed { status, fixes }
+    }
+}
+
+/// How a stage with no back commit ends: refused when the worktree's `HEAD` or index moved during the run, else clean
+/// for hooks that passed and failed with no fixes for hooks that did not.
+fn stage_unchanged(attempt: &mut Attempt<'_, '_>, worktree: &Worktree<'_>, status: i64) -> Result<StageEnd, End> {
+    if let IndexChecked::Moved(said) = index_checked(attempt, worktree, None)? {
+        attempt.say(said);
+        return Ok((refused(status, Fixes::None), End::Status(not_passing(status))));
+    }
+    if status == 0 {
+        Ok((Staged::Clean, End::Status(0)))
+    } else {
+        Ok((Staged::HooksFailed { status, fixes: Fixes::None }, End::Status(status)))
+    }
+}
+
+/// The main repository's back commit `back`, checked before anything is written: it may touch nothing a sync-back never
+/// writes, and when the hooks passed it may add no path; its patch is written and its objects moved in; the worktree's
+/// `HEAD` and index must still be the snapshot's; and the patch must apply to a copy of the index and the worktree.
+/// Only then is it applied ([`stage_apply`]). Every refusal keeps the commit at the run's `-back` ref.
+fn stage_receive(attempt: &mut Attempt<'_, '_>, worktree: &Worktree<'_>, back: &Back<'_>, status: i64) -> Result<StageEnd, End> {
+    let refusal = stage_refusal(attempt, worktree, back, status).map_err(|failed| kept_after(attempt, worktree, back, failed))?;
+    if let Some(said) = refusal {
+        return Ok(stage_refused_end(attempt, worktree, back, said, status));
+    }
+    let (names, patch) = written_patch(attempt, worktree, back).map_err(|failed| kept_after(attempt, worktree, back, failed))?;
+    if names.is_empty() {
+        remove(&patch)?;
+        return stage_unchanged(attempt, worktree, status);
+    }
+    if let Err(unmoved) = back.quarantine.moved_in(back.quarantine.wait, || {}) {
+        attempt.say(unmoved_line(&unmoved));
+        remove(&patch)?;
+        return Ok((refused(status, Fixes::None), End::Status(not_passing(status))));
+    }
+    let ended = stage_apply(attempt, worktree, back, (&names, &patch), status);
+    #[cfg(test)]
+    AFTER_STAGE_WRITE.with_borrow_mut(|hook| {
+        if let Some(hook) = hook {
+            hook(&patch);
+        }
+    });
+    // The stage's end stands: a patch that cannot be removed once the stage may have written is only said.
+    removed_or_said(attempt, &patch);
+    ended
+}
+
+/// Why the back commit `back` of hooks that ended `status` may not be applied: what [`never_written`] refuses, and,
+/// for hooks that passed, a path it adds, named with how many more it adds; `None` when it may be.
+fn stage_refusal(attempt: &mut Attempt<'_, '_>, worktree: &Worktree<'_>, back: &Back<'_>, status: i64) -> Result<Option<String>, End> {
+    if let Some(said) = never_written(attempt, worktree, back)? {
+        return Ok(Some(said));
+    }
+    if status != 0 {
+        return Ok(None);
+    }
+    let args = [
+        "diff-tree",
+        "-r",
+        "-z",
+        "--name-only",
+        "--diff-filter=A",
+        worktree.snapshot(),
+        back.commit,
+    ];
+    let listed = git_call(attempt, worktree, &args, &back.quarantine.env())?;
+    let added: Vec<&str> = listed.split('\0').filter(|name| !name.is_empty()).collect();
+    let Some(first) = added.first() else {
+        return Ok(None);
+    };
+    let more = match added.len() - 1 {
+        0 => String::new(),
+        more => format!(" and {more} more"),
+    };
+    Ok(Some(format!(
+        "gate: commit refused: the hooks on {} added {}{more}; the fixes are kept at {}",
+        attempt.call.host(),
+        escaped(first),
+        worktree.target.kept
+    )))
+}
+
+/// What the checks of a stage on one copy of the worktree's index found ([`index_checked`]).
+enum IndexChecked {
+    /// The worktree's `HEAD` or index moved during the run: the line refusing the stage.
+    Moved(String),
+    /// The patch does not apply to the copy and the worktree: it clashes with unstaged edits.
+    Clash,
+    /// Nothing moved, and the patch, when there is one, applies.
+    Passed,
+}
+
+/// The checks of a stage on one fresh copy of the worktree's index, made for them and removed once, after both: the
+/// worktree's `HEAD` must be the snapshot's and the copy's tree the one sent ([`stage_moved`]); then, given the patch
+/// `shown`, it must apply to the copy and the worktree ([`applies_to_copy`]).
+fn index_checked(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, shown: Option<&str>) -> Result<IndexChecked, End> {
+    let copy = snapshot::IndexCopy::made(worktree.root(), attempt.git, attempt.call.interrupt).map_err(escaped_end)?;
+    let set = [("GIT_INDEX_FILE", copy.path().as_os_str())];
+    let found = stage_moved(attempt, worktree, &set).and_then(|moved| match (moved, shown) {
+        (Some(said), _) => Ok(IndexChecked::Moved(said)),
+        (None, None) => Ok(IndexChecked::Passed),
+        (None, Some(shown)) => {
+            applies_to_copy(attempt, worktree, shown, &set).map(|applies| if applies { IndexChecked::Passed } else { IndexChecked::Clash })
+        }
+    });
+    let removed = copy.removed().map_err(escaped_end);
+    let found = found?;
+    removed?;
+    Ok(found)
+}
+
+/// The line refusing a stage whose worktree's `HEAD` is not the snapshot's, or whose index's tree, as `git write-tree`
+/// writes it from the copy of the index `set` points git at, is not the one sent; `None` when both are as they were.
+fn stage_moved(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, set: &[(&str, &OsStr)]) -> Result<Option<String>, End> {
+    let host = attempt.call.host();
+    let printed = git_call(attempt, worktree, &["rev-parse", "--revs-only", "HEAD^{commit}"], &[])?;
+    let head = printed.lines().next().map(str::trim_end).filter(|head| !head.is_empty());
+    if head != worktree.target.snapshot.head.as_deref() {
+        return Ok(Some(format!(
+            "gate: commit refused: HEAD moved while the hooks ran on {host}; nothing was written"
+        )));
+    }
+    let now = line(attempt, worktree, &["write-tree"], set)?;
+    let then = line(attempt, worktree, &["rev-parse", &format!("{}^{{tree}}", worktree.snapshot())], &[])?;
+    Ok((now != then).then(|| format!("gate: commit refused: the index changed while the hooks ran on {host}; nothing was written")))
+}
+
+/// The words of an apply of `patch`, `--check` or `--index` among `options`: NTFS protection refuses a path that names
+/// `.git` by its 8.3 short name or an alternate stream, whatever the repository's own setting.
+fn apply_words<'a>(options: &[&'a str], patch: &'a str) -> Vec<&'a str> {
+    let mut words = vec!["-c", "core.protectNTFS=true", "apply"];
+    words.extend_from_slice(options);
+    words.extend(["--whitespace=nowarn", "--", patch]);
+    words
+}
+
+/// Applies the checked back commit `back`, whose patch `patch` changes the files `names`, for hooks that ended
+/// `status`, once the worktree's `HEAD` and index are still the snapshot's and the patch applies to a copy of the index
+/// with the worktree ([`index_checked`]): to the index and the worktree for hooks that passed, to the worktree alone for hooks
+/// that failed ([`stage_write`]). A patch that does not apply to the copy clashes with unstaged edits ([`clashed`]).
+fn stage_apply(
+    attempt: &mut Attempt<'_, '_>,
+    worktree: &Worktree<'_>,
+    back: &Back<'_>,
+    (names, patch): (&[String], &Path),
+    status: i64,
+) -> Result<StageEnd, End> {
+    let shown = patch.display().to_string();
+    Ok(match index_checked(attempt, worktree, Some(&shown))? {
+        IndexChecked::Moved(said) => kept_refused(attempt, worktree, back, &[said], status),
+        IndexChecked::Clash => clashed(attempt, worktree, back, patch, status),
+        IndexChecked::Passed => stage_write(attempt, worktree, back, (names, &shown), status),
+    })
+}
+
+/// How a stage whose patch `patch` clashes with unstaged edits ends, for hooks that ended `status`: nothing is written,
+/// the commit is kept, the patch goes into the log, and the refusal and the diff to see are said.
+fn clashed(attempt: &mut Attempt<'_, '_>, worktree: &Worktree<'_>, back: &Back<'_>, patch: &Path, status: i64) -> StageEnd {
+    let host = attempt.call.host();
+    let kept = worktree.target.kept.as_str();
+    logged_patch(attempt, patch);
+    let said = if status == 0 {
+        format!("gate: commit refused: the hooks' fixes clash with unstaged edits; the fixes are kept at {kept}")
+    } else {
+        format!("gate: the hooks failed on {host} (status {status}); their fixes clash with unstaged edits and are kept at {kept}")
+    };
+    let see = format!("gate: {}", see_diff(worktree.snapshot(), back.commit));
+    kept_refused(attempt, worktree, back, &[said, see], status)
+}
+
+/// Writes the checked patch `shown`, which changes the files `names`, for hooks that ended `status`: to the real index
+/// and the worktree for hooks that passed, to the worktree alone for hooks that failed. How the stage ended is set on
+/// the attempt as soon as the write was tried, before anything after it can fail. A write that failed keeps the commit
+/// and says which files it may have rewritten; the seam's Ctrl+C (`--test-remote-interrupt-at apply`) comes once the
+/// fixes of hooks that passed are written.
+fn stage_write(attempt: &mut Attempt<'_, '_>, worktree: &Worktree<'_>, back: &Back<'_>, (names, shown): (&[String], &str), status: i64) -> StageEnd {
+    let written = if status == 0 {
+        locked_call(attempt, worktree, &["update-index", "-q", "--refresh"])
+            .and_then(|_| locked_call(attempt, worktree, &apply_words(&["--index"], shown)))
+    } else {
+        locked_call(attempt, worktree, &apply_words(&[], shown))
+    };
+    let staged = match (&written, status) {
+        (Err(_), _) => Staged::ApplyFailed { status },
+        (Ok(_), 0) => Staged::Applied(names.len()),
+        (Ok(_), _) => Staged::HooksFailed {
+            status,
+            fixes: Fixes::Worktree,
+        },
+    };
+    attempt.staged = Some(staged);
+    if let Err(failed) = written {
+        let said = apply_failed_line(&failed, names, &worktree.target.kept, index_lock_held(attempt, worktree));
+        let (_, end) = kept_refused(attempt, worktree, back, &[said], status);
+        return (staged, end);
+    }
+    if status == 0 {
+        if let Some(interrupt) = attempt.call.interrupt.filter(|_| attempt.raises_at("apply")) {
+            interrupt.raise();
+        }
+        return (staged, End::Status(0));
+    }
+    attempt.say(format!(
+        "gate: the hooks failed on {} (status {status}); their fixes are in the worktree, unstaged",
+        attempt.call.host()
+    ));
+    (staged, End::Status(status))
+}
+
+/// Whether the patch `shown` applies to the copy of the worktree's index `set` points git at and to the worktree, the
+/// copy's stat information refreshed first: a patch that does not clashes with unstaged edits.
+fn applies_to_copy(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, shown: &str, set: &[(&str, &OsStr)]) -> Result<bool, End> {
+    git_call(attempt, worktree, &["update-index", "-q", "--refresh"], set)?;
+    match git_call(attempt, worktree, &apply_words(&["--check", "--index"], shown), set) {
+        Ok(_) => Ok(true),
+        Err(End::Failed(_)) => Ok(false),
+        Err(other) => Err(other),
+    }
+}
+
+/// Writes the patch at `patch` into the log alone, line by line, each escaped.
+fn logged_patch(attempt: &mut Attempt<'_, '_>, patch: &Path) {
+    match std::fs::read(patch) {
+        Ok(bytes) => {
+            for text in String::from_utf8_lossy(&bytes).lines() {
+                attempt.logged(&escaped(text));
+            }
+        }
+        Err(error) => attempt.logged(&format!("gate: cannot read the patch {}: {error}", patch.display())),
+    }
+}
+
+/// How a stage refused once `back`'s objects are in the store ends: the commit kept at the run's `-back` ref, each of
+/// `said` said, and the hooks' `status` as the stage's refusal ([`refused`]). A keep that failed is said after them,
+/// and the fixes are then kept nowhere.
+fn kept_refused(attempt: &mut Attempt<'_, '_>, worktree: &Worktree<'_>, back: &Back<'_>, said: &[String], status: i64) -> StageEnd {
+    let kept = keep(attempt, worktree, back.commit);
+    for line in said {
+        attempt.say(line.clone());
+    }
+    let fixes = match kept {
+        Ok(()) => Fixes::Kept,
+        Err(why) => {
+            attempt.say(format!("gate: the fixes could not be kept at {}: {why}", worktree.target.kept));
+            Fixes::None
+        }
+    };
+    (refused(status, fixes), End::Status(not_passing(status)))
+}
+
+/// How a stage refused for `said` before `back`'s objects are in the store ends, as [`refused_end`] ends a sync-back's
+/// refusal: the objects moved in, then the commit kept as [`kept_refused`] keeps it. Objects that cannot be moved in
+/// are said, and nothing is kept.
+fn stage_refused_end(attempt: &mut Attempt<'_, '_>, worktree: &Worktree<'_>, back: &Back<'_>, said: String, status: i64) -> StageEnd {
+    if let Err(unmoved) = back.quarantine.moved_in(back.quarantine.wait, || {}) {
+        attempt.say(unmoved_line(&unmoved));
+        return (refused(status, Fixes::None), End::Status(not_passing(status)));
+    }
+    kept_refused(attempt, worktree, back, &[said], status)
+}
+
+/// Whether the index lock of the repository at `worktree` is there now, as `git rev-parse --git-path` names it: a
+/// write that failed with git's status 128 then ran into another git process's lock, which `update-index -q` does not
+/// name. A lock that cannot be looked for is taken as not there.
+fn index_lock_held(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>) -> bool {
+    git_call(attempt, worktree, &["rev-parse", "--git-path", "index.lock"], &[])
+        .is_ok_and(|path| Path::new(worktree.root()).join(path.trim_end()).exists())
+}
+
+/// The line said when writing a stage's fixes to the files `names` failed at `failed`, the fixes kept at `kept`: a
+/// busy index lock, one git named or one `lock_held` says is there, wrote nothing; any other failure leaves the index
+/// as it was but may have rewritten or removed the files, and the line gives both ways back.
+fn apply_failed_line(failed: &End, names: &[String], kept: &str, lock_held: bool) -> String {
+    let why = match failed {
+        End::Failed(why) => why.as_str(),
+        _ => "the gate was interrupted",
+    };
+    if why.contains("(status 128)") && (lock_held || why.contains("index.lock")) {
+        return "gate: commit refused: another git process held the index; nothing was written".to_owned();
+    }
+    let paths: Vec<String> = names
+        .iter()
+        .map(|name| {
+            let shown = escaped(name);
+            if shown.contains(' ') { format!("\"{shown}\"") } else { shown }
+        })
+        .collect();
+    let paths = paths.join(" ");
+    format!(
+        "gate: commit refused: the hooks' fixes could not be written: {why}; the index is unchanged, but these files may have been \
+         rewritten or removed: {paths}; to go back to what was staged: git restore --worktree -- {paths}; to take the fixes: git \
+         restore --source={kept} --staged --worktree -- {paths}"
+    )
 }
 
 /// The sync-back of a single repository, `target`, as [`sync_back`] ends it: its step's start line said once a back
@@ -1186,6 +1662,16 @@ fn refused_end(attempt: &mut Attempt<'_, '_>, worktree: &Worktree<'_>, back: &Ba
 /// than the apply cap into the worktree, or for one the worktree changed under during the run; `None` when it may be
 /// applied.
 fn refusal(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, back: &Back<'_>) -> Result<Option<String>, End> {
+    if let Some(said) = never_written(attempt, worktree, back)? {
+        return Ok(Some(said));
+    }
+    Ok(changed(attempt, worktree)?.then(|| not_applied_line(worktree.snapshot(), back.commit)))
+}
+
+/// The line said for a back commit `back` that touches what a sync-back never writes, that writes, or deletes, a path
+/// through a checkout filter or `ident`, or whose files would write more than the apply cap into the worktree; `None`
+/// when it does none of these.
+fn never_written(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, back: &Back<'_>) -> Result<Option<String>, End> {
     let snapshot = worktree.snapshot();
     let set = back.quarantine.env();
     let listing = git_call(attempt, worktree, &["diff-tree", "-r", "-z", "--raw", snapshot, back.commit], &set)?;
@@ -1205,10 +1691,7 @@ fn refusal(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, back: &Back<'_>) 
     let written = written_blobs(&listing);
     let weights = weights(&written, &attributes, LineEnds::of(&config));
     let size = written_size(attempt, worktree, &written, &weights, &set)?;
-    if let Some(line) = written_line(size, attempt.apply_cap, snapshot, back.commit) {
-        return Ok(Some(line));
-    }
-    Ok(changed(attempt, worktree)?.then(|| not_applied_line(snapshot, back.commit)))
+    Ok(written_line(size, attempt.apply_cap, snapshot, back.commit))
 }
 
 /// The bytes the files `written` write into the worktree total, each path counted: the sizes of their blobs, asked of
@@ -2128,11 +2611,11 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_WRITE_ATTRIBUTES};
 
     use super::{
-        ATTRIBUTE_ROOM, ATTRIBUTES, Attributes, AutoCrlf, Back, BackCommit, FETCH_WORDS, LineEnds, Quarantine, Remote, Synced, Target, Worktree,
-        advertised, after_keep, alternates, attribute_slices, auto_crlf, converts_to_crlf, entries, fetch, filtered, forbidden, from_snapshot,
-        has_back, ignored_line, incoming_name, incoming_owner, listed_paths, move_plan, names_odd_driver, not_applied_line, read_attributes, receive,
-        refused_end, see_diff, swept, sync_back, sync_back_ended_line, synced_line, syncing_line, total, touched_line, tree_removed, unmoved_line,
-        weight, written_blobs, written_line,
+        ATTRIBUTE_ROOM, ATTRIBUTES, Attributes, AutoCrlf, Back, BackCommit, FETCH_WORDS, Fixes, LineEnds, Quarantine, Remote, Staged, Synced, Target,
+        Worktree, advertised, after_keep, alternates, attribute_slices, auto_crlf, converts_to_crlf, entries, fetch, filtered, forbidden,
+        from_snapshot, has_back, ignored_line, incoming_name, incoming_owner, listed_paths, move_plan, names_odd_driver, not_applied_line,
+        read_attributes, receive, refused_end, see_diff, swept, sync_back, sync_back_ended_line, synced_line, syncing_line, total, touched_line,
+        tree_removed, unmoved_line, weight, written_blobs, written_line,
     };
     use crate::remote::RemoteCall;
     use crate::remote::client::{Attempt, End};
@@ -2223,6 +2706,7 @@ mod tests {
         let interrupt = Interrupt::install().expect("the console handler is installed");
         interrupt.raise();
         let call = RemoteCall {
+            commit_stage: false,
             cross_build: None,
             builder: &crate::test_support::HOST,
             key: "app-1a2b3c4d",
@@ -3042,6 +3526,7 @@ mod tests {
     /// The call of a wiring test in the repository `root`, its lines written to `log`.
     fn call_in<'a>(root: &'a str, log: &'a Path, state: &'a StateRoot) -> RemoteCall<'a> {
         RemoteCall {
+            commit_stage: false,
             cross_build: None,
             builder: &crate::test_support::HOST,
             key: KEY,
@@ -4165,6 +4650,423 @@ mod tests {
         assert_eq!(case.kept(0), Some(app), "app's back commit is kept");
         assert_eq!(case.kept(1), Some(lib), "lib's is");
         assert!(!case.said().iter().any(|line| line.contains("synced back")), "{:?}", case.said());
+        case.remove();
+    }
+
+    /// The pair case `name` set up for a commit stage of app alone: app holds `files` committed beside `a.txt`, and its
+    /// snapshot is its `HEAD`, whose tree is its index's.
+    fn stage_case(name: &str, files: &[(&str, &str)]) -> PairCase {
+        let mut case = PairCase::new(name);
+        if !files.is_empty() {
+            for (path, text) in files {
+                put(&case.root(0).join(path), text);
+            }
+            asked(case.root(0), &[], &["add", "-A"]).expect("the files are added");
+            asked(case.root(0), &[], &[&COMMITTER[..], &["commit", "--quiet", "-m", "more"]].concat()).expect("the files are committed");
+            asked(case.root(0), &[], &["rev-parse", "HEAD"])
+                .expect("HEAD is read")
+                .trim_end()
+                .clone_into(&mut case.snapshots[0].commit);
+        }
+        case.snapshots[0].head = Some(case.snapshots[0].commit.clone());
+        case
+    }
+
+    /// app's commit stage through `transport` for hooks that ended `status`: how its sync-back ended, and how the stage
+    /// did.
+    fn staged_through(case: &PairCase, transport: &dyn Transport, status: i64) -> (Result<Synced, End>, Option<Staged>) {
+        let target = Target::new(routed(PAIR[0], &case.roots[0]), PAIR[0], &case.snapshots[0], KEY);
+        let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
+        let mut call = call_in(&case.roots[0], &case.log, &state);
+        call.commit_stage = true;
+        let mut attempt = Attempt::for_tests(&call, transport);
+        let ended = sync_back(&mut attempt, &[target], None, status);
+        (ended, attempt.staged)
+    }
+
+    /// The local transport whose upload-pack runs the shell words `then` from its second call on, the fetch's: after the
+    /// stage asked for its back commit, before anything is written.
+    fn on_fetch(case: &PairCase, then: &str) -> Through {
+        let count = case.folder.join("calls").to_string_lossy().replace('\\', "/");
+        let pack = format!("f() {{ echo x >> '{count}'; if [ $(wc -l < '{count}') -ge 2 ]; then {then}; fi; git-upload-pack \"$@\"; }}; f");
+        Through {
+            local: case.local(),
+            pack: Some(pack),
+            interrupt: None,
+            readied: std::cell::Cell::new(0),
+        }
+    }
+
+    /// The names app's index stages against its `HEAD`, one a line.
+    fn staged_names(case: &PairCase) -> String {
+        asked(case.root(0), &[], &["diff", "--cached", "--name-only"]).expect("the staged names are listed")
+    }
+
+    /// The text of app's file `path`.
+    fn text_of(case: &PairCase, path: &str) -> String {
+        std::fs::read_to_string(case.root(0).join(path)).expect("the file can be read")
+    }
+
+    /// The bytes of app's real index file.
+    fn index_bytes(case: &PairCase) -> Vec<u8> {
+        std::fs::read(case.root(0).join(".git").join("index")).expect("the index can be read")
+    }
+
+    /// The line ending a stage refused from the tests' builder, and nothing written.
+    const STAGE_KEPT: &str = "the fixes are kept at refs/gate-remote/app-1a2b3c4d-back";
+
+    #[test]
+    fn a_stage_applies_the_hooks_fixes_to_the_index_and_worktree() {
+        let case = stage_case("stage-applied", &[]);
+        case.plant(0, &[("a.txt", "fixed\n")]);
+
+        let (ended, staged) = staged_through(&case, &case.local(), 0);
+
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(0), .. })), "{ended:?}");
+        assert_eq!(staged, Some(Staged::Applied(1)));
+        assert_eq!(text_of(&case, "a.txt"), "fixed\n", "the worktree holds the fix");
+        assert_eq!(staged_names(&case).trim_end(), "a.txt", "the index stages it");
+        let unstaged = asked(case.root(0), &[], &["diff", "--name-only"]).expect("the unstaged names are listed");
+        assert_eq!(unstaged, "", "the worktree and the index agree");
+        assert_eq!(case.kept(0), None, "an applied back commit is not kept");
+        case.remove();
+    }
+
+    #[test]
+    fn a_stage_with_no_back_commit_still_checks_head_and_the_index() {
+        let case = stage_case("stage-none", &[]);
+
+        let (clean, clean_staged) = staged_through(&case, &case.local(), 0);
+        put(&case.root(0).join("b.txt"), "b\n");
+        asked(case.root(0), &[], &["add", "b.txt"]).expect("b.txt is staged");
+        let (moved, moved_staged) = staged_through(&case, &case.local(), 0);
+
+        assert!(matches!(&clean, Ok(Synced { end: End::Status(0), .. })), "{clean:?}");
+        assert_eq!(clean_staged, Some(Staged::Clean));
+        assert!(matches!(&moved, Ok(Synced { end: End::Status(1), .. })), "{moved:?}");
+        assert_eq!(moved_staged, Some(Staged::Refused));
+        let refused = "gate: commit refused: the index changed while the hooks ran on builder; nothing was written";
+        assert!(case.said().iter().any(|line| line == refused), "{:?}", case.said());
+        case.remove();
+    }
+
+    #[test]
+    fn a_stage_whose_head_moved_refuses_and_writes_nothing() {
+        let case = stage_case("stage-head", &[]);
+        let back = case.plant(0, &[("a.txt", "fixed\n")]);
+        let head = case.root(0).join(".git").join("HEAD").to_string_lossy().replace('\\', "/");
+        let through = on_fetch(&case, &format!("echo 'ref: refs/heads/moved' > '{head}'"));
+
+        let (ended, staged) = staged_through(&case, &through, 0);
+
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(1), .. })), "{ended:?}");
+        assert_eq!(staged, Some(Staged::Refused));
+        let refused = "gate: commit refused: HEAD moved while the hooks ran on builder; nothing was written";
+        assert!(case.said().iter().any(|line| line == refused), "{:?}", case.said());
+        assert_eq!(text_of(&case, "a.txt"), "a\n", "the worktree is as it was");
+        assert_eq!(case.kept(0), Some(back), "the fixes are kept");
+        case.remove();
+    }
+
+    #[test]
+    fn a_stage_whose_index_changed_refuses_and_writes_nothing() {
+        let case = stage_case("stage-index", &[]);
+        let back = case.plant(0, &[("a.txt", "fixed\n")]);
+        let index = case.root(0).join(".git").join("index");
+        let other = case.folder.join("other.index");
+        std::fs::copy(&index, &other).expect("the index can be copied");
+        put(&case.root(0).join("b.txt"), "b\n");
+        asked(case.root(0), &[("GIT_INDEX_FILE", other.as_os_str())], &["add", "b.txt"]).expect("b.txt is staged in the other index");
+        let shown = |path: &Path| path.to_string_lossy().replace('\\', "/");
+        let through = on_fetch(&case, &format!("cp '{}' '{}'", shown(&other), shown(&index)));
+
+        let (ended, staged) = staged_through(&case, &through, 0);
+
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(1), .. })), "{ended:?}");
+        assert_eq!(staged, Some(Staged::Refused));
+        let refused = "gate: commit refused: the index changed while the hooks ran on builder; nothing was written";
+        assert!(case.said().iter().any(|line| line == refused), "{:?}", case.said());
+        assert_eq!(text_of(&case, "a.txt"), "a\n", "the worktree is as it was");
+        assert_eq!(case.kept(0), Some(back), "the fixes are kept");
+        case.remove();
+    }
+
+    #[test]
+    fn a_stage_whose_hooks_added_a_path_refuses_and_keeps_the_back_commit() {
+        let case = stage_case("stage-added", &[]);
+        let back = case.plant(0, &[("a.txt", "fixed\n"), ("b.txt", "b\n"), ("c.txt", "c\n")]);
+
+        let (ended, staged) = staged_through(&case, &case.local(), 0);
+
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(1), .. })), "{ended:?}");
+        assert_eq!(staged, Some(Staged::Refused));
+        let refused = format!("gate: commit refused: the hooks on builder added b.txt and 1 more; {STAGE_KEPT}");
+        assert!(case.said().contains(&refused), "{:?}", case.said());
+        assert!(!case.root(0).join("b.txt").exists(), "nothing is written");
+        assert_eq!(text_of(&case, "a.txt"), "a\n", "nothing is written");
+        assert_eq!(case.kept(0), Some(back), "the back commit is kept");
+        case.remove();
+    }
+
+    #[test]
+    fn a_stage_whose_fixes_clash_with_an_unstaged_edit_refuses_and_writes_nothing() {
+        let case = stage_case("stage-clash", &[]);
+        let back = case.plant(0, &[("a.txt", "fixed\n")]);
+        put(&case.root(0).join("a.txt"), "mine\n");
+
+        let (ended, staged) = staged_through(&case, &case.local(), 0);
+
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(1), .. })), "{ended:?}");
+        assert_eq!(staged, Some(Staged::Refused));
+        let refused = format!("gate: commit refused: the hooks' fixes clash with unstaged edits; {STAGE_KEPT}");
+        let see = format!("gate: see git diff {} {}", &case.snapshots[0].commit[..8], &back[..8]);
+        assert!(case.said().contains(&refused) && case.said().contains(&see), "{:?}", case.said());
+        assert!(crate::remote::log_texts(&case.log).contains("+fixed"), "the patch is in the log");
+        assert_eq!(text_of(&case, "a.txt"), "mine\n", "the unstaged edit stands");
+        assert_eq!(staged_names(&case), "", "nothing is staged");
+        assert_eq!(case.kept(0), Some(back), "the fixes are kept");
+        case.remove();
+    }
+
+    #[test]
+    fn a_stage_whose_hooks_failed_puts_its_fixes_in_the_worktree_only() {
+        let case = stage_case("stage-failed", &[]);
+        case.plant(0, &[("a.txt", "fixed\n")]);
+
+        let (ended, staged) = staged_through(&case, &case.local(), 3);
+
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(3), .. })), "{ended:?}");
+        assert_eq!(
+            staged,
+            Some(Staged::HooksFailed {
+                status: 3,
+                fixes: Fixes::Worktree
+            })
+        );
+        let said = "gate: the hooks failed on builder (status 3); their fixes are in the worktree, unstaged";
+        assert!(case.said().iter().any(|line| line == said), "{:?}", case.said());
+        assert_eq!(text_of(&case, "a.txt"), "fixed\n", "the worktree holds the fix");
+        assert_eq!(staged_names(&case), "", "nothing is staged");
+        case.remove();
+    }
+
+    #[test]
+    fn a_stage_whose_hooks_failed_keeps_fixes_that_clash() {
+        let case = stage_case("stage-failed-clash", &[]);
+        let back = case.plant(0, &[("a.txt", "fixed\n")]);
+        put(&case.root(0).join("a.txt"), "mine\n");
+
+        let (ended, staged) = staged_through(&case, &case.local(), 3);
+
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(3), .. })), "{ended:?}");
+        assert_eq!(
+            staged,
+            Some(Staged::HooksFailed {
+                status: 3,
+                fixes: Fixes::Kept
+            })
+        );
+        let said = format!("gate: the hooks failed on builder (status 3); their fixes clash with unstaged edits and are kept at {KEPT}");
+        assert!(case.said().contains(&said), "{:?}", case.said());
+        assert_eq!(text_of(&case, "a.txt"), "mine\n", "the unstaged edit stands");
+        assert_eq!(case.kept(0), Some(back), "the fixes are kept");
+        case.remove();
+    }
+
+    #[test]
+    fn a_stage_refusal_leaves_the_real_index_byte_identical() {
+        let case = stage_case("stage-bytes", &[]);
+        case.plant(0, &[("a.txt", "fixed\n")]);
+        put(&case.root(0).join("a.txt"), "mine\n");
+        let before = index_bytes(&case);
+
+        let (_, staged) = staged_through(&case, &case.local(), 0);
+
+        assert_eq!(staged, Some(Staged::Refused));
+        assert!(index_bytes(&case) == before, "the real index is byte for byte as it was");
+        assert!(!case.root(0).join(".git").join("index.lock").exists(), "no lock is left");
+        case.remove();
+    }
+
+    /// app's `a.txt` is held open without delete sharing, as a scanner holds it: the checks read it, but the apply
+    /// cannot replace it.
+    #[test]
+    fn a_stage_apply_that_fails_partway_names_the_paths_and_both_restores() {
+        let case = stage_case("stage-partway", &[("b.txt", "b\n")]);
+        let back = case.plant(0, &[("a.txt", "fixed\n"), ("b.txt", "fixed\n")]);
+        let handle = held_open(&case.root(0).join("a.txt"));
+
+        let (ended, staged) = staged_through(&case, &case.local(), 0);
+
+        drop(handle);
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(1), .. })), "{ended:?}");
+        assert_eq!(staged, Some(Staged::ApplyFailed { status: 0 }));
+        let said = case.said();
+        let failed = said
+            .iter()
+            .find(|line| line.starts_with("gate: commit refused: the hooks' fixes could not be written: "))
+            .cloned()
+            .unwrap_or_default();
+        assert!(!failed.is_empty(), "the failure is said: {said:?}");
+        for part in [
+            "the index is unchanged, but these files may have been rewritten or removed: a.txt b.txt;",
+            "to go back to what was staged: git restore --worktree -- a.txt b.txt;",
+            &format!("to take the fixes: git restore --source={KEPT} --staged --worktree -- a.txt b.txt"),
+        ] {
+            assert!(failed.contains(part), "{part} is in {failed}");
+        }
+        assert_eq!(staged_names(&case), "", "nothing is staged");
+        assert_eq!(case.kept(0), Some(back), "the fixes are kept");
+        case.remove();
+    }
+
+    /// app's patch is held open once the fixes are written, as a scanner holds a file it reads: the fixes stay
+    /// applied, and the patch that cannot be removed is said.
+    #[test]
+    fn a_stage_whose_patch_cannot_be_removed_still_applies_and_says_so() {
+        let case = stage_case("stage-patch-left", &[]);
+        case.plant(0, &[("a.txt", "fixed\n")]);
+        let held: std::rc::Rc<std::cell::RefCell<Option<(PathBuf, File)>>> = std::rc::Rc::default();
+        let holder = std::rc::Rc::clone(&held);
+        super::AFTER_STAGE_WRITE.set(Some(Box::new(move |patch: &Path| {
+            holder.replace(Some((patch.to_owned(), held_open(patch))));
+        })));
+
+        let (ended, staged) = staged_through(&case, &case.local(), 0);
+
+        super::AFTER_STAGE_WRITE.set(None);
+        let (patch, handle) = held.take().expect("the stage wrote its fixes");
+        drop(handle);
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(0), .. })), "{ended:?}");
+        assert_eq!(staged, Some(Staged::Applied(1)), "the fixes stay applied");
+        assert_eq!(text_of(&case, "a.txt"), "fixed\n", "the worktree holds the fix");
+        assert_eq!(staged_names(&case).trim_end(), "a.txt", "the index stages it");
+        let said = format!("gate: cannot remove {}: ", patch.display());
+        assert!(case.said().iter().any(|line| line.starts_with(&said)), "{:?}", case.said());
+        case.remove();
+    }
+
+    /// The apply fails on app's `a.txt`, held open, and the keep fails on a lock another git process holds on the
+    /// `-back` ref: the failure's line still names the paths, and the keep's failure is said after it.
+    #[test]
+    fn a_stage_apply_failure_whose_keep_fails_still_names_the_paths() {
+        let case = stage_case("stage-keep-fails", &[("b.txt", "b\n")]);
+        case.plant(0, &[("a.txt", "fixed\n"), ("b.txt", "fixed\n")]);
+        put(&case.root(0).join(".git").join(format!("{KEPT}.lock")), "");
+        let handle = held_open(&case.root(0).join("a.txt"));
+
+        let (ended, staged) = staged_through(&case, &case.local(), 0);
+
+        drop(handle);
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(1), .. })), "{ended:?}");
+        assert_eq!(staged, Some(Staged::ApplyFailed { status: 0 }));
+        let said = case.said();
+        let failed = said
+            .iter()
+            .position(|line| line.starts_with("gate: commit refused: the hooks' fixes could not be written: "));
+        let unkept = said
+            .iter()
+            .position(|line| line.starts_with(&format!("gate: the fixes could not be kept at {KEPT}: ")));
+        assert!(failed.is_some() && unkept.is_some() && failed < unkept, "{said:?}");
+        assert!(
+            failed.is_some_and(|at| said[at].contains("may have been rewritten or removed: a.txt b.txt;")),
+            "{said:?}"
+        );
+        assert_eq!(case.kept(0), None, "nothing is kept");
+        case.remove();
+    }
+
+    /// The hooks added paths, which refuses the stage, and the keep fails on a lock another git process holds on the
+    /// `-back` ref: the refusal is still said, then the keep's failure, and nothing is written.
+    #[test]
+    fn a_stage_refusal_whose_keep_fails_still_says_the_refusal() {
+        let case = stage_case("stage-refusal-keep-fails", &[]);
+        case.plant(0, &[("a.txt", "fixed\n"), ("b.txt", "b\n"), ("c.txt", "c\n")]);
+        put(&case.root(0).join(".git").join(format!("{KEPT}.lock")), "");
+
+        let (ended, staged) = staged_through(&case, &case.local(), 0);
+
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(1), .. })), "{ended:?}");
+        assert_eq!(staged, Some(Staged::Refused));
+        let said = case.said();
+        let refused = said
+            .iter()
+            .position(|line| line.starts_with("gate: commit refused: the hooks on builder added b.txt and 1 more; "));
+        let unkept = said
+            .iter()
+            .position(|line| line.starts_with(&format!("gate: the fixes could not be kept at {KEPT}: ")));
+        assert!(refused.is_some() && unkept.is_some() && refused < unkept, "{said:?}");
+        assert!(!case.root(0).join("b.txt").exists(), "nothing is written");
+        assert_eq!(case.kept(0), None, "nothing is kept");
+        case.remove();
+    }
+
+    #[test]
+    fn a_stage_whose_hooks_failed_and_whose_apply_fails_keeps_their_status() {
+        let case = stage_case("stage-failed-apply-fails", &[("b.txt", "b\n")]);
+        case.plant(0, &[("a.txt", "fixed\n"), ("b.txt", "fixed\n")]);
+        let handle = held_open(&case.root(0).join("a.txt"));
+
+        let (ended, staged) = staged_through(&case, &case.local(), 3);
+
+        drop(handle);
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(3), .. })), "{ended:?}");
+        assert_eq!(staged, Some(Staged::ApplyFailed { status: 3 }));
+        case.remove();
+    }
+
+    /// app and lib's hooks both changed their repository: lib's change refuses the stage before app's is checked, lib's
+    /// back commit kept at its `-back` ref, and nothing is written in either.
+    #[test]
+    fn a_stage_whose_sibling_s_hooks_changed_it_refuses_and_keeps_its_back_commit() {
+        let case = stage_case("stage-sibling", &[]);
+        case.plant(0, &[("a.txt", "fixed\n")]);
+        let lib = case.plant(1, &[("a.txt", "fixed\n")]);
+        let targets = [0, 1].map(|at| Target::new(routed(PAIR[at], &case.roots[at]), PAIR[at], &case.snapshots[at], KEY));
+        let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
+        let mut call = call_in(&case.roots[0], &case.log, &state);
+        call.commit_stage = true;
+        let local = case.local();
+        let mut attempt = Attempt::for_tests(&call, &local);
+
+        let ended = sync_back(&mut attempt, &targets, None, 0);
+
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(1), .. })), "{ended:?}");
+        assert_eq!(attempt.staged, Some(Staged::Refused));
+        let refused = format!(
+            "gate: commit refused: a sibling's hooks changed {}; the fixes are kept at {KEPT}",
+            PAIR[1]
+        );
+        assert!(case.said().contains(&refused), "{:?}", case.said());
+        assert_eq!(text_of(&case, "a.txt"), "a\n", "app's fixes are not written");
+        assert_eq!(staged_names(&case), "", "nothing is staged in app");
+        let lib_text = std::fs::read_to_string(case.root(1).join("a.txt")).expect("lib's a.txt is there");
+        assert_eq!(lib_text, "a\n", "lib's change is not written");
+        assert_eq!(case.kept(1), Some(lib), "lib's back commit is kept");
+        case.remove();
+    }
+
+    /// Another git process takes app's `index.lock` once the stage fetched its fixes: the checks, all on a copy of the
+    /// index, pass, and the real write finds the lock held.
+    #[test]
+    fn a_stage_whose_index_lock_is_held_says_another_git_process_held_it() {
+        let case = stage_case("stage-lock", &[]);
+        let back = case.plant(0, &[("a.txt", "fixed\n")]);
+        let lock = case.root(0).join(".git").join("index.lock");
+        let through = on_fetch(&case, &format!("touch '{}'", lock.to_string_lossy().replace('\\', "/")));
+        let before = index_bytes(&case);
+
+        let (ended, staged) = staged_through(&case, &through, 0);
+
+        assert!(lock.exists(), "the other process's lock is left as it is");
+        std::fs::remove_file(&lock).expect("the lock can be removed");
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(1), .. })), "{ended:?}");
+        assert_eq!(staged, Some(Staged::ApplyFailed { status: 0 }), "the checks passed and the write failed");
+        let said = "gate: commit refused: another git process held the index; nothing was written";
+        assert!(case.said().iter().any(|line| line == said), "{:?}", case.said());
+        assert!(index_bytes(&case) == before, "the real index is byte for byte as it was");
+        assert_eq!(text_of(&case, "a.txt"), "a\n", "nothing is written");
+        assert_eq!(case.kept(0), Some(back), "the fixes are kept");
         case.remove();
     }
 

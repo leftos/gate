@@ -12,7 +12,7 @@ Every repo that runs heavy gates is in scope, and every heavy command family in 
 
   Either it cannot run anywhere but this PC (a command that names this PC's own WSL state, such as a `/mnt/x` path or a distro folder only this PC has, an install into this PC's own folders, or a git operation that writes this checkout's refs), or its run time is measured as shorter than what routing adds: the push, the outputs, the compression and the call overhead, taken from the repo's routed runs in the journal.
 
-  Any command whose first word is `git` or `prek` stays local silently, a `git commit` included. The commit itself stays local, its hooks' gates route by their own patterns (`hooks` in `remote.json`), and a hook command that runs without a gate is never seen by routing.
+  Any command whose first word is `git` or `prek` stays local silently. A `git commit` of a repo that `remote.json` lists in `commits` first routes its pre-commit stage (below) when it is eligible, and then the commit itself runs here. Otherwise the commit stays local, its hooks' gates route by their own patterns (`hooks` in `remote.json`), and a hook command that runs without a gate is never seen by routing.
 
   A reason that work can remove does not keep a family local. It is a blocker to book. Examples: a tool or SDK the builder lacks, a window or GL the desktop route can serve, a `--local` whose recorded reason shows a routing gap, an outputs list that would need to grow (a routed `dotnet build`'s own project bin needs no entry: it comes back with the repo's list). A command that writes tracked files (a generated cache, a data file, committed screenshots) needs no `outputs` entry either: tracked files come back by the sync-back, and an outputs glob over them only adds manifest cost. Its trial checks that the routed run writes the same bytes as a local one, since a tool that reads this PC's own installs (a config folder, a user profile) can write different ones on the builder.
 
@@ -236,7 +236,7 @@ A file the gate cannot use says `gate: .gate/env.toml: <problem>; only the build
 
 A heavy gate started inside a git hook stays local silently unless `remote.json` names its repo in `hooks`, an array of repo names matched in any letter case: `"hooks": ["<repo>"]`. A value that is not an array of non-empty strings consents to no repo, and the rest of the file is still read ([design.md, remote.json](design.md#remotejson)).
 
-The key is for check-only hook commands (a build, clippy, a format check). A routed fixer's patch comes back to the worktree under prek's stash, so a fixing hook stays local.
+The key is for check-only hook commands (a build, clippy, a format check). A routed fixer's patch comes back to the worktree under prek's stash, so a fixing hook stays local. A commit stage, which runs the whole `prek run --hook-stage pre-commit` on a builder, is the exception: its fixes are applied to the index and the worktree by the stage's own rule (design.md, Sync-back).
 
 A second array, `commits`, names the repos whose commit's pre-commit hook stage may route as one run, read like `hooks` (a bad value consents to no repo and `gate check` says it). No commit routes by it yet ([design.md, remote.json](design.md#remotejson)).
 
@@ -244,7 +244,9 @@ The hook entry calls the repo's launcher, `pwsh -NoProfile -File tools/gate.ps1 
 
 The `git commit` that runs the hook is gated on `--slot heavy` when its hooks build or run analyzers, else on `--slot light`: the commit holds that slot for all its hooks, and a `--slot none` commit runs on a light slot and says to pass one of the two.
 
-A heavy commit covers its hook's gate, which still routes and takes its own remote slot; a light commit does not cover a heavy hook gate, which takes a heavy slot of its own (and routes). The commit's end-of-run line says whether the hooks fit the slot. The `git commit` itself stays local.
+A heavy commit covers its hook's gate, which still routes and takes its own remote slot; a light commit does not cover a heavy hook gate, which takes a heavy slot of its own (and routes). The commit's end-of-run line says whether the hooks fit the slot. The `git commit` itself stays local, after its pre-commit stage when the repo is in `commits` and the commit is eligible.
+
+A repo opts in with `"commits": ["<repo>"]` in `remote.json`. An eligible commit (a plain `git commit` on a heavy or light slot with no covering parent, none of the blocking variables set, a prek shim as its pre-commit hook) runs `prek run --hook-stage pre-commit` on a Windows builder under the commit's own slot, then stages the hooks' fixes and commits. The stage refuses the commit, writing nothing, when `HEAD` or the index changed while the hooks ran (an unrelated `git add` included) or when the fixes clash with unstaged edits; the fixes are then kept at `refs/gate-remote/<key>-back`. A stage that cannot start leaves the commit exactly as without it. Why a commit stays local is in the run's log: `gate: the commit's hooks run here: <reason>`. The commit's own hooks still run here ([design.md, Commit run](design.md#critical-drain-and-nesting)).
 
 Only hooks that run with `GIT_INDEX_FILE` set (pre-commit and commit-msg) need the `hooks` consent: a pre-push hook's gate routes by the repo's patterns like any other run. Every gated repo carries a committed copy of this repo's `tools/gate.ps1`; claude-config's `tools/sync-launchers.ps1` gives a first copy to each repo it lists that has none and keeps every copy current, and `~/.claude/tools/gate.ps1` is the same wrapper for a caller outside any repo.
 

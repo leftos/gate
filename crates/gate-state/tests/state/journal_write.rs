@@ -12,7 +12,7 @@ use flate2::read::GzDecoder;
 use gate_router::balance::{Balanced, BalancedEntry};
 use gate_state::{
     FallbackReason, HeavyLight, Held, JOURNAL_CAP_BYTES, JournalEvent, JournalIdentity, JournalLock, JournalNote, LockError, MachineSnapshot,
-    OtherClaim, RemoteTag, RoutingFacts, RunFacts, RunTrace, TracedChild, Verdict, append_line, journal_line,
+    OtherClaim, RemoteTag, RoutingFacts, RunFacts, RunTrace, StageFacts, StageOutcome, TracedChild, Verdict, append_line, journal_line,
 };
 use serde_json::{Value, json};
 
@@ -791,6 +791,7 @@ fn a_release_line_carries_not_routed_reason_fell_back_balanced_and_parent_pid_wh
         fell_back: vec![FallbackReason::Full, FallbackReason::Busy],
         balanced: Some(two_balanced(true)),
         parent_pid: Some(40267),
+        stage: None,
     });
     let line = journal_line(&identity(), ts(NOW), &event, None, None);
 
@@ -816,6 +817,56 @@ fn a_release_line_carries_not_routed_reason_fell_back_balanced_and_parent_pid_wh
             r#""balanced":[{"builder":"mac-1","expectedSeconds":40.4,"free":1,"cold":false},"#,
             r#"{"builder":"host","expectedSeconds":125.0,"free":0,"cold":true}],"parentPid":40267}"#
         )),
+        "{line}"
+    );
+}
+
+/// A commit's release line carries its stage as one `stage` object, last, which reads back as the facts it was written
+/// from; a stage with no status writes `null`.
+#[test]
+fn a_release_line_carries_a_commit_stage_that_reads_back_as_it_was() {
+    for (status, outcome) in [
+        (Some(0), StageOutcome::Applied),
+        (None, StageOutcome::FellBack),
+        (Some(3), StageOutcome::HooksFailed),
+    ] {
+        let stage = StageFacts {
+            host: "builder".to_owned(),
+            key: "app-1a2b3c4d".to_owned(),
+            status,
+            outcome,
+            seconds: 1.25,
+        };
+        let routing = RoutingFacts {
+            stage: Some(stage.clone()),
+            ..RoutingFacts::default()
+        };
+        assert!(!routing.is_empty(), "the stage is a routing fact");
+        let line = journal_line(&identity(), ts(NOW), &release_routed(routing), None, None);
+
+        assert_eq!(own_keys(&line).last().map(String::as_str), Some("stage"), "{line}");
+        let value: Value = serde_json::from_str(&line).expect("the line is JSON");
+        let read: StageFacts = serde_json::from_value(value["stage"].clone()).expect("the stage reads back");
+        assert_eq!(read, stage, "{line}");
+    }
+    let line = journal_line(
+        &identity(),
+        ts(NOW),
+        &release_routed(RoutingFacts {
+            stage: Some(StageFacts {
+                host: "builder".to_owned(),
+                key: "app-1a2b3c4d".to_owned(),
+                status: None,
+                outcome: StageOutcome::HooksFailed,
+                seconds: 0.5,
+            }),
+            ..RoutingFacts::default()
+        }),
+        None,
+        None,
+    );
+    assert!(
+        line.ends_with(r#""stage":{"host":"builder","key":"app-1a2b3c4d","status":null,"outcome":"hooksFailed","seconds":0.5}}"#),
         "{line}"
     );
 }

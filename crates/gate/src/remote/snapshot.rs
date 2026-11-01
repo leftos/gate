@@ -1,8 +1,9 @@
 //! The snapshot a routed run sends the builder: the worktree as `git add -A` would stage it, untracked files in and
 //! ignored ones out, committed with no parent through a copy of the index, so the real index and every worktree file
 //! stay as they were; the bridge commit, the same tree on the previous snapshot that builder received; and the local
-//! ref, one per builder, naming the snapshot each builder last received. Every commit is made by git under the
-//! `gate-remote` identity, through its environment, and is never signed.
+//! ref, one per builder, naming the snapshot each builder last received. A commit stage's snapshot is the staged index's
+//! tree instead, written through a copy of the index with nothing added, and has no bridge. Every commit is made by git
+//! under the `gate-remote` identity, through its environment, and is never signed.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -52,23 +53,26 @@ pub(crate) struct Base {
     pub commit: String,
 }
 
+/// What a snapshot sends: the worktree, its bridge built on the snapshot the builder of the id it names
+/// ([`gate_router::Builder::id`], `None` for `host`) last received; or a commit stage's staged index tree, with no
+/// bridge, which no later run's bridge builds on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Sent<'a> {
+    Worktree(Option<&'a str>),
+    Staged,
+}
+
 /// The snapshot of each of `roots`, in order, under the work-folder `key`, each git call under `bounds` or ended by the
-/// console `interrupt`, each bridge built on the snapshot the builder `builder` ([`gate_router::Builder::id`], `None`
-/// for `host`) last received; else why the call could not be made. git is found once, for every call of every root.
-pub(crate) fn take(
-    roots: &[PathBuf],
-    key: &str,
-    builder: Option<&str>,
-    bounds: GitBounds,
-    interrupt: Option<Interrupt>,
-) -> Result<Vec<Snapshot>, GitError> {
+/// console `interrupt`, each sending what `sent` says; else why the call could not be made. git is found once, for every
+/// call of every root.
+pub(crate) fn take(roots: &[PathBuf], key: &str, sent: Sent<'_>, bounds: GitBounds, interrupt: Option<Interrupt>) -> Result<Vec<Snapshot>, GitError> {
     let Some(first) = roots.first() else {
         return Ok(Vec::new());
     };
     let git = Git::find(first).map_err(GitError::Failed)?;
     roots
         .iter()
-        .map(|root| take_one(&Calls::new(&git, root, &[], bounds, interrupt), key, builder))
+        .map(|root| take_one(&Calls::new(&git, root, &[], bounds, interrupt), key, sent))
         .collect()
 }
 
@@ -112,18 +116,18 @@ pub(crate) struct Place {
 /// repository is given.
 pub(crate) const CEILING: &str = "GIT_CEILING_DIRECTORIES";
 
-/// The snapshot of the pair's repository `repo`, as [`take`] takes one, under the work-folder `key`, for the builder
-/// `builder`.
+/// The snapshot of the pair's repository `repo`, as [`take`] takes one, under the work-folder `key`, sending what `sent`
+/// says.
 pub(crate) fn take_bounded(
     repo: Bounded<'_>,
     key: &str,
-    builder: Option<&str>,
+    sent: Sent<'_>,
     bounds: GitBounds,
     interrupt: Option<Interrupt>,
 ) -> Result<Snapshot, GitError> {
     let git = Git::find(repo.root).map_err(GitError::Failed)?;
     let variables = repo.variables();
-    take_one(&Calls::new(&git, repo.root, &variables, bounds, interrupt), key, builder)
+    take_one(&Calls::new(&git, repo.root, &variables, bounds, interrupt), key, sent)
 }
 
 /// Where git finds the pair's repository `repo`, searching from its root up to its ceiling and given no place, as one
@@ -201,24 +205,56 @@ pub(super) fn worktree(root: &Path, bounds: GitBounds, interrupt: Option<Interru
     worktree_tree(&Calls::new(&git, root, &[], bounds, interrupt)).map(|(tree, _)| tree)
 }
 
-/// The snapshot of the worktree `calls` asks about under the work-folder `key`, its bridge built on the snapshot the
-/// builder `builder` last received.
-fn take_one(calls: &Calls<'_>, key: &str, builder: Option<&str>) -> Result<Snapshot, GitError> {
-    let listing = calls.output(
-        &[
-            "for-each-ref",
-            "--sort=-committerdate",
-            "--format=%(refname) %(objectname) %(symref)",
-            &builder_refs(builder),
-            "refs/remotes/origin/HEAD",
-            "refs/remotes/origin/main",
-            "refs/remotes/origin/master",
-        ],
-        &[],
-        &[],
-    )?;
-    let previous = previous(&listing, key, builder);
-    let (tree, paths) = worktree_tree(calls)?;
+/// A copy of a worktree's index in its git folder, which git is pointed at with `GIT_INDEX_FILE` to check a patch
+/// against the index without writing the real one; the caller removes it with [`IndexCopy::removed`].
+pub(super) struct IndexCopy {
+    path: PathBuf,
+}
+
+impl IndexCopy {
+    /// A fresh copy of the index of the worktree at `root`, named for this process; a repository with no index gives
+    /// none, which git reads as an empty index.
+    pub(super) fn made(root: &Path, bounds: GitBounds, interrupt: Option<Interrupt>) -> Result<IndexCopy, GitError> {
+        let git = Git::find(root).map_err(GitError::Failed)?;
+        let paths = paths(&Calls::new(&git, root, &[], bounds, interrupt), &check_copy_name(std::process::id()))?;
+        let copied = copy_index(&paths.index, &paths.copy);
+        let copy = IndexCopy { path: paths.copy };
+        match copied {
+            Ok(()) => Ok(copy),
+            Err(error) => {
+                // The copy's failure is the call's; a leftover that cannot be removed after it is the lesser problem.
+                drop(copy.removed());
+                Err(error)
+            }
+        }
+    }
+
+    /// The copy's path, as `GIT_INDEX_FILE` names it.
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Removes the copy and the lock git makes beside it.
+    pub(super) fn removed(self) -> Result<(), GitError> {
+        remove_leftovers(&self.path)
+    }
+}
+
+/// The snapshot of the worktree `calls` asks about under the work-folder `key`, sending what `sent` says: a worktree's
+/// with its bridge, or a commit stage's staged tree with none.
+fn take_one(calls: &Calls<'_>, key: &str, sent: Sent<'_>) -> Result<Snapshot, GitError> {
+    let mut listed = vec!["for-each-ref", "--sort=-committerdate", "--format=%(refname) %(objectname) %(symref)"];
+    let refs = match sent {
+        Sent::Worktree(builder) => Some(builder_refs(builder)),
+        Sent::Staged => None,
+    };
+    listed.extend(refs.as_deref());
+    listed.extend(["refs/remotes/origin/HEAD", "refs/remotes/origin/main", "refs/remotes/origin/master"]);
+    let listing = calls.output(&listed, &[], &[])?;
+    let (previous, (tree, paths)) = match sent {
+        Sent::Worktree(builder) => (previous(&listing, key, builder), worktree_tree(calls)?),
+        Sent::Staged => (None, index_tree(calls)?),
+    };
     // A shallow clone sends no history: a receiver refuses a push from one.
     let (head, base) = if paths.shallow {
         (None, None)
@@ -365,17 +401,13 @@ fn worktree_tree(calls: &Calls<'_>) -> Result<(String, GitPaths), GitError> {
 
 /// The tree of the worktree's staged index at `root`, written by `git write-tree` through a copy of the index with
 /// nothing added, which is removed however the write ends: the real index is never written. A repository with no index
-/// gives the empty tree.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "nothing outside the tests writes the tree of a worktree's staged index yet")
-)]
-fn index_tree(calls: &Calls<'_>) -> Result<String, GitError> {
+/// gives the empty tree. With it, the worktree's [`GitPaths`].
+fn index_tree(calls: &Calls<'_>) -> Result<(String, GitPaths), GitError> {
     let paths = paths(calls, &stage_copy_name(std::process::id()))?;
     let tree = staged_tree(calls, &paths.index, &paths.copy);
     let removed = remove_leftovers(&paths.copy);
     let tree = tree?;
-    removed.map(|()| tree)
+    removed.map(|()| (tree, paths))
 }
 
 /// The index, the index copy and the object store of the worktree's repository, and what the call that named them says
@@ -452,10 +484,6 @@ fn write_tree(calls: &Calls<'_>, index: &Path, copy: &Path) -> Result<String, Gi
 }
 
 /// `git write-tree` on `copy`, a fresh copy of `index`, with nothing added; with no index, git starts from an empty one.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "only the staged index's tree, which nothing outside the tests asks for, writes it")
-)]
 fn staged_tree(calls: &Calls<'_>, index: &Path, copy: &Path) -> Result<String, GitError> {
     copy_index(index, copy)?;
     let env: [(&str, &OsStr); 1] = [("GIT_INDEX_FILE", copy.as_os_str())];
@@ -504,12 +532,14 @@ fn copy_name(pid: u32) -> String {
 
 /// The staged index copy's name in the git folder, for the process `pid`: another than [`copy_name`]'s, so the two
 /// never share a file.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "only the staged index's tree, which nothing outside the tests asks for, names it")
-)]
 fn stage_copy_name(pid: u32) -> String {
     format!("gate-remote-{pid}-stage.index")
+}
+
+/// The name of the index copy a commit stage's apply checks its patch against, for the process `pid`: another than
+/// [`copy_name`]'s and [`stage_copy_name`]'s, so none of them share a file.
+fn check_copy_name(pid: u32) -> String {
+    format!("gate-remote-{pid}-check.index")
 }
 
 /// A path `git rev-parse --git-path` printed, read against the worktree `root` it was asked in.
@@ -546,7 +576,7 @@ mod tests {
     use std::slice;
 
     use super::{
-        Bounded, Calls, DATES, IDENTITY, asked, copy_name, default_branch, git_path, index_tree, lock_of, place_of, previous, repository, save,
+        Bounded, Calls, DATES, IDENTITY, Sent, asked, copy_name, default_branch, git_path, index_tree, lock_of, place_of, previous, repository, save,
         snapshot_ref, take, worktree,
     };
     use crate::remote::git::{GIT_BOUNDS, Git, GitError};
@@ -796,13 +826,13 @@ mod tests {
     fn a_saved_snapshot_is_the_parent_of_the_next_bridge_commit() {
         let root = repository("saved");
         let roots = slice::from_ref(&root);
-        let first = take(roots, OWN, None, GIT_BOUNDS, None).expect("the first snapshot is made");
+        let first = take(roots, OWN, Sent::Worktree(None), GIT_BOUNDS, None).expect("the first snapshot is made");
         assert_eq!(first.len(), 1, "one snapshot for one root");
         assert_eq!(first[0].bridge, None, "no snapshot before the first");
         save(&root, &[], &snapshot_ref(OWN, None), &first[0].commit, GIT_BOUNDS).expect("the ref is saved");
         fs::write(root.join("a.txt"), "b\n").expect("a file can be changed");
 
-        let second = take(roots, OWN, None, GIT_BOUNDS, None).expect("the second snapshot is made");
+        let second = take(roots, OWN, Sent::Worktree(None), GIT_BOUNDS, None).expect("the second snapshot is made");
 
         let bridge = second[0].bridge.as_deref().expect("a bridge commit");
         let ask = |args: &[&str]| asked(&root, args).expect("git answers");
@@ -815,12 +845,31 @@ mod tests {
         fs::remove_dir_all(&root).expect("the repository can be removed");
     }
 
+    /// A commit stage's snapshot of a worktree with a saved snapshot builds no bridge on it and leaves the saved ref as
+    /// it was: the staged tree is never a later run's bridge parent.
+    #[test]
+    fn a_stage_snapshot_builds_no_bridge_and_saves_no_snapshot_ref() {
+        let root = repository("staged-no-bridge");
+        let roots = slice::from_ref(&root);
+        let first = take(roots, OWN, Sent::Worktree(None), GIT_BOUNDS, None).expect("the first snapshot is made");
+        let reference = snapshot_ref(OWN, None);
+        save(&root, &[], &reference, &first[0].commit, GIT_BOUNDS).expect("the ref is saved");
+        asked(&root, &["add", "a.txt"]).expect("a.txt is staged");
+
+        let staged = take(roots, OWN, Sent::Staged, GIT_BOUNDS, None).expect("the staged snapshot is made");
+
+        assert_eq!(staged[0].bridge, None, "no bridge on the saved snapshot");
+        let saved = asked(&root, &["rev-parse", reference.as_str()]).expect("the saved ref is read");
+        assert_eq!(saved.trim_end(), first[0].commit, "the saved ref still names the first snapshot");
+        fs::remove_dir_all(&root).expect("the repository can be removed");
+    }
+
     #[test]
     fn the_worktree_tree_is_the_snapshot_s_own_and_makes_no_commit() {
         let root = repository("worktree-tree");
         fs::write(root.join("b.txt"), "b\n").expect("a file can be written");
         let roots = slice::from_ref(&root);
-        let made = take(roots, OWN, None, GIT_BOUNDS, None).expect("the snapshot is made");
+        let made = take(roots, OWN, Sent::Worktree(None), GIT_BOUNDS, None).expect("the snapshot is made");
 
         let tree = worktree(&root, GIT_BOUNDS, None).expect("the worktree tree is written");
 
@@ -838,7 +887,9 @@ mod tests {
     /// The tree of the staged index of the repository at `root`.
     fn staged_index_tree(root: &Path) -> String {
         let git = Git::find(root).expect("git is found");
-        index_tree(&Calls::new(&git, root, &[], GIT_BOUNDS, None)).expect("the index's tree is written")
+        index_tree(&Calls::new(&git, root, &[], GIT_BOUNDS, None))
+            .expect("the index's tree is written")
+            .0
     }
 
     /// The staged index's tree holds what is staged, not the worktree's unstaged edits or untracked files, and leaves the
@@ -898,7 +949,7 @@ mod tests {
         let root = repository("objects");
         let store = fs::canonicalize(root.join(".git").join("objects")).expect("the store is there");
         let objects_of = |folder: &Path| {
-            let made = take(slice::from_ref(&folder.to_path_buf()), OWN, None, GIT_BOUNDS, None).expect("the snapshot is made");
+            let made = take(slice::from_ref(&folder.to_path_buf()), OWN, Sent::Worktree(None), GIT_BOUNDS, None).expect("the snapshot is made");
             fs::canonicalize(&made[0].objects).expect("the named store is there")
         };
         assert_eq!(objects_of(&root), store, "a plain repository's own");

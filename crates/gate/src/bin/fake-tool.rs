@@ -53,7 +53,11 @@
 //! `argv` prints every word after it, each on its own line, and ends, so it is always the last step;
 //! `--version` adds the line `run` to the file `ran` beside this program's own file, then prints the first line of the
 //! file `version.txt` beside it, and nothing when there is no such file, so a copy named `Godot_console.exe` stands in
-//! for a Godot install a case can tell the running of from what it answers.
+//! for a Godot install a case can tell the running of from what it answers;
+//! `--hook-stage <stage>` runs the steps of the file `hook-steps.txt` beside this program, one a line, and ends with
+//! their status, so a copy named `prek.exe` stands in for `prek run --hook-stage pre-commit`; `hook-impl` adds the line
+//! `run` to the file `local-hooks.ran` beside this program and ends, so the same copy stands in for the hook shim's
+//! `prek hook-impl` and a case can tell that a commit's hooks ran here.
 //! With no `exit` step it exits 0. For example `fake-tool out hi err oops exit 3`.
 
 #![expect(
@@ -198,6 +202,7 @@ fn run(args: &[OsString]) -> Result<i32, String> {
             "spawn-away" => spawn_away(&mut steps, &mut stdout)?,
             "token" => token(&mut stdout)?,
             "token-to" => token_to(&operand(&mut steps, "token-to")?)?,
+            "--hook-stage" => return hook_steps(&mut steps, &mut stdout),
             other => keeper_step(other, &mut steps, &mut stdout)?,
         }
     }
@@ -206,11 +211,15 @@ fn run(args: &[OsString]) -> Result<i32, String> {
 }
 
 /// The steps a stand-in for the box's MSYS keeper and the command watching it take: `echo`, `swallow`, `pid-to` and
-/// `alive`; and `commit`, which does nothing, so a copy named `git.exe` stands in for `git commit`; any other step is
-/// unknown.
+/// `alive`; `commit`, which does nothing, so a copy named `git.exe` stands in for `git commit`; and `hook-impl`, which
+/// marks `local-hooks.ran` beside this program, its words after it skipped; any other step is unknown.
 fn keeper_step<'a>(step: &str, steps: &mut impl Iterator<Item = &'a OsString>, stdout: &mut impl Write) -> Result<(), String> {
     match step {
         "commit" => Ok(()),
+        "hook-impl" => {
+            for _ in steps.by_ref() {}
+            mark(&own_folder()?.join(LOCAL_HOOKS_RAN).to_string_lossy())
+        }
         "echo" => echo(stdout),
         "swallow" => io::copy(&mut io::stdin().lock(), &mut io::sink())
             .map(drop)
@@ -708,6 +717,25 @@ fn version_beside(stdout: &mut impl Write) -> Result<(), String> {
         writeln!(stdout, "{line}").map_err(|error| write_failed(&error))?;
     }
     Ok(())
+}
+
+/// The file beside this program that `hook-impl` adds a line to each time a commit's hooks run it here.
+const LOCAL_HOOKS_RAN: &str = "local-hooks.ran";
+
+/// The `--hook-stage <stage>` step of a copy named `prek.exe` run as `prek run --hook-stage <stage>`: runs the steps of
+/// the file `hook-steps.txt` beside this program, one step or operand a line, and ends with their status; no file runs
+/// no step.
+fn hook_steps<'a>(steps: &mut impl Iterator<Item = &'a OsString>, stdout: &mut impl Write) -> Result<i32, String> {
+    operand(steps, "--hook-stage")?;
+    stdout.flush().map_err(|error| write_failed(&error))?;
+    let file = own_folder()?.join("hook-steps.txt");
+    let text = match std::fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("cannot read {}: {error}", file.display())),
+    };
+    let steps: Vec<OsString> = text.lines().map(OsString::from).collect();
+    run(&steps)
 }
 
 /// This program's own folder, or why it has none.

@@ -177,14 +177,51 @@ pub struct RoutingFacts {
     /// The pid of the parent gate whose slot did not cover the run, as its `take` line says it: written as
     /// `parentPid`, after `balanced`, and left out when `None`.
     pub parent_pid: Option<u32>,
+    /// How a commit's pre-commit stage on a builder went: written as `stage`, after `parentPid`, and left out when
+    /// `None`, as for every run that is no commit with a stage.
+    pub stage: Option<StageFacts>,
 }
 
 impl RoutingFacts {
-    /// Whether the run carries none of the five facts, so its release line gains no key of theirs.
+    /// Whether the run carries none of the six facts, so its release line gains no key of theirs.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.not_routed.is_none() && self.reason.is_none() && self.fell_back.is_empty() && self.balanced.is_none() && self.parent_pid.is_none()
+        self.not_routed.is_none()
+            && self.reason.is_none()
+            && self.fell_back.is_empty()
+            && self.balanced.is_none()
+            && self.parent_pid.is_none()
+            && self.stage.is_none()
     }
+}
+
+/// A commit's pre-commit stage, as its release line's `stage` object has it: `{"host", "key", "status", "outcome",
+/// "seconds"}`, the builder's alias, the work-folder key, prek's status (`null` when none came back), how the stage
+/// ended and how long it took, in seconds to three decimals.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct StageFacts {
+    pub host: String,
+    pub key: String,
+    pub status: Option<i64>,
+    pub outcome: StageOutcome,
+    pub seconds: f64,
+}
+
+/// How a commit's pre-commit stage ended, as its `outcome` spells it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StageOutcome {
+    /// The hooks passed and their fixes were staged.
+    Applied,
+    /// The hooks passed and changed nothing.
+    Clean,
+    /// The hooks ran but the commit was refused: a check or the apply failed, or their result could not be brought
+    /// back.
+    Refused,
+    /// The hooks failed.
+    HooksFailed,
+    /// The stage fell back before its command ran, and the commit ran its hooks here.
+    FellBack,
 }
 
 /// What a critical gate found as it took the machine, which its `take` line carries after `waitedSeconds`: the counts
@@ -694,6 +731,27 @@ fn insert_routing(line: &mut Map<String, Value>, routing: &RoutingFacts) {
     if let Some(parent_pid) = routing.parent_pid {
         line.insert("parentPid".to_owned(), Value::from(parent_pid));
     }
+    if let Some(stage) = &routing.stage {
+        line.insert("stage".to_owned(), stage_value(stage));
+    }
+}
+
+/// A commit stage as a release line's `stage` field writes it ([`StageFacts`]).
+fn stage_value(stage: &StageFacts) -> Value {
+    let mut object = Map::new();
+    object.insert("host".to_owned(), Value::from(stage.host.as_str()));
+    object.insert("key".to_owned(), Value::from(stage.key.as_str()));
+    object.insert("status".to_owned(), Value::from(stage.status));
+    let outcome = match stage.outcome {
+        StageOutcome::Applied => "applied",
+        StageOutcome::Clean => "clean",
+        StageOutcome::Refused => "refused",
+        StageOutcome::HooksFailed => "hooksFailed",
+        StageOutcome::FellBack => "fellBack",
+    };
+    object.insert("outcome".to_owned(), Value::from(outcome));
+    object.insert("seconds".to_owned(), seconds(stage.seconds));
+    Value::Object(object)
 }
 
 /// A scored builder as a release line's `balanced` field writes it: `{"builder", "expectedSeconds", "free", "cold"}`,

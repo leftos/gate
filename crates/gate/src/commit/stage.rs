@@ -125,7 +125,7 @@ const IN_PROGRESS: [&str; 5] = ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
 /// The variables whose being set in the caller's environment keeps the stage here: a commit of another index, git
 /// folder, worktree or object store, one given config the gate's own git calls never see, which may name another
 /// hooks folder, or one that skips hooks.
-const BLOCKING_VARIABLES: [&str; 11] = [
+pub(crate) const BLOCKING_VARIABLES: [&str; 11] = [
     "GIT_INDEX_FILE",
     "GIT_DIR",
     "GIT_WORK_TREE",

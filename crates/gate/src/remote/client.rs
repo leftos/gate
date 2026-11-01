@@ -487,6 +487,7 @@ impl RustClient {
             warm: None,
             marker_seen: false,
             run_call_started: false,
+            staged: None,
             raised: None,
             backstop_seam: self.backstop_ms.map(Duration::from_millis),
             carried: match phases {
@@ -1534,6 +1535,8 @@ pub(super) struct Attempt<'c, 'a> {
     marker_seen: bool,
     /// Whether the attempt began its box run call: its preflight passed and its snapshot was pushed.
     run_call_started: bool,
+    /// How a commit stage's sync-back ended, once it has; `None` before, and for a call that is no stage.
+    pub(super) staged: Option<syncback::Staged>,
     /// The run call's ceiling, in whole seconds, once it was raised for a work tree the preflight found new
     /// ([`Attempt::raise_ceiling`]); `None` while it is the call's own.
     raised: Option<u64>,
@@ -1650,6 +1653,13 @@ impl Attempt<'_, '_> {
         if let Some(raised) = raised {
             self.raise_ceiling(raised);
         }
+        // A commit stage sends the PC's HEAD its snapshot read, which the box soft-resets to; a stage without one cannot
+        // run, before anything ran.
+        let stage_head = match (self.call.commit_stage, snapshot.head.as_deref()) {
+            (false, _) => None,
+            (true, Some(head)) => Some(head),
+            (true, None) => return Err(End::Failed("a commit stage needs the commit of the PC's HEAD".to_owned())),
+        };
         // After the preflight, whose installs the Godot and Unreal Engine versions are chosen from, and after the send,
         // whose landing keeps `--no-build`.
         let run = RunCall {
@@ -1678,6 +1688,7 @@ impl Attempt<'_, '_> {
             cross_build: self.call.cross_build,
             base: snapshot.base.as_ref().map(|base| base.name.as_str()),
             sibling_bases: &sibling_bases,
+            commit_stage_head: stage_head,
         };
         self.run_call_started = true;
         let (called, nonce) = self.run_called(&location, &run, &mut sent, withheld)?;
@@ -1983,10 +1994,20 @@ impl Attempt<'_, '_> {
         Ok(())
     }
 
+    /// What the snapshot of the repository at `at` in the run's order sends: a commit stage's main repository its staged
+    /// tree, every other its worktree with its bridge to this builder.
+    fn sent(&self, at: usize) -> snapshot::Sent<'_> {
+        if self.call.commit_stage && at == 0 {
+            snapshot::Sent::Staged
+        } else {
+            snapshot::Sent::Worktree(self.call.builder.id.as_deref())
+        }
+    }
+
     /// The snapshot of the call's worktree.
     fn snapshot(&self) -> Result<Snapshot, End> {
         let roots = [PathBuf::from(self.call.root)];
-        snapshot::take(&roots, self.call.key, self.call.builder.id.as_deref(), self.git, self.call.interrupt)
+        snapshot::take(&roots, self.call.key, self.sent(0), self.git, self.call.interrupt)
             .map_err(git_end)?
             .pop()
             .ok_or_else(|| End::Failed("the snapshot made no commit".to_owned()))
@@ -2148,8 +2169,7 @@ impl Attempt<'_, '_> {
                 place: Some(self.place_at(root).map_err(End::Failed)?),
                 ..bounded(repo, &ceiling)
             };
-            let builder = self.call.builder.id.as_deref();
-            let taken = snapshot::take_bounded(bound, self.call.key, builder, self.git, self.call.interrupt);
+            let taken = snapshot::take_bounded(bound, self.call.key, self.sent(at), self.git, self.call.interrupt);
             snapshots.push(taken.map_err(|error| repo_end(at, &repo.name, git_end(error)))?);
             #[cfg(feature = "test-seams")]
             if at == 0 {
@@ -2889,9 +2909,12 @@ impl Attempt<'_, '_> {
             ));
             return Err(End::Refused(FallbackReason::Unreachable));
         }
-        let reference = snapshot::snapshot_ref(key, self.call.builder.id.as_deref());
-        let saved = snapshot::save(root, &variables, &reference, &snapshot.commit, self.git);
-        saved.map_err(|error| repo_end(at, &repo.name, git_end(error)))?;
+        // A commit stage's staged tree is never saved: no later run's bridge builds on it.
+        if self.sent(at) != snapshot::Sent::Staged {
+            let reference = snapshot::snapshot_ref(key, self.call.builder.id.as_deref());
+            let saved = snapshot::save(root, &variables, &reference, &snapshot.commit, self.git);
+            saved.map_err(|error| repo_end(at, &repo.name, git_end(error)))?;
+        }
         // The push is timed to its save; the check of where git finds the repository is not part of it.
         let took = started.elapsed();
         if let Some(bound) = bound {
@@ -3926,6 +3949,8 @@ impl Attempt<'_, '_> {
             raised: self.raised,
             draining,
             run_called: self.run_call_started,
+            command_started: self.marker_seen,
+            staged: self.staged,
         }
     }
 
@@ -3991,6 +4016,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             warm: None,
             marker_seen: false,
             run_call_started: false,
+            staged: None,
             raised: None,
             backstop_seam: None,
             carried: Carried::default(),
@@ -6294,6 +6320,7 @@ mod tests {
     /// A call whose interrupt is raised, logging to `log`, which no test here writes.
     fn call(log: &Path) -> RemoteCall<'_> {
         RemoteCall {
+            commit_stage: false,
             cross_build: None,
             builder: &crate::test_support::HOST,
             key: "app-1a2b3c4d",
@@ -6376,6 +6403,7 @@ mod tests {
             warm: None,
             marker_seen: false,
             run_call_started: false,
+            staged: None,
             raised: None,
             backstop_seam: None,
             carried: Carried::default(),
@@ -6387,6 +6415,7 @@ mod tests {
     /// lock it waits for is waited out.
     fn pair_call<'a>(run: &'a gate_router::RemoteRun, siblings: Vec<Sibling<'a>>, log: &'a Path) -> RemoteCall<'a> {
         RemoteCall {
+            commit_stage: false,
             root: &run.root,
             root_id: run.root_id,
             siblings,
@@ -6419,6 +6448,7 @@ mod tests {
             data: None,
         };
         let on_mac = RemoteCall {
+            commit_stage: false,
             builder: &mac,
             root: &root,
             outputs: &globs,
@@ -6436,6 +6466,7 @@ mod tests {
         let left = outputs::sent(&mut attempt(&on_mac, &transport)).expect("the mac run's manifest is built");
         outputs::marked(&left).expect("the mac run's marker can be written");
         let on_host = RemoteCall {
+            commit_stage: false,
             builder: &crate::test_support::HOST,
             ..on_mac
         };
@@ -6476,6 +6507,7 @@ mod tests {
     fn a_main_tree_that_could_not_be_listed_has_no_lfs_phase() {
         let log = crate::test_support::temp_dir().join(format!("gate-client-lfs-unlisted-{}.log", std::process::id()));
         let call = RemoteCall {
+            commit_stage: false,
             interrupt: None,
             ..call(&log)
         };
@@ -9303,6 +9335,7 @@ mod tests {
     fn a_cold_run_call_watches_for_no_hang_hint() {
         let log = Path::new(r"C:\no-such-log.log");
         let call = RemoteCall {
+            commit_stage: false,
             usual: Some(crate::durations::Usual { p90: 30.0, family: false }),
             ..call(log)
         };
@@ -9320,6 +9353,7 @@ mod tests {
     fn the_pull_s_hang_hint_counts_from_the_start_marker_unless_the_seam_says_the_pull_s_start() {
         let log = Path::new(r"C:\no-such-log.log");
         let call = RemoteCall {
+            commit_stage: false,
             usual: Some(crate::durations::Usual { p90: 30.0, family: false }),
             ..call(log)
         };
@@ -9352,6 +9386,7 @@ mod tests {
     fn the_pull_s_hang_hint_counts_its_phase_from_the_pull_s_start_not_the_call_s() {
         let log = Path::new(r"C:\no-such-log.log");
         let call = RemoteCall {
+            commit_stage: false,
             usual: Some(crate::durations::Usual { p90: 30.0, family: false }),
             ..call(log)
         };
@@ -9387,6 +9422,7 @@ mod tests {
     fn the_hang_hint_of_a_reports_pull_names_the_failed_run_s_test_reports() {
         let log = Path::new(r"C:\no-such-log.log");
         let call = RemoteCall {
+            commit_stage: false,
             usual: Some(crate::durations::Usual { p90: 30.0, family: false }),
             ..call(log)
         };
@@ -9493,6 +9529,7 @@ mod tests {
         let log = unwritten_log();
         let warm_up = [vec!["./tool.exe".to_owned()]];
         let warm_call = RemoteCall {
+            commit_stage: false,
             warmth: Warmth::WarmUp {
                 commands: &warm_up,
                 hash: WARM_HASH,
@@ -9538,6 +9575,7 @@ mod tests {
         let log = unwritten_log();
         let warm_up = [vec!["./tool.exe".to_owned()]];
         let warm_call = RemoteCall {
+            commit_stage: false,
             warmth: Warmth::WarmUp {
                 commands: &warm_up,
                 hash: WARM_HASH,
@@ -9561,6 +9599,7 @@ mod tests {
             "no sync-back and no outputs fetch"
         );
         let plain = RemoteCall {
+            commit_stage: false,
             interrupt: None,
             ..call(&log)
         };
@@ -9573,6 +9612,7 @@ mod tests {
     /// test raises: [`call`] raises its own.
     fn key_call<'a>(log: &'a Path, state: &'a StateRoot, interrupt: Option<Interrupt>) -> RemoteCall<'a> {
         RemoteCall {
+            commit_stage: false,
             cross_build: None,
             builder: &crate::test_support::HOST,
             key: "app-1a2b3c4d",
@@ -9649,6 +9689,7 @@ mod tests {
         let globs = ["**/bin/**".to_owned()];
         let warm_up = [vec!["./tool.exe".to_owned()]];
         let warm_call = RemoteCall {
+            commit_stage: false,
             outputs: &globs,
             outputs_withheld: true,
             bins_withheld: false,
@@ -9687,6 +9728,7 @@ mod tests {
         let log = unwritten_log();
         let warm_up = [vec!["./tool.exe".to_owned()]];
         let warm_call = RemoteCall {
+            commit_stage: false,
             warmth: Warmth::WarmUp {
                 commands: &warm_up,
                 hash: WARM_HASH,
@@ -9719,6 +9761,7 @@ mod tests {
         let warm_up = [vec!["./tool.exe".to_owned()]];
         // The call's interrupt is raised, so the connection's loss ends on it.
         let warm_call = RemoteCall {
+            commit_stage: false,
             warmth: Warmth::WarmUp {
                 commands: &warm_up,
                 hash: WARM_HASH,
@@ -10122,6 +10165,7 @@ mod tests {
         let log = unwritten_log();
         // No Ctrl+C: one by the end of the stop would end the run there, with no fallback.
         let call = RemoteCall {
+            commit_stage: false,
             interrupt: None,
             ..call(&log)
         };

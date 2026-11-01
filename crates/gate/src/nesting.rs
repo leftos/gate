@@ -1262,6 +1262,7 @@ mod tests {
             slot_held: marker.map(OsString::from),
             box_job: job.map(OsString::from),
             commit_slot: None,
+            stage_blocking: Vec::new(),
         }
     }
 

@@ -190,6 +190,10 @@ pub(crate) struct RunCall<'a> {
     /// Each sibling's name and its default branch name, for the siblings that have one (`SiblingBases`, sent only when
     /// one has); a warm-up never sends them.
     pub sibling_bases: &'a [(String, String)],
+    /// The PC's `HEAD` commit of a commit's pre-commit stage, which the box soft-resets its work folder to so the hooks
+    /// see what is staged (`CommitStage: true` and `Head`, sent only for a stage); `None` for every other run. A warm-up
+    /// never sends them.
+    pub commit_stage_head: Option<&'a str>,
 }
 
 /// The step an inputs call asks the box for: which files the work folder needs (`diff`), or installing them (`put`).
@@ -323,7 +327,8 @@ fn desktop_wait(usual_p90: Option<f64>) -> u64 {
 /// with `DesktopWait` ([`desktop_wait`], which the box caps at the run's `Timeout`) for a run that asks for the
 /// builder's desktop, with `DesktopSession: true` beside them for a session run, which takes no desktop lock (a box
 /// that does not know the key takes the lock), `CrossBuild` (`Rid` and `Words`) for a run with a cross build and output globs, and the
-/// repos' default branches as `Base` and `SiblingBases` when any has one.
+/// repos' default branches as `Base` and `SiblingBases` when any has one, and `CommitStage: true` with the PC's `Head`
+/// for a commit's pre-commit stage.
 pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
     let mut object = location.object();
     for (name, value) in [
@@ -366,6 +371,10 @@ pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
             .map(|(name, base)| (name.clone(), Value::String(base.clone())))
             .collect();
         object.insert("SiblingBases".to_owned(), Value::Object(bases));
+    }
+    if let Some(head) = run.commit_stage_head {
+        object.insert("CommitStage".to_owned(), json!(true));
+        object.insert("Head".to_owned(), json!(head));
     }
     insert_siblings_and_inputs(&mut object, run);
     word(&object)
@@ -658,6 +667,7 @@ mod tests {
             sibling_snapshots,
             base: None,
             sibling_bases: &[],
+            commit_stage_head: None,
             inputs_digest: None,
             lfs_digest: None,
             sent_digest: None,
@@ -778,6 +788,7 @@ mod tests {
         let run = RunCall {
             base: Some("main"),
             sibling_bases: &bases,
+            commit_stage_head: None,
             ..warm_run(&[], None)
         };
 
@@ -810,11 +821,35 @@ mod tests {
     }
 
     #[test]
+    fn a_commit_stage_run_word_sends_commit_stage_and_head() {
+        let head = "0123456789abcdef0123456789abcdef01234567";
+        let run = RunCall {
+            commit_stage_head: Some(head),
+            ..warm_run(&[], None)
+        };
+
+        let word = run_word(&location(), &run);
+
+        let sent = decoded(&word);
+        assert_eq!(sent["CommitStage"], json!(true));
+        assert_eq!(sent["Head"], json!(head));
+        let payload = on_the_box(&word);
+        assert_eq!(payload.commit_stage(), Ok(true), "the box reads CommitStage back");
+        assert_eq!(payload.commit_stage_head(), Ok(Some(head)), "and the Head it needs");
+        let plain = decoded(&run_call(&[]));
+        assert!(
+            plain.get("CommitStage").is_none() && plain.get("Head").is_none(),
+            "no stage, neither key: {plain}"
+        );
+    }
+
+    #[test]
     fn a_warm_call_sends_no_base() {
         let bases = [("lib".to_owned(), "trunk".to_owned())];
         let run = RunCall {
             base: Some("main"),
             sibling_bases: &bases,
+            commit_stage_head: None,
             ..warm_run(&[], None)
         };
         let commands = warm_commands();
@@ -885,6 +920,7 @@ mod tests {
             sibling_snapshots: &[],
             base: None,
             sibling_bases: &[],
+            commit_stage_head: None,
             inputs_digest: None,
             lfs_digest: None,
             sent_digest: None,
@@ -936,6 +972,7 @@ mod tests {
             sibling_snapshots: &[],
             base: None,
             sibling_bases: &[],
+            commit_stage_head: None,
             inputs_digest: Some("ab"),
             lfs_digest: None,
             sent_digest: None,
@@ -1012,6 +1049,7 @@ mod tests {
             sibling_snapshots: &[],
             base: None,
             sibling_bases: &[],
+            commit_stage_head: None,
             inputs_digest: None,
             lfs_digest: None,
             sent_digest: None,
@@ -1056,6 +1094,7 @@ mod tests {
             sibling_snapshots: &[],
             base: None,
             sibling_bases: &[],
+            commit_stage_head: None,
             inputs_digest: None,
             lfs_digest: None,
             sent_digest: None,
@@ -1106,6 +1145,7 @@ mod tests {
             sibling_snapshots: &[],
             base: None,
             sibling_bases: &[],
+            commit_stage_head: None,
             inputs_digest: None,
             lfs_digest: None,
             sent_digest: None,
@@ -1157,6 +1197,7 @@ mod tests {
             sibling_snapshots: &[],
             base: None,
             sibling_bases: &[],
+            commit_stage_head: None,
             inputs_digest: None,
             lfs_digest: None,
             sent_digest: None,
@@ -1212,6 +1253,7 @@ mod tests {
             sibling_snapshots: &[],
             base: None,
             sibling_bases: &[],
+            commit_stage_head: None,
             inputs_digest: None,
             lfs_digest: None,
             sent_digest: None,
@@ -1298,6 +1340,7 @@ mod tests {
             sibling_snapshots: &[],
             base: None,
             sibling_bases: &[],
+            commit_stage_head: None,
             inputs_digest: None,
             lfs_digest: None,
             sent_digest: None,
@@ -1368,6 +1411,7 @@ mod tests {
             sibling_snapshots,
             base: None,
             sibling_bases: &[],
+            commit_stage_head: None,
             inputs_digest,
             lfs_digest: None,
             sent_digest: None,
