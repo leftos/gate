@@ -13,8 +13,8 @@ use jiff::{SignedDuration, Timestamp};
 use proc_table::filetime_to_timestamp;
 use proc_table::win32::OwnedHandle;
 use windows_sys::Win32::Foundation::{
-    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, GetLastError, HANDLE,
-    INVALID_HANDLE_VALUE, SetLastError, WAIT_TIMEOUT,
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, GetLastError,
+    HANDLE, INVALID_HANDLE_VALUE, SetLastError, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED, PostQueuedCompletionStatus};
 use windows_sys::Win32::System::JobObjects::{
@@ -27,6 +27,7 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::SystemServices::{JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS, JOB_OBJECT_MSG_EXIT_PROCESS, JOB_OBJECT_MSG_NEW_PROCESS};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForMultipleObjects,
+    WaitForSingleObject,
 };
 
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
@@ -336,6 +337,26 @@ enum Settled {
     Running,
     Ended(Timestamp),
     /// The times could not be read, for this reason.
+    Unread(String),
+}
+
+/// What a member's process has come to, as its settle reads it: its times, and for one whose times carry no exit, its
+/// handle.
+#[derive(Debug, PartialEq, Eq)]
+enum Ending {
+    Running,
+    /// Its end, at its exit.
+    Ended(Timestamp),
+    /// Its end, at the moment it was read: its handle is signalled, though its times carry no exit, as a member that
+    /// never had a thread has none. The moment as the clock's `FILETIME` ticks, which its span keeps, and as a
+    /// timestamp.
+    Signalled {
+        /// The moment, in the `FILETIME` ticks a span counts.
+        ticks: u64,
+        /// The same moment as a timestamp.
+        at: Timestamp,
+    },
+    /// Its end could not be read, for this reason.
     Unread(String),
 }
 
@@ -949,7 +970,9 @@ impl Remembered {
 
     /// Settles each running member `chosen` picks, as [`Remembered::settle`] says. One that has ended has its last
     /// times and its exit code read through its handle before it closes, goes to the book with its name, and has its
-    /// [`JobEvent::Exited`] sent; one whose exit cannot be read is sent one that knows nothing of its end.
+    /// [`JobEvent::Exited`] sent; one whose exit cannot be read is sent one that knows nothing of its end. A member
+    /// whose times carry no exit settles as ended once its handle is signalled, at the moment it is read, with no exit
+    /// code of its own.
     fn settle_where(&mut self, chosen: impl Fn(&Member) -> bool) {
         let unread = &mut self.unread;
         let events = self.events.as_ref();
@@ -961,18 +984,12 @@ impl Remembered {
             let Until::Running(process) = &member.until else {
                 return true;
             };
-            // SAFETY: the handle has `PROCESS_QUERY_LIMITED_INFORMATION` access and stays open for the whole call.
-            match settled(unsafe { start_and_exit_of(process.raw()) }) {
-                Settled::Running => true,
-                Settled::Ended(exit) => {
-                    // An exited process's times are final: read once more, they are its last.
-                    traces.ended(member.key(), span_of(process).ok());
-                    let code = exit_code(process);
-                    tell(events, exited(member, code, exit));
-                    member.until = Until::Ended(exit);
-                    true
-                }
-                Settled::Unread(why) => {
+            let (exit, code, by_handle) = match ending(process) {
+                Ending::Running => return true,
+                Ending::Ended(exit) => (exit, exit_code(process), None),
+                // A member that never had a thread has no exit code of its own: what it reads is `STILL_ACTIVE`.
+                Ending::Signalled { ticks, at } => (at, None, Some(ticks)),
+                Ending::Unread(why) => {
                     tell(
                         events,
                         JobEvent::Exited {
@@ -984,21 +1001,38 @@ impl Remembered {
                     );
                     traces.forget(member.key());
                     unread.add(format!("the exit of member {} could not be read: {why}", member.pid));
-                    false
+                    return false;
                 }
+            };
+            // An exited process's times are final: read once more, they are its last, and one whose times carry no
+            // exit ends at the moment its signalled handle was read.
+            let mut span = span_of(process).ok();
+            if let (Some(span), Some(ticks)) = (&mut span, by_handle) {
+                span.exited = Some(ticks);
             }
+            traces.ended(member.key(), span);
+            tell(events, exited(member, code, exit));
+            member.until = Until::Ended(exit);
+            true
         });
     }
 
-    /// A handle to wait on for each running member, opened by its pid with `SYNCHRONIZE` access, which the member's
-    /// own query handle lacks: the member's handle, held under this lock, keeps its pid from any other process, so the
-    /// pid opens the member. A member whose pid cannot be opened so is not waited on.
+    /// A handle to wait on for each running member: a copy of the member's own handle, with the `SYNCHRONIZE` access the
+    /// wait asks for, which a handle opened with query access alone refuses. A member whose own handle carries no
+    /// `SYNCHRONIZE` is opened by its pid instead, which the member's open handle keeps its own. A member neither gives
+    /// a handle for is not waited on.
     fn waitable(&self) -> Vec<OwnedHandle> {
         self.members
             .iter()
-            .filter(|member| matches!(member.until, Until::Running(_)))
-            // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
-            .filter_map(|member| unsafe { own_handle(OpenProcess(PROCESS_SYNCHRONIZE, 0, member.pid)) }.ok())
+            .filter_map(|member| {
+                let Until::Running(process) = &member.until else {
+                    return None;
+                };
+                copy_of(process, PROCESS_SYNCHRONIZE, 0)
+                    // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
+                    .or_else(|_| unsafe { own_handle(OpenProcess(PROCESS_SYNCHRONIZE, 0, member.pid)) })
+                    .ok()
+            })
             .collect()
     }
 
@@ -1295,6 +1329,45 @@ fn kept<H>(opened: io::Result<Option<H>>, holds: impl FnOnce(&H) -> io::Result<b
     }
 }
 
+/// What the member behind `process`, open with query and synchronize access, has come to: its times as [`settled`]
+/// reads them, and for one whose times carry no exit, its handle.
+fn ending(process: &OwnedHandle) -> Ending {
+    // SAFETY: the handle has `PROCESS_QUERY_LIMITED_INFORMATION` access and stays open for the whole call.
+    match settled(unsafe { start_and_exit_of(process.raw()) }) {
+        Settled::Running => signalled(process),
+        Settled::Ended(exit) => Ending::Ended(exit),
+        Settled::Unread(why) => Ending::Unread(why),
+    }
+}
+
+/// What the handle of a member whose times carry no exit says: one that is signalled has ended, its times read once
+/// more for the exit an ordinary process writes as it ends; one that is not still runs, and so does one whose wait
+/// fails, as a handle opened with query access alone fails it (`PROCESS_SYNCHRONIZE` missing).
+fn signalled(process: &OwnedHandle) -> Ending {
+    // SAFETY: the handle stays open for the whole call, with the `PROCESS_SYNCHRONIZE` access the wait asks for unless
+    // it was opened without it.
+    if unsafe { WaitForSingleObject(process.raw(), 0) } != WAIT_OBJECT_0 {
+        return Ending::Running;
+    }
+    // SAFETY: the handle has `PROCESS_QUERY_LIMITED_INFORMATION` access and stays open for the whole call.
+    match settled(unsafe { start_and_exit_of(process.raw()) }) {
+        // A process that ended between the two reads has written its exit time: it settles as any member does.
+        Settled::Ended(exit) => Ending::Ended(exit),
+        // A member that never had a thread never carries an exit: it ends at the moment its handle was read.
+        Settled::Running | Settled::Unread(_) => ended_now(),
+    }
+}
+
+/// The end of a member whose times carry no exit, at the moment it is read: the clock's `FILETIME` ticks, which its
+/// span keeps, and the same moment as a timestamp.
+fn ended_now() -> Ending {
+    let ticks = file_time_now();
+    match timestamp_of(ticks) {
+        Some(at) => Ending::Signalled { ticks, at },
+        None => Ending::Unread("the system time is outside the range a timestamp holds".to_owned()),
+    }
+}
+
 /// What a process's `times`, its start and its exit as FILETIME ticks, say of its end.
 fn settled(times: io::Result<(u64, u64)>) -> Settled {
     match times {
@@ -1319,15 +1392,29 @@ fn trouble(stopped: Option<&str>, finished: bool, unread: &Unread) -> Option<Str
 }
 
 /// The process `pid`, running or exited while its process object lives, opened with `PROCESS_QUERY_LIMITED_INFORMATION`
-/// access; `None` when no process has that pid.
+/// and `PROCESS_SYNCHRONIZE` access, so that its end can be waited for, else with query access alone when the system
+/// refuses the wait's access; `None` when no process has that pid.
 fn open_any(pid: u32) -> io::Result<Option<OwnedHandle>> {
+    opened(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE)
+}
+
+/// The process `pid`, opened with `access`, else with `PROCESS_QUERY_LIMITED_INFORMATION` alone when `access` asks for
+/// more and the system refuses it, as a process whose descriptor allows reading but not waiting does; `None` when no
+/// process has that pid.
+fn opened(pid: u32, access: u32) -> io::Result<Option<OwnedHandle>> {
     // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
-    match unsafe { own_handle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)) } {
+    match unsafe { own_handle(OpenProcess(access, 0, pid)) } {
         Ok(process) => Ok(Some(process)),
+        Err(error) if access != PROCESS_QUERY_LIMITED_INFORMATION && is_denied(&error) => opened(pid, PROCESS_QUERY_LIMITED_INFORMATION),
         // `OpenProcess` reports a pid no process has as `ERROR_INVALID_PARAMETER`.
         Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER.cast_signed()) => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// Whether `error` is the system's refusal of an access the caller asked for (`ERROR_ACCESS_DENIED`).
+fn is_denied(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(ERROR_ACCESS_DENIED.cast_signed())
 }
 
 /// Now, as the process table gives start times.
@@ -1343,10 +1430,17 @@ fn duplicate(handle: &OwnedHandle) -> io::Result<OwnedHandle> {
     copy_of(handle, 0, DUPLICATE_SAME_ACCESS)
 }
 
-/// A copy of the process handle `process`, with `PROCESS_QUERY_LIMITED_INFORMATION` access alone, that this process
-/// alone owns.
+/// A copy of the process handle `process`, with `PROCESS_QUERY_LIMITED_INFORMATION` and `PROCESS_SYNCHRONIZE` access
+/// alone, that this process alone owns: a member's kept handle, which can be waited on for its end as well as read. A
+/// handle whose own access refuses the wait is copied with query access alone, as [`open_any`] opens it.
 fn duplicate_query(process: &OwnedHandle) -> io::Result<OwnedHandle> {
-    copy_of(process, PROCESS_QUERY_LIMITED_INFORMATION, 0)
+    copy_of(process, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, 0).or_else(|error| {
+        if is_denied(&error) {
+            copy_of(process, PROCESS_QUERY_LIMITED_INFORMATION, 0)
+        } else {
+            Err(error)
+        }
+    })
 }
 
 /// A copy of `handle` with the `access` and the `options` `DuplicateHandle` takes, that this process alone owns.

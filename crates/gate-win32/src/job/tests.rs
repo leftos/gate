@@ -3,15 +3,22 @@ use std::sync::{Arc, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, INVALID_HANDLE_VALUE};
+use proc_table::win32::OwnedHandle;
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+use windows_sys::Win32::System::Diagnostics::ProcessSnapshotting::{
+    HPSS, PSS_CAPTURE_VA_CLONE, PSS_QUERY_VA_CLONE_INFORMATION, PSS_VA_CLONE_INFORMATION, PssCaptureSnapshot, PssFreeSnapshot, PssQuerySnapshot,
+};
 use windows_sys::Win32::System::IO::{CreateIoCompletionPort, PostQueuedCompletionStatus};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetProcessId, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+};
 
 use super::{
     DRAIN_WAIT_MS, Departure, ERROR_MORE_DATA, FINISH_KEY, Hold, JOBOBJECT_BASIC_PROCESS_ID_LIST, Job, JobEvent, Joined, Member, Message, Missed,
-    Opened, Remembered, Settled, Unread, Until, assign_to, drain_loop, duplicate, holds, image_name, kept, listed_ids, member, open_any,
-    remembered_as, settled, start_of_process, take_message, trouble,
+    Opened, Remembered, Settled, Unread, Until, assign_to, copy_of, drain_loop, duplicate, duplicate_query, holds, image_name, kept, listed_ids,
+    member, open_any, remembered_as, settled, start_of_process, take_message, trouble,
 };
-use crate::{EnvironmentBlock, Launch, LaunchOutput, Running, Suspended, own_handle, start_and_exit_of, system_directory, timestamp_of};
+use crate::{EnvironmentBlock, Launch, LaunchOutput, Running, Suspended, own_handle, start_and_exit_of, system_directory, timestamp_of, wait_millis};
 
 /// The longest a test waits for its member to end, for the job to remember it, or for the job's drop.
 const HANG_GUARD: Duration = Duration::from_secs(600);
@@ -61,6 +68,49 @@ fn suspended(command: &str) -> Suspended {
 /// cmd running `command`, started in `job`.
 fn started(job: &Job, command: &str) -> Running {
     suspended(command).assign_and_resume(job).expect("the member is assigned and resumed")
+}
+
+/// A snapshot of a process, captured in this one, freed when it drops: freeing it ends the clone and closes the handle
+/// it gave that clone, so a failed assertion still leaves neither behind.
+struct Snapshot(HPSS);
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        // SAFETY: the snapshot was captured in this process, which is the handle the free asks for, and nothing else
+        // frees it.
+        let _ = unsafe { PssFreeSnapshot(GetCurrentProcess(), self.0) };
+    }
+}
+
+/// A VA clone of the process behind `process`, with the snapshot that owns it: the clone has no thread, so its times
+/// carry no exit however it ends. The clone's handle belongs to the snapshot, which closes it, so it is never closed
+/// here.
+fn clone_of(process: &OwnedHandle) -> (Snapshot, std::mem::ManuallyDrop<OwnedHandle>) {
+    let mut snapshot = std::ptr::null_mut();
+    // SAFETY: `process` stays open with the query and duplicate access the snapshot asks for, and `snapshot` is
+    // writable.
+    let captured = unsafe { PssCaptureSnapshot(process.raw(), PSS_CAPTURE_VA_CLONE, 0, &raw mut snapshot) };
+    assert_eq!(
+        captured,
+        0,
+        "the snapshot is captured: {}",
+        io::Error::from_raw_os_error(captured.cast_signed())
+    );
+    let snapshot = Snapshot(snapshot);
+    let mut information = PSS_VA_CLONE_INFORMATION::default();
+    // SAFETY: the snapshot is open for the whole call, and `information` is writable for its size.
+    let queried = unsafe {
+        PssQuerySnapshot(
+            snapshot.0,
+            PSS_QUERY_VA_CLONE_INFORMATION,
+            (&raw mut information).cast(),
+            u32::try_from(size_of::<PSS_VA_CLONE_INFORMATION>()).expect("a small structure"),
+        )
+    };
+    assert_eq!(queried, 0, "the clone is read: {}", io::Error::from_raw_os_error(queried.cast_signed()));
+    // SAFETY: the clone's handle is open until the snapshot is freed, and no other wrapper owns it.
+    let clone = std::mem::ManuallyDrop::new(unsafe { own_handle(information.VaCloneHandle) }.expect("the clone's handle is valid"));
+    (snapshot, clone)
 }
 
 /// Waits until `done` says so, failing at the hang guard.
@@ -453,6 +503,76 @@ fn an_exit_that_cannot_be_read_is_reported_not_waited_for() {
     );
     assert_eq!(settled(Ok((1, 0))), Settled::Running);
     assert_eq!(settled(Ok((1, epoch))), Settled::Ended(Timestamp::UNIX_EPOCH));
+}
+
+#[test]
+fn a_member_that_never_had_a_thread_is_settled_once_its_handle_is_signalled() {
+    // A VA clone has no thread: once it ends, its handle is signalled, but its times never carry an exit. Its source is
+    // never resumed, and ends with the `Suspended` the test drops.
+    let child = suspended("ping -n 30 127.0.0.1 >nul");
+    let process = child.process.as_ref().expect("the child's process is open");
+    let (snapshot, clone) = clone_of(process);
+    // SAFETY: the clone's handle is open with query access and stays open for the whole call.
+    let pid = unsafe { GetProcessId(clone.raw()) };
+    assert_ne!(pid, 0, "the clone has a pid");
+    let start = start_of_process(&clone).expect("the clone's start is read");
+
+    let (sent, events) = mpsc::channel();
+    let mut remembered = Remembered {
+        events: Some(sent),
+        ..Remembered::default()
+    };
+    let handle = duplicate_query(&clone).expect("the clone's handle is copied with query and synchronize access");
+    remembered.add(
+        Member {
+            pid,
+            start,
+            from: start,
+            until: Until::Running(handle),
+        },
+        Joined::default(),
+    );
+
+    remembered.settle();
+    assert!(
+        matches!(
+            remembered.members.as_slice(),
+            [Member {
+                until: Until::Running(_),
+                ..
+            }]
+        ),
+        "a clone whose handle is not signalled still runs"
+    );
+
+    let killing = copy_of(&clone, PROCESS_TERMINATE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0)
+        .expect("the clone's handle is copied with terminate access");
+    // SAFETY: the handle is open with the terminate access the call asks for, and stays open for the whole call.
+    assert_ne!(
+        unsafe { TerminateProcess(killing.raw(), 1) },
+        0,
+        "the clone is ended: {}",
+        io::Error::last_os_error()
+    );
+    // SAFETY: the handle is open with the synchronize access the wait asks for, and stays open for the whole call.
+    let waited = unsafe { WaitForSingleObject(killing.raw(), wait_millis(HANG_GUARD)) };
+    assert_eq!(waited, WAIT_OBJECT_0, "the clone ends");
+
+    remembered.settle();
+    drop(snapshot);
+
+    assert!(
+        matches!(remembered.members.as_slice(), [Member { until: Until::Ended(_), .. }]),
+        "the signalled clone settles as ended, its handle closed"
+    );
+    let mine: Vec<JobEvent> = events.try_iter().collect();
+    assert!(
+        matches!(
+            mine.as_slice(),
+            [JobEvent::Spawned { pid: spawned, .. }, JobEvent::Exited { code: None, at: Some(_), ran: Some(_), .. }] if *spawned == pid
+        ),
+        "the clone spawned and ended, with an exit time and no exit code of its own: {mine:?}"
+    );
 }
 
 #[test]
