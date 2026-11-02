@@ -568,6 +568,13 @@ mod tests {
 
     const LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
 
+    /// The first port a low block can start at: below the dynamic port range's 49152, so no ephemeral allocation
+    /// lands on a port a case releases there.
+    const LOW_BLOCK_FLOOR: u16 = 20000;
+
+    /// The port the search for a low block ends at, exclusive.
+    const LOW_BLOCK_CEILING: u16 = 40000;
+
     /// A loopback port free a moment ago: the system's pick for a listener closed at once.
     fn free_port() -> u16 {
         let listener = TcpListener::bind((LOOPBACK, 0)).expect("a loopback listener binds");
@@ -579,6 +586,27 @@ mod tests {
         Listener::bind_in_range(LOOPBACK, port, port, port)
             .expect("the bind does not fail")
             .expect("the free port is bound")
+    }
+
+    /// The first block of `len` loopback ports from `LOW_BLOCK_FLOOR` upward that all bind, held, and the block's
+    /// first port.
+    ///
+    /// A block the system refuses a port of is released and skipped. Every port lies below the dynamic port range, so
+    /// an ephemeral allocation of another case never lands on one a case releases here.
+    ///
+    /// # Panics
+    ///
+    /// When no block of loopback ports in `LOW_BLOCK_FLOOR..LOW_BLOCK_CEILING` binds whole.
+    fn held_low_block(len: u16) -> (Vec<Listener>, u16) {
+        (LOW_BLOCK_FLOOR..=LOW_BLOCK_CEILING - len)
+            .step_by(usize::from(len))
+            .find_map(|first| {
+                let held = (first..first + len)
+                    .map(|port| Listener::bind_in_range(LOOPBACK, port, port, port).expect("the bind does not fail"))
+                    .collect::<Option<Vec<Listener>>>()?;
+                Some((held, first))
+            })
+            .expect("no block of loopback ports in 20000..40000 binds whole")
     }
 
     #[test]
@@ -594,9 +622,10 @@ mod tests {
 
     #[test]
     fn socket_bind_in_range_passes_a_held_port_wrapping_to_the_start_of_the_range() {
-        let held = TcpListener::bind((LOOPBACK, 0)).expect("a loopback listener binds");
-        let port = held.local_addr().expect("the listener's address is read").port();
-        let first = port - 8;
+        let (mut block, first) = held_low_block(8);
+        let held = block.pop().expect("a block has a last port");
+        let port = held.port();
+        drop(block);
 
         let listener = Listener::bind_in_range(LOOPBACK, first, port, port)
             .expect("the bind does not fail")
