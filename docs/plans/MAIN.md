@@ -23,26 +23,24 @@
 ## Local gate
 
 - [ ] GATE-652 Refuse a gate.exe built with its test seams at install
-- [ ] GATE-960 Take Ctrl+C when the gate's starter turned it off
-- [ ] GATE-678 Make pause suite cases fail at once when the gate they wait on exits
-- [ ] GATE-805 Smoke-test a gate install from Git Bash and pwsh, rolling back on failure
 - [ ] GATE-756 Make a light run's load adjustment see contention below saturation
 - [ ] GATE-794 Count a process already ending as ended at the other refused-terminate sites
 - [ ] GATE-817 Give the job's drain thread a turn when a member outlives the command
-- [ ] GATE-819 Reorder the other stall-window suite cases that need a step inside the window
 - [ ] GATE-860 Keep the stall watchdog from killing a job starved by a busy machine
 - [ ] GATE-941 Read process CPU from one system list per sample in the watch and the load report
-- [ ] GATE-972 Settle a thread-less job member once its handle is signalled
 - [ ] GATE-998 Journal the process chain an orphan refusal walked
 - [ ] GATE-1037 List a stalled run's open handles in its stall capture
 - [ ] GATE-1040 Stall capture edges: prek's PREK_HOME log, and module reads with no mid-call bound
 - [ ] GATE-1041 gate remote edges: whole-list soft-problem guard, Unicode repo folding, flush before replace
-- [ ] GATE-1042 End what the orphan refusal suite case leaves running (nextest LEAK)
+- [ ] GATE-1051 Say a Ctrl+C the command died of as an interrupted run
 
 ## Remote
 
-- [ ] GATE-1045 Desktop run edges: slots held through the desktop wait, and a pinned run's lost-mid-run warning
-- [ ] GATE-1043 Say when a nested gate runs a desktop command on this PC because its parent runs here
+- [ ] GATE-1050 Covered-gate log notes and the desktop helper's dropped setup errors
+- [ ] GATE-1049 Refuse a hidden desktop name another process created first
+- [ ] GATE-1048 Covered and held-back desktop edges from GATE-1043's review
+- [ ] GATE-1047 Keep a hidden desktop alive when the command root exits before its GUI child connects
+- [ ] GATE-1046 Learn a busy builder desktop before taking the builder slot
 - [ ] GATE-942 Fold the one-pool remote wait into the several-pool wait's path
 - [ ] GATE-888 Let a channel pull's ack wait outlast the box's 16 MiB send buffer on a slow path
 - [ ] GATE-887 Close GATE-861's remaining built-here gaps: a listed repo's nothing-back built list, add-only waits, client clear lines
@@ -76,7 +74,7 @@
 - [ ] GATE-429 Measure which Task Scheduler call frees its string argument, and quote the desktop task's command
 - [ ] GATE-618 Turn off auto gc in the box's shared bare repositories
 - [ ] GATE-428 Report a desktop task whose instance already ended as started with no process, not unknown
-- [ ] GATE-623 Decide how a routed Unreal package in Test runs once race-anywhere has a source-built 5.8
+- [!] GATE-623 Decide how a routed Unreal package in Test runs once race-anywhere has a source-built 5.8
 - [ ] GATE-332 Send each repo's inputs in a routed sibling pair
 - [ ] GATE-273 Read a dotnet tools manifest at the repo root as a toolchain pin
 - [ ] GATE-109 Remote: carry every verb of a routed run over one ssh connection (gate box serve)
@@ -357,7 +355,6 @@
   - [ ] GATE-1030 Do not repeat a commit stage's lines in the run's closing tail
   - [ ] GATE-1031 Say the global.json sdk-pin note once per run
 - [ ] GATE-1035 Decide LFS on the Unix box: carry LFS objects, or refuse a payload that names them
-- [ ] GATE-1039 Run desktop routes on a hidden desktop by default, with an easy proof run
 
 ## Cutover sweep
 
@@ -499,7 +496,6 @@
 - [ ] GATE-1025 Carry what the box said of its back commits as one value
 - [ ] GATE-1027 Create docs/agents/orchestrator.md and move the profile's orchestration rules into it
 - [ ] GATE-1033 Read remote.json once per gate check
-- [ ] GATE-1036 Repoint issue and project links to plan files that are gone
 - [ ] GATE-1044 Remove counts and path:line references from the durable docs
 
 ## Design files
