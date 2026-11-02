@@ -7,6 +7,8 @@ description: Use when reviewing which gate runs on this PC over a window (the la
 
 Every heavy command family in the gate journal ends in one of three states ([routing-a-repo.md](../../../docs/routing-a-repo.md#which-repos-and-which-commands)): it routes, it is booked with what blocks it, or it stays local for a reason named beside it. The census reads the journal for a window, puts every heavy family with local runs into one of those states with its evidence, and books each finding.
 
+The `route-local-runs` skill decides single commands as they appear; the census is its weekly look at whole families.
+
 A `git commit` is one of those families only when no gate is nested in it: a commit run is split, the gates nested in its hooks counting as families of their own and its uncovered share as a row of its own, blocked on work (see **A commit's nested gates**).
 
 ## Run the query

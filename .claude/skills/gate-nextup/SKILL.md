@@ -53,6 +53,7 @@ Merging is the agents' call too. Once every item under a feature marker has land
 
 ## Pre-loop hooks
 
+- **Local-run watch.** Arm it as the `route-local-runs` skill says, and handle each report it gives during the run ahead of the queue.
 - **Weekly local-run census.** On a full start, when the newest `docs/research/*-local-run-census.md` is 7 or more days old, run the `local-run-census` skill (`.claude/skills/local-run-census/SKILL.md`) over the days since that note, and book its findings as the skill says, before the slice is cut. Its bookings join the queue like any **add**.
 
 ## Gates
