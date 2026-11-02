@@ -19,7 +19,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use gate_args::{DEFAULT_STALL_SECONDS, Spelling, TestSeams, WarmRequest};
-use gate_router::warm::{FailureClass, FileRead, Record, RecordRead, RecordState, WarmupFile, read_warmup, warmup_hash};
+use gate_router::warm::{
+    DEFAULT_TIMEOUT_SECONDS, FailureClass, FileRead, Record, RecordRead, RecordState, WarmupFile, never_sent_problem, read_warmup, warmup_hash,
+};
 use gate_router::{Config, Facts, Place, Target, builder_words, escaped, repo_name, stays_local, target};
 use gate_state::FallbackReason;
 use gate_state::v1::{self, WarmFailure, WarmRecord, WarmState};
@@ -417,13 +419,12 @@ fn worded(target: &Target, file: &WarmupFile, machine: &Machine<'_>, said: &str)
         .iter()
         .enumerate()
         .map(|(at, command)| {
-            let first = command.iter().find(|word| !word.is_empty()).map_or("", String::as_str);
             if stays_local(command) {
-                return Err(never_sent(said, at, first));
+                return Err(never_sent(said, at, command));
             }
             let sent = builder_words(target, command, machine);
             if sent.program_named && stays_local(&sent.words) {
-                return Err(never_sent(said, at, first));
+                return Err(never_sent(said, at, command));
             }
             match sent.outside {
                 Some(word) => Err(End::Usage(format!(
@@ -440,13 +441,13 @@ fn worded(target: &Target, file: &WarmupFile, machine: &Machine<'_>, said: &str)
 
 /// The end of a command of the warm-up file a routed run never sends: a command this PC keeps ([`stays_local`]), by its
 /// first word as given or by the program's name the rewrite sends for it; the file named as `said`.
-fn never_sent(said: &str, at: usize, first: &str) -> End {
-    End::Usage(format!(
-        "gate: warm: {} command {} starts with {}, which a routed run never sends",
-        escaped(said),
-        at + 1,
-        escaped(first)
-    ))
+fn never_sent(said: &str, at: usize, command: &[String]) -> End {
+    End::Usage(format!("gate: warm: {} {}", escaped(said), never_sent_problem(at, command)))
+}
+
+/// The ceiling of a warm-up of `file`, in seconds.
+fn ceiling_of(file: &WarmupFile) -> u64 {
+    file.timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECONDS)
 }
 
 /// How a started warm-up ends.
@@ -547,13 +548,13 @@ fn attempt(prepared: &Prepared<'_>, seams: &TestSeams, interrupt: Option<Interru
     }
     let wait = seams
         .warm_wait_ms
-        .map_or_else(|| Duration::from_secs(prepared.first.file.timeout_seconds), Duration::from_millis);
+        .map_or_else(|| Duration::from_secs(ceiling_of(&prepared.first.file)), Duration::from_millis);
     let log = v1::warm_log_path(&prepared.root.path, &prepared.target.key);
     let early = Warmth::WarmUp {
         commands: &first.commands,
         hash: &first.hash,
     };
-    let key = call_of(prepared, &log, interrupt, first.file.timeout_seconds, early)
+    let key = call_of(prepared, &log, interrupt, ceiling_of(&first.file), early)
         .map_err(|why| refused(&first.hash, why))
         .and_then(|call| held_key(client.as_ref(), &call, wait, &first.hash));
     match key {
@@ -572,7 +573,7 @@ fn attempt(prepared: &Prepared<'_>, seams: &TestSeams, interrupt: Option<Interru
         commands: &late.commands,
         hash: &late.hash,
     };
-    match call_of(prepared, &log, interrupt, late.file.timeout_seconds, warmth) {
+    match call_of(prepared, &log, interrupt, ceiling_of(&late.file), warmth) {
         Ok(call) => {
             let outcome = client.run(&call);
             list_builder(prepared, &outcome, console);

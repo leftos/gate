@@ -1512,7 +1512,7 @@ Fields beyond J1's:
 
   They let the archive, which keeps only `release` lines, keep what the local-run census needs of a run once its `queue`, `fallback` and `take` lines roll away.
 
-  `stage` is `{"host", "key", "status", "outcome", "seconds"}`: the builder's alias, the work-folder key, prek's status (an integer, `null` when its result never came back), `outcome` (`applied`, `clean`, `refused`, `hooksFailed` or `fellBack`) and the stage's seconds to three decimals. A refused or apply-failed stage journals status 0, since the hooks passed.
+  `stage` is `{"host", "key", "status", "outcome", "seconds"}`: the builder's alias, the work-folder key, prek's status (an integer, `null` when its result never came back), `outcome` (`applied`, `clean`, `refused`, `hooksFailed` or `fellBack`) and the stage's seconds to three decimals. A refused stage journals status 0, since the hooks passed, and an apply-failed one the apply's own status.
 
   The field is absent on every other run, on a commit that is no stage, and when a Ctrl+C ended the stage before any outcome. A stage writes no `take` or `release` line for its remote slot.
 
@@ -1761,6 +1761,10 @@ A leading byte order mark is skipped, any other key is a problem, and any proble
 
 A warm-up command is worded for the builder as a routed run's words are. A command whose first word is `git` or `prek`, named by any path or sent as that program's name (`C:\x\git.exe.exe status`), is a file problem, `gate: warm: .gate/warmup.toml command <n> starts with <word>, which a routed run never sends`; a first word naming another program by a path outside the worktree is sent as the program's name ([Routing](#routing), the in-worktree path rewrite), not a file problem.
 
+A repo's tracked `.gate/stage.toml` declares a commit stage's preparation, read on the builder from the stage's checkout ([The box side](#the-box-side), stage preparation): the schema of `.gate/warmup.toml`, read by `read_warmup` with its limits, except that a missing `timeout` is 600 seconds, not 1800.
+
+The file is read on commit stages only, never from the declarations folder or on the PC, and a problem of the file refuses the stage's run. A command whose first word is `git` or `prek` is a problem here as in a warm-up.
+
 The judge, `gate_router::warm::judge`, says where a work folder's warm-up stands, given the repo's consent, the file, the work folder's record and whether its warm-up lock is held; `gate check`'s warm-up item reads it, and a routed run does not.
 
 In order: no consent or no file is no warm-up; a file problem is a problem; a held lock means a warm-up is running, whatever the record says; an unreadable record is a problem; no record, a `warming` record with a free lock, or a `warm` record of another host or file is due a warm-up; a `warm` record of this host and the file's hash is ready.
@@ -1897,6 +1901,8 @@ What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K
     It saves no `refs/gate-remote/<key>` snapshot ref, so no later run's bridge builds on it. A sibling sends its worktree with a bridge, as any run's. The payload carries `CommitStage: true` and `Head`, the PC's `HEAD` commit; a snapshot with no `HEAD` fails the stage before the run call with `a commit stage needs the commit of the PC's HEAD`.
   - The stage's wait and run count against the commit's one `--timeout`: the child commit gets the ceiling less the stage's whole seconds, at least 1 s.
   - `GATE_COMMIT_SLOT` goes to the child commit only, never to the stage's command, as do `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0`, `GIT_CONFIG_VALUE_0`, `GATE_STAGE_HEAD` and `GATE_STAGE_TREE` (below). Every run's plan strips an inherited `GATE_STAGE_HEAD` and `GATE_STAGE_TREE`.
+
+  - The builder runs the repo's stage preparation, if it declares one, after the checkout and the restores and before the hooks ([The box side](#the-box-side), stage preparation). A preparation that fails refuses the run `tools`, so the stage moves to the next builder or falls back like any refused stage.
 
   The stage ends in one of these ways:
   - It fell back before its command started (any fallback reason; the usual fallback line is said and the other Windows candidates are tried first): the commit runs as it would without a stage, its hooks here. The release's `stage.outcome` is `fellBack`.
@@ -3009,7 +3015,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     **Toolchain manifest** (GATE-206, GATE-209): a repo's `.gate/toolchain.toml` declares what a routed run's builder must have beyond the .NET SDK, and `remote/toolchain.rs` reads it as data from text the caller hands over.
 
-    [`gate check`](#gate-check) reads it from the worktree on disk and says what this PC lacks; a routed run with parity reads it from the snapshot's git tree (the only one of the repo's seven `.gate` files read there; `siblings.toml`, `desktop.toml`, `local.toml`, `env.toml`, `warmup.toml` and `windows.toml` are read from the worktree on disk) and refuses the route when the builder lacks a tool it declares (below).
+    [`gate check`](#gate-check) reads it from the worktree on disk and says what this PC lacks; a routed run with parity reads it from the snapshot's git tree (the only one of the repo's `.gate` files read there; `stage.toml` is read on the builder, from the stage's checkout, and `siblings.toml`, `desktop.toml`, `local.toml`, `env.toml`, `warmup.toml` and `windows.toml` are read from the worktree on disk) and refuses the route when the builder lacks a tool it declares (below).
 
     `toolchain::meets` compares a found version with a minimum. A repo's sibling worktrees are not declared here but in `.gate/siblings.toml` ([Sibling worktrees](#routing)), whose problems keep a run local.
 
@@ -3942,7 +3948,7 @@ A warm-up payload with `Desktop` true is refused with `gate: box payload asks a 
 
 A `run` payload may also hold `CommitStage` (true or false, false when absent or null, else `gate: box payload CommitStage is not true or false` and exit 2), which asks for a commit stage: a gated commit's pre-commit hooks run as one routed run (GATE-634).
 
-With it true the payload needs `Head`, the PC's `HEAD` commit, 40 lowercase hex characters, which the box reads only then: a `Head` missing or null is refused with `gate: box payload CommitStage needs Head` and exit 2, and one that is not a commit sha with `gate: remote run payload's Head '<value>' is not a 40-hex commit sha` and exit 2. The PC does not send these keys yet. What the box does for a commit stage is in the run's checkout and back commit, below.
+With it true the payload needs `Head`, the PC's `HEAD` commit, 40 lowercase hex characters, which the box reads only then: a `Head` missing or null is refused with `gate: box payload CommitStage needs Head` and exit 2, and one that is not a commit sha with `gate: remote run payload's Head '<value>' is not a 40-hex commit sha` and exit 2. The PC sends both on a commit stage. What the box does for a commit stage is in the run's checkout and back commit, below.
 
 For `run` the payload also needs a `Snapshot` key: exactly 40 lowercase hex characters, the commit the run checks out. Anything else is refused before the lock and the checkout with `gate: remote run payload's Snapshot '<value>' is not a 40-hex commit sha` and exit 2.
 
@@ -4177,7 +4183,7 @@ Built verbs:
 
   The checkout lines: just before the checkout, once a pair run's LFS refusal is past, the box says `gate-remote-checkout: <nonce> start` on stderr with the payload's `Nonce`, and just after the checkout succeeds `gate-remote-checkout: <nonce> done <s.sss>`, the seconds it took to three decimals. The span is the whole checkout: the fetch, the LFS scratch folder, the checkout and the clean. A checkout that fails says no done line. They are protocol lines, said without a stamp.
 
-  The start marker: just before it launches the command, before the donor console and the launch, the box says `gate-remote-started: <nonce>` on stderr once, with the payload's `Nonce`; a launch then refused or stopped has said it too. A warm-up says it once, after every tool and package restore and before its first command, and not again before the later ones.
+  The start marker: just before it launches the command, before the donor console and the launch, the box says `gate-remote-started: <nonce>` on stderr once, with the payload's `Nonce`; a launch then refused or stopped has said it too. A warm-up says it once, after every tool and package restore and before its first command, and not again before the later ones. A commit stage's preparation says none, so a refusal after it still falls back.
 
   Warm-up: a `run` with `WarmCommands` lays out and readies the work folder, restores the tools and the pnpm, bun and npm packages of every command, as a run does, then removes `{Work}.warm`, says the start marker and runs each command in order as a run's command is run (the stop signal looked at before each, and a client gone found by the heartbeat ending it with 255 and no line of its own).
 
@@ -4341,7 +4347,7 @@ Built verbs:
 
   Otherwise the line is git's own `gate: remote checkout failed (status <n>)`.
 
-  The steps are the layout, fetch, the commit probe, checkout, clean and the back ref reset (each of the three git steps once per repo on a pair run, the main repo first), the dotnet tool restore, the package restore (pnpm, bun or npm), then the command, then the sync-back. A failing step prints `gate: remote <fetch|checkout|clean|back ref reset|reset|head ref delete> failed (status <n>)` and exits `n`.
+  The steps are the layout, fetch, the commit probe, checkout, clean and the back ref reset (each of the three git steps once per repo on a pair run, the main repo first), the dotnet tool restore, the package restore (pnpm, bun or npm), a commit stage's preparation (below), then the command, then the sync-back. A failing step prints `gate: remote <fetch|checkout|clean|back ref reset|reset|head ref delete> failed (status <n>)` and exits `n`.
 
   The clean is `git clean -fdq`, with no `-x`, so a work folder keeps its ignored files between runs; a Godot project's `.godot` folder is one, so it persists from one routed run to the next.
 
@@ -4430,6 +4436,24 @@ Built verbs:
   Git that cannot say prints `gate: remote could not ask git whether node_modules is ignored in <folder>: <error | status n>`.
 
   A lockfile or package file that cannot be read prints `gate: remote could not read the lockfile <path>: <error>` or `gate: remote could not read the package file <path>: <error>`, and a record that cannot be written prints `gate: remote could not write <Work>.packages: <error>`; these exit 1. A record that cannot be read prints `gate: remote could not read <Work>.packages: <error>; installing the packages` and installs. Folders and paths in every line are escaped.
+
+  **Stage preparation** (`boxside/stage_prep.rs`). A commit stage's run (`CommitStage` true) reads `.gate/stage.toml` from the stage's checkout at the place folder after the restores and before the command, so a hook that needs restored output finds it: yaat's `dotnet format --no-restore` needs the `obj` that `dotnet restore` writes, which a cold work folder lacks. Any other run never reads the file, and a repo without it prepares nothing ([Formats](#formats)).
+
+  The commands run in order through the warm-up's command path (`each_command` with `Of::StagePrep`): the run's environment, job and restricted token, no start marker and no kill tag. They share one budget in load-adjusted seconds, `min(the file's timeout, the run's ceiling / 3)`, at least 1, so the hooks keep real time; the file's `timeout` is 600 when it sets none.
+
+  Each command says `gate: remote stage prep: running <words>` before it and `gate: remote stage prep: <words> passed in <s> s` after it. Once all passed, the box checks that the tree is as the snapshot had it: `git diff --name-only <snapshot>` plus the untracked files git does not ignore, of every repo of the run, a sibling's path named `../<sibling>/<path>`. Ignored files, the point of a preparation, do not count.
+
+  Anything else refuses the run before the command: one of the lines below, then the `tools` refusal tag and `gate: the stage's preparation failed on this builder; the commit's hooks will not run here`, status 75, so the stage moves to the next builder or the hooks run on the PC.
+  - `gate: remote stage prep failed: <words> exited <status>`
+  - `gate: remote stage prep failed: <words> ran past its budget of <n> s`
+  - `gate: remote stage prep failed: its budget of <n> s ran out before <words>`
+  - `gate: remote stage prep failed: <words> could not start (status <n>)`
+  - `gate: remote stage prep failed: a command ended the run with status <n>`
+  - `gate: remote stage prep failed: it changed <n> file(s) in the tree, first <path>`
+  - `gate: remote stage prep failed: its change to the tree could not be read`
+  - `gate: remote stage prep failed: .gate/stage.toml: <problem>`, one line per problem of the file.
+
+  A stop during the preparation, or a client that closes the connection, ends the run with that status and no refusal. A killed command leaves the interrupted-command record, so the next run of the work folder clears it; a file with problems or a command that exits clears nothing.
 
   A `Subfolder` is a folder of the main repo's tree, compared against its snapshot with per-character simple uppercase (the wrapper's OrdinalIgnoreCase): one that is not a folder inside `Work` prints `gate: remote subfolder <sub> is not a folder inside the work folder`, deletes the back ref and exits 2, and one missing from the snapshot prints `gate: remote subfolder <sub> does not exist in the snapshot` and exits 2, `<sub>` with its control characters escaped in both.
 

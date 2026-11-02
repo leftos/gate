@@ -21,6 +21,7 @@ mod prune;
 mod register;
 mod run;
 mod slots;
+mod stage_prep;
 mod stamping;
 mod stop;
 mod tools;

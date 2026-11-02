@@ -3,14 +3,16 @@
 //! ([`judge`]), which `gate check`'s warm-up item reads, and the texts that item says.
 //!
 //! `.gate/warmup.toml` holds `commands`, an array of 1 to [`MOST_COMMANDS`] commands, each a non-empty array of
-//! non-empty strings, and the optional `timeout`, whole seconds from 1 to [`MOST_TIMEOUT_SECONDS`],
-//! [`DEFAULT_TIMEOUT_SECONDS`] when missing. Any other key is a problem, and any problem means no warm-up.
+//! non-empty strings, and the optional `timeout`, whole seconds from 1 to [`MOST_TIMEOUT_SECONDS`], whose default each
+//! caller applies: [`DEFAULT_TIMEOUT_SECONDS`] for a warm-up. Any other key is a problem, and any problem means no
+//! warm-up.
 
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 use toml::{Table, Value};
 
+use crate::decide::stays_local;
 use crate::escape::escaped;
 
 /// The most commands a warm-up file may declare.
@@ -34,8 +36,27 @@ const BAD_TIMEOUT: &str = "timeout is not a whole number of seconds from 1 to 86
 pub struct WarmupFile {
     /// The commands, in file order, each its words.
     pub commands: Vec<Vec<String>>,
-    /// The ceiling of the whole warm-up, in seconds.
-    pub timeout_seconds: u64,
+    /// The ceiling of the whole list, in seconds, `None` when the file sets none.
+    pub timeout_seconds: Option<u64>,
+}
+
+/// The problem of the command `command` at `at`, from 0, which a routed run never sends ([`stays_local`]), by its first
+/// word as given.
+#[must_use]
+pub fn never_sent_problem(at: usize, command: &[String]) -> String {
+    let first = command.iter().find(|word| !word.is_empty()).map_or("", String::as_str);
+    format!("command {} starts with {}, which a routed run never sends", at + 1, escaped(first))
+}
+
+/// The problem of each of `commands` a routed run never sends ([`never_sent_problem`]), in order.
+#[must_use]
+pub fn never_sent_problems(commands: &[Vec<String>]) -> Vec<String> {
+    commands
+        .iter()
+        .enumerate()
+        .filter(|(_, command)| stays_local(command))
+        .map(|(at, command)| never_sent_problem(at, command))
+        .collect()
 }
 
 /// The warm-up file whose bytes are `bytes`, a leading byte order mark skipped.
@@ -49,12 +70,12 @@ pub fn read_warmup(bytes: &[u8]) -> Result<WarmupFile, Vec<String>> {
     let table = text.parse::<Table>().map_err(|error| vec![parse_failure(text, &error)])?;
     let mut problems = Vec::new();
     let mut commands = None;
-    let mut timeout_seconds = DEFAULT_TIMEOUT_SECONDS;
+    let mut timeout_seconds = None;
     for (key, value) in table {
         match key.as_str() {
             "commands" => commands = Some(read_commands(value, &mut problems)),
             "timeout" => match read_timeout(&value) {
-                Some(seconds) => timeout_seconds = seconds,
+                Some(seconds) => timeout_seconds = Some(seconds),
                 None => problems.push(BAD_TIMEOUT.to_owned()),
             },
             _ => problems.push(format!("{} is not a key (commands, timeout)", spelled(&key))),

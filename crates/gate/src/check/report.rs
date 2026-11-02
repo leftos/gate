@@ -1369,7 +1369,7 @@ mod tests {
         let file = FileRead::Parsed {
             file: WarmupFile {
                 commands: vec![vec!["dotnet".to_owned(), "build".to_owned()]],
-                timeout_seconds: 1800,
+                timeout_seconds: Some(1800),
             },
             hash: HASH.to_owned(),
         };

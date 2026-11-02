@@ -12290,6 +12290,32 @@ fn a_commit_stage_that_falls_back_before_its_command_runs_the_local_hooks() {
     assert!(log.contains(STAGE_START), "the commit's log keeps its lines from before the stage: {log}");
 }
 
+/// The box refuses the stage `tools` after its checkout, the repo's stage preparation failed, before the command starts:
+/// the commit runs its hooks here and lands.
+#[test]
+fn a_commit_stage_whose_box_refuses_tools_runs_the_local_hooks() {
+    let case = stage_case("client-stage-refused-tools", &["write", "a.txt", "fixed"]);
+    write(&case, ".gate/stage.toml", &format!("commands = [['{FAKE_TOOL}', 'exit', '3']]\n"));
+    git(&case, &["add", "-A"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let base = git_out(&case, &[], &["rev-parse", "HEAD"]);
+
+    let (pid, outcome) = finish_with_pid(stage_gate(&case, &steps));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let refusal = "gate: the stage's preparation failed on this builder; the commit's hooks will not run here";
+    assert!(outcome.stderr.lines().any(|said| said.ends_with(refusal)), "{outcome:?}");
+    assert!(local_hooks_ran(&case), "the commit ran its hooks here: {outcome:?}");
+    assert_eq!(git_out(&case, &[], &["rev-parse", "HEAD~1"]), base, "the commit was made: {outcome:?}");
+    assert_eq!(git_out(&case, &[], &["show", "HEAD:a.txt"]), "b", "the commit holds what was staged");
+    let own = own(&case, pid);
+    let release = own
+        .iter()
+        .find(|event| event["event"] == "release")
+        .expect("the commit released its slot");
+    assert_eq!(release["stage"]["outcome"], "fellBack", "{release}");
+}
+
 /// The box refuses the stage's run call busy, its work folder's lock held, before the command starts: the commit runs
 /// its hooks here, as with no stage.
 #[test]

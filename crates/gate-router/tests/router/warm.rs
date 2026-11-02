@@ -16,14 +16,14 @@ fn words(texts: &[&str]) -> Vec<String> {
 }
 
 #[test]
-fn a_file_of_commands_reads_with_the_default_timeout() {
+fn a_file_of_commands_reads_with_no_timeout_of_its_own() {
     let file = read_warmup(b"commands = [['dotnet', 'build', 'yaat.slnx'], ['pwsh', '-File', 'tools/restore.ps1']]\n").expect("reads");
 
     assert_eq!(
         file,
         WarmupFile {
             commands: vec![words(&["dotnet", "build", "yaat.slnx"]), words(&["pwsh", "-File", "tools/restore.ps1"])],
-            timeout_seconds: 1800,
+            timeout_seconds: None,
         }
     );
 }
@@ -32,7 +32,7 @@ fn a_file_of_commands_reads_with_the_default_timeout() {
 fn a_timeout_from_one_to_86400_seconds_is_kept() {
     for seconds in [1, 600, 86_400] {
         let file = read_warmup(format!("commands = [['a']]\ntimeout = {seconds}\n").as_bytes()).expect("reads");
-        assert_eq!(file.timeout_seconds, seconds);
+        assert_eq!(file.timeout_seconds, Some(seconds));
     }
 }
 
@@ -130,7 +130,7 @@ fn parsed_file() -> FileRead {
     FileRead::Parsed {
         file: WarmupFile {
             commands: vec![words(&["dotnet", "build"])],
-            timeout_seconds: 1800,
+            timeout_seconds: Some(1800),
         },
         hash: HASH.to_owned(),
     }

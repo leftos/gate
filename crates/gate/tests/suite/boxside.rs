@@ -5194,7 +5194,9 @@ fn staged_snapshot(case: &Case, payload: &mut Value, head_commit: &str, staged: 
     let (bare, key) = (field(payload, "Bare").to_owned(), field(payload, "Key").to_owned());
     git(&["-C", source, "push", "-q", "--force", &bare, &format!("HEAD:refs/gate-head/{key}")]);
     for (name, content) in staged {
-        fs::write(Path::new(source).join(name), content).expect("a staged file can be written");
+        let file = Path::new(source).join(name);
+        fs::create_dir_all(file.parent().expect("a file has a folder")).expect("the file's folder can be made");
+        fs::write(file, content).expect("a staged file can be written");
     }
     git(&["-C", source, "add", "-A"]);
     let tree = git(&["-C", source, "write-tree"]);
@@ -5324,6 +5326,281 @@ fn a_commit_stage_run_whose_head_commit_was_not_sent_is_refused_layout_before_it
     assert!(!has_ref(&payload, "refs/gate-back/k"), "no back commit");
 }
 
+/// A `.gate/stage.toml` declaring the one command `words`, each a TOML literal string, with `rest` after it.
+fn stage_toml(words: &[&str], rest: &str) -> String {
+    let words: Vec<String> = words.iter().map(|word| format!("'{word}'")).collect();
+    format!("commands = [[{}]]\n{rest}", words.join(", "))
+}
+
+/// Asserts `outcome` is a refusal of the commit stage `payload` before its command: its `said` lines in order, then the
+/// tag and its explanatory line together, with no command and no back commit.
+fn assert_stage_prep_refused(payload: &Value, outcome: &Outcome, said: &[&str]) {
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "the command never ran");
+    let stderr = after_checkout(payload, &outcome.stderr);
+    let refusal = format!(
+        "{}\ngate: the stage's preparation failed on this builder; the commit's hooks will not run here\n",
+        refused_line(payload, "tools")
+    );
+    let tagged = stderr.find(&refusal);
+    assert!(tagged.is_some(), "the tag and its line come together: {stderr:?}");
+    let before = lines(stderr.get(..tagged.unwrap_or_default()).unwrap_or_default());
+    let mut from = 0;
+    for line in said {
+        let at = before.iter().skip(from).position(|found| found == line);
+        assert!(at.is_some(), "{line:?} is said, in order, before the tag: {stderr:?}");
+        from += at.unwrap_or_default() + 1;
+    }
+    assert!(!stderr.contains(&started_line(payload)), "the command never started: {stderr:?}");
+    assert!(!has_ref(payload, "refs/gate-back/k"), "no back commit");
+}
+
+#[test]
+fn a_commit_stage_runs_the_repo_s_stage_prep_before_its_command() {
+    let case = Case::new("box_run_stage_prep");
+    let marker = shown(&case.folder().join("prep-marker"));
+    let mut payload = box_payload(&case, "k", &[r".\stage.cmd"]);
+    let shows_marker = format!("@type \"{marker}\"\r\n");
+    let head = [("stage.cmd", shows_marker.as_str()), ("a.txt", "a\n")];
+    let prep = stage_toml(&[FAKE_TOOL, "mark", &marker], "");
+    commit_stage_snapshot(&case, &mut payload, &head, &[(".gate/stage.toml", &prep)]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "run\n", "the command read what the preparation wrote");
+    let words = format!("{FAKE_TOOL} mark {marker}");
+    let said = lines(&outcome.stderr);
+    let running = format!("gate: remote stage prep: running {words}");
+    let passed = format!("gate: remote stage prep: {words} passed in ");
+    let start = started_line(&payload);
+    let running = said.iter().position(|line| *line == running);
+    let passed = said
+        .iter()
+        .position(|line| line.strip_prefix(passed.as_str()).is_some_and(|rest| rest.ends_with(" s")));
+    let started = said.iter().position(|line| *line == start);
+    assert!(
+        matches!((running, passed, started), (Some(running), Some(passed), Some(started)) if running < passed && passed < started),
+        "running, then passed, then the start marker: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_commit_stage_whose_stage_prep_fails_is_refused_before_its_command() {
+    let case = Case::new("box_run_stage_prep_fails");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    let prep = stage_toml(&[FAKE_TOOL, "exit", "3"], "");
+    commit_stage_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[(".gate/stage.toml", &prep)]);
+
+    let outcome = run_box(&case, &payload);
+
+    let failed = format!("gate: remote stage prep failed: {FAKE_TOOL} exit 3 exited 3");
+    assert_stage_prep_refused(&payload, &outcome, &[&failed]);
+    assert!(!command_record(&payload).exists(), "a prep that exited leaves no record: {outcome:?}");
+}
+
+#[test]
+fn a_stage_prep_that_cannot_start_is_refused_before_its_command() {
+    let case = Case::new("box_run_stage_prep_no_program");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    let prep = stage_toml(&["no-such-program-of-a-stage-prep"], "");
+    commit_stage_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[(".gate/stage.toml", &prep)]);
+
+    let outcome = run_box(&case, &payload);
+
+    let failed = "gate: remote stage prep failed: no-such-program-of-a-stage-prep could not start (status 127)";
+    assert_stage_prep_refused(&payload, &outcome, &[failed]);
+}
+
+#[test]
+fn a_stage_prep_stops_at_its_first_failing_command() {
+    let case = Case::new("box_run_stage_prep_first_fails");
+    let second = case.folder().join("second");
+    let word = shown(&second);
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    let prep = format!("commands = [['{FAKE_TOOL}', 'exit', '3'], ['{FAKE_TOOL}', 'mark', '{word}']]\n");
+    commit_stage_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[(".gate/stage.toml", &prep)]);
+
+    let outcome = run_box(&case, &payload);
+
+    let failed = format!("gate: remote stage prep failed: {FAKE_TOOL} exit 3 exited 3");
+    assert_stage_prep_refused(&payload, &outcome, &[&failed]);
+    assert!(!second.exists(), "the second command never ran: {outcome:?}");
+}
+
+#[test]
+fn a_stage_prep_says_no_start_marker_before_a_refusal() {
+    let case = Case::new("box_run_stage_prep_no_marker");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    let prep = stage_toml(&[FAKE_TOOL, "exit", "3"], "");
+    commit_stage_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[(".gate/stage.toml", &prep)]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    let marker = started_line(&payload);
+    assert!(!outcome.stdout.contains(&marker), "{outcome:?}");
+    assert!(!outcome.stderr.contains(&marker), "{outcome:?}");
+}
+
+/// The run of a stage whose preparation is the one command `words`, with `a.txt` in the snapshot.
+fn stage_prep_changing(case: &Case, words: &[&str]) -> (Value, Outcome) {
+    let mut payload = box_payload(case, "k", &[FAKE_TOOL, "out", "ran"]);
+    let prep = stage_toml(words, "");
+    commit_stage_snapshot(case, &mut payload, &[("a.txt", "a\n")], &[(".gate/stage.toml", &prep)]);
+    let outcome = run_box(case, &payload);
+    (payload, outcome)
+}
+
+#[test]
+fn a_stage_prep_that_changes_a_tracked_file_in_the_tree_is_refused() {
+    let case = Case::new("box_run_stage_prep_tracked");
+    let (payload, outcome) = stage_prep_changing(&case, &[FAKE_TOOL, "write", "a.txt", "changed"]);
+
+    let failed = "gate: remote stage prep failed: it changed 1 file(s) in the tree, first a.txt";
+    assert_stage_prep_refused(&payload, &outcome, &[failed]);
+}
+
+#[test]
+fn a_stage_prep_that_adds_an_untracked_file_in_the_tree_is_refused() {
+    let case = Case::new("box_run_stage_prep_untracked");
+    let (payload, outcome) = stage_prep_changing(&case, &[FAKE_TOOL, "write", "new.txt", "new"]);
+
+    let failed = "gate: remote stage prep failed: it changed 1 file(s) in the tree, first new.txt";
+    assert_stage_prep_refused(&payload, &outcome, &[failed]);
+}
+
+#[test]
+fn a_stage_prep_may_write_ignored_files() {
+    let case = Case::new("box_run_stage_prep_ignored");
+    let mut payload = box_payload(&case, "k", &[r".\stage.cmd"]);
+    let head = [(".gitignore", "obj/\n"), ("stage.cmd", "@type obj\\made.txt\r\n")];
+    let prep = stage_toml(&[FAKE_TOOL, "write", "obj/made.txt", "kept"], "");
+    commit_stage_snapshot(&case, &mut payload, &head, &[(".gate/stage.toml", &prep)]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "kept\n", "the ignored file reached the command");
+}
+
+/// A stop ends the run: the PC must not take it for a failed preparation and run the hooks itself.
+#[test]
+fn a_stop_during_a_stage_prep_ends_the_run_with_no_refusal() {
+    let case = Case::new("box_run_stage_prep_stopped");
+    let never = shown(&case.folder().join("never"));
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    let prep = stage_toml(&[FAKE_TOOL, "spawn-wait", &never, "wait", &never], "");
+    commit_stage_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[(".gate/stage.toml", &prep)]);
+    let running = start_box(&case, &payload);
+    let helper = spawned_pid(&running.wait_for_stdout("\n"));
+
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    wait_until_gone(helper);
+    let outcome = running.finish_read();
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate-remote-refused:"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("stage prep failed"), "{outcome:?}");
+    assert!(!outcome.stdout.contains("ran\n"), "the command never ran: {outcome:?}");
+}
+
+#[test]
+fn a_commit_stage_with_a_bad_stage_toml_is_refused_before_its_command() {
+    let case = Case::new("box_run_stage_prep_bad_file");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    let staged = [(".gate/stage.toml", "commands = [[]]\nextra = 1\n")];
+    commit_stage_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &staged);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_stage_prep_refused(
+        &payload,
+        &outcome,
+        &[
+            "gate: remote stage prep failed: .gate/stage.toml: commands[0] is empty",
+            "gate: remote stage prep failed: .gate/stage.toml: extra is not a key (commands, timeout)",
+        ],
+    );
+}
+
+#[test]
+fn a_commit_stage_with_git_in_stage_toml_is_refused_before_its_command() {
+    let case = Case::new("box_run_stage_prep_git");
+    let marker = case.folder().join("made-by-git");
+    let word = shown(&marker);
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    let prep = stage_toml(&["git", "init", "-q", &word], "");
+    commit_stage_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[(".gate/stage.toml", &prep)]);
+
+    let outcome = run_box(&case, &payload);
+
+    let failed = "gate: remote stage prep failed: .gate/stage.toml: command 1 starts with git, which a routed run never sends";
+    assert_stage_prep_refused(&payload, &outcome, &[failed]);
+    assert!(!marker.exists(), "git never ran: {outcome:?}");
+}
+
+#[test]
+fn an_ordinary_run_never_reads_stage_toml() {
+    let case = Case::new("box_run_stage_prep_ordinary");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    let prep = stage_toml(&[FAKE_TOOL, "exit", "3"], "");
+    snapshot(&case, &mut payload, &[("a.txt", "a\n"), (".gate/stage.toml", &prep)]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "ran\n");
+    assert!(!outcome.stderr.contains("stage prep"), "{outcome:?}");
+}
+
+/// Runs a stage whose preparation waits for a file nothing makes under `rest` of its `.gate/stage.toml` and `timeout`
+/// of the run, the box's clock running with wall time; the payload, the outcome and the preparation's words.
+fn stage_prep_killed(case: &Case, rest: &str, timeout: Option<u64>) -> (Value, Outcome, String) {
+    let never = shown(&case.folder().join("never"));
+    let mut payload = box_payload(case, "k", &[FAKE_TOOL, "out", "ran"]);
+    if let Some(timeout) = timeout {
+        payload["Timeout"] = json!(timeout);
+    }
+    let prep = stage_toml(&[FAKE_TOOL, "wait", &never], rest);
+    commit_stage_snapshot(case, &mut payload, &[("a.txt", "a\n")], &[(".gate/stage.toml", &prep)]);
+    let outcome = run_box_with_seams(case, &payload, &["--test-box-sample-ms", "20", "--test-box-free-percent", "100"]);
+    (payload, outcome, format!("{FAKE_TOOL} wait {never}"))
+}
+
+/// The box's own budget ends the preparation; the step it runs would wait far longer for a file nothing makes.
+#[test]
+fn a_stage_prep_past_its_timeout_is_refused() {
+    let case = Case::new("box_run_stage_prep_timeout");
+    let (payload, outcome, words) = stage_prep_killed(&case, "timeout = 1\n", None);
+
+    let past = format!("gate: remote stage prep failed: {words} ran past its budget of 1 s");
+    assert_stage_prep_refused(&payload, &outcome, &[&past]);
+    assert!(
+        lines_starting(&outcome, "gate-remote-killed:").is_empty(),
+        "no kill tag before the refusal: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_killed_stage_prep_leaves_the_interrupted_record() {
+    let case = Case::new("box_run_stage_prep_record");
+    let (payload, outcome, _) = stage_prep_killed(&case, "timeout = 1\n", None);
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    assert!(command_record(&payload).exists(), "the next run clears what it left: {outcome:?}");
+}
+
+#[test]
+fn a_stage_prep_budget_is_a_third_of_the_run_s_ceiling() {
+    let case = Case::new("box_run_stage_prep_third");
+    let (payload, outcome, words) = stage_prep_killed(&case, "timeout = 600\n", Some(3));
+
+    let past = format!("gate: remote stage prep failed: {words} ran past its budget of 1 s");
+    assert_stage_prep_refused(&payload, &outcome, &[&past]);
+}
+
 #[test]
 fn a_commit_stage_pair_run_resets_only_the_main_repo() {
     let case = Case::new("box_run_commit_stage_pair");
@@ -5343,6 +5620,21 @@ fn a_commit_stage_pair_run_resets_only_the_main_repo() {
         "the sibling's HEAD stays its snapshot"
     );
     assert_eq!(gate_head_refs(&app), "", "no PC head ref stays in the main repo's tree");
+}
+
+#[test]
+fn a_stage_prep_that_changes_a_sibling_tree_is_refused() {
+    let case = Case::new("box_run_stage_prep_sibling");
+    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "out", "ran"]);
+    let lib: &[(&str, &str)] = &[("b.txt", "b\n")];
+    let commits = pair_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[("lib", lib)]);
+    let prep = stage_toml(&[FAKE_TOOL, "write", "../lib/b.txt", "changed"], "");
+    staged_snapshot(&case, &mut payload, &commits[0], &[(".gate/stage.toml", &prep)]);
+
+    let outcome = run_box(&case, &payload);
+
+    let failed = "gate: remote stage prep failed: it changed 1 file(s) in the tree, first ../lib/b.txt";
+    assert_stage_prep_refused(&payload, &outcome, &[failed]);
 }
 
 #[test]

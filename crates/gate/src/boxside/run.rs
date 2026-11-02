@@ -54,6 +54,7 @@ use crate::boxside::preflight::{
 };
 use crate::boxside::probe;
 use crate::boxside::slots;
+use crate::boxside::stage_prep;
 use crate::boxside::stamping::{self, ProcessLines};
 use crate::boxside::stop::{Ending, STOPPED, stop_event_name, terminate_and_wait};
 use crate::boxside::tools;
@@ -82,6 +83,8 @@ const CLOSED_STATUS: u32 = 255;
 const BACK_REF_RESET: &str = "back ref reset";
 /// The most bytes of standard output the LFS post-check's quiet checkout may print.
 const RECHECKOUT_OUTPUT: usize = 64 * 1024;
+/// The most a listing of a tree's changed paths may print ([`WorkGit::tree_changes`]).
+const TREE_LISTING: usize = 1024 * 1024;
 /// The pathspec of every `.gitattributes` file at any depth, whatever the case of its name, as NTFS opens a file named
 /// `.GitAttributes` as a folder's attributes file.
 const ATTRIBUTES_FILES: &str = ":(glob,icase)**/.gitattributes";
@@ -183,7 +186,7 @@ pub(super) struct Request<'a> {
     /// The run's `Nonce`, which its start marker and its refusal tags name.
     pub(super) nonce: &'a str,
     /// The run's ceiling in whole seconds of load-adjusted time, `None` for a run the box gives none.
-    timeout: Option<u64>,
+    pub(super) timeout: Option<u64>,
     /// How the run takes the builder's desktop, from its `Desktop`, `DesktopSession` and `DesktopWait` keys: a locked
     /// run with the whole seconds it may wait for the lock, or a session run; `None` for a run on the box's own
     /// session, whatever its `DesktopWait` and `DesktopSession` said.
@@ -205,6 +208,11 @@ pub(super) struct Request<'a> {
 }
 
 impl Request<'_> {
+    /// Whether this run is a commit stage's.
+    pub(super) fn commit_stage(&self) -> bool {
+        self.main.head.is_some()
+    }
+
     fn read(payload: &Payload) -> Result<Request<'_>, String> {
         // The snapshot first, as the wrapper refuses a payload without one before the lock or the checkout.
         let snapshot = payload.snapshot()?;
@@ -1092,7 +1100,13 @@ fn warm_up(request: &Request<'_>, hash: &str, place: &Path, beat: &Beat<'_>, con
     let record = warm_record(request.work);
     record_step(preflight::remove_entry(Path::new(&record)), "remove", &record, beat, console)?;
     beat.say_protocol(console, &started_line(request.nonce));
-    let ended = match warm_commands(request, place, beat, console) {
+    let commands = Commands {
+        list: &request.commands,
+        place,
+        budget: request.timeout,
+        of: Of::WarmUp,
+    };
+    let ended = match each_command(request, &commands, &WarmLines, beat, console) {
         Ok(0) => {
             let written = written_retrying(&record, hash, || thread::sleep(WARM_WRITE_WAIT));
             record_step(written, "write", &record, beat, console).map(|()| 0)
@@ -1113,47 +1127,139 @@ fn warm_up(request: &Request<'_>, hash: &str, place: &Path, beat: &Beat<'_>, con
 const WARM_WRITE_WAIT: Duration = Duration::from_millis(100);
 const WARM_WRITE_WAITS: u32 = 10;
 
-/// Each of a warm-up's commands run in `place` in order ([`warm_up`]): 0 once all passed, else the status of the first
-/// that did not, or of a budget spent before a command, said; `Err` as [`command`] gives it, or [`CLOSED_STATUS`] for a
-/// client found gone before a command, which is then not started.
-fn warm_commands(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<u32, u32> {
-    let count = request.commands.len();
-    let mut spent = 0.0;
-    for (index, words) in request.commands.iter().enumerate() {
-        if beat.client_gone() {
-            return Err(CLOSED_STATUS);
+/// A list of commands [`each_command`] runs in order under one budget.
+pub(super) struct Commands<'a> {
+    pub(super) list: &'a [Vec<String>],
+    /// The folder they run in.
+    pub(super) place: &'a Path,
+    /// The budget all of them share, in load-adjusted seconds, `None` for none.
+    pub(super) budget: Option<u64>,
+    pub(super) of: Of,
+}
+
+/// Which of its list's commands a line of [`CommandLines`] speaks of.
+pub(super) struct At<'a> {
+    pub(super) words: &'a [String],
+    /// Its place in the list, from 1.
+    pub(super) number: usize,
+    pub(super) count: usize,
+}
+
+/// What [`each_command`] says as its list runs.
+pub(super) trait CommandLines {
+    /// The line before a command, if any.
+    fn running(&self, at: &At<'_>) -> Option<String>;
+    /// The line after a command that passed, in `took`, if any.
+    fn passed(&self, at: &At<'_>, took: Duration) -> Option<String>;
+    /// The line of a list whose `budget` is spent before a command.
+    fn ran_out(&self, budget: u64, at: &At<'_>) -> String;
+    /// The line of a command that did not pass, if any; `clean` as [`ended_clean`] says.
+    fn failed(&self, ran: &Ran, at: &At<'_>, clean: bool) -> Option<String>;
+}
+
+/// A warm-up's lines.
+struct WarmLines;
+
+impl CommandLines for WarmLines {
+    fn running(&self, _at: &At<'_>) -> Option<String> {
+        None
+    }
+
+    fn passed(&self, _at: &At<'_>, _took: Duration) -> Option<String> {
+        None
+    }
+
+    fn ran_out(&self, budget: u64, At { number, count, .. }: &At<'_>) -> String {
+        format!("gate: remote warm-up ran out of its {budget} s budget before command {number} of {count}")
+    }
+
+    fn failed(&self, _ran: &Ran, At { number, count, .. }: &At<'_>, _clean: bool) -> Option<String> {
+        Some(format!("gate: remote warm-up stopped at command {number} of {count}"))
+    }
+}
+
+/// One list's run of [`each_command`].
+struct ListRun<'a, 'b, L> {
+    request: &'a Request<'b>,
+    commands: &'a Commands<'a>,
+    lines: &'a L,
+    beat: &'a Beat<'b>,
+}
+
+impl<L: CommandLines> ListRun<'_, '_, L> {
+    /// The command at `at` run under `timeout`, its lines said: its status and the seconds of the budget it spent; `Err`
+    /// as [`command`] gives it.
+    fn one(&self, at: &At<'_>, timeout: Option<u64>, console: &mut Console) -> Result<(u32, f64), u32> {
+        let beat = self.beat;
+        if let Some(line) = self.lines.running(at) {
+            beat.say(console, &line);
         }
-        let at = index + 1;
-        let budget = request.timeout.map(|budget| (budget, remaining_budget(budget, spent)));
-        if let Some((budget, None)) = budget {
-            beat.say(
-                console,
-                &format!("gate: remote warm-up ran out of its {budget} s budget before command {at} of {count}"),
-            );
-            return Ok(KILLED);
-        }
-        let timeout = budget.and_then(|(_, left)| left);
         beat.adjusted.set(None);
         let began = Instant::now();
         let one = One {
-            words,
-            place,
+            words: at.words,
+            place: self.commands.place,
             timeout,
-            of: Of::WarmUp,
+            of: self.commands.of,
             recorded: false,
         };
-        let ran = warm_command(request, &one, beat, console)?;
-        spent += command_spent(beat.adjusted.get(), began.elapsed());
+        let ran = warm_command(self.request, &one, beat, console)?;
+        let spent = command_spent(beat.adjusted.get(), began.elapsed());
         let status = match ran {
             Ran::Exited(status) | Ran::NotStarted(status) => status,
             Ran::Killed => KILLED,
         };
+        let said = if status == 0 {
+            self.lines.passed(at, began.elapsed())
+        } else {
+            self.lines.failed(&ran, at, ended_clean(beat))
+        };
+        if let Some(line) = said {
+            beat.say(console, &line);
+        }
+        Ok((status, spent))
+    }
+}
+
+/// Each command of `commands` run in order, as a run's command is ([`command`]), `lines` saying how they go: 0 once all
+/// passed, else the status of the first that did not, or of a budget spent before a command, said; `Err` as [`command`]
+/// gives it, or [`CLOSED_STATUS`] for a client found gone before a command, which is then not started.
+pub(super) fn each_command(
+    request: &Request<'_>,
+    commands: &Commands<'_>,
+    lines: &impl CommandLines,
+    beat: &Beat<'_>,
+    console: &mut Console,
+) -> Result<u32, u32> {
+    let run = ListRun {
+        request,
+        commands,
+        lines,
+        beat,
+    };
+    let count = commands.list.len();
+    let mut spent = 0.0;
+    for (index, words) in commands.list.iter().enumerate() {
+        if beat.client_gone() {
+            return Err(CLOSED_STATUS);
+        }
+        let at = At {
+            words,
+            number: index + 1,
+            count,
+        };
+        let budget = commands.budget.map(|budget| (budget, remaining_budget(budget, spent)));
+        if let Some((budget, None)) = budget {
+            beat.say(console, &lines.ran_out(budget, &at));
+            return Ok(KILLED);
+        }
+        let (status, command) = run.one(&at, budget.and_then(|(_, left)| left), console)?;
+        spent += command;
         if status != 0 {
-            beat.say(console, &format!("gate: remote warm-up stopped at command {at} of {count}"));
             return Ok(status);
         }
-        let left = request.timeout.and_then(|budget| remaining_budget(budget, spent));
-        if let (true, Some(left)) = (at < count, left) {
+        let left = commands.budget.and_then(|budget| remaining_budget(budget, spent));
+        if let (true, Some(left)) = (at.number < count, left) {
             let waited = Instant::now();
             job_name_freed(request.job, beat, Duration::from_secs(left.saturating_mul(BACKSTOP_TIMES)), console);
             spent += gap_spent(waited.elapsed());
@@ -1162,7 +1268,16 @@ fn warm_commands(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: 
     Ok(0)
 }
 
-/// One of a warm-up's commands seen to its end as [`command`] sees it, under the interrupted-command record
+/// The status a run ends on when something other than its own work ended it ([`ended_clean`]) and no status of a
+/// command says so: [`CLOSED_STATUS`] for a client gone, else the stop said as one before a command ([`before_the_job`]).
+pub(super) fn stopped_status(request: &Request<'_>, beat: &Beat<'_>, console: &mut Console) -> u32 {
+    if beat.client_gone() {
+        return CLOSED_STATUS;
+    }
+    before_the_job(beat.stop.look(STARTING_COMMAND), request.job, beat.lock, console).map_or_else(|status| status, |()| FAILED_STATUS)
+}
+
+/// One of a list's commands seen to its end as [`command`] sees it, under the interrupted-command record
 /// ([`command_record`]): written just before the command is resumed when there is none ([`One::recorded`]), and then
 /// removed once the command ended clean ([`removed_if_clean`]); one already there, or a name that cannot be looked at,
 /// is left as it is. `Err` as [`command`] gives it.
@@ -1183,27 +1298,31 @@ const JOB_GONE_STEP: Duration = Duration::from_millis(20);
 /// ceiling has.
 const BACKSTOP_TIMES: u64 = 5;
 
-/// Returns once no job has the name `job`, a stop came (`beat`'s stop signal, its unread line said the first time
-/// under the box's output lock), or `limit` of
+/// Returns, whether the name is free, once no job has the name `job`, a stop came (`beat`'s stop signal, its unread line
+/// said the first time under the box's output lock), or `limit` of
 /// wall time passed: a process its command left and the box ended ([`ended_whole`]) leaves its job's count before its
 /// handles close, an inherited handle to the job among them, so the job can outlive its last process for as long as
 /// the machine takes to tear those down. A stop is then the next command's stop outcome ([`before_the_job`]); a job
 /// still there, or one that cannot be looked for, is left to the next command's job creation, which refuses its name
-/// with its own line. A client gone meanwhile, which the heartbeat finds, is not looked for here: [`warm_commands`]
+/// with its own line. A client gone meanwhile, which the heartbeat finds, is not looked for here: [`each_command`]
 /// looks for it before the next command.
-fn job_name_freed(job: &str, beat: &Beat<'_>, limit: Duration, console: &mut Console) {
+pub(super) fn job_name_freed(job: &str, beat: &Beat<'_>, limit: Duration, console: &mut Console) -> bool {
     let started = Instant::now();
-    while matches!(gate_win32::OpenedJob::open(job), Ok(Some(_))) && started.elapsed() < limit {
+    while matches!(gate_win32::OpenedJob::open(job), Ok(Some(_))) {
+        if started.elapsed() >= limit {
+            return false;
+        }
         let stopped = {
             // Held, so the line saying the signal cannot be read never lands inside a heartbeat line.
             let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
             beat.stop.seen(STARTING_COMMAND, console)
         };
         if stopped {
-            return;
+            return false;
         }
         thread::sleep(JOB_GONE_STEP);
     }
+    true
 }
 
 /// The seconds of a warm-up's budget a wait of `wall` time between two commands spends: a fifth of it, as a command
@@ -1277,7 +1396,7 @@ fn ran_written(work: &str, beat: &Beat<'_>, console: &mut Console) {
 /// Whether the command whose wait just ended with an exit ended clean: the run's stop signal unset when read now, as a
 /// stop ends the command with an exit of its own, and the client still there. A signal that cannot be read is no clean
 /// end.
-fn ended_clean(beat: &Beat<'_>) -> bool {
+pub(super) fn ended_clean(beat: &Beat<'_>) -> bool {
     !beat.client_gone() && matches!(beat.stop.event.is_set(), Ok(false))
 }
 
@@ -1476,12 +1595,15 @@ impl One<'_> {
 
 /// What a command [`command`] starts is a command of.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Of {
+pub(super) enum Of {
     /// A run: the start marker is said just before its launch.
     Run,
     /// A warm-up, whose start marker was said before its first command: its job is ended whole once it is over
     /// ([`ended_whole`]), so the next command can take the job's name.
     WarmUp,
+    /// A commit stage's preparation ([`stage_prep`]), which comes before the run's start marker, so a refusal after it
+    /// still falls back: its job is ended whole as a warm-up's is, and the ceiling says nothing of it ([`watch_of`]).
+    StagePrep,
 }
 
 /// Why the run of `request` is refused `lfs` before its checkout begins, so before the checkout's start line: a sibling
@@ -1522,7 +1644,7 @@ fn ready(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Bea
     };
     // Released before the command, which may change the work folder as it likes.
     drop(held);
-    match restored(request, git, folders, beat, console) {
+    match restored(request, (git, &lfs), folders, beat, console) {
         Ok(()) => Ok(lfs),
         Err(status) => {
             lfs.close(console);
@@ -1559,10 +1681,16 @@ fn no_head(repo: &Repo<'_>, head: &str) -> String {
     }
 }
 
-/// The run after its checkout and up to its command: the subfolder found, the repo's dotnet tools restored and, for a
-/// pnpm or bun command, its packages installed; else `Err` with the status the run ends on, its lines said, as
-/// [`ready`] gives it.
-fn restored(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
+/// The run after its checkout and up to its command: the subfolder found, the repo's dotnet tools restored, for a pnpm
+/// or bun command its packages installed and, on a commit stage, the repo's stage preparation run; else `Err` with the
+/// status the run ends on, its lines said, as [`ready`] gives it.
+fn restored(
+    request: &Request<'_>,
+    (git, lfs): (&WorkGit, &RunLfs),
+    folders: &Folders<'_>,
+    beat: &Beat<'_>,
+    console: &mut Console,
+) -> Result<(), u32> {
     if !folders.place.is_dir() {
         stamping::err(
             console,
@@ -1570,8 +1698,9 @@ fn restored(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &
         );
         return Err(ended_before(u32::from(USAGE_STATUS), request, beat, console));
     }
-    let restored =
-        tools::update(request, folders.work, folders.place, beat, console).and_then(|()| packages::update(request, git, folders, beat, console));
+    let restored = tools::update(request, folders.work, folders.place, beat, console)
+        .and_then(|()| packages::update(request, git, folders, beat, console))
+        .and_then(|()| stage_prep::update(request, (git, lfs), folders.place, beat, console));
     match restored {
         // The tools' refusal, its tag said: the PC runs the command itself and syncs nothing back.
         Err(REFUSED_STATUS) => Err(REFUSED_STATUS),
@@ -1917,12 +2046,12 @@ fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut 
         ceiling,
         wsl: one.wsl(),
     };
-    let watched = watch(started, console);
+    let watched = watch_of(started, one.of, console);
     stopper.armed = false;
     // Ended only now, so the command's console stays up for as long as the command may use it.
     drop(donor);
     process_lines.finish(&job);
-    if one.of == Of::WarmUp {
+    if one.of != Of::Run {
         ended_whole(&job, beat, console);
     }
     watched
@@ -2651,6 +2780,13 @@ struct Pipes {
 /// line is said once the readers drained, but for a client gone or a wait that failed. The look that finds a kill
 /// hands over the ceiling with it, so a kill is always said by the ceiling that found it.
 fn watch(started: Started<'_, '_>, console: &mut Console) -> Result<Ran, u32> {
+    watch_of(started, Of::Run, console)
+}
+
+/// [`watch`] for a command of `of`: a stage preparation's says no adjusted line and no kill line or tag, since the run
+/// has not started for the PC and goes on to its hooks or to a refusal ([`killed`]).
+fn watch_of(started: Started<'_, '_>, of: Of, console: &mut Console) -> Result<Ran, u32> {
+    let says_ceiling = of != Of::StagePrep;
     let Started {
         job,
         launched,
@@ -2699,7 +2835,7 @@ fn watch(started: Started<'_, '_>, console: &mut Console) -> Result<Ran, u32> {
             beat.adjusted.set(ceiling.as_ref().and_then(Ceiling::adjusted_seconds));
             end_what_it_left(job, keep, console);
             watched.drained(console)?;
-            if let Some(ceiling) = &ceiling {
+            if let Some(ceiling) = ceiling.as_ref().filter(|_| says_ceiling) {
                 ceiling.ended(console);
             }
             Ok(Ran::Exited(code))
@@ -2707,7 +2843,7 @@ fn watch(started: Started<'_, '_>, console: &mut Console) -> Result<Ran, u32> {
         WaitEnd::Killed((kill, ceiling)) => {
             let ceiling = ceiling.closed();
             beat.adjusted.set(ceiling.adjusted_seconds());
-            killed(watched, kill, &ceiling, beat.seams, console)
+            killed(watched, says_ceiling.then_some((kill, &ceiling)), beat.seams, console)
         }
         WaitEnd::ClientGone => Err(watched.client_gone(console)),
         WaitEnd::Failed { status, .. } => Err(watched.wait_failed(status, console)),
@@ -2727,9 +2863,10 @@ pub(super) enum Ran {
 /// The box's ceiling found the command of `watched` past a limit for `kill`: its job is ended and the readers drain
 /// ([`Watched::killed`]), a client gone meanwhile answered as such, with no back ref and no outputs; a job that still
 /// holds processes, or could not be ended, is ended once more; then the ceiling says the kill, a note first when the
-/// job was still not ended, and the run goes on as [`Ran::Killed`], a kill whatever the ending left.
+/// job was still not ended, and the run goes on as [`Ran::Killed`], a kill whatever the ending left. With no `told`,
+/// a stage preparation's kill, nothing is said here: [`ended_whole`] says what the ending left.
 /// `--test-box-kill-leaves` stands in for what that last ending leaves.
-fn killed(watched: Watched<'_>, kill: Kill, ceiling: &Ceiling<'_>, seams: &BoxSeams, console: &mut Console) -> Result<Ran, u32> {
+fn killed(watched: Watched<'_>, told: Option<(Kill, &Ceiling<'_>)>, seams: &BoxSeams, console: &mut Console) -> Result<Ran, u32> {
     let job = watched.job;
     let ending = match watched.killed(console)? {
         Ok(ending) if ending.left == 0 && seams.kill_leaves.is_none() => Ok(ending),
@@ -2742,7 +2879,9 @@ fn killed(watched: Watched<'_>, kill: Kill, ceiling: &Ceiling<'_>, seams: &BoxSe
         }),
         None => ending,
     };
-    ceiling.killed(kill, &ending, console);
+    if let Some((kill, ceiling)) = told {
+        ceiling.killed(kill, &ending, console);
+    }
     Ok(Ran::Killed)
 }
 
@@ -3863,6 +4002,35 @@ impl WorkGit {
             console,
         )?;
         Ok(Some(commit))
+    }
+
+    /// The paths of the run's trees that differ from their snapshots, each repo in turn, since a back commit commits
+    /// every one: tracked files compared with the snapshot itself, as a commit stage's `HEAD` is the PC's and its index
+    /// the snapshot's, then untracked files; ignored files do not count. A sibling's paths read `../<sibling>/<path>`.
+    /// Each git call carries the run's LFS pins ([`RunLfs::pins`]). `Err` with the status of a git step that failed, its
+    /// line said.
+    pub(super) fn tree_changes(&self, request: &Request<'_>, lfs: &RunLfs, console: &mut Console) -> Result<Vec<String>, u32> {
+        let no_storage = lfs::no_storage(request.lock);
+        let pins = lfs.pins(&no_storage);
+        let mut paths = Vec::new();
+        for (index, repo) in request.repos().enumerate() {
+            let prefix = repo
+                .name
+                .as_deref()
+                .filter(|_| index > 0)
+                .map_or_else(String::new, |name| format!("../{name}/"));
+            let tracked = ["diff", "--name-only", "-z", repo.snapshot];
+            let untracked = ["ls-files", "--others", "--exclude-standard", "-z"];
+            for (step, listing) in [("tree diff", &tracked[..]), ("tree listing", &untracked[..])] {
+                let args = [&pins[..], listing].concat();
+                let listed = self
+                    .output((step, GitClass::Long), repo, &args, (None, TREE_LISTING), console)
+                    .map_err(|failed| said(console, &failed))?;
+                let text = String::from_utf8_lossy(&listed);
+                paths.extend(text.split('\0').filter(|path| !path.is_empty()).map(|path| format!("{prefix}{path}")));
+            }
+        }
+        Ok(paths)
     }
 
     /// The `/`-separated paths the main repo's back commit `commit` changes against its back parent
