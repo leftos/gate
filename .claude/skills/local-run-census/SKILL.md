@@ -12,7 +12,7 @@ A `git commit` is one of those families only when no gate is nested in it: a com
 ## Run the query
 
 ```
-uv run --no-project python -I .claude/skills/local-run-census/census.py [--days N | --since ISO] [--journal DIR] [--json OUT]
+uv run --no-project python -I .claude/skills/local-run-census/census.py [--days N | --since ISO] [--journal DIR] [--remote FILE] [--json OUT]
 ```
 
 Run it through the launcher (`-Slot light -TimeoutSeconds 600`) and always pass `--json`: the gate prints only the tail of a long report.
@@ -20,6 +20,8 @@ Run it through the launcher (`-Slot light -TimeoutSeconds 600`) and always pass 
 Rebuild the Markdown from the JSON with `uv run --no-project python -I -c "import json, pathlib, sys; sys.path.insert(0, '.claude/skills/local-run-census'); import census; pathlib.Path('.tmp/census.md').write_text(census.render(json.loads(pathlib.Path('.tmp/census.json').read_text(encoding='utf-8'))), encoding='utf-8', newline='\n')"` from the repo root.
 
 The default window is the last 7 days; `--journal` defaults to `%LOCALAPPDATA%\gate\v1`. Tests: `uv run --no-project python -I -m unittest discover -s .claude/skills/local-run-census -p "test_*.py"`.
+
+Builder host names and addresses that `remote.json` lists are replaced with `{builder}` in every family and reason; `--remote` names another `remote.json`.
 
 What the script counts:
 
@@ -42,12 +44,14 @@ What the script counts:
   A commit with a covered or lent nested gate has no time to take out of its wall seconds: its whole `wallSeconds` counts in `git commit`, truly local, no `git commit (ungated hooks)` row is added for it, and the footer counts it under `commits with covered hook gates, share not split`. That gate still counts in its family with no seconds.
 
   The uncovered share is reported as the row `git commit (ungated hooks)` in the state blocked on work, its blocker `ungated hook commands in the repo's git hooks`, since gating them is a change in that repo. No row is added when the share is 0 s, or when the commit's `release` has no `wallSeconds`. A commit with no nested gate stays in the `git commit` family, truly local.
+
+  **A routed commit stage**: a commit whose `release` carries a `stage` with any outcome but `fellBack` ran its hooks on a builder: it counts as one routed run with the stage's seconds, and its own `wallSeconds` still count as local seconds; `commitSplit` gives `routedStages` and `stageSeconds` per repo.
 - **Per (repo, family), heavy runs only**: local, routed, unfinished and covered counts; total and median local `wallSeconds`; median routed `wallSeconds`; local verdicts; `notRouted` values; fallback reasons. Sorted by total local seconds.
 
   The `--json` output's `commitSplit` key gives, per repo, the heavy commit runs read (`commits`), how many had a nested gate, their uncovered seconds, how many were not split for a covered hook gate, and how many gates each link method found; the footer gives both link counts and the unsplit count for the whole window.
 - **The `--local` runs** of every kind, by repo, family and `reason`, a gate nested in a commit included.
 
-The report names repos and families only: it never prints a `cwd`, `log`, `host` or `key`, and free-text reasons have absolute paths replaced by `<path>`. The repo is public, so keep it that way in the note.
+The report names repos and families only: it never prints a `cwd`, `log`, `host` or `key`, free-text reasons have absolute paths replaced by `<path>`, and replaces every builder name `remote.json` lists with `{builder}`. The repo is public, so keep it that way in the note.
 
 **The archive keeps only `release` lines, and a release carries the run's routing facts**: `notRouted` and `reason` as its `queue` says them, `fellBack` with one reason per fallback attempt, `balanced` (the builders a routed run's decision scored, which the census does not read), and `parentPid` as its `take` says it. So the `notRouted` cells, the fallback reasons and the `--local` table cover every run journalled since, archived or not. A run released before the gate wrote them onto its release keeps none: judge its family from its commands, not from an empty `notRouted` cell.
 

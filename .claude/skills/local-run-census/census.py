@@ -92,6 +92,34 @@ def scrub(text: str) -> str:
     return "".join(pieces)
 
 
+def builder_names(remote: dict[str, Any]) -> list[str]:
+    """Every builder name ``remote.json`` holds, longest first so a whole ``user@host`` goes before its host."""
+    hosts = [remote.get("host")]
+    hosts += [
+        builder.get("host")
+        for builder in remote.get("builders") or []
+        if isinstance(builder, dict)
+    ]
+    names: set[str] = set()
+    for host in hosts:
+        if not isinstance(host, str) or not host:
+            continue
+        names.add(host)
+        if "@" in host:
+            names.add(host.rsplit("@", 1)[1])
+    data = remote.get("data")
+    if isinstance(data, str) and data:
+        names.add(data)
+    return sorted(names, key=len, reverse=True)
+
+
+def hide_builders(text: str, names: list[str]) -> str:
+    """Replaces every builder name in ``text`` with ``{builder}``, case-insensitively."""
+    for name in names:
+        text = re.sub(re.escape(name), "{builder}", text, flags=re.IGNORECASE)
+    return text
+
+
 def _path_end(text: str, start: int) -> int:
     quotes = [
         index for index in (text.find(quote, start) for quote in "\"'") if index != -1
@@ -801,7 +829,12 @@ class Family:
     fallbacks: Counter[str] = field(default_factory=Counter)
 
     def add(self, run: Run, covered: bool) -> None:
-        """Counts one heavy run into the family; a covered run counts as local with no seconds."""
+        """Counts one heavy run into the family; a covered run counts as local with no seconds.
+
+        A commit whose hooks ran as a stage on a builder counts as one routed run with
+        the stage's seconds, and its own ``wallSeconds`` still count as local seconds:
+        the stage ended before the commit's clock started, so nothing is subtracted.
+        """
         if covered:
             self.local += 1
             self.covered += 1
@@ -815,8 +848,12 @@ class Family:
             return
         seconds = run.release.get("wallSeconds")
         routed = run.release.get("remote") is True
+        stage = _stage_seconds(run.release)
         if routed:
             self.routed += 1
+        elif stage is not None:
+            self.routed += 1
+            self.routed_seconds.append(stage)
         else:
             self.local += 1
             self.verdicts[str(run.release.get("verdict"))] += 1
@@ -841,6 +878,15 @@ class CommitSplit:
     unsplit: Counter[str] = field(default_factory=Counter)
     by_parent_pid: Counter[str] = field(default_factory=Counter)
     by_containment: Counter[str] = field(default_factory=Counter)
+    routed_stages: Counter[str] = field(default_factory=Counter)
+    stage_seconds: dict[str, float] = field(default_factory=lambda: defaultdict(float))
+
+    def add_stage(self, repo: str, release: dict[str, Any] | None) -> None:
+        """Counts a commit whose hooks ran as a stage on a builder."""
+        seconds = _stage_seconds(release)
+        if seconds is not None:
+            self.routed_stages[repo] += 1
+            self.stage_seconds[repo] += seconds
 
     def as_data(self) -> dict[str, dict[str, Any]]:
         """The split as the census's JSON key: one entry per repo with a commit run."""
@@ -853,6 +899,8 @@ class CommitSplit:
                 "unsplitCommits": self.unsplit[repo],
                 "linkedByParentPid": self.by_parent_pid[repo],
                 "linkedByContainment": self.by_containment[repo],
+                "routedStages": self.routed_stages[repo],
+                "stageSeconds": round(self.stage_seconds.get(repo, 0.0), 1),
             }
             for repo in repos
         }
@@ -873,6 +921,17 @@ def _wall_seconds(line: dict[str, Any] | None) -> float | None:
     if line is None:
         return None
     seconds = line.get("wallSeconds")
+    return float(seconds) if isinstance(seconds, int | float) else None
+
+
+def _stage_seconds(line: dict[str, Any] | None) -> float | None:
+    """A release's routed-stage seconds, or None when its hooks ran nowhere else."""
+    if line is None:
+        return None
+    stage = line.get("stage")
+    if not isinstance(stage, dict) or stage.get("outcome") == "fellBack":
+        return None
+    seconds = stage.get("seconds")
     return float(seconds) if isinstance(seconds, int | float) else None
 
 
@@ -931,6 +990,7 @@ def _split_commit(
     """
     split.commits[repo] += 1
     split.with_nested[repo] += 1
+    split.add_stage(repo, run.release)
     nested_seconds = 0.0
     unknown = False
     for child in run.nested:
@@ -980,6 +1040,7 @@ def take_census(runs: Iterable[Run], name_repo: RepoNamer) -> Census:
             continue
         if is_commit(run):
             split.commits[key[0]] += 1
+            split.add_stage(key[0], run.release)
         families[key].add(run, covered=False)
     return Census(dict(families), local_runs, lent, split)
 
@@ -1000,13 +1061,13 @@ def _cell(value: object) -> str:
     return text.replace("|", "\\|")
 
 
-def heavy_rows(census: Census) -> list[dict[str, Any]]:
+def heavy_rows(census: Census, builders: list[str]) -> list[dict[str, Any]]:
     """The heavy-family rows, largest total local seconds first."""
     rows = []
     for (repo, family), figures in census.families.items():
         row = {
             "repo": repo,
-            "family": family,
+            "family": hide_builders(family, builders),
             "local": figures.local,
             "routed": figures.routed,
             "unfinished": figures.unfinished,
@@ -1026,10 +1087,15 @@ def heavy_rows(census: Census) -> list[dict[str, Any]]:
     return rows
 
 
-def local_rows(census: Census) -> list[dict[str, Any]]:
+def local_rows(census: Census, builders: list[str]) -> list[dict[str, Any]]:
     """The ``--local`` runs per repo, family and reason, most first."""
     rows = [
-        {"repo": repo, "family": family, "reason": scrub(reason), "runs": count}
+        {
+            "repo": repo,
+            "family": hide_builders(family, builders),
+            "reason": hide_builders(scrub(reason), builders),
+            "runs": count,
+        }
         for (repo, family, reason), count in census.local_runs.items()
     ]
     rows.sort(key=lambda row: (-row["runs"], row["repo"], row["family"], row["reason"]))
@@ -1095,11 +1161,15 @@ def _footer(data: dict[str, Any]) -> list[str]:
     elif queues_from <= window["start"]:
         coverage = "the live queue lines cover the whole window."
     else:
-        coverage = f"the live queue lines cover only the runs queued from {queues_from}."
+        coverage = (
+            f"the live queue lines cover only the runs queued from {queues_from}."
+        )
     split = data["commitSplit"]
     by_parent_pid = sum(entry["linkedByParentPid"] for entry in split.values())
     by_containment = sum(entry["linkedByContainment"] for entry in split.values())
     unsplit = sum(entry["unsplitCommits"] for entry in split.values())
+    stages = sum(entry["routedStages"] for entry in split.values())
+    stage_seconds = round(sum(entry["stageSeconds"] for entry in split.values()), 1)
     return [
         f"- Window: {window['start']} to {window['end']} (UTC).",
         (
@@ -1116,6 +1186,10 @@ def _footer(data: dict[str, Any]) -> list[str]:
             f"and parentPid, and one journalled before the gate wrote them keeps none; {coverage}"
         ),
         f"- nested gates linked by parentPid: {by_parent_pid}; by containment: {by_containment}.",
+        (
+            f"- commit runs whose hooks ran on a builder: {stages} "
+            f"({stage_seconds} s on the builder)."
+        ),
         f"- commits with covered hook gates, share not split: {unsplit}.",
     ]
 
@@ -1155,6 +1229,25 @@ def _default_journal() -> Path:
     return Path(local) / "gate" / "v1"
 
 
+def _default_remote() -> Path | None:
+    """The ``remote.json`` whose builder names are hidden, or None when this PC has no local app data."""
+    local = os.environ.get("LOCALAPPDATA")
+    return Path(local) / "gate" / "remote.json" if local else None
+
+
+def _remote_builders(path: Path | None) -> list[str]:
+    """The builder names ``remote.json`` holds; a file that is absent means no names."""
+    if path is None or not path.exists():
+        return []
+    try:
+        remote = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        sys.exit(f"census: cannot read {path}: {error}")
+    if not isinstance(remote, dict):
+        sys.exit(f"census: cannot read {path}: not a JSON object")
+    return builder_names(remote)
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Census of the gate journal's heavy runs over a window."
@@ -1176,6 +1269,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="the journal folder (default %%LOCALAPPDATA%%\\gate\\v1)",
     )
     parser.add_argument(
+        "--remote",
+        type=Path,
+        help="the remote.json holding the builder names to hide "
+        "(default %%LOCALAPPDATA%%\\gate\\remote.json)",
+    )
+    parser.add_argument(
         "--json", type=Path, help="also write the census as JSON to this file"
     )
     return parser.parse_args(argv)
@@ -1191,7 +1290,12 @@ def _first_queue(events: Iterable[dict[str, Any]]) -> str | None:
 
 
 def census_data(
-    journal: Journal, start: datetime, end: datetime, name_repo: RepoNamer
+    journal: Journal,
+    start: datetime,
+    end: datetime,
+    name_repo: RepoNamer,
+    *,
+    builders: list[str],
 ) -> dict[str, Any]:
     """The census of a journal over ``[start, end]``, as the JSON the report renders from."""
     runs, headless = group_runs(journal.events, start, end)
@@ -1209,8 +1313,8 @@ def census_data(
         "queuesFrom": _first_queue(journal.events),
         "lent": census.lent,
         "commitSplit": census.split.as_data(),
-        "heavy": heavy_rows(census),
-        "local": local_rows(census),
+        "heavy": heavy_rows(census, builders),
+        "local": local_rows(census, builders),
     }
 
 
@@ -1224,7 +1328,13 @@ def main(argv: list[str] | None = None) -> int:
         sys.exit(
             f"census: no journal files in {folder}; pass --journal <folder holding events.jsonl>"
         )
-    data = census_data(read_journal(folder), start, now, RepoNamer())
+    data = census_data(
+        read_journal(folder),
+        start,
+        now,
+        RepoNamer(),
+        builders=_remote_builders(args.remote or _default_remote()),
+    )
     if args.json is not None:
         args.json.write_text(
             json.dumps(data, indent=2) + "\n", encoding="utf-8", newline="\n"

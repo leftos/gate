@@ -313,7 +313,9 @@ class ReleaseFactsTests(unittest.TestCase):
 
     @staticmethod
     def census_of(*events: dict[str, object]) -> dict[str, object]:
-        return census.census_data(journal_of(*events), START, END, census.RepoNamer())
+        return census.census_data(
+            journal_of(*events), START, END, census.RepoNamer(), builders=[]
+        )
 
     @staticmethod
     def rows(data: dict) -> dict[tuple[str, str], dict]:
@@ -337,7 +339,14 @@ class ReleaseFactsTests(unittest.TestCase):
         )
         self.assertEqual(
             data["local"],
-            [{"repo": "demo", "family": "cargo test", "reason": "built here", "runs": 1}],
+            [
+                {
+                    "repo": "demo",
+                    "family": "cargo test",
+                    "reason": "built here",
+                    "runs": 1,
+                }
+            ],
         )
 
     def test_archive_day_counts_fallbacks_from_release_fell_back(self) -> None:
@@ -430,7 +439,14 @@ class ReleaseFactsTests(unittest.TestCase):
         self.assertEqual(build["fallbacks"], {"full": 1})
         self.assertEqual(
             data["local"],
-            [{"repo": "demo", "family": "cargo test", "reason": "from the queue", "runs": 1}],
+            [
+                {
+                    "repo": "demo",
+                    "family": "cargo test",
+                    "reason": "from the queue",
+                    "runs": 1,
+                }
+            ],
         )
 
 
@@ -477,7 +493,9 @@ class RunTests(unittest.TestCase):
             line("fallback", 6, at, reason="busy"),
         ]
         runs, _ = census.group_runs(events, START, END)
-        data = census.census_data(journal_of(*events), START, END, census.RepoNamer())
+        data = census.census_data(
+            journal_of(*events), START, END, census.RepoNamer(), builders=[]
+        )
         self.assertEqual(len(runs), 6)
         (row,) = data["heavy"]
         self.assertEqual((row["local"], row["routed"], row["unfinished"]), (3, 1, 1))
@@ -509,14 +527,16 @@ class RunTests(unittest.TestCase):
             )
         ]
         (row,) = census.census_data(
-            journal_of(*events), START, END, census.RepoNamer()
+            journal_of(*events), START, END, census.RepoNamer(), builders=[]
         )["heavy"]
         self.assertIsNone(row["localMedianSeconds"])
         self.assertEqual(row["localSecondsTotal"], 0)
 
     def test_an_empty_window_says_so(self) -> None:
         report = census.render(
-            census.census_data(journal_of(), START, END, census.RepoNamer())
+            census.census_data(
+                journal_of(), START, END, census.RepoNamer(), builders=[]
+            )
         )
         self.assertIn(census.NO_HEAVY_LOCAL, report)
 
@@ -530,7 +550,9 @@ class CommitSplitTests(unittest.TestCase):
 
     @staticmethod
     def census_of(*events: dict[str, object]) -> dict[str, object]:
-        return census.census_data(journal_of(*events), START, END, census.RepoNamer())
+        return census.census_data(
+            journal_of(*events), START, END, census.RepoNamer(), builders=[]
+        )
 
     @staticmethod
     def rows(data: dict) -> dict[tuple[str, str], dict]:
@@ -844,6 +866,8 @@ class CommitSplitTests(unittest.TestCase):
                     "unsplitCommits": 0,
                     "linkedByParentPid": 1,
                     "linkedByContainment": 0,
+                    "routedStages": 0,
+                    "stageSeconds": 0.0,
                 },
                 "other": {
                     "commits": 1,
@@ -852,6 +876,8 @@ class CommitSplitTests(unittest.TestCase):
                     "unsplitCommits": 0,
                     "linkedByParentPid": 0,
                     "linkedByContainment": 0,
+                    "routedStages": 0,
+                    "stageSeconds": 0.0,
                 },
             },
         )
@@ -880,7 +906,9 @@ class NestedLinkTests(unittest.TestCase):
 
     @staticmethod
     def census_of(*events: dict[str, object]) -> dict[str, object]:
-        return census.census_data(journal_of(*events), START, END, census.RepoNamer())
+        return census.census_data(
+            journal_of(*events), START, END, census.RepoNamer(), builders=[]
+        )
 
     @staticmethod
     def rows(data: dict) -> dict[tuple[str, str], dict]:
@@ -1182,7 +1210,9 @@ class SplitRuleTests(unittest.TestCase):
 
     @staticmethod
     def census_of(*events: dict[str, object]) -> dict[str, object]:
-        return census.census_data(journal_of(*events), START, END, census.RepoNamer())
+        return census.census_data(
+            journal_of(*events), START, END, census.RepoNamer(), builders=[]
+        )
 
     @staticmethod
     def rows(data: dict) -> dict[tuple[str, str], dict]:
@@ -1427,6 +1457,210 @@ class SplitRuleTests(unittest.TestCase):
         self.assertEqual((split["withNested"], split["linkedByContainment"]), (1, 1))
 
 
+STAGE_HOST = "builder@example-host"
+
+
+class StageTests(unittest.TestCase):
+    """A commit whose hooks ran as a stage on a builder: what the census counts it as."""
+
+    @staticmethod
+    def census_of(*events: dict[str, object]) -> dict[str, object]:
+        return census.census_data(
+            journal_of(*events), START, END, census.RepoNamer(), builders=[]
+        )
+
+    @staticmethod
+    def rows(data: dict) -> dict[tuple[str, str], dict]:
+        return {(row["repo"], row["family"]): row for row in data["heavy"]}
+
+    @staticmethod
+    def stage(outcome: str, seconds: float) -> dict[str, object]:
+        return {
+            "host": STAGE_HOST,
+            "key": "work-key",
+            "status": 0,
+            "outcome": outcome,
+            "seconds": seconds,
+        }
+
+    def test_a_routed_stage_counts_the_commit_routed_with_the_stage_seconds(
+        self,
+    ) -> None:
+        at = START + timedelta(hours=2)
+        for outcome in ("applied", "clean"):
+            with self.subTest(outcome=outcome):
+                events = [
+                    line(
+                        "queue",
+                        110,
+                        at - timedelta(seconds=30),
+                        commit=True,
+                        command=COMMIT_COMMAND,
+                    ),
+                    line(
+                        "release",
+                        110,
+                        at,
+                        commit=True,
+                        wallSeconds=4.0,
+                        verdict="passed",
+                        command=COMMIT_COMMAND,
+                        stage=self.stage(outcome, 12.5),
+                    ),
+                ]
+                data = self.census_of(*events)
+                row = self.rows(data)[("demo", "git commit")]
+                self.assertEqual((row["routed"], row["local"]), (1, 0))
+                self.assertEqual(row["routedMedianSeconds"], 12.5)
+                self.assertEqual(row["localSecondsTotal"], 4.0)
+
+    def test_a_fallen_back_stage_counts_the_commit_local(self) -> None:
+        at = START + timedelta(hours=2)
+        data = self.census_of(
+            line(
+                "release",
+                111,
+                at,
+                commit=True,
+                wallSeconds=4.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+                stage=self.stage("fellBack", 12.5),
+            )
+        )
+        row = self.rows(data)[("demo", "git commit")]
+        self.assertEqual((row["routed"], row["local"]), (0, 1))
+        self.assertEqual(row["localSecondsTotal"], 4.0)
+
+    def test_a_stage_whose_hooks_failed_still_ran_on_the_builder(self) -> None:
+        at = START + timedelta(hours=2)
+        data = self.census_of(
+            line(
+                "release",
+                112,
+                at,
+                commit=True,
+                verdict="failed",
+                command=COMMIT_COMMAND,
+                stage=self.stage("hooksFailed", 7.0),
+            )
+        )
+        row = self.rows(data)[("demo", "git commit")]
+        self.assertEqual((row["routed"], row["local"]), (1, 0))
+        self.assertEqual(row["routedMedianSeconds"], 7.0)
+        self.assertEqual(row["localSecondsTotal"], 0)
+
+    def test_commit_split_counts_routed_stages(self) -> None:
+        at = START + timedelta(hours=2)
+        data = self.census_of(
+            line(
+                "release",
+                113,
+                at,
+                commit=True,
+                wallSeconds=4.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+                stage=self.stage("applied", 10.0),
+            ),
+            line(
+                "release",
+                114,
+                at,
+                commit=True,
+                wallSeconds=3.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+                stage=self.stage("fellBack", 9.0),
+            ),
+        )
+        split = data["commitSplit"]["demo"]
+        self.assertEqual(split["routedStages"], 1)
+        self.assertEqual(split["stageSeconds"], 10.0)
+
+    def test_an_archived_release_keeps_its_stage(self) -> None:
+        at = START + timedelta(hours=2)
+        data = self.census_of(
+            line(
+                "release",
+                115,
+                at,
+                commit=True,
+                wallSeconds=4.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+                stage=self.stage("applied", 12.5),
+            )
+        )
+        row = self.rows(data)[("demo", "git commit")]
+        self.assertEqual(row["routed"], 1)
+        self.assertEqual(row["routedMedianSeconds"], 12.5)
+
+
+class BuilderNameTests(unittest.TestCase):
+    """A builder's name never reaches the report."""
+
+    @staticmethod
+    def census_of(*events: dict[str, object], builders: list[str]) -> dict[str, object]:
+        return census.census_data(
+            journal_of(*events), START, END, census.RepoNamer(), builders=builders
+        )
+
+    def test_builder_names_take_host_and_host_part_not_user(self) -> None:
+        names = census.builder_names(
+            {
+                "host": "ci@box-one",
+                "data": "10.0.0.9",
+                "builders": [{"host": "ci@mac-two"}],
+            }
+        )
+        for name in ("ci@box-one", "box-one", "10.0.0.9", "ci@mac-two", "mac-two"):
+            self.assertIn(name, names)
+        self.assertNotIn("ci", names)
+
+    def test_a_reason_naming_a_builder_is_hidden(self) -> None:
+        at = START + timedelta(hours=2)
+        builders = census.builder_names({"builders": [{"host": "ci@mac-two"}]})
+        data = self.census_of(
+            line(
+                "queue",
+                130,
+                at,
+                notRouted="--local",
+                reason="routed run landed on mac-two, which skips X",
+            ),
+            line("release", 130, at, wallSeconds=2.0, verdict="passed"),
+            builders=builders,
+        )
+        self.assertEqual(
+            data["local"][0]["reason"],
+            "routed run landed on {builder}, which skips X",
+        )
+
+    def test_main_refuses_an_unreadable_remote_json(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            folder = Path(root)
+            write_lines(
+                folder / "journal" / "events.jsonl",
+                [json.dumps(line("release", 140, START + timedelta(hours=1)))],
+            )
+            remote = folder / "remote.json"
+            remote.write_text("{not json", encoding="utf-8", newline="\n")
+            with self.assertRaises(SystemExit) as raised:
+                census.main(
+                    [
+                        "--journal",
+                        str(folder / "journal"),
+                        "--remote",
+                        str(remote),
+                    ]
+                )
+        self.assertTrue(
+            str(raised.exception).startswith("census: cannot read"),
+            str(raised.exception),
+        )
+
+
 class NoMachinePathTests(unittest.TestCase):
     """No machine path reaches the Markdown or the JSON."""
 
@@ -1465,7 +1699,9 @@ class NoMachinePathTests(unittest.TestCase):
                     verdict="passed",
                 ),
             ]
-        data = census.census_data(journal_of(*events), START, END, census.RepoNamer())
+        data = census.census_data(
+            journal_of(*events), START, END, census.RepoNamer(), builders=[]
+        )
         for text in (census.render(data), json.dumps(data)):
             self.assertIsNone(
                 MACHINE_PATH.search(text), MACHINE_PATH.search(text) and text
