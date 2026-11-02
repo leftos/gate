@@ -78,7 +78,8 @@ fn projects(files: &[OsString], console: &mut Console) -> Result<BTreeSet<PathBu
 }
 
 /// Adds every project of `file`'s nearest project folder, walking up from its own folder to the drive root; a folder
-/// that is not there carries on upward, a folder that cannot be read fails.
+/// that is not there carries on upward, a folder that cannot be read fails, and a file with no project above it gets a
+/// notice and adds none.
 fn add_projects(projects: &mut BTreeSet<PathBuf>, file: &OsString, console: &mut Console) -> Result<(), u32> {
     let full = std::path::absolute(file).map_err(|error| {
         console.err(&format!("gate: csharp format: cannot read {}: {error}", Path::new(file).display()));
@@ -100,6 +101,10 @@ fn add_projects(projects: &mut BTreeSet<PathBuf>, file: &OsString, console: &mut
         }
         folder = current.parent();
     }
+    console.err(&format!(
+        "gate: csharp format: no project above {}; it gets no restore",
+        Path::new(file).display()
+    ));
     Ok(())
 }
 
@@ -587,7 +592,33 @@ mod tests {
         assert_eq!(status, 0, "{:?}", script.spoken());
         assert!(script.verb("restore").is_empty(), "{:?}", script.spoken());
         assert_eq!(script.formats(), 1, "{:?}", script.spoken());
-        assert!(said.is_empty(), "{said:?}");
+        assert_eq!(
+            said,
+            [format!("gate: csharp format: no project above {}; it gets no restore", file.display())],
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn two_files_outside_a_project_each_get_the_notice() {
+        let root = folder("csharp-format-two-without-project");
+        let one = root.join("a.cs");
+        let two = root.join("b.cs");
+        make_file(&one);
+        make_file(&two);
+
+        let (status, script, said) = run(&[&one, &two], vec![status(0), status(0), status(0)]);
+
+        assert_eq!(status, 0, "{:?}", script.spoken());
+        assert!(script.verb("restore").is_empty(), "{:?}", script.spoken());
+        assert_eq!(
+            said,
+            [
+                format!("gate: csharp format: no project above {}; it gets no restore", one.display()),
+                format!("gate: csharp format: no project above {}; it gets no restore", two.display()),
+            ],
+            "{said:?}"
+        );
     }
 
     #[test]
@@ -785,6 +816,8 @@ mod tests {
     fn a_program_that_cannot_start_fails() {
         let root = folder("csharp-format-cannot-start");
         let file = root.join("a.cs");
+        make_file(&root.join("a.csproj"));
+        make_file(&root.join("obj").join("project.assets.json"));
         make_file(&file);
 
         let (status, script, said) = run(&[&file], vec![Answer::CannotStart]);
