@@ -149,7 +149,7 @@ A word that still holds a `\` (a regex, a list, script text after `bash -c` or `
 
 ### Several builders
 
-List each further builder in `remote.json`'s `builders` array, beside `host`. A builder that refuses a routed run or cannot be reached hands the run to the next builder that matches the command, then `host`, and the PC runs it only when none takes it.
+List each further builder in `remote.json`'s `builders` array, beside `host`. A builder that refuses a routed run or cannot be reached hands the run to the next builder that matches the command, then `host`, and the PC runs it only when none takes it (a desktop run fails instead, see below).
 
 Which refusals hand the run on, the order, the one wait shared by every builder and the lines the run says are in [design.md, The next builder](design.md#routing); a repo owner adds nothing beyond the list.
 
@@ -180,9 +180,13 @@ The PC consents in `remote.json`: `"desktop": {"<repo>": ["dotnet test *Ui*"]}`,
 
 A desktop run never runs on the PC: a reason found after the pattern matched that would keep an ordinary command here (a siblings problem, a word outside the worktree, nothing to send, gitignored inputs it cannot carry, a fact that cannot be read, a word that is not valid Unicode, only macOS builders left) refuses it instead, `gate: not routed: <the reason>; a desktop run never runs here`, exit 2, before anything runs. A light desktop run is never kept here as faster here. `--local`, a `.gate/local.toml` match, a pattern without consent and an unusable `.gate/desktop.toml` still keep it here.
 
+When no builder can run it, a desktop run fails with exit 1 instead of running on the PC: `gate: remote <alias> <reason>; a desktop run never runs here` after the builders that can take it have each been tried (a full pool, a busy work folder key, an unreachable or outdated builder hop on first). A busy desktop that stays busy for the run's ceiling says the box's `gate: not routed: the builder's desktop stayed busy for <n> s` first. A connection lost after the command started says `rebooted` or `unreachable` `after the command started; it may have run there`, and the run tries no other builder. `--builder` keeps its own `--builder given` line.
+
+A locked desktop run waits for the builder's desktop up to its ceiling, then fails; it can wait that long and then run that long, so give it a ceiling that covers both. Its waits for the PC's remote pool and slots and for the work folder's key come out of that same budget, where other runs wait 60 s and 90 s, and it waits out a `gate warm` holding the key. A light run a critical request reroutes to a builder is not treated as a desktop run.
+
 Without the consent the command runs here with `gate: not routed: desktop pattern '<pattern>' not allowed in remote.json`.
 
-A `.gate/desktop.toml` the gate cannot use keeps every routed command of the repo here with `gate: not routed: .gate/desktop.toml: <problem>`, said ahead of any later reason, so fix it before relying on routing. A desktop run holds a remote slot while it waits for the desktop, up to the larger of 60 s and its usual routed p90, and the waiting box names the run that holds the desktop. Format and rules: [design.md](design.md#remotejson).
+A `.gate/desktop.toml` the gate cannot use keeps every routed command of the repo here with `gate: not routed: .gate/desktop.toml: <problem>`, said ahead of any later reason, so fix it before relying on routing. A desktop run holds a remote slot while it waits for the desktop, up to its own ceiling, and the waiting box names the run that holds the desktop. Format and rules: [design.md](design.md#remotejson).
 
 ### A command that needs only the console session
 
@@ -194,7 +198,7 @@ A session run is handed to the console session like a desktop run but never take
 - It raises no UAC prompt.
 - It uses per-run names for credentials and named objects (mutexes, pipes, ports, temp folders), since two worktrees or PCs of one repo can now overlap where the lock queued them.
 
-A locked console or an input desktop other than `Default` still refuses a session run, which then runs here. Concurrent session runs' MSYS programs start reliably because the builder's console-session MSYS keeper task (`build-box-msys-console-keeper`, in the builder steps above) keeps an MSYS process alive in that session.
+A locked console or an input desktop other than `Default` still refuses a session run, which then fails like any desktop run rather than running here. Concurrent session runs' MSYS programs start reliably because the builder's console-session MSYS keeper task (`build-box-msys-console-keeper`, in the builder steps above) keeps an MSYS process alive in that session.
 
 Commit a `session` key only after the reinstall that carries this change, on the PC and (through `gate push`) on the builders: an older gate.exe reads the key as a `.gate/desktop.toml` problem (`session is not a key (patterns)`) and keeps all of the repo's runs here.
 

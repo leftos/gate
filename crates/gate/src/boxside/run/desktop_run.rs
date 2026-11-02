@@ -3,7 +3,7 @@
 //! run gave (a locked run; a session run takes none) and reads the console's session once more, and then the
 //! hand-off of the command to the desktop helper ([`hand_off`]). Every failure of the desktop's machinery before the
 //! command's start marker is a refusal: the box's `desktop` tag and its line, exit 75, and never a back commits line,
-//! so the PC runs the command itself.
+//! so the PC ends the run with the reason, never running a desktop command itself.
 
 mod hand_off;
 
@@ -380,7 +380,7 @@ fn desktop_refused(request: &Request<'_>, refused: &ConsoleRefused, beat: &Beat<
 }
 
 /// Refuses the run for the builder's desktop: the `desktop` refusal tag, then `lines`, said together under the box's
-/// output lock, so the PC runs the command itself.
+/// output lock, so the PC ends the run with the reason, never running a desktop command itself.
 fn said_refused(request: &Request<'_>, lines: &[String], beat: &Beat<'_>, console: &mut Console) -> DesktopEnd {
     let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
     stamping::protocol(console, &refused_line(request.nonce, Refusal::Desktop));

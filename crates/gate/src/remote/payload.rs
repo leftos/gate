@@ -17,7 +17,6 @@ use serde_json::{Map, Value, json};
 use crate::remote::channel::Asked;
 use crate::remote::snapshot::IDENTITY;
 use crate::remote::transport::Profile;
-use crate::wait::REMOTE_LIMIT;
 
 /// The gate a builder runs, from its admin-owned `C:\Program Files\gate\bin`, named literally.
 pub(crate) const BOX_EXE: &str = r#""C:\Program Files\gate\bin\gate.exe""#;
@@ -179,9 +178,6 @@ pub(crate) struct RunCall<'a> {
     /// desktop wait in whole seconds ([`desktop_wait`]), sent only for a desktop run, with `DesktopSession: true` for a
     /// session one); a warm-up never sends them, as the box refuses a warm-up on the desktop.
     pub desktop: Option<DesktopMode>,
-    /// The usual p90 of the run's remote take in seconds, which a desktop run's `DesktopWait` grows to; `None` without
-    /// history.
-    pub usual_p90: Option<f64>,
     /// The cross build a macOS builder runs after the passing command (`CrossBuild`, its `Rid` and `Words`, sent only
     /// when there is one and the run asks for outputs, as the box takes it only then); a warm-up never sends it.
     pub cross_build: Option<&'a CrossBuild>,
@@ -307,24 +303,16 @@ pub(crate) fn drain_word(root: &str, action: DrainAction) -> String {
     word(&object)
 }
 
-/// How long a desktop run may wait for the builder's desktop, in whole seconds: the larger of [`REMOTE_LIMIT`] and the
-/// run's usual p90 `usual_p90` rounded up, or [`REMOTE_LIMIT`] for a run with no usual p90; never past
-/// [`MAX_WHOLE_NUMBER`], the box's most.
-fn desktop_wait(usual_p90: Option<f64>) -> u64 {
-    // A float-to-integer cast saturates, so a p90 past `u64::MAX` seconds is `u64::MAX`.
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "a negative or NaN p90 casts to 0, under the floor"
-    )]
-    let usual = usual_p90.map_or(0, |p90| p90.ceil() as u64);
-    // At most the longest whole number the box takes, so a huge p90 waits that long rather than refusing the payload.
-    usual.clamp(REMOTE_LIMIT.as_secs(), MAX_WHOLE_NUMBER)
+/// How long a desktop run may wait for the builder's desktop, in whole seconds: the run's `timeout`, the `Timeout` its
+/// payload sends, so it waits for the desktop as long as it may run there; at least 1, and never past
+/// [`MAX_WHOLE_NUMBER`], the box's most, so a huge ceiling waits that long rather than refusing the payload.
+fn desktop_wait(timeout: u64) -> u64 {
+    timeout.clamp(1, MAX_WHOLE_NUMBER)
 }
 
 /// The payload word of the run call, with the run's variables (the caller's `--env` pairs and the gate's
 /// `SourceRevisionId`) as `Env` when there is one, and `Desktop: true`
-/// with `DesktopWait` ([`desktop_wait`], which the box caps at the run's `Timeout`) for a run that asks for the
+/// with `DesktopWait` ([`desktop_wait`], the run's `Timeout`) for a run that asks for the
 /// builder's desktop, with `DesktopSession: true` beside them for a session run, which takes no desktop lock (a box
 /// that does not know the key takes the lock), `CrossBuild` (`Rid` and `Words`) for a run with a cross build and output globs, and the
 /// repos' default branches as `Base` and `SiblingBases` when any has one, and `CommitStage: true` with the PC's `Head`
@@ -353,7 +341,7 @@ pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
     }
     if let Some(mode) = run.desktop {
         object.insert("Desktop".to_owned(), json!(true));
-        object.insert("DesktopWait".to_owned(), json!(desktop_wait(run.usual_p90)));
+        object.insert("DesktopWait".to_owned(), json!(desktop_wait(run.timeout)));
         if mode == DesktopMode::Session {
             object.insert("DesktopSession".to_owned(), json!(true));
         }
@@ -676,7 +664,6 @@ mod tests {
             unreal_version: None,
             engine_env: &[],
             desktop: None,
-            usual_p90: None,
         };
         run_word(&location().with_pair("app", &["lib".to_owned(), "tools".to_owned()]), &run)
     }
@@ -929,7 +916,6 @@ mod tests {
             unreal_version: None,
             engine_env: &[],
             desktop: None,
-            usual_p90: None,
         };
         let mut expected = preflight;
         let extra = json!({
@@ -981,7 +967,6 @@ mod tests {
             unreal_version: None,
             engine_env: &[],
             desktop: None,
-            usual_p90: None,
         };
 
         let sent = decoded(&run_word(&location(), &run));
@@ -1058,7 +1043,6 @@ mod tests {
             unreal_version: None,
             engine_env: &[],
             desktop: None,
-            usual_p90: None,
         };
 
         let word = run_word(&location(), &run);
@@ -1103,7 +1087,6 @@ mod tests {
             unreal_version: None,
             engine_env: &[],
             desktop: None,
-            usual_p90: None,
         };
         let commands = warm_commands();
         let warm = WarmCall {
@@ -1154,7 +1137,6 @@ mod tests {
             unreal_version: Some("5.8.0"),
             engine_env: &[],
             desktop: None,
-            usual_p90: None,
         };
         let commands = warm_commands();
         let warm = WarmCall {
@@ -1206,7 +1188,6 @@ mod tests {
             unreal_version: None,
             engine_env: &names,
             desktop: None,
-            usual_p90: None,
         };
         let commands = warm_commands();
         let warm = WarmCall {
@@ -1237,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn a_desktop_run_asks_for_the_desktop_with_the_usual_remote_wait_and_no_other_call_does() {
+    fn a_desktop_run_asks_for_the_desktop_waiting_up_to_its_timeout_and_no_other_call_does() {
         let words = ["./tool.exe".to_owned()];
         let mut run = RunCall {
             cross_build: None,
@@ -1262,7 +1243,6 @@ mod tests {
             unreal_version: None,
             engine_env: &[],
             desktop: Some(gate_router::desktop::DesktopMode::Locked),
-            usual_p90: None,
         };
         let commands = warm_commands();
         let warm = WarmCall {
@@ -1272,10 +1252,14 @@ mod tests {
 
         let word = run_word(&location(), &run);
         let sent = decoded(&word);
-        assert_eq!((&sent["Desktop"], &sent["DesktopWait"]), (&json!(true), &json!(60)));
+        assert_eq!(
+            (&sent["Desktop"], &sent["DesktopWait"]),
+            (&json!(true), &json!(300)),
+            "a locked run waits for the desktop up to its Timeout"
+        );
         assert!(sent.get("DesktopSession").is_none(), "a locked run sends no DesktopSession: {sent}");
         assert_eq!(on_the_box(&word).desktop(), Ok(true), "the box reads Desktop back");
-        assert_eq!(on_the_box(&word).desktop_wait(), Ok(Some(60)), "the box reads DesktopWait back");
+        assert_eq!(on_the_box(&word).desktop_wait(), Ok(Some(300)), "the box reads DesktopWait back");
         assert_eq!(on_the_box(&word).desktop_session(), Ok(false), "the box takes the lock");
         let warm_sent = decoded(&warm_word(&location(), &run, &warm));
         assert!(
@@ -1291,7 +1275,7 @@ mod tests {
         let sent = decoded(&word);
         assert_eq!(
             (&sent["Desktop"], &sent["DesktopWait"], &sent["DesktopSession"]),
-            (&json!(true), &json!(60), &json!(true)),
+            (&json!(true), &json!(300), &json!(true)),
             "a session run sends the same Desktop and DesktopWait as a locked one, and DesktopSession"
         );
         assert_eq!(on_the_box(&word).desktop_session(), Ok(true), "the box reads DesktopSession back");
@@ -1301,12 +1285,12 @@ mod tests {
             "a warm-up never asks for the session: {warm_sent}"
         );
 
-        for (usual_p90, wait) in [(None, 60), (Some(40.0), 60), (Some(240.3), 241), (Some(1e12), 2_147_483_647)] {
-            let sent = decoded(&run_word(&location(), &RunCall { usual_p90, ..run }));
+        for (timeout, wait) in [(0, 1), (1, 1), (45, 45), (3_000_000_000, 2_147_483_647)] {
+            let sent = decoded(&run_word(&location(), &RunCall { timeout, ..run }));
             assert_eq!(
                 sent["DesktopWait"],
                 json!(wait),
-                "the wait is the larger of 60 s and the usual p90 rounded up: {usual_p90:?}"
+                "the wait is the Timeout, at least 1 s and at most the box's longest whole number: {timeout}"
             );
         }
 
@@ -1349,7 +1333,6 @@ mod tests {
             unreal_version: None,
             engine_env: &[],
             desktop: None,
-            usual_p90: None,
         };
         let commands = warm_commands();
         let warm = WarmCall {
@@ -1420,7 +1403,6 @@ mod tests {
             unreal_version: None,
             engine_env: &[],
             desktop: None,
-            usual_p90: None,
         }
     }
 

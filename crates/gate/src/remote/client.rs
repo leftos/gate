@@ -488,6 +488,7 @@ impl RustClient {
             warm: None,
             marker_seen: false,
             run_call_started: false,
+            lost_mid_run: false,
             staged: None,
             checked: None,
             raised: None,
@@ -1541,6 +1542,9 @@ pub(super) struct Attempt<'c, 'a> {
     marker_seen: bool,
     /// Whether the attempt began its box run call: its preflight passed and its snapshot was pushed.
     run_call_started: bool,
+    /// Whether the run call's connection was lost after the start marker and the attempt fell back after it
+    /// ([`Attempt::falls_back_after_loss`]): the command may have run on the builder.
+    lost_mid_run: bool,
     /// How a commit stage's sync-back ended, once it has; `None` before, and for a call that is no stage.
     pub(super) staged: Option<syncback::Staged>,
     /// What a commit stage whose hooks passed checked, its fixes applied: the `HEAD` it sent and the checked tree, or why
@@ -1699,7 +1703,6 @@ impl Attempt<'_, '_> {
             unreal_version: chosen.unreal.as_deref(),
             engine_env: &chosen.engine_env,
             desktop: self.call.desktop,
-            usual_p90: self.call.usual.map(|usual| usual.p90),
             cross_build: self.call.cross_build,
             base: snapshot.base.as_ref().map(|base| base.name.as_str()),
             sibling_bases: &sibling_bases,
@@ -3244,6 +3247,8 @@ impl Attempt<'_, '_> {
     fn falls_back_after_loss(&mut self, output: Range<usize>, line: String, reason: FallbackReason) -> End {
         self.lines.drain(output);
         self.say(line);
+        // Only a loss after the start marker leaves a command that may have run there.
+        self.lost_mid_run = self.marker_seen;
         End::Refused(reason)
     }
 
@@ -3968,6 +3973,7 @@ impl Attempt<'_, '_> {
             raised: self.raised,
             draining,
             run_called: self.run_call_started,
+            lost_mid_run: self.lost_mid_run,
             command_started: self.marker_seen,
             staged: self.staged,
             checked: self.checked,
@@ -4036,6 +4042,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             warm: None,
             marker_seen: false,
             run_call_started: false,
+            lost_mid_run: false,
             staged: None,
             checked: None,
             raised: None,
@@ -6434,6 +6441,7 @@ mod tests {
             warm: None,
             marker_seen: false,
             run_call_started: false,
+            lost_mid_run: false,
             staged: None,
             checked: None,
             raised: None,
@@ -10192,6 +10200,26 @@ mod tests {
             attempt.lines
         );
         assert_eq!(attempt.lines.last().map(String::as_str), Some("gate: lost the connection to builder"));
+    }
+
+    #[test]
+    fn a_lost_connection_says_the_run_may_have_run_there_only_after_the_start_marker() {
+        let log = unwritten_log();
+        let call = RemoteCall {
+            commit_stage: false,
+            interrupt: None,
+            ..call(&log)
+        };
+        let transport = nowhere();
+        for started in [false, true] {
+            let mut attempt = attempt(&call, &transport);
+            attempt.marker_seen = started;
+
+            let ended = attempt.connection_lost(&location(), Some(BOOTED), 0..0);
+
+            assert!(matches!(ended, End::Refused(FallbackReason::Unreachable)), "{ended:?}");
+            assert_eq!(attempt.lost_mid_run, started, "lost after the start marker: {started}");
+        }
     }
 
     #[test]

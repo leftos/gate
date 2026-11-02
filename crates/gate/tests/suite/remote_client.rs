@@ -12484,3 +12484,155 @@ fn a_routed_commit_stage_journals_its_stage() {
     assert_eq!(stage["outcome"], "applied", "{stage}");
     assert!(stage["seconds"].as_f64().is_some_and(|seconds| seconds >= 0.0), "{stage}");
 }
+
+/// The `.gate/desktop.toml` pattern a desktop case declares and its routing file allows.
+const DESKTOP_PATTERN: &str = "*tool* mark*";
+/// What a desktop run says after its builder's fallback head when no builder ran it.
+const DESKTOP_NOT_HERE: &str = "; a desktop run never runs here";
+
+/// A routed case of the scripted client (`crate::routing::routed_case`) declaring [`DESKTOP_PATTERN`] in its
+/// `.gate/desktop.toml`, with a routing file sending its `*tool*` commands to `host` and allowing the pattern on the
+/// desktop; with `second`, the `builders` entry `builder-a`, a Windows builder, matches them too.
+fn desktop_case(name: &str, second: bool) -> Case {
+    let case = crate::routing::routed_case(name);
+    let folder = case.folder();
+    fs::create_dir_all(folder.join(".gate")).expect("the .gate folder can be made");
+    fs::write(folder.join(".gate").join("desktop.toml"), format!("patterns = ['{DESKTOP_PATTERN}']\n")).expect("the declaration can be written");
+    let repo = crate::routing::repo(&case);
+    let mut routing = json!({ "host": HOST, "repos": { &repo: ["*tool*"] }, "desktop": { &repo: [DESKTOP_PATTERN] } });
+    if second {
+        routing["builders"] = json!([{ "host": FIRST_BUILDER, "os": "windows", "repos": { &repo: ["*tool*"] } }]);
+    }
+    write_remote_json(&case, &routing.to_string());
+    case
+}
+
+/// Runs `.\tool.exe mark <marker> out ran here`, a desktop command of a [`desktop_case`], as a routed heavy gate whose
+/// scripted client takes `steps`: the gate's pid, its outcome and the marker file, which exists only once the command
+/// ran here.
+fn run_marking(case: &Case, steps: &[&str]) -> (u32, Outcome, PathBuf) {
+    let marker = case.folder().join("marker.txt");
+    let stub = shown(&crate::routing::stub(case, steps));
+    let marked = shown(&marker);
+    let words = crate::routing::routed_words("out.log", &stub, &[], &[r".\tool.exe", "mark", &marked, "out", "ran here"]);
+    let running = case.start(&words);
+    let pid = running.id();
+    (pid, running.finish(), marker)
+}
+
+/// Asserts the gate `pid` of `case` ended its desktop run, its `outcome`, without running it here: exit 1, a line
+/// starting `head` and ending [`DESKTOP_NOT_HERE`], no running-here line, the `marker` absent, `hops` the reasons of the
+/// fallback lines journaled for the builders the walk went on from, which the release's `fellBack` names alone, and no
+/// `fellBack` at all for a run that never hopped.
+fn assert_desktop_ended(case: &Case, (pid, outcome, marker): (u32, &Outcome, &Path), head: &str, hops: &[&str]) {
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .lines()
+            .any(|line| line.starts_with(head) && line.ends_with(DESKTOP_NOT_HERE)),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("; running here"), "{outcome:?}");
+    assert!(!marker.exists(), "the command never ran here: {outcome:?}");
+    let own = own(case, pid);
+    assert_eq!(fallbacks(&own), hops, "{own:#?}");
+    let release = own
+        .iter()
+        .find(|event| event["event"] == "release")
+        .expect("the run journals its release");
+    // A hop is a fallback the release names, as on a walk a later builder ends; the end itself adds none.
+    match release.get("fellBack") {
+        Some(fell_back) => assert_eq!(fell_back, &json!(hops), "{own:#?}"),
+        None => assert!(hops.is_empty(), "{own:#?}"),
+    }
+}
+
+#[test]
+fn a_desktop_run_the_builder_refuses_desktop_busy_fails_and_never_runs_here() {
+    let case = desktop_case("client-desktop-busy", false);
+
+    let (pid, outcome, marker) = run_marking(
+        &case,
+        &["err gate: not routed: the builder's desktop stayed busy for 1 s", "refuse desktop"],
+    );
+
+    assert!(
+        outcome.stderr.contains("gate: not routed: the builder's desktop stayed busy for 1 s\n"),
+        "{outcome:?}"
+    );
+    let line = format!("gate: remote {HOST} desktop{DESKTOP_NOT_HERE}");
+    assert!(outcome.stderr.lines().any(|said| said == line), "{outcome:?}");
+    assert_desktop_ended(&case, (pid, &outcome, &marker), &format!("gate: remote {HOST} desktop"), &[]);
+}
+
+#[test]
+fn a_desktop_run_whose_builder_is_unreachable_fails_and_never_runs_here() {
+    let case = desktop_case("client-desktop-unreachable", false);
+
+    let (pid, outcome, marker) = run_marking(&case, &["refuse unreachable"]);
+
+    assert_desktop_ended(&case, (pid, &outcome, &marker), &format!("gate: remote {HOST} unreachable"), &[]);
+}
+
+#[test]
+fn a_desktop_run_hops_to_the_next_builder_before_it_fails() {
+    let case = desktop_case("client-desktop-hops", true);
+
+    let (pid, outcome, marker) = run_marking(&case, &["refuse busy"]);
+
+    assert!(
+        outcome.stderr.contains(" busy; trying "),
+        "the first builder hands the run on: {outcome:?}"
+    );
+    assert_desktop_ended(&case, (pid, &outcome, &marker), "gate: remote ", &["busy"]);
+    assert!(
+        outcome.stderr.lines().any(|line| line.ends_with(&format!(" busy{DESKTOP_NOT_HERE}"))),
+        "the second builder's refusal ends the run: {outcome:?}"
+    );
+}
+
+/// The first builder's call spoils the routing file, so the next builder's run cannot be built as the walk reaches it.
+#[test]
+fn a_desktop_run_whose_next_builder_cannot_be_built_fails_and_never_runs_here() {
+    let case = desktop_case("client-desktop-next-unbuilt", true);
+    let routing = case.local_app_data().join("gate").join("remote.json");
+    let spoil = format!("record {}", shown(&routing));
+
+    let (pid, outcome, marker) = run_marking(&case, &[&spoil, "refuse busy"]);
+
+    assert!(!outcome.stderr.contains("; trying "), "no other builder is tried: {outcome:?}");
+    assert_desktop_ended(&case, (pid, &outcome, &marker), "gate: remote ", &[]);
+    assert!(log_texts(&case.folder().join("out.log")).contains("gate: not trying "), "{outcome:?}");
+}
+
+/// A connection lost once the command started on the builder: the command may have run there once already.
+#[test]
+fn a_desktop_run_lost_after_its_start_never_hops_and_says_it_may_have_run_there() {
+    let case = desktop_case("client-desktop-lost-after-start", true);
+
+    let (pid, outcome, marker) = run_marking(&case, &["lost-after-start", "refuse unreachable"]);
+
+    assert!(!outcome.stderr.contains("; trying "), "no other builder is tried: {outcome:?}");
+    let ending = format!(" unreachable after the command started; it may have run there{DESKTOP_NOT_HERE}");
+    assert!(outcome.stderr.lines().any(|line| line.ends_with(&ending)), "{outcome:?}");
+    assert_desktop_ended(&case, (pid, &outcome, &marker), "gate: remote ", &[]);
+}
+
+#[test]
+fn a_non_desktop_run_refused_still_runs_here() {
+    let case = crate::routing::routed_case("client-not-desktop-refused");
+
+    let (pid, outcome, marker) = run_marking(&case, &["refuse busy"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .lines()
+            .any(|line| line == format!("gate: remote {HOST} busy; running here")),
+        "{outcome:?}"
+    );
+    assert!(marker.exists(), "the command ran here: {outcome:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), ["busy"]);
+}

@@ -342,6 +342,9 @@ pub(crate) struct RemoteOutcome {
     /// Whether the client began the box run call, after a passing preflight and the snapshot push, however the call
     /// ended, a refusal at it included.
     pub run_called: bool,
+    /// Whether the run call's connection to the builder was lost after the box's start marker and the client fell back
+    /// after it, `rebooted` or `unreachable`: the command may have run there.
+    pub lost_mid_run: bool,
     /// Whether a call of the attempt said the box's start marker, however the call ended: the box started the command.
     /// A commit's stage counts as started only then.
     pub command_started: bool,
@@ -693,7 +696,8 @@ mod snapshot_only {
 /// ends the call of that number, one no drain step ends, as that refusal, and nothing else of it runs; a drain poll no drain step
 /// ends performs only the `wait`, `interrupt`, `refuse` and `fail-start` steps, and admits the run when none refuses it. `on
 /// <alias>` starts a block of steps that run only for a call to that builder; the steps before the first `on` line run
-/// for every builder without a block of its own, and an alias has one block at most.
+/// for every builder without a block of its own, and an alias has one block at most. `lost-after-start` marks the
+/// outcome as a connection lost after the command started, for a `refuse unreachable` or `refuse rebooted` beside it.
 #[cfg(feature = "test-seams")]
 mod scripted {
     use std::fs;
@@ -744,6 +748,9 @@ mod scripted {
         Killed,
         Status(i64),
         Refuse(FallbackReason),
+        /// Marks the run's connection as lost after the box started the command, as the client's fallback after a lost
+        /// connection does; with a `refuse unreachable` or `refuse rebooted` step it ends the run so.
+        LostAfterStart,
         FailStart(String),
         Adjusted(f64),
         BoxKilled(BoxKill),
@@ -922,6 +929,7 @@ mod scripted {
             "warmed" => Ok(Step::Warmed),
             "warm-deleted" => Ok(Step::WarmDeleted),
             "cold" => Ok(Step::Cold),
+            "lost-after-start" => Ok(Step::LostAfterStart),
             other => Err(format!("unknown step, or a step without its value: '{other}'")),
         }
     }
@@ -1056,6 +1064,10 @@ mod scripted {
                 });
             }
             Step::WarmDeleted => outcome.warm = Some(WarmEnd::Deleted),
+            Step::LostAfterStart => {
+                outcome.command_started = true;
+                outcome.lost_mid_run = true;
+            }
             Step::Out(_)
             | Step::Err(_)
             | Step::Record(_)

@@ -221,7 +221,8 @@ fn helper_exit_why(code: u32) -> String {
 }
 
 /// How long a run may wait for the builder's desktop: the wait it asked for, or its own timeout when that comes first.
-/// A run with no timeout waits what it asked for.
+/// A run with no timeout waits what it asked for. The PC asks for the run's timeout, so only a payload of an older PC
+/// is capped.
 #[must_use]
 pub(crate) fn capped_wait(wait: Duration, timeout: Option<Duration>) -> Duration {
     match timeout {

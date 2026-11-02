@@ -105,7 +105,8 @@ const END_PASSES: usize = 5;
 /// The wall time under which a passed run is too short to judge its slot by, so it gets no cores line.
 const HINT_MIN_WALL: Duration = Duration::from_secs(10);
 /// How long a routed run waits for its worktree's work folder while another of its runs holds it, before it falls back
-/// here as `busy` ([`Run::take_key`]); also the bound of a finished local build's one waiting take of the key, which no
+/// here as `busy` ([`Run::take_key`]), but a desktop run, which waits its ceiling ([`key_limit`]); also the
+/// bound of a finished local build's one waiting take of the key, which no
 /// drain marker holds off ([`KeyTake::Bounded`]).
 const KEY_WAIT: Duration = Duration::from_secs(90);
 /// How long a passing build here retries the work folder's key to write its built-here record, as another write here
@@ -1684,6 +1685,21 @@ struct Walk {
     current: Option<Box<RemoteRun>>,
 }
 
+impl Walk {
+    /// The walk of a run that waited `key_waited` for its work folder's key: a `desktop` run's key wait counts as a
+    /// remote wait, so the key wait and the remote slot waits share its one budget, its ceiling; any other run's
+    /// remote budget starts whole. A new drain session, nothing tried yet.
+    fn after_key(key_waited: Duration, desktop: bool) -> Walk {
+        Walk {
+            waited: if desktop { key_waited } else { Duration::ZERO },
+            session: remote::payload::run_nonce(),
+            tried: HashSet::new(),
+            built: Vec::new(),
+            current: None,
+        }
+    }
+}
+
 /// Where a routed run goes after a builder's attempt fell back ([`Run::next_candidate`]).
 enum Next {
     /// To this later builder.
@@ -2543,11 +2559,12 @@ impl Run<'_> {
     /// worth another builder ([`RETRIED`]): takes the client's work-folder key lock once, the worktree's on every
     /// builder, held until the run ends, then tries each builder in turn ([`Run::attempt`]), its remote slot taken into
     /// `hold` and freed when it falls back. A key lock another run of the worktree holds is waited for up to its bound,
-    /// and one that stays held, like a client not ready, falls back here before any remote slot is taken. Each later
-    /// candidate is built when it is tried ([`Run::next_candidate`]) and says its route lines once the fallback line
-    /// naming it is said; the run's remote tag names it from its take on. A run whose last attempt fell back runs
-    /// here, its local take counting from the run's queue line only when that fallback was the full remote pool; one a
-    /// Ctrl+C or the client ended ends as it did.
+    /// and one that stays held, like a client not ready, falls back here before any remote slot is taken; a pinned or
+    /// desktop run ends instead ([`Run::pin_ended`]). Each later candidate is built when it is tried
+    /// ([`Run::next_candidate`]) and says its route lines once the fallback line naming it is said; the run's remote tag
+    /// names it from its take on. A run whose last attempt fell back runs here, its local take counting from the run's
+    /// queue line only when that fallback was the full remote pool; one a Ctrl+C or the client ended ends as it did,
+    /// and a desktop run whose walk found no builder left ends failed.
     fn routed(&mut self, remote: &RemoteRun, hold: &mut Hold, console: &mut Console) -> Remotely {
         let (remotely, last) = self.try_builders(remote, hold, console);
         // Only a run whose last fallback is the full remote pool counts its local take from its own queue line; the
@@ -2568,31 +2585,29 @@ impl Run<'_> {
         hold.took = None;
         let pinned = self.request.builder.is_some();
         if let Err(why) = self.client.ready() {
-            return (self.fell_back(FallbackReason::Client, &RemoteOutcome::not_started(why), console), None);
+            return (
+                self.fell_back(remote, FallbackReason::Client, &RemoteOutcome::not_started(why), console),
+                None,
+            );
         }
         // The key lock reads neither figure of the call; no take has resolved them yet. A sibling that fails its check
         // again sends nothing: the run falls back here before it takes the lock or a slot.
-        let _key = match self.take_key(remote, console) {
+        let (_key, key_waited) = match self.take_key(remote, console) {
             Ok(key) => key,
             Err(remotely) => return (remotely, None),
         };
         // Under the key lock, once a run: the key is the same for every builder the run tries.
         worktree_record::leave(&self.root.path, &remote.root, &remote.repo, &remote.key, console);
-        // One drain session for every attempt and poll of the run.
-        let mut walk = Walk {
-            waited: Duration::ZERO,
-            session: remote::payload::run_nonce(),
-            tried: HashSet::new(),
-            built: Vec::new(),
-            current: None,
-        };
+        // One drain session for every attempt and poll of the run, a desktop run's remote budget already spent by its key wait.
+        let mut walk = Walk::after_key(key_waited, self.is_desktop(remote));
         loop {
             // Before each attempt, whose builder may plan another drop, so a run killed on the builder leaves its
             // entries cleared. A record that cannot be removed would outlast the build there: the run falls back here.
-            if let Err(line) = self.clear_built_here(walk.current.as_deref().unwrap_or(remote)) {
+            let goes = walk.current.as_deref().unwrap_or(remote);
+            if let Err(line) = self.clear_built_here(goes) {
                 console.err(&line);
                 let reason = FallbackReason::Inputs;
-                return (self.fell_back(reason, &RemoteOutcome::not_started(line), console), Some(reason));
+                return (self.fell_back(goes, reason, &RemoteOutcome::not_started(line), console), Some(reason));
             }
             let refusal = match self.attempt(remote, &mut walk, hold, console) {
                 Attempt::Done(remotely) => return (remotely, None),
@@ -2608,12 +2623,10 @@ impl Run<'_> {
                 hold.taken = held;
                 let said = self.drop_warm_record(current, reason);
                 self.forget_builder(current, reason, console);
-                return (self.pin_ended(reason, &outcome, said.as_deref(), console), Some(reason));
+                return (self.pin_ended(reason, &outcome, said.as_deref(), NotHere::Pinned, console), Some(reason));
             }
-            // The refused attempt's slot is let go below: the run holds nothing until it takes another.
-            hold.took = None;
             let reason = refusal.reason;
-            match self.after_refusal(remote, current, refusal, &mut walk, console) {
+            match self.after_refusal(remote, current, refusal, (&mut walk, hold), console) {
                 Ok(next) => walk.current = Some(next),
                 Err(remotely) => return (remotely, Some(reason)),
             }
@@ -2625,20 +2638,40 @@ impl Run<'_> {
     /// noted before anything of the next builder is built, then looks for the next builder of the routed run `first`
     /// ([`Run::next_candidate`]). The next builder's run, once the fallback line naming it and its route lines are said
     /// and the run's remote tag names it; else how the run ends: here, saying so, or, when a Ctrl+C ended the walk, as
-    /// an interrupt before the command started, saying only why the builder did not run it.
+    /// an interrupt before the command started, saying only why the builder did not run it. A desktop run never runs
+    /// here: its next builder is looked for before the attempt is given up, and a walk with none left ends the run on
+    /// `current` ([`Run::pin_ended`]), its slot kept in `hold` for the release to let go.
     fn after_refusal(
         &mut self,
         first: &RemoteRun,
         current: &RemoteRun,
         refusal: Refusal,
-        walk: &mut Walk,
+        (walk, hold): (&mut Walk, &mut Hold),
         console: &mut Console,
     ) -> Result<Box<RemoteRun>, Remotely> {
         let Refusal { reason, outcome, held } = refusal;
         let said = self.drop_warm_record(current, reason);
         self.forget_builder(current, reason, console);
+        // A connection lost once the command started ends the walk: the command may have run once already.
+        let early = self.is_desktop(current).then(|| {
+            if outcome.lost_mid_run {
+                Next::Here
+            } else {
+                self.next_candidate(first, reason, walk, console)
+            }
+        });
+        if matches!(early, Some(Next::Here)) {
+            hold.taken = held;
+            return Err(self.pin_ended(reason, &outcome, said.as_deref(), NotHere::Desktop, console));
+        }
+        // The refused attempt's slot is let go here: the run holds nothing until it takes another.
+        hold.took = None;
         let host = self.give_up(reason, &outcome, held, console);
-        let next = match self.next_candidate(first, reason, walk, console) {
+        let found = match early {
+            Some(next) => next,
+            None => self.next_candidate(first, reason, walk, console),
+        };
+        let next = match found {
             Next::Interrupted => {
                 console.err(&fallback_head(&host, reason, outcome.detail.as_deref()));
                 return Err(Remotely::Ended(self.interrupted_before_start(console)));
@@ -2739,11 +2772,12 @@ impl Run<'_> {
     fn attempt(&mut self, first: &RemoteRun, walk: &mut Walk, hold: &mut Hold, console: &mut Console) -> Attempt {
         // A light run a critical request sent here counts its remote take's wait from its first queue line.
         let since = self.queued_at.filter(|_| self.rerouted_for.is_some());
-        let Some(listed) = self.listed_runs(first, walk, self.remote_left(walk.waited), console) else {
+        let desktop = self.is_desktop(walk.current.as_deref().unwrap_or(first));
+        let Some(listed) = self.listed_runs(first, walk, self.remote_left(desktop, walk.waited), console) else {
             return Attempt::Done(Remotely::Ended(self.interrupted_before_start(console)));
         };
         // The budget counts the wait alone, not the builds of the listed builders' runs.
-        let left = self.remote_left(walk.waited);
+        let left = self.remote_left(desktop, walk.waited);
         let begun = Instant::now();
         let current = walk.current.as_deref().unwrap_or(first);
         let pool = Pool::Remote(BuilderPool::of(&current.builder));
@@ -2870,14 +2904,16 @@ impl Run<'_> {
         Some(runs)
     }
 
-    /// What is left of the run's remote budget ([`wait::remote_budget`]) after `waited`, the time its remote waits took
-    /// so far: none for a light run a critical request sent here, which never waits for the remote.
-    fn remote_left(&self, waited: Duration) -> Duration {
-        if self.rerouted_for.is_some() {
-            Duration::ZERO
-        } else {
-            wait::remote_budget(self.request).saturating_sub(waited)
-        }
+    /// What is left of the run's remote budget ([`wait::remote_budget`]), a `desktop` run's its ceiling, after `waited`,
+    /// the time its remote waits took so far: none for a light run a critical request sent here, which never waits for
+    /// the remote.
+    fn remote_left(&self, desktop: bool, waited: Duration) -> Duration {
+        remote_left(self.request, desktop, self.rerouted_for.is_some(), waited)
+    }
+
+    /// Whether the routed run `run` is a desktop run, which never runs here ([`desktop_run`]).
+    fn is_desktop(&self, run: &RemoteRun) -> bool {
+        desktop_run(run.desktop, self.staging.is_some(), self.rerouted_for.is_some())
     }
 
     /// Calls the client for the routed run `remote` under `figures`, the remote slot held in `hold`, and ends the run as
@@ -2916,7 +2952,7 @@ impl Run<'_> {
         let mut run_called = false;
         let wait = SlotWait {
             request: self.request,
-            left: self.remote_left(*waited),
+            left: self.remote_left(self.is_desktop(remote), *waited),
             waited,
             run_called: &mut run_called,
         };
@@ -3188,11 +3224,13 @@ impl Run<'_> {
 
     /// Takes the lock of the call's work-folder key: at once when no other run of the worktree holds it, and else after
     /// waiting up to the run's key-wait bound for the holder to let it go, saying the wait in a line with the holder's
-    /// time left when its remote claim carries a usual run time, and a still-waiting line each heartbeat. When a warm-up
-    /// of the work folder holds the key, the run falls back at once, as it did before the wait. Else how the run goes on:
-    /// here, `busy`, when the lock is held past the bound or cannot be opened or taken, which says why; or interrupted
-    /// during the wait, which says so and journals the abandon.
-    fn take_key(&mut self, remote: &RemoteRun, console: &mut Console) -> Result<Option<OwnedMutexGuard>, Remotely> {
+    /// time left when its remote claim carries a usual run time, and a still-waiting line each heartbeat; the lock and
+    /// how long the run waited for it. When a warm-up of the work folder holds the key, the run falls back at once, as
+    /// it did before the wait, but a desktop run waits it out as it waits out any holder ([`warm_up_sends_busy`]). Else
+    /// how the run goes on: `busy`, when the lock is held past the bound or cannot be opened or taken, which says why,
+    /// here or, for a pinned or desktop run, ended ([`Run::fell_back`]); or interrupted during the wait, which says so
+    /// and journals the abandon.
+    fn take_key(&mut self, remote: &RemoteRun, console: &mut Console) -> Result<(Option<OwnedMutexGuard>, Duration), Remotely> {
         // The key lock reads neither figure of the call; no take has resolved them yet. A sibling that fails its check
         // again sends nothing: the run falls back here before it takes the lock or a slot.
         let env = routed_env(&self.request.env, remote.source_revision.as_deref());
@@ -3210,10 +3248,11 @@ impl Run<'_> {
         };
         let call = match call_of(parts, remote) {
             Ok(call) => call,
-            Err(why) => return Err(self.fell_back(FallbackReason::Client, &RemoteOutcome::not_started(why), console)),
+            Err(why) => return Err(self.fell_back(remote, FallbackReason::Client, &RemoteOutcome::not_started(why), console)),
         };
-        // The key is the worktree's on every builder: a key held elsewhere is busy on all of them, so the run runs here.
-        let busy = |run: &mut Run<'_>, console: &mut Console| run.fell_back(FallbackReason::Busy, &RemoteOutcome::default(), console);
+        // The key is the worktree's on every builder: a key held elsewhere is busy on all of them, so the run runs here,
+        // or a pinned or desktop run ends.
+        let busy = |run: &mut Run<'_>, console: &mut Console| run.fell_back(remote, FallbackReason::Busy, &RemoteOutcome::default(), console);
         // The seam raises the console interrupt before the take, so the zero wait meets it as the lock's busy.
         if self.request.test_seams.interrupt_before_key
             && let Some(interrupt) = self.host.interrupt
@@ -3221,7 +3260,7 @@ impl Run<'_> {
             interrupt.raise();
         }
         match self.client.hold_key(&call) {
-            Ok(held) => return Ok(held),
+            Ok(held) => return Ok((held, Duration::ZERO)),
             // Another run of the worktree holds the key, or the lock could not be taken without a line; the zero wait
             // never reads the interrupt, which the check after it sees.
             Err(None) => {}
@@ -3241,10 +3280,11 @@ impl Run<'_> {
         let mut probe_said = false;
         let mut marker_said = drain::ProbeSaid::default();
         let mut past_bound_said = false;
-        if warm_up_holds(&self.root.path, &remote.key, console, &mut probe_said) {
+        let desktop = self.is_desktop(remote);
+        if warm_up_sends_busy(desktop, || warm_up_holds(&self.root.path, &remote.key, console, &mut probe_said)) {
             return Err(busy(self, console));
         }
-        let bound = self.request.test_seams.key_wait_ms.map_or(KEY_WAIT, Duration::from_millis);
+        let bound = key_limit(self.request, desktop);
         let heartbeat = self.request.test_seams.heartbeat_ms.map_or(wait::HEARTBEAT, Duration::from_millis);
         let mut next = heartbeat;
         let left = holder_time_left(&mut self.survey, &self.root.path, call.key, console);
@@ -3258,7 +3298,7 @@ impl Run<'_> {
         let begun = Instant::now();
         loop {
             match self.client.hold_key_waiting(&call, KEY_WAIT_SLICE) {
-                Ok(KeyWait::Held(held)) => return Ok(held),
+                Ok(KeyWait::Held(held)) => return Ok((held, begun.elapsed())),
                 Ok(KeyWait::Interrupted) => return Err(self.interrupted_key_wait(remote, begun.elapsed(), console)),
                 Ok(KeyWait::Busy) => {}
                 Err(line) => {
@@ -3280,8 +3320,8 @@ impl Run<'_> {
                 say_once(console, &mut past_bound_said, KEY_HELD_OFF_LINE);
             }
             if waited >= next {
-                // A warm-up that took the key during the wait is not waited for either.
-                if warm_up_holds(&self.root.path, &remote.key, console, &mut probe_said) {
+                // A warm-up that took the key during the wait is not waited for either, but by a desktop run.
+                if warm_up_sends_busy(desktop, || warm_up_holds(&self.root.path, &remote.key, console, &mut probe_said)) {
                     return Err(busy(self, console));
                 }
                 console.err(&format!(
@@ -3317,24 +3357,42 @@ impl Run<'_> {
         Remotely::Interrupted
     }
 
-    /// Gives up the remote attempt for `reason`, before it took a remote slot ([`Run::give_up`]), and says the run goes
-    /// on here; a run pinned with `--builder` ends instead ([`Run::pin_ended`]).
-    fn fell_back(&mut self, reason: FallbackReason, outcome: &RemoteOutcome, console: &mut Console) -> Remotely {
-        if self.request.builder.is_some() {
-            return self.pin_ended(reason, outcome, None, console);
+    /// Gives up the remote attempt of the routed run `run` for `reason`, before it took a remote slot
+    /// ([`Run::give_up`]), and says the run goes on here; a run pinned with `--builder` and a desktop run end instead
+    /// ([`Run::pin_ended`]).
+    fn fell_back(&mut self, run: &RemoteRun, reason: FallbackReason, outcome: &RemoteOutcome, console: &mut Console) -> Remotely {
+        if let Some(not_here) = self.not_here(run) {
+            return self.pin_ended(reason, outcome, None, not_here, console);
         }
         let host = self.give_up(reason, outcome, None, console);
         console.err(&fallback_line(&host, reason, outcome.detail.as_deref(), None));
         Remotely::Here
     }
 
-    /// Ends a run pinned with `--builder` whose builder did not run it, for `reason`: no other builder is tried, nothing
-    /// runs here and no fallback is journaled. Says why with [`PIN_NOT_HERE`] after the fallback head, then `said`, the
-    /// line of a warm-up record the refusal dropped, and ends the log; the run ends failed, its release journaled with
-    /// the run's remote tag.
-    fn pin_ended(&mut self, reason: FallbackReason, outcome: &RemoteOutcome, said: Option<&str>, console: &mut Console) -> Remotely {
+    /// Why the routed run `run` never runs here once its builder did not run it: pinned with `--builder`, which wins, or
+    /// a desktop run ([`Run::is_desktop`]); `None` for a run that falls back here.
+    fn not_here(&self, run: &RemoteRun) -> Option<NotHere> {
+        if self.request.builder.is_some() {
+            Some(NotHere::Pinned)
+        } else {
+            self.is_desktop(run).then_some(NotHere::Desktop)
+        }
+    }
+
+    /// Ends a run pinned with `--builder`, or a desktop run, whose builder did not run it, for `reason`, as `not_here`
+    /// says: no other builder is tried, nothing runs here and no fallback is journaled. Says why after the fallback head
+    /// ([`not_here_line`]), then `said`, the line of a warm-up record the refusal dropped, and ends the log; the run ends
+    /// failed, its release journaled with the run's remote tag.
+    fn pin_ended(
+        &mut self,
+        reason: FallbackReason,
+        outcome: &RemoteOutcome,
+        said: Option<&str>,
+        not_here: NotHere,
+        console: &mut Console,
+    ) -> Remotely {
         let host = self.tag.as_ref().map_or_else(String::new, |tag| tag.host.clone());
-        console.err(&format!("{}; {PIN_NOT_HERE}", fallback_head(&host, reason, outcome.detail.as_deref())));
+        console.err(&not_here_line(&host, reason, outcome, not_here));
         if let Some(line) = said {
             console.err(line);
         }
@@ -5504,12 +5562,74 @@ fn fallback_head(host: &str, reason: FallbackReason, detail: Option<&str>) -> St
     }
 }
 
+/// How long a routed run of `request` waits for its worktree's work folder while another of its runs holds it
+/// ([`Run::take_key`]): `--test-key-wait-ms`, else the run's own ceiling for a `desktop` run, which never runs here and
+/// so waits for the folder as long as it may run there, else [`KEY_WAIT`].
+fn key_limit(request: &RunRequest, desktop: bool) -> Duration {
+    let unseamed = if desktop {
+        Duration::from_secs(request.timeout.floor())
+    } else {
+        KEY_WAIT
+    };
+    request.test_seams.key_wait_ms.map_or(unseamed, Duration::from_millis)
+}
+
+/// Whether a warm-up holding the work folder's key, which `held` probes, sends a routed run `busy` at once: it does for
+/// any run but a `desktop` one, which never runs here and waits the warm-up out within its key limit ([`key_limit`]).
+fn warm_up_sends_busy(desktop: bool, held: impl FnOnce() -> bool) -> bool {
+    !desktop && held()
+}
+
+/// Whether a routed run asking for the desktop as `desktop` says is a desktop run, which never runs here: never a
+/// commit's stage (`staging`), nor a light run a critical request sent to a builder (`rerouted`), which goes back to
+/// its wait here after a refusal.
+fn desktop_run(desktop: Option<gate_router::desktop::DesktopMode>, staging: bool, rerouted: bool) -> bool {
+    desktop.is_some() && !staging && !rerouted
+}
+
+/// What is left of the remote budget ([`wait::remote_budget`]) of a routed run of `request`, a `desktop` run's its
+/// ceiling, after `waited`, the time its remote waits, its key wait among them, took so far: none for a light run a
+/// critical request sent here (`rerouted`), which never waits for the remote.
+fn remote_left(request: &RunRequest, desktop: bool, rerouted: bool, waited: Duration) -> Duration {
+    if rerouted {
+        Duration::ZERO
+    } else {
+        wait::remote_budget(request, desktop).saturating_sub(waited)
+    }
+}
+
 /// What a run pinned with `--builder` says after its builder's fallback head, in place of where the run goes.
 const PIN_NOT_HERE: &str = "--builder given, so not running here";
+/// What a desktop run says after its builder's fallback head, in place of where the run goes.
+const DESKTOP_NOT_HERE: &str = "a desktop run never runs here";
+
+/// Why a routed run whose builder did not run it ends instead of running here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NotHere {
+    /// The run was pinned with `--builder`.
+    Pinned,
+    /// The run is a desktop run.
+    Desktop,
+}
+
+/// The line a routed run says as it ends, not running here, for `reason` from the builder `host` ([`NotHere`]): the
+/// fallback head ([`fallback_head`]), then [`PIN_NOT_HERE`] or [`DESKTOP_NOT_HERE`]; a desktop run whose `outcome` says
+/// the run call's connection was lost after the start says before it that the command may have run there.
+fn not_here_line(host: &str, reason: FallbackReason, outcome: &RemoteOutcome, not_here: NotHere) -> String {
+    let head = fallback_head(host, reason, outcome.detail.as_deref());
+    match not_here {
+        NotHere::Pinned => format!("{head}; {PIN_NOT_HERE}"),
+        NotHere::Desktop if outcome.lost_mid_run => {
+            format!("{head} after the command started; it may have run there; {DESKTOP_NOT_HERE}")
+        }
+        NotHere::Desktop => format!("{head}; {DESKTOP_NOT_HERE}"),
+    }
+}
 
 /// The fallback reasons worth another builder: a builder that is full, busy, cannot be reached, or lacks the version,
-/// parity, install or tools the run needs may be one another builder has. Every other reason runs here: the PC's own
-/// failures (`client`, `inputs`, `lfs`) and those of the worktree, the desktop or a lost run.
+/// parity, install or tools the run needs may be one another builder has. Every other reason runs here, and a desktop
+/// run ends instead: the PC's own failures (`client`, `inputs`, `lfs`) and those of the worktree, the desktop or a lost
+/// run.
 const RETRIED: [FallbackReason; 7] = [
     FallbackReason::Full,
     FallbackReason::Busy,
@@ -5703,6 +5823,97 @@ mod tests {
     use gate_state::v1::{Claim, ClaimKind};
     use jiff::Timestamp;
     use serde_json::{Map, Value};
+
+    #[test]
+    fn a_desktop_run_lost_mid_run_says_it_may_have_run_there_and_a_pinned_one_keeps_its_line() {
+        use gate_state::FallbackReason;
+        let lost = RemoteOutcome {
+            lost_mid_run: true,
+            ..RemoteOutcome::default()
+        };
+        assert_eq!(
+            super::not_here_line("builder", FallbackReason::Rebooted, &lost, super::NotHere::Desktop),
+            "gate: remote builder rebooted after the command started; it may have run there; a desktop run never runs here"
+        );
+        assert_eq!(
+            super::not_here_line("builder", FallbackReason::Unreachable, &RemoteOutcome::default(), super::NotHere::Desktop),
+            "gate: remote builder unreachable; a desktop run never runs here"
+        );
+        assert_eq!(
+            super::not_here_line("builder", FallbackReason::Rebooted, &lost, super::NotHere::Pinned),
+            "gate: remote builder rebooted; --builder given, so not running here"
+        );
+    }
+
+    #[test]
+    fn a_rerouted_light_run_or_a_commit_stage_is_no_desktop_run() {
+        let locked = Some(gate_router::desktop::DesktopMode::Locked);
+        assert!(super::desktop_run(locked, false, false), "a routed run asking for the desktop is one");
+        assert!(!super::desktop_run(None, false, false), "a run asking for none is not");
+        assert!(!super::desktop_run(locked, true, false), "a commit's stage never is");
+        assert!(
+            !super::desktop_run(locked, false, true),
+            "a light run a critical request rerouted goes back to its wait"
+        );
+    }
+
+    #[test]
+    fn a_desktop_run_waits_out_a_warm_up_holding_its_key_and_any_other_run_goes_busy() {
+        assert!(!super::warm_up_sends_busy(true, || true), "a desktop run waits the warm-up out");
+        assert!(super::warm_up_sends_busy(false, || true), "any other run goes busy at once");
+        assert!(!super::warm_up_sends_busy(false, || false), "no warm-up holds the key");
+    }
+
+    #[test]
+    fn a_desktop_runs_key_wait_spends_its_remote_budget() {
+        let mut request = crate::wait::scratch::request(Slot::Heavy);
+        request.timeout = gate_args::Ceiling::Given(900);
+        let walk = super::Walk::after_key(Duration::from_secs(100), true);
+        assert_eq!(
+            super::remote_left(&request, true, false, walk.waited),
+            Duration::from_secs(800),
+            "the key wait and the slot waits share the ceiling"
+        );
+        assert_eq!(
+            super::remote_left(&request, true, true, walk.waited),
+            Duration::ZERO,
+            "a rerouted run never waits"
+        );
+    }
+
+    #[test]
+    fn a_non_desktop_runs_key_wait_leaves_its_remote_budget_whole() {
+        let request = crate::wait::scratch::request(Slot::Heavy);
+        let walk = super::Walk::after_key(Duration::from_secs(100), false);
+        assert_eq!(
+            super::remote_left(&request, false, false, walk.waited),
+            crate::wait::REMOTE_LIMIT,
+            "any other run gets its whole 60 s after the key wait"
+        );
+    }
+
+    #[test]
+    fn a_desktop_runs_key_limit_is_its_ceiling_and_any_other_runs_is_the_key_wait() {
+        let mut request = crate::wait::scratch::request(Slot::Heavy);
+        request.timeout = gate_args::Ceiling::Given(900);
+        assert_eq!(
+            super::key_limit(&request, true),
+            Duration::from_mins(15),
+            "a desktop run waits up to its ceiling"
+        );
+        assert_eq!(super::key_limit(&request, false), super::KEY_WAIT, "any other run waits the key wait");
+        request.test_seams.key_wait_ms = Some(250);
+        assert_eq!(
+            super::key_limit(&request, true),
+            Duration::from_millis(250),
+            "the seam wins for a desktop run"
+        );
+        assert_eq!(
+            super::key_limit(&request, false),
+            Duration::from_millis(250),
+            "the seam wins for any other run"
+        );
+    }
 
     #[test]
     fn every_plan_unsets_an_inherited_checked_head_and_tree_and_only_a_set_one_reaches_the_command() {

@@ -38,9 +38,15 @@ const BUSY_RETRY: Duration = Duration::from_millis(100);
 pub(crate) const REMOTE_LIMIT: Duration = Duration::from_secs(60);
 
 /// The whole time a routed run of `request` waits for remote slots, across every builder it tries:
-/// `--test-remote-wait-ms`, else [`REMOTE_LIMIT`].
-pub(crate) fn remote_budget(request: &RunRequest) -> Duration {
-    request.test_seams.remote_wait_ms.map_or(REMOTE_LIMIT, Duration::from_millis)
+/// `--test-remote-wait-ms`, else the run's own ceiling for a `desktop` run, which never runs here and so waits for the
+/// builder as long as it may run there, else [`REMOTE_LIMIT`].
+pub(crate) fn remote_budget(request: &RunRequest, desktop: bool) -> Duration {
+    let unseamed = if desktop {
+        Duration::from_secs(request.timeout.floor())
+    } else {
+        REMOTE_LIMIT
+    };
+    request.test_seams.remote_wait_ms.map_or(unseamed, Duration::from_millis)
 }
 
 /// A probe of a pool's slots: for each, whether some gate has it open, `None` for a slot that could not be probed.
@@ -372,7 +378,8 @@ impl<'a> Wait<'a> {
             pool,
             order: ticket.queue_order(),
             processors: host.processors,
-            limit: pool.is_remote().then(|| remote_budget(request)),
+            // A routed run limits its remote wait to what is left of its own budget ([`Wait::limit_to`]).
+            limit: pool.is_remote().then(|| remote_budget(request, false)),
             place,
             under,
             barrier: None,
@@ -1494,6 +1501,35 @@ mod tests {
     use crate::console::Console;
     use crate::slots::BesideTry;
     use crate::slots::{self, BuilderPool, Pool, Survey, ThisGate};
+
+    #[test]
+    fn a_desktop_runs_remote_budget_is_its_ceiling_and_any_other_runs_is_60_s() {
+        let mut request = request(Slot::Heavy);
+        request.timeout = gate_args::Ceiling::Given(900);
+        assert_eq!(
+            super::remote_budget(&request, true),
+            Duration::from_mins(15),
+            "a desktop run waits up to its ceiling"
+        );
+        assert_eq!(super::remote_budget(&request, false), super::REMOTE_LIMIT, "any other run waits 60 s");
+        request.timeout = gate_args::Ceiling::Auto(1200);
+        assert_eq!(
+            super::remote_budget(&request, true),
+            Duration::from_mins(20),
+            "an auto ceiling's floor bounds it"
+        );
+        request.test_seams.remote_wait_ms = Some(250);
+        assert_eq!(
+            super::remote_budget(&request, true),
+            Duration::from_millis(250),
+            "the seam wins for a desktop run"
+        );
+        assert_eq!(
+            super::remote_budget(&request, false),
+            Duration::from_millis(250),
+            "the seam wins for any other run"
+        );
+    }
 
     #[test]
     fn the_took_line_names_the_place_and_the_wait_in_tenths() {
