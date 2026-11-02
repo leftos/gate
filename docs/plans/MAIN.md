@@ -350,7 +350,6 @@
 - [ ] GATE-1022 Let an amending post-commit hook pass the routed stage's after-commit check
 - [ ] GATE-1023 Check the commit against the routed hooks' tree on the watch-error path too
 - [ ] GATE-1024 Refuse a single-repo back ref the box said it never made
-- [ ] GATE-1028 Cut a routed commit stage's push and sync-back cost when its hooks fix a file
 - [ ] GATE-1029 Polish the console output of a routed commit stage
   - [ ] GATE-1030 Do not repeat a commit stage's lines in the run's closing tail
   - [ ] GATE-1031 Say the global.json sdk-pin note once per run
@@ -370,7 +369,6 @@
 - [ ] GATE-306 Cap how many of a repo's full suites run at once, per repo, queued by the gate
 - [ ] GATE-635 Close the remaining secret forms the journaled command-line redaction misses
 - [ ] GATE-636 Bound the trace naming thread's command-line read and free its queue at job end
-- [ ] GATE-1005 Write the from-scratch setup guides for people and agents, with scripted builder prep and a toolchain-installing install.ps1
 - [ ] GATE-1012 Harden the Windows builder prep's disk and event-log edges: RAW disks with data, the event log reboot, ReFS on Pro
 - [ ] GATE-1013 Close the install.ps1 toolchain check's leftover gaps: rustc beside rustup, toolchain overrides, test PATH shims
 - [ ] GATE-1014 Close the macOS builder prep's leftover gaps: root-side home reads, sshd -T re-read, tailscale ownership
@@ -495,6 +493,7 @@
 - [ ] GATE-1021 Read the back commits line only when it carries the box's own stamp
 - [ ] GATE-1025 Carry what the box said of its back commits as one value
 - [ ] GATE-1027 Create docs/agents/orchestrator.md and move the profile's orchestration rules into it
+- [ ] GATE-1033 Read remote.json once per gate check
 
 ## No project
 
