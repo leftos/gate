@@ -68,7 +68,7 @@ A reason work can remove never makes a family truly local: it is a blocker to bo
 | State | Booked as |
 |---|---|
 | ready to route | The `remote.json` change (back the file up first, change only the repo's keys, as routing-a-repo.md says), or an Urgent or High step under GATE-192. |
-| blocked on work | A GATE issue, High, under the gate repo's focus fence, citing the runs (repo, family, counts, window). |
+| blocked on work | A GATE issue, High, on the gate repo's routing path, citing the runs (repo, family, counts, window). |
 | truly local | The repo's `.gate/local.toml` pattern, or a row in routing-a-repo.md's table, with the reason. `git` and `prek` need neither: they stay local silently. A `git commit (ungated hooks)` row is never truly local: it is booked like any blocked-on-work family, in the repo whose hooks run ungated. |
 
 ## The note
