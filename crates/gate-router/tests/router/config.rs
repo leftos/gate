@@ -593,6 +593,53 @@ fn an_unusable_commits_value_consents_no_repo_and_keeps_the_rest_of_the_file() {
     }
 }
 
+/// The routing file listing `g` with `requireSiblings` holding `value`.
+fn require_siblings_file(value: &str) -> Config {
+    Config::parse(&format!(
+        r#"{{"host": "builder-1", "slots": 2, "repos": {{"g": ["x"]}}, "siblings": {{"g": ["b"]}}, "requireSiblings": {value}}}"#
+    ))
+    .expect("routing reads the file whatever requireSiblings holds")
+}
+
+#[test]
+fn require_siblings_names_each_repo_in_any_letter_case() {
+    let config = require_siblings_file(r#"["Yaat", "gate"]"#);
+
+    assert_eq!(config.siblings_required("yaat"), Ok(true), "the repo name in any case");
+    assert_eq!(config.siblings_required("GATE"), Ok(true), "the repo name in any case");
+    assert_eq!(config.siblings_required("g"), Ok(false), "a repo it does not list");
+    assert_eq!(config.commits_allowed("yaat"), Ok(false), "requireSiblings is no commits consent");
+    assert_eq!(
+        config.allowed_siblings("yaat").map(<[String]>::len),
+        Ok(0),
+        "requireSiblings allows no sibling itself"
+    );
+    let empty = require_siblings_file("[]");
+    assert_eq!(empty.siblings_required("g"), Ok(false), "an empty list");
+    let keyed = Config::parse(r#"{"host": "builder-1", "repos": {}, "RequireSiblings": ["g"]}"#).expect("usable");
+    assert_eq!(keyed.siblings_required("g"), Ok(true), "the key in any case");
+}
+
+#[test]
+fn a_bad_require_siblings_requires_nothing_and_says_why() {
+    for (value, problem) in [
+        (r#"{"g": true}"#, "requireSiblings must be an array of repo names"),
+        (r#""g""#, "requireSiblings must be an array of repo names"),
+        ("null", "requireSiblings must be an array of repo names"),
+        (r#"["g", ""]"#, "requireSiblings[1] is not a non-empty string"),
+        (r#"["g", 3]"#, "requireSiblings[1] is not a non-empty string"),
+        (r#"[["g"]]"#, "requireSiblings[0] is not a non-empty string"),
+    ] {
+        let config = require_siblings_file(value);
+        assert_eq!(config.siblings_required("g"), Err(problem), "{value}");
+        assert_eq!(config.host(), "builder-1", "{value}");
+        assert_eq!(config.slots(), 2, "{value}");
+        assert_eq!(pattern_texts(&config, "g"), ["x"], "{value}");
+        assert_eq!(config.allowed_siblings("g"), Ok(&["b".to_owned()][..]), "{value}");
+        assert_eq!(config.commits_allowed("g"), Ok(false), "{value}");
+    }
+}
+
 /// The routing file listing `g` with `ssh` holding `value`.
 fn ssh_file(value: &str) -> Config {
     Config::parse(&format!(

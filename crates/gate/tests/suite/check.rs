@@ -734,6 +734,35 @@ fn check_reports_an_absent_sibling_without_counting_it() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
 }
 
+/// A sibling the routing file requires, absent beside the worktree, is counted missing and says routed runs stay here.
+#[test]
+fn check_reports_a_required_absent_sibling_as_missing() {
+    let case = repo_case("check_required_absent_sibling");
+    write(&case, ".gate/siblings.toml", "siblings = ['server', 'docs']\n");
+    fs::create_dir_all(case.folder().join("server").join(".git")).expect("the present sibling's git can be made");
+    write_remote_json(
+        &case,
+        r#"{"host": "builder-1", "repos": {"app": ["*"]}, "siblings": {"app": ["server", "docs"]}, "requireSiblings": ["app"]}"#,
+    );
+    let stub = stubs(&case, &[]);
+
+    let outcome = check(&case, &[stub], &[]);
+
+    let root = root(&case);
+    let parent = root.rsplit_once('/').map_or("", |(parent, _)| parent);
+    assert_eq!(
+        lines(&outcome.stdout)[1..],
+        [
+            "check: here: app declares no toolchain".to_owned(),
+            format!("check: here: sibling server ok ({parent}/server)"),
+            format!("check: here: sibling docs absent, and remote.json requires it (routed runs stay here; {parent}/docs)"),
+            "check: here: 1 missing, 0 too old".to_owned(),
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
 /// A routing file whose `siblings` value cannot be used says why on a line of its own, counted missing, and allows no
 /// sibling.
 #[test]

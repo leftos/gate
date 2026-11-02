@@ -292,6 +292,7 @@ fn soft_problems(config: &Config) -> Vec<String> {
         config.allowed_desktop_session("").err(),
         config.hooks_allowed("").err(),
         config.commits_allowed("").err(),
+        config.siblings_required("").err(),
         config.ssh().err(),
         config.send_build_allowed("").err(),
         config.declarations_folder("").err(),

@@ -9,7 +9,8 @@
 //! `.gate/desktop.toml` patterns whose commands may run on the builder's desktop) and the optional `desktopSession`
 //! (each repo name's list of the `.gate/desktop.toml` `session` patterns whose commands may run in the builder's
 //! console session without the desktop lock) and the optional `hooks` (the repo
-//! names whose gates started inside a git hook may route) and the optional `sendBuild` (the repo names whose routed
+//! names whose gates started inside a git hook may route) and the optional `requireSiblings` (the repo names whose
+//! declared siblings must all be beside the worktree for a run to route) and the optional `sendBuild` (the repo names whose routed
 //! `dotnet test --no-build` may send the PC's build) and the optional `declarations` (each repo name's folder
 //! holding the `.gate` files the repo has none of) and the optional `builders` (further builders a routed run may go
 //! to, each with its own `host`, `os`, `root`, `slots`, `repos` and `outputs`, and an optional `data`, the builder's
@@ -110,6 +111,9 @@ pub struct Config {
     /// The repo names whose commits' pre-commit hook stage may route, or why `commits` cannot be used, which consents to
     /// none.
     commits: Result<Vec<String>, String>,
+    /// The repo names whose declared siblings are all required beside the worktree for a run to route, or why
+    /// `requireSiblings` cannot be used, which requires none.
+    require_siblings: Result<Vec<String>, String>,
     /// The ssh every gate ssh call runs, `None` when the key is missing, or why `ssh` cannot be used.
     ssh: Result<Option<PathBuf>, String>,
     /// The repo names whose routed `dotnet test --no-build` may send the PC's build, or why `sendBuild` cannot be used,
@@ -162,7 +166,8 @@ impl Config {
     /// [`Config::allowed_desktop`] gives its reason, and a bad `desktopSession`, allowing no session pattern, and
     /// [`Config::allowed_desktop_session`] gives its reason, and a bad `hooks`, consenting to no hook routing, and
     /// [`Config::hooks_allowed`] gives its reason, and a bad `commits`, consenting to no commit's hook stage routing, and
-    /// [`Config::commits_allowed`] gives its reason, and a bad `ssh`, naming no ssh, and [`Config::ssh`] gives its
+    /// [`Config::commits_allowed`] gives its reason, and a bad `requireSiblings`, requiring no sibling, and
+    /// [`Config::siblings_required`] gives its reason, and a bad `ssh`, naming no ssh, and [`Config::ssh`] gives its
     /// reason, and a bad `sendBuild`, letting no repo send its build, and
     /// [`Config::send_build_allowed`] gives its reason, and a bad `declarations`, naming no folder, and
     /// [`Config::declarations_folder`] gives its reason. A `builders` entry's bad `crossBuild` (no object, on an entry
@@ -214,6 +219,7 @@ impl Config {
             desktop_session: read_desktop_consent(&data, "desktopSession"),
             hooks: read_hooks_consent(&data),
             commits: read_commits_consent(&data),
+            require_siblings: read_names(&data, "requireSiblings"),
             ssh: read_ssh(&data),
             send_build: read_names(&data, "sendBuild"),
             declarations: read_declarations(&data),
@@ -323,6 +329,20 @@ impl Config {
     /// the file is read whatever it holds.
     pub fn commits_allowed(&self, repo: &str) -> Result<bool, &str> {
         match &self.commits {
+            Err(problem) => Err(problem),
+            Ok(names) => Ok(names.iter().any(|name| eq_ignoring_case(name, repo))),
+        }
+    }
+
+    /// Whether `requireSiblings` requires every declared sibling of `repo` beside the worktree for its run to route, its
+    /// repo name matched in any letter case: `false` when it does not name the repo or there is no such key.
+    ///
+    /// # Errors
+    ///
+    /// Why `requireSiblings` cannot be used: not an array of non-empty strings. Such a value requires no sibling, and the
+    /// rest of the file is read whatever it holds.
+    pub fn siblings_required(&self, repo: &str) -> Result<bool, &str> {
+        match &self.require_siblings {
             Err(problem) => Err(problem),
             Ok(names) => Ok(names.iter().any(|name| eq_ignoring_case(name, repo))),
         }

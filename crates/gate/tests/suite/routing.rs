@@ -1232,6 +1232,38 @@ fn declare_sibling(case: &Case) -> (String, PathBuf) {
     (name, beside)
 }
 
+/// Requires, in the case's routing file, every sibling the case's repo declares, so none may be absent.
+fn require_siblings(case: &Case) {
+    let path = case.local_app_data().join("gate").join("remote.json");
+    let mut routing: Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("the case has a routing file")).expect("the routing file is JSON");
+    routing["requireSiblings"] = json!([repo(case)]);
+    write_remote_json(case, &routing.to_string());
+}
+
+#[test]
+fn a_required_absent_sibling_journals_sibling_absent() {
+    let case = routed_case("routing-sibling-required-absent");
+    let (name, _) = declare_sibling(&case);
+    require_siblings(&case);
+    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "out", "ran here"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains(&format!("gate: not routed: required sibling {name} is not beside the worktree\n")),
+        "{outcome:?}"
+    );
+    let events = events(&case);
+    assert_local(&events, Some("sibling absent"));
+    let released = events
+        .iter()
+        .find(|event| event["event"] == "release")
+        .expect("the run journalled its release");
+    assert_eq!(released["notRouted"], "sibling absent", "{released}");
+}
+
 #[test]
 fn a_declared_sibling_absent_beside_the_worktree_routes_saying_so() {
     let case = routed_case("routing-sibling-missing");

@@ -431,6 +431,7 @@ Each sibling the repo declares is checked as routing checks it, and gets one lin
 - `sibling <name> not allowed in remote.json`, counted missing, when this PC's `remote.json` does not allow the repo that sibling (`siblings`, [remote.json](#remotejson)) and its folder is there; a sibling whose folder is missing reads as absent, below, as it needs no consent. Consent is asked only when `remote.json` is usable and lists the repo; with no usable file, or one that does not list the repo, routing would never carry a sibling and every sibling is checked for its folder alone.
 - `sibling <name> ok (<path>)` when its folder, `../<name>` of the worktree root as routing spells it, is a real folder with a `.git` (a folder, or the file of a linked worktree) that is no link or junction.
 - `sibling <name> absent (routed runs go without it; <path>)` when nothing is there. It only informs: it is not counted missing, has no hint line, and leaves the exit alone.
+- `sibling <name> absent, and remote.json requires it (routed runs stay here; <path>)` in its place for a repo `requireSiblings` lists, or for every repo when that value cannot be used: counted missing, with no hint line.
 - `sibling <name> <reason>`, counted missing, for a refused folder, worded as routing words it: `is a link or a junction`, `is not a folder`, `has no .git`, `has a .git that is a link or a junction`, or `is the worktree's own folder` for a name that is the root's folder name in any ASCII letter case.
 - `sibling <name> skipped: <why>` when its folder cannot be read.
 
@@ -903,7 +904,7 @@ The lines of a run that starts its command:
 
   These lines keep a matched command here for siblings: a problem with the repo's `.gate/siblings.toml` (`gate: not routed: .gate/siblings.toml: <problem>`, control characters and reordering marks escaped) and a root folder name the builder cannot lay out while a sibling is carried (`gate: not routed: the worktree folder name <leaf> cannot be laid out on the builder`).
 
-  A declared sibling with no worktree beside the root is absent and keeps nothing here: the run routes without it ([Routing](#routing)).
+  A declared sibling with no worktree beside the root is absent and keeps nothing here, unless `requireSiblings` lists the repo: the run routes without it ([Routing](#routing)). For a listed repo the run stays here, saying `gate: not routed: required sibling <name> is not beside the worktree` (`required siblings <a>, <b> are not beside the worktree` for more).
 
   Also a present sibling `remote.json` does not allow: `gate: not routed: sibling <name> is not allowed in remote.json`, or `siblings <a>, <b> are not allowed in remote.json` for more, with `: <problem>` added when the `siblings` value cannot be used.
 
@@ -1465,7 +1466,7 @@ The event's own fields:
 
 | Event | Fields after the common ones |
 |---|---|
-| `queue` | `log` (the log's full path), `notRouted` (written right after `log`, only when a heavy or light gate was kept local with `--local`, with the value `--local`, or when a light gate's command is proven faster here, with the value `faster here` (a run that drops its `--no-build` is decided as heavy and never says it), or when a matched command's outside path lies in another worktree of a listed repo and the run says to `--cd` it, with the value `another worktree`, or when a matched command's repo `.gate/local.toml` keeps it here, by a pattern or by a problem, with the value `declared local`, or when a matched command's word names a gitignored project input, with the value `gitignored input`; every other reason for a local run, the plain outside line included, writes none), `reason` (the free text the run gave `--reason`, written after `notRouted`, when it gave one; absent otherwise), `pinned` (`true`, written after `reason`, only when the run was given `--builder`; absent otherwise) |
+| `queue` | `log` (the log's full path), `notRouted` (written right after `log`, only when a heavy or light gate was kept local with `--local`, with the value `--local`, or when a light gate's command is proven faster here, with the value `faster here` (a run that drops its `--no-build` is decided as heavy and never says it), or when a matched command's outside path lies in another worktree of a listed repo and the run says to `--cd` it, with the value `another worktree`, or when a matched command's repo `.gate/local.toml` keeps it here, by a pattern or by a problem, with the value `declared local`, or when a matched command's word names a gitignored project input, with the value `gitignored input`, or when a sibling `requireSiblings` requires is absent, with the value `sibling absent`; every other reason for a local run, the plain outside line included, writes none), `reason` (the free text the run gave `--reason`, written after `notRouted`, when it gave one; absent otherwise), `pinned` (`true`, written after `reason`, only when the run was given `--builder`; absent otherwise) |
 | `take` | `slots` (the slot names taken; a critical gate lists every heavy and light slot it holds; a `none` run lists none, `[]`, with `waitedSeconds` 0.0), `waitedSeconds`, optionally `parentPid` (also on the late take of a covered gate), and for a critical gate `counts`, `otherHeld`, then `otherClaims` or `snapshotError` |
 | `release` | `slots` (the same list), `heldSeconds`, `status` (null when the gate failed before its command had one), `wallSeconds`, `adjustedSeconds`, optionally `avgCores`, `peakCores`, `freeCores`, `verdict`, the [run trace](GLOSSARY.md#run-trace) (`cpuSeconds`, `processes`, `peakProcesses`, `priority`, `loadFreeShare`, `children`, `phases`), `cold` for a cold routed run, `path` for a routed run whose Tailscale path was read, and the run's routing facts `notRouted`, `reason`, `fellBack`, `balanced`, `parentPid` and `stage`, each when the run has it |
 | `abandon` | `waitedSeconds`: the gate ended while still queued (Ctrl+C while waiting for a slot, or, for a routed run, while its client waited to start or while it waited for its work folder's key, remote-tagged) |
@@ -1706,6 +1707,12 @@ The staged listing and the prek-config check use plumbing (`diff-index --cached`
 The key is for check-only hook commands (a build, clippy, a format check): a routed fixer's patch comes back to the worktree under prek's stash. The hook entry calls `gate run ... -- <heavy command>`.
 
 The `git commit` that runs the hook is a commit run ([Commit run](#critical-drain-and-nesting)) on `--slot heavy` or `light`, so it holds a slot for its hooks: a heavy commit covers the hook's gate, which still routes when its patterns match and takes its own remote slot, and a light commit does not cover a heavy hook gate, which takes a heavy slot of its own.
+
+`requireSiblings` is an array of repo names, matched in any letter case, whose matched commands route only with every declared sibling beside the worktree (`Config::siblings_required`).
+
+A listed repo's run whose declared sibling is absent stays here saying `gate: not routed: required sibling <name> is not beside the worktree`, or `required siblings <a>, <b> are not beside the worktree` for more, in declared order, journalled `notRouted: sibling absent`. A repo it does not list keeps the absent-sibling rule: the run routes without the sibling, or as a single repo.
+
+It reads like `commits`: a value that is not an array (`requireSiblings must be an array of repo names`) or holds an item that is not a non-empty string (`requireSiblings[N] is not a non-empty string`) requires every repo's declared siblings, so it fails closed: an absent one keeps the run here with `gate: not routed: required sibling <name> is not beside the worktree (remote.json's requireSiblings cannot be used: <problem>)`. It leaves the rest of the file usable, and `gate check` and `gate remote` say it as a missing item, `check: here: remote.json: <problem>`, so the check exits 1.
 
 **Declarations folder.** `declarations` is an object mapping a repo name, matched in any letter case, to an absolute folder: `{"declarations": {"<repo>": "D:\\notes\\<repo>\\gate"}}`.
 
@@ -2680,7 +2687,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   Then, for declared siblings: a name the builder cannot lay out (the same `.gate/siblings.toml:` line, checked again whatever the reader checked, before consent).
 
-  A declared sibling with nothing at its name beside the root is absent and none of the checks below touch it: it needs no consent, and the run routes with the present siblings, or single when none is present.
+  Then, for a repo `requireSiblings` lists, a declared sibling with nothing at its name beside the root keeps the run here (`gate: not routed: required sibling <name> is not beside the worktree`, `required siblings <a>, <b> are not beside the worktree` for more, journalled `notRouted: sibling absent`), checked when the worktree is opened, before any builder is picked, so no pick, score or steer-off reads anything for it. A pinned run says `gate: --builder <host> cannot route this run: required sibling <name> is not beside the worktree`.
+
+  Otherwise a declared sibling with nothing at its name beside the root is absent and none of the checks below touch it: it needs no consent, and the run routes with the present siblings, or single when none is present.
 
   Then a present sibling `remote.json` does not allow (`gate: not routed: sibling <name> is not allowed in remote.json`; every sibling is not allowed when the `siblings` value cannot be used, the line then ending `: <problem>`).
 
@@ -2762,7 +2771,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   It reads (root, prefix below the root and common git folder), and a folder below the root asks `git ls-files` whether the snapshot would send anything there (tracked or untracked and not ignored, and still on disk). A `subst` drive is followed through `gate_win32::device_target`. A word that is not valid Unicode keeps a command that would route here, saying so; a desktop run is refused instead (`gate: not routed: a word of the command is not valid Unicode; a desktop run never runs here`).
 
-  The queue line carries `notRouted` `--local` for a heavy or light `--local` gate, `faster here` for a light run proven faster here (never for a run that drops its `--no-build`, which is decided as heavy, [Routing](#routing), "A light gate"), `another worktree`, `declared local` or `gitignored input` for the runs those reasons keep here, the run's `--reason` text after it, and the remote tag for a routed one.
+  The queue line carries `notRouted` `--local` for a heavy or light `--local` gate, `faster here` for a light run proven faster here (never for a run that drops its `--no-build`, which is decided as heavy, [Routing](#routing), "A light gate"), `another worktree`, `declared local`, `gitignored input` or `sibling absent` for the runs those reasons keep here, the run's `--reason` text after it, and the remote tag for a routed one.
 
   When the remote client has a part missing, the routed run falls back before it takes a remote slot: the `fallback` line has reason `client`, the gate says `gate: remote <host> client could not start: ...; running here`, and the later `take` and `release` carry no remote fields.
 - **The routing file's text** is JSON with `//` and `/* */` comments and trailing commas allowed outside strings, and a leading byte order mark skipped, as the PowerShell gate's reader allows. Keys match in any letter case, and unknown keys are ignored.

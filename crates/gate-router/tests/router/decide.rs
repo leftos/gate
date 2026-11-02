@@ -3114,11 +3114,85 @@ fn a_word_into_an_absent_sibling_is_outside() {
 fn an_absent_sibling_needs_no_consent() {
     let facts = FakeFacts {
         present: Vec::new(),
-        ..consenting(None, &["yaat-server"])
+        ..consenting(None, &["yaat-server"], "")
     };
     let run = routed(decide(&heavy(&words(&["dotnet", "test"])), &facts));
     assert_eq!(run.siblings, Vec::new());
     assert_eq!(run.absent_siblings, ["yaat-server"], "routed though remote.json allows no sibling");
+}
+
+#[test]
+fn a_required_sibling_that_is_absent_keeps_the_run_here() {
+    let command = words(&["dotnet", "test"]);
+    let facts = FakeFacts {
+        present: Vec::new(),
+        ..consenting(None, &["yaat-server"], r#", "requireSiblings": ["yaat"]"#)
+    };
+    let route = decide(&heavy(&command), &facts);
+    assert_eq!(
+        local_line(&route).as_deref(),
+        Some("gate: not routed: required sibling yaat-server is not beside the worktree")
+    );
+    assert!(
+        matches!(&route, Route::Local { reason: Some(LocalReason::SiblingAbsent { names, .. }) } if names == &["yaat-server"]),
+        "the absent required sibling is the reason"
+    );
+    let both = FakeFacts {
+        present: Vec::new(),
+        ..consenting(None, &["yaat-server", "b"], r#", "requireSiblings": ["yaat"]"#)
+    };
+    assert_eq!(
+        local_line(&decide(&heavy(&command), &both)).as_deref(),
+        Some("gate: not routed: required siblings yaat-server, b are not beside the worktree"),
+        "named in declared order"
+    );
+}
+
+#[test]
+fn an_absent_sibling_not_required_still_routes_single() {
+    let command = words(&["dotnet", "test"]);
+    for facts in [
+        FakeFacts::with_siblings("", &["yaat-server"], &[]),
+        FakeFacts {
+            present: Vec::new(),
+            ..consenting(None, &["yaat-server"], r#", "requireSiblings": ["other"]"#)
+        },
+    ] {
+        let run = routed(decide(&heavy(&command), &facts));
+        assert_eq!(run.siblings, Vec::new(), "the absent sibling is not carried");
+        assert_eq!(run.absent_siblings, ["yaat-server"]);
+    }
+}
+
+#[test]
+fn a_required_sibling_that_is_present_routes_as_a_pair() {
+    let facts = consenting(Some(r#"{"yaat": ["b"]}"#), &["b"], r#", "requireSiblings": ["yaat"]"#);
+    let run = routed(decide(&heavy(&words(&["dotnet", "test"])), &facts));
+    assert_eq!(run.siblings, [carried("b")]);
+    assert!(run.absent_siblings.is_empty(), "nothing is absent: {:?}", run.absent_siblings);
+}
+
+#[test]
+fn a_bad_require_siblings_value_keeps_an_absent_sibling_here() {
+    let command = words(&["dotnet", "test"]);
+    for (value, problem) in [
+        (r#"{"yaat": true}"#, "requireSiblings must be an array of repo names"),
+        (r#""yaat""#, "requireSiblings must be an array of repo names"),
+        ("null", "requireSiblings must be an array of repo names"),
+        (r#"["yaat", ""]"#, "requireSiblings[1] is not a non-empty string"),
+        (r#"["yaat", 3]"#, "requireSiblings[1] is not a non-empty string"),
+    ] {
+        let facts = FakeFacts {
+            present: Vec::new(),
+            ..consenting(None, &["yaat-server"], &format!(r#", "requireSiblings": {value}"#))
+        };
+        let line = local_line(&decide(&heavy(&command), &facts));
+        let expected = format!(
+            "gate: not routed: required sibling yaat-server is not beside the worktree (remote.json's requireSiblings cannot \
+             be used: {problem})"
+        );
+        assert_eq!(line.as_deref(), Some(expected.as_str()), "{value}");
+    }
 }
 
 #[test]
@@ -3199,10 +3273,10 @@ fn no_siblings_changes_nothing() {
 }
 
 /// A gate at the root declaring `declared`, all beside the root, under a routing file whose `siblings` value is
-/// `siblings` (no key at all for `None`).
-fn consenting(siblings: Option<&str>, declared: &[&str]) -> FakeFacts {
+/// `siblings` (no key at all for `None`) and whose other keys are `extra`, each with its leading comma.
+fn consenting(siblings: Option<&str>, declared: &[&str], extra: &str) -> FakeFacts {
     let key = siblings.map_or_else(String::new, |value| format!(r#", "siblings": {value}"#));
-    let config = Config::parse(&format!(r#"{{"host": "builder-1", "repos": {{"yaat": ["*"]}}{key}}}"#)).expect("usable");
+    let config = Config::parse(&format!(r#"{{"host": "builder-1", "repos": {{"yaat": ["*"]}}{key}{extra}}}"#)).expect("usable");
     FakeFacts {
         config: Ok(Some(config)),
         ..FakeFacts::with_siblings("", declared, declared)
@@ -3263,7 +3337,7 @@ fn only_the_siblings_the_routing_file_allows_are_carried() {
             "gate: not routed: sibling A is not allowed in remote.json",
         ),
     ] {
-        let facts = consenting(siblings, declared);
+        let facts = consenting(siblings, declared, "");
         assert_eq!(local_line(&decide(&heavy(&command), &facts)).as_deref(), Some(line), "{case}");
         let roots: Vec<String> = declared.iter().map(|name| sibling_root(name)).collect();
         assert_eq!(
@@ -3273,7 +3347,7 @@ fn only_the_siblings_the_routing_file_allows_are_carried() {
         );
         assert_eq!(facts.siblings_read.get(), 1, "{case}");
     }
-    let facts = consenting(Some(r#"{"YAAT": ["yaat-server", "b", "c"]}"#), &["b"]);
+    let facts = consenting(Some(r#"{"YAAT": ["yaat-server", "b", "c"]}"#), &["b"], "");
     let run = routed(decide(&heavy(&command), &facts));
     assert_eq!(run.siblings, [carried("b")], "only the declared sibling is carried");
     assert_eq!(*facts.presence_asked.borrow(), [sibling_root("b")]);
@@ -3284,7 +3358,7 @@ fn a_declared_name_that_is_no_folder_name_never_reaches_the_folder_check() {
     let command = words(&["dotnet", "test"]);
     for name in [r"x\y", "x/y", "..", "c:"] {
         let allowed = format!(r#"{{"yaat": ["b", "{}"]}}"#, name.replace('\\', r"\\"));
-        let facts = consenting(Some(&allowed), &["b", name]);
+        let facts = consenting(Some(&allowed), &["b", name], "");
         assert_eq!(
             local_line(&decide(&heavy(&command), &facts)),
             Some(format!(
@@ -3304,7 +3378,7 @@ fn a_declared_name_that_is_no_folder_name_never_reaches_the_folder_check() {
 fn a_siblings_file_problem_is_shown_with_its_marks_escaped() {
     let facts = FakeFacts {
         siblings: Err("line 1:\r\n  bad\u{1b}[31m \u{202e}key".to_owned()),
-        ..consenting(Some(r#"{"yaat": ["b"]}"#), &["b"])
+        ..consenting(Some(r#"{"yaat": ["b"]}"#), &["b"], "")
     };
     assert_eq!(
         local_line(&decide(&heavy(&words(&["dotnet", "test"])), &facts)).as_deref(),
@@ -3315,7 +3389,7 @@ fn a_siblings_file_problem_is_shown_with_its_marks_escaped() {
 
 #[test]
 fn a_word_into_an_allowed_sibling_that_is_not_declared_is_outside() {
-    let facts = consenting(Some(r#"{"yaat": ["yaat-server", "b"]}"#), &["yaat-server"]);
+    let facts = consenting(Some(r#"{"yaat": ["yaat-server", "b"]}"#), &["yaat-server"], "");
     let route = decide(&heavy(&words(&["dotnet", "test", r"..\b\x"])), &facts);
     assert_eq!(local_line(&route).as_deref(), Some(r"gate: not routed: ..\b\x is outside the worktree"));
     assert_eq!(facts.siblings_read.get(), 1, "the declaration is read once");
@@ -5490,6 +5564,27 @@ fn an_absent_sibling_on_a_macos_pick_is_handed_to_the_change_read_as_absent() {
         [(Vec::<String>::new(), vec!["b".to_owned()])],
         "the absent name is handed as absent, never as a sibling git reads"
     );
+}
+
+#[test]
+fn a_required_absent_sibling_is_said_before_a_macos_steer_off() {
+    let config = Config::parse(&format!(
+        r#"{{"host": "builder-1", "repos": {{"other": ["*"]}}, "builders": {MAC_THEN_WINDOWS_DOTNET},
+            "requireSiblings": ["yaat"]}}"#
+    ))
+    .expect("usable");
+    let facts = FakeFacts {
+        siblings: Ok(words(&["b"])),
+        windows_change: touched(),
+        ..FakeFacts::with_config(config)
+    };
+    let route = decide(&heavy(&words(&["dotnet", "build", "tests/X"])), &facts);
+    assert_eq!(
+        local_line(&route).as_deref(),
+        Some("gate: not routed: required sibling b is not beside the worktree"),
+        "the required absent sibling keeps it here whatever the builders"
+    );
+    assert_eq!(facts.windows_change_asked.get(), 0, "the change is never read");
 }
 
 /// A gate at the root whose change is `change` to `.gate/windows.toml`'s paths, under a routing file whose `host`

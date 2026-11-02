@@ -651,6 +651,10 @@ pub enum LocalReason {
     SiblingsFile { file: String, problem: String },
     /// The declared sibling `name` is there but cannot be carried, for `reason`, which reads after its name.
     SiblingRefused { name: String, reason: String },
+    /// The declared siblings `names`, in declared order, are not beside the worktree root, and `remote.json`'s
+    /// `requireSiblings` requires them, naming the repo or unusable, with `problem` saying why it cannot be used when it
+    /// cannot.
+    SiblingAbsent { names: Vec<String>, problem: Option<String> },
     /// The declared siblings `names`, in declared order, are not among those `remote.json`'s `siblings` allows the
     /// repo; `problem` is why that value cannot be used, when it cannot.
     SiblingsNotAllowed { names: Vec<String>, problem: Option<String> },
@@ -747,6 +751,13 @@ impl LocalReason {
                 escaped(pattern)
             ),
             Self::SiblingRefused { name, reason } => format!("sibling {name} {reason}"),
+            Self::SiblingAbsent { names, problem } => {
+                let (noun, verb) = if names.len() == 1 { ("sibling", "is") } else { ("siblings", "are") };
+                let problem = problem.as_ref().map_or_else(String::new, |problem| {
+                    format!(" (remote.json's requireSiblings cannot be used: {problem})")
+                });
+                format!("required {noun} {} {verb} not beside the worktree{problem}", names.join(", "))
+            }
             Self::SiblingsNotAllowed { names, problem } => not_allowed_reason(names, problem.as_deref()),
             Self::LeafNotLaidOut { leaf } => format!("the worktree folder name {leaf} cannot be laid out on the builder"),
             Self::DesktopNotAllowed { pattern, mode, problem } => {
@@ -1208,7 +1219,7 @@ fn windows_builders(config: &Config, repo: &str) -> Vec<(Builder, String)> {
 /// A commit stage's run of the worktree at `place` on `builder`, its target settled as any run's ([`settle`]), with no
 /// later candidates; else why the worktree cannot be opened or settled, and the commit runs as it would with no stage.
 fn stage_run(config: &Config, place: Place, builder: Builder, facts: &dyn Facts) -> Result<RemoteRun, String> {
-    let opened = open(place, facts, |repo| config.is_routed(repo)).map_err(kept_here)?;
+    let opened = open(config, place, facts, |repo| config.is_routed(repo)).map_err(kept_here)?;
     let target = settle(config, opened, builder, facts).map_err(kept_here)?;
     Ok(RemoteRun {
         builder: target.builder,
@@ -1291,7 +1302,7 @@ pub struct BuilderWords {
 ///
 /// The reason to say, if any, when the worktree has no target.
 pub fn target(config: &Config, place: Place, facts: &dyn Facts) -> Result<Target, Option<LocalReason>> {
-    let opened = open(place, facts, |repo| config.patterns(repo).is_some())?;
+    let opened = open(config, place, facts, |repo| config.patterns(repo).is_some())?;
     settle(config, opened, config.host_builder().clone(), facts)
 }
 
@@ -2218,6 +2229,9 @@ enum Unopened {
     HookNotAllowed,
     /// The repo, named, is not one the caller's listing names.
     NotListed(String),
+    /// The worktree opened, and the routing file keeps its run here for this reason ([`open`]): a declared sibling it
+    /// requires is absent.
+    Kept(LocalReason),
     /// The command's first word, as the rewrite sent it, names a program that stays on this PC ([`stays_local`]).
     StaysLocal,
 }
@@ -2228,6 +2242,7 @@ impl Unopened {
     fn here(self, git_hook: bool) -> Here {
         match self {
             Unopened::PlaceFailed(reason) if !git_hook => Some(reason),
+            Unopened::Kept(reason) => Some(reason),
             _ => None,
         }
     }
@@ -2259,7 +2274,11 @@ fn opened_and_sent(
         return Err(Unopened::HookNotAllowed);
     }
     let is_listed = listed(&repo);
-    let mut opened = open(place, facts, |_| is_listed).map_err(|_| Unopened::NotListed(repo))?;
+    let mut opened = match open(config, place, facts, |_| is_listed) {
+        Ok(opened) => opened,
+        Err(Some(reason)) => return Err(Unopened::Kept(reason)),
+        Err(None) => return Err(Unopened::NotListed(repo)),
+    };
     opened.built_here = BuiltHere::of(words);
     let drives = subst_drives(&opened.place.root, words, facts);
     let sent = rewritten(&opened.place, declared_pairs(&opened.siblings), words, &drives, Separators::AsWritten);
@@ -2498,7 +2517,7 @@ fn pinned_config(facts: &dyn Facts) -> Result<Config, PinRefusal> {
 fn pin_unopened(host: &str, unopened: Unopened) -> PinRefusal {
     let why = match unopened {
         Unopened::NoWorktree => "the gate's folder is in no git worktree".to_owned(),
-        Unopened::PlaceFailed(reason) => reason.reason(),
+        Unopened::PlaceFailed(reason) | Unopened::Kept(reason) => reason.reason(),
         Unopened::HookNotAllowed => PIN_HOOK.to_owned(),
         Unopened::StaysLocal => PIN_STAYS_LOCAL.to_owned(),
         Unopened::NotListed(repo) => {
@@ -3052,8 +3071,10 @@ struct OpenedSibling {
 
 /// The worktree at `place` when `listed` says the routing file lists its repo, with its siblings file read and each
 /// declared sibling's presence learned ([`presence`]); `Err(None)` when it does not list it, whose file is then not read
-/// at all.
-fn open(place: Place, facts: &dyn Facts, listed: impl FnOnce(&str) -> bool) -> Result<Opened, Here> {
+/// at all. A repo the routing file `config` requires every declared sibling of ([`Config::siblings_required`], a value
+/// that cannot be used requiring every repo's) keeps the run here when one is absent ([`LocalReason::SiblingAbsent`]),
+/// before any builder is picked.
+fn open(config: &Config, place: Place, facts: &dyn Facts, listed: impl FnOnce(&str) -> bool) -> Result<Opened, Here> {
     let repo = repo_name(&place.checkout);
     if !listed(&repo) {
         return Err(None);
@@ -3064,6 +3085,13 @@ fn open(place: Place, facts: &dyn Facts, listed: impl FnOnce(&str) -> bool) -> R
         Err(problem) => (Vec::new(), Some(problem)),
     };
     let (siblings, absent) = presence(declared, &leaf, facts);
+    let required = config.siblings_required(&repo);
+    if required != Ok(false) && !absent.is_empty() {
+        return Err(Some(LocalReason::SiblingAbsent {
+            names: absent,
+            problem: required.err().map(str::to_owned),
+        }));
+    }
     let file = escaped(&facts.declaration_said(&place, "siblings.toml"));
     Ok(Opened {
         place,
@@ -3335,7 +3363,8 @@ struct Declared<'a> {
 /// folder name the builder cannot lay out; a sibling named like that folder (ASCII letter case aside); a sibling
 /// refused, or whose folder could not be read ([`Facts::sibling_folder`]); a sibling whose folder is the root's or an
 /// earlier sibling's. An absent sibling (nothing at its name beside the root, dropped from the run) is none of
-/// these, and needs no consent. With each present sibling's folder id, in declared order. The root's own id is read for
+/// these, and needs no consent: a run one is required to have never reaches here ([`open`]). With each present sibling's
+/// folder id, in declared order. The root's own id is read for
 /// every matched command, siblings or none, after the siblings pass ([`Facts::root_id`]): a root whose id cannot be
 /// read keeps the run here, as its sync-back's lock needs it. With the root's id first.
 fn check_siblings(declared: &Declared<'_>, allowed: Result<&[String], &str>, facts: &dyn Facts) -> Result<(FolderId, Vec<FolderId>), Here> {

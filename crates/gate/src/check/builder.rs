@@ -643,6 +643,8 @@ impl Answer<'_> {
             consent_problem: None,
             hooks_problem: None,
             commits_problem: None,
+            require_siblings_problem: None,
+            siblings_required: false,
             ssh_problem: None,
             desktop_session_problem: None,
             cross_build_problems: Vec::new(),

@@ -302,6 +302,8 @@ fn checked(place: &Place, seams: &CheckSeams) -> Checked {
     });
     let hooks_problem = hooks_problem(&repo);
     let commits_problem = commits_problem(&repo);
+    let require_siblings_problem = require_siblings_problem(&repo);
+    let siblings_required = siblings_required(&repo);
     let ssh_problem = ssh_problem();
     let desktop_session_problem = desktop_session_problem(&repo);
     let cross_build_problems = cross_build_problems();
@@ -330,6 +332,8 @@ fn checked(place: &Place, seams: &CheckSeams) -> Checked {
         consent_problem,
         hooks_problem,
         commits_problem,
+        require_siblings_problem,
+        siblings_required,
         ssh_problem,
         desktop_session_problem,
         cross_build_problems,
@@ -732,6 +736,30 @@ fn commits_problem(repo: &str) -> Option<String> {
         return None;
     };
     config.commits_allowed(repo).err().map(str::to_owned)
+}
+
+/// Why this PC's routing file's `requireSiblings` value cannot be used, if it cannot: the reason the router's
+/// `siblings_required` gives, whatever the repo. A routing file that cannot be read at all is no such problem, as its own
+/// line says it.
+fn require_siblings_problem(repo: &str) -> Option<String> {
+    let path = route::remote_json_path(std::env::var_os("LOCALAPPDATA").as_deref())?;
+    let Ok(Some(config)) = route::read_remote_json(&path) else {
+        return None;
+    };
+    config.siblings_required(repo).err().map(str::to_owned)
+}
+
+/// Whether this PC's routing file's `requireSiblings` requires the repo's declared siblings, by the router's rule: a value
+/// that cannot be used requires every repo's, and a routing file that cannot be read at all requires none, as its own line
+/// says it.
+fn siblings_required(repo: &str) -> bool {
+    let Some(path) = route::remote_json_path(std::env::var_os("LOCALAPPDATA").as_deref()) else {
+        return false;
+    };
+    let Ok(Some(config)) = route::read_remote_json(&path) else {
+        return false;
+    };
+    config.siblings_required(repo) != Ok(false)
 }
 
 /// Why this PC's routing file's `ssh` value cannot be used, if it cannot: the reason the router's `ssh` gives, or that

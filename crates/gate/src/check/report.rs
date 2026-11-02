@@ -177,6 +177,11 @@ pub(crate) struct Checked {
     pub hooks_problem: Option<String>,
     /// Why this PC's routing file's `commits` value cannot be used, when it cannot.
     pub commits_problem: Option<String>,
+    /// Why this PC's routing file's `requireSiblings` value cannot be used, when it cannot.
+    pub require_siblings_problem: Option<String>,
+    /// Whether this PC's routing file requires the repo's declared siblings, by routing's rule: a value that cannot be
+    /// used requires every repo's. Never for a builder, which lays no siblings out.
+    pub siblings_required: bool,
     /// Why this PC's routing file's `ssh` value cannot be used, or that the file it names does not exist; none for a
     /// builder.
     pub ssh_problem: Option<String>,
@@ -363,6 +368,9 @@ fn items(at: At<'_>, checked: &Checked) -> Vec<Item> {
     if let Some(problem) = &checked.commits_problem {
         items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
     }
+    if let Some(problem) = &checked.require_siblings_problem {
+        items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
+    }
     if let Some(problem) = &checked.ssh_problem {
         items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
     }
@@ -381,7 +389,7 @@ fn items(at: At<'_>, checked: &Checked) -> Vec<Item> {
             Kind::Missing,
         ));
     }
-    items.extend(checked.siblings.iter().map(sibling_item));
+    items.extend(checked.siblings.iter().map(|sibling| sibling_item(sibling, checked.siblings_required)));
     if checked.siblings_skipped {
         items.push(Item::new("siblings skipped: a routed run lays them out".to_owned(), Kind::Skipped));
     }
@@ -694,7 +702,7 @@ fn builder_sdks(have: &[String]) -> String {
 
 /// The line of a declared sibling; a refused one worded as routing words it, `sibling {name} {reason}`, and an absent one
 /// informs only, as a routed run goes without it.
-fn sibling_item(sibling: &Sibling) -> Item {
+fn sibling_item(sibling: &Sibling, required: bool) -> Item {
     let Sibling { name, path, found } = sibling;
     let folder = match found {
         Found::NotAllowed => return Item::new(format!("sibling {name} not allowed in remote.json"), Kind::Missing),
@@ -703,6 +711,10 @@ fn sibling_item(sibling: &Sibling) -> Item {
     match folder {
         Ok(SiblingFolder::Present(_)) => Item::new(format!("sibling {name} ok ({path})"), Kind::Ok),
         Ok(SiblingFolder::Refused(reason)) => Item::new(format!("sibling {name} {reason}"), Kind::Missing),
+        Ok(SiblingFolder::Missing) if required => Item::new(
+            format!("sibling {name} absent, and remote.json requires it (routed runs stay here; {path})"),
+            Kind::Missing,
+        ),
         Ok(SiblingFolder::Missing) => Item::new(format!("sibling {name} absent (routed runs go without it; {path})"), Kind::Unchecked),
         Err(why) => Item::new(format!("sibling {name} skipped: {}", escaped(why)), Kind::Skipped),
     }
@@ -765,6 +777,8 @@ mod tests {
             consent_problem: None,
             hooks_problem: None,
             commits_problem: None,
+            require_siblings_problem: None,
+            siblings_required: false,
             ssh_problem: None,
             desktop_session_problem: None,
             cross_build_problems: Vec::new(),

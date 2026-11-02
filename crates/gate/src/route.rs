@@ -52,6 +52,8 @@ const ANOTHER_WORKTREE: &str = "another worktree";
 const DECLARED_LOCAL: &str = "declared local";
 /// The `notRouted` value of a matched command kept here because a word names a gitignored project input.
 const GITIGNORED_INPUT: &str = "gitignored input";
+/// The `notRouted` value of a matched command kept here because a sibling the routing file requires is absent.
+const SIBLING_ABSENT: &str = "sibling absent";
 /// The declaration file of the prefixes of the caller's variables a repo's commands read.
 const ENV_NAME: &str = "env.toml";
 /// The largest file of `.gate` the gate reads: 64 KiB.
@@ -514,7 +516,8 @@ fn consented_hash(remote: &RemoteRun, machine: &Machine<'_>) -> Option<String> {
 /// for a light gate its learned local run time proves faster here ([`LocalReason::FasterHere`]), `another worktree` for
 /// a matched command whose outside path lies in another git worktree, `declared local` for one its repo's
 /// `.gate/local.toml` keeps here, by a pattern or by a problem, `gitignored input` for one whose word names a gitignored
-/// project input, else none.
+/// project input, `sibling absent` for one whose declared sibling the routing file requires and it is not beside the
+/// worktree, else none.
 pub(crate) fn not_routed(route: &Route) -> Option<String> {
     match route {
         Route::Local {
@@ -532,6 +535,9 @@ pub(crate) fn not_routed(route: &Route) -> Option<String> {
         Route::Local {
             reason: Some(LocalReason::GitignoredPastCap { .. } | LocalReason::GitignoredPair { .. } | LocalReason::GitignoredUnsent { .. }),
         } => Some(GITIGNORED_INPUT.to_owned()),
+        Route::Local {
+            reason: Some(LocalReason::SiblingAbsent { .. }),
+        } => Some(SIBLING_ABSENT.to_owned()),
         _ => None,
     }
 }
@@ -3508,7 +3514,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_local_flag_another_worktree_and_the_local_file_write_not_routed() {
+    fn only_the_named_reasons_write_not_routed() {
         let flag = Route::Local {
             reason: Some(LocalReason::LocalFlag),
         };
@@ -3541,8 +3547,15 @@ mod tests {
         let failed = Route::Local {
             reason: Some(LocalReason::Failed { reason: "x".to_owned() }),
         };
+        let absent = Route::Local {
+            reason: Some(LocalReason::SiblingAbsent {
+                names: vec!["b".to_owned()],
+                problem: None,
+            }),
+        };
 
         assert_eq!(not_routed(&flag).as_deref(), Some("--local"));
+        assert_eq!(not_routed(&absent).as_deref(), Some("sibling absent"));
         assert_eq!(not_routed(&other).as_deref(), Some("another worktree"));
         assert_eq!(not_routed(&declared).as_deref(), Some("declared local"));
         assert_eq!(
