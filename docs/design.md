@@ -2715,13 +2715,31 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A run carrying siblings (a pair; a worktree whose declared siblings are all absent routes single and sends inputs as a single repo does) says `gate: not routed: <path> is gitignored, and a sibling pair does not send inputs yet`.
 
-  A candidate whose files cannot be listed says `gate: not routed: <path> is gitignored and its files cannot be sent: <why>`, `<why>` being the walk's or git's text, `it is inside a nested repository`, `the folder is a link or junction`, `<file> is left out of the files its folder sends` or `cannot read <path>: <error>`. A pinned run says `gate: --builder <host> cannot route this run: <reason>` with the same reasons.
+  A candidate whose files cannot be listed says `gate: not routed: <path> is gitignored and its files cannot be sent: <why>`. A pinned run says `gate: --builder <host> cannot route this run: <reason>` with the same reasons.
+
+  `<why>` is the walk's or git's text, `it is inside a nested repository`, `the folder is a link or junction`, `<file> is left out of the files its folder sends` or `cannot read <path>: <error>`.
+
+  For a build that reads a file the run would not send (below), it is `the build reads <file> <where>, which is not sent` (`<where>` being `above its folder`, `outside its folder` or `beside it`), `the build reads <file> <where>, and git cannot tell whether it is sent: <why>` or `the build reads <file>, which cannot be read: <error>`.
 
   A candidate is an existing file with an extension of `.csproj .fsproj .vbproj .proj .sln .slnx .slnf .targets .props .rsp .runsettings`, or, in a `dotnet` command after the verb, a folder in which every project or solution file directly inside is gitignored; a candidate an `inputs` glob covers is not one, since `inputs` already sends it ([remote.json](#remotejson)).
 
   `git check-ignore` runs first on a candidate's own project files, so a tracked candidate never walks. An ignored `.props`, `.targets`, `.rsp` or `.runsettings` file, and an ignored project or solution file at the root, carry only themselves.
 
   An ignored project or solution file below the root carries its folder's gitignored files, as does a folder candidate. The sweep is recursive and skips `bin` and `obj` below the swept folder, links and junctions, nested repositories, the forms the inputs pipeline excludes, and files past `PATH_DEPTH_LIMIT` parts.
+
+  A project, solution or folder candidate whose build reads a file outside what it carries that git reports ignored cannot be carried, since the run would not send that file. It reads two kinds.
+
+  The first is a build file in any folder above it, the worktree root included (`beside it` for a root project): `Directory.Build.props`, `Directory.Build.targets`, `Directory.Build.rsp`, `Directory.Packages.props`, `Directory.Solution.props`, `Directory.Solution.targets`, `nuget.config` or `global.json`, in any letter case.
+
+  The second is a path named in a carried build file (`.csproj`, `.fsproj`, `.vbproj`, `.proj`, `.props`, `.targets`, `.sln`, `.slnx`, `.slnf`), read by its byte-order mark (UTF-16 or UTF-8; with none, UTF-8) with every `<!-- … -->` comment removed.
+
+  Such a path is every string between a pair of double or single quotes on one line, a leading `$(MSBuildThisFileDirectory)` dropped, that holds a `..` segment and resolves, from that file's folder, to an existing file or folder outside the candidate's folder (compared without regard to letter case).
+
+  A value still holding `$(` is skipped. A candidate that carries only itself (a root project, a settings file) is scanned as one file, and follows every relative path it names, a `..` or not.
+
+  A path one of the repo's `inputs` globs matches, or another candidate of the command carries, is sent, so it is never asked. One `git check-ignore` for every candidate judges the rest, and each is asked alone when that call fails; a tracked one changes nothing.
+
+  The run stays here, the safe direction, when a path's own call fails or a carried build file cannot be read. A nearer build file shadowing a farther one is not judged, and a conditional `Import` is followed whatever its condition.
 
   Candidates come from whole words, switch values after `=` or a colon, MSBuild lists split on `;` and `,`, and `@file`. Never read: script text, words after a bare `--`, and the values of the dotnet output options (`-o`, `--output`, `--results-directory`, `--diag`, `-d`, `--artifacts-path`, `-bl`, `--binaryLogger`, `-fl`, `-flp`, `--fileLoggerParameters`).
 

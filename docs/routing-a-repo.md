@@ -30,6 +30,10 @@ A command whose word names an existing gitignored project input (a project, solu
 
 A command whose gitignored inputs hold more than 64 MiB or 2000 files, that carries them in a sibling pair (a run carrying siblings; declared siblings that are all absent make a single repo), or whose files cannot be sent stays local, saying `gate: not routed: <path> is gitignored ...` with the reason, and is journalled `notRouted: gitignored input` ([design.md, Routing](design.md#routing)). A sibling pair with no such inputs routes.
 
+A gitignored project, solution or dotnet folder also stays local when its build reads a gitignored file the run would not send. That is a build file such as `Directory.Build.props`, `Directory.Packages.props`, `nuget.config` or `global.json` in a folder above it (the worktree root included), or a relative path in one of its carried project, props, targets or solution files that points outside its own folder ([design.md, Routing](design.md#routing) lists both).
+
+The line ends `the build reads <file> above its folder, which is not sent` or `the build reads <file> outside its folder, which is not sent`. A throwaway build under `.tmp/` that leans on ignored build files around it therefore stays on the PC by itself, and its caller needs no `--local`.
+
 List a repo in `remote.json`'s `requireSiblings` when its build cannot work without its declared sibling (career-driver's cannot without godot-pad-claim). Its matched command then stays local, saying `gate: not routed: required sibling <name> is not beside the worktree` and journalled `notRouted: sibling absent`, instead of routing as a single repo that fails on the builder, and `gate check` counts the absent sibling missing. A value of `requireSiblings` that cannot be used requires every repo's siblings.
 
 A repo not listed keeps the rule above: declared siblings that are all absent make a single repo. The worktrees of a listed repo must be cut as pairs, `<repo>.wt/<slug>/<repo>` with the sibling beside it, through the repo's nextup profile `siblings:` line ([design.md, Formats](design.md#formats)).
