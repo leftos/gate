@@ -3598,10 +3598,263 @@ fn patterns(texts: &[&str]) -> Vec<Pattern> {
 
 /// The desktop declaration whose `patterns` are `locked` and whose `session` patterns are `session`.
 fn declaration(locked: &[&str], session: &[&str]) -> DesktopDeclaration {
+    hidden_declaration(locked, session, &[])
+}
+
+/// The desktop declaration whose `patterns` are `locked`, whose `session` patterns are `session` and whose `hidden`
+/// patterns are `hidden`.
+fn hidden_declaration(locked: &[&str], session: &[&str], hidden: &[&str]) -> DesktopDeclaration {
     DesktopDeclaration {
         patterns: patterns(locked),
         session: patterns(session),
+        hidden: patterns(hidden),
     }
+}
+
+#[test]
+fn a_hidden_pattern_wins_over_a_locked_or_session_pattern_the_command_also_matches() {
+    let facts = session_facts(
+        Some(r#"{"yaat": ["tool *"]}"#),
+        Some(r#"{"yaat": ["tool x*", "tool s*"]}"#),
+        hidden_declaration(&["tool *"], &["tool s*"], &["tool x*"]),
+    );
+    assert_eq!(
+        routed(decide(&heavy(&words(&["tool", "x"])), &facts)).desktop,
+        Some(DesktopMode::Hidden),
+        "a command matching hidden and another key's pattern is a hidden run"
+    );
+    assert_eq!(routed(decide(&heavy(&words(&["tool", "y"])), &facts)).desktop, Some(DesktopMode::Locked));
+    let session_only = session_facts(
+        None,
+        Some(r#"{"yaat": ["tool s*"]}"#),
+        hidden_declaration(&[], &["tool s*"], &["tool x*"]),
+    );
+    assert_eq!(
+        routed(decide(&heavy(&words(&["tool", "s"])), &session_only)).desktop,
+        Some(DesktopMode::Session)
+    );
+}
+
+#[test]
+fn a_hidden_pattern_consented_by_either_desktop_key_gives_a_hidden_run() {
+    let declared = || hidden_declaration(&[], &[], &["tool *"]);
+    let by_session = session_facts(None, Some(r#"{"yaat": ["tool *"]}"#), declared());
+    assert_eq!(
+        routed(decide(&heavy(&words(&["tool", "x"])), &by_session)).desktop,
+        Some(DesktopMode::Hidden)
+    );
+    let by_desktop = session_facts(Some(r#"{"yaat": ["tool *"]}"#), None, declared());
+    assert_eq!(
+        routed(decide(&heavy(&words(&["tool", "x"])), &by_desktop)).desktop,
+        Some(DesktopMode::Hidden)
+    );
+}
+
+#[test]
+fn a_hidden_pattern_neither_desktop_key_lists_stays_here_naming_both_keys() {
+    let facts = session_facts(
+        Some(r#"{"yaat": ["tool x*"]}"#),
+        Some(r#"{"yaat": ["TOOL *"]}"#),
+        hidden_declaration(&[], &[], &["tool *"]),
+    );
+    assert_eq!(
+        local_line(&decide(&heavy(&words(&["tool", "x"])), &facts)).as_deref(),
+        Some("gate: not routed: desktop hidden pattern 'tool *' not allowed in remote.json desktop or desktopSession")
+    );
+    let unusable = session_facts(Some(r#"["tool *"]"#), None, hidden_declaration(&[], &[], &["tool *"]));
+    assert_eq!(
+        local_line(&decide(&heavy(&words(&["tool", "x"])), &unusable)).as_deref(),
+        Some("gate: not routed: desktop hidden pattern 'tool *' not allowed in remote.json desktop or desktopSession: desktop must be a JSON object"),
+        "a key that cannot be used says why"
+    );
+}
+
+/// `inputs` given `--desktop hidden`.
+fn hidden_run(inputs: Inputs<'_>) -> Inputs<'_> {
+    Inputs {
+        desktop_hidden: true,
+        ..inputs
+    }
+}
+
+/// The refusal line of `--desktop hidden` on a command matching no `.gate/desktop.toml` pattern.
+const HIDDEN_UNMATCHED: &str = "gate: --desktop hidden needs a command matching a pattern of .gate/desktop.toml";
+
+#[test]
+fn a_hidden_proof_run_of_a_consented_pattern_of_any_mode_routes_hidden() {
+    let facts = session_facts(
+        Some(r#"{"yaat": ["dotnet test*"]}"#),
+        Some(r#"{"yaat": ["tool *"]}"#),
+        declaration(&["dotnet test*"], &["tool *"]),
+    );
+    let locked = words(&["dotnet", "test"]);
+    assert_eq!(routed(decide(&hidden_run(heavy(&locked)), &facts)).desktop, Some(DesktopMode::Hidden));
+    let session = words(&["tool", "x"]);
+    assert_eq!(routed(decide(&hidden_run(light(&session)), &facts)).desktop, Some(DesktopMode::Hidden));
+    assert_eq!(
+        routed(decide(&heavy(&locked), &facts)).desktop,
+        Some(DesktopMode::Locked),
+        "without it the mode stays"
+    );
+}
+
+#[test]
+fn a_hidden_proof_run_matching_no_desktop_pattern_is_refused() {
+    let facts = desktop_facts(Some(r#"{"yaat": ["dotnet test*"]}"#), &["dotnet test*"]);
+    let route = decide(&hidden_run(heavy(&words(&["dotnet", "build"]))), &facts);
+    assert_eq!(refused(route).line(), HIDDEN_UNMATCHED);
+}
+
+/// The refusal line of a `--desktop hidden` run the decision would keep here for `why` before a desktop pattern
+/// matched.
+fn hidden_kept_here(why: &str) -> String {
+    format!("gate: --desktop hidden cannot route this run: {why}")
+}
+
+/// A routing file consenting `dotnet test*` of `yaat`, which its `.gate/desktop.toml` declares.
+fn hidden_consented() -> FakeFacts {
+    desktop_facts(Some(r#"{"yaat": ["dotnet test*"]}"#), &["dotnet test*"])
+}
+
+#[test]
+fn a_hidden_proof_run_under_an_unusable_routing_file_is_refused_saying_it_was_ignored() {
+    let reason = Config::parse("{").expect_err("broken");
+    let unusable = FakeFacts {
+        config: Err(ConfigProblem {
+            path: PathBuf::from(r"C:\gate\remote.json"),
+            reason: reason.clone(),
+        }),
+        ..hidden_consented()
+    };
+    assert_eq!(
+        refused(decide(&hidden_run(heavy(&words(&["dotnet", "test"]))), &unusable)).line(),
+        hidden_kept_here(&format!(r"ignored C:\gate\remote.json: {reason}"))
+    );
+}
+
+#[test]
+fn a_hidden_proof_run_no_routing_pattern_matches_is_refused_as_nothing_routes_it() {
+    assert_eq!(
+        refused(decide(&hidden_run(heavy(&words(&["npm", "test"]))), &hidden_consented())).line(),
+        hidden_kept_here("nothing routes it")
+    );
+}
+
+#[test]
+fn a_hidden_proof_run_its_local_file_keeps_here_is_refused_the_same_with_or_without_a_pin() {
+    let local = FakeFacts {
+        local: Ok(patterns(&["dotnet test*"])),
+        ..hidden_consented()
+    };
+    let test = words(&["dotnet", "test"]);
+    let line = hidden_kept_here(".gate/local.toml keeps it here (dotnet test*)");
+    assert_eq!(refused(decide(&hidden_run(heavy(&test)), &local)).line(), line);
+    assert_eq!(
+        refused(decide(&hidden_run(pinned_to(&test, "builder-1")), &local)).line(),
+        line,
+        "a pinned run says the same"
+    );
+}
+
+#[test]
+fn a_hidden_proof_run_of_a_git_command_is_refused_as_nothing_routes_it() {
+    assert_eq!(
+        refused(decide(&hidden_run(heavy(&words(&["git", "status"]))), &hidden_consented())).line(),
+        hidden_kept_here("nothing routes it")
+    );
+}
+
+#[test]
+fn a_hidden_proof_run_of_a_git_commit_is_never_a_commit_stage() {
+    let facts = FakeFacts {
+        commit_stage: true,
+        ..FakeFacts::with_config(commits_config(r#"{"yaat": ["dotnet *"]}"#, ""))
+    };
+    assert_eq!(
+        refused(decide(&hidden_run(heavy(&words(&["git", "commit", "-m", "x"]))), &facts)).line(),
+        hidden_kept_here("nothing routes it")
+    );
+}
+
+#[test]
+fn a_hidden_proof_run_sent_on_to_a_later_builder_keeps_its_proof_or_skips_it() {
+    let build = words(&["dotnet", "build"]);
+    let consented = builder_desktop_facts(r#"{"other": ["*"]}"#, TWO_WINDOWS, &["dotnet build*"], &[]);
+    let run = routed(decide(&hidden_run(heavy(&build)), &consented));
+    assert_eq!((run.builder.alias.as_str(), run.desktop), ("win-2", Some(DesktopMode::Hidden)));
+    assert_eq!(later_aliases(&run), ["win-3"]);
+    let later = later_run(&hidden_run(heavy(&build)), &consented, &run.later[0]).expect("the later builder is kept");
+    assert_eq!(later.desktop, Some(DesktopMode::Hidden), "the later builder's run is hidden too");
+    let undeclared = builder_desktop_facts(r#"{"other": ["*"]}"#, TWO_WINDOWS, &[], &[]);
+    assert_eq!(
+        later_run(&hidden_run(heavy(&build)), &undeclared, &run.later[0]).map(|run| run.desktop),
+        Err(Some(
+            "--desktop hidden needs a command matching a pattern of .gate/desktop.toml".to_owned()
+        )),
+        "a pattern that no longer matches never goes on as a run without the desktop"
+    );
+    let unconsented = FakeFacts {
+        desktop: Ok(declaration(&["dotnet b*"], &[])),
+        ..builder_desktop_facts(r#"{"other": ["*"]}"#, TWO_WINDOWS, &[], &[])
+    };
+    assert_eq!(
+        later_run(&hidden_run(heavy(&build)), &unconsented, &run.later[0]).map(|run| run.desktop),
+        Err(Some(
+            "--desktop hidden needs the desktop pattern 'dotnet b*' allowed in remote.json".to_owned()
+        ))
+    );
+}
+
+#[test]
+fn a_pinned_hidden_proof_run_routes_hidden_to_its_builder_or_is_refused() {
+    let facts = builder_desktop_facts(r#"{"other": ["*"]}"#, TWO_WINDOWS, &["dotnet build*"], &[]);
+    let run = routed(decide(&hidden_run(pinned_to(&words(&["dotnet", "build"]), "win-3")), &facts));
+    assert_eq!((run.builder.alias.as_str(), run.desktop), ("win-3", Some(DesktopMode::Hidden)));
+    assert_eq!(
+        refused(decide(&hidden_run(pinned_to(&words(&["dotnet", "test"]), "win-3")), &facts)).line(),
+        HIDDEN_UNMATCHED
+    );
+}
+
+#[test]
+fn a_hidden_proof_run_whose_consent_key_cannot_be_used_is_refused_saying_why() {
+    let facts = desktop_facts(Some(r#"["dotnet test*"]"#), &["dotnet test*"]);
+    assert_eq!(
+        refused(decide(&hidden_run(heavy(&words(&["dotnet", "test"]))), &facts)).line(),
+        "gate: --desktop hidden needs the desktop pattern 'dotnet test*' allowed in remote.json: desktop must be a JSON object"
+    );
+}
+
+#[test]
+fn a_hidden_proof_run_of_an_unconsented_pattern_is_refused() {
+    let facts = desktop_facts(Some(r#"{"yaat": ["dotnet build*"]}"#), &["dotnet test*"]);
+    assert_eq!(
+        refused(decide(&hidden_run(heavy(&words(&["dotnet", "test"]))), &facts)).line(),
+        "gate: --desktop hidden needs the desktop pattern 'dotnet test*' allowed in remote.json"
+    );
+    let escaped = desktop_facts(None, &["dotnet test\t*"]);
+    assert_eq!(
+        refused(decide(&hidden_run(heavy(&words(&["dotnet", "test\tx"]))), &escaped)).line(),
+        r"gate: --desktop hidden needs the desktop pattern 'dotnet test\t*' allowed in remote.json"
+    );
+}
+
+#[test]
+fn a_hidden_proof_run_under_a_covering_parent_or_in_a_box_run_is_refused() {
+    let facts = desktop_facts(Some(r#"{"yaat": ["dotnet test*"]}"#), &["dotnet test*"]);
+    let command = words(&["dotnet", "test"]);
+    for parent in [Nested::Covering, Nested::BoxRun] {
+        let inputs = Inputs {
+            parent,
+            ..hidden_run(heavy(&command))
+        };
+        assert_eq!(
+            refused(decide(&inputs, &facts)).line(),
+            "gate: --desktop hidden cannot route under a parent gate",
+            "{parent:?}"
+        );
+    }
+    assert!(facts.asked().is_empty(), "asked {:?}", facts.asked());
 }
 
 /// A gate at the root whose `.gate/desktop.toml` declares `declared`, under a routing file routing `dotnet *` and

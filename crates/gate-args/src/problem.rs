@@ -149,6 +149,16 @@ pub enum Problem {
         host: String,
         why: String,
     },
+    /// `--desktop` given a value other than `hidden`, named as the caller spelled it.
+    BadDesktop {
+        option: String,
+        value: String,
+    },
+    /// `--desktop hidden` given on a run that can never route, for `why`: `--local`, or a slot other than heavy or
+    /// light.
+    DesktopCannotRoute {
+        why: String,
+    },
     /// A run that must state its reason (`local`, `slot critical`, or both) and gave no `--reason`, in the caller's
     /// spelling.
     ReasonNeeded {
@@ -263,6 +273,8 @@ impl fmt::Display for Problem {
             Problem::AloneNeedsCritical(Spelling::Cli) => f.write_str("gate: --alone needs --slot critical"),
             Problem::AloneNeedsCritical(Spelling::Compat) => f.write_str("gate: -Alone needs -Slot critical"),
             Problem::BuilderCannotRoute { host, why } => write!(f, "gate: --builder {} cannot route this run: {why}", escaped(host)),
+            Problem::BadDesktop { option, value } => write!(f, "gate: {option} takes hidden, got '{value}'"),
+            Problem::DesktopCannotRoute { why } => write!(f, "gate: --desktop hidden cannot route this run: {why}"),
             Problem::ReasonNeeded { local, critical, spelling } => f.write_str(match (local, critical, spelling) {
                 (true, false, Spelling::Cli) => "gate: --local needs --reason \"<why>\"",
                 (false, true, Spelling::Cli) => "gate: --slot critical needs --reason \"<why>\"",

@@ -46,6 +46,7 @@ pub(crate) enum ValueOption {
     Env,
     Reason,
     Builder,
+    Desktop,
     #[cfg(feature = "test-seams")]
     SampleMs,
     #[cfg(feature = "test-seams")]
@@ -266,6 +267,8 @@ pub(crate) struct RunBuilder {
     push_seams: PushSeams,
     /// `--builder <host>`: `gate check`'s builder, or the one builder a run is pinned to.
     builder: Option<String>,
+    /// `--desktop hidden`: the run's desktop command runs on a hidden desktop.
+    desktop_hidden: bool,
     /// `gate check`'s own seams (`CheckSeams`); its builder seams are read into `test_seams`, as a run's are.
     check_seams: CheckSeams,
     given: Vec<RunOption>,
@@ -372,6 +375,7 @@ impl RunBuilder {
             ValueOption::Env => self.env_word(value)?,
             ValueOption::Reason => self.reason = Some(Self::reason_value(spelled, value)?),
             ValueOption::Builder => self.builder = Some(value.to_owned()),
+            ValueOption::Desktop => self.desktop_hidden = Self::desktop_value(spelled, value)?,
             #[cfg(feature = "test-seams")]
             ValueOption::SampleMs
             | ValueOption::LoadWindowMs
@@ -509,7 +513,8 @@ impl RunBuilder {
             | ValueOption::BringTracked
             | ValueOption::Env
             | ValueOption::Reason
-            | ValueOption::Builder => {}
+            | ValueOption::Builder
+            | ValueOption::Desktop => {}
         }
         Ok(())
     }
@@ -529,6 +534,17 @@ impl RunBuilder {
             return Err(Problem::EmptyReason(spelled.to_owned()));
         }
         Ok(value.to_owned())
+    }
+
+    /// Whether `--desktop`'s value asks for a hidden desktop: `hidden`, in any ASCII case, is its one value.
+    fn desktop_value(spelled: &str, value: &str) -> Result<bool, Problem> {
+        if value.eq_ignore_ascii_case("hidden") {
+            return Ok(true);
+        }
+        Err(Problem::BadDesktop {
+            option: spelled.to_owned(),
+            value: value.to_owned(),
+        })
     }
 
     /// Sets or clears a switch.
@@ -595,7 +611,7 @@ impl RunBuilder {
         if self.alone && self.slot.is_some_and(|slot| slot != Slot::Critical) {
             self.problems.push(Problem::AloneNeedsCritical(spelling));
         }
-        self.check_builder_routes();
+        self.check_never_routes();
         if !self.given.contains(&RunOption::Value(ValueOption::Reason)) {
             let local = self.local;
             let critical = self.slot == Some(Slot::Critical);
@@ -626,6 +642,7 @@ impl RunBuilder {
                 local: self.local,
                 alone: self.alone,
                 builder: self.builder,
+                desktop_hidden: self.desktop_hidden,
                 reason: self.reason,
                 bring_tracked: self.bring_tracked,
                 env: self.env,
@@ -640,23 +657,32 @@ impl RunBuilder {
         }
     }
 
-    /// Refuses a `--builder` pin on a run that can never route: one given `--local`, or one on a slot other than heavy or
-    /// light.
-    fn check_builder_routes(&mut self) {
-        let Some(host) = &self.builder else {
+    /// Refuses a `--builder` pin and `--desktop hidden` on a run that can never route ([`Self::never_routes`]).
+    fn check_never_routes(&mut self) {
+        let Some(why) = self.never_routes() else {
             return;
         };
-        let why = if self.local {
-            "--local keeps it here".to_owned()
-        } else {
-            match self.slot {
-                Some(slot @ (Slot::Critical | Slot::None)) => {
-                    format!("only a heavy or light run routes, and this one is --slot {}", slot.as_str())
-                }
-                _ => return,
-            }
-        };
-        self.problems.push(Problem::BuilderCannotRoute { host: host.clone(), why });
+        if let Some(host) = &self.builder {
+            self.problems.push(Problem::BuilderCannotRoute {
+                host: host.clone(),
+                why: why.clone(),
+            });
+        }
+        if self.desktop_hidden {
+            self.problems.push(Problem::DesktopCannotRoute { why });
+        }
+    }
+
+    /// Why the run can never route: it was given `--local`, or a slot other than heavy or light; `None` for one that
+    /// may.
+    fn never_routes(&self) -> Option<String> {
+        if self.local {
+            return Some("--local keeps it here".to_owned());
+        }
+        match self.slot {
+            Some(slot @ (Slot::Critical | Slot::None)) => Some(format!("only a heavy or light run routes, and this one is --slot {}", slot.as_str())),
+            _ => None,
+        }
     }
 
     /// Refuses the `--env` pairs: more pairs or bytes than its cap ([`values::over_cap`]), counted over the accepted

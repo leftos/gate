@@ -573,6 +573,48 @@ fn a_lent_gate_whose_desktop_command_runs_on_this_pc_says_so() {
 }
 
 #[test]
+fn a_heavy_desktop_hidden_run_under_a_light_parent_while_a_critical_request_drains_is_never_lent_and_routes() {
+    let case = routed_case("critical-unlent-desktop-hidden");
+    declare_desktop(&case, &["*tool* argv*"]);
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":4}"#);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let mut held_extra = POLL.to_vec();
+    held_extra.push("--local");
+    held_extra.extend(LOCAL_REASON);
+    let held = holder(
+        &case,
+        &heavy_words("holder.log", &held_extra, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]),
+    );
+    let critical = case.start(&critical_words("critical.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
+    critical.wait_for_stderr(WAITING);
+
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let mut extra = POLL.to_vec();
+    extra.extend(["--test-remote-client", steps.as_str(), "--desktop", "hidden"]);
+    extra.extend(GIT_HANG_GUARDS);
+    let marker = test_marker(&case, "light");
+    let hidden = start(marked(&case, &heavy_words("hidden.log", &extra, &[r".\tool.exe", "argv", "a"]), &marker));
+    let_go(&go);
+    let hidden = hidden.finish();
+
+    assert_passed(&hidden);
+    assert!(
+        !hidden.stderr.contains(&lent(process::id())),
+        "a hidden run is never lent its parent's slot: {hidden:?}"
+    );
+    let recorded: Value = serde_json::from_str(&fs::read_to_string(&call).expect("the client recorded its call")).expect("the record is JSON");
+    assert_eq!(
+        recorded["desktopHidden"],
+        json!(true),
+        "decided as itself, it routes as a hidden run: {recorded}"
+    );
+    assert_passed(&critical.finish());
+    assert_passed(&held.finish());
+}
+
+#[test]
 fn a_lent_auto_run_uses_its_history_for_the_ceiling() {
     let case = Case::new("a_lent_auto_run_uses_its_history_for_the_ceiling");
     write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":4}"#);

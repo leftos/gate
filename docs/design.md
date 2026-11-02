@@ -84,6 +84,7 @@ The watchdog samples the command and kills its job on a stall, at the ceiling an
 | `--no-markers` | `-NoMarkers` | The command's status is the verdict; the marker scan is off (V2). | ruling |
 | `--local` | `-Local` | Never route this run to a builder (F1). | kept (F1) |
 | `--builder <host>` (or `--builder=<host>`) | none | Route this run to the builder `<host>` alone, never another and never here; heavy and light runs only ([Routing](#routing), Pinned run). | ruling (GATE-677) |
+| `--desktop hidden` | none | Run a command that matches a declared, consented `.gate/desktop.toml` pattern of any mode as a hidden run on a desktop of its own no one sees, this run only; heavy and light runs only, allowed with `--builder` ([Routing](#routing), the desktop paragraphs). | ruling (GATE-1039) |
 | `--reason "<why>"` | `-Reason "<why>"`, `-Reason:<why>` | The free-text reason a run states for itself. Required, and non-blank, when the run is `--local`, `--slot critical` or `--alone`; accepted and recorded on any run. Recorded on its `queue` event, in its claim and in its ticket. | ruling |
 | `--state-dir <path>` | none | Use another [state root](#state-root); a relative path is read against the caller's working directory, before `--cd`. | ruling |
 | `--cd <folder>` | `-Cd` | Run the command in `<folder>` and route from it ([Run folder](#run-folder)). | ruling (GATE-323) |
@@ -1732,7 +1733,11 @@ A routed client that cannot use `remote.json` logs `gate: ignored <path>: <reaso
 
 ops-tower reads only `slots`.
 
-A repo's `.gate/desktop.toml`, which declares the commands that need the builder's desktop, is read by `gate_router::desktop::read_desktop`: two optional keys, at least one present, `patterns` (commands that hold the desktop lock for their run) and `session` (commands that need only the console session and take no lock), each an array of at most 32 non-empty `-like` patterns (`= []` declares none). A leading byte order mark is skipped and any other key is a problem.
+A repo's `.gate/desktop.toml`, which declares the commands that need the builder's desktop, is read by `gate_router::desktop::read_desktop`: three optional keys, at least one present, `patterns` (commands that hold the desktop lock for their run), `session` (commands that need only the console session and take no lock) and `hidden` (commands that need only the console session and run on a desktop of their own that no one sees, taking no lock),
+
+no pattern in two keys (letter case aside), each an array of at most 32 non-empty `-like` patterns (`= []` declares none).
+
+A leading byte order mark is skipped and any other key is a problem.
 
 The first problem wins, each key's count checked before its entries: `declares no patterns or session`, `<key> is not an array (TOML <type>)`, `<key>[<i>] is not a string (TOML <type>)`, `<key>[<i>] is empty`, `<key>[<i>] is not a valid wildcard pattern: "<text>"`, `declares more than 32 <key>` (the cap is per key), `<key> is not a key (patterns, session)`, `"<p>" is in both patterns and session` (compared without letter case), plus the UTF-8 and parse failures, with `<key>` `patterns` or `session`.
 
@@ -2707,15 +2712,29 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A command that needs the builder's desktop is declared in the repo's `.gate/desktop.toml` and consented to in `remote.json`'s `desktop` ([remote.json](#remotejson)); the check runs right after the `.gate/local.toml` check and before the siblings, outside-path and nothing-sent checks, on a command the `repos` patterns matched, and the file is read from disk as it stands, through the same guarded read as `siblings.toml` (`.gate` and the file not followed as links, at most 64 KiB), or, when the worktree has no such file, from the repo's declarations folder ([remote.json](#remotejson), Declarations folder).
 
-  The first declared pattern the command's rewritten words match decides, matched against the same words joined by single spaces as the repo's `repos` patterns; a `patterns` entry is looked at before a `session` one, so a command matching both is a locked run. No file, empty lists or no matching pattern asks for nothing.
+  The first declared pattern the command's rewritten words match decides, matched against the same words joined by single spaces as the repo's `repos` patterns; a `hidden` entry is looked at first, then a `patterns` one, then a `session` one, so a command matching a `hidden` entry is a hidden run and one matching both a `patterns` and a `session` entry is a locked run. No file, empty lists or no matching pattern asks for nothing.
 
-  A matching pattern that `remote.json` does not list for the repo, letter case included, keeps the run here with `gate: not routed: desktop pattern '<pattern>' not allowed in remote.json` (escaped), or for a `session` entry `gate: not routed: desktop session pattern '<pattern>' not allowed in remote.json desktopSession`, the line ending `: <problem>` when the value cannot be used.
+  A matching pattern that `remote.json` does not list for the repo, letter case included, keeps the run here with `gate: not routed: desktop pattern '<pattern>' not allowed in remote.json` (escaped), for a `session` entry `gate: not routed: desktop session pattern '<pattern>' not allowed in remote.json desktopSession`, or for a `hidden` entry `gate: not routed: desktop hidden pattern '<pattern>' not allowed in remote.json desktop or desktopSession`,
 
-  A `patterns` entry is listed in `desktop`, a `session` entry in `desktopSession`, and `desktop` never allows a session pattern.
+  the line ending `: <problem>` when the value cannot be used.
+
+  A `patterns` entry is listed in `desktop`, a `session` entry in `desktopSession`, and `desktop` never allows a session pattern. A `hidden` entry is listed in either, exactly; it takes no key of its own in `remote.json`.
 
   A file that cannot be used keeps every routed command of the repo here with `gate: not routed: .gate/desktop.toml: <problem>`, the first problem, on one line and escaped, said ahead of the later reasons (faster here, siblings, an outside word); a copy read from the declarations folder is named by its full path in place of `.gate/desktop.toml`.
 
-  A consented match makes the run a desktop run: `RemoteRun.desktop` is the match's mode, locked or session, and the run call asks for the desktop (the client's Desktop bullet, below). A session run is a desktop run that needs the builder's console session but not the desktop lock.
+  A consented match makes the run a desktop run: `RemoteRun.desktop` is the match's mode, locked, session or hidden, and the run call asks for the desktop (the client's Desktop bullet, below). A session run is a desktop run that needs the builder's console session but not the desktop lock; a hidden run is a session run whose command starts on a desktop of its own that no one sees (The hidden desktop, in The desktop run's design).
+
+  `gate run --desktop hidden` makes a run whose command matches a declared pattern of any mode, and that `remote.json` allows the repo under that pattern's own mode (a `hidden` pattern in either key), a hidden run, this run only.
+
+  The run is refused, exit 2 before anything runs, with `gate: --desktop hidden needs a command matching a pattern of .gate/desktop.toml`, `gate: --desktop hidden needs the desktop pattern '<pattern>' allowed in remote.json` (ending `: <problem>` when the value cannot be used),
+
+  `gate: --desktop hidden cannot route under a parent gate` (a covering parent's slot, or inside a box run), or `gate: --desktop hidden cannot route this run: <the reason>` for a run the decision would keep here before any pattern matched (`nothing routes it` when it would say none).
+
+  A later desktop reason refuses it as it does any desktop run.
+
+  It is allowed with `--builder`, is never lent a light parent's slot while a critical request drains, and a later builder whose pattern or consent no longer proves it is skipped (`gate: not trying <alias>: --desktop hidden needs …`), never run without the desktop. The flag is never passed to nested gates.
+
+  Parsing refuses (exit 2) a value but `hidden`, in any ASCII case (`gate: --desktop takes hidden, got '<value>'`), and a run that can never route, as `--builder` is: `gate: --desktop hidden cannot route this run: --local keeps it here` or `... only a heavy or light run routes, and this one is --slot <none|critical>`.
 
   A desktop run never runs here: `--local`, a `.gate/local.toml` match (read before the desktop decision), a pattern `remote.json` does not consent and an unusable `.gate/desktop.toml` still keep it here, but any reason found after the desktop match refuses it instead, with `gate: not routed: <the reason's usual text>; a desktop run never runs here` and exit 2, before anything runs, as a pin the decision refuses does (`PinRefusal::DesktopNotHere`). A desktop run whose only candidates are `macos` builders is refused the same way, with `no builder remote.json lists can run a desktop run (a macOS builder has no desktop)` as the reason. A light desktop run skips the faster-here comparison and always routes.
 
@@ -3206,7 +3225,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     The wait is no part of the run's time: on admission the run's start and its slot's hold restart, so the recorded duration, `--timeout auto` and the hang hint leave it out, and no journal format changes. What stays counted: the slot claim's `started`, which other waiters' holder ETA reads, and a pinned run's `heldSeconds` after a fallback past the lapse.
 
     A warm-up that meets the drain says `gate: warm: the builder is drained; this warm-up ends without warming` ([gate warm](#gate-warm)), and `gate check --builder` reports it ([With `--builder`](#with---builder)).
-  - **Desktop.** A routed run whose `RemoteRun.desktop` is true (Routing, the desktop paragraphs) sends `Desktop: true` and `DesktopWait` in its run call's payload (`payload::run_word`), with `DesktopSession: true` beside them for a session run, `DesktopWait` being the run's sent `Timeout` (at least 1, at most 2147483647), so the run waits for the desktop as long as it may run there; the call carries no usual p90.
+  - **Desktop.** A routed run whose `RemoteRun.desktop` is true (Routing, the desktop paragraphs) sends `Desktop: true` and `DesktopWait` in its run call's payload (`payload::run_word`), with `DesktopSession: true` beside them for a session or hidden run and `DesktopHidden: true` as well for a hidden run, `DesktopWait` being the run's sent `Timeout` (at least 1, at most 2147483647), so the run waits for the desktop as long as it may run there; the call carries no usual p90.
 
     A desktop run can therefore wait up to its ceiling for the desktop and then run up to its ceiling. Its waits for the PC's remote pool and builder slots and for the work folder's key come out of one budget equal to its ceiling (the floor of an `auto:` ceiling), where other runs keep 60 s for the pool and 90 s for the key; it also waits out a `gate warm` holding the key.
 
@@ -3909,7 +3928,9 @@ A `run` payload may also hold `Desktop` (true or false, false when absent or nul
 
 `DesktopSession` (true or false, false when absent or null, else `gate: box payload DesktopSession is not true or false`; true without `Desktop` true, `gate: box payload DesktopSession needs Desktop`, both exit 2) makes it a session run, which takes no desktop lock.
 
-`DesktopHidden` (true or false, false when absent or null, else `gate: box payload DesktopHidden is not true or false`; true without `DesktopSession` true, `gate: box payload DesktopHidden needs DesktopSession`, both exit 2) makes the session run's command run on a desktop of its own that no one sees (The hidden desktop, in The desktop run's design). The PC does not send the key yet.
+`DesktopHidden` (true or false, false when absent or null, else `gate: box payload DesktopHidden is not true or false`; true without `DesktopSession` true, `gate: box payload DesktopHidden needs DesktopSession`, both exit 2) makes the session run's command run on a desktop of its own that no one sees (The hidden desktop, in The desktop run's design).
+
+The PC sends it for a hidden run, beside `DesktopSession`, and never for a session or locked run; an older box never gets it, as the preflight refuses a builder whose gate version differs.
 
 A warm-up payload with `Desktop` true is refused with `gate: box payload asks a warm-up for the desktop` and exit 2.
 

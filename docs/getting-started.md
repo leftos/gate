@@ -121,7 +121,7 @@ A repo describes itself to gate in a tracked `.gate` folder. Every file is optio
 | `toolchain.toml` | The tools (`[tools]`) and the .NET `workloads` a routed run's builder must have. A tool's version is a minimum (`rust`, `cargo-nextest`, `node` and the others), or `""` for any version; `godot` and `unreal` are exact pins instead. `gate check` checks this PC's tools against it and says the workloads are `not checked yet`. |
 | `siblings.toml` | The sibling worktrees beside the repo that a routed run carries with it. |
 | `warmup.toml` | The commands `gate warm` runs to warm a builder's work folder. |
-| `desktop.toml` | The routed commands that need the builder's logged-on desktop (`patterns`) or only its console session (`session`). |
+| `desktop.toml` | The routed commands that need the builder's logged-on desktop (`patterns`), only its console session (`session`) or a desktop of their own that no one sees (`hidden`). |
 | `local.toml` | The commands that always run on this PC (`patterns`). |
 | `env.toml` | The prefixes of the repo's own environment variables (`prefixes`), so a routed run names the ones it does not send. |
 | `windows.toml` | The paths whose change keeps a run off a macOS builder (`paths`). |

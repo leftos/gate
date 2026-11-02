@@ -1105,6 +1105,7 @@ mod scripted {
             "outputs": call.outputs,
             "inputs": call.inputs,
             "desktop": call.desktop.is_some(),
+            "desktopHidden": call.desktop == Some(gate_router::desktop::DesktopMode::Hidden),
             "log": call.log.to_string_lossy(),
             "timeout": call.timeout,
             "stall": call.stall,

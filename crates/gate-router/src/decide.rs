@@ -241,6 +241,10 @@ pub struct Inputs<'a> {
     pub given: Option<&'a [String]>,
     /// `--builder <host>`: the one builder the run may go to, as given; `None` for a run the pick routes.
     pub pin: Option<&'a str>,
+    /// `--desktop hidden`: the run must match a declared desktop pattern of any mode that `remote.json` allows its
+    /// repo, and then runs as a hidden run ([`DesktopMode::Hidden`]), else it is refused; `false` for a run whose
+    /// matched pattern gives its mode.
+    pub desktop_hidden: bool,
 }
 
 /// The gate's place in its git worktree.
@@ -554,6 +558,16 @@ pub enum PinRefusal {
     /// the text of the [`LocalReason::reason`] it would have said, or [`NO_DESKTOP_BUILDER`] for one it would have kept
     /// here silently. A desktop run never runs here.
     DesktopNotHere { why: String },
+    /// A `--desktop hidden` run ([`Inputs::desktop_hidden`]) whose command matches no `.gate/desktop.toml` pattern.
+    HiddenUnmatched,
+    /// A `--desktop hidden` run whose first matching desktop pattern, `pattern`, `remote.json` does not allow its repo;
+    /// `problem` is why the consent's key cannot be used, when it cannot.
+    HiddenNotAllowed { pattern: String, problem: Option<String> },
+    /// A `--desktop hidden` run the decision would keep here before any desktop pattern matched, for `reason`, `None`
+    /// for one it would keep here silently.
+    HiddenKeptHere { reason: Option<LocalReason> },
+    /// A `--desktop hidden` run on a covering parent's slot or inside a box run, which can never route.
+    HiddenCovered,
 }
 
 /// Why a desktop run the decision would keep here silently cannot route: no builder left once the macOS ones are
@@ -589,6 +603,17 @@ impl PinRefusal {
                 cd_value(tree)
             ),
             Self::DesktopNotHere { why } => format!("gate: not routed: {why}; a desktop run never runs here"),
+            Self::HiddenUnmatched => "gate: --desktop hidden needs a command matching a pattern of .gate/desktop.toml".to_owned(),
+            Self::HiddenNotAllowed { pattern, problem } => format!(
+                "gate: --desktop hidden needs the desktop pattern '{}' allowed in remote.json{}",
+                escaped(pattern),
+                problem.as_ref().map_or_else(String::new, |problem| format!(": {problem}"))
+            ),
+            Self::HiddenKeptHere { reason } => format!(
+                "gate: --desktop hidden cannot route this run: {}",
+                reason.as_ref().map_or_else(|| "nothing routes it".to_owned(), LocalReason::reason)
+            ),
+            Self::HiddenCovered => "gate: --desktop hidden cannot route under a parent gate".to_owned(),
         }
     }
 
@@ -636,7 +661,7 @@ pub enum LocalReason {
     DesktopFile { file: String, problem: String },
     /// The first declared desktop pattern the command matches, `pattern`, of the mode `mode`, is not among those
     /// `remote.json` allows the repo: its `desktop` for a locked (`patterns`) entry, its `desktopSession` for a session
-    /// one; `problem` is why that value cannot be used, when it cannot.
+    /// one, either for a hidden one; `problem` is why that value cannot be used, when it cannot.
     DesktopNotAllowed {
         pattern: String,
         mode: DesktopMode,
@@ -734,6 +759,10 @@ impl LocalReason {
                             escaped(pattern)
                         )
                     }
+                    DesktopMode::Hidden => format!(
+                        "desktop hidden pattern '{}' not allowed in remote.json desktop or desktopSession{problem}",
+                        escaped(pattern)
+                    ),
                 }
             }
         }
@@ -1047,8 +1076,17 @@ fn absent_line(names: &[String]) -> Option<String> {
 ///
 /// A run pinned to one builder ([`Inputs::pin`]) goes to that builder alone, with no later candidates, or is refused
 /// ([`pinned`]).
+///
+/// A `--desktop hidden` run ([`Inputs::desktop_hidden`]) is refused under a covering parent's slot or inside a box run
+/// before anything is read; else it is a desktop run of [`DesktopMode::Hidden`] once its command matches a declared
+/// pattern of any mode that the routing file allows its repo, and refused when it matches none or that pattern is not
+/// allowed ([`hidden_refusal`]), or, with the reason it would say, when the decision would keep it here before any
+/// desktop pattern matched ([`PinRefusal::HiddenKeptHere`]).
 #[must_use]
 pub fn decide(inputs: &Inputs<'_>, facts: &dyn Facts) -> Route {
+    if inputs.desktop_hidden && inputs.parent != Nested::None {
+        return Route::Refused(PinRefusal::HiddenCovered);
+    }
     if let Some(host) = inputs.pin {
         return match pinned(inputs, host, facts) {
             Ok(run) => Route::Routed(Box::new(run)),
@@ -1058,6 +1096,9 @@ pub fn decide(inputs: &Inputs<'_>, facts: &dyn Facts) -> Route {
     match route(inputs, facts) {
         Ok(Decided::Routed(run)) => Route::Routed(Box::new(run)),
         Ok(Decided::Stage(run)) => Route::Stage(Box::new(run)),
+        // A hidden run kept here is one no desktop pattern has matched yet: once one has, it is a desktop run, which is
+        // refused instead ([`Unrouted::kept`]).
+        Err(Unrouted::Here(reason)) if inputs.desktop_hidden => Route::Refused(PinRefusal::HiddenKeptHere { reason }),
         Err(Unrouted::Here(reason)) => Route::Local { reason },
         Err(Unrouted::Refused(refusal)) => Route::Refused(refusal),
     }
@@ -1294,6 +1335,10 @@ struct Matched {
 
 fn route(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Decided, Unrouted> {
     let config = configured(inputs, facts)?;
+    // A commit is no desktop command: a hidden run is never asked for its stage, and is refused as nothing routing it.
+    if inputs.desktop_hidden && stays_local(inputs.words) {
+        return Err(Unrouted::Here(None));
+    }
     if let Some(run) = commit_stage(&config, inputs, facts) {
         return Ok(Decided::Stage(run));
     }
@@ -1856,6 +1901,7 @@ fn file_stem(path: &str) -> &str {
 /// no macOS one ([`steer_off_backslashes`]).
 fn matched(config: &Config, inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Matched, Unrouted> {
     let (git_hook, words) = (inputs.git_hook, inputs.words);
+    let hidden = inputs.desktop_hidden;
     let (opened, drives, sent) =
         opened_and_sent(config, git_hook, words, facts, |repo| config.is_routed(repo)).map_err(|unopened| unopened.here(git_hook))?;
     let matching = matching(config, &opened.repo, &sent.words);
@@ -1872,6 +1918,9 @@ fn matched(config: &Config, inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Ma
     check_local(&opened.place, &[&sent.words, &given], facts)?;
     // Known before any steer-off, speed check or settling, so none of them keeps a desktop run here.
     let found = desktop_pattern(&opened.place, &sent.words, facts)?;
+    if hidden && let Some(refusal) = hidden_refusal(config, &opened.repo, found.as_ref()) {
+        return Err(Unrouted::Refused(refusal));
+    }
     let desktop_run = found
         .as_ref()
         .is_some_and(|(pattern, mode)| desktop_consent(config, &opened.repo, pattern, *mode).is_ok());
@@ -1895,6 +1944,7 @@ fn matched(config: &Config, inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Ma
             builder,
             pattern,
             found: DesktopRead::Read(found.clone()),
+            hidden,
             unix,
         };
         let mut matched = built(config, opened, sent, kept, facts)?;
@@ -1912,6 +1962,8 @@ struct Kept {
     pattern: String,
     /// What the pick read of the worktree's `.gate/desktop.toml` ([`macos_desktop`]).
     found: DesktopRead,
+    /// Whether the run was given `--desktop hidden` ([`Inputs::desktop_hidden`]).
+    hidden: bool,
     /// A macOS pick's words in their Unix form; `None` for another builder, which runs the words as sent.
     unix: Option<Vec<String>>,
 }
@@ -1922,7 +1974,7 @@ struct Kept {
 fn built(config: &Config, mut opened: Opened, sent: Rewritten, kept: Kept, facts: &dyn Facts) -> Result<Matched, Here> {
     let built_here = std::mem::take(&mut opened.built_here);
     let target = settle(config, opened, kept.builder, facts)?;
-    let desktop = check_desktop(config, &target, kept.found, &sent.words, facts)?;
+    let desktop = check_desktop(config, &target, (kept.found, kept.hidden), &sent.words, facts)?;
     Ok(Matched {
         target,
         pattern: kept.pattern,
@@ -2242,7 +2294,16 @@ pub fn later_run(inputs: &Inputs<'_>, facts: &dyn Facts, candidate: &LaterCandid
         .ok_or_else(|| Some(format!("remote.json no longer lists it for {}", opened.repo)))?;
     let builder = builder.clone();
     let pattern = first_match(patterns, &sent.words).ok_or_else(|| Some("none of its patterns matches the command now".to_owned()))?;
-    kept_run(&config, (opened, drives, sent), (builder, pattern), inputs.words, facts).map_err(|unkept| match unkept {
+    let mut proven = None;
+    if inputs.desktop_hidden {
+        // Read again, as the first pick read it: a hidden run that no longer matches never goes on without the desktop.
+        proven = desktop_pattern(&opened.place, &sent.words, facts).map_err(|here| Some(kept_here(here)))?;
+        if let Some(refusal) = hidden_refusal(&config, &opened.repo, proven.as_ref()) {
+            let line = refusal.line();
+            return Err(Some(line.strip_prefix("gate: ").unwrap_or(&line).to_owned()));
+        }
+    }
+    kept_run(&config, (opened, drives, sent), (builder, pattern), (inputs.words, proven), facts).map_err(|unkept| match unkept {
         Unkept::Here(here) => Some(kept_here(here)),
         Unkept::Desktop | Unkept::WindowsOnly | Unkept::WindowsChange(_) | Unkept::BuiltHere(_) | Unkept::Backslash => None,
     })
@@ -2269,17 +2330,37 @@ enum Unkept {
 /// The routed run of the opened worktree's command, its subst table and its words `sent` ([`opened_and_sent`]), on the
 /// `chosen` builder whose pattern matched it: the worktree's `.gate/local.toml` checked ([`check_local`]), the builder
 /// kept unless a macOS one's steer-off rule would move a pick off it, then built and ended ([`built`], [`ended`]) for
-/// the command as `given`. What [`later_run`] and a pinned run ([`pinned`]) both build once they have their builder.
+/// the command as `given`. `proven` is the desktop pattern a `--desktop hidden` run's caller already matched and found
+/// allowed ([`hidden_refusal`]), which makes it a hidden run and is not read again; `None` for any other run. What
+/// [`later_run`] and a pinned run ([`pinned`]) both build once they have their builder.
 ///
 /// # Errors
 ///
 /// Why the builder is not kept ([`Unkept`]); each caller says it its own way.
-fn kept_run(config: &Config, sent: OpenedAndSent, chosen: (Builder, String), given: &[String], facts: &dyn Facts) -> Result<RemoteRun, Unkept> {
+fn kept_run(
+    config: &Config,
+    sent: OpenedAndSent,
+    chosen: (Builder, String),
+    (given, proven): (&[String], Option<(String, DesktopMode)>),
+    facts: &dyn Facts,
+) -> Result<RemoteRun, Unkept> {
     let (opened, drives, sent) = sent;
     let (builder, pattern) = chosen;
     check_local(&opened.place, &[&sent.words], facts).map_err(Unkept::Here)?;
-    let found = macos_desktop(&builder, &opened, &sent.words, facts).map_err(Unkept::Here)?;
-    if let Some(unkept) = macos_kept_off(config, &builder, &opened, (&sent.words, &found), facts) {
+    let hidden = proven.is_some();
+    let (read, found) = if let Some(found) = proven {
+        // What a macOS pick reads, which steers off it; nothing for another builder.
+        let read = if builder.os == BuilderOs::Macos {
+            DesktopRead::Read(Some(found.clone()))
+        } else {
+            DesktopRead::NotRead
+        };
+        (read, DesktopRead::Read(Some(found)))
+    } else {
+        let read = macos_desktop(&builder, &opened, &sent.words, facts).map_err(Unkept::Here)?;
+        (read.clone(), read)
+    };
+    if let Some(unkept) = macos_kept_off(config, &builder, &opened, (&sent.words, &read), facts) {
         return Err(unkept);
     }
     let unix = match slashed(&builder, &opened, given, &drives, facts) {
@@ -2291,6 +2372,7 @@ fn kept_run(config: &Config, sent: OpenedAndSent, chosen: (Builder, String), giv
         builder,
         pattern,
         found,
+        hidden,
         unix,
     };
     let matched = built(config, opened, sent, kept, facts).map_err(Unkept::Here)?;
@@ -2334,7 +2416,17 @@ fn pinned(inputs: &Inputs<'_>, host: &str, facts: &dyn Facts) -> Result<RemoteRu
         host: host.to_owned(),
         why: "none of its patterns matches the command".to_owned(),
     })?;
-    kept_run(&config, (opened, drives, sent), (builder, pattern), inputs.words, facts).map_err(|unkept| match unkept {
+    let mut proven = None;
+    if inputs.desktop_hidden {
+        // In the unpinned order ([`matched`]): `.gate/local.toml` before the desktop file, each refused as there.
+        let kept_here = |reason| PinRefusal::HiddenKeptHere { reason };
+        check_local(&opened.place, &[&sent.words], facts).map_err(kept_here)?;
+        proven = desktop_pattern(&opened.place, &sent.words, facts).map_err(kept_here)?;
+        if let Some(refusal) = hidden_refusal(&config, &opened.repo, proven.as_ref()) {
+            return Err(refusal);
+        }
+    }
+    kept_run(&config, (opened, drives, sent), (builder, pattern), (inputs.words, proven), facts).map_err(|unkept| match unkept {
         Unkept::Here(reason) => here(reason),
         Unkept::Desktop => cannot("it asks for a desktop, which a macOS builder does not have"),
         Unkept::WindowsOnly => cannot("it may test a Windows-only project, which a macOS builder cannot run"),
@@ -2649,8 +2741,9 @@ fn check_local(place: &Place, spellings: &[&[String]], facts: &dyn Facts) -> Res
 }
 
 /// The first pattern of the worktree's `.gate/desktop.toml` at `place` that the rewritten `words` match, joined by single
-/// spaces, with its mode: the `patterns` key's first, which take the desktop lock, then the `session` key's; `None` when
-/// none does. Keeps the command here, saying why, when the file has a problem, shown [`escaped`].
+/// spaces, with its mode, the least intrusive mode first: the `hidden` key's first, then the `patterns` key's, which
+/// take the desktop lock, then the `session` key's; `None` when none does. Keeps the command here, saying why, when the
+/// file has a problem, shown [`escaped`].
 fn desktop_pattern(place: &Place, words: &[String], facts: &dyn Facts) -> Result<Option<(String, DesktopMode)>, Here> {
     let declared = facts.desktop(place).map_err(|problem| {
         Some(LocalReason::DesktopFile {
@@ -2658,8 +2751,30 @@ fn desktop_pattern(place: &Place, words: &[String], facts: &dyn Facts) -> Result
             problem: escaped(&fold_lines(&problem)),
         })
     })?;
-    let locked = first_match(&declared.patterns, words).map(|pattern| (pattern, DesktopMode::Locked));
-    Ok(locked.or_else(|| first_match(&declared.session, words).map(|pattern| (pattern, DesktopMode::Session))))
+    let found = [
+        (&declared.hidden, DesktopMode::Hidden),
+        (&declared.patterns, DesktopMode::Locked),
+        (&declared.session, DesktopMode::Session),
+    ]
+    .into_iter()
+    .find_map(|(patterns, mode)| first_match(patterns, words).map(|pattern| (pattern, mode)));
+    Ok(found)
+}
+
+/// Why a `--desktop hidden` run cannot go on with `found`, the first declared desktop pattern its command matches
+/// ([`desktop_pattern`]): it matches none, or `remote.json` does not allow the repo `repo` that pattern under its own
+/// mode's consent ([`desktop_consent`]), saying why its key cannot be used when it cannot; `None` when the run may go
+/// on as a hidden run.
+fn hidden_refusal(config: &Config, repo: &str, found: Option<&(String, DesktopMode)>) -> Option<PinRefusal> {
+    let Some((pattern, mode)) = found else {
+        return Some(PinRefusal::HiddenUnmatched);
+    };
+    desktop_consent(config, repo, pattern, *mode)
+        .err()
+        .map(|problem| PinRefusal::HiddenNotAllowed {
+            pattern: pattern.clone(),
+            problem,
+        })
 }
 
 /// The pick `first` of the opened worktree's command `words`, kept unless it is a macOS builder and a declared desktop
@@ -2793,6 +2908,7 @@ fn macos_built_here(builder: &Builder, opened: &Opened, facts: &dyn Facts) -> Op
 }
 
 /// What the pick read of the worktree's `.gate/desktop.toml` ([`steer_off_macos`]).
+#[derive(Clone)]
 enum DesktopRead {
     /// The pick did not read it.
     NotRead,
@@ -2811,12 +2927,20 @@ impl DesktopRead {
 /// How a matched command uses the builder's desktop: the mode of the first pattern of the worktree's
 /// `.gate/desktop.toml` that its rewritten `words` match ([`desktop_pattern`]), joined by single spaces as the repo's
 /// patterns see them, when `remote.json` allows the repo that pattern, listed exactly (letter case included): its
-/// `desktop` for a locked pattern, its `desktopSession` for a session one; `None` when no declared pattern matches.
-/// Keeps the command here, saying why, when the file has a problem, shown [`escaped`], or when that pattern is not
-/// allowed, every one of a mode when its key cannot be used.
+/// `desktop` for a locked pattern, its `desktopSession` for a session one, either for a hidden one; `None` when no
+/// declared pattern matches. A run given `--desktop hidden` (`hidden`), whose pattern its caller already found allowed
+/// ([`hidden_refusal`]), is a hidden run whatever the pattern's mode, with no consent asked again. Keeps the command
+/// here, saying why, when the file has a problem, shown [`escaped`], or when that pattern is not allowed, every one of
+/// a mode when its key cannot be used.
 ///
 /// `read` is what the pick already read of the file ([`steer_off_macos`]); a file it did not read is read here.
-fn check_desktop(config: &Config, target: &Target, read: DesktopRead, words: &[String], facts: &dyn Facts) -> Result<Option<DesktopMode>, Here> {
+fn check_desktop(
+    config: &Config,
+    target: &Target,
+    (read, hidden): (DesktopRead, bool),
+    words: &[String],
+    facts: &dyn Facts,
+) -> Result<Option<DesktopMode>, Here> {
     let found = match read {
         DesktopRead::Read(found) => found,
         DesktopRead::NotRead => desktop_pattern(&target.place, words, facts)?,
@@ -2824,6 +2948,10 @@ fn check_desktop(config: &Config, target: &Target, read: DesktopRead, words: &[S
     let Some((pattern, mode)) = found else {
         return Ok(None);
     };
+    // A hidden run's pattern was found allowed when it was matched ([`hidden_refusal`]).
+    if hidden {
+        return Ok(Some(DesktopMode::Hidden));
+    }
     match desktop_consent(config, &target.repo, &pattern, mode) {
         Ok(()) => Ok(Some(mode)),
         Err(problem) => Err(Some(LocalReason::DesktopNotAllowed { pattern, mode, problem })),
@@ -2831,16 +2959,27 @@ fn check_desktop(config: &Config, target: &Target, read: DesktopRead, words: &[S
 }
 
 /// Whether `remote.json` allows the repo `repo` the declared desktop `pattern` of `mode`, listed exactly (letter case
-/// included): its `desktop` for a locked pattern, its `desktopSession` for a session one.
+/// included): its `desktop` for a locked pattern, its `desktopSession` for a session one, either for a hidden one.
 ///
 /// # Errors
 ///
-/// When it does not: why that key cannot be used, on one line, when it cannot.
+/// When it does not: why that key cannot be used, on one line, when it cannot; for a hidden pattern, why `desktop`
+/// cannot be used, else why `desktopSession` cannot.
 fn desktop_consent(config: &Config, repo: &str, pattern: &str, mode: DesktopMode) -> Result<(), Option<String>> {
-    let consent = match mode {
-        DesktopMode::Locked => config.allowed_desktop(repo),
-        DesktopMode::Session => config.allowed_desktop_session(repo),
-    };
+    match mode {
+        DesktopMode::Locked => listed_in(config.allowed_desktop(repo), pattern),
+        DesktopMode::Session => listed_in(config.allowed_desktop_session(repo), pattern),
+        DesktopMode::Hidden => listed_in(config.allowed_desktop(repo), pattern)
+            .or_else(|first| listed_in(config.allowed_desktop_session(repo), pattern).map_err(|second| first.or(second))),
+    }
+}
+
+/// Whether the consent `consent` lists `pattern` exactly.
+///
+/// # Errors
+///
+/// When it does not: why the key cannot be used, on one line, when it cannot.
+fn listed_in(consent: Result<&[String], &str>, pattern: &str) -> Result<(), Option<String>> {
     match consent {
         Ok(allowed) if allowed.iter().any(|listed| listed == pattern) => Ok(()),
         Ok(_) => Err(None),

@@ -124,6 +124,10 @@ pub(crate) struct Decided {
 /// request holds it back, whether its command would route on heavy without reading the routing file or git on any other
 /// run: the [`Inputs`] the run's own decision had, less the slot it asked for, and what [`Machine::new`] read of the
 /// environment.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is a fact of its own about the run, set independently of the others"
+)]
 pub(crate) struct Decision {
     parent: Nested,
     local: bool,
@@ -135,6 +139,8 @@ pub(crate) struct Decision {
     local_app_data: Option<OsString>,
     /// `--builder <host>`, the one builder the run is pinned to.
     pin: Option<String>,
+    /// `--desktop hidden`: the run's desktop command runs on a hidden desktop ([`Inputs::desktop_hidden`]).
+    desktop_hidden: bool,
     /// The state root the run's records are under, the built-here record among them ([`Facts::built_here`]).
     state: PathBuf,
 }
@@ -153,6 +159,7 @@ impl Decision {
             unicode: request.command.iter().all(|word| word.to_str().is_some()),
             local_app_data: environment.local_app_data.clone(),
             pin: request.builder.clone(),
+            desktop_hidden: request.desktop_hidden,
         }
     }
 
@@ -166,6 +173,7 @@ impl Decision {
             words: &self.words,
             given: self.given.as_deref(),
             pin: self.pin.as_deref(),
+            desktop_hidden: self.desktop_hidden,
         }
     }
 }
@@ -3132,6 +3140,7 @@ mod tests {
             words: &words,
             given: None,
             pin: None,
+            desktop_hidden: false,
         };
         machine.commit_stage(config, &inputs)
     }

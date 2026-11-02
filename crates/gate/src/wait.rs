@@ -1402,6 +1402,7 @@ pub(crate) mod scratch {
             local: false,
             alone: false,
             builder: None,
+            desktop_hidden: false,
             reason: None,
             bring_tracked: Vec::new(),
             env: Vec::new(),

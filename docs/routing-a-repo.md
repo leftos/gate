@@ -202,6 +202,26 @@ A locked console or an input desktop other than `Default` still refuses a sessio
 
 Commit a `session` key only after the reinstall that carries this change, on the PC and (through `gate push`) on the builders: an older gate.exe reads the key as a `.gate/desktop.toml` problem (`session is not a key (patterns)`) and keeps all of the repo's runs here.
 
+### A command that runs on a hidden desktop
+
+A command that needs a desktop but not the builder's own can run on a desktop the gate creates for it, which no one sees and nothing else shares: windows create and show, `PrintWindow` and Direct3D give real pixels, and `SendInput` is refused.
+
+A hidden run never takes the desktop lock or touches the console desktop, so it neither waits for a locked run nor shows a window on the builder. Use it by default for a desktop route, and keep `patterns` or `session` only for a command that proves it cannot run there (one that needs `SendInput`, for example).
+
+Declare it under a third key, `hidden = ["dotnet test *Ui*"]`, beside `patterns` and `session` (any may be absent, at most 32 each, no pattern in two, letter case aside); the first declared pattern a command matches decides, `hidden` first, then `patterns`, then `session`.
+
+The PC consents with an exact entry in `desktop.<repo>` or `desktopSession.<repo>`; there is no key of its own. Without it the command runs here with `gate: not routed: desktop hidden pattern '<pattern>' not allowed in remote.json desktop or desktopSession`.
+
+To prove a command there before moving it, run `gate run --desktop hidden -- <command>`: a command matching a declared and consented pattern of any mode runs as a hidden run, this run only, and `--builder <host>` may pin it.
+
+It is refused, exit 2, when the command matches no pattern of `.gate/desktop.toml` (`gate: --desktop hidden needs a command matching a pattern of .gate/desktop.toml`), when the pattern is not allowed (`gate: --desktop hidden needs the desktop pattern '<pattern>' allowed in remote.json`), under a parent gate, with `--local` or a `critical` or `none` slot, or for any reason that keeps a routed command here;
+
+the run never goes on without the desktop, so a builder that no longer proves it is skipped.
+
+Once the proof run passes, move the pattern from `patterns` or `session` to `hidden` in `.gate/desktop.toml`; the `remote.json` entry stays as it is. A repo that has not moved keeps its locked runs unchanged.
+
+Commit a `hidden` key only after the reinstall that carries this change, on the PC and (through `gate push`) on the builders: an older gate.exe reads the key as a `.gate/desktop.toml` problem (`hidden is not a key (patterns, session)`, or the like) and keeps all of the repo's runs here.
+
 ## A repo with a command that stays on this PC
 
 A repo with a command that needs this PC (its WSL state, a service or device only this PC has) declares its `-like` patterns in a tracked `.gate/local.toml`, `patterns = ["dotnet test *Lan*"]`, at most 32, matched against the same rewritten words as the repo's `repos` patterns. No consent in `remote.json` is needed, since the file only keeps commands here.

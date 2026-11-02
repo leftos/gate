@@ -22,6 +22,7 @@ run options:
   --no-markers         the command's status is the verdict
   --local              never route this run to a builder
   --builder <host>     route this run to the builder <host> alone, never another and never here; heavy runs only
+  --desktop hidden     run a command matching an allowed desktop pattern on a desktop of its own no one sees, this run only
   --reason \"<why>\"     why this run is local, critical or alone; required with --local, --slot critical and --alone
   --alone              with --slot critical: hold the machine alone, every light slot included
   --state-dir <path>   use another state root (also GATE_STATE_DIR)

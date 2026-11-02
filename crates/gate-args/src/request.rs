@@ -555,6 +555,9 @@ pub struct RunRequest {
     pub alone: bool,
     /// `--builder <host>` as given: the one builder this run may go to, never another and never this PC.
     pub builder: Option<String>,
+    /// `--desktop hidden`: the command, which must match a declared desktop pattern its repo is allowed, runs on a
+    /// hidden desktop of the builder's console session, whatever mode its pattern declares.
+    pub desktop_hidden: bool,
     /// The `--reason` text the caller gave, recorded with the run; required when `local` or a critical slot.
     pub reason: Option<String>,
     /// The `--bring-tracked` globs, in the order given: a fetched output git tracks is installed only when one matches it.

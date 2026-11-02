@@ -201,6 +201,7 @@ fn run_option(name: &str) -> Option<RunOption> {
         "local" => RunOption::Switch(SwitchOption::Local),
         "alone" => RunOption::Switch(SwitchOption::Alone),
         "builder" => RunOption::Value(ValueOption::Builder),
+        "desktop" => RunOption::Value(ValueOption::Desktop),
         _ => return seam_option(name),
     };
     Some(option)

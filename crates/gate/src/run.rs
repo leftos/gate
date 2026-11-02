@@ -1968,13 +1968,13 @@ impl Run<'_> {
     /// Decides where the command runs, and sets the remote tag of a routed run. A gate a parent's slot covers runs
     /// here, as does one whose light parent lends it its slot before it queues, while a critical request drains, which
     /// is not routed ([`Run::on_parent`]) but is decided as a covered gate, so a desktop command says it runs here
-    /// ([`gate_router::LocalReason::DesktopUnderParent`]); a run pinned with `--builder` asks for no lend, so it routes
-    /// whatever a critical request is doing. The route, and what the decision learnt of the gate's place in its
-    /// worktree. The hash of the warm-up file the route asks the builder's work folder to be warm with is kept for the
-    /// call. `given` holds the words as the caller wrote them for a run that dropped its `--no-build` before its route
-    /// ([`route::route`]).
+    /// ([`gate_router::LocalReason::DesktopUnderParent`]); a run pinned with `--builder` or given `--desktop hidden`
+    /// asks for no lend, so it is decided as itself whatever a critical request is doing. The route, and what the
+    /// decision learnt of the gate's place in its worktree. The hash of the warm-up file the route asks the builder's
+    /// work folder to be warm with is kept for the call. `given` holds the words as the caller wrote them for a run
+    /// that dropped its `--no-build` before its route ([`route::route`]).
     fn route(&mut self, environment: &Environment, given: Option<&[String]>, console: &mut Console) -> (Route, Placed) {
-        if self.request.builder.is_none() && self.lend_before_queue(console) {
+        if self.request.builder.is_none() && !self.request.desktop_hidden && self.lend_before_queue(console) {
             self.lent = true;
             let decided = route::route(self.request, environment, (Nested::Covering, given), (self.root, &self.gate), console);
             assert!(
@@ -2132,9 +2132,10 @@ impl Run<'_> {
 
     /// Asks a light parent whose slot does not cover this run, once it dropped its `--no-build` and asks for a heavy
     /// slot, whether it lends that slot before the run queues, as [`Run::route`] asked of the nesting the run was read
-    /// with; a run already lent its parent's slot keeps it, and a run pinned with `--builder` asks for none.
+    /// with; a run already lent its parent's slot keeps it, and a run pinned with `--builder` or given
+    /// `--desktop hidden` asks for none.
     fn lend_again(&mut self, console: &mut Console) {
-        if !self.lent && self.request.builder.is_none() {
+        if !self.lent && self.request.builder.is_none() && !self.request.desktop_hidden {
             self.lent = self.lend_before_queue(console);
         }
     }

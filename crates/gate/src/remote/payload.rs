@@ -176,7 +176,8 @@ pub(crate) struct RunCall<'a> {
     pub engine_env: &'a [String],
     /// How the run uses the builder's desktop, `None` for not at all (`Desktop: true` and `DesktopWait`, the run's
     /// desktop wait in whole seconds ([`desktop_wait`]), sent only for a desktop run, with `DesktopSession: true` for a
-    /// session one); a warm-up never sends them, as the box refuses a warm-up on the desktop.
+    /// session or hidden one and `DesktopHidden: true` for a hidden one); a warm-up never sends them, as the box
+    /// refuses a warm-up on the desktop.
     pub desktop: Option<DesktopMode>,
     /// The cross build a macOS builder runs after the passing command (`CrossBuild`, its `Rid` and `Words`, sent only
     /// when there is one and the run asks for outputs, as the box takes it only then); a warm-up never sends it.
@@ -311,12 +312,12 @@ fn desktop_wait(timeout: u64) -> u64 {
 }
 
 /// The payload word of the run call, with the run's variables (the caller's `--env` pairs and the gate's
-/// `SourceRevisionId`) as `Env` when there is one, and `Desktop: true`
-/// with `DesktopWait` ([`desktop_wait`], the run's `Timeout`) for a run that asks for the
-/// builder's desktop, with `DesktopSession: true` beside them for a session run, which takes no desktop lock (a box
-/// that does not know the key takes the lock), `CrossBuild` (`Rid` and `Words`) for a run with a cross build and output globs, and the
-/// repos' default branches as `Base` and `SiblingBases` when any has one, and `CommitStage: true` with the PC's `Head`
-/// for a commit's pre-commit stage.
+/// `SourceRevisionId`) as `Env` when there is one, and `Desktop: true` with `DesktopWait` ([`desktop_wait`], the run's
+/// `Timeout`) for a run that asks for the builder's desktop, with `DesktopSession: true` beside them for a session run,
+/// which takes no desktop lock (a box that does not know the key takes the lock), and `DesktopHidden: true` beside
+/// those for a hidden run, a session run on a desktop of its own that no one sees, `CrossBuild` (`Rid` and `Words`) for
+/// a run with a cross build and output globs, and the repos' default branches as `Base` and `SiblingBases` when any has
+/// one, and `CommitStage: true` with the PC's `Head` for a commit's pre-commit stage.
 pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
     let mut object = location.object();
     for (name, value) in [
@@ -342,8 +343,11 @@ pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
     if let Some(mode) = run.desktop {
         object.insert("Desktop".to_owned(), json!(true));
         object.insert("DesktopWait".to_owned(), json!(desktop_wait(run.timeout)));
-        if mode == DesktopMode::Session {
+        if matches!(mode, DesktopMode::Session | DesktopMode::Hidden) {
             object.insert("DesktopSession".to_owned(), json!(true));
+        }
+        if mode == DesktopMode::Hidden {
+            object.insert("DesktopHidden".to_owned(), json!(true));
         }
     }
     if let Some(cross) = run.cross_build.filter(|_| !run.outputs.is_empty()) {
@@ -1285,6 +1289,8 @@ mod tests {
             "a warm-up never asks for the session: {warm_sent}"
         );
 
+        assert!(sent.get("DesktopHidden").is_none(), "a session run sends no DesktopHidden: {sent}");
+
         for (timeout, wait) in [(0, 1), (1, 1), (45, 45), (3_000_000_000, 2_147_483_647)] {
             let sent = decoded(&run_word(&location(), &RunCall { timeout, ..run }));
             assert_eq!(
@@ -1299,6 +1305,54 @@ mod tests {
         assert!(
             sent.get("Desktop").is_none() && sent.get("DesktopWait").is_none() && sent.get("DesktopSession").is_none(),
             "a run without the desktop sends neither key: {sent}"
+        );
+    }
+
+    #[test]
+    fn a_hidden_run_asks_for_a_session_run_on_a_hidden_desktop_and_a_warm_up_does_not() {
+        let words = ["./tool.exe".to_owned()];
+        let run = RunCall {
+            cross_build: None,
+            words: &words,
+            subfolder: "",
+            nonce: "0123456789abcdef0123456789abcdef",
+            snapshot: SHA,
+            outputs: &[],
+            failure_outputs: &[],
+            full: false,
+            timeout: 300,
+            host: "builder",
+            sibling_snapshots: &[],
+            base: None,
+            sibling_bases: &[],
+            commit_stage_head: None,
+            inputs_digest: None,
+            lfs_digest: None,
+            sent_digest: None,
+            env: &[],
+            godot_version: None,
+            unreal_version: None,
+            engine_env: &[],
+            desktop: Some(gate_router::desktop::DesktopMode::Hidden),
+        };
+        let word = run_word(&location(), &run);
+        let sent = decoded(&word);
+        assert_eq!(
+            (&sent["Desktop"], &sent["DesktopWait"], &sent["DesktopSession"], &sent["DesktopHidden"]),
+            (&json!(true), &json!(300), &json!(true), &json!(true)),
+            "a hidden run is a session run with DesktopHidden: {sent}"
+        );
+        assert_eq!(on_the_box(&word).desktop_session(), Ok(true), "the box takes no lock");
+        assert_eq!(on_the_box(&word).desktop_hidden(), Ok(true), "the box reads DesktopHidden back");
+        let commands = warm_commands();
+        let warm = WarmCall {
+            commands: &commands,
+            hash: WARM_HASH,
+        };
+        let warm_sent = decoded(&warm_word(&location(), &run, &warm));
+        assert!(
+            warm_sent.get("DesktopSession").is_none() && warm_sent.get("DesktopHidden").is_none(),
+            "a warm-up never asks for a hidden desktop: {warm_sent}"
         );
     }
 

@@ -29,6 +29,7 @@ fn run_reads_every_option_and_the_defaults() {
             local: false,
             alone: false,
             builder: None,
+            desktop_hidden: false,
             reason: None,
             bring_tracked: Vec::new(),
             env: Vec::new(),
@@ -687,6 +688,84 @@ fn run_takes_a_builder() {
     assert!(
         USAGE.lines().any(|line| line.starts_with("  --builder <host> ")),
         "the usage lists --builder:\n{USAGE}"
+    );
+}
+
+#[test]
+fn run_takes_desktop_hidden() {
+    assert!(run_with(&["--desktop", "hidden", "--", "cmd"]).desktop_hidden);
+    assert!(
+        run_with(&["--desktop=Hidden", "--", "cmd"]).desktop_hidden,
+        "the inline form, in any ASCII case"
+    );
+    assert!(!run_with(&["--", "cmd"]).desktop_hidden, "off by default");
+    assert!(
+        USAGE.lines().any(|line| line.starts_with("  --desktop hidden ")),
+        "the usage lists --desktop hidden:\n{USAGE}"
+    );
+}
+
+#[test]
+fn a_desktop_value_other_than_hidden_is_refused() {
+    assert_eq!(
+        problems_with(&["--desktop", "visible", "--", "cmd"]),
+        ["gate: --desktop takes hidden, got 'visible'"]
+    );
+    assert_eq!(problems_with(&["--desktop", "--", "cmd"]), ["gate: --desktop needs a value"]);
+    assert_eq!(
+        problems_with(&["--desktop", "hidden", "--desktop", "hidden", "--", "cmd"]),
+        ["gate: --desktop is given twice"]
+    );
+}
+
+#[test]
+fn a_desktop_hidden_run_with_local_or_on_a_critical_or_no_slot_is_refused_and_on_light_is_not() {
+    assert_eq!(
+        problems_with(&["--desktop", "hidden", "--local", "--reason", "trial", "--", "cmd"]),
+        ["gate: --desktop hidden cannot route this run: --local keeps it here"]
+    );
+    let on = |slot: &str| {
+        problems(&[
+            "run",
+            "--slot",
+            slot,
+            "--timeout",
+            "5",
+            "--log",
+            "out.log",
+            "--desktop",
+            "hidden",
+            "--reason",
+            "r",
+            "--",
+            "cmd",
+        ])
+    };
+    for slot in ["none", "critical"] {
+        assert_eq!(
+            on(slot),
+            [format!(
+                "gate: --desktop hidden cannot route this run: only a heavy or light run routes, and this one is --slot {slot}"
+            )]
+        );
+    }
+    let light = run_request(&[
+        "run",
+        "--slot",
+        "light",
+        "--timeout",
+        "5",
+        "--log",
+        "out.log",
+        "--desktop",
+        "hidden",
+        "--",
+        "cmd",
+    ]);
+    assert!(light.desktop_hidden, "a light run may run hidden");
+    assert!(
+        run_with(&["--desktop", "hidden", "--builder", "win-1", "--", "cmd"]).desktop_hidden,
+        "a pinned run may run hidden"
     );
 }
 

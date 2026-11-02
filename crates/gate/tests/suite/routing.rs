@@ -2051,6 +2051,42 @@ fn a_command_matching_a_consented_desktop_pattern_asks_the_client_for_the_deskto
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let call = recorded(&call);
     assert_eq!(call["desktop"], json!(true), "{call}");
+    assert_eq!(
+        call["desktopHidden"],
+        json!(false),
+        "a locked pattern's run takes the visible desktop: {call}"
+    );
+}
+
+#[test]
+fn a_desktop_hidden_run_of_a_consented_locked_pattern_asks_the_client_for_a_hidden_desktop() {
+    let case = routed_case("routing-call-desktop-hidden");
+    declare_desktop(&case, &["*tool* argv*"]);
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &["--desktop", "hidden"], &[r".\tool.exe", "argv", "a"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let call = recorded(&call);
+    assert_eq!((&call["desktop"], &call["desktopHidden"]), (&json!(true), &json!(true)), "{call}");
+}
+
+#[test]
+fn a_desktop_hidden_run_matching_no_desktop_pattern_is_refused_and_never_calls_the_client() {
+    let case = routed_case("routing-desktop-hidden-unmatched");
+    declare_desktop(&case, &["*tool* argv*"]);
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &["--desktop", "hidden"], &[r".\tool.exe", "out", "a"])));
+
+    assert!(!call.exists(), "the client never ran: {outcome:?}");
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: --desktop hidden needs a command matching a pattern of .gate/desktop.toml\n"),
+        "{outcome:?}"
+    );
 }
 
 /// Declares `*tool* mark*` in the case's `.gate/desktop.toml` and writes a routing file routing `*tool*` that consents
