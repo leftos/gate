@@ -59,8 +59,10 @@ A repo that already routes needs no routing trial for one more pattern: the next
 
 ## Apply a pattern
 
-1. Write the narrowest pattern that covers the shape: the shape's words, each `#` as `*`, and each path separator as `?`, since a run may spell it either way.
-2. Never write a pattern that matches on the tool or verb alone (`cargo build *`).
+Routing is opt-out: a repo routes a whole verb, and keeps what must stay here in its `.gate/local.toml`, which outranks every pattern.
+
+1. A test, lint, check or format command gets the verb's wildcard (`cargo nextest run *`, `cargo test *`, `cargo clippy *`, `cargo check *`, `dotnet test *`, `dotnet format *`), not one shape. A variation that cannot route is an opt-out, never a narrower pattern.
+2. A build gets the verb's wildcard when the repo's `outputs` bring back everything this PC uses from it. Otherwise write the shape's words, each `#` as `*` and each path separator as `?`, since a run may spell it either way.
 3. Run `pwsh -NoProfile -File tools/gate.ps1 remote add repos <repo> "<pattern>" --dry-run`, read the line, then run it without `--dry-run`. The tool writes its own backup.
 4. Mark the shape `routed`, the pattern as the note. If the command runs here again, the report flags it `STILL-LOCAL-AFTER-FIX`.
 
@@ -74,5 +76,6 @@ The repo is public. An issue names the repo and the family, never a raw shape, s
 
 - Marking a shape `local` because routing it needs work. That is `booked`.
 - Reporting a batch of bookings and stopping. A booked GATE issue is worked next.
-- Widening a pattern to catch the next variation. A new variation is a new shape, decided when it appears.
+- Adding one exact command when the verb's wildcard is what the repo needs. The next variation would then run here for a week before anyone sees it.
+- Blaming a missing pattern for a run that fell back. `fellBack=` means it matched and was routed; book the fallback.
 - Leaving the watch ended after a report: it does not re-arm itself.
