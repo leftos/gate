@@ -45,6 +45,8 @@ A reason work can remove never makes a shape `local` (census, "Sort every heavy 
 
 **Book by where the work sits.** A change in the caller repo (a tracked wrapper script, an `inputs` or `.gate/stage.toml` declaration) is a repo inbox request to that repo. A change in the gate or a builder is a High GATE issue. One booking covers every shape with the same cause: mark them all with it.
 
+**A GATE booking is then worked, in this session.** Booking records the cause; it does not finish the shape. Start the issue once the batch is decided, under the usual orchestrator rules, and stop only for what needs the owner or another repo.
+
 ## The clear-route test
 
 All three must hold:
@@ -71,5 +73,6 @@ The repo is public. An issue names the repo and the family, never a raw shape, s
 ## Common mistakes
 
 - Marking a shape `local` because routing it needs work. That is `booked`.
+- Reporting a batch of bookings and stopping. A booked GATE issue is worked next.
 - Widening a pattern to catch the next variation. A new variation is a new shape, decided when it appears.
 - Leaving the watch ended after a report: it does not re-arm itself.
