@@ -219,6 +219,7 @@ fn snapshots(files: &[OsString]) -> Vec<Option<Vec<u8>>> {
 /// because it is variadic.
 fn format_words(files: &[OsString]) -> Vec<OsString> {
     let mut words = os_words(&[
+        "format",
         "style",
         "--severity",
         "info",
@@ -236,6 +237,7 @@ fn format_words(files: &[OsString]) -> Vec<OsString> {
 /// The words of the dead-store check: the two rules with no fixer run.
 fn verify_words(files: &[OsString]) -> Vec<OsString> {
     let mut words = os_words(&[
+        "format",
         "style",
         "--verify-no-changes",
         "--severity",
@@ -350,17 +352,17 @@ mod tests {
 
         /// How many format passes it ran, not counting the verify pass.
         fn formats(&self) -> usize {
-            self.verb("style")
+            self.verb("format")
                 .iter()
-                .filter(|call| call.words.get(1).is_some_and(|word| word == "--severity"))
+                .filter(|call| call.words.get(2).is_some_and(|word| word == "--severity"))
                 .count()
         }
 
         /// How many dead-store verify passes it ran.
         fn verifies(&self) -> usize {
-            self.verb("style")
+            self.verb("format")
                 .iter()
-                .filter(|call| call.words.get(1).is_some_and(|word| word == "--verify-no-changes"))
+                .filter(|call| call.words.get(2).is_some_and(|word| word == "--verify-no-changes"))
                 .count()
         }
 
@@ -490,7 +492,7 @@ mod tests {
 
         assert_eq!(status, 0, "{:?}", script.spoken());
         let verbs: Vec<&str> = script.calls.iter().map(|call| call.words[0].as_str()).collect();
-        assert_eq!(verbs, ["restore", "style", "add", "style"], "{:?}", script.spoken());
+        assert_eq!(verbs, ["restore", "format", "add", "format"], "{:?}", script.spoken());
         assert_eq!(script.calls[0].program, "dotnet");
         assert!(said.contains(&format!("gate: csharp format: restored {}", project.display())), "{said:?}");
     }
@@ -511,9 +513,9 @@ mod tests {
         assert_eq!(
             script.spoken(),
             [
-                format!("dotnet style --severity info --no-restore --exclude-diagnostics IDE0059 IDE0060 IDE0130 --include {shown}"),
+                format!("dotnet format style --severity info --no-restore --exclude-diagnostics IDE0059 IDE0060 IDE0130 --include {shown}"),
                 format!("git add -- {shown}"),
-                format!("dotnet style --verify-no-changes --severity info --no-restore --diagnostics IDE0059 IDE0060 --include {shown}"),
+                format!("dotnet format style --verify-no-changes --severity info --no-restore --diagnostics IDE0059 IDE0060 --include {shown}"),
             ]
         );
     }
