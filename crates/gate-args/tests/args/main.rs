@@ -8,6 +8,7 @@ mod boxcmd;
 mod burn;
 mod check;
 mod compat;
+mod csharp;
 mod cutover;
 mod drain;
 mod expect;

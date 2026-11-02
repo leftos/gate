@@ -39,6 +39,7 @@ pub(crate) fn answer(args: Vec<OsString>, environment: &Environment, console: &m
         Ok(Invocation::Warm(request)) => crate::warm::warm(&request, environment, console),
         Ok(Invocation::Burn(request)) => crate::burn::burn(&request, console),
         Ok(Invocation::Expect(request)) => u32::from(expect(&request, environment, console)),
+        Ok(Invocation::CsharpFormat(request)) => crate::csharp_format::format(&request, console),
         Ok(Invocation::Box(request)) => crate::boxside::answer(&request, console),
         Err(problems) => u32::from(usage_error(&problems, console)),
     }

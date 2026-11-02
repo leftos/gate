@@ -5,7 +5,8 @@ use std::iter::Peekable;
 
 use crate::problem::Problem;
 use crate::request::{
-    BurnRequest, CheckRequest, CutoverRequest, DrainRequest, ExpectRequest, PruneRequest, PushRequest, RunRequest, StopRequest, WarmRequest,
+    BurnRequest, CheckRequest, CsharpFormatRequest, CutoverRequest, DrainRequest, ExpectRequest, PruneRequest, PushRequest, RunRequest, StopRequest,
+    WarmRequest,
 };
 use crate::run::{RunBuilder, RunOption, SwitchOption, ValueOption, next_text};
 use crate::values;
@@ -39,6 +40,17 @@ fn read_until_command(builder: &mut RunBuilder, words: impl Iterator<Item = OsSt
         }
     }
     Vec::new()
+}
+
+/// Reads the words after `gate csharp`: the verb `format`, then every file to format, unchanged.
+pub(crate) fn parse_csharp(mut words: impl Iterator<Item = OsString>) -> Result<CsharpFormatRequest, Vec<Problem>> {
+    let Some(first) = words.next() else {
+        return Err(vec![Problem::NoCsharpVerb]);
+    };
+    match first.to_str() {
+        Some("format") => Ok(CsharpFormatRequest { files: words.collect() }),
+        _ => Err(vec![Problem::BadCsharpVerb(first.to_string_lossy().into_owned())]),
+    }
 }
 
 /// Reads the words after `gate stop-tree`: the pid, and `--state-dir` before it or after it.

@@ -770,6 +770,17 @@ fn with_no_gate_an_in_session_call_with_the_dash_dash_eaten_runs() {
 }
 
 #[test]
+fn with_no_gate_csharp_says_it_cannot_and_fails() {
+    let case = Case::new("with_no_gate_csharp_says_it_cannot_and_fails");
+
+    let ran = run_launcher(&case, &["csharp", "format", "a.cs"]);
+
+    assert_eq!(ran.code, Some(1), "{ran:?}");
+    assert_eq!(ran.stdout, "", "{ran:?}");
+    assert_eq!(lines(&ran.stderr), "gate: no gate.exe found; cannot run gate csharp", "{ran:?}");
+}
+
+#[test]
 fn with_no_gate_stop_tree_says_it_cannot_and_fails() {
     let case = Case::new("with_no_gate_stop_tree_says_it_cannot_and_fails");
     let calls: [&[&str]; 3] = [&["-StopTree", "4242"], &["-StopTree:4242"], &["stop-tree", "4242"]];

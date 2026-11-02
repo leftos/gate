@@ -14,6 +14,7 @@ usage: gate run --slot heavy|light|critical|none [--alone] [--reason \"<why>\"] 
        gate warm [--cd <folder>] [--background] [--state-dir <path>]
        gate burn [--cores <n>] --seconds <s>
        gate expect [--state-dir <path>] [--slot heavy|light|critical] -- <command> [args...]
+       gate csharp format [<file>...]
        gate --version | --help
 
 run options:

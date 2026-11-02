@@ -15,6 +15,7 @@ mod cli;
 mod compat;
 mod cores;
 mod critical;
+mod csharp_format;
 mod cutover;
 mod diagnostics;
 mod drain;

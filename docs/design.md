@@ -27,7 +27,7 @@ Non-goals:
 
 The CLI is subcommands with GNU-style flags: `--name value` or `--name=value`, and `--` ends the gate's options. The first word picks the parser. `--version`, `--help`, `-h` and `help` are matched first; then a subcommand name selects the CLI below, and any other first word starting with `-` selects the [compatibility layer](#compatibility-layer). No arguments at all print the usage on stderr and exit 2.
 
-A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `drain`, `prune`, `remote`, `check`, `warm`, `burn` or `expect` line also prints the usage on stdout and exits 0, whatever else the line holds; after the `--` it belongs to the command (`gate run --slot light --timeout 5 --log x.log -- tool --help` runs `tool --help`).
+A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `drain`, `prune`, `remote`, `check`, `warm`, `burn`, `expect` or `csharp` line also prints the usage on stdout and exits 0, whatever else the line holds; after the `--` it belongs to the command (`gate run --slot light --timeout 5 --log x.log -- tool --help` runs `tool --help`).
 
 | Subcommand | Purpose |
 |---|---|
@@ -41,6 +41,7 @@ A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `
 | `gate check` | Say what this PC lacks for the repo in the current folder, and how to install it. |
 | `gate burn` | Spin the CPU for a set time, for the load-burn tool. |
 | `gate expect` | Print the expected time of a command here and on each builder, from the durations store. |
+| `gate csharp format` | Format C# files as a repo's pre-commit hook does: restore their projects, format, stage the fixes, check the dead stores ([`gate csharp format`](#gate-csharp-format)). |
 | `gate warm` | Warm the builder's work folder of the worktree the gate is started in, by running its `.gate/warmup.toml` commands there ([`gate warm`](#gate-warm)). |
 | `gate box` | Hidden: the builder side of a routed run. |
 | `gate --version` | Print `gate <package version>+<build id>` and exit 0 ([Build id](#build-id)). |
@@ -573,6 +574,19 @@ It prints one line per place with an estimate on stdout, the local one first, th
 `no history` on stdout, exit 0, when no place has an estimate, when the store is missing, and, silently, when it is of an older or newer key version. A torn or unreadable store also prints `no history` and exits 0, with `gate: cannot read {path} ({reason}); expected times are unavailable` on stderr. A working directory that cannot be read prints `gate: cannot read the working directory: {error}` on stderr and exits 1.
 
 The launcher maps no `-Expect`: the compatibility layer refuses it, and callers run `gate.exe expect -- <command>` directly.
+
+### `gate csharp format`
+
+`gate csharp format [<file>...]` is a C# repo's pre-commit format hook as a subcommand. Its usage line is `       gate csharp format [<file>...]`, listed directly after `gate expect`. It takes no slot: it runs under the `git commit` gate that started the hook. It is built into `gate.exe`, so `gate push` carries it to the Windows builders, and commit stages run it only there.
+
+- Usage errors, exit 2, each line before the usage: `gate: csharp needs the verb format` for no verb, and `gate: csharp takes the verb format, not <word>`. A `--help` or `-h` before any `--` prints the usage on stdout and exits 0. With no files it says nothing and exits 0.
+- **Projects.** For each file it walks from the file's absolute path up to the drive root to the nearest folder holding a `.csproj` file; every `.csproj` of that folder counts, a missing folder carries on upward, and a folder named like a project is not one.
+- **Restore.** Each project, in sorted order, is restored when `obj/project.assets.json` is missing or older than the project's `.csproj` or any `Directory.Packages.props`, `Directory.Build.props`, `Directory.Build.targets` or `global.json` in the project's folder or above it (`csharp_format::needs_restore`), saying `gate: csharp format: restored <project>` on stderr. A project formatted without restored output loads no source generators, and the formatter then breaks the build.
+- **Format.** `dotnet format style --severity info --no-restore --exclude-diagnostics IDE0059 IDE0060 IDE0130 --include <files>`, up to 3 passes until the files stop changing, since IDE0008 fixes one sub-rule per pass (dotnet/roslyn#80349); more than one pass says `gate: csharp format: <n> passes (IDE0008 fixes one sub-rule per pass, dotnet/roslyn#80349)`. Then `git add -- <files>`.
+- **Dead-store check.** `dotnet format style --verify-no-changes --severity info --no-restore --diagnostics IDE0059 IDE0060 --include <files>`. IDE0059 and IDE0060 are never auto-fixed, since their fixer deletes dead stores and a dead store is usually a bug; IDE0130's fixer crashes `dotnet format`.
+- **Failures**, each with the child's status as the exit code unless stated: `gate: csharp format: cannot read <folder>: <error>` (exit 1), `gate: csharp format: dotnet restore <project> failed (status <n>)`, `gate: csharp format: dotnet format failed (status <n>)`, `gate: csharp format: git add failed (status <n>)`, `gate: csharp format: the dead-store check failed (status <n>); IDE0059 and IDE0060 are never fixed for you`, and `gate: csharp format: cannot start <program>: <error>` (exit 1).
+- The children start through `gate_win32::spawn`, after `run::find_program` resolves them along `PATH` and `PATHEXT`.
+- The launcher cannot run it without `gate.exe` ([The launcher's hand-over](#the-launchers-hand-over)).
 
 ### `gate warm`
 
@@ -5753,6 +5767,7 @@ The launcher is this repo's `tools/gate.ps1` (`#requires -Version 7.3`), a slim 
   - `-Env` variables are restored afterwards. A `GATE_` name is refused with `gate: -Env cannot set GATE_ names: <name>` and exit 2.
   - A `-Cd` folder that cannot be entered gives `gate: cannot enter the -Cd folder <folder>: <reason>` and exit 2.
   - A command that is not found or throws gives `gate: <message>` and exit 1.
+  - `csharp` as the first word gives `gate: no gate.exe found; cannot run gate csharp` and exit 1.
   - `-StopTree <pid>`, `-StopTree:<pid>` and `stop-tree <pid>` give `gate: no gate.exe found; cannot stop the tree of <pid>` and exit 1.
   - With no command, `gate: missing the command: put it after --, e.g. -- dotnet test` and four usage lines on stderr, exit 2.
 

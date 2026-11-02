@@ -35,6 +35,8 @@ pub enum Invocation {
     Burn(BurnRequest),
     /// `gate expect`.
     Expect(ExpectRequest),
+    /// `gate csharp format <file>...`.
+    CsharpFormat(CsharpFormatRequest),
     /// `gate warm`.
     Warm(WarmRequest),
     /// `gate remote add|remove`.
@@ -618,6 +620,13 @@ pub struct CutoverSeams {
 pub struct PushRequest {
     /// The hidden `--test-*` flags that set the push's ssh, bound and desktop task registration.
     pub seams: PushSeams,
+}
+
+/// A valid `gate csharp format`: the files to format, as the caller gave them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CsharpFormatRequest {
+    /// The words after `format`, unchanged: the files whose projects are restored and which are formatted.
+    pub files: Vec<OsString>,
 }
 
 /// A valid `gate check`, which takes no words: the builder to check in place of this PC, and the hidden seams the

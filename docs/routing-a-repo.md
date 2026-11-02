@@ -304,6 +304,8 @@ A repo opts in with `"commits": ["<repo>"]` in `remote.json`. An eligible commit
 
 A hook that needs restored output declares its preparation in a tracked `.gate/stage.toml`, which has the schema of `.gate/warmup.toml` (`commands`, `timeout`; the default is 600 s, not 1800). The builder runs its commands in the stage's checkout after the tool and package restores and before the hooks, on commit stages only ([design.md, The box side](design.md#the-box-side), stage preparation).
 
+A C# repo's format hook uses `gate csharp format` instead, which restores the projects it formats itself ([design.md, `gate csharp format`](design.md#gate-csharp-format)), so it needs no `.gate/stage.toml` for it. Its hook entry is `pwsh -NoProfile -File tools/gate.ps1 csharp format` with `language = "system"`, `types = ["c#"]`, `require_serial = true` and `stages = ["pre-commit"]`.
+
 yaat's `dotnet format --no-restore` hook is the case: a cold work folder has no `obj`, and the formatter's fixes come out wrong without it, so yaat's file is `commands = [["dotnet", "restore", "yaat.slnx"]]`. A command that fails, runs past its budget or changes a tracked or untracked file refuses the stage (`tools`), so it moves to the next builder or the hooks run on the PC.
 
 Only hooks that run with `GIT_INDEX_FILE` set (pre-commit and commit-msg) need the `hooks` consent: a pre-push hook's gate routes by the repo's patterns like any other run. Every gated repo carries a committed copy of this repo's `tools/gate.ps1`; claude-config's `tools/sync-launchers.ps1` gives a first copy to each repo it lists that has none and keeps every copy current, and `~/.claude/tools/gate.ps1` is the same wrapper for a caller outside any repo.

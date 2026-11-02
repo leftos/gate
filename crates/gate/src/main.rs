@@ -16,6 +16,7 @@ mod check;
 mod commit;
 mod console;
 mod covered;
+mod csharp_format;
 mod cutover;
 mod dotnet_projects;
 mod drain_cmd;

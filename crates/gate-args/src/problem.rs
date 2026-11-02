@@ -137,6 +137,10 @@ pub enum Problem {
     Unreadable(String),
     /// A `gate box` with no verb, an unknown verb, any word but `--stdin` after it, or an extra word: the box's own usage line, said alone.
     BoxUsage,
+    /// A `gate csharp` with no verb.
+    NoCsharpVerb,
+    /// A `gate csharp` whose first word is not `format`, as given, shown lossily when it is not valid Unicode.
+    BadCsharpVerb(String),
     /// A test seam given without the seam it works through.
     SeamNeeds {
         option: &'static str,
@@ -269,6 +273,8 @@ impl fmt::Display for Problem {
                 "       gate box prune --root <folder> [--keys <key>...]\n",
                 "       gate box hold --root <root> --holder <text> --ceiling <seconds> [--wait <seconds>] -- <command> [args...]",
             )),
+            Problem::NoCsharpVerb => f.write_str("gate: csharp needs the verb format"),
+            Problem::BadCsharpVerb(word) => write!(f, "gate: csharp takes the verb format, not {word}"),
             Problem::SeamNeeds { option, needs } => write!(f, "gate: {option} needs {needs}"),
             Problem::AloneNeedsCritical(Spelling::Cli) => f.write_str("gate: --alone needs --slot critical"),
             Problem::AloneNeedsCritical(Spelling::Compat) => f.write_str("gate: -Alone needs -Slot critical"),
