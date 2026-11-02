@@ -280,17 +280,25 @@ fn a_stall_kill_ends_a_child_outside_the_job_whose_launcher_exited_at_once() {
 fn a_silent_idle_command_is_killed_as_stalled() {
     let case = Case::new("a_silent_idle_command_is_killed_as_stalled");
     let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100", "--test-stall-from-output"];
+    let pid_file = case.folder().join("command.pid");
 
-    // `sleep` blocks without a tick of CPU, where `wait` would poll.
-    let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "pid", "out", "hi", "sleep", UNTIL_KILLED]));
+    // `sleep` blocks without a tick of CPU, where `wait` would poll. The window opens at the command's first output byte,
+    // its `hi` line; its own pid goes to a file before that, without output, so the line the case reads comes before the
+    // window closes.
+    let outcome = case.run(&run_words(
+        "out.log",
+        &seams,
+        &[FAKE_TOOL, "pid-to", &shown(&pid_file), "out", "hi", "sleep", UNTIL_KILLED],
+    ));
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     let stalled = Regex::new(&format!(
         concat!(
             r"(?m)^gate: STALLED: no output and no CPU for \d+ s \(machine free \d+% on average\); ",
-            r"killed {} pid out hi sleep {} and its children$"
+            r"killed {} pid-to {} out hi sleep {} and its children$"
         ),
         regex::escape(FAKE_TOOL),
+        regex::escape(&shown(&pid_file)),
         UNTIL_KILLED
     ))
     .expect("the pattern is valid");
@@ -308,7 +316,11 @@ fn a_silent_idle_command_is_killed_as_stalled() {
         (&Value::from("stalled"), &Value::from(124)),
         "{release}"
     );
-    let pid = said_pid(&log, "pid ");
+    let pid: u32 = fs::read_to_string(&pid_file)
+        .expect("the command wrote its pid before its first output")
+        .trim()
+        .parse()
+        .expect("the pid file holds a pid");
     // A terminated process leaves its job before its object is signalled, so its end is waited for, not read once.
     wait_until(&format!("the killed command {pid} ending"), || {
         gate_win32::process_start_of(pid).is_ok_and(|start| start.is_none())
@@ -447,22 +459,35 @@ fn a_stall_window_from_the_first_output_does_not_count_a_quiet_start() {
     let case = Case::new("a_stall_window_from_the_first_output_does_not_count_a_quiet_start");
     // The first sleep blocks 3 s, twice the window, without a byte of output or a tick of CPU: with the window starting
     // at the command's first output, that quiet start is no stall, and the quiet after `hi` is. Without the seam the
-    // command is killed in its first sleep, before it prints anything.
+    // command is killed in its first sleep, before it prints anything. Its own pid goes to a file before its first byte,
+    // without output, so the `hi` line the case reads comes before the window closes.
     let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100", "--test-stall-from-output"];
+    let pid_file = case.folder().join("command.pid");
 
     let outcome = case.run(&run_words(
         "out.log",
         &seams,
-        &[FAKE_TOOL, "sleep", "3000", "pid", "out", "hi", "sleep", UNTIL_KILLED],
+        &[
+            FAKE_TOOL,
+            "sleep",
+            "3000",
+            "pid-to",
+            &shown(&pid_file),
+            "out",
+            "hi",
+            "sleep",
+            UNTIL_KILLED,
+        ],
     ));
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     let stalled = Regex::new(&format!(
         concat!(
             r"(?m)^gate: STALLED: no output and no CPU for \d+ s \(machine free \d+% on average\); ",
-            r"killed {} sleep 3000 pid out hi sleep {} and its children$"
+            r"killed {} sleep 3000 pid-to {} out hi sleep {} and its children$"
         ),
         regex::escape(FAKE_TOOL),
+        regex::escape(&shown(&pid_file)),
         UNTIL_KILLED
     ))
     .expect("the pattern is valid");
@@ -480,7 +505,11 @@ fn a_stall_window_from_the_first_output_does_not_count_a_quiet_start() {
         (&Value::from("stalled"), &Value::from(124)),
         "{release}"
     );
-    let pid = said_pid(&log, "pid ");
+    let pid: u32 = fs::read_to_string(&pid_file)
+        .expect("the command wrote its pid before its first output")
+        .trim()
+        .parse()
+        .expect("the pid file holds a pid");
     // A terminated process leaves its job before its object is signalled, so its end is waited for, not read once.
     wait_until(&format!("the killed command {pid} ending"), || {
         gate_win32::process_start_of(pid).is_ok_and(|start| start.is_none())

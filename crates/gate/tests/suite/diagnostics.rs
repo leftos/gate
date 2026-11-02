@@ -2,9 +2,11 @@
 //! before the kill line, one pointer line on stderr says where the block went, the failed run's tail leaves the block
 //! out, and a gathering that failed ends the run as the kill it was gathering for.
 
+use std::fs;
+
 use regex::Regex;
 
-use crate::support::{Case, FAKE_TOOL, UNTIL_KILLED, assert_in_order, log_texts, release, run_words, said_pid, shown};
+use crate::support::{Case, FAKE_TOOL, UNTIL_KILLED, assert_in_order, log_texts, release, run_words, shown};
 
 /// The failure `--test-diagnostics-fail` makes at the start of a gathering.
 const DIAGNOSTICS_FAIL: &str = "--test-diagnostics-fail makes the diagnostics fail (test seam only)";
@@ -59,12 +61,23 @@ fn a_kill_writes_its_diagnostics_to_the_log_before_the_kill_line() {
     let case = Case::new("a_kill_writes_its_diagnostics_to_the_log_before_the_kill_line");
     let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100", "--test-stall-from-output"];
     let log_path = case.folder().join("out.log");
+    let pid_file = case.folder().join("command.pid");
 
-    let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "pid", "out", "hi", "sleep", UNTIL_KILLED]));
+    // The window opens at the command's first output byte, its `hi` line; its own pid goes to a file before that, without
+    // output, so the `hi` line the assertions read comes before the window closes.
+    let outcome = case.run(&run_words(
+        "out.log",
+        &seams,
+        &[FAKE_TOOL, "pid-to", &shown(&pid_file), "out", "hi", "sleep", UNTIL_KILLED],
+    ));
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     let log = log_texts(&log_path);
-    let pid = said_pid(&log, "pid ");
+    let pid: u32 = fs::read_to_string(&pid_file)
+        .expect("the command wrote its pid before its first output")
+        .trim()
+        .parse()
+        .expect("the pid file holds a pid");
     let stalled = Regex::new(r"(?m)^gate: STALLED: .*$").expect("the pattern is valid");
     let kill = stalled.find(&log).expect("the log has its STALLED line").as_str();
     let job = format!("gate:   job {pid} parent ");
