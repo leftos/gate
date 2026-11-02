@@ -12177,6 +12177,39 @@ fn a_routed_commit_stage_stages_the_hooks_fixes_then_commits() {
     assert!(!outcome.stderr.contains("cannot skip the hooks"), "{outcome:?}");
 }
 
+/// A commit stage and the run after it send only what changed: the run before the stage sends the 2 MiB file once, and
+/// neither the stage's snapshot, which no ref of the PC's names, nor the run after it sends it back.
+#[test]
+fn a_commit_stage_and_the_run_after_it_push_only_what_changed() {
+    let case = stage_case("client-stage-push-size", &["write", "a.txt", "fixed"]);
+    fs::write(case.folder().join("big.bin"), incompressible(2 << 20)).expect("the big file can be written");
+    git(&case, &["add", "big.bin"]);
+    let first_log = case.folder().join("first.log");
+    let first_steps = ssh_steps(&case, "first", &["ok", "ok"]);
+    let stage_steps = ssh_steps(&case, "stage", &["ok", "ok"]);
+    let last_log = case.folder().join("last.log");
+    let last_steps = ssh_steps(&case, "last", &["ok", "ok"]);
+
+    let first = finish(client_gate(&case, &shown(&first_log), &first_steps, &[r".\tool.exe", "out", "a"]));
+    let stage = finish(stage_gate(&case, &stage_steps));
+    let last = finish(client_gate(&case, &shown(&last_log), &last_steps, &[r".\tool.exe", "out", "b"]));
+
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(stage.code, Some(0), "{stage:?}");
+    assert_eq!(last.code, Some(0), "{last:?}");
+    let (sent_first, sent_stage, sent_last) = (
+        pushed_bytes(&first_log),
+        pushed_bytes(&case.folder().join("out.log")),
+        pushed_bytes(&last_log),
+    );
+    assert!(
+        sent_first > 2.0 * 1024.0 * 1024.0,
+        "the first push sends the big file: {sent_first} bytes"
+    );
+    assert!(sent_stage < 64.0 * 1024.0, "the stage sends only its fix: {sent_stage} bytes");
+    assert!(sent_last < 64.0 * 1024.0, "the run after it sends only what changed: {sent_last} bytes");
+}
+
 #[test]
 fn a_routed_commit_stage_whose_fixes_clash_refuses_the_commit() {
     let case = stage_case("client-stage-clash", &["write", "a.txt", "fixed"]);

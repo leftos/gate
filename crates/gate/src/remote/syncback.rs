@@ -36,7 +36,7 @@ use gate_wire::{BACK_COMMITS_FAILED, BACK_COMMITS_PREFIX};
 
 use super::RemoteCall;
 use super::client::{Attempt, Called, End, Watch};
-use super::git::{self, Git, GitError};
+use super::git::{self, Git, GitBounds, GitError};
 use super::install;
 use super::launch::KILL_WAIT;
 use super::payload;
@@ -392,6 +392,8 @@ fn stage_main(attempt: &mut Attempt<'_, '_>, target: &Target<'_>, status: i64) -
 thread_local! {
     /// What a test does with a stage's worktree root just before its checked tree is read.
     static BEFORE_CHECKED_TREE: std::cell::RefCell<Option<PatchHook>> = const { std::cell::RefCell::new(None) };
+    /// What a test does with a stage's worktree root just before its fetch, once its snapshot was checked.
+    static BEFORE_FETCH: std::cell::RefCell<Option<PatchHook>> = const { std::cell::RefCell::new(None) };
 }
 
 /// What a stage whose hooks passed checked, read under its worktree lock once its fixes, if any, were written: the
@@ -1219,11 +1221,14 @@ const FETCH_WORDS: [&str; 10] = [
 ];
 
 /// Fetches the back ref the builder holds into `FETCH_HEAD`, its objects written into `quarantine` alone, every object
-/// it sends checked, and no tag or submodule. It says its progress, which a live fetch keeps sending on standard error,
-/// so only a fetch that went quiet stalls. Its job may write at most the attempt's fetch cap: past it the fetch is
-/// stopped, and the run of the command that ended `status` ends with the line saying the changes stay on the builder, a
-/// passing run as 1. One still running at its transfer ceiling is stopped with the TRANSFER TIMED OUT line: a passing
-/// run ends killed, and a failing one keeps its command's status. That end; `None` when the fetch went through.
+/// it sends checked, and no tag or submodule. A commit stage's snapshot is the one object no ref of the PC's names, so
+/// only its fetch names it as a negotiation tip, and only while the store holds it: the tip is what lets the builder
+/// send only the fix back. A single repository's and each of a pair's saved snapshot ref already names the snapshot, so
+/// they fetch as they always have. It says its progress, which a live fetch keeps sending on standard error, so only a
+/// fetch that went quiet stalls. Its job may write at most the attempt's fetch cap: past it the fetch is stopped, and
+/// the run of the command that ended `status` ends with the line saying the changes stay on the builder, a passing run
+/// as 1. One still running at its transfer ceiling is stopped with the TRANSFER TIMED OUT line: a passing run ends
+/// killed, and a failing one keeps its command's status. That end; `None` when the fetch went through.
 fn fetch(
     attempt: &mut Attempt<'_, '_>,
     worktree: &Worktree<'_>,
@@ -1237,25 +1242,127 @@ fn fetch(
         watch: Watch::Fetch(attempt.limits_for("fetch"), Some(attempt.fetch_cap)),
         set: &set,
     };
-    let args = remote.args(&FETCH_WORDS);
     let begun = Instant::now();
-    let stopped = transfer_retried(attempt, worktree, remote, (&fetch, &args), |attempt, called| match called.cut {
-        Some(Cut::TooBig(cap)) => {
-            attempt.noted(&called);
-            attempt.say(worktree.said(stopped_line(cap, remote.reference)));
-            Ok(Some(End::Status(not_passing(status))))
-        }
-        Some(Cut::Ceiling(ceiling)) => {
-            attempt.say(watchdog::transfer_line(ceiling, "fetching the sync-back"));
-            attempt.noted(&called);
-            if status == 0 { Err(End::Killed) } else { Ok(Some(End::Status(status))) }
-        }
-        _ => checked(attempt, worktree, &fetch, &args, called).map(|_| None),
-    });
+    let stopped = fetched(attempt, worktree, remote, &fetch, status);
     // A pair's sync-back fetches once per repository, and its part of the run's split is their sum, retries and their
     // pauses included.
     attempt.split.sync_back = Some(attempt.split.sync_back.unwrap_or_default() + begun.elapsed());
     stopped
+}
+
+/// The fetch of [`fetch`], its call `fetch` given the quarantine's variables: a commit stage's snapshot is named as the
+/// tip when the store holds it, and the fetch is made once more without the tip when the snapshot went between the
+/// check and the fetch; every other sync-back fetches with no tip, as it always has.
+fn fetched(
+    attempt: &mut Attempt<'_, '_>,
+    worktree: &Worktree<'_>,
+    remote: &Remote<'_>,
+    fetch: &Network<'_>,
+    status: i64,
+) -> Result<Option<End>, End> {
+    let snapshot = worktree.snapshot();
+    let tipped = attempt.call.commit_stage && holds(attempt, worktree, fetch.set);
+    let tip = format!("--negotiation-tip={snapshot}");
+    let words: Vec<&str> = if tipped {
+        FETCH_WORDS.iter().copied().chain([tip.as_str()]).collect()
+    } else {
+        FETCH_WORDS.to_vec()
+    };
+    #[cfg(test)]
+    BEFORE_FETCH.with_borrow_mut(|hook| {
+        if let Some(hook) = hook {
+            hook(worktree.root());
+        }
+    });
+    let mut went = false;
+    let args = remote.args(&words);
+    let judge = Judge {
+        worktree,
+        fetch,
+        remote,
+        args: &args,
+        status,
+    };
+    let stopped = transfer_retried(attempt, worktree, remote, (fetch, &args), |attempt, called| {
+        if tipped && tip_gone(&called, snapshot) {
+            went = true;
+            return Ok(None);
+        }
+        judge.judge(attempt, called)
+    })?;
+    if !went {
+        return Ok(stopped);
+    }
+    attempt.logged(&format!(
+        "gate: the stage's snapshot {snapshot} went before the fetch; fetching without it"
+    ));
+    let args = remote.args(&FETCH_WORDS);
+    let judge = Judge {
+        worktree,
+        fetch,
+        remote,
+        args: &args,
+        status,
+    };
+    transfer_retried(attempt, worktree, remote, (fetch, &args), |attempt, called| judge.judge(attempt, called))
+}
+
+/// Whether the fetch `called` failed because git could not read the commit its tip names: the stage's snapshot went
+/// between the check and the fetch.
+fn tip_gone(called: &Called, snapshot: &str) -> bool {
+    called.cut.is_none() && called.status != 0 && git::failure_text(&called.lines).contains(&format!("fatal: the object {snapshot} does not exist"))
+}
+
+/// One fetch's calls as they are judged: the worktree, the call with its words, where the builder holds the back ref,
+/// and the status of the command the fetch serves.
+struct Judge<'a, 't> {
+    worktree: &'t Worktree<'t>,
+    fetch: &'a Network<'a>,
+    remote: &'a Remote<'a>,
+    args: &'a [String],
+    status: i64,
+}
+
+impl Judge<'_, '_> {
+    /// What the fetch call `called` means: the run's end when it was stopped at its cap or at its transfer ceiling,
+    /// `None` when it went through, and the run's failure otherwise.
+    fn judge(&self, attempt: &mut Attempt<'_, '_>, called: Called) -> Result<Option<End>, End> {
+        let (worktree, remote, status) = (self.worktree, self.remote, self.status);
+        match called.cut {
+            Some(Cut::TooBig(cap)) => {
+                attempt.noted(&called);
+                attempt.say(worktree.said(stopped_line(cap, remote.reference)));
+                Ok(Some(End::Status(not_passing(status))))
+            }
+            Some(Cut::Ceiling(ceiling)) => {
+                attempt.say(watchdog::transfer_line(ceiling, "fetching the sync-back"));
+                attempt.noted(&called);
+                if status == 0 { Err(End::Killed) } else { Ok(Some(End::Status(status))) }
+            }
+            _ => checked(attempt, worktree, self.fetch, self.args, called).map(|_| None),
+        }
+    }
+}
+
+/// Whether the worktree's store holds the run's snapshot, as git given the variables `set` sees it: `git cat-file -e`
+/// exits 0 only when it does. It is a sub-millisecond local object lookup, which takes no interrupt as [`locked_call`]
+/// takes none, since the fetch right after it ends on a Ctrl+C anyway. A store without it is no failure — only a fetch
+/// made without the tip, since a stage's snapshot is a loose commit no ref names, which a `git gc --prune=now` during
+/// the stage can take away — but a check git could not finish is said, and is no snapshot held either.
+fn holds(attempt: &mut Attempt<'_, '_>, worktree: &Worktree<'_>, set: &[(&str, &OsStr)]) -> bool {
+    let snapshot = worktree.snapshot();
+    let object = format!("{snapshot}^{{commit}}");
+    let args = ["cat-file", "-e", object.as_str()];
+    match worktree.git.status_within(&locked_with(worktree, &args, set, attempt.git), 0) {
+        Ok((status, _, _)) => status.success(),
+        Err(error) => {
+            let why = String::from(error);
+            attempt.logged(&format!(
+                "gate: cannot check the stage's snapshot {snapshot} before the fetch ({why}); fetching without it"
+            ));
+            false
+        }
+    }
 }
 
 /// `status`, but 1 for a passing run: how a run whose changes were not applied ends.
@@ -2323,11 +2430,19 @@ fn git_call(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, args: &[&str], s
     worktree.git.output(&call).map_err(escaped_end)
 }
 
+/// The call [`locked_call`] makes with `args` in the worktree, given the variables `set`: a [`git::Call::locked`] call,
+/// whose console is hidden and which no Ctrl+C ends while it holds a lock in the git folder.
+fn locked_with<'a>(worktree: &'a Worktree<'a>, args: &'a [&'a str], set: &'a [(&'a str, &'a OsStr)], bounds: GitBounds) -> git::Call<'a> {
+    git::Call {
+        set,
+        ..git::Call::locked(worktree.root(), args, bounds)
+    }
+}
+
 /// Runs git with `args` in the worktree as [`git_call`] does, but as a [`git::Call::locked`] call, which no Ctrl+C
 /// ends while it holds a lock in the git folder.
 fn locked_call(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, args: &[&str]) -> Result<String, End> {
-    let call = git::Call::locked(worktree.root(), args, attempt.git);
-    worktree.git.output(&call).map_err(escaped_end)
+    worktree.git.output(&locked_with(worktree, args, &[], attempt.git)).map_err(escaped_end)
 }
 
 /// A git failure as the attempt's end, its text escaped: an interrupt is the run's interrupt, any other a failure.
@@ -3780,6 +3895,9 @@ mod tests {
         asked(&builder, &[], &["add", "-A"]).expect("the builder's file is added");
         asked(&builder, &[], &[&COMMITTER[..], &["commit", "--quiet", "-m", "back"]].concat()).expect("the builder commits");
         let client = repository("retry-client");
+        asked(&client, &[], &["add", "-A"]).expect("the client's file is added");
+        asked(&client, &[], &[&COMMITTER[..], &["commit", "--quiet", "-m", "base"]].concat()).expect("the client commits");
+        let base = asked(&client, &[], &["rev-parse", "HEAD"]).expect("HEAD is read").trim_end().to_owned();
         let objects = client.join(".git").join("objects");
         let quarantine = Quarantine::made(&objects, &incoming_name(std::process::id(), 1, NONCE)).expect("the quarantine is made");
         let marker = crate::test_support::temp_dir().join(format!("gate-sync-back-retry-{}", std::process::id()));
@@ -3805,7 +3923,7 @@ mod tests {
         let transport = Local::new(r"local:C:\gate-sync-back-tests", None).expect("a local transport");
         let mut attempt = Attempt::for_tests(&call, &transport);
         let snapshot = Snapshot {
-            commit: SNAPSHOT.to_owned(),
+            commit: base,
             bridge: None,
             objects: objects.clone(),
             head: None,
@@ -3845,6 +3963,135 @@ mod tests {
         std::fs::remove_dir_all(&builder).expect("the builder can be removed");
         std::fs::remove_dir_all(&client).expect("the client can be removed");
         std::fs::remove_file(&marker).expect("the marker can be removed");
+        std::fs::remove_file(&log).expect("the log can be removed");
+    }
+
+    /// A commit stage's snapshot no object of the worktree names still fetches: the negotiation tip is given only when
+    /// the store holds the snapshot, as a `git gc --prune=now` during a stage can take a loose snapshot away.
+    #[test]
+    fn a_fetch_whose_snapshot_is_gone_fetches_without_the_tip() {
+        let builder = repository("gone-builder");
+        asked(&builder, &[], &["add", "-A"]).expect("the builder's file is added");
+        asked(&builder, &[], &[&COMMITTER[..], &["commit", "--quiet", "-m", "back"]].concat()).expect("the builder commits");
+        let client = repository("gone-client");
+        let objects = client.join(".git").join("objects");
+        let quarantine = Quarantine::made(&objects, &incoming_name(std::process::id(), 1, NONCE)).expect("the quarantine is made");
+        let url = builder.to_string_lossy().into_owned();
+        let remote = Remote {
+            url: &url,
+            pack: None,
+            ssh: None,
+            reference: "HEAD",
+        };
+        let shown = client.to_string_lossy().into_owned();
+        let log = test_log("gone");
+        let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
+        let mut call = call_in(&shown, &log, &state);
+        call.commit_stage = true;
+        let transport = Local::new(r"local:C:\gate-sync-back-tests", None).expect("a local transport");
+        let mut attempt = Attempt::for_tests(&call, &transport);
+        let snapshot = Snapshot {
+            commit: SNAPSHOT.to_owned(),
+            bridge: None,
+            objects: objects.clone(),
+            head: None,
+            base: None,
+        };
+        let target = Target::new(routed("app", &shown), "app", &snapshot, KEY);
+        let worktree = Worktree {
+            target: &target,
+            git: Git::find(&client).expect("git is found"),
+            pair: false,
+        };
+
+        let fetched = fetch(&mut attempt, &worktree, &remote, &quarantine, 0);
+
+        assert!(matches!(fetched, Ok(None)), "{fetched:?}");
+        let back = asked(&client, &[], &["rev-parse", "FETCH_HEAD"]).expect("FETCH_HEAD names the commit");
+        let back = back.trim_end();
+        assert!(asked(&client, &[], &["cat-file", "-e", back]).is_err(), "the real store lacks {back}");
+        assert_eq!(
+            asked(&client, &quarantine.env(), &["cat-file", "-e", back]),
+            Ok(String::new()),
+            "the quarantine holds {back}"
+        );
+        std::fs::remove_dir_all(&builder).expect("the builder can be removed");
+        std::fs::remove_dir_all(&client).expect("the client can be removed");
+        std::fs::remove_file(&log).expect("the log can be removed");
+    }
+
+    /// A stage's snapshot the check finds and that goes before the fetch: git cannot read the tip, so the fetch is made
+    /// again without it and says the snapshot went.
+    #[test]
+    fn a_stage_s_snapshot_that_goes_before_the_fetch_is_fetched_without_a_tip() {
+        let builder = repository("tip-gone-builder");
+        asked(&builder, &[], &["add", "-A"]).expect("the builder's file is added");
+        asked(&builder, &[], &[&COMMITTER[..], &["commit", "--quiet", "-m", "back"]].concat()).expect("the builder commits");
+        let client = repository("tip-gone-client");
+        asked(&client, &[], &["add", "-A"]).expect("the client's file is added");
+        let tree = asked(&client, &[], &["write-tree"]).expect("the client's tree is written");
+        let snapshot = asked(
+            &client,
+            &[],
+            &[&COMMITTER[..], &["commit-tree", tree.trim_end(), "-m", "snapshot"]].concat(),
+        )
+        .expect("the stage's snapshot is made");
+        let snapshot = snapshot.trim_end().to_owned();
+        let objects = client.join(".git").join("objects");
+        let quarantine = Quarantine::made(&objects, &incoming_name(std::process::id(), 1, NONCE)).expect("the quarantine is made");
+        let url = builder.to_string_lossy().into_owned();
+        let remote = Remote {
+            url: &url,
+            pack: None,
+            ssh: None,
+            reference: "HEAD",
+        };
+        let shown = client.to_string_lossy().into_owned();
+        let log = test_log("tip-gone");
+        let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
+        let mut call = call_in(&shown, &log, &state);
+        call.commit_stage = true;
+        let transport = Local::new(r"local:C:\gate-sync-back-tests", None).expect("a local transport");
+        let mut attempt = Attempt::for_tests(&call, &transport);
+        let made = Snapshot {
+            commit: snapshot.clone(),
+            bridge: None,
+            objects: objects.clone(),
+            head: None,
+            base: None,
+        };
+        let target = Target::new(routed("app", &shown), "app", &made, KEY);
+        let worktree = Worktree {
+            target: &target,
+            git: Git::find(&client).expect("git is found"),
+            pair: false,
+        };
+        let loose = objects.join(&snapshot[..2]).join(&snapshot[2..]);
+        super::BEFORE_FETCH.set(Some(Box::new(move |_: &Path| {
+            std::fs::remove_file(&loose).expect("the snapshot's object can be removed");
+        })));
+
+        let fetched = fetch(&mut attempt, &worktree, &remote, &quarantine, 0);
+
+        super::BEFORE_FETCH.set(None);
+        assert!(matches!(fetched, Ok(None)), "{fetched:?}");
+        let said = crate::remote::log_texts(&log);
+        assert!(
+            said.contains(&format!(
+                "gate: the stage's snapshot {snapshot} went before the fetch; fetching without it"
+            )),
+            "{said}"
+        );
+        let back = asked(&client, &[], &["rev-parse", "FETCH_HEAD"]).expect("FETCH_HEAD names the commit");
+        let back = back.trim_end();
+        assert!(asked(&client, &[], &["cat-file", "-e", back]).is_err(), "the real store lacks {back}");
+        assert_eq!(
+            asked(&client, &quarantine.env(), &["cat-file", "-e", back]),
+            Ok(String::new()),
+            "the quarantine holds {back}"
+        );
+        std::fs::remove_dir_all(&builder).expect("the builder can be removed");
+        std::fs::remove_dir_all(&client).expect("the client can be removed");
         std::fs::remove_file(&log).expect("the log can be removed");
     }
 
@@ -4947,6 +5194,93 @@ mod tests {
                 tree: tree.trim_end().to_owned()
             })),
             "the checked tree is the real index's once the fixes are applied"
+        );
+        case.remove();
+    }
+
+    /// `len` bytes no pack shrinks, from a fixed seed, so every run stages the same tree.
+    fn incompressible(len: usize) -> Vec<u8> {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut bytes = Vec::with_capacity(len);
+        while bytes.len() < len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            bytes.extend_from_slice(&state.to_le_bytes());
+        }
+        bytes.truncate(len);
+        bytes
+    }
+
+    /// A commit stage's sync-back fetches only what its fix changed: the snapshot no PC ref names is the fetch's
+    /// negotiation tip, so the 4 MiB the stage sent is not sent back, and a fetch capped at 1 MiB goes through.
+    #[test]
+    fn a_stage_s_sync_back_fetches_only_what_the_fix_changed() {
+        let mut case = stage_case("stage-fetch-tip", &[]);
+        let root = case.root(0).to_path_buf();
+        std::fs::write(root.join("big.bin"), incompressible(4 << 20)).expect("the big file can be written");
+        asked(&root, &[], &["add", "-A"]).expect("the files are staged");
+        let tree = asked(&root, &[], &["write-tree"]).expect("the staged tree is written");
+        let made = asked(
+            &root,
+            &[],
+            &[&COMMITTER[..], &["commit-tree", tree.trim_end(), "-m", "snapshot"]].concat(),
+        )
+        .expect("the stage's snapshot is made");
+        made.trim_end().clone_into(&mut case.snapshots[0].commit);
+        let snapshot = case.snapshots[0].commit.clone();
+        assert_eq!(
+            asked(&root, &[], &["rev-list", "--parents", "-n", "1", &snapshot])
+                .expect("git answers")
+                .split_whitespace()
+                .count(),
+            1,
+            "the snapshot is parentless, as a stage's is"
+        );
+        let named = asked(&root, &[], &["for-each-ref", "--format=%(objectname)"]).expect("the refs are listed");
+        assert!(!named.lines().any(|line| line.trim_end() == snapshot), "no PC ref names the snapshot");
+        let bare = case.folder.join("builder").join("app.git");
+        asked(
+            &root,
+            &[],
+            &["push", "--quiet", &bare.to_string_lossy(), &format!("{snapshot}:refs/gate/{KEY}")],
+        )
+        .expect("the snapshot is pushed as a real run leaves it");
+        let scratch = case.folder.join("scratch-app");
+        asked(&case.folder, &[], &["init", "--quiet", &scratch.to_string_lossy()]).expect("the scratch repository is made");
+        asked(&scratch, &[], &["fetch", "--quiet", &bare.to_string_lossy(), &format!("refs/gate/{KEY}")]).expect("the snapshot is fetched");
+        asked(&scratch, &[], &["checkout", "--quiet", "FETCH_HEAD"]).expect("the snapshot is checked out");
+        put(&scratch.join("a.txt"), "fixed\n");
+        asked(&scratch, &[], &["add", "a.txt"]).expect("the fix is staged");
+        asked(&scratch, &[], &[&COMMITTER[..], &["commit", "--quiet", "-m", "back"]].concat()).expect("the back commit is made");
+        asked(
+            &scratch,
+            &[],
+            &["push", "--quiet", &bare.to_string_lossy(), &format!("HEAD:refs/gate-back/{KEY}")],
+        )
+        .expect("the back commit is pushed");
+        let target = Target::new(routed(PAIR[0], &case.roots[0]), PAIR[0], &case.snapshots[0], KEY);
+        let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
+        let mut call = call_in(&case.roots[0], &case.log, &state);
+        call.commit_stage = true;
+        let transport = case.local();
+        let mut attempt = Attempt::for_tests(&call, &transport);
+        attempt.fetch_cap = 1_048_576;
+
+        let ended = sync_back(&mut attempt, &[target], None, 0, false);
+
+        assert!(matches!(&ended, Ok(Synced { end: End::Status(0), .. })), "{ended:?}");
+        assert_eq!(attempt.staged, Some(Staged::Applied(1)), "the fix is applied");
+        assert_eq!(text_of(&case, "a.txt"), "fixed\n", "the worktree holds the fix");
+        assert_eq!(
+            asked(&root, &[], &["show", ":a.txt"]).expect("the index's a.txt is read"),
+            "fixed\n",
+            "the index stages the fix"
+        );
+        assert!(
+            !case.said().iter().any(|line| line.contains("gate: remote sync-back stopped:")),
+            "the fetch was not stopped at its cap: {:?}",
+            case.said()
         );
         case.remove();
     }

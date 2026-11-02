@@ -2,8 +2,9 @@
 //! ignored ones out, committed with no parent through a copy of the index, so the real index and every worktree file
 //! stay as they were; the bridge commit, the same tree on the previous snapshot that builder received; and the local
 //! ref, one per builder, naming the snapshot each builder last received. A commit stage's snapshot is the staged index's
-//! tree instead, written through a copy of the index with nothing added, and has no bridge. Every commit is made by git
-//! under the `gate-remote` identity, through its environment, and is never signed.
+//! tree instead, written through a copy of the index with nothing added, and its bridge stands on the PC's `HEAD` commit
+//! and on the snapshot the worktree last sent that builder. Every commit is made by git under the `gate-remote` identity,
+//! through its environment, and is never signed.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -53,13 +54,14 @@ pub(crate) struct Base {
     pub commit: String,
 }
 
-/// What a snapshot sends: the worktree, its bridge built on the snapshot the builder of the id it names
-/// ([`gate_router::Builder::id`], `None` for `host`) last received; or a commit stage's staged index tree, with no
-/// bridge, which no later run's bridge builds on.
+/// What a snapshot sends, and the builder of the id it names ([`gate_router::Builder::id`], `None` for `host`) that
+/// receives it: the worktree, its bridge built on the snapshot that builder last received; or a commit stage's staged
+/// index tree, whose bridge stands on the PC's `HEAD` and on that same snapshot, on that snapshot alone for a shallow
+/// clone, and which no later run's bridge builds on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Sent<'a> {
     Worktree(Option<&'a str>),
-    Staged,
+    Staged(Option<&'a str>),
 }
 
 /// The snapshot of each of `roots`, in order, under the work-folder `key`, each git call under `bounds` or ended by the
@@ -241,19 +243,25 @@ impl IndexCopy {
 }
 
 /// The snapshot of the worktree `calls` asks about under the work-folder `key`, sending what `sent` says: a worktree's
-/// with its bridge, or a commit stage's staged tree with none.
+/// with its bridge on the snapshot that builder last received, whatever the depth of its clone; or a commit stage's
+/// staged tree, its bridge on the PC's `HEAD` and on that same snapshot, on the saved snapshot alone when the clone is
+/// shallow, and on `HEAD` alone when the PC saves none.
 fn take_one(calls: &Calls<'_>, key: &str, sent: Sent<'_>) -> Result<Snapshot, GitError> {
-    let mut listed = vec!["for-each-ref", "--sort=-committerdate", "--format=%(refname) %(objectname) %(symref)"];
-    let refs = match sent {
-        Sent::Worktree(builder) => Some(builder_refs(builder)),
-        Sent::Staged => None,
+    let builder = match sent {
+        Sent::Worktree(builder) | Sent::Staged(builder) => builder,
     };
-    listed.extend(refs.as_deref());
+    let refs = builder_refs(builder);
+    let mut listed = vec![
+        "for-each-ref",
+        "--sort=-committerdate",
+        "--format=%(refname) %(objectname) %(symref)",
+        refs.as_str(),
+    ];
     listed.extend(["refs/remotes/origin/HEAD", "refs/remotes/origin/main", "refs/remotes/origin/master"]);
     let listing = calls.output(&listed, &[], &[])?;
-    let (previous, (tree, paths)) = match sent {
-        Sent::Worktree(builder) => (previous(&listing, key, builder), worktree_tree(calls)?),
-        Sent::Staged => (None, index_tree(calls)?),
+    let (tree, paths) = match sent {
+        Sent::Worktree(_) => worktree_tree(calls)?,
+        Sent::Staged(_) => index_tree(calls)?,
     };
     // A shallow clone sends no history: a receiver refuses a push from one.
     let (head, base) = if paths.shallow {
@@ -261,10 +269,23 @@ fn take_one(calls: &Calls<'_>, key: &str, sent: Sent<'_>) -> Result<Snapshot, Gi
     } else {
         (paths.head, default_branch(&listing))
     };
+    // A worktree snapshot's bridge stands on the snapshot that builder last received. A stage's stands on the PC's
+    // `HEAD` and on that same snapshot, so the builder advertises the commit the next ordinary run's bridge builds on.
+    let saved = previous(&listing, key, builder);
+    let parents: Vec<&str> = match sent {
+        Sent::Worktree(_) => saved.as_deref().into_iter().collect(),
+        Sent::Staged(_) => head.as_deref().into_iter().chain(saved.as_deref()).collect(),
+    };
     let commit = calls.committed(&["commit-tree", "--no-gpg-sign", &tree, "-m", SNAPSHOT_MESSAGE])?;
-    let bridge = match &previous {
-        Some(parent) => Some(calls.committed(&["commit-tree", "--no-gpg-sign", &tree, "-p", parent, "-m", BRIDGE_MESSAGE])?),
-        None => None,
+    let bridge = if parents.is_empty() {
+        None
+    } else {
+        let mut args = vec!["commit-tree", "--no-gpg-sign", tree.as_str()];
+        for parent in &parents {
+            args.extend(["-p", parent]);
+        }
+        args.extend(["-m", BRIDGE_MESSAGE]);
+        Some(calls.committed(&args)?)
     };
     Ok(Snapshot {
         commit,
@@ -554,6 +575,30 @@ fn asked(root: &Path, args: &[&str]) -> Result<String, GitError> {
     git.output(&git::Call::bounded(root, args, git::GIT_BOUNDS))
 }
 
+/// `git add -A` and a commit of it in the repository at `root` with `message`, as a committer of the test's own: the
+/// commit's sha.
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "a test that cannot make its commit must fail loudly")]
+fn commit(root: &Path, message: &str) -> String {
+    asked(root, &["add", "-A"]).expect("the files are staged");
+    asked(
+        root,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@localhost",
+            "commit",
+            "-q",
+            "--no-gpg-sign",
+            "-m",
+            message,
+        ],
+    )
+    .expect("the commit is made");
+    asked(root, &["rev-parse", "HEAD"]).expect("HEAD is read").trim_end().to_owned()
+}
+
 /// A new git repository in the unit tests' temp folder for the test `name`, holding `a.txt`.
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test that cannot make its repository must fail loudly")]
@@ -576,8 +621,8 @@ mod tests {
     use std::slice;
 
     use super::{
-        Bounded, Calls, DATES, IDENTITY, Sent, asked, copy_name, default_branch, git_path, index_tree, lock_of, place_of, previous, repository, save,
-        snapshot_ref, take, worktree,
+        Bounded, Calls, DATES, IDENTITY, Sent, asked, commit, copy_name, default_branch, git_path, index_tree, lock_of, place_of, previous,
+        repository, save, snapshot_ref, take, worktree,
     };
     use crate::remote::git::{GIT_BOUNDS, Git, GitError};
 
@@ -845,22 +890,116 @@ mod tests {
         fs::remove_dir_all(&root).expect("the repository can be removed");
     }
 
-    /// A commit stage's snapshot of a worktree with a saved snapshot builds no bridge on it and leaves the saved ref as
-    /// it was: the staged tree is never a later run's bridge parent.
+    /// A commit stage's snapshot bridges on the PC's HEAD commit and on the snapshot the worktree last sent this builder,
+    /// so the push leaves out every object either tree shares with the staged tree, the builder still advertises the
+    /// saved snapshot, and the saved ref is left as it was.
     #[test]
-    fn a_stage_snapshot_builds_no_bridge_and_saves_no_snapshot_ref() {
-        let root = repository("staged-no-bridge");
+    fn a_stage_snapshot_bridges_on_the_head_commit_and_saves_no_snapshot_ref() {
+        let root = repository("staged-bridge");
+        let head = commit(&root, "base");
         let roots = slice::from_ref(&root);
         let first = take(roots, OWN, Sent::Worktree(None), GIT_BOUNDS, None).expect("the first snapshot is made");
         let reference = snapshot_ref(OWN, None);
         save(&root, &[], &reference, &first[0].commit, GIT_BOUNDS).expect("the ref is saved");
-        asked(&root, &["add", "a.txt"]).expect("a.txt is staged");
+        fs::write(root.join("a.txt"), "b\n").expect("a file can be changed");
+        asked(&root, &["add", "a.txt"]).expect("the change is staged");
 
-        let staged = take(roots, OWN, Sent::Staged, GIT_BOUNDS, None).expect("the staged snapshot is made");
+        let staged = take(roots, OWN, Sent::Staged(None), GIT_BOUNDS, None).expect("the staged snapshot is made");
 
-        assert_eq!(staged[0].bridge, None, "no bridge on the saved snapshot");
-        let saved = asked(&root, &["rev-parse", reference.as_str()]).expect("the saved ref is read");
-        assert_eq!(saved.trim_end(), first[0].commit, "the saved ref still names the first snapshot");
+        let bridge = staged[0].bridge.as_deref().expect("a bridge on HEAD");
+        let ask = |args: &[&str]| asked(&root, args).expect("git answers");
+        assert_eq!(
+            ask(&["rev-list", "--parents", "-n", "1", bridge]).trim_end(),
+            format!("{bridge} {head} {}", first[0].commit),
+            "the bridge stands on HEAD and on the saved snapshot"
+        );
+        let tree = |commit: &str| ask(&["rev-parse", &format!("{commit}^{{tree}}")]);
+        assert_eq!(tree(bridge), tree(&staged[0].commit), "the bridge carries the staged tree");
+        assert_eq!(
+            ask(&["rev-parse", reference.as_str()]).trim_end(),
+            first[0].commit,
+            "the saved ref still names the first snapshot"
+        );
+        fs::remove_dir_all(&root).expect("the repository can be removed");
+    }
+
+    /// A commit stage's snapshot with no snapshot of the worktree saved for this builder bridges on the PC's HEAD
+    /// alone: there is no earlier snapshot of the builder's to stand on.
+    #[test]
+    fn a_stage_snapshot_with_no_saved_snapshot_bridges_on_head_alone() {
+        let root = repository("staged-head-alone");
+        let head = commit(&root, "base");
+        fs::write(root.join("a.txt"), "b\n").expect("a file can be changed");
+        asked(&root, &["add", "a.txt"]).expect("the change is staged");
+
+        let staged = take(slice::from_ref(&root), OWN, Sent::Staged(None), GIT_BOUNDS, None).expect("the staged snapshot is made");
+
+        let bridge = staged[0].bridge.as_deref().expect("a bridge on HEAD");
+        let ask = |args: &[&str]| asked(&root, args).expect("git answers");
+        assert_eq!(
+            ask(&["rev-list", "--parents", "-n", "1", bridge]).trim_end(),
+            format!("{bridge} {head}"),
+            "the bridge stands on HEAD alone"
+        );
+        fs::remove_dir_all(&root).expect("the repository can be removed");
+    }
+
+    /// A commit stage's snapshot of a shallow clone builds no bridge: the clone has no history a push may send, and the
+    /// PC's HEAD is not sent either.
+    #[test]
+    fn a_shallow_clone_s_stage_snapshot_builds_no_bridge() {
+        let root = repository("staged-shallow");
+        commit(&root, "base");
+        let shallow = root.with_file_name(format!("{}-shallow", root.file_name().expect("a name").to_string_lossy()));
+        if shallow.exists() {
+            fs::remove_dir_all(&shallow).expect("an earlier run's clone can be removed");
+        }
+        let url = format!("file:///{}", root.to_string_lossy().replace('\\', "/"));
+        asked(&root, &["clone", "--quiet", "--depth", "1", &url, &shallow.to_string_lossy()]).expect("the shallow clone is made");
+        assert_eq!(
+            asked(&shallow, &["rev-parse", "--is-shallow-repository"])
+                .expect("git answers")
+                .trim_end(),
+            "true",
+            "the clone is shallow"
+        );
+        fs::write(shallow.join("a.txt"), "b\n").expect("a file can be changed");
+        asked(&shallow, &["add", "a.txt"]).expect("the change is staged");
+
+        let staged = take(slice::from_ref(&shallow), OWN, Sent::Staged(None), GIT_BOUNDS, None).expect("the staged snapshot is made");
+
+        assert_eq!(staged[0].bridge, None, "a shallow clone sends no bridge");
+        fs::remove_dir_all(&shallow).expect("the clone can be removed");
+        fs::remove_dir_all(&root).expect("the repository can be removed");
+    }
+
+    /// A shallow clone's stage with a snapshot saved bridges on that snapshot alone: it is a commit the builder already
+    /// holds, and nothing of the clone's own history is sent with it.
+    #[test]
+    fn a_shallow_clone_s_stage_snapshot_with_a_saved_snapshot_bridges_on_it_alone() {
+        let root = repository("staged-shallow-saved");
+        commit(&root, "base");
+        let shallow = root.with_file_name(format!("{}-shallow", root.file_name().expect("a name").to_string_lossy()));
+        if shallow.exists() {
+            fs::remove_dir_all(&shallow).expect("an earlier run's clone can be removed");
+        }
+        let url = format!("file:///{}", root.to_string_lossy().replace('\\', "/"));
+        asked(&root, &["clone", "--quiet", "--depth", "1", &url, &shallow.to_string_lossy()]).expect("the shallow clone is made");
+        let saved = asked(&shallow, &["rev-parse", "HEAD"]).expect("HEAD is read").trim_end().to_owned();
+        save(&shallow, &[], &snapshot_ref(OWN, None), &saved, GIT_BOUNDS).expect("the ref is saved");
+        fs::write(shallow.join("a.txt"), "b\n").expect("a file can be changed");
+        asked(&shallow, &["add", "a.txt"]).expect("the change is staged");
+
+        let staged = take(slice::from_ref(&shallow), OWN, Sent::Staged(None), GIT_BOUNDS, None).expect("the staged snapshot is made");
+
+        let bridge = staged[0].bridge.as_deref().expect("a bridge on the saved snapshot");
+        let ask = |args: &[&str]| asked(&shallow, args).expect("git answers");
+        assert_eq!(
+            ask(&["rev-list", "--parents", "-n", "1", bridge]).trim_end(),
+            format!("{bridge} {saved}"),
+            "the saved snapshot alone"
+        );
+        fs::remove_dir_all(&shallow).expect("the clone can be removed");
         fs::remove_dir_all(&root).expect("the repository can be removed");
     }
 

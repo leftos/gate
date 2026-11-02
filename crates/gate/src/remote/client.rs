@@ -2009,11 +2009,12 @@ impl Attempt<'_, '_> {
         Ok(())
     }
 
-    /// What the snapshot of the repository at `at` in the run's order sends: a commit stage's main repository its staged
-    /// tree, every other its worktree with its bridge to this builder.
+    /// What the snapshot of the repository at `at` in the run's order sends, and the builder that receives it, named by
+    /// both kinds: a commit stage's main repository its staged tree, every other its worktree; each builds the bridge
+    /// this builder is given.
     fn sent(&self, at: usize) -> snapshot::Sent<'_> {
         if self.call.commit_stage && at == 0 {
-            snapshot::Sent::Staged
+            snapshot::Sent::Staged(self.call.builder.id.as_deref())
         } else {
             snapshot::Sent::Worktree(self.call.builder.id.as_deref())
         }
@@ -2925,7 +2926,7 @@ impl Attempt<'_, '_> {
             return Err(End::Refused(FallbackReason::Unreachable));
         }
         // A commit stage's staged tree is never saved: no later run's bridge builds on it.
-        if self.sent(at) != snapshot::Sent::Staged {
+        if !matches!(self.sent(at), snapshot::Sent::Staged(_)) {
             let reference = snapshot::snapshot_ref(key, self.call.builder.id.as_deref());
             let saved = snapshot::save(root, &variables, &reference, &snapshot.commit, self.git);
             saved.map_err(|error| repo_end(at, &repo.name, git_end(error)))?;
