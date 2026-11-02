@@ -70,6 +70,7 @@ fn print_request_shows_the_new_cli_request() {
         "noMarkers": false,
         "local": false,
         "builder": null,
+        "desktopHidden": false,
         "reason": null,
         "bringTracked": [],
         "env": [],

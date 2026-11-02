@@ -412,6 +412,74 @@ fn a_run_builder_value_given_as_its_own_word_reaches_gate_exe() {
     }
 }
 
+/// A `run` asking for a hidden desktop writes the mode as a word of its own: the launcher must read it as the option's
+/// value and not as the command's first word, whichever side of `--slot` the option falls.
+#[test]
+fn a_run_desktop_value_given_as_its_own_word_reaches_gate_exe() {
+    let case = Case::new("a_run_desktop_value_given_as_its_own_word_reaches_gate_exe");
+    let exe = install_gate(&case);
+    let command = ["cmd", "/c", "echo", "hi"];
+    let orderings = [
+        [
+            "run",
+            "--desktop",
+            "hidden",
+            "--log",
+            "out.log",
+            "--timeout",
+            "5",
+            "--slot",
+            "heavy",
+            "--test-print-request",
+        ],
+        [
+            "run",
+            "--log",
+            "out.log",
+            "--timeout",
+            "5",
+            "--slot",
+            "heavy",
+            "--desktop",
+            "hidden",
+            "--test-print-request",
+        ],
+    ];
+
+    for options in orderings {
+        let in_session: Vec<&str> = options.iter().chain(&command).copied().collect();
+        let restored: Vec<&str> = options.iter().chain(&["--"]).chain(&command).copied().collect();
+
+        let handed = run_launcher_in_session(&case, &in_session);
+        let direct = run_direct(&exe, &case, &restored);
+
+        assert_eq!(
+            handed.request(),
+            direct.request(),
+            "the launcher did not put the -- back: {options:?}: {handed:?}"
+        );
+        assert_eq!(
+            handed.request()["command"],
+            serde_json::json!(command),
+            "a command word was split or lost: {options:?}"
+        );
+        assert_eq!(handed.request()["desktopHidden"], true, "the desktop option was lost: {options:?}");
+
+        let filed = run_launcher(&case, &restored);
+
+        assert_eq!(
+            filed.request(),
+            direct.request(),
+            "the -File call with its -- was split: {options:?}: {filed:?}"
+        );
+        assert_eq!(
+            filed.request()["desktopHidden"],
+            true,
+            "the desktop option was lost through -File: {options:?}"
+        );
+    }
+}
+
 #[test]
 fn the_stop_tree_subcommand_is_handed_over_as_it_came() {
     let case = Case::new("the_stop_tree_subcommand_is_handed_over_as_it_came");

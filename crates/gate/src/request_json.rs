@@ -62,6 +62,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot) -> Stri
         "noMarkers": request.no_markers,
         "local": request.local,
         "builder": request.builder,
+        "desktopHidden": request.desktop_hidden,
         "reason": request.reason,
         "bringTracked": request.bring_tracked,
         "env": request.env,
