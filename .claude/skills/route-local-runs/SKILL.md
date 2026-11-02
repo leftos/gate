@@ -37,7 +37,7 @@ Take the first row that holds, then record the decision with `watch_local.py mar
 | 6 | The command drives this PC's own state: a window, a GPU session, an install into this PC's folders, a rig or measurement of its own processes, a build whose exes are started on this PC by a repo with no `outputs` for them | Mark `local`, the reason as the note. |
 | 7 | The repo is `(no repo)` | No repo owns it. Mark `local`, note `no repo`. |
 | 7a | The repo is not a key of `remote.json`'s `repos` | **Add** one step under GATE-192 (Remote routing for every caller repo) for the repo, unless an open one names it, mark `booked`. |
-| 8 | The shape holds `.tmp/*` | Scratch work. Add up `seconds` across every shape of one script. Under 1800, mark `local`, note `scratch`. At 1800 or more, read the script: if row 6 fits, take it; else book asking how the repo should run this job routed, mark `booked`. A script no longer on disk is judged by its arguments. |
+| 8 | The shape holds `.tmp/*` | Scratch work. The shape hides the script, so read the name from the journal, and add up `seconds` across every shape of one script, counting the parts of one job (`rerun_a` to `rerun_d`) as one. Under 1800, mark `local`, note `scratch`. At 1800 or more, read the script: if row 6 fits, take it; else book asking how the repo should run this job routed, mark `booked`. A script no longer on disk is judged by its arguments. |
 | 9 | The clear-route test below passes | Apply the pattern, mark `routed`. |
 | 10 | Anything else | Book what blocks the route, mark `booked`. |
 
