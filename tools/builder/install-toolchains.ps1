@@ -624,6 +624,21 @@ Invoke-Step 'VB-CABLE 45 virtual audio output' {
         throw "VBCABLE_Setup_x64.exe exited $($setup.ExitCode) and no VB-Audio sound device is present"
     }
 }
+# Routed headless Blender jobs name blender.exe by its installed path, so the builder keeps the PC's folder. download.blender.org
+# answers scripted requests 403, so this comes from a mirror the Blender project lists, with the hash it publishes.
+Invoke-Step 'Blender 5.2.2 LTS' {
+    $sha = '3849D17A682CBA006075AAA3F3597ECB5C9C30EC31035B2E092C53E40679B535'
+    $f = Get-File 'https://mirrors.ocf.berkeley.edu/blender/release/Blender5.2/blender-5.2.2-windows-x64.zip'
+    $got = (Get-FileHash -Path $f -Algorithm SHA256).Hash
+    if ($got -ne $sha) { throw "blender-5.2.2-windows-x64.zip SHA-256 is $got, expected $sha" }
+    $tmp = Join-Path $dl 'blender-extract'
+    Expand-Archive -Path $f -DestinationPath $tmp -Force
+    $src = Get-ChildItem $tmp -Directory | Select-Object -First 1
+    $blenderDir = 'C:\Program Files\Blender Foundation\Blender 5.2'
+    New-Item -ItemType Directory -Force $blenderDir | Out-Null
+    Copy-Item -Path (Join-Path $src.FullName '*') -Destination $blenderDir -Recurse -Force
+    Remove-Item $tmp -Recurse -Force
+}
 Invoke-Step 'FFmpeg 9.0.2' {
     $sha = '759D0A9831C436A0EB331AD36F236C06CB04AAA0005DA46571F0E9D3D9206F6B'
     $f = Get-File 'https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-full_build.zip'
