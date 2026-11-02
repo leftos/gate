@@ -230,6 +230,20 @@ A command it matches runs here with `gate: not routed: .gate/local.toml keeps it
 
 A `.gate/local.toml` the gate cannot use keeps every routed command of the repo here with `gate: not routed: .gate/local.toml: <problem>`, so fix it before relying on routing. A repo that cannot commit the file keeps it in its declarations folder ([design.md](design.md#remotejson)). `gate check` does not report it.
 
+A command that matches none of the repo's `repos` patterns stays here whatever the file says, so it needs no entry.
+
+## A repo with a job that reads data outside the worktree
+
+A word naming a path outside the worktree keeps a run on this PC, and no pattern overrides it. A long job over a data folder outside the repo (a large private folder on another drive) routes through the `inputs` route instead, with no gate change:
+
+- A PC-side job command mirrors the folder into an ignored folder of the worktree, `.tmp/blender-data/` (`robocopy /MIR`, a real copy that keeps modified times, since `inputs` skips links and its hash cache reads them), runs the repo's wrapper through the gate, then copies the results back.
+- The tracked wrapper reads the mirror by its relative path and writes results to `.tmp/blender-out/`. A script it runs must be tracked too: a gitignored script that no `inputs` glob covers does not reach the builder.
+- `remote.json`: `repos` names the wrapper alone, `inputs` gains the mirror's glob, and `outputs` and `failureOutputs` gain the results' glob. A `.tmp` glob must name the folder `.tmp` exactly.
+
+Naming the wrapper rather than the tool keeps ad-hoc runs of the tool on this PC.
+
+The first run sends the whole folder and later runs only what changed. A put past 4 GiB falls back to this PC. Each worktree holding the mirror sends and keeps its own copy, and every routed run from it hashes the mirror, so one worktree should hold it. Every routed command runs as the same builder user, so a copy on a builder is readable by any repo's routed run.
+
 ## A repo with Windows-only projects its commands do not name
 
 A routed `dotnet test` of a Windows-only project already stays off a macOS builder, but a script such as `pwsh tools/test-all.ps1` hides which projects it tests.
