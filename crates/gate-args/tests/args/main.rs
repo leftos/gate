@@ -15,6 +15,7 @@ mod program;
 mod prune;
 mod push;
 mod quoting;
+mod remote;
 mod run;
 mod seams;
 mod support;

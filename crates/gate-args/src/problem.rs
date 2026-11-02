@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use crate::remote::RemoteProblem;
 #[cfg(feature = "test-seams")]
 use crate::request::{DESKTOP_MODES, DESKTOP_SESSIONS};
 #[cfg(feature = "test-seams")]
@@ -180,6 +181,8 @@ pub enum Problem {
         name: String,
         position: usize,
     },
+    /// A `gate remote` line it cannot take, said as `gate: remote: ...`.
+    Remote(RemoteProblem),
     /// A `--env` word that is not valid Unicode, `position` its place among the run's `--env` words. The word is not
     /// said: it may be a secret pasted without its name.
     EnvWordNotUnicode(usize),
@@ -276,6 +279,7 @@ impl fmt::Display for Problem {
             #[cfg(feature = "test-seams")]
             Problem::SeamNotUsedWith { option, with } => write!(f, "gate: {option} is not used with {with}"),
             Problem::EnvRefused { refusal, name, position } => f.write_str(&refusal.usage_line(&escaped(&shown_name(name)), *position)),
+            Problem::Remote(problem) => write!(f, "gate: remote: {problem}"),
             Problem::EnvWordNotUnicode(n) => write!(f, "gate: --env word {n} is not valid Unicode"),
             Problem::EnvForwardNotSet(n) => write!(f, "gate: --env word {n} names a variable to forward, and it is not set"),
             Problem::EnvForwardNotUnicode(n) => write!(f, "gate: --env word {n} names a variable whose value is not Unicode"),

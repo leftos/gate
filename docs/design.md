@@ -27,7 +27,7 @@ Non-goals:
 
 The CLI is subcommands with GNU-style flags: `--name value` or `--name=value`, and `--` ends the gate's options. The first word picks the parser. `--version`, `--help`, `-h` and `help` are matched first; then a subcommand name selects the CLI below, and any other first word starting with `-` selects the [compatibility layer](#compatibility-layer). No arguments at all print the usage on stderr and exit 2.
 
-A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `drain`, `prune`, `check`, `warm`, `burn` or `expect` line also prints the usage on stdout and exits 0, whatever else the line holds; after the `--` it belongs to the command (`gate run --slot light --timeout 5 --log x.log -- tool --help` runs `tool --help`).
+A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `drain`, `prune`, `remote`, `check`, `warm`, `burn` or `expect` line also prints the usage on stdout and exits 0, whatever else the line holds; after the `--` it belongs to the command (`gate run --slot light --timeout 5 --log x.log -- tool --help` runs `tool --help`).
 
 | Subcommand | Purpose |
 |---|---|
@@ -37,6 +37,7 @@ A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `
 | `gate push` | Copy the installed `gate.exe` and desktop helper to every builder `remote.json` names and register the desktop task there. |
 | `gate drain` | Raise a barrier on a builder and wait until no routed run is going there, so it can be redeployed; `--lift` lifts it, `--status` reports ([`gate drain`](#gate-drain)). |
 | `gate prune --builders` | Mark the worktree records whose worktree is gone, and prune the work folder of each one that has been gone an hour on every builder `remote.json` lists, then remove what this PC keeps of the key ([`gate prune`](#gate-prune)). |
+| `gate remote` | Add or remove patterns in one list of `remote.json`, keeping the rest of the file as it is ([`gate remote`](#gate-remote)). |
 | `gate check` | Say what this PC lacks for the repo in the current folder, and how to install it. |
 | `gate burn` | Spin the CPU for a set time, for the load-burn tool. |
 | `gate expect` | Print the expected time of a command here and on each builder, from the durations store. |
@@ -746,6 +747,30 @@ A `test-seams` build starts the background sweep only for a routed run given the
 
 Test-seams builds accept hidden options on `prune` and no `--test-print-request`: `--test-remote-transport` (a local folder in place of ssh, as `gate check --builder` takes it), `--test-remote-ssh` (which also needs `--test-remote-transport`) and `--test-prune-gone-age-ms <n>` (the least age of a gone worktree, in milliseconds, 3600000 by default; a whole number, 0 allowed).
 
+### `gate remote`
+
+`gate remote add <section> <repo> <pattern>... [--builder <host>] [--tag <word>] [--dry-run]` and `gate remote remove <section> <repo> <pattern>... [--builder <host>] [--dry-run]` edit one list of `%LOCALAPPDATA%\gate\remote.json`, so no session hand-edits the file other sessions share. Its usage lines follow `gate prune --builders`'s.
+
+`<section>` is one of `repos`, `outputs`, `failureOutputs`, `inputs`, `desktop`, `desktopSession` or `siblings`, and `<repo>` a key of that section. With `--builder <host>` (a `builders` entry matched by host in ASCII case) the list is the entry's own, and only `repos`, `outputs` and `failureOutputs` exist there. The flat lists (`warmup`, `hooks`, `commits`, `sendBuild`) are not edited by it. A repo key matches in ASCII case and keeps its spelling; a missing repo or section is appended at the end. Removing the last pattern leaves `[]` and never deletes the key (an empty `outputs` list brings nothing back).
+
+The file is rewritten as it stood: key order, indent (spaces or tabs), line ending, byte order mark and final newline are kept, and a file holding comments or trailing commas is refused, since a rewrite would drop them. Before it writes, the command checks that the result passes the router's parse, changes nothing outside the one list and adds no problem the file did not have, then re-reads the file and compares its bytes with what it edited. The write is `gate_state::write_text_replacing`, an atomic replace.
+
+A write that changes the file first makes a backup beside it, `remote.json.bak-[<tag>-]<yyyyMMddTHHmmssZ>` (UTC; `-2` to `-99` is appended when the name is taken), created new before the replace. `--tag` names the backup (1 to 40 of `A-Za-z0-9_-`) and is for `add` only. A no-op or a `--dry-run` makes no backup and writes nothing.
+
+Output on stdout, one line per pattern: `remote: <section>.<repo>: + <pattern>`, `remote: <section>.<repo>: - <pattern>`, `remote: <section>.<repo>: unchanged (already has <pattern>)` or `remote: <section>.<repo>: absent (no <pattern>)`, with `builders[<n>].<section>.<repo>` for a builder's list. Then `remote: backup <path>` and `remote: wrote <path>`, or `remote: dry run; nothing written`. Adding a present pattern or removing an absent one is not an error (exit 0).
+
+Exit 0 on success, 1 on a refusal and 2 on usage. Usage errors print their `gate: ` line before the usage: `gate: remote: missing the verb add or remove` (likewise a missing section, repo or pattern), `unknown verb <v>; add or remove`, `unknown section <s>; one of repos, outputs, failureOutputs, inputs, desktop, desktopSession, siblings`, `a builder has no section <s>; with --builder, one of repos, outputs, failureOutputs`, `--tag is for add only; remove makes no backup to name` and `--tag must be 1 to 40 ASCII letters, digits, '_' and '-', got '<v>'`, plus the shared `--<opt> is given twice`, `unknown option <w>` and `--<opt> needs a value` (an option word or `--` after `--tag` or `--builder` is never its value).
+
+A refusal prints one `remote: ` line on stderr and leaves the file as it was:
+
+- `no remote.json at <path>`, `no remote.json: LOCALAPPDATA is not an absolute folder` and `ignored <path>: <reason>` (the router's reason for an unusable file);
+- `<host> is not a builders entry of remote.json; --builder edits builders[] entries only, and the top-level host's lists are edited without it`;
+- `refused: the file holds comments or trailing commas, which a rewrite would drop; edit it by hand; nothing written`;
+- `refused: the result would be refused: <reason>; nothing written`, `refused: the result changes more than the one list; nothing written` and `refused: the result has a problem the file did not have: <problem>; nothing written`;
+- `refused: <section> is not an object of lists; edit it by hand; nothing written` (and `.<repo> is not a list`), and `refused: <path> is not UTF-8 text; nothing written`;
+- `changed while editing; nothing written` when the re-read differs;
+- `cannot read <path>[ again]: <error>`, `cannot make the backup <path>: <error>; nothing written` (the path is the numbered file the gate made, which it removes again; `; <path> may be left partly written` is added before `; nothing written` when that removal fails too), `cannot make the backup <path>: it and every numbered name up to -99 are taken; nothing written` and `cannot write <path>: <error>; it is left as it was, and <backup> holds it`.
+
 ### `gate box`
 
 Hidden from the usage and from `--help`. It is the builder side of a routed run, run over ssh on the builder ([The box side](#the-box-side)).
@@ -1165,7 +1190,7 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 | Path under the root | Writer | Readers | Notes |
 |---|---|---|---|
 | `slot-counts.json` | ops-tower's Gates tab, people | every waiting gate, ops-tower | [Counts](#counts). |
-| `remote.json` | people | the router, ops-tower (`slots`) | Builders and routing (T1); read from `%LOCALAPPDATA%\gate\remote.json`, beside the `v1\` folder, whatever the state root is. Its optional `declarations` names, per repo, a PC-owned folder holding the `.gate` files the repo cannot commit ([remote.json](#remotejson), Declarations folder). |
+| `remote.json` | people, `gate remote` (one list at a time) | the router, ops-tower (`slots`) | Builders and routing (T1); read from `%LOCALAPPDATA%\gate\remote.json`, beside the `v1\` folder, whatever the state root is. Its optional `declarations` names, per repo, a PC-owned folder holding the `.gate` files the repo cannot commit ([remote.json](#remotejson), Declarations folder). |
 | `slots\<name>.json` | the gate holding the slot, written before its `take` line | other gates, ops-tower | [Claim](#claim); `<name>` is the mutex name without `Local\` and the root hash, plus `gate-critical.json` for a critical gate, its one claim for the whole machine (kind `critical`, index 0), written before its `take` line; the heavy and light slots it holds get none. |
 | `slots\gate-lent-<parent pid>-<pid>-<start>.json` | a gate lent its light parent's slot, from before its command starts to after it ends | a critical gate's drain; ops-tower does not read it | [Claim](#claim) (the lend marker). Claim readers skip it. |
 | `waiting\<pid>-<start>.json` | the waiting gate | other gates, ops-tower | [Ticket](#ticket). |
@@ -1573,7 +1598,7 @@ Two rolls within one second collide on the archive name: the second archive fail
 
 ### remote.json
 
-`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos`, the optional `data`, the optional `ssh`, the optional `builders` and the optional per-repo `outputs`, `failureOutputs`, `inputs`, `siblings` and `desktop` and the optional `warmup`, `hooks`, `commits`, `sendBuild` and `declarations`, read afresh by each routed gate and ignored as a whole with one line when unusable.
+`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos`, the optional `data`, the optional `ssh`, the optional `hosts`, the optional `builders` and the optional per-repo `outputs`, `failureOutputs`, `inputs`, `siblings` and `desktop` and the optional `warmup`, `hooks`, `commits`, `sendBuild` and `declarations`, read afresh by each routed gate and ignored as a whole with one line when unusable. [`gate remote`](#gate-remote) edits the pattern lists.
 
 A minimal file, at `%LOCALAPPDATA%\gate\remote.json`, routes one repo's builds and tests to one Windows builder:
 

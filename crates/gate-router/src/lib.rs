@@ -19,6 +19,7 @@ pub mod balance;
 mod config;
 mod decide;
 pub mod desktop;
+mod edit;
 pub mod env;
 mod escape;
 mod key;
@@ -38,6 +39,7 @@ pub use decide::{
     builds_in_place, decide, dotnet_builds, dotnet_takes_solution, dotnet_target, is_cargo, is_dotnet, is_input_file, is_project_or_solution,
     later_run, later_stage_run, names_program, positional_target, sdk_build_target, sibling_root, stays_local, target, without_no_build,
 };
+pub use edit::{BUILDER_SECTIONS, EDIT_SECTIONS, Edit, EditRefusal, EditVerb, Edited, edit_remote_json};
 pub use escape::{escaped, is_reordering_mark};
 pub use key::{is_layout_char, is_layout_name, repo_name, work_folder_key};
 pub use like::{InvalidPattern, Pattern};

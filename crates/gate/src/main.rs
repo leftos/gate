@@ -46,6 +46,7 @@ mod pause;
 mod prune_cmd;
 mod push;
 mod remote;
+mod remote_cmd;
 mod request_json;
 mod resolve;
 mod restore;

@@ -37,6 +37,8 @@ pub enum Invocation {
     Expect(ExpectRequest),
     /// `gate warm`.
     Warm(WarmRequest),
+    /// `gate remote add|remove`.
+    Remote(RemoteRequest),
     /// The hidden `gate box <verb> --stdin`, `gate box register-desktop`, or `gate box prune --root <folder>
     /// [--keys <key>...]`.
     Box(BoxRequest),
@@ -769,3 +771,38 @@ pub struct PushSeams {
     /// `ok` (`--test-push-register ok|fail`): the pushed gate's `box register-desktop` is given `--test-box-register`.
     pub register_ok: Option<bool>,
 }
+
+/// A valid `gate remote add|remove`: one repo's pattern list in one section of `remote.json`, at the top level or in
+/// the `builders` entry `--builder` names, gains or loses the patterns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteRequest {
+    /// `add` or `remove`.
+    pub verb: RemoteVerb,
+    /// The section as given, one of [`REMOTE_SECTIONS`], or of [`REMOTE_BUILDER_SECTIONS`] with `--builder`.
+    pub section: String,
+    /// The repo name as given.
+    pub repo: String,
+    /// The patterns as given, in order, one or more.
+    pub patterns: Vec<String>,
+    /// `--builder <host>` as given: edit the `builders` entry whose `host` it names; `None` edits the top level.
+    pub builder: Option<String>,
+    /// `--tag <word>` as given, `add` only: the word the backup's name carries.
+    pub tag: Option<String>,
+    /// `--dry-run`: say what would change, back up and write nothing.
+    pub dry_run: bool,
+}
+
+/// What `gate remote` does to the list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteVerb {
+    /// `gate remote add`.
+    Add,
+    /// `gate remote remove`.
+    Remove,
+}
+
+/// The sections `gate remote` edits.
+pub const REMOTE_SECTIONS: [&str; 7] = ["repos", "outputs", "failureOutputs", "inputs", "desktop", "desktopSession", "siblings"];
+
+/// The sections `gate remote --builder` edits, the ones a `builders` entry has.
+pub const REMOTE_BUILDER_SECTIONS: [&str; 3] = ["repos", "outputs", "failureOutputs"];

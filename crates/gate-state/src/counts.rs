@@ -291,6 +291,17 @@ pub(crate) fn write_replacing(path: &Path, text: &str) -> io::Result<()> {
     replace_with(path, WRITE_ATTEMPTS, |file| file.write_all(text.as_bytes()))
 }
 
+/// Writes `text` over the file at `path` so a reader sees the old file or the new one, never part of one, as
+/// [`write_replacing`] does: for a file another process reads, such as `gate remote`'s rewrite of `remote.json`.
+///
+/// # Errors
+///
+/// Why the temp file beside `path` could not be made or written, or why the move over `path` failed every try; the
+/// file at `path` is then left as it was.
+pub fn write_text_replacing(path: &Path, text: &str) -> io::Result<()> {
+    write_replacing(path, text)
+}
+
 /// [`write_replacing`] with the move over `path` tried once: for a writer on a run's path, which says a failure and
 /// goes on at once rather than wait out a reader.
 pub(crate) fn write_replacing_once(path: &Path, text: &str) -> io::Result<()> {

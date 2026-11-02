@@ -5,6 +5,7 @@
 
 mod config;
 mod decide;
+mod edit;
 mod key;
 mod like;
 mod rewrite;

@@ -33,6 +33,7 @@ mod pause;
 mod prune;
 mod push;
 mod remote_client;
+mod remote_cmd;
 mod remote_inputs;
 mod remote_lfs;
 mod request;
