@@ -593,6 +593,58 @@ fn an_unusable_commits_value_consents_no_repo_and_keeps_the_rest_of_the_file() {
     }
 }
 
+/// The routing file listing `g` with `ssh` holding `value`.
+fn ssh_file(value: &str) -> Config {
+    Config::parse(&format!(
+        r#"{{"host": "builder-1", "slots": 2, "repos": {{"g": ["x"]}}, "hosts": ["builder-2"], "ssh": {value}}}"#
+    ))
+    .expect("routing reads the file whatever ssh holds")
+}
+
+#[test]
+fn ssh_absent_names_no_ssh() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"g": ["x"]}}"#).expect("usable");
+
+    assert_eq!(config.ssh(), Ok(None));
+}
+
+#[test]
+fn ssh_reads_an_absolute_path() {
+    let config = ssh_file(r#""C:\\Program Files\\Git\\usr\\bin\\ssh.exe""#);
+
+    assert_eq!(config.ssh(), Ok(Some(Path::new(r"C:\Program Files\Git\usr\bin\ssh.exe"))));
+    let keyed = Config::parse(r#"{"host": "builder-1", "repos": {}, "SSH": "C:\\ssh.exe"}"#).expect("usable");
+    assert_eq!(keyed.ssh(), Ok(Some(Path::new(r"C:\ssh.exe"))), "the key in any case");
+    let upper = ssh_file(r#""C:\\Program Files\\Git\\usr\\bin\\SSH.EXE""#);
+    assert_eq!(
+        upper.ssh(),
+        Ok(Some(Path::new(r"C:\Program Files\Git\usr\bin\SSH.EXE"))),
+        "ssh.exe in any case"
+    );
+}
+
+#[test]
+fn an_unusable_ssh_value_names_no_ssh_and_keeps_the_rest_of_the_file() {
+    for (value, problem) in [
+        ("3", "ssh must be a string"),
+        ("null", "ssh must be a string"),
+        (r#"["C:\\ssh.exe"]"#, "ssh must be a string"),
+        (r#""""#, "ssh must be an absolute path to ssh.exe"),
+        (r#""ssh.exe""#, "ssh must be an absolute path to ssh.exe"),
+        (r#""git\\usr\\bin\\ssh.exe""#, "ssh must be an absolute path to ssh.exe"),
+        (r#""C:\\tools\\ssh.cmd""#, "ssh must be an absolute path to ssh.exe"),
+        (r#""C:\\Program Files\\Git\\usr\\bin\\ssh""#, "ssh must be an absolute path to ssh.exe"),
+        (r#""C:\\""#, "ssh must be an absolute path to ssh.exe"),
+    ] {
+        let config = ssh_file(value);
+        assert_eq!(config.ssh(), Err(problem), "{value}");
+        assert_eq!(config.host(), "builder-1", "{value}");
+        assert_eq!(config.slots(), 2, "{value}");
+        assert_eq!(config.builders(), Ok(&["builder-1".to_owned(), "builder-2".to_owned()][..]), "{value}");
+        assert_eq!(pattern_texts(&config, "g"), ["x"], "{value}");
+    }
+}
+
 /// The routing file listing `g` with `sendBuild` holding `value`.
 fn send_build_file(value: &str) -> Config {
     Config::parse(&format!(

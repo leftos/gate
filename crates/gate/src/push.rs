@@ -605,7 +605,7 @@ pub(crate) fn push(request: &PushRequest, environment: &Environment, console: &m
     };
     let ssh = match &request.seams.ssh {
         Some(stub) => std::path::absolute(stub).map_err(|error| format!("cannot run {}: {error}", stub.display())),
-        None => Ssh::find().map(|ssh| ssh.program),
+        None => prepared.ssh.clone(),
     };
     let bound = request.seams.bound_ms.map_or(BOUND, Duration::from_millis);
     let mut status = 0;
@@ -661,7 +661,7 @@ fn swept(ssh: &Result<PathBuf, String>, environment: &Environment, console: &mut
         seams: PruneSeams::default(),
         quiet: true,
     };
-    let transport = || {
+    let transport = |_: &Config| {
         ssh.clone()
             .map(|program| Box::new(Ssh { program }) as Box<dyn Transport>)
             .map_err(|why| format!("gate: prune: {why}"))
@@ -672,9 +672,11 @@ fn swept(ssh: &Result<PathBuf, String>, environment: &Environment, console: &mut
 /// What every builder is sent: the Windows builders, what [`SCRIPT`]'s slots hold but the root and the count, which are
 /// each builder's own, the exe and the helper as every call is fed them, the exe's version as shown and as read, and the
 /// ssh line; then the macOS builders and, when there are any, what `source.json` says the installed gate was built
-/// from, or why it cannot be used.
+/// from, or why it cannot be used; and the ssh the routing file names ([`Config::ssh`]), else the one found along the
+/// gate's own `PATH`, or why it cannot be used or found.
 struct Prepared {
     builders: Vec<Windows>,
+    ssh: Result<PathBuf, String>,
     sha: String,
     helper_sha: String,
     register: String,
@@ -709,10 +711,12 @@ fn root_expression(place: Place<'_>, root: &str) -> String {
     place.root.map_or_else(|| format!("'{}'", root.replace('\'', "''")), str::to_owned)
 }
 
-/// The builders a push reaches: `host` and each `hosts` entry, Windows builders, then the macOS `builders` entries.
+/// The builders a push reaches: `host` and each `hosts` entry, Windows builders, then the macOS `builders` entries; and
+/// the ssh the routing file names, else the one found along the gate's own `PATH`, or why it cannot be used or found.
 struct Listed {
     hosts: Vec<Windows>,
     macs: Vec<Mac>,
+    ssh: Result<PathBuf, String>,
 }
 
 /// A Windows builder the push installs gate on: its alias, its remote root and its slot count.
@@ -767,7 +771,7 @@ fn prepared(
         .filter(|folder| folder.is_absolute())
         .ok_or_else(|| "push: no remote.json: LOCALAPPDATA is not an absolute folder".to_owned())?;
     let gate = folder.join("gate");
-    let Listed { hosts: builders, macs } = builders(&gate.join("remote.json"))?;
+    let Listed { hosts: builders, macs, ssh } = builders(&gate.join("remote.json"))?;
     let bin = gate.join("bin");
     let exe = bin.join("gate.exe");
     // The lock tools/install.ps1 holds while it replaces and checks the exe and the helper, held for their reads and the
@@ -781,6 +785,7 @@ fn prepared(
     drop(lock);
     Ok(Prepared {
         builders,
+        ssh,
         sha: sha256_hex(&bytes),
         helper_sha: sha256_hex(&helper),
         register: register_command(register_ok),
@@ -890,7 +895,8 @@ fn builders(path: &Path) -> Result<Listed, String> {
             let hosts = config.builders().map(<[String]>::to_vec).map_err(ignored)?;
             let macs = macs_of(&config, &hosts);
             let hosts = hosts.into_iter().map(|alias| windows_of(&config, alias)).collect();
-            Ok(Listed { hosts, macs })
+            let ssh = Ssh::find(config.ssh()).map(|ssh| ssh.program);
+            Ok(Listed { hosts, macs, ssh })
         }
     }
 }

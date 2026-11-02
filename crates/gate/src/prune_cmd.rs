@@ -65,15 +65,16 @@ pub(crate) type Outcomes = BTreeMap<String, Vec<(Option<String>, Outcome)>>;
 
 /// Runs `gate prune --builders` and returns its exit status: 0 when nothing failed, 1 when anything did.
 pub(crate) fn prune(request: &PruneRequest, environment: &Environment, console: &mut Console) -> u32 {
-    prune_through(request, environment, || transport(&request.seams), console)
+    prune_through(request, environment, |config| transport(&request.seams, config), console)
 }
 
-/// Runs the sweep as [`prune`] does, its builders reached through the transport `transport` makes, asked for only once a
-/// record is a candidate; else the line saying why there is none. Returns the sweep's exit status.
+/// Runs the sweep as [`prune`] does, its builders reached through the transport `transport` makes from the routing
+/// file, asked for only once a record is a candidate; else the line saying why there is none. Returns the sweep's exit
+/// status.
 pub(crate) fn prune_through(
     request: &PruneRequest,
     environment: &Environment,
-    transport: impl FnOnce() -> Result<Box<dyn Transport>, String>,
+    transport: impl FnOnce(&Config) -> Result<Box<dyn Transport>, String>,
     console: &mut Console,
 ) -> u32 {
     let state = match resolve::root(None, environment) {
@@ -116,7 +117,7 @@ pub(crate) fn prune_through(
         Ok(listed) => listed,
         Err(line) => return failed_with(&line, console),
     };
-    let transport = match transport() {
+    let transport = match transport(&config) {
         Ok(transport) => transport,
         Err(line) => return failed_with(&line, console),
     };
@@ -446,25 +447,27 @@ fn listed(local_app_data: Option<&OsStr>) -> Result<(Config, Vec<Builder>), Stri
     Ok((config, builders))
 }
 
-/// The way to the builders: the local transport `--test-remote-transport` names, else ssh found along the gate's own
-/// `PATH`. Else the line saying why the local transport cannot be used, or why ssh cannot be found.
+/// The way to the builders: the local transport `--test-remote-transport` names, else the ssh `config` names or the
+/// one found along the gate's own `PATH`. Else the line saying why the local transport cannot be used, or why ssh
+/// cannot be found.
 #[cfg(feature = "test-seams")]
-fn transport(seams: &PruneSeams) -> Result<Box<dyn Transport>, String> {
+fn transport(seams: &PruneSeams, config: &Config) -> Result<Box<dyn Transport>, String> {
     match &seams.remote_transport {
         Some(named) => crate::remote::local_transport(named, seams.remote_ssh.as_deref()).map(|local| Box::new(local) as Box<dyn Transport>),
-        None => ssh(),
+        None => ssh(config),
     }
 }
 
-/// The way to the builders: ssh found along the gate's own `PATH`; else the line saying why it cannot be found.
+/// The way to the builders: the ssh `config` names, else the one found along the gate's own `PATH`; else the line
+/// saying why it cannot be found.
 #[cfg(not(feature = "test-seams"))]
-fn transport(_seams: &PruneSeams) -> Result<Box<dyn Transport>, String> {
-    ssh()
+fn transport(_seams: &PruneSeams, config: &Config) -> Result<Box<dyn Transport>, String> {
+    ssh(config)
 }
 
-/// ssh found along the gate's own `PATH`; else the line saying why it cannot be found.
-fn ssh() -> Result<Box<dyn Transport>, String> {
-    Ssh::find()
+/// The ssh `config` names, else the one found along the gate's own `PATH`; else the line saying why it cannot be found.
+fn ssh(config: &Config) -> Result<Box<dyn Transport>, String> {
+    Ssh::find(config.ssh())
         .map(|ssh| Box::new(ssh) as Box<dyn Transport>)
         .map_err(|why| format!("gate: prune: {why}"))
 }

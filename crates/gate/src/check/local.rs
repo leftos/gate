@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use gate_args::{CheckRequest, CheckSeams};
 use gate_router::warm::{FileRead, Judgement, Record, RecordRead, RecordState, Situation, WarmupFile, judge, lock_problem_text, record_problem_text};
-use gate_router::{Config, Place, SiblingFolder, repo_name, sibling_root, work_folder_key};
+use gate_router::{Config, Place, SiblingFolder, escaped, repo_name, sibling_root, work_folder_key};
 use gate_state::v1;
 
 use crate::answer::FAILED_STATUS;
@@ -302,6 +302,7 @@ fn checked(place: &Place, seams: &CheckSeams) -> Checked {
     });
     let hooks_problem = hooks_problem(&repo);
     let commits_problem = commits_problem(&repo);
+    let ssh_problem = ssh_problem();
     let desktop_session_problem = desktop_session_problem(&repo);
     let cross_build_problems = cross_build_problems();
     let (allowed, consent_problem) = match allowed_siblings(&repo) {
@@ -329,6 +330,7 @@ fn checked(place: &Place, seams: &CheckSeams) -> Checked {
         consent_problem,
         hooks_problem,
         commits_problem,
+        ssh_problem,
         desktop_session_problem,
         cross_build_problems,
         root_problem: None,
@@ -730,6 +732,21 @@ fn commits_problem(repo: &str) -> Option<String> {
         return None;
     };
     config.commits_allowed(repo).err().map(str::to_owned)
+}
+
+/// Why this PC's routing file's `ssh` value cannot be used, if it cannot: the reason the router's `ssh` gives, or that
+/// the file it names does not exist. A routing file that cannot be read at all is no such problem, as its own line says
+/// it.
+fn ssh_problem() -> Option<String> {
+    let path = route::remote_json_path(std::env::var_os("LOCALAPPDATA").as_deref())?;
+    let Ok(Some(config)) = route::read_remote_json(&path) else {
+        return None;
+    };
+    match config.ssh() {
+        Err(problem) => Some(problem.to_owned()),
+        Ok(Some(ssh)) if !ssh.is_file() => Some(format!("ssh {} does not exist", escaped(&ssh.display().to_string()))),
+        Ok(_) => None,
+    }
 }
 
 /// Why this PC's routing file's `desktopSession` value cannot be used, if it cannot: the reason the router's

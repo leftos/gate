@@ -372,12 +372,12 @@ fn call_command(program: Program, system: &Path) -> Command {
     command
 }
 
-/// The transport in `slot`, the ssh one found along the gate's own `PATH` and kept there when the slot is empty; else
-/// why ssh cannot be found.
+/// The transport in `slot`, the ssh one kept there when the slot is empty: the ssh `remote.json` names, else `ssh.exe`
+/// found along the gate's own `PATH`; else why ssh cannot be found.
 fn found(slot: &mut Option<Box<dyn Transport>>) -> Result<&mut dyn Transport, String> {
     let transport = match slot {
         Some(transport) => transport,
-        None => slot.insert(Box::new(Ssh::find()?)),
+        None => slot.insert(Box::new(Ssh::find_as_remote_json_says()?)),
     };
     Ok(transport.as_mut())
 }

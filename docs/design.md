@@ -297,7 +297,7 @@ The helper's aside copies thus go with a later verified push. The `kept <n> asid
 
 Each version read on the builder is bounded at 30 s.
 
-The ssh a push runs is `ssh.exe` found along `PATH`, never `ssh.cmd` or `ssh.bat`.
+The ssh a push runs is the `ssh` of `remote.json` ([remote.json](#remotejson)) when it names one, else `ssh.exe` found along `PATH`, never `ssh.cmd` or `ssh.bat`.
 
 **macOS builders.** After the Windows builders, each `builders` entry with `"os": "macos"` is pushed to in file order, one after another; an entry whose alias is also `host` or a `hosts` entry is left out. A Mac gets no copy of `gate.exe`: it builds its own `gate-box` ([The Unix box](#the-unix-box)) from the commit the installed gate was built from, so the box on the Mac carries the installed gate's version text.
 
@@ -432,6 +432,8 @@ When the repo declares siblings and `remote.json` lists the repo but its `siblin
 
 A `desktopSession` value of `remote.json` that cannot be used is said the same way, `check: <where>: remote.json: <problem>` counted missing, whatever the repo. So is a `commits` value that cannot be used, right after the `hooks` one.
 
+An `ssh` value that cannot be used is said as `check: here: remote.json: <problem>`, and a named ssh that does not exist as `check: here: remote.json: ssh <path> does not exist`, both counted missing.
+
 #### The warm-up items
 
 Each is one line `check: here: warm-up: <text>`. The state root, where the work folder's warm-up record and lock are, is found as the other commands find it, `GATE_STATE_DIR` and then `%LOCALAPPDATA%\gate\v1`; `gate check` takes no `--state-dir`.
@@ -470,7 +472,7 @@ Test-seams builds accept the hidden `--test-probe-limit-ms <n>` (the 10 s probe 
 
 `gate check --builder <host>` says what one builder lacks for the repo in the current folder. It needs one host (`gate: --builder needs a value`; given twice, `gate: --builder is given twice`), which must be a builder `remote.json` lists (`host`, `hosts` or a `builders` entry), matched ignoring ASCII case and printed in `remote.json`'s spelling. Any other host prints `gate check: <host> is not a builder remote.json lists` and exits 2.
 
-The repo is found as for the local check (outside a git worktree is `check: not in a git repository`, exit 1). A `remote.json` that is missing, ignored or cannot be found is a stderr line with exit 1: `check: <host>: remote.json not found at <path>`, `check: <host>: remote.json is ignored: <reason>` or `check: <host>: remote.json cannot be found: LOCALAPPDATA is not an absolute folder`.
+The repo is found as for the local check (outside a git worktree is `check: not in a git repository`, exit 1). A `remote.json` that is missing, ignored or cannot be found is a stderr line with exit 1: `check: <host>: remote.json not found at <path>`, `check: <host>: remote.json is ignored: <reason>` or `check: <host>: remote.json cannot be found: LOCALAPPDATA is not an absolute folder`. An ssh that cannot be run is `check: <host>: cannot run ssh: <why>` with exit 1, the `why` being one of the `cannot run ssh` errors of [remote.json](#remotejson).
 
 It runs the box's preflight once over ssh with this repo's real work-folder key and the manifest's tools, bounded at 120 s, with no retry and no PC-side lock. A routed run of the same worktree running at the same time may collide with it (GATE-270). The preflight creates the same folders a routed run's preflight would.
 
@@ -625,7 +627,7 @@ The barrier, the sessions and the gated verbs are the box's ([The box side](#the
 - The builder is the one `remote.json`'s `host` names, else the one `--builder <host>` names, which must be a builder `remote.json` lists. No line names the builder.
 - It reads `%LOCALAPPDATA%` only, as `gate push` does; `GATE_STATE_DIR` and `--state-dir` do not apply. It takes no slot and writes no claim, journal line or log.
 
-It calls the builder's `gate box drain --stdin` over ssh, found along the gate's own `PATH`, with the payload `{"Root","Action"}` (`payload::drain_word`), `Action` being `raise`, `status` or `lift`. Each call is bounded at 120 s and ended by Ctrl+C. Every line goes to stderr.
+It calls the builder's `gate box drain --stdin` over ssh, the `ssh` of `remote.json` when it names one, else found along the gate's own `PATH`, with the payload `{"Root","Action"}` (`payload::drain_word`), `Action` being `raise`, `status` or `lift`. Each call is bounded at 120 s and ended by Ctrl+C. Every line goes to stderr.
 
 **The wait** (no option) works in this order.
 
@@ -666,7 +668,7 @@ The list above follows it only when a barrier stands and the state is `waiting` 
 **Usage and setup errors**, each before any call to the builder:
 
 - Exit 2, each on its own `gate: ` line before the usage: `gate: --lift cannot be given with --status`, `gate: unexpected argument {word}` (any word that is not an option, `--` included), `gate: unknown option {opt}`, and the other problems the shared parser finds; and, from the routing file, `gate drain: {host} is not a builder remote.json lists` (no usage after it).
-- Exit 1, on one line each: `drain: no remote.json at {path}`, `drain: no remote.json: LOCALAPPDATA is not an absolute folder`, `drain: ignored {path}: {why}` (a `remote.json` that cannot be used, or a builder entry it cannot use), and `gate: drain: {why}` when ssh cannot be found.
+- Exit 1, on one line each: `drain: no remote.json at {path}`, `drain: no remote.json: LOCALAPPDATA is not an absolute folder`, `drain: ignored {path}: {why}` (a `remote.json` that cannot be used, or a builder entry it cannot use), and `gate: drain: {why}` when ssh cannot be found or run (the `cannot run ssh` errors of [remote.json](#remotejson)).
 
 The exit is 0 for a drained builder, a lift, a lift of nothing and a status; 1 for a failure; 2 for usage; 0xC000013A on Ctrl+C.
 
@@ -694,7 +696,7 @@ The exit is 0 when nothing failed, 1 on any failure and 2 for usage. Every line 
 - A key the box said nothing of says `gate: remote {host} kept {key}: its box said nothing of it` and fails.
 - A builder that cannot be reached says `gate: remote {host} could not be reached: {why}` (`no answer in 300 s` when the bound passed), fails each of its keys, and its later calls are not made. A box that does not take the keyed prune says `gate: remote {host} kept {key}: its box cannot prune by key` for each key, which is no failure.
 - A builder whose root has a space says `gate: remote {host} cannot prune: its root {root} has a space` and fails its keys.
-- Without `remote.json`: `gate: prune: no remote.json at {path}`; one that cannot be used: `gate: prune: ignored {path}: {reason}`; both exit 1, as does ssh not found (`gate: prune: {why}`), and neither is said when no record is a candidate.
+- Without `remote.json`: `gate: prune: no remote.json at {path}`; one that cannot be used: `gate: prune: ignored {path}: {reason}`; both exit 1, as does ssh not found or not runnable (`gate: prune: {why}`, the `cannot run ssh` errors of [remote.json](#remotejson)), and neither is said when no record is a candidate.
 
 **The removal.** After the builders, the sweep removes what the PC keeps of each key it called them for, in this order, as far as the builders pruned it.
 
@@ -1499,7 +1501,7 @@ Two rolls within one second collide on the archive name: the second archive fail
 
 ### remote.json
 
-`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos`, the optional `data`, the optional `builders` and the optional per-repo `outputs`, `failureOutputs`, `inputs`, `siblings` and `desktop` and the optional `warmup`, `hooks`, `commits`, `sendBuild` and `declarations`, read afresh by each routed gate and ignored as a whole with one line when unusable.
+`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos`, the optional `data`, the optional `ssh`, the optional `builders` and the optional per-repo `outputs`, `failureOutputs`, `inputs`, `siblings` and `desktop` and the optional `warmup`, `hooks`, `commits`, `sendBuild` and `declarations`, read afresh by each routed gate and ignored as a whole with one line when unusable.
 
 A minimal file, at `%LOCALAPPDATA%\gate\remote.json`, routes one repo's builds and tests to one Windows builder:
 
@@ -1568,6 +1570,12 @@ A value that is not an array (`hooks must be an array of repo names`) or holds a
 `commits` is an array of repo names, matched in any letter case, whose commit's pre-commit hook stage may route as a [commit stage](GLOSSARY.md) (`Config::commits_allowed`). It reads like `hooks`: a value that is not an array (`commits must be an array of repo names`) or holds an item that is not a non-empty string (`commits[N] is not a non-empty string`) consents to no repo and leaves the rest of the file usable, and `gate check` says it as a missing item right after the `hooks` one, `check: here: remote.json: <problem>`, so the check exits 1.
 
 An eligible commit of a repo `commits` names runs its pre-commit hooks on a Windows builder as a commit stage, under the commit's own local slot ([Commit run](#critical-drain-and-nesting)); every other run, and every other commit, is decided as before. The commit itself still starts here after the stage.
+
+`ssh` is an absolute path to a file named `ssh.exe`, in any letter case (`gate_router::config`). When set, every ssh the gate runs is that file: a routed run and the git push and fetch it makes (git's ssh command is built from it), `gate check --builder`, `gate drain`, `gate prune`, `gate push` and its prune sweep (Windows and Mac builders alike) and the Tailscale `ssh -G` read. Absent, the gate finds `ssh.exe` along its own `PATH`, never `ssh.cmd` or `ssh.bat`.
+
+A value that is not a string (`ssh must be a string`) or not an absolute path to `ssh.exe` (`ssh must be an absolute path to ssh.exe`, also for `ssh.cmd`, `ssh.bat` and a name with no extension) names no ssh and leaves the rest of the file usable. A named file that does not exist is an error with no fall back to `PATH`: `cannot run ssh: remote.json's ssh {path} does not exist`. The other errors are `cannot run ssh: remote.json: {problem}` and `cannot run ssh: cannot read remote.json: {why}`, the last for a `remote.json` that exists but cannot be read; a missing file means the `PATH` lookup.
+
+The setting exists because every Win32-OpenSSH client measured (9.5p2, 10.0p2, 10.4p1) sends CPU-bound at about 12 MiB per CPU-second: 256 MiB to a Windows builder took 18.8 to 24.6 s on about 22 CPU-s. Git for Windows' bundled OpenSSH (10.6p1, `C:\Program Files\Git\usr\bin\ssh.exe`) sent the same in 4.3 to 10.8 s on 1.3 to 1.7 CPU-s. Receiving is fast with every client, and the builders' sshd needs no change.
 
 The judge of whether a commit's stage may route is `stage_eligible` in `crates/gate/src/commit/stage.rs`, over the commit's words, its environment and the repo's facts.
 
@@ -2704,13 +2712,13 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   In a build with the `test-seams` feature, `gate run --test-remote-transport local:<folder>` (or `local:{alias}={folder}|{alias}={folder}`, a folder for each builder) stands in for the builder with a local folder, and `--test-remote-snapshot` and `--test-remote-client` take precedence over the ssh client.
 
-  The Rust client's builder root is `D:\gate-remote`, and its ssh is `ssh.exe` found along the gate's own `PATH`: `ssh.cmd` and `ssh.bat` are never looked for, in the client and in `gate push` alike ([`gate push`](#gate-push)). ssh is looked up only when a run routes, in the client's `ready()` as the routed attempt starts, before any key lock, ticket or slot; a run that never routes never looks for it.
+  The Rust client's builder root is `D:\gate-remote`, and its ssh is the `ssh` of `remote.json` when it names one ([remote.json](#remotejson)), else `ssh.exe` found along the gate's own `PATH`: `ssh.cmd` and `ssh.bat` are never looked for, in the client and in `gate push` alike ([`gate push`](#gate-push)). ssh is looked up only when a run routes, in the client's `ready()` as the routed attempt starts, before any key lock, ticket or slot; a run that never routes never looks for it.
 
   The client's ssh calls start in the Windows system folder with `NoDefaultCurrentDirectoryInExePath=1`, and every git call the gate makes carries that variable (`NO_CURRENT_FOLDER` in `remote/git.rs`), so neither ssh nor a program it starts by name is found in the gate's working folder, which may be the worktree.
 
   The client runs the file the ssh found leads to through links, and refuses it when that file lies inside the run's worktree, with the same check the dotnet read has.
 
-  A client that cannot start falls back `client` and says `gate: remote <host> client could not start: <why>; running here`; a run with no usable ssh says `cannot run ssh: <message>` before any key lock, ticket or remote slot. A `cannot run ssh: <path> lies inside the worktree` is said after the remote slot is taken, since the worktree is known only to the run call.
+  A client that cannot start falls back `client` and says `gate: remote <host> client could not start: <why>; running here`, with `<why>` `cannot run ssh: remote.json's ssh <path> does not exist` for a named ssh that is missing; a run with no usable ssh says `cannot run ssh: <message>` before any key lock, ticket or remote slot. A `cannot run ssh: <path> lies inside the worktree` is said after the remote slot is taken, since the worktree is known only to the run call.
 
   A repo name that is not `[A-Za-z0-9_-]+` is never sent to the builder: the push and the sync-back fail the run with `cannot push to the repo '<name>': a repo name is letters, digits, '_' and '-'`, as a client failure (`gate: the remote run failed: ...`).
 

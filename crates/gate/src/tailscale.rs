@@ -376,7 +376,7 @@ fn status_text(calls: Calls<'_>) -> Result<Option<String>, String> {
 /// The host name `ssh -G -- <alias>` resolves `alias` to, with ssh found as the transport finds it; else why it gave
 /// none, its own words cut from the front of a failure line.
 fn resolved_host(alias: &str, calls: Calls<'_>) -> Result<String, String> {
-    let ssh = Ssh::find().map_err(|why| format!("could not start: {why}"))?;
+    let ssh = Ssh::find_as_remote_json_says().map_err(|why| format!("could not start: {why}"))?;
     let program = ssh.program.to_string_lossy();
     let args = ["-G", "--", alias];
     let named = format!("{program} {} ", args.join(" "));

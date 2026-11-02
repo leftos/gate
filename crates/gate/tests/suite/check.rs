@@ -1244,6 +1244,53 @@ fn check_says_an_unusable_commits_value() {
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
 }
 
+/// A routing file whose `ssh` is no absolute path.
+const RELATIVE_SSH_ROUTING: &str = r#"{"host": "builder-1", "repos": {"app": ["*"]}, "ssh": "git\\usr\\bin\\ssh.exe"}"#;
+
+/// An `ssh` value that cannot be used fails the check once, saying why.
+#[test]
+fn check_says_an_unusable_ssh_value() {
+    let case = repo_case("check_bad_ssh_value");
+    write_remote_json(&case, RELATIVE_SSH_ROUTING);
+
+    let outcome = check(&case, &[], &[]);
+
+    assert_eq!(
+        lines(&outcome.stdout),
+        [
+            format!("check: here: app at {}", root(&case)).as_str(),
+            "check: here: app declares no toolchain",
+            "check: here: remote.json: ssh must be an absolute path to ssh.exe",
+            "check: here: 1 missing, 0 too old",
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
+/// An `ssh` naming a file that does not exist fails the check once, naming the file.
+#[test]
+fn check_says_a_named_ssh_that_does_not_exist() {
+    let case = repo_case("check_missing_ssh");
+    let missing = case.folder().join("git").join("ssh.exe");
+    let text = serde_json::json!({"host": "builder-1", "repos": {"app": ["*"]}, "ssh": missing}).to_string();
+    write_remote_json(&case, &text);
+
+    let outcome = check(&case, &[], &[]);
+
+    assert_eq!(
+        lines(&outcome.stdout),
+        [
+            format!("check: here: app at {}", root(&case)).as_str(),
+            "check: here: app declares no toolchain",
+            format!("check: here: remote.json: ssh {} does not exist", missing.display()).as_str(),
+            "check: here: 1 missing, 0 too old",
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
 /// A `warmup` value that cannot be used says nothing for a repo with no warm-up file, so one bad value never fails
 /// the check of every repo on the PC.
 #[test]
@@ -2114,6 +2161,30 @@ fn check_builder_says_a_builder_that_does_not_answer_in_time() {
 
     assert_eq!(outcome.stdout, "", "{outcome:?}");
     assert_eq!(outcome.stderr, "check: builder-1: unreachable: no answer in 500 ms\n", "{outcome:?}");
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
+/// A routing file whose `ssh` names a file that does not exist fails `gate check --builder` before any call, through
+/// the real ssh lookup (no transport seam), as an ssh that cannot be found does.
+#[test]
+fn check_builder_says_a_named_ssh_that_does_not_exist() {
+    let case = repo_case("check_builder_missing_ssh");
+    let missing = case.folder().join("git").join("ssh.exe");
+    let text = serde_json::json!({"host": "builder-1", "repos": {"app": ["*"]}, "ssh": missing}).to_string();
+    write_remote_json(&case, &text);
+    let mut command = case.gate_in(REPO, &["check", "--builder", "builder-1"]);
+    command.env("PATH", path_with_git(&[]));
+
+    let outcome = finish(command);
+
+    assert_eq!(
+        outcome.stderr,
+        format!(
+            "check: builder-1: cannot run ssh: remote.json's ssh {} does not exist\n",
+            missing.display()
+        ),
+        "{outcome:?}"
+    );
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
 }
 

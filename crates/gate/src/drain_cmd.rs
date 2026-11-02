@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use gate_args::{BoxVerb, DrainAction, DrainRequest, DrainSeams};
-use gate_router::{Builder, escaped};
+use gate_router::{Builder, Config, escaped};
 use gate_win32::{Interrupt, PipedConsole};
 use gate_wire::stamp;
 use serde_json::Value;
@@ -55,14 +55,14 @@ const THE_BUILDER: &str = "the builder";
 /// Runs `gate drain` and returns its exit status: 0 drained, lifted or reported, 1 a failure, 2 a builder `remote.json`
 /// does not list, `CONTROL_C_EXIT` on Ctrl+C.
 pub(crate) fn drain(request: &DrainRequest, environment: &Environment, console: &mut Console) -> u32 {
-    let builder = match chosen(request.builder.as_deref(), environment.local_app_data.as_deref()) {
-        Ok(builder) => builder,
+    let (builder, config) = match chosen(request.builder.as_deref(), environment.local_app_data.as_deref()) {
+        Ok(chosen) => chosen,
         Err((status, line)) => {
             console.err(&line);
             return u32::from(status);
         }
     };
-    let transport = match transport(&request.seams) {
+    let transport = match transport(&request.seams, &config) {
         Ok(transport) => transport,
         Err(line) => {
             console.err(&line);
@@ -91,9 +91,9 @@ pub(crate) fn drain(request: &DrainRequest, environment: &Environment, console: 
 }
 
 /// The builder `remote.json` under `local_app_data` lists as `named`, else its `host`
-/// ([`gate_router::Config::named_builder`]). Else the status and the line: 2 for a name it does not list, 1 for a
-/// routing file that is not there or cannot be used, worded as `gate push` words it.
-fn chosen(named: Option<&str>, local_app_data: Option<&OsStr>) -> Result<Builder, (u8, String)> {
+/// ([`gate_router::Config::named_builder`]), and the file read. Else the status and the line: 2 for a name it does not
+/// list, 1 for a routing file that is not there or cannot be used, worded as `gate push` words it.
+fn chosen(named: Option<&str>, local_app_data: Option<&OsStr>) -> Result<(Builder, Config), (u8, String)> {
     let path = route::remote_json_path(local_app_data)
         .ok_or_else(|| (FAILED_STATUS, "drain: no remote.json: LOCALAPPDATA is not an absolute folder".to_owned()))?;
     let ignored = |reason: &str| (FAILED_STATUS, format!("drain: ignored {}: {reason}", path.display()));
@@ -103,31 +103,34 @@ fn chosen(named: Option<&str>, local_app_data: Option<&OsStr>) -> Result<Builder
         Err(problem) => return Err(ignored(&problem.reason)),
     };
     let host = named.unwrap_or_else(|| config.host());
-    config
+    let builder = config
         .named_builder(host)
         .map_err(ignored)?
-        .ok_or_else(|| (USAGE_STATUS, format!("gate drain: {} is not a builder remote.json lists", escaped(host))))
+        .ok_or_else(|| (USAGE_STATUS, format!("gate drain: {} is not a builder remote.json lists", escaped(host))))?;
+    Ok((builder, config))
 }
 
-/// The way to the builder: the local transport `--test-remote-transport` names, else ssh found along the gate's own
-/// `PATH`. Else the line saying why the local transport cannot be used, or why ssh cannot be found.
+/// The way to the builder: the local transport `--test-remote-transport` names, else the ssh `config` names or the one
+/// found along the gate's own `PATH`. Else the line saying why the local transport cannot be used, or why ssh cannot be
+/// found.
 #[cfg(feature = "test-seams")]
-fn transport(seams: &DrainSeams) -> Result<Box<dyn Transport>, String> {
+fn transport(seams: &DrainSeams, config: &Config) -> Result<Box<dyn Transport>, String> {
     match &seams.remote_transport {
         Some(named) => crate::remote::local_transport(named, seams.remote_ssh.as_deref()).map(|local| Box::new(local) as Box<dyn Transport>),
-        None => ssh(),
+        None => ssh(config),
     }
 }
 
-/// The way to the builder: ssh found along the gate's own `PATH`; else the line saying why it cannot be found.
+/// The way to the builder: the ssh `config` names, else the one found along the gate's own `PATH`; else the line saying
+/// why it cannot be found.
 #[cfg(not(feature = "test-seams"))]
-fn transport(_seams: &DrainSeams) -> Result<Box<dyn Transport>, String> {
-    ssh()
+fn transport(_seams: &DrainSeams, config: &Config) -> Result<Box<dyn Transport>, String> {
+    ssh(config)
 }
 
-/// ssh found along the gate's own `PATH`; else the line saying why it cannot be found.
-fn ssh() -> Result<Box<dyn Transport>, String> {
-    Ssh::find()
+/// The ssh `config` names, else the one found along the gate's own `PATH`; else the line saying why it cannot be found.
+fn ssh(config: &Config) -> Result<Box<dyn Transport>, String> {
+    Ssh::find(config.ssh())
         .map(|ssh| Box::new(ssh) as Box<dyn Transport>)
         .map_err(|why| format!("gate: drain: {why}"))
 }

@@ -110,6 +110,8 @@ pub struct Config {
     /// The repo names whose commits' pre-commit hook stage may route, or why `commits` cannot be used, which consents to
     /// none.
     commits: Result<Vec<String>, String>,
+    /// The ssh every gate ssh call runs, `None` when the key is missing, or why `ssh` cannot be used.
+    ssh: Result<Option<PathBuf>, String>,
     /// The repo names whose routed `dotnet test --no-build` may send the PC's build, or why `sendBuild` cannot be used,
     /// which lets none.
     send_build: Result<Vec<String>, String>,
@@ -160,7 +162,8 @@ impl Config {
     /// [`Config::allowed_desktop`] gives its reason, and a bad `desktopSession`, allowing no session pattern, and
     /// [`Config::allowed_desktop_session`] gives its reason, and a bad `hooks`, consenting to no hook routing, and
     /// [`Config::hooks_allowed`] gives its reason, and a bad `commits`, consenting to no commit's hook stage routing, and
-    /// [`Config::commits_allowed`] gives its reason, and a bad `sendBuild`, letting no repo send its build, and
+    /// [`Config::commits_allowed`] gives its reason, and a bad `ssh`, naming no ssh, and [`Config::ssh`] gives its
+    /// reason, and a bad `sendBuild`, letting no repo send its build, and
     /// [`Config::send_build_allowed`] gives its reason, and a bad `declarations`, naming no folder, and
     /// [`Config::declarations_folder`] gives its reason. A `builders` entry's bad `crossBuild` (no object, on an entry
     /// whose `os` is not `macos`, a value that is no string or no runtime identifier, or a repo without a non-empty
@@ -211,6 +214,7 @@ impl Config {
             desktop_session: read_desktop_consent(&data, "desktopSession"),
             hooks: read_hooks_consent(&data),
             commits: read_commits_consent(&data),
+            ssh: read_ssh(&data),
             send_build: read_names(&data, "sendBuild"),
             declarations: read_declarations(&data),
         })
@@ -303,6 +307,20 @@ impl Config {
         match &self.commits {
             Err(problem) => Err(problem),
             Ok(names) => Ok(names.iter().any(|name| eq_ignoring_case(name, repo))),
+        }
+    }
+
+    /// The ssh `ssh` names, which every gate ssh call runs in place of the `ssh.exe` found along `PATH`: `None` when
+    /// there is no such key.
+    ///
+    /// # Errors
+    ///
+    /// Why `ssh` cannot be used: not a string, or not an absolute path to a file named `ssh.exe`. Such a value names no ssh, and the rest of the
+    /// file is read whatever it holds.
+    pub fn ssh(&self) -> Result<Option<&Path>, &str> {
+        match &self.ssh {
+            Err(problem) => Err(problem),
+            Ok(path) => Ok(path.as_deref()),
         }
     }
 
@@ -1038,6 +1056,24 @@ fn read_hooks_consent(data: &Map<String, Value>) -> Result<Vec<String>, String> 
 /// is missing.
 fn read_commits_consent(data: &Map<String, Value>) -> Result<Vec<String>, String> {
     read_names(data, "commits")
+}
+
+/// The `ssh` path: the ssh every gate ssh call runs; none when the key is missing. A value that is no string, or no
+/// absolute path to a file named `ssh.exe` in any letter case, is why it cannot be used: no `ssh.cmd` or `ssh.bat` shim
+/// runs in its place, as none does along `PATH`.
+fn read_ssh(data: &Map<String, Value>) -> Result<Option<PathBuf>, String> {
+    let Some(value) = property(data, "ssh") else {
+        return Ok(None);
+    };
+    let Value::String(text) = value else {
+        return Err("ssh must be a string".to_owned());
+    };
+    let path = PathBuf::from(text);
+    let named_ssh_exe = path.file_name().is_some_and(|name| name.eq_ignore_ascii_case("ssh.exe"));
+    if !path.is_absolute() || !named_ssh_exe {
+        return Err("ssh must be an absolute path to ssh.exe".to_owned());
+    }
+    Ok(Some(path))
 }
 
 /// The list of repo names at `key`, in file order; none when the key is missing. A value that is no array, or an entry

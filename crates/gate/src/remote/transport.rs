@@ -523,16 +523,21 @@ fn box_words(line: &str) -> Vec<OsString> {
         .collect()
 }
 
-/// The ssh transport: OpenSSH found along the gate's own `PATH`, the builder's root `D:\gate-remote`, and git pushing
+/// The ssh transport: the ssh `remote.json`'s `ssh` names, else OpenSSH's `ssh.exe` found along the gate's own `PATH`,
+/// the builder's root `D:\gate-remote`, and git pushing
 /// over ssh to a receive-pack started through pwsh, which reads the single-quoted path git sends through cmd.
 /// `gate push` runs its calls with ssh's own path; a routed run that no test seam gives a client uses the ssh
 /// transport, and judges the ssh it found against the run's worktree before its first call.
 pub(crate) mod ssh {
+    use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
+
+    use gate_router::{Config, escaped};
 
     use super::{Profile, Program, PushTarget, SSH_OPTIONS, Transport, Wire, sent_repo, ssh_words};
     use crate::environment::Variables;
     use crate::remote::git::judged;
+    use crate::route;
     use crate::run::find_program;
 
     pub(crate) const BUILDER_ROOT: &str = r"D:\gate-remote";
@@ -544,18 +549,55 @@ pub(crate) mod ssh {
     }
 
     impl Ssh {
-        /// `ssh.exe` found along the gate's own `PATH`, read against the working directory; else why it cannot be
-        /// found.
-        pub(crate) fn find() -> Result<Ssh, String> {
+        /// The ssh `named` gives, the routing file's `ssh` ([`Config::ssh`]): the file it names, else `ssh.exe` found
+        /// along the gate's own `PATH`, read against the working directory, when it names none; else why it cannot be
+        /// used or found.
+        pub(crate) fn find(named: Result<Option<&Path>, &str>) -> Result<Ssh, String> {
+            if let Some(named) = named.map_err(|problem| format!("cannot run ssh: remote.json: {}", escaped(problem)))? {
+                return Ssh::named(named);
+            }
             let folder = std::env::current_dir().map_err(|error| format!("cannot read the working directory: {error}"))?;
-            Ssh::find_in(&Variables::from_process(), &folder)
+            Ssh::find_in(&Variables::from_process(), &folder, None)
         }
 
-        /// `ssh.exe` found along the `PATH` of `variables`, read against `folder`; else why it cannot be found.
-        pub(super) fn find_in(variables: &Variables, folder: &Path) -> Result<Ssh, String> {
+        /// The ssh this PC's routing file names ([`Ssh::find`]), the file read here.
+        pub(crate) fn find_as_remote_json_says() -> Result<Ssh, String> {
+            Ssh::find_as_remote_json_under_says(std::env::var_os("LOCALAPPDATA").as_deref())
+        }
+
+        /// The ssh the routing file under `local_app_data` names ([`Ssh::find`]): one that is not there names none;
+        /// else why the file that is there cannot be read or used.
+        pub(super) fn find_as_remote_json_under_says(local_app_data: Option<&OsStr>) -> Result<Ssh, String> {
+            let config = match route::remote_json_path(local_app_data).map(|path| route::read_remote_json(&path)) {
+                None | Some(Ok(None)) => None,
+                Some(Ok(Some(config))) => Some(config),
+                Some(Err(problem)) => return Err(format!("cannot run ssh: cannot read remote.json: {}", escaped(&problem.reason))),
+            };
+            Ssh::find(config.as_ref().map_or(Ok(None), Config::ssh))
+        }
+
+        /// The file `named` when given, else `ssh.exe` found along the `PATH` of `variables`, read against `folder`;
+        /// else why it cannot be found. A named file that does not exist is refused, with no fall back to `PATH`.
+        pub(super) fn find_in(variables: &Variables, folder: &Path, named: Option<&Path>) -> Result<Ssh, String> {
+            if let Some(named) = named {
+                return Ssh::named(named);
+            }
             find_program(SSH_EXE, variables, folder)
                 .map(|program| Ssh { program })
                 .map_err(|why| format!("cannot run ssh: {why}"))
+        }
+
+        /// The ssh file `named`; else that it does not exist, its path escaped onto one line.
+        fn named(named: &Path) -> Result<Ssh, String> {
+            if !named.is_file() {
+                return Err(format!(
+                    "cannot run ssh: remote.json's ssh {} does not exist",
+                    escaped(&named.display().to_string())
+                ));
+            }
+            Ok(Ssh {
+                program: named.to_path_buf(),
+            })
         }
     }
 
@@ -1122,9 +1164,135 @@ mod tests {
         let path = std::env::join_paths([&shim, &real]).expect("the folders join into a PATH");
         let variables = Variables::from_process().with("PATH", &path.to_string_lossy());
 
-        let found = Ssh::find_in(&variables, &root).expect("ssh.exe is found");
+        let found = Ssh::find_in(&variables, &root, None).expect("ssh.exe is found");
 
         assert_eq!(found.program, real.join("ssh.exe"), "the .cmd earlier on PATH is passed over");
+        fs::remove_dir_all(&root).expect("the folders can be removed");
+    }
+
+    #[test]
+    fn ssh_named_in_remote_json_is_run_ahead_of_the_one_on_path() {
+        let root = crate::test_support::temp_dir().join(format!("gate-ssh-named-{}", std::process::id()));
+        let (on_path, named) = (root.join("path"), root.join("git").join("usr").join("bin"));
+        for folder in [&on_path, &named] {
+            fs::create_dir_all(folder).expect("a folder can be made");
+        }
+        fs::write(on_path.join("ssh.exe"), "").expect("the PATH stand-in can be written");
+        fs::write(named.join("ssh.exe"), "").expect("the named stand-in can be written");
+        let path = std::env::join_paths([&on_path]).expect("the folder joins into a PATH");
+        let variables = Variables::from_process().with("PATH", &path.to_string_lossy());
+
+        let found = Ssh::find_in(&variables, &root, Some(&named.join("ssh.exe"))).expect("the named ssh is taken");
+
+        assert_eq!(
+            found.program,
+            named.join("ssh.exe"),
+            "remote.json's ssh is run, not the first ssh.exe on PATH"
+        );
+        fs::remove_dir_all(&root).expect("the folders can be removed");
+    }
+
+    #[test]
+    fn a_named_ssh_that_does_not_exist_is_refused_with_its_path() {
+        let root = crate::test_support::temp_dir().join(format!("gate-ssh-named-missing-{}", std::process::id()));
+        let on_path = root.join("path");
+        fs::create_dir_all(&on_path).expect("a folder can be made");
+        fs::write(on_path.join("ssh.exe"), "").expect("the PATH stand-in can be written");
+        let path = std::env::join_paths([&on_path]).expect("the folder joins into a PATH");
+        let variables = Variables::from_process().with("PATH", &path.to_string_lossy());
+        let missing = root.join("git").join("ssh.exe");
+
+        let refused = Ssh::find_in(&variables, &root, Some(&missing)).map(|ssh| ssh.program);
+
+        assert_eq!(
+            refused,
+            Err(format!("cannot run ssh: remote.json's ssh {} does not exist", missing.display())),
+            "no fall back to the ssh.exe on PATH"
+        );
+        fs::remove_dir_all(&root).expect("the folders can be removed");
+    }
+
+    #[test]
+    fn an_unusable_named_ssh_says_the_routing_file_s_problem() {
+        let refused = Ssh::find(Err("ssh must be a string")).map(|ssh| ssh.program);
+
+        assert_eq!(refused, Err("cannot run ssh: remote.json: ssh must be a string".to_owned()));
+        let control = Ssh::find(Err("ssh\nforged")).map(|ssh| ssh.program);
+        assert_eq!(
+            control,
+            Err(r"cannot run ssh: remote.json: ssh\nforged".to_owned()),
+            "the problem is said on one line"
+        );
+    }
+
+    #[test]
+    fn a_missing_named_ssh_is_said_on_one_line() {
+        let named = PathBuf::from("C:\\gate-no-such\nline\\ssh.exe");
+
+        let refused = Ssh::find(Ok(Some(&named))).map(|ssh| ssh.program);
+
+        assert_eq!(
+            refused,
+            Err(r"cannot run ssh: remote.json's ssh C:\gate-no-such\nline\ssh.exe does not exist".to_owned()),
+            "the newline in the path is escaped"
+        );
+    }
+
+    #[test]
+    fn a_routing_file_that_cannot_be_read_gives_no_ssh_and_says_why() {
+        let root = crate::test_support::temp_dir().join(format!("gate-ssh-bad-routing-{}", std::process::id()));
+        fs::create_dir_all(root.join("gate")).expect("the routing file's folder can be made");
+        fs::write(root.join("gate").join("remote.json"), "{ not json").expect("the routing file can be written");
+
+        let refused = Ssh::find_as_remote_json_under_says(Some(root.as_os_str())).map(|ssh| ssh.program);
+
+        let why = refused.expect_err("a routing file that cannot be read is no PATH lookup");
+        assert!(why.starts_with("cannot run ssh: cannot read remote.json: "), "{why}");
+        fs::remove_dir_all(&root).expect("the folders can be removed");
+    }
+
+    #[test]
+    fn a_routing_file_naming_a_missing_ssh_is_refused_by_the_helper() {
+        let root = crate::test_support::temp_dir().join(format!("gate-ssh-named-routing-{}", std::process::id()));
+        fs::create_dir_all(root.join("gate")).expect("the routing file's folder can be made");
+        let missing = root.join("git").join("ssh.exe");
+        let text = serde_json::json!({"host": "builder-1", "repos": {}, "ssh": missing}).to_string();
+        fs::write(root.join("gate").join("remote.json"), text).expect("the routing file can be written");
+
+        let refused = Ssh::find_as_remote_json_under_says(Some(root.as_os_str())).map(|ssh| ssh.program);
+
+        assert_eq!(
+            refused,
+            Err(format!("cannot run ssh: remote.json's ssh {} does not exist", missing.display()))
+        );
+        fs::remove_dir_all(&root).expect("the folders can be removed");
+    }
+
+    #[test]
+    fn no_routing_file_keeps_the_path_lookup() {
+        let root = crate::test_support::temp_dir().join(format!("gate-ssh-no-routing-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("the folder can be made");
+        let folder = std::env::current_dir().expect("the working directory can be read");
+
+        let found = Ssh::find_as_remote_json_under_says(Some(root.as_os_str())).map(|ssh| ssh.program);
+
+        let on_path = Ssh::find_in(&Variables::from_process(), &folder, None).map(|ssh| ssh.program);
+        assert_eq!(found, on_path, "no routing file is the PATH lookup");
+        fs::remove_dir_all(&root).expect("the folders can be removed");
+    }
+
+    #[test]
+    fn no_named_ssh_keeps_the_path_lookup() {
+        let root = crate::test_support::temp_dir().join(format!("gate-ssh-unnamed-{}", std::process::id()));
+        let on_path = root.join("path");
+        fs::create_dir_all(&on_path).expect("a folder can be made");
+        fs::write(on_path.join("ssh.exe"), "").expect("the PATH stand-in can be written");
+        let path = std::env::join_paths([&on_path]).expect("the folder joins into a PATH");
+        let variables = Variables::from_process().with("PATH", &path.to_string_lossy());
+
+        let found = Ssh::find_in(&variables, &root, None).expect("ssh.exe is found along PATH");
+
+        assert_eq!(found.program, on_path.join("ssh.exe"), "without remote.json's ssh, PATH's is run");
         fs::remove_dir_all(&root).expect("the folders can be removed");
     }
 }

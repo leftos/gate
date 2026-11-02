@@ -177,6 +177,9 @@ pub(crate) struct Checked {
     pub hooks_problem: Option<String>,
     /// Why this PC's routing file's `commits` value cannot be used, when it cannot.
     pub commits_problem: Option<String>,
+    /// Why this PC's routing file's `ssh` value cannot be used, or that the file it names does not exist; none for a
+    /// builder.
+    pub ssh_problem: Option<String>,
     /// Why this PC's routing file's `desktopSession` value cannot be used, when it cannot.
     pub desktop_session_problem: Option<String>,
     /// Why each `builders` entry's `crossBuild` in this PC's routing file cannot be used, one per such entry in file
@@ -358,6 +361,9 @@ fn items(at: At<'_>, checked: &Checked) -> Vec<Item> {
         items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
     }
     if let Some(problem) = &checked.commits_problem {
+        items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
+    }
+    if let Some(problem) = &checked.ssh_problem {
         items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
     }
     if let Some(problem) = &checked.desktop_session_problem {
@@ -759,6 +765,7 @@ mod tests {
             consent_problem: None,
             hooks_problem: None,
             commits_problem: None,
+            ssh_problem: None,
             desktop_session_problem: None,
             cross_build_problems: Vec::new(),
             root_problem: None,

@@ -262,7 +262,7 @@ The Mac's `root` in `remote.json` is that same absolute work root.
 
 1. Write `%LOCALAPPDATA%\gate\remote.json`. The minimal file, one Windows builder and one repo's patterns and outputs, is in [design.md, remote.json](design.md#remotejson).
 
-   `host` is required and names the Windows builder whose work root is `D:\gate-remote`. A Mac, or a further Windows builder with a work root of its own, is an entry of the `builders` array, with its `os`, its `root` and its own `repos`.
+   `host` is required and names the Windows builder whose work root is `D:\gate-remote`. On a Windows PC, also set `"ssh": "C:\\Program Files\\Git\\usr\\bin\\ssh.exe"` (an absolute path to an `ssh.exe`): Git for Windows' bundled OpenSSH sends large transfers several times faster and with far less CPU than the Win32-OpenSSH client; without `ssh`, gate uses the `ssh.exe` along its `PATH`. A Mac, or a further Windows builder with a work root of its own, is an entry of the `builders` array, with its `os`, its `root` and its own `repos`.
 2. Run `gate push`. It copies the installed `gate.exe` and desktop helper to each Windows builder, into `C:\Program Files\gate\bin` (so the builder's ssh session must be an administrator's), registers the desktop task there and writes the builder's slot count, one `push: <host>: ...` line at a time. A Mac builds its [box](GLOSSARY.md), the program that runs routed work there, from the commit the install recorded, so install from a clean tree first.
 
    Run `gate push` again after every reinstall on this PC: a builder that runs another build of gate refuses routed runs, which then go to the next builder or run here.

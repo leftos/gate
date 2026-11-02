@@ -322,6 +322,34 @@ fn with_no_ssh_a_routed_run_falls_back_with_reason_client() {
     assert_in_order(&log, &[no_ssh, "ran here"]);
 }
 
+/// A routing file whose `ssh` names a file that does not exist starts no client, though an ssh lies on `PATH`: the run
+/// falls back with reason `client`, saying why, and the ssh on `PATH` is never called.
+#[test]
+fn a_named_ssh_that_does_not_exist_falls_back_with_reason_client() {
+    let case = ssh_case("routing-named-ssh-missing");
+    let outside = Case::new("routing-named-ssh-missing-stand-in");
+    let steps = fake_ssh_in(&outside.folder());
+    let missing = outside.folder().join("git").join("ssh.exe");
+    let routing = json!({ "host": HOST, "repos": { repo(&case): ["*tool*"] }, "ssh": missing });
+    write_remote_json(&case, &routing.to_string());
+
+    let outcome = finish(ssh_gate(&case, &path_with(&outside.folder()), &steps));
+
+    let line = format!(
+        "gate: remote builder client could not start: cannot run ssh: remote.json's ssh {} does not exist; running here",
+        missing.display()
+    );
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(&line), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_fell_back(&case, &events(&case));
+    assert_eq!(
+        ssh_calls(&steps),
+        Vec::<String>::new(),
+        "the ssh on PATH is not called in the named one's place"
+    );
+}
+
 #[test]
 fn an_ssh_inside_the_worktree_is_refused_with_reason_client() {
     let case = ssh_case("routing-ssh-inside");

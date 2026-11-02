@@ -17,7 +17,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use gate_args::{BoxVerb, CheckRequest, CheckSeams};
-use gate_router::{Builder, Place, escaped, repo_name, work_folder_key};
+use gate_router::{Builder, Config, Place, escaped, repo_name, work_folder_key};
 use gate_state::v1;
 use gate_win32::PipedConsole;
 use gate_wire::slots::BoxSlots;
@@ -67,8 +67,8 @@ fn drained_line(drain: Drain) -> String {
 /// the exit status: 0 when nothing is missing, 1 when something is or the check could not run, 2 for a host
 /// `remote.json` does not list.
 pub(crate) fn check(request: &CheckRequest, host: &str, console: &mut Console) -> u32 {
-    let builder = match listed(host) {
-        Ok(builder) => builder,
+    let (builder, config) = match listed(host) {
+        Ok(listed) => listed,
         Err((status, line)) => {
             console.err(&line);
             return u32::from(status);
@@ -80,7 +80,7 @@ pub(crate) fn check(request: &CheckRequest, host: &str, console: &mut Console) -
         Ok(None) => return failed(console, "check: not in a git repository"),
         Err(why) => return failed(console, &format!("check: {why}")),
     };
-    let mut transport = match transport(&request.seams, host) {
+    let mut transport = match transport(&request.seams, host, &config) {
         Ok(transport) => transport,
         Err(line) => return failed(console, &line),
     };
@@ -120,9 +120,9 @@ fn failed(console: &mut Console, line: &str) -> u32 {
     u32::from(FAILED_STATUS)
 }
 
-/// The builder `remote.json` lists as `host` ([`gate_router::Config::named_builder`]). Else the status and the line: 2
-/// for a host it does not list, 1 for a routing file that is not there or cannot be used.
-fn listed(host: &str) -> Result<Builder, (u8, String)> {
+/// The builder `remote.json` lists as `host` ([`gate_router::Config::named_builder`]), and the file read. Else the
+/// status and the line: 2 for a host it does not list, 1 for a routing file that is not there or cannot be used.
+fn listed(host: &str) -> Result<(Builder, Config), (u8, String)> {
     let cannot = |why: String| (FAILED_STATUS, format!("check: {}: remote.json {why}", escaped(host)));
     let path = route::remote_json_path(std::env::var_os("LOCALAPPDATA").as_deref())
         .ok_or_else(|| cannot("cannot be found: LOCALAPPDATA is not an absolute folder".to_owned()))?;
@@ -131,31 +131,35 @@ fn listed(host: &str) -> Result<Builder, (u8, String)> {
         Ok(None) => return Err(cannot(format!("not found at {}", path.display()))),
         Err(problem) => return Err(cannot(format!("is ignored: {}", problem.reason))),
     };
-    config
+    let builder = config
         .named_builder(host)
         .map_err(|why| cannot(format!("is ignored: {why}")))?
-        .ok_or_else(|| (USAGE_STATUS, format!("gate check: {} is not a builder remote.json lists", escaped(host))))
+        .ok_or_else(|| (USAGE_STATUS, format!("gate check: {} is not a builder remote.json lists", escaped(host))))?;
+    Ok((builder, config))
 }
 
-/// The way to the builder `host`: the local transport `--test-remote-transport` names, else ssh found along the gate's
-/// own `PATH`. Else the line saying why the local transport cannot be used, or why ssh cannot be found.
+/// The way to the builder `host`: the local transport `--test-remote-transport` names, else the ssh `config` names or
+/// the one found along the gate's own `PATH`. Else the line saying why the local transport cannot be used, or why ssh
+/// cannot be found.
 #[cfg(feature = "test-seams")]
-fn transport(seams: &CheckSeams, host: &str) -> Result<Box<dyn Transport>, String> {
+fn transport(seams: &CheckSeams, host: &str, config: &Config) -> Result<Box<dyn Transport>, String> {
     match &seams.remote_transport {
         Some(named) => crate::remote::local_transport(named, seams.remote_ssh.as_deref()).map(|local| Box::new(local) as Box<dyn Transport>),
-        None => ssh(host),
+        None => ssh(host, config),
     }
 }
 
-/// The way to the builder `host`: ssh found along the gate's own `PATH`; else the line saying why it cannot be found.
+/// The way to the builder `host`: the ssh `config` names, else the one found along the gate's own `PATH`; else the
+/// line saying why it cannot be found.
 #[cfg(not(feature = "test-seams"))]
-fn transport(_seams: &CheckSeams, host: &str) -> Result<Box<dyn Transport>, String> {
-    ssh(host)
+fn transport(_seams: &CheckSeams, host: &str, config: &Config) -> Result<Box<dyn Transport>, String> {
+    ssh(host, config)
 }
 
-/// ssh found along the gate's own `PATH`; else the line of the builder `host` saying why it cannot be found.
-fn ssh(host: &str) -> Result<Box<dyn Transport>, String> {
-    Ssh::find()
+/// The ssh `config` names, else the one found along the gate's own `PATH`; else the line of the builder `host` saying
+/// why it cannot be found.
+fn ssh(host: &str, config: &Config) -> Result<Box<dyn Transport>, String> {
+    Ssh::find(config.ssh())
         .map(|ssh| Box::new(ssh) as Box<dyn Transport>)
         .map_err(|why| format!("check: {host}: {why}"))
 }
@@ -639,6 +643,7 @@ impl Answer<'_> {
             consent_problem: None,
             hooks_problem: None,
             commits_problem: None,
+            ssh_problem: None,
             desktop_session_problem: None,
             cross_build_problems: Vec::new(),
             root_problem: None,
