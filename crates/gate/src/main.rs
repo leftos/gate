@@ -52,6 +52,7 @@ mod restore;
 mod route;
 mod run;
 mod slots;
+mod stall_capture;
 mod stop_tree;
 mod stopping;
 mod tailscale;

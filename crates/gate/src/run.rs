@@ -72,6 +72,7 @@ use crate::resolve::{Environment, ResolvedRoot};
 use crate::restore::{self, NotRestoring, RestorePlan};
 use crate::route::{self, Placed};
 use crate::slots::{self, BuilderPool, ClaimOf, LendMarker, Pool, Survey, Taken, Takes, ThisGate, epoch_ms};
+use crate::stall_capture;
 use crate::stopping::failure;
 use crate::tailscale;
 use crate::wait::{self, Arrival, Host, PoolNow, UnderParent, Wait, Waited};
@@ -4550,9 +4551,10 @@ impl Run<'_> {
     /// Ends the run as the watch ended it: a command that exited has what it left in its job ended but the gates there
     /// ([`end_leftovers`]), then its verdict, so a leftover's last output is in the log the verdict scans and a failure
     /// to end one is said before the verdict line; one killed as stalled, timed out or past the backstop has its
-    /// diagnostics written to the log, its kill line and the pointer to them said, its job terminated and the verdict of
-    /// status 124; an interrupted one is given 5 s to end before its job is stopped, and has the verdict of its own
-    /// status, neither scanned for markers. A gate failure after a command's own exit ends its job, not what it left
+    /// diagnostics written to the log, its kill line said, its job terminated, a stalled one's stall capture written
+    /// beside the log and said ([`stall_capture::save`]), the pointer to the diagnostics said, and the verdict of status
+    /// 124; an interrupted one is given 5 s to end before its job is stopped, and has the verdict of its own status,
+    /// neither scanned for markers. A gate failure after a command's own exit ends its job, not what it left
     /// running outside it.
     fn after_watch(&mut self, watched: Watched, timing: Timing, started: Started<'_>, console: &mut Console) -> Ended {
         let started = Started {
@@ -4571,6 +4573,7 @@ impl Run<'_> {
                 hint,
                 processes,
                 diagnostics,
+                capture,
             } => {
                 console.note_block(&diagnostics);
                 console.err(&line);
@@ -4578,6 +4581,9 @@ impl Run<'_> {
                     console.err(hint);
                 }
                 kill(&self.ender(job, running), recorded, processes, console);
+                if let Some(capture) = capture {
+                    stall_capture::save(capture, self.log.path(), console);
+                }
                 console.err(&format!("gate: diagnostics written to {}", self.log.path().display()));
                 let exited = i64::from(STOPPED);
                 self.ended(
@@ -6175,6 +6181,7 @@ mod tests {
             hint: None,
             processes: 1,
             diagnostics: Vec::new(),
+            capture: None,
         };
 
         stop(
@@ -6200,6 +6207,7 @@ mod tests {
             hint: None,
             processes: 1,
             diagnostics: Vec::new(),
+            capture: None,
         };
 
         let after_exit = earlier(records_after(&Watched::Exited(0), Some(&recorded)));

@@ -14,6 +14,7 @@ use gate_wire::stamp::{Tag, is_process_line, unstamped};
 use regex::Regex;
 
 use crate::console::{Console, Note};
+use crate::stall_capture;
 
 /// The failure markers (kept, V2), as the PowerShell gate and design.md write them.
 const MARKERS: &str = concat!(
@@ -55,9 +56,10 @@ impl Log {
         &self.path
     }
 
-    /// Creates the log's folder and removes an earlier log, and the `.err` file beside it the PowerShell gate writes,
-    /// so a run that never starts its command leaves only its own lines. A log a running command still writes cannot
-    /// be removed.
+    /// Creates the log's folder and removes an earlier log, the `.err` file beside it the PowerShell gate writes, and
+    /// the stall capture and prek log copy beside it ([`stall_capture`]), so a run that never starts its command leaves
+    /// only its own lines and a capture file always belongs to the latest run of its log. A log a running command still
+    /// writes cannot be removed.
     ///
     /// # Errors
     ///
@@ -68,7 +70,13 @@ impl Log {
         }
         let mut err_path = OsString::from(self.path.as_os_str());
         err_path.push(".err");
-        for path in [&self.path, &PathBuf::from(err_path)] {
+        let earlier = [
+            self.path.clone(),
+            PathBuf::from(err_path),
+            stall_capture::capture_path(&self.path),
+            stall_capture::prek_copy_path(&self.path),
+        ];
+        for path in &earlier {
             match fs::remove_file(path) {
                 Err(error) if error.kind() != io::ErrorKind::NotFound => {
                     return Err(format!("cannot remove the earlier {}: {error}", path.display()));

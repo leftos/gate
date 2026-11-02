@@ -316,6 +316,133 @@ fn a_silent_idle_command_is_killed_as_stalled() {
 }
 
 #[test]
+fn a_stalled_run_leaves_a_stall_capture_naming_its_threads() {
+    let case = Case::new("a_stalled_run_leaves_a_stall_capture_naming_its_threads");
+    let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100", "--test-stall-from-output"];
+
+    let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "pid", "out", "hi", "sleep", UNTIL_KILLED]));
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    let capture_path = case.folder().join("out.log.stall.txt");
+    assert_in_order(
+        &outcome.stderr,
+        &[
+            "gate: STALLED: ",
+            &format!("gate: stall capture written to {} (", capture_path.display()),
+            "gate: diagnostics written to ",
+        ],
+    );
+    let capture = fs::read_to_string(&capture_path).expect("the stall capture was written beside the log");
+    assert!(
+        capture.starts_with("gate stall capture: "),
+        "the capture starts with its header: {capture}"
+    );
+    let pid = said_pid(&log_texts(&case.folder().join("out.log")), "pid ");
+    let named = Regex::new(&format!(r"(?mi)^process {pid} parent \d+ fake-tool\.exe$")).expect("the pattern is valid");
+    assert!(named.is_match(&capture), "the capture names the command {pid}: {capture}");
+    let waiting = Regex::new(r"(?m)^  thread \d+ state \S+ wait \S+ waited \d+ ms start \S+$").expect("the pattern is valid");
+    assert!(waiting.is_match(&capture), "the capture lists a thread with its wait: {capture}");
+}
+
+#[test]
+fn a_stalled_prek_leaves_a_copy_of_prek_s_log() {
+    let case = Case::new("a_stalled_prek_leaves_a_copy_of_prek_s_log");
+    copy_tool(&case, "prek.exe");
+    let prek = shown(&case.folder().join("prek.exe"));
+    let prek_log = case.local_app_data().join("prek").join("prek.log");
+    fs::create_dir_all(prek_log.parent().expect("the log has a folder")).expect("prek's log folder is made");
+    let text = "prek: running hooks\nprek: waiting for the hook to exit\n";
+    fs::write(&prek_log, text).expect("prek's log is written");
+    let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100", "--test-stall-from-output"];
+
+    let outcome = case.run(&run_words("out.log", &seams, &[&prek, "out", "hi", "sleep", UNTIL_KILLED]));
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    let copy = case.folder().join("out.log.stall.prek.log");
+    assert_in_order(
+        &outcome.stderr,
+        &[
+            "gate: STALLED: ",
+            &format!("gate: stall capture copied prek's log to {}", copy.display()),
+            "gate: diagnostics written to ",
+        ],
+    );
+    assert_eq!(
+        fs::read_to_string(&copy).expect("prek's log was copied beside the log"),
+        text,
+        "the copy holds prek's log"
+    );
+}
+
+#[test]
+fn a_timed_out_run_leaves_no_stall_capture() {
+    let case = Case::new("a_timed_out_run_leaves_no_stall_capture");
+    // A critical run's load-adjusted clock is wall time, so the 1 s ceiling comes before the stall window and the
+    // backstop however busy the machine is.
+    let words = [
+        "run",
+        "--slot",
+        "critical",
+        "--reason",
+        "the suite's critical run",
+        "--timeout",
+        "1",
+        "--log",
+        "out.log",
+        "--test-sample-ms",
+        "100",
+        "--",
+        FAKE_TOOL,
+        "sleep",
+        UNTIL_KILLED,
+    ];
+
+    let outcome = case.run(&words);
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: TIMED OUT after 1 s"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("stall capture"), "a ceiling kill says no capture: {outcome:?}");
+    assert!(
+        !case.folder().join("out.log.stall.txt").exists(),
+        "a ceiling kill leaves no stall capture"
+    );
+}
+
+#[test]
+fn a_run_removes_an_earlier_stall_capture_beside_its_log() {
+    let case = Case::new("a_run_removes_an_earlier_stall_capture_beside_its_log");
+    let earlier = [case.folder().join("out.log.stall.txt"), case.folder().join("out.log.stall.prek.log")];
+    for path in &earlier {
+        fs::write(path, "an earlier run's capture\n").expect("the earlier capture is written");
+    }
+
+    let outcome = case.run(&run_words("out.log", &[], &[FAKE_TOOL, "out", "hi"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    for path in &earlier {
+        assert!(!path.exists(), "{} was removed as the run began", path.display());
+    }
+}
+
+#[test]
+fn a_log_of_another_extension_keeps_its_own_stall_capture() {
+    let case = Case::new("a_log_of_another_extension_keeps_its_own_stall_capture");
+    // `out.txt`'s capture, under its own name and under the name a capture that replaced the log's extension would take,
+    // which `out.log`'s would share.
+    let others = [case.folder().join("out.txt.stall.txt"), case.folder().join("out.stall.txt")];
+    for path in &others {
+        fs::write(path, "out.txt's capture\n").expect("the other log's capture is written");
+    }
+
+    let outcome = case.run(&run_words("out.log", &[], &[FAKE_TOOL, "out", "hi"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    for path in &others {
+        assert!(path.exists(), "{} is left alone by a run logging to out.log", path.display());
+    }
+}
+
+#[test]
 fn a_stall_window_from_the_first_output_does_not_count_a_quiet_start() {
     let case = Case::new("a_stall_window_from_the_first_output_does_not_count_a_quiet_start");
     // The first sleep blocks 3 s, twice the window, without a byte of output or a tick of CPU: with the window starting

@@ -1,6 +1,6 @@
 //! The system's process list, as `NtQuerySystemInformation(SystemProcessInformation)` gives it: every process with its
-//! id, its parent's id, its image name, its creation time and its CPU times, read in one call that needs no access to
-//! any process. The offsets are x64.
+//! id, its parent's id, its image name, its creation time, its CPU times and its threads, read in one call that needs no
+//! access to any process. The offsets are x64.
 
 use std::io;
 use std::mem::offset_of;
@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows_sys::Wdk::System::SystemInformation::{NtQuerySystemInformation, SystemProcessInformation};
 use windows_sys::Win32::Foundation::{STATUS_INFO_LENGTH_MISMATCH, UNICODE_STRING};
-use windows_sys::Win32::System::WindowsProgramming::SYSTEM_PROCESS_INFORMATION;
+use windows_sys::Win32::System::WindowsProgramming::{CLIENT_ID, SYSTEM_PROCESS_INFORMATION, SYSTEM_THREAD_INFORMATION};
 
 /// What the process list is called in an error.
 pub const PROCESS_LIST: &str = "NtQuerySystemInformation(SystemProcessInformation)";
@@ -27,6 +27,17 @@ const PID_AT: usize = offset_of!(SYSTEM_PROCESS_INFORMATION, UniqueProcessId);
 const PARENT_PID_AT: usize = offset_of!(SYSTEM_PROCESS_INFORMATION, Reserved2);
 /// The bytes of an entry this reader reads: everything up to the end of the parent's id.
 const ENTRY_READ: usize = PARENT_PID_AT + size_of::<usize>();
+/// Where an entry keeps the number of its threads, and where its thread array starts: right after the entry's fixed part.
+const THREAD_COUNT_AT: usize = offset_of!(SYSTEM_PROCESS_INFORMATION, NumberOfThreads);
+const THREADS_AT: usize = size_of::<SYSTEM_PROCESS_INFORMATION>();
+/// The size of one entry of the thread array, and where it keeps each field this reader reads: the tick count at which
+/// the thread began its wait (`WaitTime`, in `Reserved2`), its start address, its id, its state and its wait reason.
+const THREAD_SIZE: usize = size_of::<SYSTEM_THREAD_INFORMATION>();
+const THREAD_WAIT_TIME_AT: usize = offset_of!(SYSTEM_THREAD_INFORMATION, Reserved2);
+const THREAD_START_AT: usize = offset_of!(SYSTEM_THREAD_INFORMATION, StartAddress);
+const THREAD_ID_AT: usize = offset_of!(SYSTEM_THREAD_INFORMATION, ClientId) + offset_of!(CLIENT_ID, UniqueThread);
+const THREAD_STATE_AT: usize = offset_of!(SYSTEM_THREAD_INFORMATION, ThreadState);
+const THREAD_WAIT_REASON_AT: usize = offset_of!(SYSTEM_THREAD_INFORMATION, WaitReason);
 /// What the buffer grows by over the size the system last asked for, as the list can grow between two calls.
 const LIST_SLACK: usize = 64 * 1024;
 /// How many times the list is asked for before a list that keeps outgrowing its buffer is an error.
@@ -51,6 +62,59 @@ pub struct Entry<'a> {
     pub kernel: i64,
     /// Its user time.
     pub user: i64,
+    /// How many threads it says it has, and the bytes from its thread array's start to the next entry, or to the
+    /// buffer's end for the last: checked only by [`Entry::threads`], so a reader that needs no threads never loses an
+    /// entry to them.
+    thread_count: usize,
+    thread_room: &'a [u8],
+}
+
+impl Entry<'_> {
+    /// The process's threads, decoded from its thread array.
+    ///
+    /// # Errors
+    ///
+    /// An error naming the process when its thread array runs past its link to the next entry or the buffer, or when
+    /// a thread entry cannot be decoded.
+    pub fn threads(&self) -> io::Result<Vec<Thread>> {
+        let array = self
+            .thread_count
+            .checked_mul(THREAD_SIZE)
+            .and_then(|size| self.thread_room.get(..size))
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "{PROCESS_LIST}: process {}'s {} threads run past its entry; the list layout is not the one expected",
+                    self.pid, self.thread_count
+                ))
+            })?;
+        array.as_chunks::<THREAD_SIZE>().0.iter().map(|thread| thread_at(thread)).collect()
+    }
+}
+
+/// One thread of a process in the list, as [`Entry::threads`] decodes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Thread {
+    /// The thread id.
+    pub tid: usize,
+    /// Its scheduling state, a `KTHREAD_STATE` value (2 is running, 5 waiting).
+    pub state: u32,
+    /// Why it waits, a `KWAIT_REASON` value; meaningful only while it waits.
+    pub wait_reason: u32,
+    /// The system's tick count, in clock ticks, at which it began its current or last wait.
+    pub wait_time: u32,
+    /// The address the kernel started it at (for a user thread, usually `RtlUserThreadStart`).
+    pub start_address: usize,
+}
+
+/// The thread of the thread entry `bytes`, one whole entry of a thread array.
+fn thread_at(bytes: &[u8]) -> io::Result<Thread> {
+    Ok(Thread {
+        tid: read_usize(bytes, THREAD_ID_AT)?,
+        state: read_u32(bytes, THREAD_STATE_AT)?,
+        wait_reason: read_u32(bytes, THREAD_WAIT_REASON_AT)?,
+        wait_time: read_u32(bytes, THREAD_WAIT_TIME_AT)?,
+        start_address: read_usize(bytes, THREAD_START_AT)?,
+    })
 }
 
 /// The system's process list, as `NtQuerySystemInformation` writes it, in a buffer aligned for its entries; the read
@@ -93,7 +157,7 @@ pub fn as_bytes(list: &[u64]) -> &[u8] {
 
 /// The entries of the process list `bytes` that `keep` keeps, walked by each entry's link to the next and checked
 /// against the buffer at every step. An entry that cannot be decoded (one of its fields, or its image name, leaves the
-/// buffer) is skipped, and the walk goes on by its link.
+/// buffer) is skipped, and the walk goes on by its link. Its threads are not checked here ([`Entry::threads`]).
 ///
 /// # Errors
 ///
@@ -107,7 +171,7 @@ pub fn walk<'a>(bytes: &'a [u8], keep: impl Fn(&Entry<'a>) -> bool) -> io::Resul
         if next != 0 && next < ENTRY_READ {
             return Err(outside(at, bytes.len()));
         }
-        if let Ok(entry) = entry_at(bytes, at)
+        if let Ok(entry) = entry_at(bytes, at, next)
             && keep(&entry)
         {
             kept.push(entry);
@@ -119,8 +183,8 @@ pub fn walk<'a>(bytes: &'a [u8], keep: impl Fn(&Entry<'a>) -> bool) -> io::Resul
     }
 }
 
-/// The entry at `at` of the process list `bytes`.
-fn entry_at(bytes: &[u8], at: usize) -> io::Result<Entry<'_>> {
+/// The entry at `at` of the process list `bytes`, whose link to the next entry is `next` (0 for the last).
+fn entry_at(bytes: &[u8], at: usize, next: usize) -> io::Result<Entry<'_>> {
     Ok(Entry {
         pid: read_usize(bytes, at + PID_AT)?,
         parent_pid: read_usize(bytes, at + PARENT_PID_AT)?,
@@ -128,7 +192,21 @@ fn entry_at(bytes: &[u8], at: usize) -> io::Result<Entry<'_>> {
         create: read_i64(bytes, at + CREATE_TIME_AT)?,
         kernel: read_i64(bytes, at + KERNEL_TIME_AT)?,
         user: read_i64(bytes, at + USER_TIME_AT)?,
+        thread_count: usize::try_from(read_u32(bytes, at + THREAD_COUNT_AT)?).map_err(io::Error::other)?,
+        thread_room: thread_room(bytes, at, next),
     })
+}
+
+/// The bytes from the thread array's start of the entry at `at` of the process list `bytes`, whose link to the next
+/// entry is `next`, to that next entry, or to the buffer's end for the last; empty when the array would start past
+/// them, which [`Entry::threads`] then refuses for any thread.
+fn thread_room(bytes: &[u8], at: usize, next: usize) -> &[u8] {
+    let limit = if next == 0 {
+        bytes.len()
+    } else {
+        at.saturating_add(next).min(bytes.len())
+    };
+    at.checked_add(THREADS_AT).and_then(|start| bytes.get(start..limit)).unwrap_or_default()
 }
 
 /// The image name of the entry at `at` of the process list `bytes`, whose characters the system wrote into the same
@@ -192,10 +270,66 @@ mod tests {
     use windows_sys::Win32::Security::Authorization::{SE_KERNEL_OBJECT, SetSecurityInfo};
     use windows_sys::Win32::Security::{ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, InitializeAcl, PROTECTED_DACL_SECURITY_INFORMATION};
     use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadId, GetProcessTimes, PROCESS_QUERY_LIMITED_INFORMATION};
 
-    use super::{as_bytes, process_list, walk};
+    use super::{PID_AT, THREAD_COUNT_AT, THREAD_ID_AT, THREAD_SIZE, THREAD_STATE_AT, THREADS_AT, Thread, as_bytes, process_list, walk};
     use crate::win32::{open_process, parent_pid_of};
+
+    /// A list of one entry, the last, for process `pid`, that says it has `count` threads and holds room for one: the
+    /// thread of id `tid` in state `state`.
+    fn one_entry_list(pid: usize, count: u32, tid: usize, state: u32) -> Vec<u8> {
+        let mut bytes = vec![0_u8; THREADS_AT + THREAD_SIZE];
+        bytes[PID_AT..PID_AT + size_of::<usize>()].copy_from_slice(&pid.to_le_bytes());
+        bytes[THREAD_COUNT_AT..THREAD_COUNT_AT + 4].copy_from_slice(&count.to_le_bytes());
+        let tid_at = THREADS_AT + THREAD_ID_AT;
+        bytes[tid_at..tid_at + size_of::<usize>()].copy_from_slice(&tid.to_le_bytes());
+        let state_at = THREADS_AT + THREAD_STATE_AT;
+        bytes[state_at..state_at + 4].copy_from_slice(&state.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn the_walk_lists_the_current_thread_of_this_process_as_running() {
+        // SAFETY: the call takes no arguments and cannot fail.
+        let tid = usize::try_from(unsafe { GetCurrentThreadId() }).expect("a thread id fits a usize");
+        let list = process_list().expect("the process list reads unelevated");
+        let pid = usize::try_from(std::process::id()).expect("a pid fits a usize");
+        let found = walk(as_bytes(&list), |entry| entry.pid == pid).expect("the list walks");
+        let me = found.first().expect("this process is listed");
+        let threads = me.threads().expect("this process's threads decode");
+        let current: Vec<&Thread> = threads.iter().filter(|thread| thread.tid == tid).collect();
+        assert_eq!(current.len(), 1, "the current thread {tid} is listed once among {threads:?}");
+        assert_eq!(
+            current.first().map(|thread| thread.state),
+            Some(2),
+            "the thread that reads the list is running as the list is taken: {current:?}"
+        );
+    }
+
+    #[test]
+    fn a_thread_count_that_overruns_the_entry_is_refused() {
+        let fits = one_entry_list(4242, 1, 77, 5);
+        let listed = walk(&fits, |_| true).expect("the list walks");
+        let threads = listed.first().expect("an entry whose one thread fits is decoded").threads();
+        assert_eq!(
+            threads
+                .expect("its thread decodes")
+                .iter()
+                .map(|thread| (thread.tid, thread.state))
+                .collect::<Vec<_>>(),
+            [(77, 5)],
+            "the one thread is the one written"
+        );
+
+        let overrun = one_entry_list(4242, 2, 77, 5);
+        let listed = walk(&overrun, |_| true).expect("the list walks");
+        let entry = listed.first().expect("an entry whose thread array overruns is still walked");
+        assert_eq!((entry.pid, entry.name), (4242, &[][..]), "its pid and name are read");
+        assert!(
+            entry.threads().is_err(),
+            "its threads, two said with room for one, are refused, never read past its end"
+        );
+    }
 
     /// A `FILETIME`'s two halves as one count of 100 ns ticks.
     fn ticks(time: FILETIME) -> u64 {

@@ -47,6 +47,7 @@ mod task;
 #[cfg(test)]
 mod test_support;
 mod thread;
+mod thread_start;
 mod times;
 mod token;
 mod traced;
@@ -76,6 +77,7 @@ pub use pipe::{ConnectWait, PipeClient, PipeOwner, PipeRead, PipeServer, PipeWri
 pub use piped::{DesktopLaunch, OutputPipes, PipedConsole, PipedFed, PipedLaunch, PipedSuspended, breakaway_refused, output_pipes};
 pub use session::{ConnectState, LockState, SessionState, active_console_session, input_desktop_name, session_state};
 pub use task::{StartedTask, TaskArgument, TaskError, TaskStart, register_task, run_task};
+pub use thread_start::{Module, process_modules, resolve_address, thread_start_address, waited_ms};
 pub use times::{ProcessTimes, SystemTimes, file_time_now, process_times, system_times, wsl_vm_cpu};
 pub use token::{Account, Grant, NetworkGroup, RestrictedToken, TokenFacts, current_account, current_user_sid, token_facts};
 pub use traced::{ProcessSpan, TracedMember, worth_naming};

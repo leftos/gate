@@ -146,10 +146,16 @@ fn the_failed_tail_holds_the_last_lines_around_a_big_block() {
         "the failed tail leaves the block out: {outcome:?}"
     );
     let still = "gate: the command was still running 5 s after its job was terminated";
-    let ending: &[&str] = if tail.len() > 3 && tail[tail.len() - 2] == still {
-        &[kill, terminated, still, &pointer]
+    // The stall capture line names its file and counts, so it is matched by its start and its own text expected.
+    let capture = tail
+        .iter()
+        .copied()
+        .find(|line| line.starts_with("gate: stall capture written to "))
+        .expect("the tail says the stall capture was written");
+    let ending: &[&str] = if tail.len() > 4 && tail[tail.len() - 3] == still {
+        &[kill, terminated, still, capture, &pointer]
     } else {
-        &[kill, terminated, &pointer]
+        &[kill, terminated, capture, &pointer]
     };
     assert!(tail.ends_with(ending), "the tail ends with {ending:?}: {outcome:?}");
     // Whenever the command got its numbered lines out before the block, the tail holds the last of them.

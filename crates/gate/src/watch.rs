@@ -27,6 +27,7 @@ use crate::nesting::Parent;
 use crate::pause::PauseReader;
 use crate::resolve::ResolvedRoot;
 use crate::slots::{Pool, Takes, ThisGate, epoch_ms};
+use crate::stall_capture::{self, Capture, STALL_CAPTURE_BUDGET_MS};
 use crate::trace;
 
 /// How long the watch waits for the command between two samples.
@@ -48,12 +49,14 @@ pub(crate) enum Watched {
     Exited(u32),
     /// The command was killed as stalled, timed out or past the backstop: the line that says so, the line said right
     /// after it on stderr and in the log but kept out of the kill's journal text (the routing hint of a stalled ssh
-    /// command), the processes its job held as the kill was found, and the diagnostics block gathered for it.
+    /// command), the processes its job held as the kill was found, the diagnostics block gathered for it, and for a
+    /// stalled kill the stall capture gathered for it, or why it could not be.
     Killed {
         line: String,
         hint: Option<&'static str>,
         processes: u32,
         diagnostics: Vec<String>,
+        capture: Option<Result<Capture, String>>,
     },
     /// The console was interrupted while the command ran.
     Interrupted,
@@ -508,7 +511,8 @@ impl<'a> Watcher<'a> {
     }
 
     /// The kill due now, as stalled, timed out or past the backstop, or `None`; a command that exited as the kill was
-    /// found keeps its own status, checked again once the diagnostics are gathered.
+    /// found keeps its own status, checked again once the diagnostics, and for a stalled kill the stall capture, are
+    /// gathered.
     fn kill(&mut self, console: &mut Console) -> io::Result<Option<Watched>> {
         let now = self.started.elapsed();
         let Some(kill) = self.watch.kill_check(now) else {
@@ -518,6 +522,10 @@ impl<'a> Watcher<'a> {
             return Ok(Some(exited));
         }
         let diagnostics = self.diagnostics();
+        let capture = match &kill {
+            Kill::Stalled { quiet, .. } => Some(stall_capture::capture(&|| self.job.process_ids(), *quiet, STALL_CAPTURE_BUDGET_MS)),
+            _ => None,
+        };
         if let Some(exited) = self.exit_if_ended(console)? {
             return Ok(Some(exited));
         }
@@ -528,6 +536,7 @@ impl<'a> Watcher<'a> {
             hint: self.stall_hint.filter(|_| stalled),
             processes,
             diagnostics,
+            capture,
         }))
     }
 
