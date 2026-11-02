@@ -1,15 +1,20 @@
 //! Ctrl+C, raised by the gate on itself through its test seams: a running command still running 5 s later has its job
-//! terminated and the gate exits as Ctrl+C does; a queued gate deletes its ticket, journals the abandon and exits so.
+//! terminated and the gate exits as Ctrl+C does; a queued gate deletes its ticket, journals the abandon and exits so;
+//! and a Ctrl+C raised on the gate's own console, which a starter that made its own process group had turned off for it,
+//! still stops the command and ends the run.
 
 use std::fs;
+use std::os::windows::process::CommandExt as _;
+use std::process::Command;
 use std::time::Duration;
 
 use gate_state::v1::ticket_path;
 use serde_json::Value;
+use windows_sys::Win32::System::Threading::{CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP};
 
 use crate::support::{
-    Case, Escapee, FAKE_TOOL, UNTIL_KILLED, assert_in_order, events, log_texts, release, run_words, said_pid, shown, wait_for_journal_line,
-    wait_until, write_counts,
+    Case, Escapee, FAKE_TOOL, UNTIL_KILLED, assert_in_order, events, finish, log_texts, process_lines, release, run_words, said_pid, shown, start,
+    wait_for_journal_line, wait_until, write_counts,
 };
 
 /// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code.
@@ -73,6 +78,37 @@ fn a_ctrl_c_ends_a_child_outside_the_job_whose_launcher_has_ended() {
     assert!(
         matches!((launcher.exited(), away.exited()), (Ok(left), Ok(ended)) if left < ended),
         "the launcher had ended before the interrupt ended the escapee {pid}: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_gate_whose_starter_turned_ctrl_c_off_still_takes_it() {
+    let case = Case::new("a_gate_whose_starter_turned_ctrl_c_off_still_takes_it");
+    let log = case.folder().join("out.log");
+    // The command ignores a Ctrl+C of its own, so only the gate's interrupt can end the run, and a starter's process
+    // group is what Windows begins by ignoring one: the console of its own is the one the case sends the Ctrl+C to.
+    let mut command = case.gate(&run_words("out.log", &[], &[FAKE_TOOL, "ignore-ctrl-c", "sleep", "60000"]));
+    command.creation_flags(CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP);
+    let running = start(command);
+    let pid = running.id();
+
+    // The log's spawn line is written as the gate starts the command, once its handler is installed: the point at which
+    // a Ctrl+C on its console has something to reach.
+    running.wait_until("the command starting", || {
+        process_lines(&log).iter().any(|line| line.starts_with("spawn pid="))
+    });
+
+    let mut sender = Command::new(FAKE_TOOL);
+    sender.args(["ctrl-c-console", &pid.to_string()]);
+    let sent = finish(sender);
+    assert_eq!(sent.code, Some(0), "the Ctrl+C is raised on the gate's console: {sent:?}");
+
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "the gate took the Ctrl+C: {outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate: interrupted; stopping the command"),
+        "the gate says it interrupted the command: {outcome:?}"
     );
 }
 

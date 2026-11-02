@@ -50,8 +50,9 @@ impl Interrupt {
     ///
     /// # Errors
     ///
-    /// The system's error when the event cannot be created or the handler cannot be installed; a later call tries again,
-    /// and no call returns an interrupt until the handler is set.
+    /// The system's error when the event cannot be created, the handler cannot be installed, or the ignore flag a
+    /// starter left set cannot be cleared; a later call tries again, and no call returns an interrupt until the handler
+    /// is set.
     pub fn install() -> io::Result<Interrupt> {
         // A panic while installing leaves nothing half done that a later call cannot redo.
         let _guard = INSTALLING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -69,6 +70,15 @@ impl Interrupt {
         }
         // SAFETY: `handler` is a `extern "system"` function that lives as long as the process.
         if unsafe { SetConsoleCtrlHandler(Some(handler), 1) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // A starter that made this process's own process group, or called `SetConsoleCtrlHandler(NULL, TRUE)`, leaves
+        // Ctrl+C ignored in this process and in every child it starts: while the flag is set, a `CTRL_C_EVENT` reaches
+        // no handler, not even the one just registered. The handler is registered first, so no Ctrl+C can reach the
+        // default handler in between; clearing the flag then lets the event reach it. A process the flag never reached
+        // is unaffected by the clear, whose failure is reported all the same, as the registration's is.
+        // SAFETY: null with 0 clears this process's ignore flag, which the call accepts.
+        if unsafe { SetConsoleCtrlHandler(None, 0) } == 0 {
             return Err(io::Error::last_os_error());
         }
         HANDLER_SET.store(true, Ordering::Release);

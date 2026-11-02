@@ -24,7 +24,12 @@
 //! `cwd` prints `cwd <its working folder>`, each on stdout; `mark <path>` adds the line `run` to the file at the path,
 //! creating it when missing, so a case can count how many times its command ran;
 //! `free-console` leaves this process's console, as a GUI program or one that detaches early does, its standard handles
-//! kept; `write <path> <text>` writes the text to the file at the path, replacing it, its folders made when missing;
+//! kept; `ctrl-c-console <pid>` leaves this process's console, joins the console the process `pid` is on, makes this
+//! process ignore a Ctrl+C, raises one on that console and leaves it again, so a case can send a Ctrl+C to a console it
+//! does not own, and a call that fails says on stderr which it was and ends the run 1; `ignore-ctrl-c` makes this
+//! process ignore a Ctrl+C and goes on to its next step, so a command is still there when the gate's own interrupt ends
+//! the run;
+//! `write <path> <text>` writes the text to the file at the path, replacing it, its folders made when missing;
 //! `rewrite <path> <text>` writes it so again and again until the process is ended, each time holding it open 20 ms
 //! without delete sharing, and never goes on to a later step;
 //! `fill <path> <bytes>` writes a file of that many `x` bytes at the path, its folders made when missing, through a
@@ -75,6 +80,11 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+use windows_sys::Win32::System::Console::{
+    AttachConsole, CTRL_C_EVENT, FreeConsole, GenerateConsoleCtrlEvent, GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE, SetConsoleCtrlHandler, SetStdHandle,
+};
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, GetPriorityClass};
 
@@ -123,21 +133,12 @@ fn run(args: &[OsString]) -> Result<i32, String> {
             "test" | "run" => {}
             "out" => writeln!(stdout, "{}", operand(&mut steps, "out")?).map_err(|error| write_failed(&error))?,
             "env" => writeln!(stdout, "{}", variable(&operand(&mut steps, "env")?)).map_err(|error| write_failed(&error))?,
-            "bytes" => stdout
-                .write_all(&decode_hex(&operand(&mut steps, "bytes")?)?)
-                .map_err(|error| write_failed(&error))?,
+            "bytes" => bytes(&operand(&mut steps, "bytes")?, &mut stdout)?,
             "err" => {
                 stdout.flush().map_err(|error| write_failed(&error))?;
                 writeln!(io::stderr().lock(), "{}", operand(&mut steps, "err")?).map_err(|error| write_failed(&error))?;
             }
-            "lines" => {
-                let text = operand(&mut steps, "lines")?;
-                let count: u32 = text.parse().map_err(|_| format!("lines takes a count, got '{text}'"))?;
-                let line = operand(&mut steps, "lines")?;
-                for number in 1..=count {
-                    writeln!(stdout, "{line}{number}").map_err(|error| write_failed(&error))?;
-                }
-            }
+            "lines" => lines(&mut steps, &mut stdout)?,
             "sleep" => {
                 let text = operand(&mut steps, "sleep")?;
                 let ms: u64 = text.parse().map_err(|_| format!("sleep takes milliseconds, got '{text}'"))?;
@@ -187,11 +188,14 @@ fn run(args: &[OsString]) -> Result<i32, String> {
             }
             "noise" => noise(&mut steps)?,
             "free-console" => free_console()?,
-            "--version" => version_beside(&mut stdout)?,
-            "pid" => {
-                writeln!(stdout, "pid {}", std::process::id()).map_err(|error| write_failed(&error))?;
-                stdout.flush().map_err(|error| write_failed(&error))?;
+            "ignore-ctrl-c" => ignore_ctrl_c()?,
+            "ctrl-c-console" => {
+                if !ctrl_c_console(&operand(&mut steps, "ctrl-c-console")?)? {
+                    return Ok(1);
+                }
             }
+            "--version" => version_beside(&mut stdout)?,
+            "pid" => pid(&mut stdout)?,
             "session" => session(&mut stdout)?,
             "priority" => priority(&mut stdout)?,
             "cwd" => cwd(&mut stdout)?,
@@ -458,6 +462,23 @@ fn token(stdout: &mut impl Write) -> Result<(), String> {
     .map_err(|error| write_failed(&error))
 }
 
+/// The `lines <n> <text>` step: prints n lines on stdout, the i-th `<text><i>` counting from 1.
+fn lines<'a>(steps: &mut impl Iterator<Item = &'a OsString>, stdout: &mut impl Write) -> Result<(), String> {
+    let text = operand(steps, "lines")?;
+    let count: u32 = text.parse().map_err(|_| format!("lines takes a count, got '{text}'"))?;
+    let line = operand(steps, "lines")?;
+    for number in 1..=count {
+        writeln!(stdout, "{line}{number}").map_err(|error| write_failed(&error))?;
+    }
+    Ok(())
+}
+
+/// The `pid` step: prints `pid <this process's pid>` on stdout, flushed.
+fn pid(stdout: &mut impl Write) -> Result<(), String> {
+    writeln!(stdout, "pid {}", std::process::id()).map_err(|error| write_failed(&error))?;
+    stdout.flush().map_err(|error| write_failed(&error))
+}
+
 /// The `session <id>` step: the id of the session this process runs in, as `ProcessIdToSessionId` gives it.
 fn session(stdout: &mut impl Write) -> Result<(), String> {
     let mut id = 0;
@@ -705,13 +726,68 @@ fn noise<'a>(steps: &mut impl Iterator<Item = &'a OsString>) -> Result<(), Strin
     file.flush().map_err(failed)
 }
 
+/// The standard handles `ctrl-c-console` puts back after it leaves the console it joined.
+const STD_HANDLES: [STD_HANDLE; 3] = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE];
+
+/// The `ignore-ctrl-c` step: makes this process ignore a Ctrl+C and goes on to its next step, so a command it runs is
+/// still there when the gate stops watching it.
+fn ignore_ctrl_c() -> Result<(), String> {
+    // SAFETY: null with 1 sets this process's ignore flag, which the call accepts.
+    if unsafe { SetConsoleCtrlHandler(None, 1) } == 0 {
+        return Err(format!("cannot make this process ignore a Ctrl+C: {}", io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
 /// Leaves this process's console; its standard handles, the pipes it was given, stay as they are.
 fn free_console() -> Result<(), String> {
     // SAFETY: the call takes no pointers.
-    if unsafe { windows_sys::Win32::System::Console::FreeConsole() } == 0 {
+    if unsafe { FreeConsole() } == 0 {
         return Err(format!("cannot leave the console: {}", io::Error::last_os_error()));
     }
     Ok(())
+}
+
+/// The `ctrl-c-console <pid>` step: leaves this process's console, joins the console the process `pid` is on, makes this
+/// process ignore a Ctrl+C, raises one on that console and leaves it again, so a case can send a Ctrl+C to a console it
+/// does not own. Whether every call worked; the first that did not says on stderr which one it was, and the run ends 1.
+fn ctrl_c_console(pid: &str) -> Result<bool, String> {
+    let pid: u32 = pid.parse().map_err(|_| format!("ctrl-c-console takes a pid, got '{pid}'"))?;
+    // The standard handles are put back once this process has left every console, so a failure line reaches the pipe
+    // the case gave it.
+    // SAFETY: the calls take no pointer of this process's.
+    let saved = STD_HANDLES.map(|id| unsafe { GetStdHandle(id) });
+    // SAFETY: the console calls take no pointers, and the console the process `pid` is on stays up while this process
+    // is attached to it. A first `FreeConsole` that fails because there is no console to leave counts as worked, which
+    // is what it was for.
+    let mut failure = unsafe {
+        let left = FreeConsole();
+        let left_error = io::Error::last_os_error();
+        if left == 0 && left_error.raw_os_error() != Some(ERROR_INVALID_PARAMETER.cast_signed()) {
+            Some(("FreeConsole", left_error))
+        } else if AttachConsole(pid) == 0 {
+            Some(("AttachConsole", io::Error::last_os_error()))
+        } else if SetConsoleCtrlHandler(None, 1) == 0 {
+            Some(("SetConsoleCtrlHandler", io::Error::last_os_error()))
+        } else if GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) == 0 {
+            Some(("GenerateConsoleCtrlEvent", io::Error::last_os_error()))
+        } else if FreeConsole() == 0 {
+            Some(("FreeConsole", io::Error::last_os_error()))
+        } else {
+            None
+        }
+    };
+    for (id, handle) in STD_HANDLES.iter().zip(saved) {
+        // SAFETY: `handle` was this process's standard handle, which leaving and joining a console do not close.
+        if unsafe { SetStdHandle(*id, handle) } == 0 && failure.is_none() {
+            failure = Some(("SetStdHandle", io::Error::last_os_error()));
+        }
+    }
+    let Some((call, error)) = failure else {
+        return Ok(true);
+    };
+    writeln!(io::stderr().lock(), "fake-tool: ctrl-c-console: {call} failed: {error}").map_err(|error| write_failed(&error))?;
+    Ok(false)
 }
 
 /// The `--version` step: adds the line `run` to the file `ran` beside this program's own file, then prints the first
@@ -763,6 +839,11 @@ fn own_folder() -> Result<PathBuf, String> {
 /// The value of the variable `name`, or the line saying it is not set.
 fn variable(name: &str) -> String {
     std::env::var_os(name).map_or_else(|| format!("fake-tool: {name} is not set"), |value| value.to_string_lossy().into_owned())
+}
+
+/// The `bytes <hex>` step: writes the bytes the hex digits spell to stdout as they are, with no line feed added.
+fn bytes(text: &str, stdout: &mut impl Write) -> Result<(), String> {
+    stdout.write_all(&decode_hex(text)?).map_err(|error| write_failed(&error))
 }
 
 /// The bytes two hex digits each spell.
