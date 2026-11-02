@@ -91,6 +91,7 @@ fn spawn() -> Spawn {
         environment: wide("A=1\0B=2\0\0"),
         stdout: 0x1F4,
         stderr: 0x7FFF_FFFC,
+        hidden: false,
     }
 }
 
@@ -109,6 +110,7 @@ fn spawn_json_with(field: &str, value: Option<&str>) -> String {
         ("environment", format!("\"{}\"", b64(&good.environment))),
         ("stdout", "4".to_owned()),
         ("stderr", "8".to_owned()),
+        ("hidden", "false".to_owned()),
     ];
     let mut parts = vec!["\"type\":\"spawn\"".to_owned()];
     for (name, json) in fields {
@@ -196,6 +198,37 @@ fn a_missing_field_is_refused_by_name() {
     for field in ["application", "command_line", "directory", "environment", "stdout", "stderr"] {
         assert_eq!(decoded(&spawn_json_with(field, None)), Err(DecodeError::Missing(field)), "{field}");
     }
+}
+
+#[test]
+fn a_spawn_round_trips_hidden_true_and_false() {
+    for hidden in [true, false] {
+        let sent = Spawn { hidden, ..spawn() };
+        let body = encode(&Message::Spawn(sent.clone()));
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("the body is JSON");
+
+        assert_eq!(json["hidden"], hidden, "the wire carries hidden as a JSON boolean");
+        assert_eq!(decode(&body), Ok(Message::Spawn(sent)), "hidden {hidden} reads back");
+    }
+}
+
+#[test]
+fn a_spawn_without_hidden_or_with_a_hidden_that_is_not_a_boolean_is_refused() {
+    assert_eq!(decoded(&spawn_json_with("hidden", None)), Err(DecodeError::Missing("hidden")));
+    for bad in ["\"true\"", "1", "null"] {
+        assert_eq!(
+            decoded(&spawn_json_with("hidden", Some(bad))),
+            Err(DecodeError::WrongType("hidden")),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn a_spawn_s_debug_names_hidden() {
+    let shown = format!("{:?}", Spawn { hidden: true, ..spawn() });
+
+    assert!(shown.contains("hidden: true"), "{shown}");
 }
 
 #[test]

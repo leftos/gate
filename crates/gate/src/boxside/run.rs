@@ -223,9 +223,15 @@ impl Request<'_> {
         let asked = payload.desktop()?;
         // A session run says its wait too, which it never spends: it takes no lock.
         let session = payload.desktop_session()?;
+        // A hidden run is a session run whose command gets a desktop of its own.
+        let hidden = payload.desktop_hidden()?;
         let desktop = if asked {
             let wait = payload.desktop_wait()?.ok_or_else(|| "gate: box payload lacks DesktopWait".to_owned())?;
-            Some(if session { DesktopTake::Session } else { DesktopTake::Locked { wait } })
+            Some(if session {
+                DesktopTake::Session { hidden }
+            } else {
+                DesktopTake::Locked { wait }
+            })
         } else {
             None
         };
@@ -4323,13 +4329,40 @@ mod tests {
 
         let session = run_payload(&json!({ "Desktop": true, "DesktopWait": 30, "DesktopSession": true }));
         let request = Request::read(&session).expect("a session run of the builder's desktop is read");
-        assert_eq!(request.desktop, Some(DesktopTake::Session), "a session run takes no lock");
+        assert_eq!(
+            request.desktop,
+            Some(DesktopTake::Session { hidden: false }),
+            "a session run takes no lock"
+        );
 
         let ignored = run_payload(&json!({ "DesktopWait": "30" }));
         let request = Request::read(&ignored).expect("a run that asks for no desktop is read");
         assert_eq!(
             request.desktop, None,
             "the payload asks for no desktop, and a wait no run asks for is ignored"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a payload the box cannot read must fail the case loudly")]
+    fn a_hidden_session_run_is_read_as_a_hidden_session() {
+        let hidden = run_payload(&json!({ "Desktop": true, "DesktopWait": 30, "DesktopSession": true, "DesktopHidden": true }));
+        let request = Request::read(&hidden).expect("a hidden run of the builder's desktop is read");
+        assert_eq!(
+            request.desktop,
+            Some(DesktopTake::Session { hidden: true }),
+            "a hidden run is a session run on a desktop of its own"
+        );
+
+        let shown = run_payload(&json!({ "Desktop": true, "DesktopWait": 30, "DesktopSession": true, "DesktopHidden": false }));
+        let request = Request::read(&shown).expect("a session run that is not hidden is read");
+        assert_eq!(request.desktop, Some(DesktopTake::Session { hidden: false }));
+
+        let locked = run_payload(&json!({ "Desktop": true, "DesktopWait": 30, "DesktopHidden": true }));
+        assert_eq!(
+            Request::read(&locked).err(),
+            Some("gate: box payload DesktopHidden needs DesktopSession".to_owned()),
+            "a locked run is never hidden"
         );
     }
 

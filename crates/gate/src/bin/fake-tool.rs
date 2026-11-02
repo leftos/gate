@@ -49,7 +49,8 @@
 //! and writes nothing; `pid-to <path>` writes this process's pid to the file at the path, its folders made when
 //! missing; `alive <path>` reads a pid from the file at the path and prints `alive <pid>` when that process runs, else
 //! fails with `fake-tool: process <pid> is not running`; `run-each <n>` runs this program with no steps n times, one
-//! after another, each waited for;
+//! after another, each waited for; `desktop-name-to <path>` writes the name of the desktop its thread is on to the file
+//! at the path, whole, loading user32 only then, so no other step needs a desktop it can connect to;
 //! `argv` prints every word after it, each on its own line, and ends, so it is always the last step;
 //! `--version` adds the line `run` to the file `ran` beside this program's own file, then prints the first line of the
 //! file `version.txt` beside it, and nothing when there is no such file, so a copy named `Godot_console.exe` stands in
@@ -230,8 +231,17 @@ fn keeper_step<'a>(step: &str, steps: &mut impl Iterator<Item = &'a OsString>, s
         "pid-to" => pid_to(&operand(steps, "pid-to")?),
         "alive" => alive(&operand(steps, "alive")?, stdout),
         "run-each" => run_each(&operand(steps, "run-each")?),
+        "desktop-name-to" => desktop_name_to(&operand(steps, "desktop-name-to")?),
         other => Err(format!("unknown step '{other}'")),
     }
+}
+
+/// The `desktop-name-to` step: writes the name of the desktop this thread is on to the file at `path`, whole, through a
+/// file beside it moved over it. user32 is loaded only by this step ([`gate_win32::thread_desktop_name`]), so every
+/// other step still runs on a desktop this process cannot connect to.
+fn desktop_name_to(path: &str) -> Result<(), String> {
+    let name = gate_win32::thread_desktop_name().map_err(|error| format!("cannot read this thread's desktop: {error}"))?;
+    write_whole(path, &name)
 }
 
 /// The `pid-to` step: writes this process's pid to the file at `path`, through a file beside it moved over it, so a

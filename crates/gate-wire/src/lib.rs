@@ -536,6 +536,22 @@ impl Payload {
         Ok(session)
     }
 
+    /// Whether the session run takes a desktop of its own that no one sees, `DesktopHidden`: true or false, false when
+    /// the key is absent or null; else the usage line saying it is not true or false. A true one without
+    /// `DesktopSession: true` is the usage line saying it needs `DesktopSession`, and a `DesktopSession` the box refuses
+    /// ([`Payload::desktop_session`]) is refused as that says.
+    pub fn desktop_hidden(&self) -> Result<bool, String> {
+        let hidden = match self.object.get("DesktopHidden") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(hidden)) => *hidden,
+            Some(_) => return Err("gate: box payload DesktopHidden is not true or false".to_owned()),
+        };
+        if hidden && !self.desktop_session()? {
+            return Err("gate: box payload DesktopHidden needs DesktopSession".to_owned());
+        }
+        Ok(hidden)
+    }
+
     /// The run's drain session id, `Session`: 1 to [`MOST_SESSION_CHARS`] ASCII letters, digits, `_` and `-`; `None`
     /// when the key is absent or null, as a PC older than the drain sends it. Else the usage line, the value shown with
     /// its control characters escaped.
@@ -3351,6 +3367,47 @@ mod tests {
         assert_eq!(
             head(json!({ "CommitStage": "yes", "Head": sha })),
             Err("gate: box payload CommitStage is not true or false".to_owned())
+        );
+    }
+
+    #[test]
+    fn desktop_hidden_is_true_or_false_false_when_absent_and_needs_desktop_session() {
+        let hidden = |json: serde_json::Value| decoded(&json.to_string()).and_then(|payload| payload.desktop_hidden());
+        let session = || json!({ "Desktop": true, "DesktopSession": true });
+        let with = |value: serde_json::Value| {
+            let mut json = session();
+            json["DesktopHidden"] = value;
+            json
+        };
+        assert_eq!(hidden(json!({})), Ok(false), "absent");
+        assert_eq!(hidden(session()), Ok(false), "absent on a session run");
+        assert_eq!(hidden(with(json!(null))), Ok(false), "null");
+        assert_eq!(hidden(with(json!(true))), Ok(true));
+        assert_eq!(hidden(with(json!(false))), Ok(false));
+        assert_eq!(hidden(json!({ "DesktopHidden": false })), Ok(false), "false needs no DesktopSession");
+        for bad in [json!("true"), json!(1), json!([true])] {
+            assert_eq!(
+                hidden(with(bad.clone())),
+                Err("gate: box payload DesktopHidden is not true or false".to_owned()),
+                "{bad}"
+            );
+        }
+        for not_session in [
+            json!({ "Desktop": true, "DesktopHidden": true }),
+            json!({ "Desktop": true, "DesktopSession": false, "DesktopHidden": true }),
+            json!({ "Desktop": true, "DesktopSession": null, "DesktopHidden": true }),
+            json!({ "DesktopHidden": true }),
+        ] {
+            assert_eq!(
+                hidden(not_session.clone()),
+                Err("gate: box payload DesktopHidden needs DesktopSession".to_owned()),
+                "{not_session}"
+            );
+        }
+        assert_eq!(
+            hidden(json!({ "DesktopSession": true, "DesktopHidden": true })),
+            Err("gate: box payload DesktopSession needs Desktop".to_owned()),
+            "a session without Desktop is refused as it is today"
         );
     }
 

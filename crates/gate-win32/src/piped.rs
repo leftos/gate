@@ -16,6 +16,7 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectExtendedLimitInformation, OpenJobObjectW, QueryInformationJobObject,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::StationsAndDesktops::DESKTOP_READOBJECTS;
 use windows_sys::Win32::System::SystemServices::JOB_OBJECT_QUERY;
 use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, GetCurrentProcess, NORMAL_PRIORITY_CLASS, PROCESS_CREATION_FLAGS,
@@ -24,7 +25,7 @@ use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_DESKTOP_APP
 
 use crate::create::{Creation, DesktopPolicy, Inherited, check_launch, create_inheriting_on};
 use crate::launch::{nul, setup, struct_size};
-use crate::{EnvironmentBlock, Job, LaunchError, RestrictedToken, Suspended, own_handle, wide};
+use crate::{EnvironmentBlock, HiddenDesktop, Job, LaunchError, RestrictedToken, Suspended, own_handle, wide};
 
 /// How to start a command whose output the caller reads: the caller decides every part of it.
 pub struct PipedLaunch {
@@ -154,12 +155,13 @@ impl PipedLaunch {
     }
 }
 
-/// The window station and desktop a [`DesktopLaunch`] creates its command on: the interactive one.
+/// The window station and desktop a [`DesktopLaunch`] creates its command on when it names no hidden one: the
+/// interactive one.
 const INTERACTIVE_DESKTOP: &str = r"WinSta0\Default";
 
-/// How the desktop helper starts a command on the interactive desktop of its session, its output going to two pipe
-/// write ends it was handed: the caller decides every part of it.
-pub struct DesktopLaunch {
+/// How the desktop helper starts a command on the interactive desktop of its session, or on a hidden desktop it
+/// created, its output going to two pipe write ends it was handed: the caller decides every part of it.
+pub struct DesktopLaunch<'d> {
     /// The program file, as an absolute path: `CreateProcessW` runs it as named and searches no folder for it. A
     /// `.cmd` or `.bat` file is refused; the caller runs one through cmd.exe itself.
     pub application: PathBuf,
@@ -169,15 +171,21 @@ pub struct DesktopLaunch {
     pub directory: PathBuf,
     /// The command's whole environment.
     pub environment: EnvironmentBlock,
+    /// The hidden desktop the command is created on, or `None` for the interactive one.
+    pub desktop: Option<&'d HiddenDesktop>,
 }
 
-impl DesktopLaunch {
+impl DesktopLaunch<'_> {
     /// Creates the command suspended, with this process's token, in its working folder with its environment, on the
-    /// interactive desktop (`lpDesktop` `WinSta0\Default`) and a hidden console of its own (`CREATE_NO_WINDOW`), in the
-    /// normal priority class (`NORMAL_PRIORITY_CLASS`) whatever this process's class is, and inside this process's job:
-    /// no breakaway is asked for. Its stdin is `NUL`, and its stdout and stderr `stdout` and `stderr`, which stay open
-    /// and this process's; it inherits exactly those three handles, through copies open only while the spawn lock is
-    /// held, as [`PipedLaunch::start_suspended`]'s command does. It is created with the desktop-app policy
+    /// interactive desktop (`lpDesktop` `WinSta0\Default`) or, when [`DesktopLaunch::desktop`] names one, on that hidden
+    /// desktop (`lpDesktop` its [`HiddenDesktop::full_name`]), and a hidden console of its own (`CREATE_NO_WINDOW`), in
+    /// the normal priority class (`NORMAL_PRIORITY_CLASS`) whatever this process's class is, and inside this process's
+    /// job: no breakaway is asked for. Its stdin is `NUL`, and its stdout and stderr `stdout` and `stderr`, which stay
+    /// open and this process's; it inherits exactly those three handles, and the hidden desktop's when it has one, with
+    /// `DESKTOP_READOBJECTS` access alone, so it holds that desktop open from its creation on through a handle that holds
+    /// no right to switch to it (the command, as this process's user under the desktop's default DACL, can still open
+    /// the desktop by name with more rights), through copies open only while the spawn lock is held, as
+    /// [`PipedLaunch::start_suspended`]'s command does. It is created with the desktop-app policy
     /// `PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE` where the system can set it, and without it,
     /// [`Suspended::note`] saying so, before Windows 10 1703.
     ///
@@ -198,13 +206,15 @@ impl DesktopLaunch {
             environment: &self.environment,
             token: None,
         };
+        let others: Vec<(&OwnedHandle, Option<u32>)> = self.desktop.iter().map(|desktop| (desktop.owned(), Some(DESKTOP_READOBJECTS))).collect();
         let inherited = Inherited {
             stdio: [&input, &output, &errors],
-            others: &[],
+            others: &others,
         };
         let policy = DesktopPolicy::Wanted(PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE);
         let flags = CREATE_NO_WINDOW | NORMAL_PRIORITY_CLASS;
-        let suspended = create_inheriting_on(&creation, flags, &inherited, policy, Some(INTERACTIVE_DESKTOP))?;
+        let on = self.desktop.map_or(INTERACTIVE_DESKTOP, HiddenDesktop::full_name);
+        let suspended = create_inheriting_on(&creation, flags, &inherited, policy, Some(on))?;
         // The command holds its own copies now; the caller's handles stay open.
         drop((input, output, errors));
         Ok(suspended)

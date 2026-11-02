@@ -236,6 +236,7 @@ fn cmd_spawn(command: &str, probe: &str, stdout: u64, stderr: u64) -> Spawn {
         environment,
         stdout,
         stderr,
+        hidden: false,
     }
 }
 
@@ -469,6 +470,71 @@ fn a_spawn_with_a_bad_field_is_refused() {
         assert_eq!(exit_of(&mut session.helper), code(HelperExit::BadSpawn), "{case}");
         assert_eq!(session.children(), Vec::<u32>::new(), "{case}: the helper started nothing");
     }
+}
+
+#[test]
+fn a_hidden_spawn_s_command_holds_the_desktop_named_for_the_pipe() {
+    let mut session = Session::start(Some(ROOMY_LIMIT_MS));
+    let arg = arg0(std::process::id(), session.server.name()).expect("the pipe's name makes an Arg0");
+    let (_, random) = arg.split_once(':').expect("an Arg0 is <pid>:<random part>");
+    let desktop = format!("gate-{random}");
+    let exists = |name: &str| gate_win32::desktop_exists(name).expect("the desktop is looked for");
+    let (_out_read, out_write) = std::io::pipe().expect("the stdout pipe is made");
+    let (_err_read, err_write) = std::io::pipe().expect("the stderr pipe is made");
+    let (stdout, stderr) = (session.push(&out_write), session.push(&err_write));
+    let spawn = Spawn {
+        hidden: true,
+        ..cmd_spawn("exit 0", "x", stdout, stderr)
+    };
+
+    session.send(&Message::Spawn(spawn));
+    let (pid, process, thread) = child_of(&session.receive());
+
+    assert!(exists(&desktop), "the helper made the desktop {desktop}, named for its pipe");
+    let watch = LeftChild::open(pid);
+    let process: OwnedHandle = session.remote.pull(process).expect("the process is taken");
+    let thread: OwnedHandle = session.remote.pull(thread).expect("the thread is taken");
+    let suspended = Suspended::adopt(process, thread, pid, unended()).expect("the child is adopted");
+    session.send(&Message::Done);
+    assert_eq!(exit_of(&mut session.helper), code(HelperExit::Done));
+    assert!(exists(&desktop), "the suspended command still holds the desktop once the helper is gone");
+    drop(suspended);
+    assert!(watch.wait(HANG_GUARD).expect("the child is waited on"), "the test ended the child");
+    assert!(!exists(&desktop), "the desktop is gone with its last holder");
+}
+
+#[test]
+fn a_bad_hidden_spawn_is_refused_before_its_desktop_is_made() {
+    // The desktop cannot be made under the fault, so only a spawn refused before the desktop exits `BadSpawn`.
+    let mut session = Session::start_with_fault(Some(ROOMY_LIMIT_MS), Some("no-desktop"));
+    let (_out_read, out_write) = std::io::pipe().expect("the stdout pipe is made");
+    let stdout = session.push(&out_write);
+    let spawn = Spawn {
+        hidden: true,
+        ..cmd_spawn("exit 0", "x", stdout, stdout)
+    };
+
+    session.send(&Message::Spawn(spawn));
+
+    assert_eq!(exit_of(&mut session.helper), code(HelperExit::BadSpawn));
+    assert_eq!(session.children(), Vec::<u32>::new(), "the helper started nothing");
+}
+
+#[test]
+fn a_hidden_spawn_whose_desktop_cannot_be_made_is_a_setup_failure() {
+    let mut session = Session::start_with_fault(Some(ROOMY_LIMIT_MS), Some("no-desktop"));
+    let (_out_read, out_write) = std::io::pipe().expect("the stdout pipe is made");
+    let (_err_read, err_write) = std::io::pipe().expect("the stderr pipe is made");
+    let (stdout, stderr) = (session.push(&out_write), session.push(&err_write));
+    let spawn = Spawn {
+        hidden: true,
+        ..cmd_spawn("exit 0", "x", stdout, stderr)
+    };
+
+    session.send(&Message::Spawn(spawn));
+
+    assert_eq!(exit_of(&mut session.helper), code(HelperExit::SetupFailed));
+    assert_eq!(session.children(), Vec::<u32>::new(), "the helper started nothing");
 }
 
 #[test]

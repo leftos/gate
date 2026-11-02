@@ -84,6 +84,9 @@ pub struct Spawn {
     pub stdout: u64,
     /// The value of the stderr pipe's write end in the helper's table.
     pub stderr: u64,
+    /// Whether the command runs on a desktop of its own the helper creates, which no one sees, in place of the
+    /// interactive one.
+    pub hidden: bool,
 }
 
 impl fmt::Debug for Spawn {
@@ -97,6 +100,7 @@ impl fmt::Debug for Spawn {
             .field("environment_units", &self.environment.len())
             .field("stdout", &self.stdout)
             .field("stderr", &self.stderr)
+            .field("hidden", &self.hidden)
             .finish()
     }
 }
@@ -181,6 +185,7 @@ pub fn encode(message: &Message) -> Vec<u8> {
             fields.insert("environment".to_owned(), wide_field(&spawn.environment));
             fields.insert("stdout".to_owned(), Value::from(spawn.stdout));
             fields.insert("stderr".to_owned(), Value::from(spawn.stderr));
+            fields.insert("hidden".to_owned(), Value::from(spawn.hidden));
         }
         Message::Child { pid, process, thread } => {
             fields.insert("pid".to_owned(), Value::from(*pid));
@@ -293,6 +298,7 @@ fn take_spawn(fields: &mut Map<String, Value>) -> Result<Spawn, DecodeError> {
         environment: take_wide(fields, "environment")?,
         stdout: take_u64(fields, "stdout")?,
         stderr: take_u64(fields, "stderr")?,
+        hidden: take_bool(fields, "hidden")?,
     };
     for (field, units) in [
         ("application", &spawn.application),

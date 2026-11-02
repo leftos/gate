@@ -10,12 +10,14 @@
 //! process's parent as the MSYS runtime records it ([`msys_parent`]), and the Windows message of an error code. And
 //! what a run on the interactive desktop needs: a named pipe for one
 //! user's local client, handles copied into and out of another process and the checks on a process taken that way, a
-//! command created on the interactive desktop, the console session's state, and a registered scheduled task started in
+//! command created on the interactive desktop or on a hidden desktop this process creates ([`HiddenDesktop`]), the
+//! name of the desktop a thread is on ([`thread_desktop_name`]), the console session's state, and a registered scheduled task started in
 //! a given session once its definition is checked ([`run_task`]), and whether an installed file only SYSTEM,
 //! Administrators and `TrustedInstaller` can change ([`check_installed_file`]). It holds no policy but three:
 //! [`run_task`] starts only a task defined as the desktop helper's must be, [`check_installed_file`] trusts only the
 //! owners [`TRUSTED_OWNERS`] names, and a
-//! [`DesktopLaunch`] always creates its command in the normal priority class on `WinSta0\Default`. The names, the
+//! [`DesktopLaunch`] always creates its command in the normal priority class, on `WinSta0\Default` unless it is given a
+//! hidden desktop. The names, the
 //! waits, the environment and priority of any other command, and what an abandoned mutex means to the gate are the
 //! caller's. Windows only; elsewhere the crate is empty.
 
@@ -24,6 +26,7 @@
 mod adopt;
 mod console;
 mod create;
+mod desktop;
 mod detached;
 mod device;
 mod event;
@@ -60,6 +63,9 @@ pub use adopt::{
 };
 pub use console::{Donor, Utf8Console};
 pub use create::spawn;
+pub use desktop::HiddenDesktop;
+#[cfg(any(test, feature = "test-seams"))]
+pub use desktop::desktop_exists;
 pub use detached::start_detached;
 pub use device::device_target;
 pub use event::{EventWait, NamedEvent};
@@ -75,7 +81,7 @@ pub use msys::{MsysParent, msys_parent};
 pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, PrivateMutex, PrivateName, mutex_exists};
 pub use pipe::{ConnectWait, PipeClient, PipeOwner, PipeRead, PipeServer, PipeWrite};
 pub use piped::{DesktopLaunch, OutputPipes, PipedConsole, PipedFed, PipedLaunch, PipedSuspended, breakaway_refused, output_pipes};
-pub use session::{ConnectState, LockState, SessionState, active_console_session, input_desktop_name, session_state};
+pub use session::{ConnectState, LockState, SessionState, active_console_session, input_desktop_name, session_state, thread_desktop_name};
 pub use task::{StartedTask, TaskArgument, TaskError, TaskStart, register_task, run_task};
 pub use thread_start::{Module, process_modules, resolve_address, thread_start_address, waited_ms};
 pub use times::{ProcessTimes, SystemTimes, file_time_now, process_times, system_times, wsl_vm_cpu};

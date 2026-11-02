@@ -384,11 +384,12 @@ pub(crate) mod tests {
     use std::path::PathBuf;
     use std::sync::{Mutex, PoisonError, TryLockError};
 
-    use std::os::windows::io::{AsRawHandle, BorrowedHandle};
+    use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle};
 
     use proc_table::win32::OwnedHandle;
     use windows_sys::Win32::Foundation::{CompareObjectHandles, GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::System::StationsAndDesktops::DESKTOP_READOBJECTS;
     use windows_sys::Win32::System::Threading::{
         BELOW_NORMAL_PRIORITY_CLASS, CreateEventW, GetCurrentProcess, GetPriorityClass, NORMAL_PRIORITY_CLASS, SetPriorityClass,
     };
@@ -496,13 +497,14 @@ pub(crate) mod tests {
     }
 
     /// A desktop launch of cmd that would exit at once, were it ever resumed.
-    fn desktop_launch() -> DesktopLaunch {
+    fn desktop_launch() -> DesktopLaunch<'static> {
         let system = system_folder();
         DesktopLaunch {
             application: system.join("cmd.exe"),
             command_line: "cmd /d /c exit 0".encode_utf16().collect(),
             directory: system,
             environment: environment(),
+            desktop: None,
         }
     }
 
@@ -580,6 +582,37 @@ pub(crate) mod tests {
         let process = suspended.process.as_ref().expect("the process is held");
         assert_eq!(class_of(process.raw()), NORMAL_PRIORITY_CLASS);
         assert!(thread_is_suspended(borrow(&suspended.thread)).expect("the thread is read"));
+    }
+
+    #[test]
+    fn a_launch_on_a_hidden_desktop_hands_over_a_copy_of_its_handle_alone() {
+        let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+        let (_stdout, output) = pipe_from_child("stdout").expect("the stdout pipe is made");
+        let (_stderr, errors) = pipe_from_child("stderr").expect("the stderr pipe is made");
+        let desktop = crate::HiddenDesktop::create(&format!("gate-test-{}-launch", std::process::id())).expect("the desktop is created");
+        let launch = DesktopLaunch {
+            desktop: Some(&desktop),
+            ..desktop_launch()
+        };
+
+        let suspended = launch.start_suspended(borrow(&output), borrow(&errors)).expect("the command is created");
+
+        let copies = COPIES.take();
+        assert_eq!(
+            CHECKED.take(),
+            Some(4),
+            "the window checked NUL, the two write ends and the desktop, none of them inheritable"
+        );
+        let child = RemoteProcess::open(suspended.pid()).expect("the child opens");
+        let pulled = child.pull(copies[3]).expect("the child holds the desktop's copy");
+        // SAFETY: both handles are open for the whole call.
+        let same = unsafe { CompareObjectHandles(pulled.as_raw_handle(), desktop.owned().raw()) } != 0;
+        assert!(same, "the child's fourth handle is the hidden desktop");
+        let access = crate::adopt::granted_access(pulled.as_handle()).expect("the copy's access is read");
+        assert_eq!(
+            access, DESKTOP_READOBJECTS,
+            "the child's copy holds the desktop with read access alone, no switch right"
+        );
     }
 
     #[test]

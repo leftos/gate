@@ -1015,6 +1015,94 @@ fn two_session_runs_run_beside_a_held_desktop_lock() {
     assert!(!holder_record(&first).exists(), "no holder record is left: {outcome:?}");
 }
 
+/// The payload of a hidden run of `case`'s work folder `key` running `command`: a session run with `DesktopHidden`.
+fn hidden_payload(case: &Case, key: &str, command: &[&str]) -> Value {
+    let mut payload = session_payload(case, key, command);
+    payload["DesktopHidden"] = json!(true);
+    payload
+}
+
+/// The desktop name `fake-tool desktop-name-to` wrote at `path`.
+fn desktop_named(path: &Path) -> String {
+    fs::read_to_string(path).expect("the command wrote its desktop's name")
+}
+
+/// Asserts `name` is a hidden desktop's, as the helper names one: `gate-` and the run's random part, never `Default`.
+fn is_hidden_desktop(name: &str, outcome: &Outcome) {
+    let random = name.strip_prefix("gate-").unwrap_or_default();
+    assert!(
+        random.len() == 32 && random.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+        "the command ran on a desktop of its own, gate- and the run's 32-hex random part, not {name:?}: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_hidden_desktop_run_runs_its_command_on_a_desktop_of_its_own() {
+    let case = Case::new("desktop_hidden_own");
+    let named = case.folder().join("desktop-name");
+    let payload = hidden_payload(&case, "k", &[FAKE_TOOL, "desktop-name-to", &shown(&named), "out", "ran"]);
+
+    let outcome = handed_off(&case, &payload, "ok");
+
+    assert_eq!(
+        outcome.code,
+        Some(0),
+        "the hidden run passed, its command alive after the helper left: {outcome:?}"
+    );
+    ran_its_command(&outcome, &payload);
+    assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
+    let name = desktop_named(&named);
+    is_hidden_desktop(&name, &outcome);
+    // The stand-in helper made it in the suite's own window station, where the case can look for it.
+    let left = gate_win32::desktop_exists(&name).expect("the desktop is looked for");
+    assert!(!left, "the hidden desktop is gone once the run has ended: {outcome:?}");
+}
+
+#[test]
+fn a_hidden_desktop_run_takes_no_desktop_lock() {
+    let case = Case::new("desktop_hidden_no_lock");
+    let named = case.folder().join("desktop-name");
+    let payload = hidden_payload(&case, "k", &[FAKE_TOOL, "desktop-name-to", &shown(&named), "out", "ran"]);
+    let held = HeldDesktop::hold(&case);
+
+    let outcome = handed_off(&case, &payload, "ok");
+    drop(held);
+
+    assert_eq!(outcome.code, Some(0), "the hidden run ran beside the held lock: {outcome:?}");
+    ran_its_command(&outcome, &payload);
+    assert!(lines_starting(&outcome, BUSY_WAIT_PREFIX).is_empty(), "it never waited: {outcome:?}");
+    assert!(!holder_record(&payload).exists(), "no hidden run writes a holder record: {outcome:?}");
+    is_hidden_desktop(&desktop_named(&named), &outcome);
+}
+
+#[test]
+fn two_hidden_desktop_runs_get_different_desktops() {
+    let case = Case::new("desktop_hidden_two");
+    let go = case.folder().join("go");
+    let (first_named, second_named) = (case.folder().join("first-name"), case.folder().join("second-name"));
+    let first = hidden_payload(
+        &case,
+        "a",
+        &[FAKE_TOOL, "desktop-name-to", &shown(&first_named), "out", "holding", "wait", &shown(&go)],
+    );
+    let second = hidden_payload(&case, "b", &[FAKE_TOOL, "desktop-name-to", &shown(&second_named), "out", "ran"]);
+
+    let running = desktop_call(&case, &first, "ok", &[]).start();
+    running.wait_for_stdout("holding");
+    let beside = handed_off(&case, &second, "ok");
+    let_go(&go);
+    let outcome = running.finish_read();
+
+    for (run, said, payload) in [("first", &outcome, &first), ("second", &beside, &second)] {
+        assert_eq!(said.code, Some(0), "the {run} hidden run passed: {said:?}");
+        ran_its_command(said, payload);
+    }
+    let (one, other) = (desktop_named(&first_named), desktop_named(&second_named));
+    is_hidden_desktop(&one, &outcome);
+    is_hidden_desktop(&other, &beside);
+    assert_ne!(one, other, "two runs at once, each on its own desktop: {outcome:?} {beside:?}");
+}
+
 #[test]
 fn a_session_run_writes_no_holder_record() {
     let case = Case::new("desktop_session_no_record");

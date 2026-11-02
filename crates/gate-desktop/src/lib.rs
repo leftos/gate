@@ -155,16 +155,16 @@ pub fn arg0(box_pid: u32, pipe: &str) -> Option<String> {
     (box_pid != 0 && is_pipe_hex(hex)).then(|| format!("{box_pid}:{hex}"))
 }
 
-/// The box's pid and the pipe's full name from `Arg0`; `None` unless it is `<pid>:<hex>`, the pid all ASCII digits,
-/// with no leading 0, and not 0, and the hex exactly 32 lowercase hex digits: the form [`arg0`] writes. The name is
-/// always built here, never taken from `Arg0`.
-fn parse_arg0(text: &str) -> Option<(u32, String)> {
+/// The box's pid, the pipe's full name and its random part, the checked hex, from `Arg0`; `None` unless it is
+/// `<pid>:<hex>`, the pid all ASCII digits, with no leading 0, and not 0, and the hex exactly 32 lowercase hex digits:
+/// the form [`arg0`] writes. The name is always built here, never taken from `Arg0`.
+fn parse_arg0(text: &str) -> Option<(u32, String, &str)> {
     let (pid, hex) = text.split_once(':')?;
     if pid.is_empty() || pid.starts_with('0') || !pid.bytes().all(|byte| byte.is_ascii_digit()) || !is_pipe_hex(hex) {
         return None;
     }
     let pid = pid.parse::<u32>().ok().filter(|&pid| pid != 0)?;
-    Some((pid, format!(r"\\.\pipe\{PIPE_PREFIX}-{hex}")))
+    Some((pid, format!(r"\\.\pipe\{PIPE_PREFIX}-{hex}"), hex))
 }
 
 /// Whether `hex` is a pipe name's random part: exactly 32 digits of `0-9a-f`.
@@ -177,7 +177,7 @@ fn is_pipe_hex(hex: &str) -> bool {
 mod tests {
     use gate_win32::TaskArgument;
 
-    use super::{HELPER_FILE, HelperExit, PIPE_PREFIX, arg0, helper_path};
+    use super::{HELPER_FILE, HelperExit, PIPE_PREFIX, arg0, helper_path, parse_arg0};
 
     #[test]
     fn every_exit_code_has_a_why_and_maps_back() {
@@ -222,6 +222,20 @@ mod tests {
 
             assert_eq!(TaskArgument::new(&written).map(|argument| argument.as_str().to_owned()), Some(written));
         }
+    }
+
+    #[test]
+    fn an_arg0_read_back_gives_its_pid_its_pipe_and_the_pipe_s_random_part() {
+        let random = "0123456789abcdef0123456789abcdef";
+        let pipe = format!(r"\\.\pipe\{PIPE_PREFIX}-{random}");
+        let written = arg0(4242, &pipe).expect("the pipe's name makes an Arg0");
+
+        assert_eq!(parse_arg0(&written), Some((4242, pipe, random)));
+        assert_eq!(
+            parse_arg0(&format!("4242:{}", random.to_uppercase())),
+            None,
+            "the random part is lowercase hex"
+        );
     }
 
     #[test]

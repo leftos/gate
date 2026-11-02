@@ -51,8 +51,8 @@ pub(super) enum DesktopTake {
     /// It holds the builder's desktop lock for its whole run, waiting at most `wait` seconds for it.
     Locked { wait: u64 },
     /// It needs only the console's logon session: it never opens, waits for or holds the lock, and keeps no holder
-    /// record.
-    Session,
+    /// record. A `hidden` one runs its command on a desktop of its own the helper creates, which no one sees.
+    Session { hidden: bool },
 }
 
 /// Why the console's session could not be read whole.
@@ -132,6 +132,7 @@ pub(super) fn desktop_command(
             beat,
             limits,
             session,
+            take,
         };
         hand_off::hand_off(&here, console)
     };
@@ -144,7 +145,7 @@ pub(super) fn desktop_command(
             };
             locked(request, &turns, beat, console, hand)
         }
-        DesktopTake::Session => {
+        DesktopTake::Session { .. } => {
             let session = account_and_console(beat.seams).map_err(|refused| desktop_refused(request, &refused, beat, console))?;
             hand(session, console)
         }

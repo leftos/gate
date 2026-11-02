@@ -8,7 +8,7 @@ use std::os::windows::io::{AsHandle, BorrowedHandle};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use gate_win32::{DesktopLaunch, EnvironmentBlock, LaunchError, PipeClient, PipeOwner, Released, Suspended};
+use gate_win32::{DesktopLaunch, EnvironmentBlock, HiddenDesktop, LaunchError, PipeClient, PipeOwner, Released, Suspended};
 use gate_wire::build_version;
 use windows_sys::Win32::System::SystemServices::SECURITY_MANDATORY_MEDIUM_RID;
 
@@ -41,7 +41,8 @@ const TEST_LIMIT_VARIABLE: &str = "GATE_DESKTOP_TEST_LIMIT_MS";
 const TEST_PIPE_OWNER_VARIABLE: &str = "GATE_DESKTOP_TEST_PIPE_OWNER";
 
 /// The seam that picks one step of the run to break, in a build with the `test-seams` feature: `exit-before-hello`,
-/// `hang`, `wrong-version`, `lie-handle` or `exit-after-create`. An absent, empty or unknown value is no fault.
+/// `hang`, `wrong-version`, `lie-handle`, `exit-after-create` or `no-desktop`. An absent, empty or unknown value is no
+/// fault.
 #[cfg(feature = "test-seams")]
 const TEST_FAULT_VARIABLE: &str = "GATE_DESKTOP_TEST_FAULT";
 
@@ -64,6 +65,8 @@ enum Fault {
     LieHandle,
     /// Start the child suspended as normal, then exit without reporting it, leaving it suspended.
     ExitAfterCreate,
+    /// Fail to create a hidden spawn's desktop, as `CreateDesktopW` refusing it would.
+    NoDesktop,
 }
 
 #[cfg(feature = "test-seams")]
@@ -76,6 +79,7 @@ impl Fault {
             "wrong-version" => Some(Fault::WrongVersion),
             "lie-handle" => Some(Fault::LieHandle),
             "exit-after-create" => Some(Fault::ExitAfterCreate),
+            "no-desktop" => Some(Fault::NoDesktop),
             _ => None,
         }
     }
@@ -127,7 +131,7 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> HelperExit {
     let (Some(arg0), None) = (args.next(), args.next()) else {
         return HelperExit::BadArgument;
     };
-    let Some((box_pid, name)) = arg0.to_str().and_then(parse_arg0) else {
+    let Some((box_pid, name, random)) = arg0.to_str().and_then(parse_arg0) else {
         return HelperExit::BadArgument;
     };
     #[cfg(feature = "test-seams")]
@@ -142,7 +146,7 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> HelperExit {
     };
     #[cfg(not(feature = "test-seams"))]
     let owner = PipeOwner::Administrators;
-    match serve(box_pid, &name, limits, owner) {
+    match serve(box_pid, &name, random, limits, owner) {
         Ok(exit) | Err(exit) => exit,
     }
 }
@@ -158,8 +162,9 @@ fn pipe_owner_seam() -> Option<PipeOwner> {
     }
 }
 
-/// The run once `Arg0` is read: every step in order, the first that ends the run giving its exit.
-fn serve(box_pid: u32, name: &str, limits: Limits, owner: PipeOwner) -> Result<HelperExit, HelperExit> {
+/// The run once `Arg0` is read, its pipe `name` and that name's `random` part: every step in order, the first that ends
+/// the run giving its exit.
+fn serve(box_pid: u32, name: &str, random: &str, limits: Limits, owner: PipeOwner) -> Result<HelperExit, HelperExit> {
     check_integrity()?;
     let pipe = connect(name, limits.connect, owner)?;
     match pipe.server_pid() {
@@ -172,7 +177,9 @@ fn serve(box_pid: u32, name: &str, limits: Limits, owner: PipeOwner) -> Result<H
     }
     send(&pipe, &hello(), limits.message)?;
     let spawn = receive_spawn(&pipe, limits.message)?;
-    let child = start(&pipe, spawn, limits.message)?;
+    // A hidden spawn's desktop is held until the run ends, after `Done`: the command holds its own inherited copy from
+    // its creation on.
+    let (child, _desktop) = start(&pipe, spawn, random, limits.message)?;
     let released = child.release().map_err(|_| HelperExit::Internal)?;
     #[cfg(feature = "test-seams")]
     record_child(released.pid)?;
@@ -219,7 +226,7 @@ fn fault_before_hello(pipe: &PipeClient, limits: Limits) -> Option<HelperExit> {
     match Fault::asked()? {
         Fault::ExitBeforeHello => Some(HelperExit::BoxGone),
         Fault::Hang => Some(hang(pipe, limits)),
-        Fault::WrongVersion | Fault::LieHandle | Fault::ExitAfterCreate => None,
+        Fault::WrongVersion | Fault::LieHandle | Fault::ExitAfterCreate | Fault::NoDesktop => None,
     }
 }
 
@@ -355,10 +362,27 @@ fn receive_spawn(pipe: &PipeClient, limit: Duration) -> Result<Spawn, HelperExit
     }
 }
 
-/// The command `spawn` asks for, created suspended on the desktop with the two output handles the box placed in this
-/// process, once they and the environment pass their checks. A command `CreateProcessW` refuses is reported to the
-/// box as `Failed`, written within `limit`; a launch that fails before that call is not.
-fn start(pipe: &PipeClient, spawn: Spawn, limit: Duration) -> Result<Suspended, HelperExit> {
+/// The desktop of its own a `hidden` spawn's command runs on, created in this process's window station and named
+/// `gate-<random>`, `random` the control pipe's random part; `None` for a spawn that is not hidden. A desktop that
+/// cannot be created ends the run as `SetupFailed`, as a launch that fails before `CreateProcessW` does.
+fn hidden_desktop(hidden: bool, random: &str) -> Result<Option<HiddenDesktop>, HelperExit> {
+    if !hidden {
+        return Ok(None);
+    }
+    #[cfg(feature = "test-seams")]
+    if Fault::asked() == Some(Fault::NoDesktop) {
+        return Err(HelperExit::SetupFailed);
+    }
+    HiddenDesktop::create(&format!("gate-{random}"))
+        .map(Some)
+        .map_err(|_| HelperExit::SetupFailed)
+}
+
+/// The command `spawn` asks for, created suspended with the two output handles the box placed in this process, once
+/// they and the environment pass their checks: on the interactive desktop, or, for a hidden spawn, on a desktop of its
+/// own ([`hidden_desktop`]) made only then, and returned for the caller to hold. A command `CreateProcessW` refuses is
+/// reported to the box as `Failed`, written within `limit`; a launch that fails before that call is not.
+fn start(pipe: &PipeClient, spawn: Spawn, random: &str, limit: Duration) -> Result<(Suspended, Option<HiddenDesktop>), HelperExit> {
     let Spawn {
         application,
         command_line,
@@ -366,6 +390,7 @@ fn start(pipe: &PipeClient, spawn: Spawn, limit: Duration) -> Result<Suspended, 
         environment,
         stdout,
         stderr,
+        hidden,
     } = spawn;
     if stdout == stderr {
         return Err(HelperExit::BadSpawn);
@@ -376,20 +401,23 @@ fn start(pipe: &PipeClient, spawn: Spawn, limit: Duration) -> Result<Suspended, 
         return Err(HelperExit::BadSpawn);
     }
     let environment = EnvironmentBlock::from_wide(environment).map_err(|_| HelperExit::BadSpawn)?;
+    let desktop = hidden_desktop(hidden, random)?;
     let launch = DesktopLaunch {
         application: PathBuf::from(OsString::from_wide(&application)),
         command_line,
         directory: PathBuf::from(OsString::from_wide(&directory)),
         environment,
+        desktop: desktop.as_ref(),
     };
-    launch.start_suspended(stdout, stderr).map_err(|error| match error {
+    let suspended = launch.start_suspended(stdout, stderr).map_err(|error| match error {
         LaunchError::CreateProcess { code, .. } => {
             // The exit says the spawn failed whether or not the box reads why.
             let _reported = send(pipe, &Message::Failed { code }, limit);
             HelperExit::SpawnFailed
         }
         LaunchError::Setup { .. } => HelperExit::SetupFailed,
-    })
+    })?;
+    Ok((suspended, desktop))
 }
 
 /// The output handle the box placed in this process as `value`, once it passes

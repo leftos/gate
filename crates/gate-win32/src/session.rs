@@ -1,18 +1,19 @@
 //! The sessions of this machine: which one is attached to the console, and for a session whether it is connected,
 //! who is logged on to it and whether it is locked.
 
+use std::ffi::c_void;
 use std::io;
 
-use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE};
 use windows_sys::Win32::System::RemoteDesktop::{
     WTS_CONNECTSTATE_CLASS, WTS_CURRENT_SERVER_HANDLE, WTS_SESSIONSTATE_LOCK, WTS_SESSIONSTATE_UNLOCK, WTSActive, WTSConnectQuery, WTSConnected,
     WTSDisconnected, WTSDown, WTSFreeMemory, WTSGetActiveConsoleSessionId, WTSINFOEXW, WTSIdle, WTSInit, WTSListen, WTSQuerySessionInformationW,
     WTSReset, WTSSessionInfoEx, WTSShadow,
 };
 use windows_sys::Win32::System::StationsAndDesktops::{
-    CloseDesktop, DESKTOP_READOBJECTS, GetUserObjectInformationW, HDESK, OpenInputDesktop, UOI_NAME,
+    CloseDesktop, DESKTOP_READOBJECTS, GetUserObjectInformationW, HDESK, OpenInputDesktop, UOI_NAME, USER_OBJECT_INFORMATION_INDEX,
 };
-use windows_sys::core::PWSTR;
+use windows_sys::core::{BOOL, PWSTR};
 
 /// The id `WTSGetActiveConsoleSessionId` gives when no session is attached to the console, as while one is being
 /// attached or detached.
@@ -40,28 +41,73 @@ pub fn input_desktop_name() -> io::Result<String> {
     if desktop.is_null() {
         return Err(io::Error::last_os_error());
     }
-    let name = desktop_name(desktop);
+    let name = object_name(desktop);
     // SAFETY: the handle was opened above, is used by nothing else and is closed once; a failed close loses nothing
     // the name needs.
     unsafe { CloseDesktop(desktop) };
     name
 }
 
-/// The name of the open desktop `desktop`.
-fn desktop_name(desktop: HDESK) -> io::Result<String> {
-    desktop_name_from(desktop, 64)
+/// The name of the desktop this thread is on (`GetThreadDesktop`, then `GetUserObjectInformationW` with `UOI_NAME`),
+/// both calls found in user32 when this is called (`LoadLibraryExW` from the system folder, then `GetProcAddress`),
+/// so a program that calls nothing else of user32 imports none of it and starts on any desktop, one its window
+/// station cannot open among them. Loading user32 connects this process to its desktop.
+///
+/// # Errors
+///
+/// The system's error when user32 cannot be loaded, either call cannot be found or fails.
+pub fn thread_desktop_name() -> io::Result<String> {
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+
+    /// `GetThreadDesktop`'s signature.
+    type ThreadDesktop = unsafe extern "system" fn(u32) -> HDESK;
+
+    let library = crate::wide("user32.dll");
+    // SAFETY: the name is NUL-terminated and outlives the call; no file handle is passed, as the call requires. The
+    // module is never freed.
+    let module = unsafe { LoadLibraryExW(library.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
+    if module.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let find = |name: &std::ffi::CStr| {
+        // SAFETY: the module is loaded and never freed, and the name is a NUL-terminated ASCII string.
+        unsafe { GetProcAddress(module, name.as_ptr().cast()) }.ok_or_else(io::Error::last_os_error)
+    };
+    let (thread_desktop, read) = (find(c"GetThreadDesktop")?, find(c"GetUserObjectInformationW")?);
+    // SAFETY: user32 exports both with these signatures, as windows-sys declares them.
+    let (thread_desktop, read) = unsafe {
+        (
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, ThreadDesktop>(thread_desktop),
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, ReadObjectInformation>(read),
+        )
+    };
+    // SAFETY: the call takes no pointers; the thread's desktop is never closed (it needs no close).
+    let desktop = unsafe { thread_desktop(GetCurrentThreadId()) };
+    if desktop.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    object_name_with(read, desktop, 64)
 }
 
-/// The name of the open desktop `desktop`, read into a buffer of `units` UTF-16 units at first, grown to the size the
-/// system asks for while it is too small.
-fn desktop_name_from(desktop: HDESK, units: usize) -> io::Result<String> {
+/// `GetUserObjectInformationW`'s signature.
+type ReadObjectInformation = unsafe extern "system" fn(HANDLE, USER_OBJECT_INFORMATION_INDEX, *mut c_void, u32, *mut u32) -> BOOL;
+
+/// The name of the open desktop or window station `object`.
+pub(crate) fn object_name(object: HANDLE) -> io::Result<String> {
+    object_name_with(GetUserObjectInformationW, object, 64)
+}
+
+/// The name of the open desktop or window station `object`, read by `read` into a buffer of `units` UTF-16 units at
+/// first, grown to the size the system asks for while it is too small.
+fn object_name_with(read: ReadObjectInformation, object: HANDLE, units: usize) -> io::Result<String> {
     let mut buffer = vec![0_u16; units];
     loop {
         let size = u32::try_from(buffer.len() * 2).map_err(io::Error::other)?;
         let mut needed = 0;
-        // SAFETY: the desktop is open for the whole call, `buffer` is writable for `size` bytes and `needed` is writable.
-        let read = unsafe { GetUserObjectInformationW(desktop, UOI_NAME, buffer.as_mut_ptr().cast(), size, &raw mut needed) };
-        if read != 0 {
+        // SAFETY: the object is open for the whole call, `buffer` is writable for `size` bytes and `needed` is writable.
+        let done = unsafe { read(object, UOI_NAME, buffer.as_mut_ptr().cast(), size, &raw mut needed) };
+        if done != 0 {
             let units = buffer.iter().position(|&unit| unit == 0).unwrap_or(buffer.len());
             return Ok(String::from_utf16_lossy(&buffer[..units]));
         }
@@ -223,11 +269,10 @@ mod tests {
     use windows_sys::Win32::System::RemoteDesktop::{
         WTSActive, WTSConnectQuery, WTSConnected, WTSDisconnected, WTSDown, WTSIdle, WTSInit, WTSListen, WTSReset, WTSShadow,
     };
-
-    use windows_sys::Win32::System::StationsAndDesktops::GetThreadDesktop;
+    use windows_sys::Win32::System::StationsAndDesktops::{GetThreadDesktop, GetUserObjectInformationW};
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 
-    use super::{ConnectState, LockState, active_console_session, connect_state, desktop_name_from, lock_state, session_state};
+    use super::{ConnectState, LockState, active_console_session, connect_state, lock_state, object_name_with, session_state};
 
     #[test]
     fn a_desktop_name_longer_than_the_first_buffer_is_read_whole() {
@@ -235,8 +280,8 @@ mod tests {
         let desktop = unsafe { GetThreadDesktop(GetCurrentThreadId()) };
         assert!(!desktop.is_null(), "the thread's desktop is read: {}", std::io::Error::last_os_error());
 
-        let roomy = desktop_name_from(desktop, 64).expect("the name is read into a roomy buffer");
-        let grown = desktop_name_from(desktop, 1).expect("the name is read after the buffer grows");
+        let roomy = object_name_with(GetUserObjectInformationW, desktop, 64).expect("the name is read into a roomy buffer");
+        let grown = object_name_with(GetUserObjectInformationW, desktop, 1).expect("the name is read after the buffer grows");
 
         assert!(!roomy.is_empty(), "the desktop has a name");
         assert_eq!(grown, roomy, "the grown buffer holds the whole name");

@@ -3907,6 +3907,8 @@ A `run` payload may also hold `Desktop` (true or false, false when absent or nul
 
 `DesktopSession` (true or false, false when absent or null, else `gate: box payload DesktopSession is not true or false`; true without `Desktop` true, `gate: box payload DesktopSession needs Desktop`, both exit 2) makes it a session run, which takes no desktop lock.
 
+`DesktopHidden` (true or false, false when absent or null, else `gate: box payload DesktopHidden is not true or false`; true without `DesktopSession` true, `gate: box payload DesktopHidden needs DesktopSession`, both exit 2) makes the session run's command run on a desktop of its own that no one sees (The hidden desktop, in The desktop run's design). The PC does not send the key yet.
+
 A warm-up payload with `Desktop` true is refused with `gate: box payload asks a warm-up for the desktop` and exit 2.
 
 A `run` payload may also hold `CommitStage` (true or false, false when absent or null, else `gate: box payload CommitStage is not true or false` and exit 2), which asks for a commit stage: a gated commit's pre-commit hooks run as one routed run (GATE-634).
@@ -4407,6 +4409,8 @@ Built verbs:
   The desktop run (a `run` payload with `Desktop` true, `DesktopWait` its wait in seconds) reads the console session twice and takes the builder's desktop lock between the reads.
 
   A session run (`DesktopSession` true beside them) reads the session in the same two places but never opens, waits for or holds `gate\desktop`: it says no busy-wait, abandoned-lock or busy-timeout line and writes no holder record, and several session runs and one locked run may run at once. Its `DesktopWait` is read and never spent. The rest of this section describes a locked run.
+
+  A hidden session run (`DesktopHidden` true beside `DesktopSession`) is a session run whose helper starts the command on a desktop it creates for it, in the helper's own window station (The hidden desktop, in The desktop run's design); the box's checks and refusals are those of any session run.
 
   The first, cheap read comes right after the work-folder lock is held, before the layout and the checkout: when the console cannot take the command the run is refused with `gate-remote-refused: <nonce> desktop` then `gate: not routed: the builder has no desktop session: <why>`, said together under the output lock, the command never started, and exit 75.
 
@@ -5021,6 +5025,13 @@ The rules behind the desktop run (GATE-231) that a later change to the helper, t
 
 - Pipe objects are not tied to a session; handles belong to processes. The write ends go into the helper as non-inheritable copies, so none leaks into a process the helper itself starts. The helper makes its own inheritable copies inside the spawn lock and hands exactly NUL and those two to the command through the handle list. The box's copies close once the command holds its own, the forwarders start only after the marker, and the read ends stay in the box.
 - The helper creates the command by the box's own rules, through a `gate_win32` function and not a copy of them: `check_launch`, the handle list, the desktop-app policy `DISABLE_PROCESS_TREE`, `CREATE_NO_WINDOW` and `CREATE_SUSPENDED`, with `lpDesktop` set to `WinSta0\Default`.
+
+**The hidden desktop.**
+
+- A hidden session run's `spawn` message carries `hidden` true, a required boolean field: a `spawn` body without it is refused as one the helper cannot read. The box sends true only for a `DesktopSession` run whose payload holds `DesktopHidden` true.
+- After the spawn's checks (a bad spawn exits `BadSpawn` before any desktop is made) the helper creates a desktop in its own window station, named `gate-<the random part of the control pipe's name>`, and starts the command on it (`lpDesktop` the station and that name). A desktop that cannot be created exits `SetupFailed`. It takes no desktop lock and writes no holder record: the desktop is the run's own, so nothing is shared with the console or another run.
+- A hidden desktop lives while any handle to it is open, and a process gets a handle of its own only when user32 connects it. A desktop whose creator closes its handle before the suspended command connects is destroyed, and the command dies in init (`0xc0000142`). So the helper's own handle is not inheritable and the command inherits a copy with `DESKTOP_READOBJECTS` access alone, made under the spawn lock like the pipe ends and open from the command's creation on. That copy keeps the desktop alive after the helper exits, which it does after `Done` and before the box resumes the command. The desktop is gone once the run ends.
+- On it windows create and show, `PrintWindow` and `BitBlt` return real pixels, and Direct3D 11 (hardware and WARP) and WGL work; `SendInput` is refused.
 
 **Environment and folder.**
 
@@ -5951,6 +5962,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   `GATE_DESKTOP_TEST_FAULT` names the step the helper breaks; absent, empty or unknown is no fault:
   - `exit-before-hello` exits 13 before saying hello, `hang` answers nothing and waits until the pipe goes away (13) or its own done limit passes (18), the longest limit it keeps, so a box that keeps its message limit gives up first, and `wrong-version` says the build `0.0.0+fault`.
   - `lie-handle` reports the child's thread handle value as `process` (the real pid and thread), and `exit-after-create` creates its child, leaves it suspended and exits 19.
+  - `no-desktop` fails the creation of a hidden spawn's desktop, so the helper exits `SetupFailed` as `CreateDesktopW` refusing it would.
 - **No fixture from the checkout path.** No routing pattern, expected path or assertion is derived from where the repo is checked out; a case builds its own repository and routing file in its root. `checkout::repo_file` is the one route to a checked-in file (the install script), never for a path or pattern a case asserts on.
 - **Launcher cases** (GATE-41): `crates/gate/tests/suite/launcher.rs` has 20 cases. They run the checked-in `tools/gate.ps1`. A case's `LOCALAPPDATA` is its `appdata` folder, whose `gate\v1` is the default root with the real slot names, so every such case also sets `GATE_STATE_DIR` to a non-default folder, and its `GATE_LAUNCHER_PROGRAM_FILES` is an empty folder of its own, so the machine's installed gate is never found.
 

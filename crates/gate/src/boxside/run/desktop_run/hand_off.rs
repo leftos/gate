@@ -32,7 +32,7 @@ use jiff::Timestamp;
 use proc_table::{ProcessInfo, Win32ProcessTable};
 use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
 
-use super::{DesktopEnd, desktop_refused};
+use super::{DesktopEnd, DesktopTake, desktop_refused};
 use crate::boxside::ceiling::{Ceiling, Spec};
 use crate::boxside::desktop::lines::{DesktopRefusal, Limits, TaskVerdict, could_not_end_line, end_report, task_verdict};
 use crate::boxside::desktop::verify::{
@@ -99,6 +99,8 @@ pub(super) struct Here<'h, 'r> {
     pub(super) beat: &'h Beat<'r>,
     pub(super) limits: Limits,
     pub(super) session: u32,
+    /// How the run takes the builder's desktop: a hidden session run's command gets a desktop of its own.
+    pub(super) take: DesktopTake,
 }
 
 impl Here<'_, '_> {
@@ -418,6 +420,7 @@ fn exchange(here: &Here<'_, '_>, pinned: &Pinned, job: &Job, program: FileIdenti
         environment: prepared.environment.as_wide().to_vec(),
         stdout: given(stdout_write)?,
         stderr: given(stderr_write)?,
+        hidden: matches!(here.take, DesktopTake::Session { hidden: true }),
     };
     let pipes = Pipes {
         stdout: stdout_read,
