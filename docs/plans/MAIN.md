@@ -34,10 +34,15 @@
 - [ ] GATE-941 Read process CPU from one system list per sample in the watch and the load report
 - [ ] GATE-972 Settle a thread-less job member once its handle is signalled
 - [ ] GATE-998 Journal the process chain an orphan refusal walked
-- [ ] GATE-1034 Save a STALLED run's thread waits, handles and prek.log before the kill
+- [ ] GATE-1037 List a stalled run's open handles in its stall capture
+- [ ] GATE-1040 Stall capture edges: prek's PREK_HOME log, and module reads with no mid-call bound
+- [ ] GATE-1041 gate remote edges: whole-list soft-problem guard, Unicode repo folding, flush before replace
+- [ ] GATE-1042 End what the orphan refusal suite case leaves running (nextest LEAK)
 
 ## Remote
 
+- [ ] GATE-1045 Desktop run edges: slots held through the desktop wait, and a pinned run's lost-mid-run warning
+- [ ] GATE-1043 Say when a nested gate runs a desktop command on this PC because its parent runs here
 - [ ] GATE-942 Fold the one-pool remote wait into the several-pool wait's path
 - [ ] GATE-888 Let a channel pull's ack wait outlast the box's 16 MiB send buffer on a slow path
 - [ ] GATE-887 Close GATE-861's remaining built-here gaps: a listed repo's nothing-back built list, add-only waits, client clear lines
@@ -352,6 +357,7 @@
   - [ ] GATE-1030 Do not repeat a commit stage's lines in the run's closing tail
   - [ ] GATE-1031 Say the global.json sdk-pin note once per run
 - [ ] GATE-1035 Decide LFS on the Unix box: carry LFS objects, or refuse a payload that names them
+- [ ] GATE-1039 Run desktop routes on a hidden desktop by default, with an easy proof run
 
 ## Cutover sweep
 
@@ -377,7 +383,6 @@
 
 - [ ] GATE-611 Prune the PC cache folder of a builder removed from remote.json
 - [ ] GATE-803 Add Task Index rows for suite cases, gate.ps1 arguments and the state journal
-- [ ] GATE-1016 Add a kept command to edit remote.json patterns safely
 - [ ] GATE-140 End an escaped tree at the box, remote client and push kill sites
 - [ ] GATE-536 docs: Task Index row for changing the remote client
 - [ ] GATE-143 Measure whether mspdbsrv or a Framework MSBuild node leaves a gate's job
@@ -495,6 +500,7 @@
 - [ ] GATE-1027 Create docs/agents/orchestrator.md and move the profile's orchestration rules into it
 - [ ] GATE-1033 Read remote.json once per gate check
 - [ ] GATE-1036 Repoint issue and project links to plan files that are gone
+- [ ] GATE-1044 Remove counts and path:line references from the durable docs
 
 ## Design files
 
