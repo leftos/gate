@@ -35,9 +35,10 @@ pub use config::{Builder, BuilderOs, CARGO_OUTPUTS, Config, ConfigProblem, DEFAU
 pub use decide::{
     BuildSettings, BuildTarget, BuilderWords, CARRIED_INPUT, CONFIGURATION_ELEMENTS, CarriedSibling, CrossBlocked, CrossBuild, CrossTarget,
     DROPPED_NO_BUILD_LINE, DROPPED_UNSENT_LINE, DotnetTarget, Facts, FolderId, GitignoredInput, Inputs, LaterCandidate, LocalReason, NO_OUTPUTS_LINE,
-    OUTPUT_PROPERTIES, PROJECT_EXTENSIONS, PinRefusal, Place, RemoteRun, Route, SendPlan, SiblingFolder, Slot, Target, build_settings, builder_words,
-    builds_in_place, decide, dotnet_builds, dotnet_takes_solution, dotnet_target, is_cargo, is_dotnet, is_input_file, is_project_or_solution,
-    later_run, later_stage_run, names_program, positional_target, sdk_build_target, sibling_root, stays_local, target, without_no_build,
+    Nested, OUTPUT_PROPERTIES, PROJECT_EXTENSIONS, PinRefusal, Place, RemoteRun, Route, SendPlan, SiblingFolder, Slot, Target, build_settings,
+    builder_words, builds_in_place, decide, dotnet_builds, dotnet_takes_solution, dotnet_target, is_cargo, is_dotnet, is_input_file,
+    is_project_or_solution, later_run, later_stage_run, names_program, positional_target, sdk_build_target, sibling_root, stays_local, target,
+    without_no_build,
 };
 pub use edit::{BUILDER_SECTIONS, EDIT_SECTIONS, Edit, EditRefusal, EditVerb, Edited, edit_remote_json};
 pub use escape::{escaped, is_reordering_mark};

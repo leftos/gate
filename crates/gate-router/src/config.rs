@@ -268,6 +268,24 @@ impl Config {
         }
     }
 
+    /// Whether `desktop` or `desktopSession` allows any repo a pattern: `false` when neither key can be used or both list
+    /// only empty arrays.
+    #[must_use]
+    pub fn has_desktop_consent(&self) -> bool {
+        let any = |table: &Result<Vec<(String, Vec<String>)>, String>| {
+            table.as_ref().is_ok_and(|table| table.iter().any(|(_, patterns)| !patterns.is_empty()))
+        };
+        any(&self.desktop) || any(&self.desktop_session)
+    }
+
+    /// Whether `desktop` or `desktopSession` allows `repo` a pattern, its repo name matched in any letter case: `false`
+    /// when neither key can be used or neither lists one for it.
+    #[must_use]
+    pub fn has_desktop_consent_for(&self, repo: &str) -> bool {
+        let consents = |allowed: Result<&[String], &str>| allowed.is_ok_and(|patterns| !patterns.is_empty());
+        consents(self.allowed_desktop(repo)) || consents(self.allowed_desktop_session(repo))
+    }
+
     /// Whether `warmup` lets `repo` run its warm-up, its repo name matched in any letter case: `false` when it does not
     /// name the repo or there is no such key.
     ///

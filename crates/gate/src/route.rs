@@ -18,9 +18,9 @@ use gate_router::desktop::DesktopDeclaration;
 use gate_router::warm::FileRead;
 use gate_router::windows::{self, WindowsChange};
 use gate_router::{
-    Builder, Config, ConfigProblem, CrossTarget, Facts, FolderId, GitignoredInput, Inputs, LaterCandidate, LocalReason, Pattern, PinRefusal, Place,
-    RemoteRun, Route, SiblingFolder, SiblingRoot, Target, decide, dropped_env, dropped_env_line, escaped, is_input_file, is_project_or_solution,
-    repo_name, work_folder_key,
+    Builder, Config, ConfigProblem, CrossTarget, Facts, FolderId, GitignoredInput, Inputs, LaterCandidate, LocalReason, Nested, Pattern, PinRefusal,
+    Place, RemoteRun, Route, SiblingFolder, SiblingRoot, Target, decide, dropped_env, dropped_env_line, escaped, is_input_file,
+    is_project_or_solution, repo_name, work_folder_key,
 };
 use gate_win32::Share;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -124,12 +124,8 @@ pub(crate) struct Decided {
 /// request holds it back, whether its command would route on heavy without reading the routing file or git on any other
 /// run: the [`Inputs`] the run's own decision had, less the slot it asked for, and what [`Machine::new`] read of the
 /// environment.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each bool is an independent input of the decision, read by name; no two form a state machine"
-)]
 pub(crate) struct Decision {
-    covering_parent: bool,
+    parent: Nested,
     local: bool,
     git_hook: bool,
     words: Vec<String>,
@@ -144,12 +140,12 @@ pub(crate) struct Decision {
 }
 
 impl Decision {
-    /// What the decision of a run with `request` sees under `covering_parent`, read from `environment`, its records
-    /// under the state root `state`.
-    fn of(request: &RunRequest, environment: &Environment, covering_parent: bool, state: &Path) -> Decision {
+    /// What the decision of a run with `request` sees under `parent`, read from `environment`, its records under the
+    /// state root `state`.
+    fn of(request: &RunRequest, environment: &Environment, parent: Nested, state: &Path) -> Decision {
         Decision {
             state: state.to_owned(),
-            covering_parent,
+            parent,
             local: request.local,
             git_hook: environment.git_index_file.as_deref().is_some_and(|value| !value.is_empty()),
             words: request.command.iter().map(|word| word.to_string_lossy().into_owned()).collect(),
@@ -164,7 +160,7 @@ impl Decision {
     fn inputs(&self, slot: gate_router::Slot) -> Inputs<'_> {
         Inputs {
             slot,
-            covering_parent: self.covering_parent,
+            parent: self.parent,
             local: self.local,
             git_hook: self.git_hook,
             words: &self.words,
@@ -179,19 +175,20 @@ impl Decision {
 /// when it has one ([`declared_prefixes`]), and the line of the watched variables it does not send ([`dropped_line`]),
 /// the names the repo's declared prefixes start among them, after them. A command that would route but has a word that
 /// is not valid Unicode runs here, saying so, but for a desktop run, which is refused ([`PinRefusal::DesktopNotHere`]).
-/// A gate under a `covering_parent`'s slot runs here, saying nothing. A run that dropped its `--no-build` before its
-/// decision names the words the caller wrote as `given`, which the repo's `.gate/local.toml` is matched against too
-/// ([`Inputs::given`]). With
-/// the route, what the decision learnt of the gate's place in its git worktree, and, for a routed run of a repo whose
-/// warm-up is set up, the hash of its warm-up file ([`consented_hash`]).
+/// A gate a parent's slot covers ([`Nested::Covering`]) runs here, saying only that a desktop command runs here with
+/// its parent ([`LocalReason::DesktopUnderParent`]), and a gate inside a box run ([`Nested::BoxRun`]) says nothing. A
+/// run that dropped its `--no-build` before its decision names the words the caller wrote as `given`, which the repo's
+/// `.gate/local.toml` is matched against too ([`Inputs::given`]). With the route, what the decision learnt of the
+/// gate's place in its git worktree, and, for a routed run of a repo whose warm-up is set up, the hash of its warm-up
+/// file ([`consented_hash`]).
 pub(crate) fn route(
     request: &RunRequest,
     environment: &Environment,
-    (covering_parent, given): (bool, Option<&[String]>),
+    (parent, given): (Nested, Option<&[String]>),
     (root, gate): (&ResolvedRoot, &ThisGate),
     console: &mut Console,
 ) -> Decided {
-    let mut decision = Decision::of(request, environment, covering_parent, &root.path);
+    let mut decision = Decision::of(request, environment, parent, &root.path);
     decision.given = given.map(<[String]>::to_vec);
     let mut machine = Machine::new(environment, &request.test_seams)
         .with_state(&decision)
@@ -349,14 +346,27 @@ fn balanced_figures(entry: &BalancedEntry, has_duration: bool) -> String {
     format!("{expected}{free}{cold}")
 }
 
-/// The routed run a light gate held back behind a critical request gets when its command would route on heavy: the
-/// decision `decision` saw asked again with the heavy slot, no proof of speed consulted, with the git limits
-/// and the `HEAD` a routed run reads. Says that the critical request of gate `by` sends the run to its builder, then
-/// the routed run's lines as [`route`] does, and notes the decision's log lines. `None` when the decision would keep
-/// the run here or a word is not valid Unicode, and `None` when the log lies in another worktree of the run's repo than
-/// its root, which keeps the run here like a run that stays local and notes the refusal line ([`log_in_other_worktree`]).
-/// With the run, the hash of its repo's warm-up file when its warm-up is set up ([`consented_hash`]).
-pub(crate) fn route_as_heavy(request: &RunRequest, decision: &Decision, by: u32, console: &mut Console) -> Option<(RemoteRun, Option<String>)> {
+/// What a light gate held back behind a critical request does once its command is asked again as heavy
+/// ([`route_as_heavy`]).
+pub(crate) enum AsHeavy {
+    /// It runs on the builder: the routed run, with the hash of its repo's warm-up file when its warm-up is set up
+    /// ([`consented_hash`]).
+    Routed(Box<RemoteRun>, Option<String>),
+    /// It goes back to its wait here.
+    Here,
+    /// It ends, refused; its lines are said.
+    Refused,
+}
+
+/// What a light gate held back behind a critical request does once the decision `decision` saw is asked again with the
+/// heavy slot, no proof of speed consulted, with the git limits and the `HEAD` a routed run reads. A run that would
+/// route is [`AsHeavy::Routed`]: says that the critical request of gate `by` sends the run to its builder, then the
+/// routed run's lines as [`route`] does, and notes the decision's log lines. [`AsHeavy::Here`] when the decision would
+/// keep the run here or a word is not valid Unicode, and when the log lies in another worktree of the run's repo than
+/// its root, which keeps the run here like a run that stays local and notes the refusal line
+/// ([`log_in_other_worktree`]). [`AsHeavy::Refused`] when the decision refuses the run: notes the decision's log lines,
+/// then says the refusal's line on stderr.
+pub(crate) fn route_as_heavy(request: &RunRequest, decision: &Decision, by: u32, console: &mut Console) -> AsHeavy {
     // A commit's stage is judged once, under the commit's own slot: the judge is not asked again as heavy.
     let machine = Machine::of(decision.local_app_data.as_deref(), &request.test_seams)
         .with_state(decision)
@@ -370,8 +380,15 @@ pub(crate) fn route_as_heavy(request: &RunRequest, decision: &Decision, by: u32,
             }
             None => Some(run),
         },
+        Route::Refused(refused) => {
+            for line in machine.unsaid_notes() {
+                console.note(&line);
+            }
+            console.err(&refused.line());
+            return AsHeavy::Refused;
+        }
         // These facts judge no stage, so a commit is never a stage here.
-        Route::Routed(_) | Route::Local { .. } | Route::Refused(_) | Route::Stage(_) => None,
+        Route::Routed(_) | Route::Local { .. } | Route::Stage(_) => None,
     };
     let Some(run) = routed else {
         for line in machine.unsaid_notes() {
@@ -380,7 +397,7 @@ pub(crate) fn route_as_heavy(request: &RunRequest, decision: &Decision, by: u32,
         if let Some(refusal) = refusal {
             console.note(&refusal.line());
         }
-        return None;
+        return AsHeavy::Here;
     };
     let warm_hash = consented_hash(&run, &machine);
     let declared = declared_prefixes(&run, &machine);
@@ -392,7 +409,7 @@ pub(crate) fn route_as_heavy(request: &RunRequest, decision: &Decision, by: u32,
         run.builder.alias
     ));
     say_routed(request, &run, declared, console);
-    Some((*run, warm_hash))
+    AsHeavy::Routed(run, warm_hash)
 }
 
 /// The routed run of `request` on `candidate`, a later builder of the run its decision `decision` routed
@@ -1265,7 +1282,7 @@ impl Facts for Machine<'_> {
             words: &words,
             is_set: &is_set,
             slot: gate_slot(inputs.slot),
-            covered: inputs.covering_parent,
+            covered: inputs.parent != Nested::None,
             consented: true,
         };
         let root = Path::new(&place.root);
@@ -3109,7 +3126,7 @@ mod tests {
         let words: Vec<String> = ["git", "commit", "-m", "staged"].map(str::to_owned).to_vec();
         let inputs = gate_router::Inputs {
             slot: gate_router::Slot::Heavy,
-            covering_parent: false,
+            parent: gate_router::Nested::None,
             local: false,
             git_hook: false,
             words: &words,

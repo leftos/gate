@@ -322,6 +322,18 @@ impl Nesting {
         (self.covering().is_some() && self.under_commit().is_none()) || matches!(self, Nesting::InBox)
     }
 
+    /// What holds this gate as routing is told it ([`gate_router::Nested`]): a box run first, then a parent's slot it
+    /// routes as covered by ([`Nesting::routes_as_covered`]), else nothing.
+    pub(crate) fn nested(&self) -> gate_router::Nested {
+        if matches!(self, Nesting::InBox) {
+            gate_router::Nested::BoxRun
+        } else if self.routes_as_covered() {
+            gate_router::Nested::Covering
+        } else {
+            gate_router::Nested::None
+        }
+    }
+
     /// Whether this gate runs inside the hooks of a live commit run, whether its slot covers the gate, refuses it or
     /// does not cover it ([`Nesting::marked_for_commit`]).
     pub(crate) fn in_commit(&self) -> bool {

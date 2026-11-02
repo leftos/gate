@@ -21,6 +21,7 @@ use jiff::Timestamp;
 use regex::Regex;
 use serde_json::Value;
 
+use crate::routing::{UNDER_PARENT_LINE, declare_desktop, heavy_words_with_limit, routed_case};
 use crate::support::{
     Case, Escapee, FAKE_TOOL, GATE, Outcome, POLL, Running, assert_in_order, critical_words, events, events_of, finish, heavy_words, log_texts,
     none_words, run_words, said_pid, shown, start, take_of, tool, wait_for_file, wait_for_journal_line, wait_until, write_counts,
@@ -168,6 +169,41 @@ fn a_gate_under_a_covering_parent_takes_no_slot() {
             &format!("gate: running under the heavy slot of gate {outer_pid}\n"),
             &format!("{marker}\n"),
         ],
+    );
+}
+
+#[test]
+fn a_covered_gate_whose_desktop_command_runs_on_this_pc_says_so() {
+    let case = routed_case("nesting-desktop-under-parent");
+    declare_desktop(&case, &["*tool* argv*"]);
+    let marker = test_marker(&case, "heavy");
+    let desktop = finish(marked(
+        &case,
+        &heavy_words_with_limit("desktop.log", &[], &[r".\tool.exe", "argv", "a"]),
+        &marker,
+    ));
+    let other = finish(marked(
+        &case,
+        &heavy_words_with_limit("other.log", &[], &[r".\tool.exe", "out", "hi"]),
+        &marker,
+    ));
+
+    assert_passed(&desktop);
+    assert!(desktop.stderr.contains(UNDER_PARENT_LINE), "{desktop:?}");
+    assert!(
+        log_texts(&case.folder().join("desktop.log")).contains(UNDER_PARENT_LINE),
+        "the log holds the line too"
+    );
+    assert_passed(&other);
+    assert!(other.stdout.contains("hi"), "{other:?}");
+    assert!(
+        !other.stderr.contains("desktop pattern"),
+        "a command matching no desktop pattern says nothing of it: {other:?}"
+    );
+    assert_eq!(
+        sequence(&case).iter().filter(|(event, _)| event == "covered").count(),
+        2,
+        "both ran covered, here"
     );
 }
 

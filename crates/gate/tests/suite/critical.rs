@@ -16,8 +16,8 @@ use serde_json::{Value, json};
 use crate::durations::seed;
 use crate::nesting::{marked, test_marker};
 use crate::routing::{
-    BUSY_LINE, GIT_HANG_GUARDS, HOST, balance_case, has_no_remote_fields, has_remote_tag, hold_marker, names, own, repo, routed_case, routed_words,
-    seed_faster_here, stub,
+    BUSY_LINE, GIT_HANG_GUARDS, HOST, UNDER_PARENT_LINE, balance_case, declarations_holding, declare_desktop, declare_marking_desktop,
+    has_no_remote_fields, has_remote_tag, hold_marker, name_declarations, names, own, repo, routed_case, routed_words, seed_faster_here, stub,
 };
 use crate::support::{
     Case, FAKE_TOOL, GATE, LOCAL_REASON, POLL, Running, UNTIL_KILLED, USAGE, assert_in_order, critical_words, events, events_of, finish, git,
@@ -541,6 +541,38 @@ fn a_heavy_child_of_a_light_parent_is_lent_the_parents_slot_while_a_critical_req
 }
 
 #[test]
+fn a_lent_gate_whose_desktop_command_runs_on_this_pc_says_so() {
+    let case = routed_case("critical-lent-desktop");
+    declare_desktop(&case, &["*tool* argv*"]);
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":4}"#);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let mut held_extra = POLL.to_vec();
+    held_extra.push("--local");
+    held_extra.extend(LOCAL_REASON);
+    let held = holder(
+        &case,
+        &heavy_words("holder.log", &held_extra, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]),
+    );
+    let critical = case.start(&critical_words("critical.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
+    critical.wait_for_stderr(WAITING);
+
+    let mut extra = POLL.to_vec();
+    extra.extend(GIT_HANG_GUARDS);
+    let marker = test_marker(&case, "light");
+    let lent_gate = finish(marked(&case, &heavy_words("lent.log", &extra, &[r".\tool.exe", "argv", "a"]), &marker));
+
+    assert_passed(&lent_gate);
+    assert!(lent_gate.stderr.contains(&lent(process::id())), "{lent_gate:?}");
+    assert!(lent_gate.stderr.contains(UNDER_PARENT_LINE), "{lent_gate:?}");
+    let lent_pid = lent_to(&case, process::id());
+    assert_eq!(events_of(&case, lent_pid), ["parent"], "lent before it queued, it journals no queue");
+    let_go(&go);
+    assert_passed(&critical.finish());
+    assert_passed(&held.finish());
+}
+
+#[test]
 fn a_lent_auto_run_uses_its_history_for_the_ceiling() {
     let case = Case::new("a_lent_auto_run_uses_its_history_for_the_ceiling");
     write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":4}"#);
@@ -873,6 +905,56 @@ fn a_light_gate_held_back_logging_into_another_worktree_stays_here_saying_so() {
         log_texts(&other.join("light.log")).contains(&line),
         "the refused run's log holds its line"
     );
+}
+
+/// A light gate kept here at its start whose heavy re-ask, once a critical request holds it back, is refused ends there
+/// with the usage status, saying the refusal, and its command never runs. The refusal is staged by a desktop pattern
+/// declared and consented while the gate waits: its command names a path outside the worktree, which keeps any run here,
+/// and a desktop run is refused instead.
+#[test]
+fn a_light_gate_held_back_whose_heavy_re_ask_is_refused_ends_saying_so() {
+    let case = reroute_case("a_light_gate_held_back_whose_heavy_re_ask_is_refused_ends_saying_so", 2);
+    let (lights, light_go) = light_holders(&case, 3);
+    let call = case.folder().join("call.json");
+    let steps = recording_stub(&case, &call);
+    let marker = case.folder().join("marker");
+    let marker_word = shown(&marker);
+    // Run here, the command would pass, printing the outside path.
+    let command = [r".\tool.exe", "mark", marker_word.as_str(), "out", FAKE_TOOL];
+    let light = light_with_client(&case, "light.log", &steps, &with_heartbeat(), &command);
+    light.wait_for_stderr("gate: still waiting for a light slot (");
+
+    // The pattern is declared in the repo's declarations folder, so the re-ask holds a note for the log: where it read
+    // the file from.
+    declare_marking_desktop(&case);
+    let worktree_file = case.folder().join(".gate").join("desktop.toml");
+    let text = fs::read_to_string(&worktree_file).expect("the declaration was written");
+    fs::remove_file(&worktree_file).expect("the worktree's desktop file can be removed");
+    let folder = declarations_holding(&case, &[("desktop.toml", &text)]);
+    name_declarations(&case, &folder);
+    let read = format!("gate: .gate/desktop.toml read from {}", folder.join("desktop.toml").display());
+    let planted = (process::id(), own_start());
+    write_ticket(&case, TicketKind::Critical, planted, 0, false);
+    let refusal = format!("gate: not routed: {FAKE_TOOL} is outside the worktree; a desktop run never runs here\n");
+    light.wait_for_stderr_where("the refusal, or the wait going on beside the critical request", |text| {
+        text.contains(&refusal) || text.contains(&still_beside(planted.0))
+    });
+    let ticket = v1::ticket_path(&case.root(), planted.0, planted.1.as_millisecond().unsigned_abs());
+    fs::remove_file(&ticket).expect("the planted ticket can be deleted");
+    let_go(&light_go);
+    let outcome = light.finish();
+    for light in lights {
+        assert_passed(&light.finish());
+    }
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert!(outcome.stderr.contains(&refusal), "{outcome:?}");
+    assert!(!outcome.stderr.contains(&read), "the decision's notes are the log's alone: {outcome:?}");
+    let log = log_texts(&case.folder().join("light.log"));
+    assert!(log.contains(&refusal), "{log}");
+    assert!(log.lines().any(|line| line == read), "{read}: {log}");
+    assert!(!call.exists(), "nothing went to the builder: {outcome:?}");
+    assert!(!marker.exists(), "the command never ran here: {outcome:?}");
 }
 
 #[test]

@@ -1303,7 +1303,7 @@ fn a_declared_sibling_the_routing_file_does_not_allow_runs_here_saying_so() {
 }
 
 /// Names `folder` as the case repo's declarations folder in the case's routing file, the rest of it kept.
-fn name_declarations(case: &Case, folder: &Path) {
+pub(crate) fn name_declarations(case: &Case, folder: &Path) {
     let path = case.local_app_data().join("gate").join("remote.json");
     let mut routing: Value =
         serde_json::from_str(&fs::read_to_string(&path).expect("the case has a routing file")).expect("the routing file is JSON");
@@ -1312,7 +1312,7 @@ fn name_declarations(case: &Case, folder: &Path) {
 }
 
 /// A declarations folder under the case's LOCALAPPDATA holding each `(name, text)` of `files`; its path.
-fn declarations_holding(case: &Case, files: &[(&str, &str)]) -> PathBuf {
+pub(crate) fn declarations_holding(case: &Case, files: &[(&str, &str)]) -> PathBuf {
     let folder = case.local_app_data().join("declarations");
     fs::create_dir_all(&folder).expect("the declarations folder can be made");
     for (name, text) in files {
@@ -1813,9 +1813,14 @@ fn the_client_is_called_with_the_repo_s_inputs() {
     assert_eq!(call["desktop"], json!(false), "a repo with no desktop file asks for no desktop: {call}");
 }
 
+/// The line a gate under a parent gate here says when its command matches the consented `*tool* argv*` of
+/// [`declare_desktop`].
+pub(crate) const UNDER_PARENT_LINE: &str =
+    "gate: a desktop command runs on this PC because its parent gate runs here (desktop pattern '*tool* argv*')\n";
+
 /// Declares `*tool* argv*` in the case's `.gate/desktop.toml` and writes a routing file routing `*tool*` whose
 /// `desktop` value allows the repo `allowed`.
-fn declare_desktop(case: &Case, allowed: &[&str]) {
+pub(crate) fn declare_desktop(case: &Case, allowed: &[&str]) {
     let folder = case.folder();
     fs::create_dir_all(folder.join(".gate")).expect("the .gate folder can be made");
     fs::write(folder.join(".gate").join("desktop.toml"), "patterns = ['*tool* argv*']\n").expect("the declaration can be written");
@@ -2050,7 +2055,7 @@ fn a_command_matching_a_consented_desktop_pattern_asks_the_client_for_the_deskto
 
 /// Declares `*tool* mark*` in the case's `.gate/desktop.toml` and writes a routing file routing `*tool*` that consents
 /// it, so a `.\tool.exe mark <file> …` command is a desktop run whose run would leave the marker `file`.
-fn declare_marking_desktop(case: &Case) {
+pub(crate) fn declare_marking_desktop(case: &Case) {
     let folder = case.folder();
     fs::create_dir_all(folder.join(".gate")).expect("the .gate folder can be made");
     fs::write(folder.join(".gate").join("desktop.toml"), "patterns = ['*tool* mark*']\n").expect("the declaration can be written");

@@ -9,9 +9,9 @@ use gate_router::desktop::{DesktopDeclaration, DesktopMode};
 use gate_router::windows::WindowsChange;
 use gate_router::{
     BuildSettings, BuildTarget, Builder, BuilderOs, CARRIED_INPUT, Config, ConfigProblem, CrossBlocked, CrossTarget, DROPPED_NO_BUILD_LINE,
-    DotnetTarget, Facts, GitignoredInput, Inputs, LocalReason, NO_OUTPUTS_LINE, PROJECT_EXTENSIONS, Pattern, PinRefusal, Place, RemoteRun, Route,
-    SiblingFolder, Slot, Target, build_settings, builder_words, decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet, is_usable_host, later_run,
-    sdk_build_target, target, without_no_build, work_folder_key,
+    DotnetTarget, Facts, GitignoredInput, Inputs, LocalReason, NO_OUTPUTS_LINE, Nested, PROJECT_EXTENSIONS, Pattern, PinRefusal, Place, RemoteRun,
+    Route, SiblingFolder, Slot, Target, build_settings, builder_words, decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet, is_usable_host,
+    later_run, sdk_build_target, target, without_no_build, work_folder_key,
 };
 
 use crate::support::{FakeFacts, HEAD, ROOT, carried, fake_id, heavy, light, place_at, sibling_root, words};
@@ -291,11 +291,16 @@ fn a_light_gate_under_a_covering_parent_stays_silent() {
         ..FakeFacts::at_root()
     };
     let inputs = Inputs {
-        covering_parent: true,
+        parent: Nested::Covering,
         ..light(&command)
     };
     assert_eq!(decide(&inputs, &facts), SILENT);
-    assert!(facts.asked().is_empty(), "{:?}", facts.asked());
+    assert_eq!(
+        facts.asked(),
+        ["config"],
+        "the routing file consents no repo a desktop pattern, so git is never asked"
+    );
+    assert_eq!(facts.desktop_read.get(), 0);
     assert_eq!(facts.local_p50_asked.get(), 0);
 }
 
@@ -583,12 +588,149 @@ fn a_covering_parent_keeps_it_here_silently_even_with_local_and_reads_no_routing
     let command = words(&["dotnet", "test"]);
     let facts = FakeFacts::at_root();
     let inputs = Inputs {
-        covering_parent: true,
+        parent: Nested::Covering,
         local: true,
         ..heavy(&command)
     };
     assert_eq!(decide(&inputs, &facts), SILENT);
     assert_eq!(facts.asked(), Vec::<String>::new());
+}
+
+/// A light gate a parent's slot covers, running `command`.
+fn covered(command: &[String]) -> Inputs<'_> {
+    Inputs {
+        parent: Nested::Covering,
+        ..light(command)
+    }
+}
+
+/// The route of a covered gate that says its desktop `pattern` runs here because its parent gate does.
+fn under_parent(pattern: &str) -> Route {
+    Route::Local {
+        reason: Some(LocalReason::DesktopUnderParent { pattern: pattern.to_owned() }),
+    }
+}
+
+#[test]
+fn a_covered_gate_matching_a_consented_desktop_pattern_says_it_runs_here_under_parent() {
+    let facts = desktop_facts(Some(r#"{"YAAT": ["dotnet test*"]}"#), &["dotnet test*"]);
+    let command = words(&["dotnet", "test"]);
+    let route = decide(&covered(&command), &facts);
+    assert_eq!(route, under_parent("dotnet test*"));
+    assert_eq!(
+        local_line(&route).as_deref(),
+        Some("gate: a desktop command runs on this PC because its parent gate runs here (desktop pattern 'dotnet test*')")
+    );
+    assert_eq!(facts.desktop_read.get(), 1);
+    let heavy_covered = Inputs {
+        slot: Slot::Heavy,
+        ..covered(&command)
+    };
+    assert_eq!(decide(&heavy_covered, &facts), under_parent("dotnet test*"), "a heavy gate says it too");
+}
+
+#[test]
+fn a_covered_gate_matches_desktop_patterns_against_its_rewritten_words() {
+    let facts = desktop_facts(Some(r#"{"yaat": ["dotnet test tests*"]}"#), &["dotnet test tests*"]);
+    let command = words(&[r"C:\Program Files\dotnet\dotnet.exe", "test", "X:/dev/yaat.wt/a/tests/T.csproj"]);
+    assert_eq!(
+        decide(&covered(&command), &facts),
+        under_parent("dotnet test tests*"),
+        "the pattern matches `dotnet test tests/T.csproj`, the words as the rewrite sends them"
+    );
+}
+
+#[test]
+fn a_covered_gate_matching_a_consented_session_pattern_says_it_runs_here_under_parent() {
+    let facts = session_facts(None, Some(r#"{"yaat": ["tool *"]}"#), declaration(&[], &["tool *"]));
+    assert_eq!(decide(&covered(&words(&["tool", "x"])), &facts), under_parent("tool *"));
+}
+
+#[test]
+fn a_covered_gate_matching_an_unconsented_desktop_pattern_stays_silent() {
+    let facts = desktop_facts(Some(r#"{"yaat": ["dotnet build*"]}"#), &["dotnet test*"]);
+    assert_eq!(decide(&covered(&words(&["dotnet", "test"])), &facts), SILENT);
+    assert_eq!(facts.desktop_read.get(), 1);
+    let unreadable = FakeFacts {
+        desktop: Err("bad toml".to_owned()),
+        ..desktop_facts(Some(r#"{"yaat": ["dotnet test*"]}"#), &[])
+    };
+    assert_eq!(
+        decide(&covered(&words(&["dotnet", "test"])), &unreadable),
+        SILENT,
+        "a covered gate never says a desktop file problem"
+    );
+    let unusable = FakeFacts {
+        config: Err(ConfigProblem {
+            path: PathBuf::from("remote.json"),
+            reason: "not JSON".to_owned(),
+        }),
+        ..FakeFacts::at_root()
+    };
+    assert_eq!(
+        decide(&covered(&words(&["dotnet", "test"])), &unusable),
+        SILENT,
+        "nor an unusable routing file"
+    );
+    assert_eq!(unusable.asked(), ["config"]);
+}
+
+#[test]
+fn a_covered_gate_in_a_consented_repo_the_routing_file_does_not_route_says_nothing() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"other": ["dotnet *"]}, "desktop": {"yaat": ["dotnet test*"]}}"#).expect("usable");
+    let facts = FakeFacts {
+        desktop: Ok(declaration(&["dotnet test*"], &[])),
+        ..FakeFacts::with_config(config)
+    };
+    assert_eq!(decide(&covered(&words(&["dotnet", "test"])), &facts), SILENT);
+    assert_eq!(facts.desktop_read.get(), 0);
+}
+
+#[test]
+fn a_covered_git_command_matching_a_consented_desktop_pattern_says_nothing() {
+    let facts = desktop_facts(Some(r#"{"yaat": ["git*"]}"#), &["git*"]);
+    for command in [words(&["git", "status"]), words(&[r"C:\Program Files\Git\cmd\git.exe", "status"])] {
+        assert_eq!(decide(&covered(&command), &facts), SILENT, "{command:?}");
+    }
+    assert_eq!(
+        facts.desktop_read.get(),
+        0,
+        "a command that stays on this PC never reads the desktop file"
+    );
+}
+
+#[test]
+fn a_covered_gate_in_a_repo_with_no_desktop_consent_reads_no_desktop_file() {
+    for (case, desktop) in [("no key", None), ("another repo", Some(r#"{"other": ["dotnet test*"]}"#))] {
+        let facts = desktop_facts(desktop, &["dotnet test*"]);
+        assert_eq!(decide(&covered(&words(&["dotnet", "test"])), &facts), SILENT, "{case}");
+        assert_eq!(facts.desktop_read.get(), 0, "{case}");
+    }
+    let unplaced = FakeFacts {
+        place: Ok(None),
+        ..desktop_facts(Some(r#"{"yaat": ["dotnet test*"]}"#), &["dotnet test*"])
+    };
+    assert_eq!(decide(&covered(&words(&["dotnet", "test"])), &unplaced), SILENT, "no worktree");
+    assert_eq!(unplaced.desktop_read.get(), 0);
+}
+
+#[test]
+fn a_covered_gate_in_a_box_run_or_with_local_reads_no_routing_file() {
+    let facts = desktop_facts(Some(r#"{"yaat": ["dotnet test*"]}"#), &["dotnet test*"]);
+    let command = words(&["dotnet", "test"]);
+    let in_box = Inputs {
+        parent: Nested::BoxRun,
+        ..covered(&command)
+    };
+    let local = Inputs {
+        local: true,
+        ..covered(&command)
+    };
+    for (case, inputs) in [("in a box run", in_box), ("with --local", local)] {
+        assert_eq!(decide(&inputs, &facts), SILENT, "{case}");
+    }
+    assert_eq!(facts.asked(), Vec::<String>::new());
+    assert_eq!(facts.desktop_read.get(), 0);
 }
 
 #[test]
@@ -3214,7 +3356,7 @@ fn an_unlisted_repo_never_reads_the_siblings_file() {
         (
             "covered",
             Inputs {
-                covering_parent: true,
+                parent: Nested::Covering,
                 ..heavy(&command)
             },
         ),
@@ -4403,7 +4545,7 @@ fn a_pin_under_a_covering_parent_is_refused() {
     let command = words(&["dotnet", "build"]);
     let facts = FakeFacts::with_config(with_builders(r#"{"yaat": ["dotnet *"]}"#, MAC_AND_WIN));
     let covered = Inputs {
-        covering_parent: true,
+        parent: Nested::Covering,
         ..pinned_to(&command, "win-2")
     };
     let refusal = refused(decide(&covered, &facts));

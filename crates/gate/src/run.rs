@@ -27,8 +27,8 @@ use gate_args::{
 use gate_inputs::glob::names_tmp;
 use gate_router::warm::{RecordRead, RecordState};
 use gate_router::{
-    BuildSettings, BuildTarget, DEFAULT_OUTPUTS, LaterCandidate, PinRefusal, Place, RemoteRun, Route, build_settings, builds_in_place, dotnet_builds,
-    dotnet_target, sdk_build_target, without_no_build, work_folder_key,
+    BuildSettings, BuildTarget, DEFAULT_OUTPUTS, LaterCandidate, Nested, PinRefusal, Place, RemoteRun, Route, build_settings, builds_in_place,
+    dotnet_builds, dotnet_target, sdk_build_target, without_no_build, work_folder_key,
 };
 use gate_state::{
     Estimate, FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RoutingFacts, RunFacts, RunTrace, StageFacts, StageOutcome,
@@ -1938,10 +1938,8 @@ impl<'a> Run<'a> {
 /// `None` for a run that goes on.
 fn ended_at_route(route: &Route, request: &RunRequest, log: &Log, console: &mut Console) -> Option<u32> {
     if matches!(route, Route::Refused(_)) {
-        if readies_log_first(request)
-            && let Err(error) = log.finish(console)
-        {
-            console.err(&format!("gate: cannot write to {}: {error}", log.path().display()));
+        if readies_log_first(request) {
+            finish_log(log, console);
         }
         return Some(u32::from(USAGE_STATUS));
     }
@@ -1949,6 +1947,13 @@ fn ended_at_route(route: &Route, request: &RunRequest, log: &Log, console: &mut 
         return prepare_log(log, console).err();
     }
     None
+}
+
+/// Appends the notes `console` holds to `log` ([`Log::finish`]); else says why.
+fn finish_log(log: &Log, console: &mut Console) {
+    if let Err(error) = log.finish(console) {
+        console.err(&format!("gate: cannot write to {}: {error}", log.path().display()));
+    }
 }
 
 /// Readies `log` for the run ([`Log::prepare`]); else says why, and the gate's failed status.
@@ -1962,25 +1967,32 @@ fn prepare_log(log: &Log, console: &mut Console) -> Result<(), u32> {
 impl Run<'_> {
     /// Decides where the command runs, and sets the remote tag of a routed run. A gate a parent's slot covers runs
     /// here, as does one whose light parent lends it its slot before it queues, while a critical request drains, which
-    /// is not routed ([`Run::on_parent`]); a run pinned with `--builder` asks for no lend, so it routes whatever a
-    /// critical request is doing. The route, and what the decision learnt of the gate's place in its worktree.
-    /// The hash of the warm-up file the route asks the builder's work folder to be warm with is kept for the call.
-    /// `given` holds the words as the caller wrote them for a run that dropped its `--no-build` before its route
+    /// is not routed ([`Run::on_parent`]) but is decided as a covered gate, so a desktop command says it runs here
+    /// ([`gate_router::LocalReason::DesktopUnderParent`]); a run pinned with `--builder` asks for no lend, so it routes
+    /// whatever a critical request is doing. The route, and what the decision learnt of the gate's place in its
+    /// worktree. The hash of the warm-up file the route asks the builder's work folder to be warm with is kept for the
+    /// call. `given` holds the words as the caller wrote them for a run that dropped its `--no-build` before its route
     /// ([`route::route`]).
     fn route(&mut self, environment: &Environment, given: Option<&[String]>, console: &mut Console) -> (Route, Placed) {
         if self.request.builder.is_none() && self.lend_before_queue(console) {
             self.lent = true;
-            return (Route::Local { reason: None }, Placed::NotAsked);
+            let decided = route::route(self.request, environment, (Nested::Covering, given), (self.root, &self.gate), console);
+            assert!(
+                matches!(decided.route, Route::Local { .. }),
+                "a covered gate's decision keeps it here: {:?}",
+                decided.route
+            );
+            return (decided.route, decided.placed);
         }
         // A gate inside a box run stays here as a covered gate does, saying nothing. A gate a commit run's slot covers
         // is asked as one under no parent, so a build in the commit's hooks still routes.
-        let covering = self.nesting.routes_as_covered();
+        let parent = self.nesting.nested();
         let route::Decided {
             mut route,
             placed: place,
             warm_hash,
             decision,
-        } = route::route(self.request, environment, (covering, given), (self.root, &self.gate), console);
+        } = route::route(self.request, environment, (parent, given), (self.root, &self.gate), console);
         self.warm_hash = warm_hash;
         self.would = Some(decision);
         self.may_reroute = !matches!(route, Route::Routed(_));
@@ -2234,10 +2246,12 @@ impl Run<'_> {
     /// a slot into `hold`, one whose parent's slot does not cover it saying so first, before any wait line. A light run
     /// its start decision kept here that a critical request holds back with no place beside it asks once whether its
     /// command would route on heavy ([`route::route_as_heavy`]): when it would, it says so, closes its log and runs on
-    /// the builder ([`Run::routed`]), its remote tag naming the request; a refusal or fallback, or a command that would
-    /// not route, sends it back to its wait here, keeping the instant it queued. A commit with a `stage` runs its
-    /// pre-commit hooks on that builder once it holds its own slot, and starts only as the stage says ([`Run::stage`]).
-    /// How the run ended; `None` when a Ctrl+C ended the wait for a slot or for the remote client to start.
+    /// the builder ([`Run::routed`]), its remote tag naming the request; a fallback, a command that would not route, or
+    /// a log in another worktree of its repo sends it back to its wait here, keeping the instant it queued; a command
+    /// the heavy decision refuses ends the run with the usage status ([`Run::route_held_back`]). A commit with a
+    /// `stage` runs its pre-commit hooks on that builder once it holds its own slot, and starts only as the stage says
+    /// ([`Run::stage`]). How the run ended; `None` when a Ctrl+C ended the wait for a slot or for the remote client to
+    /// start.
     fn here(&mut self, plan: Plan, stage: Option<&RemoteRun>, hold: &mut Hold, console: &mut Console) -> Option<Ended> {
         self.open_log(console);
         let nesting = self.nesting;
@@ -2472,22 +2486,35 @@ impl Run<'_> {
     /// Asks once whether the light run the critical request of gate `by` held back, out of the queue it joined at
     /// `queued`, would route on heavy, and runs it on the builder when it would ([`Run::here`]). How the run ended
     /// there; [`Remotely::Here`] when it goes back to its wait here, its command not routing or its route fallen back.
-    /// The lines the route says are held, not written to the log, as a heavy routed run's are before its log opens: a
-    /// fallback removes the log the client wrote, and the reopened log takes them, the fallback line after them.
+    /// A run the heavy decision refuses ends with the usage status, its lines appended to its log as a run refused at
+    /// its start writes them ([`ended_at_route`]). The lines the route says are held, not written to the log, as a heavy
+    /// routed run's are before its log opens: a fallback removes the log the client wrote, and the reopened log takes
+    /// them, the fallback line after them.
     fn route_held_back(&mut self, by: u32, queued: Instant, hold: &mut Hold, console: &mut Console) -> Remotely {
         self.may_reroute = false;
         self.queued_at = Some(queued);
         console.detach();
-        let routed = self
-            .would
-            .as_ref()
-            .and_then(|decision| route::route_as_heavy(self.request, decision, by, console));
-        let Some((remote, warm_hash)) = routed else {
-            // It waits on, held back like any light gate, its log taking the notes the decision held.
-            if let Some(writer) = &self.writer {
-                console.attach(writer);
+        let as_heavy = match &self.would {
+            Some(decision) => route::route_as_heavy(self.request, decision, by, console),
+            None => route::AsHeavy::Here,
+        };
+        let (remote, warm_hash) = match as_heavy {
+            route::AsHeavy::Routed(remote, warm_hash) => (remote, warm_hash),
+            route::AsHeavy::Here => {
+                // It waits on, held back like any light gate, its log taking the notes the decision held.
+                if let Some(writer) = &self.writer {
+                    console.attach(writer);
+                }
+                return Remotely::Here;
             }
-            return Remotely::Here;
+            route::AsHeavy::Refused => {
+                self.close_log(console);
+                finish_log(&self.log, console);
+                return Remotely::Ended(Ended {
+                    status: i64::from(USAGE_STATUS),
+                    facts: None,
+                });
+            }
         };
         self.close_log(console);
         self.warm_hash = warm_hash;
@@ -5613,11 +5640,14 @@ enum NotHere {
 }
 
 /// The line a routed run says as it ends, not running here, for `reason` from the builder `host` ([`NotHere`]): the
-/// fallback head ([`fallback_head`]), then [`PIN_NOT_HERE`] or [`DESKTOP_NOT_HERE`]; a desktop run whose `outcome` says
-/// the run call's connection was lost after the start says before it that the command may have run there.
+/// fallback head ([`fallback_head`]), then [`PIN_NOT_HERE`] or [`DESKTOP_NOT_HERE`]; a pinned or desktop run whose
+/// `outcome` says the run call's connection was lost after the start says before it that the command may have run there.
 fn not_here_line(host: &str, reason: FallbackReason, outcome: &RemoteOutcome, not_here: NotHere) -> String {
     let head = fallback_head(host, reason, outcome.detail.as_deref());
     match not_here {
+        NotHere::Pinned if outcome.lost_mid_run => {
+            format!("{head} after the command started; it may have run there; {PIN_NOT_HERE}")
+        }
         NotHere::Pinned => format!("{head}; {PIN_NOT_HERE}"),
         NotHere::Desktop if outcome.lost_mid_run => {
             format!("{head} after the command started; it may have run there; {DESKTOP_NOT_HERE}")
@@ -5825,7 +5855,7 @@ mod tests {
     use serde_json::{Map, Value};
 
     #[test]
-    fn a_desktop_run_lost_mid_run_says_it_may_have_run_there_and_a_pinned_one_keeps_its_line() {
+    fn a_desktop_or_pinned_run_lost_mid_run_says_it_may_have_run_there() {
         use gate_state::FallbackReason;
         let lost = RemoteOutcome {
             lost_mid_run: true,
@@ -5841,7 +5871,11 @@ mod tests {
         );
         assert_eq!(
             super::not_here_line("builder", FallbackReason::Rebooted, &lost, super::NotHere::Pinned),
-            "gate: remote builder rebooted; --builder given, so not running here"
+            "gate: remote builder rebooted after the command started; it may have run there; --builder given, so not running here"
+        );
+        assert_eq!(
+            super::not_here_line("builder", FallbackReason::Unreachable, &RemoteOutcome::default(), super::NotHere::Pinned),
+            "gate: remote builder unreachable; --builder given, so not running here"
         );
     }
 

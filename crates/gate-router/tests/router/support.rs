@@ -7,7 +7,7 @@ use gate_router::balance::{self, BuilderFigures};
 use gate_router::desktop::DesktopDeclaration;
 use gate_router::windows::WindowsChange;
 use gate_router::{
-    Builder, CarriedSibling, Config, ConfigProblem, CrossTarget, Facts, FolderId, GitignoredInput, Inputs, Pattern, Place, SiblingFolder,
+    Builder, CarriedSibling, Config, ConfigProblem, CrossTarget, Facts, FolderId, GitignoredInput, Inputs, Nested, Pattern, Place, SiblingFolder,
     SiblingRoot, Slot, Target,
 };
 
@@ -72,7 +72,7 @@ pub fn words(list: &[&str]) -> Vec<String> {
 pub fn heavy(words: &[String]) -> Inputs<'_> {
     Inputs {
         slot: Slot::Heavy,
-        covering_parent: false,
+        parent: Nested::None,
         local: false,
         git_hook: false,
         words,
