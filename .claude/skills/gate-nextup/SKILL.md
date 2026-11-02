@@ -204,7 +204,9 @@ This PC is cut over: every gate on it runs the installed `gate.exe`, and each bu
 
 After each landing whose diff changes code the local gate runs (the run, watchdog, slots, waiting, launch, the CLI and its subcommands, the journal, gate-state's writers) or code the builders run (`gate box` and its verbs), run the full suite (Gates) on that commit in the main checkout on `main`, and only when it passed, run `pwsh -NoProfile -File tools/install.ps1` from there, then `& "$env:LOCALAPPDATA\gate\bin\gate.exe" push`.
 
-The landing's report names the installed version and each builder's result line.
+Then run `pwsh -NoProfile -File tools/smoke-install.ps1` from the main checkout: it runs the installed gate once from a real Git Bash script (forked through MSYS's stub, which the suite never takes) and once from pwsh, and prints one verdict line. A `smoke: FAILED` line reinstalls the previous installed commit at once (`git worktree add .tmp/rollback <that commit>`, then `tools/install.ps1` and `gate push` from there), and the failure becomes an Urgent **add** with the verdict line.
+
+The landing's report names the installed version, each builder's result line and the smoke verdict.
 
 A landing that changes `tools/builder/install-toolchains.ps1` is followed by a run of each changed step on every builder: stage the landed copy (and `wsl-setup.sh`) in `C:\build-box\gate\` and run it elevated with `-User {builder user} -Only "<step>",...`, as `docs/routing-a-repo.md` ("Builder setup") gives it, once no gate is running there.
 
