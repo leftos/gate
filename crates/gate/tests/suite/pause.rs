@@ -127,9 +127,12 @@ fn child_stderr(case: &Case, log: &str) -> String {
     log_texts(&case.folder().join(log))
 }
 
-/// Returns once the child gate of the parent logging to `log` has said `needle` on its stderr.
-fn wait_for_child_stderr(case: &Case, log: &str, needle: &str) {
-    wait_until(&format!("{needle:?} on the child's stderr"), || child_stderr(case, log).contains(needle));
+/// Returns once the child gate of the parent logging to `log` has said `needle` on its stderr, waiting on the parent as
+/// [`wait_showing_child`] does, so a parent that ended first fails the case at once, with what the child said beside it.
+fn wait_for_child_stderr(parent: &Running, case: &Case, log: &str, needle: &str) {
+    wait_showing_child(parent, case, log, &format!("{needle:?} on the child's stderr"), || {
+        child_stderr(case, log).contains(needle)
+    });
 }
 
 /// Waits on the parent gate's own `wait_until`, and on a failed wait says what the child under it said by then, so a red
@@ -245,10 +248,10 @@ fn a_child_waiting_behind_a_holding_critical_gate_keeps_a_pause_marker_until_it_
     let parent = case.start(&parent_words("parent.log", &child_gate("child.log", &POLL)));
     let parent_pid = parent.id();
     let barrier = format!("gate: waiting for a heavy slot behind the critical request of gate {critical_pid}");
-    wait_for_child_stderr(&case, "parent.log", &barrier);
+    wait_for_child_stderr(&parent, &case, "parent.log", &barrier);
     let parent_start = started(parent_pid).expect("the parent gate runs");
 
-    wait_until("the pause marker of the waiting child, naming a child that runs", || {
+    parent.wait_until("the pause marker of the waiting child, naming a child that runs", || {
         marker_of(&case, parent_pid, parent_start).is_some_and(|marker| started(marker.pid) == Some(marker.start_ms))
     });
     let marker = marker_of(&case, parent_pid, parent_start).expect("the marker is there, and names its child");
@@ -259,7 +262,7 @@ fn a_child_waiting_behind_a_holding_critical_gate_keeps_a_pause_marker_until_it_
     assert_eq!(marker.parent_start_ms, parent_start);
 
     let_go(&go);
-    wait_until("the pause marker going as the child takes its slot", || {
+    parent.wait_until("the pause marker going as the child takes its slot", || {
         marker_of(&case, parent_pid, parent_start).is_none()
     });
     assert_passed(&parent.finish());
@@ -276,20 +279,21 @@ fn a_pause_marker_is_rewritten_every_pass_while_the_child_waits() {
     let parent = case.start(&parent_words("parent.log", &child_gate("child.log", &POLL)));
     let parent_pid = parent.id();
     wait_for_child_stderr(
+        &parent,
         &case,
         "parent.log",
         &format!("gate: waiting for a heavy slot behind the critical request of gate {critical_pid}"),
     );
     let parent_start = started(parent_pid).expect("the parent gate runs");
 
-    wait_until("the pause marker of the waiting child", || {
+    parent.wait_until("the pause marker of the waiting child", || {
         marker_of(&case, parent_pid, parent_start).is_some()
     });
     let marker = marker_of(&case, parent_pid, parent_start).expect("the marker is there");
     let path = v1::paused_dir(&case.root()).join(v1::pause_name(marker.parent_pid, marker.parent_start_ms, marker.pid, marker.start_ms));
     let first = modified(&path).expect("the marker has a last write");
 
-    wait_until("the marker written again on a later pass", || modified(&path) != Some(first));
+    parent.wait_until("the marker written again on a later pass", || modified(&path) != Some(first));
 
     let_go(&go);
     assert_passed(&parent.finish());
@@ -307,11 +311,12 @@ fn a_pause_marker_that_cannot_be_written_is_said_once() {
 
     let parent = case.start(&parent_words("parent.log", &child_gate("child.log", &HEARTBEATS)));
     wait_for_child_stderr(
+        &parent,
         &case,
         "parent.log",
         &format!("gate: waiting for a heavy slot behind the critical request of gate {critical_pid}"),
     );
-    wait_until("several passes of the child's wait", || {
+    parent.wait_until("several passes of the child's wait", || {
         child_stderr(&case, "parent.log").matches(STILL_WAITING).count() >= 3
     });
     let text = child_stderr(&case, "parent.log");
@@ -379,7 +384,7 @@ fn a_pause_marker_is_deleted_when_the_child_is_lent_its_parents_slot() {
     let parent = case.start(&parent_words("parent.log", &child_gate("child.log", &POLL)));
     let parent_pid = parent.id();
     let parent_start = started(parent_pid).expect("the parent gate runs");
-    wait_until("the pause marker of the waiting child", || {
+    parent.wait_until("the pause marker of the waiting child", || {
         marker_of(&case, parent_pid, parent_start).is_some()
     });
 
@@ -387,7 +392,7 @@ fn a_pause_marker_is_deleted_when_the_child_is_lent_its_parents_slot() {
     // is, while it does.
     request.holds = false;
     v1::write_ticket(&ticket, &request).expect("the critical ticket can be rewritten");
-    wait_until("the pause marker gone as the child is lent its parent's slot", || {
+    parent.wait_until("the pause marker gone as the child is lent its parent's slot", || {
         marker_of(&case, parent_pid, parent_start).is_none()
     });
     assert_passed(&parent.finish());
@@ -414,12 +419,13 @@ fn a_parent_whose_child_waits_behind_a_critical_request_is_not_stalled() {
     let mut parent = case.start(&run_words("parent.log", &PARENT_WATCH, &child));
     let parent_pid = parent.id();
     wait_for_child_stderr(
+        &parent,
         &case,
         "parent.log",
         &format!("gate: waiting for a heavy slot behind the critical request of gate {critical_pid}"),
     );
     let parent_start = started(parent_pid).expect("the parent gate runs");
-    wait_until("the pause marker of the waiting child, naming a child that runs", || {
+    parent.wait_until("the pause marker of the waiting child, naming a child that runs", || {
         marker_of(&case, parent_pid, parent_start).is_some_and(|marker| started(marker.pid) == Some(marker.start_ms))
     });
     let marker_seen = Instant::now();
@@ -460,12 +466,13 @@ fn a_covered_gate_whose_grandchild_waits_behind_a_critical_request_is_not_stalle
     let mut parent = case.start(&parent_words("parent.log", &covered));
     let parent_pid = parent.id();
     wait_for_child_stderr(
+        &parent,
         &case,
         "covered.log",
         &format!("gate: waiting for a heavy slot behind the critical request of gate {critical_pid}"),
     );
     let parent_start = started(parent_pid).expect("the parent gate runs");
-    wait_until("the pause marker of the waiting grandchild, named after the parent", || {
+    parent.wait_until("the pause marker of the waiting grandchild, named after the parent", || {
         marker_of(&case, parent_pid, parent_start).is_some_and(|marker| started(marker.pid) == Some(marker.start_ms))
     });
 
@@ -554,7 +561,12 @@ fn a_covered_gate_is_not_paused_by_a_sibling_waiting_under_its_parent() {
     ));
     let parent = case.start(&run_words("parent.log", &POLL, &covered));
     let parent_pid = parent.id();
-    wait_for_child_stderr(&case, "parent.log", &format!("gate: running under the light slot of gate {parent_pid}"));
+    wait_for_child_stderr(
+        &parent,
+        &case,
+        "parent.log",
+        &format!("gate: running under the light slot of gate {parent_pid}"),
+    );
     let parent_start = started(parent_pid).expect("the parent gate runs");
 
     // A sibling the parent started beside the covered gate waits behind the critical request under the parent's slot:
@@ -622,11 +634,12 @@ fn a_pause_folder_the_watchdog_cannot_read_is_said_once() {
     // fail before the child's fifth still-waiting line.
     let parent = case.start(&run_words("parent.log", &SAMPLED, &child_gate("child.log", &HEARTBEATS)));
     wait_for_child_stderr(
+        &parent,
         &case,
         "parent.log",
         &format!("gate: waiting for a heavy slot behind the critical request of gate {critical_pid}"),
     );
-    wait_until("several passes of the child's wait", || {
+    parent.wait_until("several passes of the child's wait", || {
         child_stderr(&case, "parent.log").matches(STILL_WAITING).count() >= 5
     });
 
