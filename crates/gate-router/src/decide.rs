@@ -507,11 +507,13 @@ pub enum Route {
     /// Here, a commit whose pre-commit hooks ([`STAGE_WORDS`]) run first on the Windows builder of this run, their
     /// fixes brought back to the index and the worktree before the commit itself runs here ([`commit_stage`]).
     Stage(Box<RemoteRun>),
-    /// Nowhere: a run pinned to one builder that cannot go to it, which the gate refuses before anything runs.
+    /// Nowhere: a run pinned to one builder that cannot go to it, or a desktop run that cannot route, which the gate
+    /// refuses before anything runs.
     Refused(PinRefusal),
 }
 
-/// Why a run cannot go on as asked: a pin that cannot be met, or a log in another worktree.
+/// Why a run cannot go on as asked: a pin that cannot be met, a log in another worktree, or a desktop run that cannot
+/// route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PinRefusal {
     /// The routing file is not there or cannot be used, for `why`.
@@ -533,7 +535,15 @@ pub enum PinRefusal {
         /// The run's worktree root, as git gave it.
         root: PathBuf,
     },
+    /// A desktop run (a consented `.gate/desktop.toml` pattern matched) that the decision would keep here, for `why`:
+    /// the text of the [`LocalReason::reason`] it would have said, or [`NO_DESKTOP_BUILDER`] for one it would have kept
+    /// here silently. A desktop run never runs here.
+    DesktopNotHere { why: String },
 }
+
+/// Why a desktop run the decision would keep here silently cannot route: no builder left once the macOS ones are
+/// steered off.
+const NO_DESKTOP_BUILDER: &str = "no builder remote.json lists can run a desktop run (a macOS builder has no desktop)";
 
 /// Why a pinned run on a covering parent's slot, or inside a box run, cannot route.
 const PIN_COVERED: &str = "a parent gate's slot covers this gate";
@@ -563,6 +573,15 @@ impl PinRefusal {
                 escaped(&root.display().to_string()),
                 cd_value(tree)
             ),
+            Self::DesktopNotHere { why } => format!("gate: not routed: {why}; a desktop run never runs here"),
+        }
+    }
+
+    /// The refusal of a desktop run the decision would keep `here`.
+    #[must_use]
+    pub fn desktop_not_here(here: Option<LocalReason>) -> PinRefusal {
+        PinRefusal::DesktopNotHere {
+            why: here.map_or_else(|| NO_DESKTOP_BUILDER.to_owned(), |reason| reason.reason()),
         }
     }
 }
@@ -999,6 +1018,10 @@ fn absent_line(names: &[String]) -> Option<String> {
 /// does not keep here runs here, saying why, when its learned local p50 proves it faster here than the builder the
 /// macOS and backslash steer-offs leave it ([`LocalReason::FasterHere`]).
 ///
+/// A desktop run, a command its `.gate/desktop.toml` (read right after `.gate/local.toml`) gives a pattern the routing
+/// file consents, never runs here: it skips the light-run speed check, and every later reason that would keep it here,
+/// a silent one included, refuses it instead ([`PinRefusal::DesktopNotHere`]).
+///
 /// A run pinned to one builder ([`Inputs::pin`]) goes to that builder alone, with no later candidates, or is refused
 /// ([`pinned`]).
 #[must_use]
@@ -1012,7 +1035,8 @@ pub fn decide(inputs: &Inputs<'_>, facts: &dyn Facts) -> Route {
     match route(inputs, facts) {
         Ok(Decided::Routed(run)) => Route::Routed(Box::new(run)),
         Ok(Decided::Stage(run)) => Route::Stage(Box::new(run)),
-        Err(reason) => Route::Local { reason },
+        Err(Unrouted::Here(reason)) => Route::Local { reason },
+        Err(Unrouted::Refused(refusal)) => Route::Refused(refusal),
     }
 }
 
@@ -1020,6 +1044,30 @@ pub fn decide(inputs: &Inputs<'_>, facts: &dyn Facts) -> Route {
 enum Decided {
     Routed(RemoteRun),
     Stage(RemoteRun),
+}
+
+/// Why an unpinned decision does not route the command: it runs here, saying why or silently, or, for a desktop run
+/// the decision would keep here once it knows it is one, it is refused ([`PinRefusal::DesktopNotHere`]).
+enum Unrouted {
+    Here(Here),
+    Refused(PinRefusal),
+}
+
+impl Unrouted {
+    /// What a decision that would keep the command `here` ends with: the refusal for a `desktop_run`, else here.
+    fn kept(desktop_run: bool, here: Here) -> Unrouted {
+        if desktop_run {
+            Unrouted::Refused(PinRefusal::desktop_not_here(here))
+        } else {
+            Unrouted::Here(here)
+        }
+    }
+}
+
+impl From<Here> for Unrouted {
+    fn from(here: Here) -> Unrouted {
+        Unrouted::Here(here)
+    }
 }
 
 /// The words a commit stage's builder runs: the repo's pre-commit hooks, over what the commit stages, with no file list.
@@ -1221,14 +1269,17 @@ struct Matched {
     built_here: BuiltHere,
 }
 
-fn route(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Decided, Here> {
+fn route(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Decided, Unrouted> {
     let config = configured(inputs, facts)?;
     if let Some(run) = commit_stage(&config, inputs, facts) {
         return Ok(Decided::Stage(run));
     }
     let config = routable(config, inputs)?;
     let matched = matched(&config, inputs, facts)?;
-    ended(&config, matched, inputs.words, facts).map(Decided::Routed)
+    let desktop_run = matched.desktop.is_some();
+    ended(&config, matched, inputs.words, facts)
+        .map(Decided::Routed)
+        .map_err(|here| Unrouted::kept(desktop_run, here))
 }
 
 /// Why the `matched` command whose `word` names a path outside the worktree runs here: the git worktree its outside
@@ -1751,7 +1802,7 @@ fn file_stem(path: &str) -> &str {
 /// A macOS pick runs the words rewritten with `/` ([`Separators::Slash`]) and its relative `\` paths the snapshot carries
 /// written with `/` ([`unix_form`]); a pick whose words still hold a `\` goes on, silently, to the next builder that is
 /// no macOS one ([`steer_off_backslashes`]).
-fn matched(config: &Config, inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Matched, Here> {
+fn matched(config: &Config, inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Matched, Unrouted> {
     let (git_hook, words) = (inputs.git_hook, inputs.words);
     let (opened, drives, sent) =
         opened_and_sent(config, git_hook, words, facts, |repo| config.is_routed(repo)).map_err(|unopened| unopened.here(git_hook))?;
@@ -1763,34 +1814,43 @@ fn matched(config: &Config, inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Ma
             words,
             drives: &drives,
         };
-        return Err(another_worktree(config, &unmatched, git_hook, facts));
+        return Err(another_worktree(config, &unmatched, git_hook, facts).into());
     }
     let given = inputs.given.map(|given| written(&opened, given, facts)).unwrap_or_default();
     check_local(&opened.place, &[&sent.words, &given], facts)?;
-    let local_p50 = (inputs.slot == Slot::Light)
-        .then(|| facts.local_p50(&opened.place, &sent.words))
-        .flatten();
-    let Scored { order, balanced, scores } = scored(matching, &opened.place, &sent.words, facts, local_p50);
-    let first = pick(&order, |_| true).ok_or(None)?;
-    let (builder, pattern, found) = steer_off_macos((config, &order), &opened, &sent.words, facts, first)?;
-    let unix = slashed(&builder, &opened, words, &drives, facts);
-    let (builder, pattern, unix) = steer_off_backslashes(&order, (builder, pattern, unix))?;
-    // Compared only now, so a builder the steer-offs turned away never sets the finish a light run must beat.
-    if let Some(reason) = proven_faster_here(local_p50, scores.as_ref(), &builder) {
-        return Err(Some(reason));
-    }
-    let later = later_candidates(&order, &builder);
-    let balanced = balanced.map(|balanced| picked_first(balanced, &builder));
-    let kept = Kept {
-        builder,
-        pattern,
-        found,
-        unix,
+    // Known before any steer-off, speed check or settling, so none of them keeps a desktop run here.
+    let found = desktop_pattern(&opened.place, &sent.words, facts)?;
+    let desktop_run = found
+        .as_ref()
+        .is_some_and(|(pattern, mode)| desktop_consent(config, &opened.repo, pattern, *mode).is_ok());
+    let picked = || -> Result<Matched, Here> {
+        // A desktop run always routes, so it asks no local p50 that only the speed check would use.
+        let local_p50 = (inputs.slot == Slot::Light && !desktop_run)
+            .then(|| facts.local_p50(&opened.place, &sent.words))
+            .flatten();
+        let Scored { order, balanced, scores } = scored(matching, &opened.place, &sent.words, facts, local_p50);
+        let first = pick(&order, |_| true).ok_or(None)?;
+        let (builder, pattern) = steer_off_macos((config, &order), &opened, &sent.words, facts, (first, &found))?;
+        let unix = slashed(&builder, &opened, words, &drives, facts);
+        let (builder, pattern, unix) = steer_off_backslashes(&order, (builder, pattern, unix))?;
+        // Compared only now, so a builder the steer-offs turned away never sets the finish a light run must beat.
+        if let Some(reason) = proven_faster_here(local_p50, scores.as_ref(), &builder) {
+            return Err(Some(reason));
+        }
+        let later = later_candidates(&order, &builder);
+        let balanced = balanced.map(|balanced| picked_first(balanced, &builder));
+        let kept = Kept {
+            builder,
+            pattern,
+            found: DesktopRead::Read(found.clone()),
+            unix,
+        };
+        let mut matched = built(config, opened, sent, kept, facts)?;
+        matched.later = later;
+        matched.balanced = balanced;
+        Ok(matched)
     };
-    let mut matched = built(config, opened, sent, kept, facts)?;
-    matched.later = later;
-    matched.balanced = balanced;
-    Ok(matched)
+    picked().map_err(|here| Unrouted::kept(desktop_run, here))
 }
 
 /// A builder the pipeline kept for the command, once its steer-off rules let it run it.
@@ -2166,8 +2226,8 @@ fn kept_run(config: &Config, sent: OpenedAndSent, chosen: (Builder, String), giv
     let (opened, drives, sent) = sent;
     let (builder, pattern) = chosen;
     check_local(&opened.place, &[&sent.words], facts).map_err(Unkept::Here)?;
-    let (found, unkept) = macos_kept_off(config, &builder, &opened, &sent.words, facts).map_err(Unkept::Here)?;
-    if let Some(unkept) = unkept {
+    let found = macos_desktop(&builder, &opened, &sent.words, facts).map_err(Unkept::Here)?;
+    if let Some(unkept) = macos_kept_off(config, &builder, &opened, (&sent.words, &found), facts) {
         return Err(unkept);
     }
     let unix = match slashed(&builder, &opened, given, &drives, facts) {
@@ -2555,26 +2615,29 @@ fn desktop_pattern(place: &Place, words: &[String], facts: &dyn Facts) -> Result
 /// a `dotnet test` of a Windows-only test project ([`macos_windows_only`]), or the change touches the paths of the
 /// worktree's `.gate/windows.toml` or cannot be told to ([`macos_windows_change`]), or the last build of a dotnet
 /// `test` or `run --no-build` ran here ([`macos_built_here`]): the pick then goes on to the next builder of the
-/// decision's score `order` that is no macOS one. Also what it read of the desktop file; `Err(None)` when no other
-/// builder's pattern matches, but for a run whose last build ran here, which runs here keeping its word
-/// ([`LocalReason::BuiltHere`]).
+/// decision's score `order` that is no macOS one. `found` is the first declared desktop pattern the command matches,
+/// already read. `Err(None)` when no other builder's pattern matches, but for a run whose last build ran here, which
+/// runs here keeping its word ([`LocalReason::BuiltHere`]).
 fn steer_off_macos(
     (config, order): (&Config, &[(Builder, String)]),
     opened: &Opened,
     words: &[String],
     facts: &dyn Facts,
-    first: (Builder, String),
-) -> Result<(Builder, String, DesktopRead), Here> {
-    let (read, unkept) = macos_kept_off(config, &first.0, opened, words, facts)?;
-    let Some(unkept) = unkept else {
-        return Ok((first.0, first.1, read));
+    (first, found): ((Builder, String), &Option<(String, DesktopMode)>),
+) -> Result<(Builder, String), Here> {
+    let read = if first.0.os == BuilderOs::Macos {
+        DesktopRead::Read(found.clone())
+    } else {
+        DesktopRead::NotRead
+    };
+    let Some(unkept) = macos_kept_off(config, &first.0, opened, (words, &read), facts) else {
+        return Ok(first);
     };
     let unpicked = match unkept {
         Unkept::BuiltHere(project) => Some(LocalReason::BuiltHere { project }),
         _ => None,
     };
-    let (builder, pattern) = pick(order, |builder| builder.os != BuilderOs::Macos).ok_or(unpicked)?;
-    Ok((builder, pattern, read))
+    pick(order, |builder| builder.os != BuilderOs::Macos).ok_or(unpicked)
 }
 
 /// What a pick of `builder` reads of the opened worktree's `.gate/desktop.toml` for the command `words`: the first
@@ -2646,17 +2709,16 @@ fn here_why(here: Here) -> String {
 /// a declared desktop pattern the command matches ([`macos_desktop`]), a Windows-only test ([`macos_windows_only`]), the
 /// change ([`macos_windows_change`]) or a last build that ran here ([`macos_built_here`]), each asked only when no
 /// earlier one keeps it off; `None` when none does, or
-/// for any other builder. Also what it read of the desktop file. The one list of these rules that the first pick
-/// ([`steer_off_macos`]) and a later or pinned builder ([`kept_run`]) both follow.
+/// for any other builder. `read` is what the pick read of the desktop file ([`macos_desktop`]). The one list of these
+/// rules that the first pick ([`steer_off_macos`]) and a later or pinned builder ([`kept_run`]) both follow.
 fn macos_kept_off(
     config: &Config,
     builder: &Builder,
     opened: &Opened,
-    words: &[String],
+    (words, read): (&[String], &DesktopRead),
     facts: &dyn Facts,
-) -> Result<(DesktopRead, Option<Unkept>), Here> {
-    let read = macos_desktop(builder, opened, words, facts)?;
-    let unkept = if read.steers_off() {
+) -> Option<Unkept> {
+    if read.steers_off() {
         Some(Unkept::Desktop)
     } else if macos_windows_only(builder, &opened.place, words, facts) {
         Some(Unkept::WindowsOnly)
@@ -2664,8 +2726,7 @@ fn macos_kept_off(
         Some(Unkept::WindowsChange(reason))
     } else {
         macos_built_here(builder, opened, facts).map(Unkept::BuiltHere)
-    };
-    Ok((read, unkept))
+    }
 }
 
 /// The key of the built-here record's entry that says the last build of the opened worktree's dotnet `test` or
@@ -2711,18 +2772,28 @@ fn check_desktop(config: &Config, target: &Target, read: DesktopRead, words: &[S
     let Some((pattern, mode)) = found else {
         return Ok(None);
     };
-    let consent = match mode {
-        DesktopMode::Locked => config.allowed_desktop(&target.repo),
-        DesktopMode::Session => config.allowed_desktop_session(&target.repo),
-    };
-    let (allowed, problem) = match consent {
-        Ok(patterns) => (patterns, None),
-        Err(problem) => (&[][..], Some(fold_lines(problem))),
-    };
-    if allowed.contains(&pattern) {
-        return Ok(Some(mode));
+    match desktop_consent(config, &target.repo, &pattern, mode) {
+        Ok(()) => Ok(Some(mode)),
+        Err(problem) => Err(Some(LocalReason::DesktopNotAllowed { pattern, mode, problem })),
     }
-    Err(Some(LocalReason::DesktopNotAllowed { pattern, mode, problem }))
+}
+
+/// Whether `remote.json` allows the repo `repo` the declared desktop `pattern` of `mode`, listed exactly (letter case
+/// included): its `desktop` for a locked pattern, its `desktopSession` for a session one.
+///
+/// # Errors
+///
+/// When it does not: why that key cannot be used, on one line, when it cannot.
+fn desktop_consent(config: &Config, repo: &str, pattern: &str, mode: DesktopMode) -> Result<(), Option<String>> {
+    let consent = match mode {
+        DesktopMode::Locked => config.allowed_desktop(repo),
+        DesktopMode::Session => config.allowed_desktop_session(repo),
+    };
+    match consent {
+        Ok(allowed) if allowed.iter().any(|listed| listed == pattern) => Ok(()),
+        Ok(_) => Err(None),
+        Err(problem) => Err(Some(fold_lines(problem))),
+    }
 }
 
 /// A worktree whose repo the routing file lists, with the siblings its siblings file declares, not yet checked.

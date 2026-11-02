@@ -178,9 +178,10 @@ impl Decision {
 /// here when there is a reason to say, or the lines of a routed run, then the problem of its repo's `.gate/env.toml`
 /// when it has one ([`declared_prefixes`]), and the line of the watched variables it does not send ([`dropped_line`]),
 /// the names the repo's declared prefixes start among them, after them. A command that would route but has a word that
-/// is not valid Unicode runs here, saying so. A gate under a `covering_parent`'s slot runs here, saying nothing. A run
-/// that dropped its `--no-build` before its decision names the words the caller wrote as `given`, which the repo's
-/// `.gate/local.toml` is matched against too ([`Inputs::given`]). With
+/// is not valid Unicode runs here, saying so, but for a desktop run, which is refused ([`PinRefusal::DesktopNotHere`]).
+/// A gate under a `covering_parent`'s slot runs here, saying nothing. A run that dropped its `--no-build` before its
+/// decision names the words the caller wrote as `given`, which the repo's `.gate/local.toml` is matched against too
+/// ([`Inputs::given`]). With
 /// the route, what the decision learnt of the gate's place in its git worktree, and, for a routed run of a repo whose
 /// warm-up is set up, the hash of its warm-up file ([`consented_hash`]).
 pub(crate) fn route(
@@ -197,11 +198,14 @@ pub(crate) fn route(
         .reading_figures(FigureReader::of(request, root, gate));
     machine.run_log = run_log(request);
     let route = match decide(&decision.inputs(slot(request.slot)), &machine) {
-        Route::Routed(_) if !decision.unicode => match &decision.pin {
+        Route::Routed(run) if !decision.unicode => match &decision.pin {
             Some(host) => Route::Refused(PinRefusal::CannotRoute {
                 host: host.clone(),
                 why: NOT_UNICODE.to_owned(),
             }),
+            None if run.desktop.is_some() => Route::Refused(PinRefusal::desktop_not_here(Some(LocalReason::Failed {
+                reason: NOT_UNICODE.to_owned(),
+            }))),
             None => Route::Local {
                 reason: Some(LocalReason::Failed {
                     reason: NOT_UNICODE.to_owned(),

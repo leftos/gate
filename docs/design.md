@@ -896,6 +896,10 @@ The lines of a run that starts its command:
 
   It is also said for a word of the command that is not valid Unicode (`gate: not routed: a word of the command is not valid Unicode`), or a fact that could not be read (`gate: not routed: cannot run git: <error>`, or the working directory or git's output).
 
+  A desktop run (a command matching a consented `.gate/desktop.toml` pattern, [Routing](#routing), the decision) is never kept here for a reason found after that match: the line is `gate: not routed: <the reason's usual text>; a desktop run never runs here` and the gate ends with exit 2 before anything runs, as a refused pin does. The reasons are the siblings, outside-word, nothing-sent, gitignored-input, built-here, unreadable-fact and not-Unicode ones above.
+
+  A desktop run whose only candidates are `macos` builders says `gate: not routed: no builder remote.json lists can run a desktop run (a macOS builder has no desktop); a desktop run never runs here`.
+
   These lines keep a matched command here for siblings: a problem with the repo's `.gate/siblings.toml` (`gate: not routed: .gate/siblings.toml: <problem>`, control characters and reordering marks escaped) and a root folder name the builder cannot lay out while a sibling is carried (`gate: not routed: the worktree folder name <leaf> cannot be laid out on the builder`).
 
   A declared sibling with no worktree beside the root is absent and keeps nothing here: the run routes without it ([Routing](#routing)).
@@ -2304,7 +2308,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
 - **What routes** is kept (T2): a heavy or light gate, not `--local`, under no covering or lending parent (a commit run's slot is not one for this rule, [Commit run](#critical-drain-and-nesting)), outside a git hook (`GIT_INDEX_FILE` set to a non-empty value) unless `remote.json`'s `hooks` names the repo, whose first word is not `git` or `prek`, in a git worktree of a repo `remote.json` lists, whose words with in-worktree paths rewritten (T3) match one of that repo's patterns.
 
-  A light gate routes as a heavy one does, unless its learned local time proves it faster here (**A light gate**, below); a light gate its start decision kept here is also sent to a builder when the critical barrier holds it back (**A light gate held back**, below). A critical or no-slot gate never routes.
+  A light gate routes as a heavy one does, unless its learned local time proves it faster here (**A light gate**, below; a desktop run is never kept here for that); a light gate its start decision kept here is also sent to a builder when the critical barrier holds it back (**A light gate held back**, below). A critical or no-slot gate never routes.
 
   **Which builder.** The builders that can take the run are the routed `builders` entries, in file order, whose own `repos.<repo>` patterns match the Windows-form rewritten words, then `host` when the top-level patterns match. One match takes the run; with two or more, the run goes to the one with the earliest expected finish, and a tie goes to the builder the worktree record lists, then to file order. A warm-up always goes to `host`.
 
@@ -2318,13 +2322,13 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   With nothing known (no free-slot difference, no duration, no record) file order decides. The figures are read once, at the decision, and the run says them in the `gate: balanced to` line and journals them as the release's `balanced` ([Journal](#journal)); a builder that filled since is corrected by the failover below, and nothing rescores.
 
-  A light run rerouted by a critical request and `gate warm` keep file order and read no figures; a later candidate rebuilt at the failover reads none either, and keeps its place in the scored order. Problem lines the figure read meets (a pool that cannot be probed or read) go to the run's log, once each. A command matching a `.gate/desktop.toml` pattern is never picked by a `macos` entry, nor is any command of a change that touches a `.gate/windows.toml` path or cannot be told to.
+  A light run rerouted by a critical request and `gate warm` keep file order and read no figures; a later candidate rebuilt at the failover reads none either, and keeps its place in the scored order. Problem lines the figure read meets (a pool that cannot be probed or read) go to the run's log, once each. A command matching a `.gate/desktop.toml` pattern is never picked by a `macos` entry (with no other builder left it is refused, Output lines), nor is any command of a change that touches a `.gate/windows.toml` path or cannot be told to.
 
   A `sendBuild` repo's `--no-build` test picked by a `macos` entry drops `--no-build` and sends no build, unless its last build ran here (the built-here record, [Glossary](GLOSSARY.md)): a dotnet `test` or `run --no-build` of that kind is kept off the Mac as a Windows-only test is, and goes to the next Windows builder with a send, else runs here.
 
   A run pinned with `--builder` never asks the record. The words sent to a `macos` builder use `/` inside the recognised path spans. A repo listed only in a `builders` entry is routed ([`gate check`](#gate-check) treats it so).
 
-  **A light gate.** A matched light command not kept here by `.gate/local.toml` is kept here when it is provably faster here: its learned local p50 is under 0.8 times the expected finish of the builder the run would go to. That builder is the best capable one left after the macOS and backslash steer-offs, and its finish is the score above, so a queue wait and a cold folder count.
+  **A light gate.** A matched light command not kept here by `.gate/local.toml`, and not a desktop run (which skips this comparison and always routes), is kept here when it is provably faster here: its learned local p50 is under 0.8 times the expected finish of the builder the run would go to. That builder is the best capable one left after the macOS and backslash steer-offs, and its finish is the score above, so a queue wait and a cold folder count.
 
   The local p50 is the median of the 5 newest passing runs of the command's exact key under the place `local`, with at least 5 runs in the window; a family key's estimate and a critical key's never count, nor does a run on a builder, whose key is the builder's. The comparison is strict: a tie routes, and so does a run with no local history, or whose chosen builder has no duration (no scored builder had one).
 
@@ -2693,7 +2697,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   The first pattern the words match keeps the run here with `gate: not routed: .gate/local.toml keeps it here (<pattern>)` (escaped). A file that cannot be used keeps every routed command of the repo here with `gate: not routed: .gate/local.toml: <problem>`, the first problem, on one line and escaped. Both journal `notRouted: "declared local"`, a copy from the declarations folder is named by its full path, and `gate check` does not report the file.
 
-  A command that needs the builder's desktop is declared in the repo's `.gate/desktop.toml` and consented to in `remote.json`'s `desktop` ([remote.json](#remotejson)); the check runs after the siblings checks and before the outside-path and nothing-sent checks, on a command the `repos` patterns matched, and the file is read from disk as it stands, through the same guarded read as `siblings.toml` (`.gate` and the file not followed as links, at most 64 KiB), or, when the worktree has no such file, from the repo's declarations folder ([remote.json](#remotejson), Declarations folder).
+  A command that needs the builder's desktop is declared in the repo's `.gate/desktop.toml` and consented to in `remote.json`'s `desktop` ([remote.json](#remotejson)); the check runs right after the `.gate/local.toml` check and before the siblings, outside-path and nothing-sent checks, on a command the `repos` patterns matched, and the file is read from disk as it stands, through the same guarded read as `siblings.toml` (`.gate` and the file not followed as links, at most 64 KiB), or, when the worktree has no such file, from the repo's declarations folder ([remote.json](#remotejson), Declarations folder).
 
   The first declared pattern the command's rewritten words match decides, matched against the same words joined by single spaces as the repo's `repos` patterns; a `patterns` entry is looked at before a `session` one, so a command matching both is a locked run. No file, empty lists or no matching pattern asks for nothing.
 
@@ -2701,9 +2705,11 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A `patterns` entry is listed in `desktop`, a `session` entry in `desktopSession`, and `desktop` never allows a session pattern.
 
-  A file that cannot be used keeps every routed command of the repo here with `gate: not routed: .gate/desktop.toml: <problem>`, the first problem, on one line and escaped; a copy read from the declarations folder is named by its full path in place of `.gate/desktop.toml`.
+  A file that cannot be used keeps every routed command of the repo here with `gate: not routed: .gate/desktop.toml: <problem>`, the first problem, on one line and escaped, said ahead of the later reasons (faster here, siblings, an outside word); a copy read from the declarations folder is named by its full path in place of `.gate/desktop.toml`.
 
   A consented match makes the run a desktop run: `RemoteRun.desktop` is the match's mode, locked or session, and the run call asks for the desktop (the client's Desktop bullet, below). A session run is a desktop run that needs the builder's console session but not the desktop lock.
+
+  A desktop run never runs here: `--local`, a `.gate/local.toml` match (read before the desktop decision), a pattern `remote.json` does not consent and an unusable `.gate/desktop.toml` still keep it here, but any reason found after the desktop match refuses it instead, with `gate: not routed: <the reason's usual text>; a desktop run never runs here` and exit 2, before anything runs, as a pin the decision refuses does (`PinRefusal::DesktopNotHere`). A desktop run whose only candidates are `macos` builders is refused the same way, with `no builder remote.json lists can run a desktop run (a macOS builder has no desktop)` as the reason. A light desktop run skips the faster-here comparison and always routes.
 
   git is found along the gate's own `PATH` (absolute entries only) and run by its full path from the gate's folder, with the `GIT_*` variables that point it at another repository, index or config removed and `core.fsmonitor` off and `core.hooksPath` pointing at a folder that cannot exist (inside the git program's own file), so a gate in a hook that exports `GIT_DIR` is judged by the repo it is in (it routes when `hooks` names that repo, [remote.json](#remotejson)) and no hook a repository's config names runs.
 
@@ -2715,7 +2721,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   The worktree comes from one `git rev-parse` run in the gate's folder, which is the `--cd` folder when given: a caller in a main checkout gates a worktree's command with `--cd <worktree>`.
 
-  It reads (root, prefix below the root and common git folder), and a folder below the root asks `git ls-files` whether the snapshot would send anything there (tracked or untracked and not ignored, and still on disk). A `subst` drive is followed through `gate_win32::device_target`. A word that is not valid Unicode keeps a command that would route here, saying so.
+  It reads (root, prefix below the root and common git folder), and a folder below the root asks `git ls-files` whether the snapshot would send anything there (tracked or untracked and not ignored, and still on disk). A `subst` drive is followed through `gate_win32::device_target`. A word that is not valid Unicode keeps a command that would route here, saying so; a desktop run is refused instead (`gate: not routed: a word of the command is not valid Unicode; a desktop run never runs here`).
 
   The queue line carries `notRouted` `--local` for a heavy or light `--local` gate, `faster here` for a light run proven faster here (never for a run that drops its `--no-build`, which is decided as heavy, [Routing](#routing), "A light gate"), `another worktree`, `declared local` or `gitignored input` for the runs those reasons keep here, the run's `--reason` text after it, and the remote tag for a routed one.
 

@@ -178,9 +178,11 @@ A repo with a routed command that needs the builder's logged-on desktop (a GUI t
 
 The PC consents in `remote.json`: `"desktop": {"<repo>": ["dotnet test *Ui*"]}`, each pattern listed exactly as the file spells it, letter case included. The first declared pattern a command matches decides, and a command no pattern matches asks for no desktop.
 
+A desktop run never runs on the PC: a reason found after the pattern matched that would keep an ordinary command here (a siblings problem, a word outside the worktree, nothing to send, gitignored inputs it cannot carry, a fact that cannot be read, a word that is not valid Unicode, only macOS builders left) refuses it instead, `gate: not routed: <the reason>; a desktop run never runs here`, exit 2, before anything runs. A light desktop run is never kept here as faster here. `--local`, a `.gate/local.toml` match, a pattern without consent and an unusable `.gate/desktop.toml` still keep it here.
+
 Without the consent the command runs here with `gate: not routed: desktop pattern '<pattern>' not allowed in remote.json`.
 
-A `.gate/desktop.toml` the gate cannot use keeps every routed command of the repo here with `gate: not routed: .gate/desktop.toml: <problem>`, so fix it before relying on routing. A desktop run holds a remote slot while it waits for the desktop, up to the larger of 60 s and its usual routed p90, and the waiting box names the run that holds the desktop. Format and rules: [design.md](design.md#remotejson).
+A `.gate/desktop.toml` the gate cannot use keeps every routed command of the repo here with `gate: not routed: .gate/desktop.toml: <problem>`, said ahead of any later reason, so fix it before relying on routing. A desktop run holds a remote slot while it waits for the desktop, up to the larger of 60 s and its usual routed p90, and the waiting box names the run that holds the desktop. Format and rules: [design.md](design.md#remotejson).
 
 ### A command that needs only the console session
 

@@ -2048,6 +2048,67 @@ fn a_command_matching_a_consented_desktop_pattern_asks_the_client_for_the_deskto
     assert_eq!(call["desktop"], json!(true), "{call}");
 }
 
+/// Declares `*tool* mark*` in the case's `.gate/desktop.toml` and writes a routing file routing `*tool*` that consents
+/// it, so a `.\tool.exe mark <file> …` command is a desktop run whose run would leave the marker `file`.
+fn declare_marking_desktop(case: &Case) {
+    let folder = case.folder();
+    fs::create_dir_all(folder.join(".gate")).expect("the .gate folder can be made");
+    fs::write(folder.join(".gate").join("desktop.toml"), "patterns = ['*tool* mark*']\n").expect("the declaration can be written");
+    let routing = json!({ "host": HOST, "repos": { repo(case): ["*tool*"] }, "desktop": { repo(case): ["*tool* mark*"] } });
+    write_remote_json(case, &routing.to_string());
+}
+
+/// Runs the desktop run `.\tool.exe mark <marker> out x`, then `extra`, as a routed heavy gate of `case` whose client
+/// would record its call; the outcome, whether the client ran and whether the command ran.
+fn run_marking_desktop(case: &Case, extra: &[&OsStr]) -> (Outcome, bool, bool) {
+    declare_marking_desktop(case);
+    let (call, marker) = (case.folder().join("call.json"), case.folder().join("marker"));
+    let steps = shown(&stub(case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let marker_word = shown(&marker);
+    let mut gate = case.gate(&routed_words(
+        "out.log",
+        &steps,
+        &[],
+        &[r".\tool.exe", "mark", marker_word.as_str(), "out", "x"],
+    ));
+    gate.args(extra);
+    let outcome = finish(gate);
+    (outcome, call.exists(), marker.exists())
+}
+
+#[test]
+fn a_desktop_command_naming_a_path_outside_the_worktree_is_refused_not_run_here() {
+    let case = routed_case("routing-desktop-outside");
+    let (outcome, called, ran) = run_marking_desktop(&case, &[OsStr::new(FAKE_TOOL)]);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains(&format!(
+            "gate: not routed: {FAKE_TOOL} is outside the worktree; a desktop run never runs here\n"
+        )),
+        "{outcome:?}"
+    );
+    assert!(!called, "the client never ran: {outcome:?}");
+    assert!(!ran, "the command never ran here: {outcome:?}");
+}
+
+#[test]
+fn a_desktop_command_with_a_word_that_is_not_unicode_is_refused() {
+    let case = routed_case("routing-desktop-not-unicode");
+    let word = OsString::from_wide(&[u16::from(b'x'), 0xD800]);
+    let (outcome, called, ran) = run_marking_desktop(&case, &[&word]);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: not routed: a word of the command is not valid Unicode; a desktop run never runs here\n"),
+        "{outcome:?}"
+    );
+    assert!(!called, "the client never ran: {outcome:?}");
+    assert!(!ran, "the command never ran here: {outcome:?}");
+}
+
 #[test]
 fn a_declared_desktop_pattern_the_routing_file_does_not_allow_runs_here_saying_so() {
     let case = routed_case("routing-desktop-not-allowed");

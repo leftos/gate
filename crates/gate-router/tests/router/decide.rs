@@ -4695,13 +4695,170 @@ fn a_command_matching_a_desktop_pattern_is_never_picked_by_a_macos_builder() {
     );
 
     let facts = builder_desktop_facts(r#"{"other": ["*"]}"#, MAC_BUILD, &["dotnet build*"], &[]);
-    assert_eq!(decide(&heavy(&command), &facts), SILENT, "no other builder runs it");
+    assert_eq!(
+        decide(&heavy(&command), &facts),
+        desktop_refused(NO_DESKTOP_BUILDER),
+        "no other builder runs it"
+    );
 
     let facts = builder_desktop_facts(r#"{"yaat": ["dotnet *"]}"#, MAC_BUILD, &["dotnet test*"], &[]);
     let run = routed(decide(&heavy(&command), &facts));
     assert_eq!(run.builder.alias, "mac-1", "a command no desktop pattern matches stays on the Mac");
     assert_eq!(run.desktop, None);
     assert_eq!(facts.desktop_read.get(), 1, "the desktop file is read once");
+}
+
+/// Why a desktop run with no builder left once the macOS ones are steered off is refused.
+const NO_DESKTOP_BUILDER: &str = "no builder remote.json lists can run a desktop run (a macOS builder has no desktop)";
+
+/// The refusal of a desktop run the decision would keep here for `why`.
+fn desktop_refused(why: &str) -> Route {
+    Route::Refused(PinRefusal::DesktopNotHere { why: why.to_owned() })
+}
+
+/// `base` under the routing file `{"host": "builder-1", <rest>, "desktop": {"yaat": ["dotnet *"]}}`, its
+/// `.gate/desktop.toml` declaring `declared`.
+fn desktop_run_facts(rest: &str, declared: &[&str], base: FakeFacts) -> FakeFacts {
+    let text = format!(r#"{{"host": "builder-1", {rest}, "desktop": {{"yaat": ["dotnet *"]}}}}"#);
+    FakeFacts {
+        config: Ok(Some(Config::parse(&text).expect("usable"))),
+        desktop: Ok(declaration(declared, &[])),
+        ..base
+    }
+}
+
+/// The facts of [`a_light_gate_proven_faster_here_stays_here_and_says_why`], its `.gate/desktop.toml` declaring
+/// `declared` and the routing file consenting `dotnet *`.
+fn faster_desktop_facts(declared: &[&str]) -> FakeFacts {
+    let base = FakeFacts {
+        local_p50: Some(9.0),
+        ..FakeFacts::at_root()
+    };
+    let rest = format!(r#""repos": {{"other": ["*"]}}, "builders": {TWO_WINDOWS}"#);
+    desktop_run_facts(&rest, declared, base)
+        .with_figures("win-2", figures(0.0, Some(14.0)))
+        .with_figures("win-3", figures(0.0, Some(20.0)))
+}
+
+#[test]
+fn a_light_desktop_run_proven_faster_here_still_routes() {
+    let facts = faster_desktop_facts(&["dotnet *"]);
+    let run = routed(decide(&light(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(run.builder.alias, "win-2");
+    assert_eq!(run.desktop, Some(DesktopMode::Locked));
+    assert_eq!(facts.local_p50_asked.get(), 0, "a desktop run asks no local p50");
+}
+
+#[test]
+fn a_declared_local_pattern_keeps_a_consented_desktop_command_here() {
+    let facts = FakeFacts {
+        local: Ok(patterns(&["dotnet test*"])),
+        ..desktop_facts(Some(r#"{"yaat": ["dotnet test*"]}"#), &["dotnet test*"])
+    };
+    let route = decide(&heavy(&words(&["dotnet", "test"])), &facts);
+    assert_eq!(
+        route,
+        Route::Local {
+            reason: Some(LocalReason::DeclaredLocal {
+                file: ".gate/local.toml".to_owned(),
+                pattern: "dotnet test*".to_owned(),
+            })
+        }
+    );
+}
+
+#[test]
+fn a_light_run_no_desktop_pattern_matches_proven_faster_here_still_stays_here() {
+    let facts = faster_desktop_facts(&["dotnet test*"]);
+    assert_eq!(
+        local_line(&decide(&light(&words(&["dotnet", "build"])), &facts)).as_deref(),
+        Some("gate: not routed: faster here: about 9 s here, win-2 about 14 s")
+    );
+}
+
+#[test]
+fn a_desktop_run_whose_only_candidates_are_macos_builders_is_refused() {
+    let facts = builder_desktop_facts(r#"{"other": ["*"]}"#, MAC_BUILD, &["dotnet build*"], &[]);
+    let route = decide(&heavy(&words(&["dotnet", "build"])), &facts);
+    assert_eq!(route, desktop_refused(NO_DESKTOP_BUILDER));
+    assert_eq!(
+        local_line(&route).as_deref(),
+        Some("gate: not routed: no builder remote.json lists can run a desktop run (a macOS builder has no desktop); a desktop run never runs here")
+    );
+}
+
+#[test]
+fn a_desktop_run_with_a_siblings_problem_is_refused() {
+    let base = FakeFacts {
+        siblings: Err("bad".to_owned()),
+        ..FakeFacts::at_root()
+    };
+    let facts = desktop_run_facts(r#""repos": {"yaat": ["dotnet *"]}"#, &["dotnet *"], base);
+    assert_eq!(
+        decide(&heavy(&words(&["dotnet", "test"])), &facts),
+        desktop_refused(".gate/siblings.toml: bad")
+    );
+}
+
+#[test]
+fn a_desktop_run_naming_a_path_outside_the_worktree_is_refused() {
+    let facts = desktop_facts(Some(r#"{"yaat": ["dotnet test*"]}"#), &["dotnet test*"]);
+    let route = decide(&heavy(&words(&["dotnet", "test", r"..\other\x.csproj"])), &facts);
+    assert_eq!(route, desktop_refused(r"..\other\x.csproj is outside the worktree"));
+    assert_eq!(
+        local_line(&route).as_deref(),
+        Some(r"gate: not routed: ..\other\x.csproj is outside the worktree; a desktop run never runs here")
+    );
+}
+
+#[test]
+fn a_desktop_run_whose_folder_holds_nothing_the_snapshot_sends_is_refused() {
+    let base = FakeFacts {
+        has_files: Ok(false),
+        ..FakeFacts::at("src/empty/")
+    };
+    let facts = desktop_run_facts(r#""repos": {"yaat": ["dotnet *"]}"#, &["dotnet *"], base);
+    assert_eq!(
+        decide(&heavy(&words(&["dotnet", "test"])), &facts),
+        desktop_refused("src/empty holds nothing the snapshot sends")
+    );
+}
+
+#[test]
+fn a_desktop_run_naming_a_gitignored_input_it_cannot_carry_is_refused() {
+    let facts = desktop_run_facts(r#""repos": {"yaat": ["*"]}"#, &["dotnet *"], probe_of(past_bytes()));
+    let command = words(&["dotnet", "test", r".tmp\probe", "-p:Extra=.tmp/x.props"]);
+    assert_eq!(decide(&heavy(&command), &facts), desktop_refused(&past_cap("65 MiB in 2 files")));
+}
+
+#[test]
+fn a_desktop_run_built_here_whose_send_cannot_be_made_is_refused() {
+    let base = FakeFacts {
+        built_here: Some("one".to_owned()),
+        ..FakeFacts::at_root()
+    };
+    let facts = desktop_run_facts(r#""repos": {"yaat": ["dotnet *"]}, "sendBuild": []"#, &["dotnet *"], base);
+    let command = words(&["dotnet", "test", "One/One.csproj", "-c", "Release", "--no-build", "-o", "out"]);
+    assert_eq!(
+        decide(&heavy(&command), &facts),
+        desktop_refused("the last build of one ran here; --no-build kept")
+    );
+}
+
+#[test]
+fn local_on_a_desktop_command_still_keeps_it_here() {
+    let facts = desktop_facts(Some(r#"{"yaat": ["dotnet test*"]}"#), &["dotnet test*"]);
+    let command = words(&["dotnet", "test"]);
+    let inputs = Inputs {
+        local: true,
+        ..heavy(&command)
+    };
+    assert_eq!(
+        decide(&inputs, &facts),
+        Route::Local {
+            reason: Some(LocalReason::LocalFlag)
+        }
+    );
 }
 
 #[test]
