@@ -31,12 +31,13 @@ Take the first row that holds, then record the decision with `watch_local.py mar
 | 2 | `matched=since` | Covered now. Mark `routed`, note `pattern added since`. |
 | 3 | `fellBack=` | A route failed and fell back. Book it with the reason, mark `booked`. |
 | 4 | `reason=declared local` | The repo keeps it here in `.gate/local.toml`. Mark `local`, its reason there as the note. |
-| 5 | `reason=--local: <text>` where the text names this PC's own state | Mark `local`, the reason as the note. |
+| 5 | `reason=--local: <text>` where the text names something no work can move off this PC | Mark `local`, the reason as the note. |
 | 5a | `reason=` any other value: `--local` with a removable reason, `sibling absent`, `gitignored input`, `another worktree` | The gate said why it stayed. Book that cause, mark `booked`. |
 | 5b | `matched=yes` and `reason=none` | A matching command stayed here with no reason given. Book it, mark `booked`. |
 | 6 | The command drives this PC's own state: a window, a GPU session, an install into this PC's folders, a rig or measurement of its own processes, a build whose exes are started on this PC by a repo with no `outputs` for them | Mark `local`, the reason as the note. |
-| 7 | The repo is not a key of `remote.json`'s `repos` | **Add** one step under GATE-192 (Remote routing for every caller repo) for the repo, unless an open one names it, mark `booked`. |
-| 8 | The shape holds `.tmp/*` | Scratch work. Under 1800 `seconds`, mark `local`, note `scratch`. At 1800 or more, read the script: if row 6 fits, take it; else book asking how the repo should run this job routed, mark `booked`. |
+| 7 | The repo is `(no repo)` | No repo owns it. Mark `local`, note `no repo`. |
+| 7a | The repo is not a key of `remote.json`'s `repos` | **Add** one step under GATE-192 (Remote routing for every caller repo) for the repo, unless an open one names it, mark `booked`. |
+| 8 | The shape holds `.tmp/*` | Scratch work. Add up `seconds` across every shape of one script. Under 1800, mark `local`, note `scratch`. At 1800 or more, read the script: if row 6 fits, take it; else book asking how the repo should run this job routed, mark `booked`. A script no longer on disk is judged by its arguments. |
 | 9 | The clear-route test below passes | Apply the pattern, mark `routed`. |
 | 10 | Anything else | Book what blocks the route, mark `booked`. |
 
@@ -48,7 +49,7 @@ A reason work can remove never makes a shape `local` (census, "Sort every heavy 
 
 All three must hold:
 
-1. **The repo routes its kind.** `routed` is above 0, or `nearest` names a pattern with the same first two words, or for a shell the same script.
+1. **The repo routes its kind.** `routed` is above 0, or `nearest` names a pattern with the same first two words; for a shell or interpreter, the same script.
 2. **Nothing here needs what it makes.** It is a test, lint, check, format or analysis command, or a simulation that only prints; or it is a build, and the repo's routed builds of the same project already bring back what it makes. A script that does both counts as a build. Read the repo's `outputs` in `remote.json`. Windows outputs started on the PC must come from a Windows builder (`gate-nextup`, "What the Mac mini runs").
 3. **The builder can run it.** The repo has no `.gate/local.toml` pattern for it, every tool it names is on the builder (`gate check --builder <host>`), and it reads nothing outside the worktree that `docs/routing-a-repo.md` says a repo must declare.
 
