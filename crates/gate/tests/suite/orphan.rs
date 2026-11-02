@@ -4,6 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+use gate_win32::StoppableProcess;
+
 use crate::support::{Case, FAKE_TOOL, GATE, INHERITED, said_pid, shown, start, wait_for_file, wait_until};
 
 /// The case's `step.cmd` and the files it waits on and writes.
@@ -85,6 +87,9 @@ fn a_gate_whose_script_lost_its_caller_refuses_to_start() {
     let cmd_pid = said_pid(&started_said, "spawned ");
 
     let (status, stderr) = step.go_and_wait();
+    // The script's cmd.exe moves the status over the status file and exits after it, with no handle left that waits
+    // for it: the case waits for it to be gone, so nothing the script started outlives the case.
+    wait_for_gone(cmd_pid, "the script's cmd.exe");
 
     assert_eq!(status, "2", "the gate refuses with 2: {stderr}");
     assert_eq!(
@@ -146,6 +151,12 @@ fn git_bash() -> PathBuf {
 /// `path` with forward slashes, as a bash script names a Windows path.
 fn posix(path: &Path) -> String {
     shown(path).replace('\\', "/")
+}
+
+/// Returns once no process has `pid`: a script moves its status over the status file and ends after it, so the case
+/// waits under the hang guard for the script to be gone, and nothing it started still runs once the case ends.
+fn wait_for_gone(pid: u32, what: &str) {
+    wait_until(&format!("{what} {pid} ending"), || matches!(StoppableProcess::open(pid), Ok(None)));
 }
 
 /// How a `step.sh` reaches its gate.
@@ -326,6 +337,10 @@ fn a_gate_whose_git_bash_script_lost_its_shell_refuses_to_start() {
     fs::write(&step.go, "").expect("the go file can be written");
 
     let (status, said) = step.status();
+    // The script's own bash wrote the status and ends after it, the outer bash that forked it already killed and
+    // waited for: the case waits for the script to be gone, so nothing it started outlives the case.
+    let pid: u32 = script_pid.parse().expect("the ready file holds the script's bash's Windows pid");
+    wait_for_gone(pid, "the script's bash");
 
     assert_eq!(status, "2", "the gate refuses under a script whose shell was killed: {said}");
     let refused = format!("gate: refused: the script that started this gate lost its caller (bash.exe {script_pid}, whose parent ");
@@ -337,7 +352,8 @@ fn a_gate_whose_git_bash_script_lost_its_shell_refuses_to_start() {
     assert!(!said.contains("stop-tree"), "the refusal advises no stop-tree: {said}");
 }
 
-/// Writes `case`'s `step.sh` for a gate under a live gate: `/usr/bin` put on its PATH, then an outer gate run on a
+/// Writes `case`'s `step.sh` for a gate under a live gate: `/usr/bin` put on its PATH, the script's own Windows pid
+/// written whole to `script.pid` beside its script, then an outer gate run on a
 /// `pwsh -Command` that writes the ready file, waits for the go file with `fake-tool wait`, removes every variable a
 /// gate around the suite may set, the nesting markers among them, from its own environment and runs an inner gate on a
 /// trivial command, ending with the inner gate's status; the outer gate's status, written to a file moved over the
@@ -359,11 +375,17 @@ fn write_nested(case: &Case) -> BashStep {
         root = shown(&case.root()),
         inner = shown(&folder.join("inner.log")),
     );
+    let written_pid = posix(&folder.join("script.tmp"));
+    let script_pid = posix(&folder.join("script.pid"));
     let body = format!(
         "PATH=/usr/bin:$PATH\n\
+         cat /proc/$$/winpid > '{written_pid}'\n\
+         mv '{written_pid}' '{script_pid}'\n\
          MSYS_NO_PATHCONV=1 '{gate}' run --state-dir '{root}' --slot none --timeout 3600 --log '{log}' --test-poll-ms 20 \
          -- pwsh -NoProfile -Command \"{command}\"\n\
          {tail}",
+        written_pid = written_pid,
+        script_pid = script_pid,
         gate = posix(Path::new(GATE)),
         root = posix(&case.root()),
         log = posix(&step.log),
@@ -384,6 +406,11 @@ fn a_gate_under_a_live_gate_whose_script_lost_its_shell_runs() {
     fs::write(&step.go, "").expect("the go file can be written");
 
     let (status, said) = step.status();
+    // The script's own bash wrote the status and ends after it, the outer bash that forked it killed and waited for:
+    // the case waits for the script to be gone, so nothing it started outlives the case.
+    let pid = fs::read_to_string(step.go.with_file_name("script.pid")).expect("the script's pid can be read");
+    let pid: u32 = pid.trim().parse().expect("the script's pid file holds a Windows pid");
+    wait_for_gone(pid, "the script's bash");
 
     assert_eq!(status, "0", "the inner gate runs under a live gate whose script lost its shell: {said}");
     assert!(!said.contains("refused"), "the inner gate refuses nothing: {said}");
