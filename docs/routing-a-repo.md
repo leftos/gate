@@ -212,7 +212,7 @@ Declare it under a third key, `hidden = ["dotnet test *Ui*"]`, beside `patterns`
 
 The PC consents with an exact entry in `desktop.<repo>` or `desktopSession.<repo>`; there is no key of its own. Without it the command runs here with `gate: not routed: desktop hidden pattern '<pattern>' not allowed in remote.json desktop or desktopSession`.
 
-To prove a command there before moving it, run `gate run --desktop hidden -- <command>`: a command matching a declared and consented pattern of any mode runs as a hidden run, this run only, and `--builder <host>` may pin it.
+To prove a command there before moving it, run `gate run --desktop hidden -- <command>`: a command matching a declared and consented pattern of any mode runs as a hidden run, this run only, and `--builder <host>` may pin it. The log's hand-off line (`gate: the desktop helper pid=<h> started the command pid=<c> on the hidden desktop gate-<32 hex>`) shows it ran there; a locked or session run says `on the visible desktop`.
 
 It is refused, exit 2, when the command matches no pattern of `.gate/desktop.toml` (`gate: --desktop hidden needs a command matching a pattern of .gate/desktop.toml`), when the pattern is not allowed (`gate: --desktop hidden needs the desktop pattern '<pattern>' allowed in remote.json`), under a parent gate, with `--local` or a `critical` or `none` slot, or for any reason that keeps a routed command here;
 

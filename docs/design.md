@@ -2730,7 +2730,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A consented match makes the run a desktop run: `RemoteRun.desktop` is the match's mode, locked, session or hidden, and the run call asks for the desktop (the client's Desktop bullet, below). A session run is a desktop run that needs the builder's console session but not the desktop lock; a hidden run is a session run whose command starts on a desktop of its own that no one sees (The hidden desktop, in The desktop run's design).
 
-  `gate run --desktop hidden` makes a run whose command matches a declared pattern of any mode, and that `remote.json` allows the repo under that pattern's own mode (a `hidden` pattern in either key), a hidden run, this run only.
+  `gate run --desktop hidden` makes a run whose command matches a declared pattern of any mode, and that `remote.json` allows the repo under that pattern's own mode (a `hidden` pattern in either key), a hidden run, this run only. The run's log shows the proof: the hand-off line names `the hidden desktop gate-<32 hex>`.
 
   The run is refused, exit 2 before anything runs, with `gate: --desktop hidden needs a command matching a pattern of .gate/desktop.toml`, `gate: --desktop hidden needs the desktop pattern '<pattern>' allowed in remote.json` (ending `: <problem>` when the value cannot be used),
 
@@ -4149,7 +4149,7 @@ Built verbs:
 
   Bare, byte for byte: the start marker, every refusal tag (`busy` included), the kill tag, the adjusted line, the outputs line and the heartbeat. The process lines come from a thread of its own under the output lock, and none follows the box's final lines. The stamp is read once the line's lock is held.
 
-  On the desktop route the command's parent is the helper, a process outside the run's job, so the hand-off writes `gate: the desktop helper pid=<h> started the command pid=<c>`, and the process tree joins the command to the box through it.
+  On the desktop route the command's parent is the helper, a process outside the run's job, so the hand-off writes `gate: the desktop helper pid=<h> started the command pid=<c> on the hidden desktop gate-<32 hex>` for a hidden run or `... on the visible desktop` for a locked or session run, and the process tree joins the command to the box through it.
 
   The heartbeat: `gate box run` writes `gate-remote-heartbeat: <cpu ms>` on stderr every 5 s, on `gate-watchdog`'s `BeatClock` and `Pump`. Before the command starts (from just before the checkout) and after the command's wait ends it is not CPU-gated, so every period writes a beat, the first one period after it begins.
 

@@ -211,9 +211,10 @@ pub(super) fn hand_off(here: &Here<'_, '_>, console: &mut Console) -> Result<Ran
         Err(fault) => return Err(ended_on(here, fault, pinned, &job, console)),
     };
     let helper = pinned.pid;
+    let desktop = desktop_said(here.take, &pinned.arg0);
     release_helper(here, pinned, console);
     let beat = here.beat;
-    beat.say(console, &parent_line(helper, suspended.pid()));
+    beat.say(console, &parent_line(helper, suspended.pid(), &desktop));
     if let Some(park) = beat.seams.park_launch.as_deref() {
         wait_for_path(park, console);
     }
@@ -264,9 +265,23 @@ pub(super) fn hand_off(here: &Here<'_, '_>, console: &mut Console) -> Result<Ran
 }
 
 /// The line naming the desktop helper `helper`, a process outside the run's job, as the parent of the command
-/// `command` it created, so the run's process tree joins the command to the box through it.
-fn parent_line(helper: u32, command: u32) -> String {
-    format!("gate: the desktop helper pid={helper} started the command pid={command}")
+/// `command` it created, so the run's process tree joins the command to the box through it, and the desktop `desktop`
+/// the command runs on.
+fn parent_line(helper: u32, command: u32, desktop: &str) -> String {
+    format!("gate: the desktop helper pid={helper} started the command pid={command} on {desktop}")
+}
+
+/// The desktop a run's command runs on, as its hand-off line names it: the hidden desktop the helper made, by its
+/// name, or the visible one.
+fn desktop_said(take: DesktopTake, arg0: &str) -> String {
+    if take.hidden() {
+        match gate_desktop::hidden_desktop_name(arg0) {
+            Some(name) => format!("the hidden desktop {name}"),
+            None => format!("a hidden desktop whose name the box cannot read from Arg0 '{arg0}'"),
+        }
+    } else {
+        "the visible desktop".to_owned()
+    }
 }
 
 /// Makes the control pipe, starts the helper's task in the console session with the pipe's name, and checks the
@@ -420,7 +435,7 @@ fn exchange(here: &Here<'_, '_>, pinned: &Pinned, job: &Job, program: FileIdenti
         environment: prepared.environment.as_wide().to_vec(),
         stdout: given(stdout_write)?,
         stderr: given(stderr_write)?,
-        hidden: matches!(here.take, DesktopTake::Session { hidden: true }),
+        hidden: here.take.hidden(),
     };
     let pipes = Pipes {
         stdout: stdout_read,
@@ -1214,7 +1229,8 @@ mod tests {
     use crate::boxside::desktop::lines::DesktopRefusal;
 
     use super::{
-        EndingHelper, HelperEnd, SweptHelper, SweptMachine, SweptProcess, end_within, helper_not_ended, identity_of, sweep_on, unlisted_line,
+        DesktopTake, EndingHelper, HelperEnd, SweptHelper, SweptMachine, SweptProcess, desktop_said, end_within, helper_not_ended, identity_of,
+        sweep_on, unlisted_line,
     };
 
     /// A case's own temp folder, removed with everything in it when the case ends, also when it fails.
@@ -1225,6 +1241,19 @@ mod tests {
             // Nothing here may fail a case that is already ending; a folder left behind is only temp clutter.
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn desktop_said_names_the_desktop_its_command_runs_on() {
+        let hex = "0123456789abcdef0123456789abcdef";
+        let pipe = format!(r"\\.\pipe\{}-{hex}", gate_desktop::PIPE_PREFIX);
+        let made = gate_desktop::arg0(4242, &pipe).expect("the pipe's name makes an Arg0");
+        let hidden = DesktopTake::Session { hidden: true };
+
+        assert_eq!(desktop_said(hidden, &made), format!("the hidden desktop gate-{hex}"));
+        assert_eq!(desktop_said(DesktopTake::Session { hidden: false }, &made), "the visible desktop");
+        assert_eq!(desktop_said(DesktopTake::Locked { wait: 5 }, &made), "the visible desktop");
+        assert_eq!(desktop_said(hidden, "x"), "a hidden desktop whose name the box cannot read from Arg0 'x'");
     }
 
     #[test]

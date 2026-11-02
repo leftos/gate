@@ -13,7 +13,7 @@ use gate_wire::build_version;
 use windows_sys::Win32::System::SystemServices::SECURITY_MANDATORY_MEDIUM_RID;
 
 use crate::protocol::{DEFAULT_DESKTOP, FRAME_LIMIT, Message, ReadError, Spawn, WriteError, read_message, write_message};
-use crate::{CONNECT_LIMIT, DONE_LIMIT, HelperExit, MESSAGE_LIMIT, parse_arg0};
+use crate::{CONNECT_LIMIT, DONE_LIMIT, HelperExit, MESSAGE_LIMIT, desktop_name, parse_arg0};
 
 /// `ERROR_FILE_NOT_FOUND`: no pipe of the name exists yet.
 const ERROR_FILE_NOT_FOUND: i32 = 2;
@@ -373,7 +373,7 @@ fn hidden_desktop(hidden: bool, random: &str) -> Result<Option<HiddenDesktop>, H
     if Fault::asked() == Some(Fault::NoDesktop) {
         return Err(HelperExit::SetupFailed);
     }
-    HiddenDesktop::create(&format!("gate-{random}"))
+    HiddenDesktop::create(&desktop_name(random))
         .map(Some)
         .map_err(|_| HelperExit::SetupFailed)
 }

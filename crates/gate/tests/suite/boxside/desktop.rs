@@ -1036,6 +1036,13 @@ fn is_hidden_desktop(name: &str, outcome: &Outcome) {
     );
 }
 
+/// The one hand-off line of `outcome`: the desktop helper's start of the command, naming the desktop it ran on.
+fn hand_off_line(outcome: &Outcome) -> String {
+    let lines = lines_starting(outcome, "gate: the desktop helper pid=");
+    assert_eq!(lines.len(), 1, "one hand-off line: {outcome:?}");
+    lines[0].to_string()
+}
+
 #[test]
 fn a_hidden_desktop_run_runs_its_command_on_a_desktop_of_its_own() {
     let case = Case::new("desktop_hidden_own");
@@ -1053,6 +1060,10 @@ fn a_hidden_desktop_run_runs_its_command_on_a_desktop_of_its_own() {
     assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
     let name = desktop_named(&named);
     is_hidden_desktop(&name, &outcome);
+    assert!(
+        hand_off_line(&outcome).ends_with(&format!(" on the hidden desktop {name}")),
+        "the log names the hidden desktop the command ran on: {outcome:?}"
+    );
     // The stand-in helper made it in the suite's own window station, where the case can look for it.
     let left = gate_win32::desktop_exists(&name).expect("the desktop is looked for");
     assert!(!left, "the hidden desktop is gone once the run has ended: {outcome:?}");
@@ -1121,6 +1132,10 @@ fn a_session_run_writes_no_holder_record() {
     ran_its_command(&outcome, &payload);
     assert!(!kept, "a session run keeps no holder record while its command runs: {outcome:?}");
     assert!(!record.exists(), "a session run leaves no holder record: {outcome:?}");
+    assert!(
+        hand_off_line(&outcome).ends_with(" on the visible desktop"),
+        "a session run's log names the visible desktop: {outcome:?}"
+    );
 }
 
 #[test]
@@ -1138,6 +1153,10 @@ fn a_locked_run_still_waits_behind_a_held_lock() {
     assert_eq!(outcome.code, Some(0), "the locked run took the desktop once it was free: {outcome:?}");
     assert_eq!(lines_starting(&outcome, BUSY_WAIT), [BUSY_WAIT], "the busy line, once: {outcome:?}");
     ran_its_command(&outcome, &payload);
+    assert!(
+        hand_off_line(&outcome).ends_with(" on the visible desktop"),
+        "a locked run's log names the visible desktop: {outcome:?}"
+    );
 }
 
 #[test]

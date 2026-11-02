@@ -155,6 +155,18 @@ pub fn arg0(box_pid: u32, pipe: &str) -> Option<String> {
     (box_pid != 0 && is_pipe_hex(hex)).then(|| format!("{box_pid}:{hex}"))
 }
 
+/// The name of the hidden desktop a run's command gets, `gate-<random>`, from the run's `Arg0` as [`arg0`] writes it;
+/// `None` for an `Arg0` not of that form.
+#[must_use]
+pub fn hidden_desktop_name(arg0: &str) -> Option<String> {
+    parse_arg0(arg0).map(|(_, _, random)| desktop_name(random))
+}
+
+/// The hidden desktop's name for a pipe's random part.
+pub(crate) fn desktop_name(random: &str) -> String {
+    format!("gate-{random}")
+}
+
 /// The box's pid, the pipe's full name and its random part, the checked hex, from `Arg0`; `None` unless it is
 /// `<pid>:<hex>`, the pid all ASCII digits, with no leading 0, and not 0, and the hex exactly 32 lowercase hex digits:
 /// the form [`arg0`] writes. The name is always built here, never taken from `Arg0`.
@@ -177,7 +189,7 @@ fn is_pipe_hex(hex: &str) -> bool {
 mod tests {
     use gate_win32::TaskArgument;
 
-    use super::{HELPER_FILE, HelperExit, PIPE_PREFIX, arg0, helper_path, parse_arg0};
+    use super::{HELPER_FILE, HelperExit, PIPE_PREFIX, arg0, helper_path, hidden_desktop_name, parse_arg0};
 
     #[test]
     fn every_exit_code_has_a_why_and_maps_back() {
@@ -236,6 +248,16 @@ mod tests {
             None,
             "the random part is lowercase hex"
         );
+    }
+
+    #[test]
+    fn a_hidden_desktop_is_named_from_the_runs_arg0() {
+        let hex = "0123456789abcdef0123456789abcdef";
+        let pipe = format!(r"\\.\pipe\{PIPE_PREFIX}-{hex}");
+        let written = arg0(7, &pipe).expect("the pipe's name makes an Arg0");
+
+        assert_eq!(hidden_desktop_name(&written), Some(format!("gate-{hex}")));
+        assert_eq!(hidden_desktop_name("7:xyz"), None, "an Arg0 not of the form names no desktop");
     }
 
     #[test]

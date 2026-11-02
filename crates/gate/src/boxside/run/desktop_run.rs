@@ -55,6 +55,13 @@ pub(super) enum DesktopTake {
     Session { hidden: bool },
 }
 
+impl DesktopTake {
+    /// Whether the run's command gets a hidden desktop of its own.
+    pub(super) fn hidden(self) -> bool {
+        matches!(self, DesktopTake::Session { hidden: true })
+    }
+}
+
 /// Why the console's session could not be read whole.
 #[derive(Debug)]
 enum Unread {
