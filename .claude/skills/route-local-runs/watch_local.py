@@ -2,10 +2,10 @@
 
 Reads the gate journal's release lines, groups the heavy runs that stayed here for
 at least a minimum time into normalized command shapes, and prints for each pending
-shape whether a ``remote.json`` pattern matches its latest run the way the gate's
-``-like`` match reads it and whether that pattern was in force when the run started,
-how many of the repo's command family routed instead, the nearest pattern of that
-family and how it differs, so the session can decide whether to route it.
+shape whether a pattern matched its latest run, as the gate journalled it, or matches
+its words now, as ``gate remote match`` says, how many of the repo's command family
+routed instead, the nearest pattern of that family and how it differs, so the session
+can decide whether to route it. The gate is the only matcher.
 
 A shape is pending until it is marked ``local`` or ``booked``, and an unmarked shape
 stays in every report with the lines it last had; a shape marked ``routed`` that ran
@@ -24,11 +24,13 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
 import zlib
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -46,8 +48,6 @@ TMP_PATTERN = re.compile(r"(?<![\w./\\:])\.tmp/[^\s\"']+")
 # A number that stands as a word or follows `=`: a digit, then digits and `.,:-`, then
 # whitespace or the end. A digit inside a name (`net8.0`) or a path (`5.2/b.exe`) stays.
 NUMBER_TOKEN = re.compile(r"(?<=[\s=])\d[\d.,:-]*(?=\s|$)")
-# The gate's backup of `remote.json`: `remote.json.bak-[<tag>-]<stamp>[-<n>]`.
-BACKUP_STEM = r"\.bak-(?:.+-)?(\d{8}T\d{6}Z)(?:-\d+)?"
 CURSOR_HOURS = 24
 ARCHIVE_DAYS = 7
 DEFAULT_MIN_SECONDS = 60.0
@@ -60,10 +60,41 @@ STILL_LOCAL = "STILL-LOCAL-AFTER-FIX"
 UNREAD = object()
 # The census's name for a repo, where the key `remote.json` uses for it differs.
 GATE_KEYS = {"claude-config": "claude"}
+# The `notRouted` token of a command none of its repo's patterns matched.
+NO_PATTERN = "no pattern"
+# What asks the gate which pattern a command of a repo matches, without the two operands.
+MATCH_CALL = ("pwsh", "-NoProfile", "-File", "tools/gate.ps1", "remote", "match")
+# Whether a pattern of the repo matches the words now.
+Ask = Callable[[str, str], bool]
 
 
 class LocalRunsError(Exception):
     """A file the run cannot read or write, said as ``local-runs: <text>``."""
+
+
+def gate_match(repo: str, text: str) -> bool:
+    """Whether a pattern of ``repo`` matches ``text`` now, as ``gate remote match`` says.
+
+    Status 0 is a match and 1 none; any other status raises with the command and its
+    output.
+    """
+    command = [*MATCH_CALL, repo, text]
+    shown = " ".join(command)
+    try:
+        done = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError as error:
+        raise LocalRunsError(f"cannot run {shown}: {error}") from error
+    if done.returncode not in (0, 1):
+        output = (done.stdout + done.stderr).strip()
+        raise LocalRunsError(f"{shown} ended with status {done.returncode}: {output}")
+    return done.returncode == 0
 
 
 @dataclass
@@ -77,6 +108,7 @@ class Options:
     settle: float = DEFAULT_SETTLE
     poll: float = DEFAULT_POLL
     hours: float = DEFAULT_HOURS
+    ask: Ask = gate_match
 
 
 # ---------------------------------------------------------------- paths
@@ -116,63 +148,23 @@ def utcnow() -> datetime:
 # ---------------------------------------------------------------- shapes
 
 
-def without_folder(text: str, folder: str) -> str:
-    """``text`` with each path starting at ``folder`` made relative.
+def words_of(event: dict[str, Any]) -> str:
+    """The words a run's shape is read from: those the gate matched, else its command.
 
-    ``folder`` is removed wherever it starts a path, in both separator forms and in any
-    letter case, so two worktrees of one repo share a shape.
+    A ``--local`` run and a line written before the gate journalled its words have only
+    the command.
     """
-    result = text
-    if folder:
-        for form in (folder, folder.replace("\\", "/")):
-            result = re.sub(re.escape(form) + r"[\\/]", "", result, flags=re.IGNORECASE)
-    return result
+    return str(event.get("sentWords") or event.get("command") or "")
 
 
-def root_of(cwd: str) -> str:
-    """The folder paths are named from: the first at or above ``cwd`` holding ``.git``, else ``cwd``."""
-    folder = Path(cwd)
-    while True:
-        if (folder / ".git").exists():
-            return str(folder)
-        parent = folder.parent
-        if parent == folder:
-            return cwd
-        folder = parent
+def shape_of(text: str) -> str:
+    """A command's shape: ``\\`` becomes ``/``, ``.tmp`` paths are starred, numbers folded.
 
-
-class Roots:
-    """The root of a working folder, cached one answer per folder."""
-
-    def __init__(self) -> None:
-        self._cache: dict[str, str] = {}
-
-    def __call__(self, cwd: str) -> str:
-        if cwd not in self._cache:
-            self._cache[cwd] = root_of(cwd)
-        return self._cache[cwd]
-
-
-def sent_text(command: str, cwd: str) -> str:
-    """The words the gate matches a pattern against: bare program, unquoted, from the root."""
-    words = census.split_command(command)
-    if not words:
-        return ""
-    words[0] = census.program_name(words[0])
-    return without_folder(" ".join(words), ROOTS(cwd))
-
-
-def shape_of(command: str, cwd: str) -> str:
-    """A command's shape: the sent words, with ``.tmp`` paths starred and numbers folded.
-
-    The words are those the gate matches, so a quoted or absolute path is relative to
-    the worktree root; then ``\\`` becomes ``/``, each ``.tmp/`` path after a word's
-    start becomes ``.tmp/*`` (a quoted path keeps its closing quote), and each number
-    that stands as a word or follows ``=`` becomes ``#``, so two runs differing only in
-    a seed, a count or a rate share one shape.
+    Each ``.tmp/`` path after a word's start becomes ``.tmp/*`` (a quoted path keeps its
+    closing quote), and each number that stands as a word or follows ``=`` becomes ``#``,
+    so two runs differing only in a seed, a count or a rate share one shape.
     """
-    text = TMP_PATTERN.sub(".tmp/*", sent_text(command, cwd).replace("\\", "/"))
-    return NUMBER_TOKEN.sub("#", text)
+    return NUMBER_TOKEN.sub("#", TMP_PATTERN.sub(".tmp/*", text.replace("\\", "/")))
 
 
 def shape_id(repo: str, shape: str) -> str:
@@ -237,7 +229,6 @@ class JournalCache:
 
 CACHE = JournalCache()
 NAMER = census.RepoNamer()
-ROOTS = Roots()
 
 
 def recent(path: Path, cutoff: datetime) -> bool:
@@ -387,11 +378,10 @@ def counted_runs(
         seconds = wall_seconds(event)
         if moment is None or start is None or seconds is None:
             continue
-        cwd = str(event.get("cwd") or "")
         runs.append(
             Run(
-                repo=NAMER(cwd),
-                shape=shape_of(str(event.get("command") or ""), cwd),
+                repo=NAMER(str(event.get("cwd") or "")),
+                shape=shape_of(words_of(event)),
                 at=moment,
                 started=start,
                 seconds=seconds,
@@ -593,145 +583,18 @@ def load_patterns(path: Path) -> dict[str, list[str]]:
     return patterns_of(remote)
 
 
-def patterns_at(remote: Path, repo: str, when: datetime) -> list[str]:
-    """The repo's patterns in force at ``when``, read from the backups beside ``remote``.
-
-    A ``gate remote`` backup is named ``<remote name>.bak-[<tag>-]<YYYYMMDD>T<HHMMSS>Z[-<n>]``
-    and holds the file as it was just before that moment, so the earliest backup stamped
-    after ``when`` holds what was in force then. A name that does not parse is skipped,
-    and a backup that is not JSON moves on to the next later one. With no later backup,
-    the current file decides.
-    """
-    stem = re.escape(remote.name) + BACKUP_STEM
-    later: list[tuple[datetime, Path]] = []
-    for path in remote.parent.glob(remote.name + ".bak-*"):
-        found = re.fullmatch(stem, path.name)
-        if found is None:
-            continue
-        moment = backup_time(found.group(1))
-        if moment is not None and moment > when:
-            later.append((moment, path))
-    for _moment, path in sorted(later, key=lambda entry: (entry[0], entry[1].name)):
-        backup = backup_patterns(path)
-        if backup is not None:
-            return patterns_for(backup, repo)
-    return patterns_for(load_patterns(remote), repo)
-
-
-def backup_time(stamp_text: str) -> datetime | None:
-    """A backup name's stamp as an aware UTC time, or None when it does not parse."""
-    try:
-        return datetime.strptime(stamp_text, "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
-    except ValueError:
-        return None
-
-
-def backup_patterns(path: Path) -> dict[str, list[str]] | None:
-    """A backup's patterns, or None when it cannot be read as JSON."""
-    try:
-        return patterns_of(json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, json.JSONDecodeError):
-        return None
+def gate_key(repo: str) -> str:
+    """The key ``remote.json`` uses for a repo the census names."""
+    return GATE_KEYS.get(repo.lower(), repo)
 
 
 def patterns_for(patterns: dict[str, list[str]], repo: str) -> list[str]:
     """A repo's patterns, matched by its gate key in any letter case, none when it has no entry."""
-    key = GATE_KEYS.get(repo.lower(), repo).lower()
+    key = gate_key(repo).lower()
     for name, values in patterns.items():
         if name.lower() == key:
             return values
     return []
-
-
-def matches(patterns: list[str], text: str) -> bool:
-    """Whether any pattern takes the whole text, as the gate's ``-like`` match reads it."""
-    return any(like(pattern, text) for pattern in patterns)
-
-
-def like(pattern: str, text: str) -> bool:
-    """Whether the gate's ``-like`` match takes the whole text.
-
-    ``*`` is any run of characters, ``?`` one character, ``[...]`` one character of a
-    set whose ``a-z`` entries are ranges, and a backtick makes the next character
-    literal, compared ignoring case. A pattern that does not parse, an unclosed ``[``
-    or a range whose start is above its end, matches nothing.
-    """
-    translated = translate_pattern(pattern)
-    if translated is None:
-        return False
-    return re.fullmatch(translated, text, re.IGNORECASE | re.DOTALL) is not None
-
-
-def translate_pattern(pattern: str) -> str | None:
-    """A ``-like`` pattern as an ``re`` pattern, or None when it does not parse."""
-    parts: list[str] = []
-    index = 0
-    while index < len(pattern):
-        char = pattern[index]
-        if char == "*":
-            parts.append(".*")
-        elif char == "?":
-            parts.append(".")
-        elif char == "`":
-            if index + 1 < len(pattern):
-                index += 1
-                parts.append(re.escape(pattern[index]))
-            else:
-                parts.append(re.escape(char))
-        elif char == "[":
-            found = translate_set(pattern, index)
-            if found is None:
-                return None
-            parts.append(found[0])
-            index = found[1]
-            continue
-        else:
-            parts.append(re.escape(char))
-        index += 1
-    return "".join(parts)
-
-
-def translate_set(pattern: str, start: int) -> tuple[str, int] | None:
-    """The ``re`` of the set at ``start`` and the index after its ``]``, or None when it does not parse."""
-    units: list[tuple[str, bool]] = []
-    index = start + 1
-    just_opened = True
-    while index < len(pattern):
-        char = pattern[index]
-        if char == "`" and index + 1 < len(pattern):
-            units.append((pattern[index + 1], False))
-            just_opened = False
-            index += 2
-            continue
-        if char == "]" and not just_opened:
-            fragment = set_pattern(units)
-            return None if fragment is None else (fragment, index + 1)
-        units.append((char, char == "-"))
-        just_opened = False
-        index += 1
-    return None
-
-
-def set_pattern(units: list[tuple[str, bool]]) -> str | None:
-    """One ``re`` alternation for a set: a unit, an unescaped ``-`` and a unit make a range."""
-    parts: list[str] = []
-    index = 0
-    while index < len(units):
-        if index + 2 < len(units) and units[index + 1][1]:
-            low, high = units[index][0], units[index + 2][0]
-            if ord(low) > ord(high):
-                return None
-            parts.append(f"[{unit(low)}-{unit(high)}]")
-            index += 3
-        else:
-            parts.append(unit(units[index][0]))
-            index += 1
-    return "(?:" + "|".join(parts) + ")" if parts else "(?!)"
-
-
-def unit(char: str) -> str:
-    """One character as a ``re`` escape no class metacharacter can confuse."""
-    return f"\\u{ord(char):04x}" if ord(char) <= 0xFFFF else f"\\U{ord(char):08x}"
 
 
 def nearest_pattern(patterns: list[str], shape: str) -> str | None:
@@ -773,18 +636,19 @@ def differs(nearest: str, shape: str) -> list[str]:
     return missing + extra
 
 
-def match_state(
-    patterns: list[str],
-    remote: Path,
-    group: Group,
-    text: str,
-    when: datetime,
-) -> str:
-    """Whether a pattern matches now (``yes``), only since the run (``since``), or never (``no``)."""
-    if not matches(patterns, text):
+def match_state(event: dict[str, Any], repo: str, ask: Ask) -> str:
+    """What the gate says of a run's patterns: ``yes``, ``since`` or ``no``.
+
+    A run the gate gave no words matched nothing it can tell of (``no``). One it says
+    matched no pattern is ``since`` when a pattern matches its words now, else ``no``; any
+    other run with words matched a pattern at the run (``yes``).
+    """
+    sent = event.get("sentWords")
+    if not sent:
         return "no"
-    repo = group.repo
-    return "yes" if matches(patterns_at(remote, repo, when), text) else "since"
+    if event.get("notRouted") != NO_PATTERN:
+        return "yes"
+    return "since" if ask(gate_key(repo), str(sent)) else "no"
 
 
 # ---------------------------------------------------------------- facts
@@ -815,9 +679,8 @@ def routed_counter(events: list[dict[str, Any]]) -> Counter[tuple[str, str]]:
     for event in events:
         if event.get("event") != "release" or event.get("remote") is not True:
             continue
-        cwd = str(event.get("cwd") or "")
-        shape = shape_of(str(event.get("command") or ""), cwd)
-        counter[(NAMER(cwd).lower(), census.family_of(shape))] += 1
+        repo = NAMER(str(event.get("cwd") or "")).lower()
+        counter[(repo, census.family_of(shape_of(words_of(event))))] += 1
     return counter
 
 
@@ -834,19 +697,16 @@ def block_of(
     *,
     patterns: dict[str, list[str]],
     counter: Counter[tuple[str, str]],
-    remote: Path,
+    ask: Ask,
     state: dict[str, Any],
 ) -> list[str]:
     """One shape's report block: its line, then its shape, nearest and differs lines."""
     own = patterns_for(patterns, group.repo)
     latest = group.latest
-    text = sent_text(
-        str(latest.event.get("command") or ""), str(latest.event.get("cwd") or "")
-    )
     facts = [
         f"runs={len(group.runs)}",
         f"seconds={group.seconds}",
-        f"matched={match_state(own, remote, group, text, latest.started)}",
+        f"matched={match_state(latest.event, group.repo, ask)}",
         f"routed={routed_count(counter, group)}",
         f"reason={reason_of(latest.event)}",
     ]
@@ -890,7 +750,7 @@ def report(options: Options, view: View, cursor: datetime) -> list[str]:
             group,
             patterns=patterns,
             counter=counter,
-            remote=options.remote,
+            ask=options.ask,
             state=state,
         )
         for group in pending

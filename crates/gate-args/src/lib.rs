@@ -36,7 +36,7 @@ pub use request::{
     DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, DesktopMode, DesktopSession, DrainAction, DrainRequest, DrainSeams, ExpectRequest, HoldRequest,
     Invocation, ProcessScan, PruneRequest, PruneSeams, PushRequest, PushSeams, RunRequest, Slot, StopRequest, TestSeams,
 };
-pub use request::{REMOTE_BUILDER_SECTIONS, REMOTE_SECTIONS, RemoteRequest, RemoteVerb};
+pub use request::{REMOTE_BUILDER_SECTIONS, REMOTE_SECTIONS, RemoteMatchRequest, RemoteRequest, RemoteVerb};
 pub use usage::USAGE;
 pub use values::{
     EnvRefusal, GATE_NAME_PREFIX, GATE_SET_NAMES, GATE_SET_PREFIXES, GIT_READ_NAMES, MACHINE_PATH_NAMES, MOST_ENV_BYTES, MOST_ENV_NAMES, env_refusal,
@@ -81,7 +81,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Invocation, Vec<Problem>> {
         "push" => cli::parse_push(rest.into_iter()).map(Invocation::Push),
         "drain" => cli::parse_drain(rest.into_iter()).map(Invocation::Drain),
         "prune" => cli::parse_prune(rest.into_iter()).map(Invocation::Prune),
-        "remote" => remote::parse(rest.into_iter()).map(Invocation::Remote),
+        "remote" => remote::parse(rest.into_iter()),
         "check" => cli::parse_check(rest.into_iter()).map(Invocation::Check),
         "warm" => cli::parse_warm(rest.into_iter()).map(Invocation::Warm),
         "burn" => cli::parse_burn(rest.into_iter()).map(Invocation::Burn),

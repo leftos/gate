@@ -41,6 +41,8 @@ pub enum Invocation {
     Warm(WarmRequest),
     /// `gate remote add|remove`.
     Remote(RemoteRequest),
+    /// `gate remote match`.
+    RemoteMatch(RemoteMatchRequest),
     /// The hidden `gate box <verb> --stdin`, `gate box register-desktop`, or `gate box prune --root <folder>
     /// [--keys <key>...]`.
     Box(BoxRequest),
@@ -802,6 +804,15 @@ pub struct RemoteRequest {
     pub tag: Option<String>,
     /// `--dry-run`: say what would change, back up and write nothing.
     pub dry_run: bool,
+}
+
+/// A valid `gate remote match`: which pattern of `remote.json` a command of one repo matches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteMatchRequest {
+    /// The repo name as given.
+    pub repo: String,
+    /// The command's words joined by single spaces, as the gate matches them.
+    pub text: String,
 }
 
 /// What `gate remote` does to the list.

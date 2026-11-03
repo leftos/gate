@@ -321,6 +321,37 @@ class ReleaseFactsTests(unittest.TestCase):
     def rows(data: dict) -> dict[tuple[str, str], dict]:
         return {(row["repo"], row["family"]): row for row in data["heavy"]}
 
+    def test_no_pattern_reads_as_a_missing_not_routed(self) -> None:
+        at = START + timedelta(hours=2)
+
+        def heavy(**fields: object) -> dict:
+            return self.census_of(
+                line("queue", 30, at, **fields),
+                line(
+                    "release",
+                    30,
+                    at + timedelta(minutes=1),
+                    wallSeconds=10.0,
+                    verdict="passed",
+                    **fields,
+                ),
+            )
+
+        token = heavy(notRouted="no pattern")
+        self.assertEqual(self.rows(token)[("demo", "cargo test")]["notRouted"], {})
+        self.assertEqual(token["heavy"], heavy()["heavy"])
+        archived = self.census_of(
+            line(
+                "release",
+                31,
+                at,
+                notRouted="no pattern",
+                wallSeconds=10.0,
+                verdict="passed",
+            )
+        )
+        self.assertEqual(self.rows(archived)[("demo", "cargo test")]["notRouted"], {})
+
     def test_archive_day_reads_not_routed_and_reason_from_release(self) -> None:
         at = START + timedelta(hours=2)
         data = self.census_of(

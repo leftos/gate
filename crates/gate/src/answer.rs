@@ -35,6 +35,7 @@ pub(crate) fn answer(args: Vec<OsString>, environment: &Environment, console: &m
         Ok(Invocation::Drain(request)) => crate::drain_cmd::drain(&request, environment, console),
         Ok(Invocation::Prune(request)) => crate::prune_cmd::prune(&request, environment, console),
         Ok(Invocation::Remote(request)) => crate::remote_cmd::remote(&request, environment, console),
+        Ok(Invocation::RemoteMatch(request)) => crate::remote_cmd::remote_match(&request, environment, console),
         Ok(Invocation::Check(request)) => crate::check::check(&request, console),
         Ok(Invocation::Warm(request)) => crate::warm::warm(&request, environment, console),
         Ok(Invocation::Burn(request)) => crate::burn::burn(&request, console),

@@ -3,13 +3,16 @@
 //! the write the file is read again and a change since the first read refuses the edit; then the original bytes are
 //! copied to a backup made new beside it, and the new text replaces the file in one move, so a reader sees the old
 //! file or the new one. No line names a `host` the file holds.
+//!
+//! `gate remote match` reads the file as routing does and prints the pattern a command would match
+//! ([`gate_router::pattern_for`]), so nothing outside the gate needs a matcher of its own.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use gate_args::{RemoteRequest, RemoteVerb};
-use gate_router::{Edit, EditRefusal, EditVerb, Edited, edit_remote_json};
+use gate_args::{RemoteMatchRequest, RemoteRequest, RemoteVerb};
+use gate_router::{Edit, EditRefusal, EditVerb, Edited, edit_remote_json, pattern_for};
 use jiff::Timestamp;
 
 use crate::answer::FAILED_STATUS;
@@ -37,6 +40,33 @@ pub(crate) fn remote(request: &RemoteRequest, environment: &Environment, console
             console.err(&line);
             u32::from(FAILED_STATUS)
         }
+    }
+}
+
+/// Runs `gate remote match` and returns its exit status: 0 with the first pattern of the repo that matches the text on
+/// stdout, 1 with nothing on it when none matches or, saying why on stderr, when `remote.json` cannot be read.
+pub(crate) fn remote_match(request: &RemoteMatchRequest, environment: &Environment, console: &mut Console) -> u32 {
+    let Some(path) = route::remote_json_path(environment.local_app_data.as_deref()) else {
+        console.err("remote: no remote.json: LOCALAPPDATA is not an absolute folder");
+        return u32::from(FAILED_STATUS);
+    };
+    let config = match route::read_remote_json(&path) {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            console.err(&format!("remote: no remote.json at {}", path.display()));
+            return u32::from(FAILED_STATUS);
+        }
+        Err(problem) => {
+            console.err(&format!("remote: ignored {}: {}", problem.path.display(), problem.reason));
+            return u32::from(FAILED_STATUS);
+        }
+    };
+    match pattern_for(&config, &request.repo, &request.text) {
+        Some(pattern) => {
+            console.out(&pattern);
+            0
+        }
+        None => u32::from(FAILED_STATUS),
     }
 }
 

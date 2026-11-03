@@ -11,12 +11,81 @@ use gate_router::{
     BuildSettings, BuildTarget, Builder, BuilderOs, CARRIED_INPUT, Config, ConfigProblem, CrossBlocked, CrossTarget, DROPPED_NO_BUILD_LINE,
     DotnetTarget, Facts, GitignoredInput, Inputs, LocalReason, NO_OUTPUTS_LINE, Nested, PROJECT_EXTENSIONS, Pattern, PinRefusal, Place, RemoteRun,
     Route, SiblingFolder, Slot, Target, build_settings, builder_words, decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet, is_usable_host,
-    later_run, sdk_build_target, target, without_no_build, work_folder_key,
+    later_run, pattern_for, sdk_build_target, target, without_no_build, work_folder_key,
 };
 
 use crate::support::{FakeFacts, HEAD, ROOT, carried, fake_id, heavy, light, place_at, sibling_root, words};
 
 const SILENT: Route = Route::Local { reason: None };
+
+/// What `command`, each path in it named absolutely, told a gate at the root of a worktree of `yaat` about its match.
+fn told_of(command: &[&str]) -> (Route, Option<(String, bool)>) {
+    let facts = FakeFacts::at_root();
+    let command = words(command);
+    let route = decide(&heavy(&command), &facts);
+    (route, facts.matched_against.into_inner())
+}
+
+#[test]
+fn matched_against_is_told_the_rewritten_words_a_pattern_matched() {
+    let (route, told) = told_of(&["dotnet", "build", "X:/dev/yaat.wt/a/src/A.csproj"]);
+    routed(route);
+    assert_eq!(told, Some(("dotnet build src/A.csproj".to_owned(), true)));
+}
+
+#[test]
+fn matched_against_is_told_the_rewritten_words_no_pattern_matched() {
+    let (route, told) = told_of(&["other", "X:/dev/yaat.wt/a/src/A.csproj", "--verbose"]);
+    assert_eq!(route, SILENT, "no pattern says nothing");
+    assert_eq!(told, Some(("other src/A.csproj --verbose".to_owned(), false)));
+}
+
+#[test]
+fn matched_against_is_told_nothing_of_a_run_that_asks_no_pattern() {
+    let command = words(&["dotnet", "build"]);
+    let facts = FakeFacts::at_root();
+    let inputs = Inputs {
+        local: true,
+        ..heavy(&command)
+    };
+    assert!(matches!(decide(&inputs, &facts), Route::Local { .. }));
+    assert_eq!(*facts.matched_against.borrow(), None, "--local");
+
+    let git = words(&["git", "status"]);
+    let facts = FakeFacts::at_root();
+    assert_eq!(decide(&heavy(&git), &facts), SILENT);
+    assert_eq!(*facts.matched_against.borrow(), None, "git stays here before the patterns");
+}
+
+#[test]
+fn matched_against_and_pattern_for_read_one_pattern_list_alike() {
+    let config = crate::support::config();
+    let (route, told) = told_of(&["cargo", "test", "--workspace"]);
+    assert_eq!(routed(route).pattern, "cargo test*");
+    assert_eq!(told, Some(("cargo test --workspace".to_owned(), true)));
+    assert_eq!(pattern_for(&config, "yaat", "cargo test --workspace").as_deref(), Some("cargo test*"));
+    assert_eq!(
+        pattern_for(&config, "YAAT", "CARGO test").as_deref(),
+        Some("cargo test*"),
+        "any letter case"
+    );
+    assert_eq!(pattern_for(&config, "yaat", "other src/A.csproj"), None);
+    assert_eq!(pattern_for(&config, "unlisted", "cargo test"), None);
+}
+
+#[test]
+fn matched_against_pattern_for_answers_the_first_pattern_of_the_first_list() {
+    let config = Config::parse(
+        r#"{"host": "builder-1", "slots": 2, "repos": {"yaat": ["cargo*"]},
+            "builders": [
+                {"host": "off", "os": "windows", "routed": false, "repos": {"yaat": ["cargo test --off*"]}},
+                {"host": "on", "os": "windows", "repos": {"yaat": ["cargo test*", "cargo*"]}}
+            ]}"#,
+    )
+    .expect("the fixture is usable");
+    assert_eq!(pattern_for(&config, "yaat", "cargo test --off").as_deref(), Some("cargo test*"));
+    assert_eq!(pattern_for(&config, "yaat", "cargo build").as_deref(), Some("cargo*"));
+}
 
 fn routed(route: Route) -> RemoteRun {
     assert!(matches!(route, Route::Routed(_)), "the command runs here: {:?}", local_line(&route));

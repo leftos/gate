@@ -1,4 +1,5 @@
-//! `gate remote add|remove` on the case's own `remote.json`: what it writes, what it backs up, and what it leaves.
+//! `gate remote add|remove` on the case's own `remote.json`: what it writes, what it backs up, and what it leaves; and
+//! what `gate remote match` answers of it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,30 @@ fn check_says_a_routing_problem(case: &Case) -> (bool, Outcome) {
     let outcome = case.run(&["check"]);
     let said = outcome.stderr.lines().any(|line| line.contains("remote.json:"));
     (said, outcome)
+}
+
+#[test]
+fn a_match_prints_the_pattern_and_ends_zero() {
+    let case = Case::new("remote_match_found");
+    write_remote_json(&case, ROUTING);
+
+    let outcome = case.run(&["remote", "match", "gate", "cargo test --workspace"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(lines(&outcome.stdout), ["cargo test*"], "{outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+}
+
+#[test]
+fn no_match_prints_nothing_and_ends_one() {
+    let case = Case::new("remote_match_none");
+    write_remote_json(&case, ROUTING);
+
+    let outcome = case.run(&["remote", "match", "gate", "cargo build --workspace"]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
 }
 
 #[test]

@@ -21,7 +21,7 @@ It exits 0 with a report when something is pending, and 1 after 8 hours with not
 
 ## Decide each pending shape
 
-Read the report largest first. In it, `seconds` sums the shape's runs in this report; `routed` counts this repo's routed runs of the same family; `matched` is `no`, `since` (a pattern added after the run) or `yes` (a pattern was in force and the run stayed here anyway).
+Read the report largest first. In it, `seconds` sums the shape's runs in this report; `routed` counts this repo's routed runs of the same family; `matched` is what the gate reports: `yes` (a pattern matched at the run and it stayed here anyway), `since` (the gate matched no pattern at the run and one matches its words now) or `no` (none matches them, or the gate gave the run no words).
 
 Take the first row that holds, then record the decision with `watch_local.py mark <id>... --verdict routed|local|booked --note "<why>"`, which takes several ids.
 

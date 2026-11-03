@@ -421,6 +421,54 @@ fn without_a_routing_file_nothing_is_said_and_nothing_is_written() {
     assert!(!case.root().join("remote").exists(), "no remote folder in the state root");
 }
 
+/// The `sentWords` and `notRouted` of a run's `queue` line, first of `events`, which its `release` line, last, repeats.
+fn queue_and_release_facts(events: &[Value]) -> (Value, Value) {
+    let queue = events.first().expect("a queue line");
+    let release = events.last().expect("a release line");
+    assert_eq!(queue["event"], "queue", "{events:#?}");
+    assert_eq!(release["event"], "release", "{events:#?}");
+    assert_eq!(queue["sentWords"], release["sentWords"], "{events:#?}");
+    assert_eq!(queue.get("notRouted"), release.get("notRouted"), "{events:#?}");
+    (queue["sentWords"].clone(), queue.get("notRouted").cloned().unwrap_or(Value::Null))
+}
+
+#[test]
+fn a_command_no_pattern_matches_journals_its_sent_words_and_no_pattern() {
+    let case = routed_case("routing-no-pattern");
+    write_remote_json(
+        &case,
+        &json!({ "host": HOST, "repos": { repo(&case): ["no such command*"] } }).to_string(),
+    );
+    let named = case.folder().join("a.txt").display().to_string();
+    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "out", &named])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains("not routed"), "no pattern says nothing: {outcome:?}");
+    let events = events(&case);
+    assert_local(&events, Some("no pattern"));
+    assert_eq!(
+        queue_and_release_facts(&events),
+        (json!(r".\tool.exe out a.txt"), json!("no pattern")),
+        "the path is the relative form the patterns were asked about"
+    );
+}
+
+#[test]
+fn a_routed_command_journals_its_sent_words() {
+    let case = routed_case("routing-sent-words");
+    let steps = shown(&stub(&case, &["status 0"]));
+    let named = case.folder().join("a.txt").display().to_string();
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "out", &named])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let events = events(&case);
+    assert_eq!(
+        queue_and_release_facts(&events),
+        (json!(r".\tool.exe out a.txt"), Value::Null),
+        "a routed run names the words its pattern matched and no reason: {events:#?}"
+    );
+}
+
 #[test]
 fn inside_a_git_hook_a_heavy_gate_stays_here_silently() {
     let case = routed_case("routing-hook");
@@ -6435,7 +6483,10 @@ fn a_dropped_no_build_run_that_stays_here_carries_no_faster_here_reason() {
     let events = own(&case, pid);
     assert_eq!(took_on(&case, pid), ["here"], "the run stayed here: {events:#?}");
     let queue = events.iter().find(|event| event["event"] == "queue").expect("the run queued");
-    assert!(queue.get("notRouted").is_none(), "the heavy decision kept it here for no reason: {queue}");
+    assert_eq!(
+        queue["notRouted"], "no pattern",
+        "the heavy decision kept it here for no faster-here reason: {queue}"
+    );
 }
 
 #[test]

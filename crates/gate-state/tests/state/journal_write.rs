@@ -230,6 +230,7 @@ fn a_routed_queue_line_ends_with_the_remote_fields_as_the_fixture_does() {
         not_routed: None,
         reason: None,
         pinned: false,
+        sent_words: None,
     };
     let line = journal_line(&identity(), ts(NOW), &queue, Some(&tag()), None);
 
@@ -244,6 +245,7 @@ fn a_queue_kept_local_writes_not_routed_after_the_log() {
         not_routed: Some("--local".to_owned()),
         reason: None,
         pinned: false,
+        sent_words: None,
     };
     let line = journal_line(&identity(), ts(NOW), &queue, None, None);
 
@@ -261,6 +263,7 @@ fn a_queue_with_a_reason_writes_it_after_not_routed() {
         not_routed: Some("--local".to_owned()),
         reason: Some("checking routing".to_owned()),
         pinned: false,
+        sent_words: None,
     };
     let line = journal_line(&identity(), ts(NOW), &queue, None, None);
 
@@ -272,6 +275,7 @@ fn a_queue_with_a_reason_writes_it_after_not_routed() {
         not_routed: None,
         reason: Some("checking routing".to_owned()),
         pinned: false,
+        sent_words: None,
     };
     assert_eq!(own_keys(&journal_line(&identity(), ts(NOW), &without, None, None)), ["log", "reason"]);
 }
@@ -283,6 +287,7 @@ fn a_pinned_run_s_queue_line_says_pinned() {
         not_routed: None,
         reason: Some("trial".to_owned()),
         pinned,
+        sent_words: None,
     };
     let line = journal_line(&identity(), ts(NOW), &queue(true), None, None);
     assert_eq!(own_keys(&line), ["log", "reason", "pinned"]);
@@ -590,6 +595,7 @@ fn a_line_without_a_remote_tag_has_no_remote_field() {
             not_routed: None,
             reason: None,
             pinned: false,
+            sent_words: None,
         },
         JournalEvent::Take {
             slots: Vec::new(),
@@ -631,6 +637,7 @@ fn line_starts_with_v_then_the_common_keys_in_order() {
             not_routed: None,
             reason: None,
             pinned: false,
+            sent_words: None,
         },
         None,
         None,
@@ -721,6 +728,7 @@ fn time_has_seven_fractional_digits_and_z() {
             not_routed: None,
             reason: None,
             pinned: false,
+            sent_words: None,
         },
         None,
         None,
@@ -738,6 +746,7 @@ fn time_has_seven_fractional_digits_and_z() {
             not_routed: None,
             reason: None,
             pinned: false,
+            sent_words: None,
         },
         None,
         None,
@@ -791,6 +800,7 @@ fn a_release_line_carries_not_routed_reason_fell_back_balanced_and_parent_pid_wh
         fell_back: vec![FallbackReason::Full, FallbackReason::Busy],
         balanced: Some(two_balanced(true)),
         parent_pid: Some(40267),
+        sent_words: None,
         stage: None,
     });
     let line = journal_line(&identity(), ts(NOW), &event, None, None);
@@ -819,6 +829,54 @@ fn a_release_line_carries_not_routed_reason_fell_back_balanced_and_parent_pid_wh
         )),
         "{line}"
     );
+}
+
+/// A queue line writes the sent words after `pinned`, and writes no field for none.
+#[test]
+fn a_queue_writes_its_sent_words_after_pinned() {
+    let queue = |sent_words: Option<&str>| JournalEvent::Queue {
+        log: "x".to_owned(),
+        not_routed: Some("no pattern".to_owned()),
+        reason: None,
+        pinned: true,
+        sent_words: sent_words.map(str::to_owned),
+    };
+    let line = journal_line(&identity(), ts(NOW), &queue(Some("cargo test a.txt")), None, None);
+    assert_eq!(own_keys(&line), ["log", "notRouted", "pinned", "sentWords"]);
+    assert_eq!(parsed(&line)["sentWords"], "cargo test a.txt");
+    assert_eq!(
+        own_keys(&journal_line(&identity(), ts(NOW), &queue(None), None, None)),
+        ["log", "notRouted", "pinned"]
+    );
+}
+
+/// A release line writes the sent words after `parentPid` and before `stage`, and writes no field for none; the words
+/// alone make the routing facts worth a key.
+#[test]
+fn a_release_writes_its_sent_words_after_parent_pid() {
+    let event = release_routed(RoutingFacts {
+        parent_pid: Some(7),
+        sent_words: Some("cargo test".to_owned()),
+        stage: Some(StageFacts {
+            host: "host".to_owned(),
+            key: "key".to_owned(),
+            status: Some(0),
+            outcome: StageOutcome::Clean,
+            seconds: 1.0,
+        }),
+        ..RoutingFacts::default()
+    });
+    let line = journal_line(&identity(), ts(NOW), &event, None, None);
+    let keys = own_keys(&line);
+    assert_eq!(keys[keys.len() - 3..], ["parentPid", "sentWords", "stage"], "{line}");
+    assert_eq!(parsed(&line)["sentWords"], "cargo test");
+
+    let only = RoutingFacts {
+        sent_words: Some("cargo test".to_owned()),
+        ..RoutingFacts::default()
+    };
+    assert!(!only.is_empty(), "the sent words are a fact of the run");
+    assert!(RoutingFacts::default().is_empty());
 }
 
 /// A commit's release line carries its stage as one `stage` object, last, which reads back as the facts it was written
@@ -1361,6 +1419,7 @@ fn journal_line_lists_the_lock_on_a_queue_line() {
             not_routed: None,
             reason: None,
             pinned: false,
+            sent_words: None,
         },
         None,
         Some(r"Local\gate-test-journal"),
@@ -1407,6 +1466,7 @@ fn a_line_appended_under_an_abandoned_journal_lock_lists_the_lock() {
                     not_routed: None,
                     reason: None,
                     pinned: false,
+                    sent_words: None,
                 },
                 None,
                 abandoned,

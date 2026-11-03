@@ -1,7 +1,7 @@
 //! `gate remote add|remove`: the verb, section, repo and patterns, `--builder`, `--tag` and `--dry-run` anywhere, each
-//! usage error, `--help`, and the usage line.
+//! usage error, `--help`, and the usage line; and `gate remote match`'s two operands.
 
-use gate_args::{Invocation, RemoteRequest, RemoteVerb, USAGE};
+use gate_args::{Invocation, RemoteMatchRequest, RemoteRequest, RemoteVerb, USAGE};
 
 use crate::support::{invocation, problems};
 
@@ -107,7 +107,7 @@ fn remote_after_a_separator_every_word_is_a_positional() {
 fn remote_missing_words_are_usage_errors() {
     assert_eq!(
         problems(&["remote"]),
-        ["gate: remote: missing the verb add or remove", "gate: remote: missing the section"]
+        ["gate: remote: missing the verb add, remove or match", "gate: remote: missing the section"]
     );
     assert_eq!(problems(&["remote", "add"]), ["gate: remote: missing the section"]);
     assert_eq!(problems(&["remote", "add", "repos"]), ["gate: remote: missing the repo"]);
@@ -118,7 +118,7 @@ fn remote_missing_words_are_usage_errors() {
 fn remote_unknown_verbs_sections_and_options_are_usage_errors() {
     assert_eq!(
         problems(&["remote", "show", "repos", "gate", "x"]),
-        ["gate: remote: unknown verb show; add or remove"]
+        ["gate: remote: unknown verb show; add, remove or match"]
     );
     assert_eq!(
         problems(&["remote", "add", "warmup", "gate", "x"]),
@@ -208,6 +208,51 @@ fn remote_an_option_given_twice_is_a_usage_error() {
 }
 
 #[test]
+fn remote_match_takes_a_repo_and_a_text() {
+    let expected = Invocation::RemoteMatch(RemoteMatchRequest {
+        repo: "gate".to_owned(),
+        text: "cargo test --workspace".to_owned(),
+    });
+    assert_eq!(invocation(&["remote", "match", "gate", "cargo test --workspace"]), expected);
+    assert_eq!(invocation(&["remote", "match", "--", "gate", "cargo test --workspace"]), expected);
+}
+
+#[test]
+fn remote_match_a_missing_operand_is_a_usage_error() {
+    assert_eq!(problems(&["remote", "match"]), ["gate: remote: missing the repo"]);
+    assert_eq!(problems(&["remote", "match", "gate"]), ["gate: remote: missing the text"]);
+    assert_eq!(problems(&["remote", "match", "gate", ""]), ["gate: remote: missing the text"]);
+}
+
+#[test]
+fn remote_match_a_third_operand_is_a_usage_error() {
+    assert_eq!(
+        problems(&["remote", "match", "gate", "cargo test", "--", "extra"]),
+        ["gate: remote: match takes a repo and one text, and not extra"]
+    );
+    assert_eq!(
+        problems(&["remote", "match", "gate", "cargo", "test"]),
+        ["gate: remote: match takes a repo and one text, and not test"]
+    );
+}
+
+#[test]
+fn remote_match_refuses_the_options_of_an_edit() {
+    for (words, option) in [
+        (["--dry-run"].as_slice(), "--dry-run"),
+        (["--builder", "one@example"].as_slice(), "--builder"),
+        (["--tag", "census"].as_slice(), "--tag"),
+    ] {
+        let line: Vec<&str> = ["remote", "match", "gate", "cargo test"].iter().chain(words).copied().collect();
+        assert_eq!(
+            problems(&line),
+            [format!("gate: remote: {option} is for add and remove only; match changes nothing")],
+            "{words:?}"
+        );
+    }
+}
+
+#[test]
 fn remote_help_is_the_usage_and_the_usage_lists_remote() {
     assert_eq!(invocation(&["remote", "--help"]), Invocation::Help);
     assert_eq!(invocation(&["remote", "add", "repos", "-h"]), Invocation::Help);
@@ -217,6 +262,10 @@ fn remote_help_is_the_usage_and_the_usage_lists_remote() {
     );
     assert!(
         USAGE.contains("\n       gate remote remove <section> <repo> <pattern>... [--builder <host>] [--dry-run]\n"),
+        "{USAGE}"
+    );
+    assert!(
+        USAGE.contains("[--builder <host>] [--dry-run]\n       gate remote match <repo> <text>\n"),
         "{USAGE}"
     );
     let prune = USAGE.find("gate prune").expect("prune is listed");

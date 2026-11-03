@@ -95,6 +95,9 @@ pub enum JournalEvent {
         /// Whether the run was pinned to one builder with `--builder`, written after `reason` as `pinned: true`;
         /// `false` writes no field.
         pinned: bool,
+        /// The words the run's patterns were asked about, joined as they were matched, written after `pinned` as
+        /// `sentWords`; `None` writes no field.
+        sent_words: Option<String>,
     },
     /// The gate took its slot.
     Take {
@@ -177,13 +180,16 @@ pub struct RoutingFacts {
     /// The pid of the parent gate whose slot did not cover the run, as its `take` line says it: written as
     /// `parentPid`, after `balanced`, and left out when `None`.
     pub parent_pid: Option<u32>,
-    /// How a commit's pre-commit stage on a builder went: written as `stage`, after `parentPid`, and left out when
+    /// The words the run's patterns were asked about, joined as they were matched, as its `queue` line says them:
+    /// written as `sentWords`, after `parentPid`, and left out when `None`.
+    pub sent_words: Option<String>,
+    /// How a commit's pre-commit stage on a builder went: written as `stage`, after `sentWords`, and left out when
     /// `None`, as for every run that is no commit with a stage.
     pub stage: Option<StageFacts>,
 }
 
 impl RoutingFacts {
-    /// Whether the run carries none of the six facts, so its release line gains no key of theirs.
+    /// Whether the run carries none of the seven facts, so its release line gains no key of theirs.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.not_routed.is_none()
@@ -191,6 +197,7 @@ impl RoutingFacts {
             && self.fell_back.is_empty()
             && self.balanced.is_none()
             && self.parent_pid.is_none()
+            && self.sent_words.is_none()
             && self.stage.is_none()
     }
 }
@@ -494,10 +501,10 @@ impl fmt::Display for JournalNote {
 /// decimals. A `release` without facts writes null times and the verdict
 /// `unknown`.
 ///
-/// A `release` also carries the run's routing facts, `notRouted`, `reason`, `fellBack`, `balanced` and `parentPid`, as
-/// the run's `queue`, `fallback` and `take` lines said them and, for `balanced`, as its routing decision scored its
-/// builders, so that the archive keeps them once the journal rolls: each field is left out when the run has none of
-/// it.
+/// A `release` also carries the run's routing facts, `notRouted`, `reason`, `fellBack`, `balanced`, `parentPid` and
+/// `sentWords`, as the run's `queue`, `fallback` and `take` lines said them and, for `balanced`, as its routing decision
+/// scored its builders, so that the archive keeps them once the journal rolls: each field is left out when the run has
+/// none of it.
 ///
 /// `remote` is the tag of a routed run up to its fallback: when it is `Some`, the event's own fields are followed by
 /// `remote: true`, `host` and `key`, and, when the tag names a critical request, `routedFor: critical` and `criticalPid`;
@@ -559,6 +566,7 @@ fn insert_own_fields(line: &mut Map<String, Value>, event: &JournalEvent) {
             not_routed,
             reason,
             pinned,
+            sent_words,
         } => {
             line.insert("log".to_owned(), Value::from(log.as_str()));
             if let Some(not_routed) = not_routed {
@@ -569,6 +577,9 @@ fn insert_own_fields(line: &mut Map<String, Value>, event: &JournalEvent) {
             }
             if *pinned {
                 line.insert("pinned".to_owned(), Value::Bool(true));
+            }
+            if let Some(sent_words) = sent_words {
+                line.insert("sentWords".to_owned(), Value::from(sent_words.as_str()));
             }
         }
         JournalEvent::Take {
@@ -712,7 +723,7 @@ fn tenths(value: f64) -> Value {
 }
 
 /// Inserts a release line's `routing` facts ([`RoutingFacts`]), each only when the run has it: `notRouted`, `reason`,
-/// `fellBack`, `balanced`, then `parentPid`.
+/// `fellBack`, `balanced`, `parentPid`, `sentWords`, then `stage`.
 fn insert_routing(line: &mut Map<String, Value>, routing: &RoutingFacts) {
     if let Some(not_routed) = &routing.not_routed {
         line.insert("notRouted".to_owned(), Value::from(not_routed.as_str()));
@@ -730,6 +741,9 @@ fn insert_routing(line: &mut Map<String, Value>, routing: &RoutingFacts) {
     }
     if let Some(parent_pid) = routing.parent_pid {
         line.insert("parentPid".to_owned(), Value::from(parent_pid));
+    }
+    if let Some(sent_words) = &routing.sent_words {
+        line.insert("sentWords".to_owned(), Value::from(sent_words.as_str()));
     }
     if let Some(stage) = &routing.stage {
         line.insert("stage".to_owned(), stage_value(stage));

@@ -214,6 +214,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         client,
         tag: None,
         routing: RoutingFacts::default(),
+        sent: None,
         warm_hash: None,
         cold: false,
         tailscale_read: None,
@@ -844,6 +845,9 @@ struct Run<'a> {
     /// The routing facts the run's `queue`, `fallback` and `take` lines say, which its `release` line copies so the
     /// archive keeps them ([`Run::queue`], [`Run::give_up`]).
     routing: RoutingFacts,
+    /// What the routing decision's patterns were asked about, set by [`Run::route`] and taken by [`Run::queue`], which
+    /// writes it into [`Run::routing`].
+    sent: Option<route::Sent>,
     /// The hash of the warm-up file a routed run's work folder must be warm with, which its call asks the builder for;
     /// `None` when the route asks no warmth. Set once, by [`Run::route`].
     warm_hash: Option<String>,
@@ -1992,7 +1996,9 @@ impl Run<'_> {
             placed: place,
             warm_hash,
             decision,
+            sent,
         } = route::route(self.request, environment, (parent, given), (self.root, &self.gate), console);
+        self.sent = sent;
         self.warm_hash = warm_hash;
         self.would = Some(decision);
         self.may_reroute = !matches!(route, Route::Routed(_));
@@ -2185,13 +2191,16 @@ impl Run<'_> {
             self.cover(parent.pid, console);
             return;
         }
-        self.routing.not_routed = route::not_routed(route);
+        let sent = self.sent.take();
+        self.routing.not_routed = route::not_routed(route, sent.as_ref());
+        self.routing.sent_words = sent.map(|sent| sent.text);
         self.routing.reason = self.request.reason.clone();
         let event = JournalEvent::Queue {
             log: self.log.path().to_string_lossy().into_owned(),
             not_routed: self.routing.not_routed.clone(),
             reason: self.routing.reason.clone(),
             pinned: self.request.builder.is_some(),
+            sent_words: self.routing.sent_words.clone(),
         };
         self.journal.write(&event, self.tag.as_ref(), console);
     }

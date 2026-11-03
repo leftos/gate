@@ -1,9 +1,10 @@
-"""Tests of the local-run watcher: shapes, what counts, the report, backups, mark and watch."""
+"""Tests of the local-run watcher: shapes, what counts, the report, the gate's match, mark and watch."""
 
 import gzip
 import io
 import itertools
 import json
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -31,6 +32,7 @@ def release(
     command: str = "cargo build --workspace",
     cwd: str = WT,
     wall: float = 120.0,
+    sent_words: str | None = None,
     **fields: object,
 ) -> dict[str, object]:
     event: dict[str, object] = {
@@ -47,6 +49,8 @@ def release(
         "command": command,
         "wallSeconds": wall,
     }
+    if sent_words is not None:
+        event["sentWords"] = sent_words
     event.update(fields)
     return event
 
@@ -144,15 +148,11 @@ class Case(unittest.TestCase):
 class ShapeTests(unittest.TestCase):
     """The shape table and the one path kept whole, one case each."""
 
-    def test_the_five_shape_rows_and_the_non_example(self) -> None:
+    def test_the_shape_rows_and_the_non_example(self) -> None:
         cases = [
             (
                 "cargo build --manifest-path Cargo.toml -p daemon --release",
                 "cargo build --manifest-path Cargo.toml -p daemon --release",
-            ),
-            (
-                f"cargo nextest run --manifest-path {WT}\\Cargo.toml --workspace",
-                "cargo nextest run --manifest-path Cargo.toml --workspace",
             ),
             (
                 r"dotnet build .tmp\dbg1656\probe\Probe.csproj",
@@ -163,25 +163,13 @@ class ShapeTests(unittest.TestCase):
                 "uv run --no-project python -I .tmp/* --seed #",
             ),
             (
-                'dotnet build "x:/dev/rustling-tulip.wt/rt-763/src/A.csproj"',
-                "dotnet build src/A.csproj",
-            ),
-            (
-                r'"C:\Program Files\dotnet\dotnet.exe" build src/A.csproj',
-                "dotnet build src/A.csproj",
-            ),
-            (
-                'dotnet build "src/A B.csproj"',
-                "dotnet build src/A B.csproj",
-            ),
-            (
                 r"dotnet run --project X:\dev\other\A.csproj",
                 "dotnet run --project X:/dev/other/A.csproj",
             ),
         ]
         for command, expected in cases:
             with self.subTest(command=command):
-                self.assertEqual(watch_local.shape_of(command, WT), expected)
+                self.assertEqual(watch_local.shape_of(command), expected)
 
     def test_the_number_rows_of_the_shape_table(self) -> None:
         cases = [
@@ -191,44 +179,23 @@ class ShapeTests(unittest.TestCase):
             ),
             ("tool --seed=4 --rate=0.5", "tool --seed=# --rate=#"),
             ("dotnet build -f net8.0", "dotnet build -f net8.0"),
-            ('blender "x/Blender 5.2/b.exe"', "blender x/Blender 5.2/b.exe"),
+            ('blender "x/Blender 5.2/b.exe"', 'blender "x/Blender 5.2/b.exe"'),
         ]
         for command, expected in cases:
             with self.subTest(command=command):
-                self.assertEqual(watch_local.shape_of(command, WT), expected)
+                self.assertEqual(watch_local.shape_of(command), expected)
 
-    def test_a_cwd_below_the_root_shares_the_roots_shape(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder) / "repo"
-            (root / ".git").mkdir(parents=True)
-            below = root / "src"
-            command = f'dotnet build "{root / "A.csproj"}"'
-            self.assertEqual(
-                watch_local.shape_of(command, str(root)), "dotnet build A.csproj"
-            )
-            self.assertEqual(
-                watch_local.shape_of(command, str(below)), "dotnet build A.csproj"
-            )
+    def test_a_shape_is_read_from_the_sent_words_before_the_command(self) -> None:
+        event = release(
+            1, START, command=f"cargo test {WT}/a.txt", sent_words="cargo test a.txt"
+        )
+        self.assertEqual(watch_local.words_of(event), "cargo test a.txt")
 
-
-class LikeTests(unittest.TestCase):
-    """The gate's ``-like`` match, one rule per case."""
-
-    def test_like_reads_a_set_and_a_range(self) -> None:
-        self.assertTrue(watch_local.like("[ab]c", "bc"))
-        self.assertTrue(watch_local.like("[a-c]x", "bx"))
-        self.assertFalse(watch_local.like("[a-c]x", "dx"))
-
-    def test_like_takes_a_backtick_literally(self) -> None:
-        self.assertTrue(watch_local.like("a`*b", "a*b"))
-        self.assertFalse(watch_local.like("a`*b", "axb"))
-
-    def test_an_unclosed_set_matches_nothing(self) -> None:
-        self.assertFalse(watch_local.like("a[b", "ab"))
-        self.assertFalse(watch_local.like("[c-a]x", "bx"))
-
-    def test_matching_ignores_case(self) -> None:
-        self.assertTrue(watch_local.like("Cargo Build*", "cargo build --workspace"))
+    def test_a_run_with_no_sent_words_is_read_from_its_command(self) -> None:
+        self.assertEqual(
+            watch_local.words_of(release(1, START, command="cargo test -p a")),
+            "cargo test -p a",
+        )
 
 
 class CountingTests(Case):
@@ -320,7 +287,7 @@ class ReportTests(Case):
 
     def test_a_matched_shape_says_so(self) -> None:
         self.write_remote({"rustling-tulip": ["cargo build*"]})
-        self.write_events(release(1, START))
+        self.write_events(release(1, START, sent_words="cargo build --workspace"))
         status, text = self.scan()
         self.assertEqual(status, 0)
         self.assertIn("matched=yes", text)
@@ -362,6 +329,50 @@ class ReportTests(Case):
         status, text = self.scan()
         self.assertEqual(status, 0)
         self.assertIn("routed=1", text)
+
+    def test_routed_counts_by_the_sent_words(self) -> None:
+        self.write_events(
+            release(1, START, sent_words="cargo test a.txt", wall=90.0),
+            release(
+                1,
+                START,
+                command=f"cargo test {WT}/a.txt",
+                sent_words="cargo test a.txt",
+                remote=True,
+            ),
+        )
+        status, text = self.scan()
+        self.assertEqual(status, 0)
+        self.assertIn("routed=1", text)
+
+    def test_a_shape_comes_from_the_sent_words_over_the_command(self) -> None:
+        self.write_events(
+            release(
+                1,
+                START,
+                command=f"cargo test {WT}/a.txt",
+                sent_words="cargo test a.txt",
+            ),
+            release(
+                1,
+                START + timedelta(minutes=1),
+                command=f"cargo test {OTHER_WT}/a.txt",
+                sent_words="cargo test a.txt",
+            ),
+        )
+        status, text = self.scan()
+        self.assertEqual(status, 0)
+        self.assertEqual(text.count("  shape: "), 1)
+        self.assertIn("  shape: cargo test a.txt", text)
+        self.assertIn("runs=2", text)
+
+    def test_a_line_with_neither_new_field_reads(self) -> None:
+        self.write_events(release(1, START))
+        status, text = self.scan()
+        self.assertEqual(status, 0)
+        self.assertIn("matched=no", text)
+        self.assertIn("reason=none", text)
+        self.assertIn("  shape: cargo build --workspace", text)
 
     def test_a_local_shape_is_not_pending(self) -> None:
         self.write_events(release(1, START))
@@ -480,7 +491,7 @@ class ReportTests(Case):
         self.assertIn("reason=--local: builder busy", text)
         self.assertIn("reason=faster here", text)
 
-    def test_a_builder_entrys_pattern_counts(self) -> None:
+    def test_a_builder_entrys_pattern_is_a_nearest(self) -> None:
         self.write_remote_data(
             {
                 "builders": [
@@ -495,9 +506,9 @@ class ReportTests(Case):
         self.write_events(release(1, START))
         status, text = self.scan()
         self.assertEqual(status, 0)
-        self.assertIn("matched=yes", text)
+        self.assertIn("  nearest: cargo build*", text)
 
-    def test_a_not_routed_builder_entrys_pattern_does_not_count(self) -> None:
+    def test_a_not_routed_builder_entrys_pattern_is_no_nearest(self) -> None:
         self.write_remote_data(
             {
                 "builders": [
@@ -513,7 +524,7 @@ class ReportTests(Case):
         self.write_events(release(1, START))
         status, text = self.scan()
         self.assertEqual(status, 0)
-        self.assertIn("matched=no", text)
+        self.assertNotIn("nearest:", text)
 
     def test_two_runs_differing_only_in_numbers_share_a_shape(self) -> None:
         self.write_events(
@@ -536,152 +547,135 @@ class ReportTests(Case):
         self.assertIn("runs=2 seconds=160", text)
         self.assertIn("--seeds # --nations #", text)
 
-    def test_a_question_mark_pattern_matches_a_separator(self) -> None:
-        command = (
-            "dotnet run --project src/Intrigue.Sim -c Release --no-build -- "
-            "--mode generate --seeds 1-10000 --nations 7"
-        )
-        pattern = "dotnet run --project src?Intrigue.Sim *"
-        self.write_remote({"world-of-intrigue": [pattern]})
+    def test_claude_configs_patterns_are_found_under_its_gate_key(self) -> None:
+        self.write_remote({"claude": ["cargo build*"]})
+        asked: list[tuple[str, str]] = []
+
+        def ask(repo: str, text: str) -> bool:
+            asked.append((repo, text))
+            return True
+
         self.write_events(
             release(
                 1,
                 START,
-                cwd=r"X:\dev\world-of-intrigue.wt\wi-1",
-                command=command,
+                cwd=r"C:\Users\me\.claude-wt\cc-1",
+                sent_words="cargo build --workspace",
+                notRouted="no pattern",
             )
         )
-        status, text = self.scan()
-        self.assertEqual(status, 0)
-        self.assertIn("matched=yes", text)
-
-    def test_claude_configs_patterns_are_found_under_its_gate_key(self) -> None:
-        self.write_remote({"claude": ["cargo build*"]})
-        self.write_events(release(1, START, cwd=r"C:\Users\me\.claude-wt\cc-1"))
-        status, text = self.scan()
+        status, text = self.scan(ask=ask)
         self.assertEqual(status, 0)
         self.assertIn(" claude-config ", text)
-        self.assertIn("matched=yes", text)
+        self.assertIn("matched=since", text)
+        self.assertIn("  nearest: cargo build*", text)
+        self.assertEqual(asked, [("claude", "cargo build --workspace")])
 
 
-class BackupTests(Case):
-    """The three-valued matched fact, read from the backups beside ``remote.json``."""
+class MatchTests(Case):
+    """The matched fact, one row each, with the gate's answer stubbed."""
 
     def setUp(self) -> None:
         super().setUp()
-        self.write_events(release(1, START))
-        self.write_remote({"rustling-tulip": ["cargo build*"]})
+        self.asked: list[tuple[str, str]] = []
+        self.answer = False
 
-    def write_backup(
-        self,
-        at: datetime,
-        repos: dict[str, list[str]],
-        name: str | None = None,
-        text: str | None = None,
-    ) -> Path:
-        path = self.remote.parent / (
-            name or f"remote.json.bak-{at.strftime('%Y%m%dT%H%M%SZ')}"
-        )
-        path.write_text(
-            text if text is not None else json.dumps({"repos": repos}),
-            encoding="utf-8",
-            newline="\n",
-        )
-        return path
+    def ask(self, repo: str, text: str) -> bool:
+        self.asked.append((repo, text))
+        return self.answer
 
-    def matched(self, text: str) -> str:
+    def matched(self, *events: dict[str, object]) -> str:
+        self.write_events(*events)
+        status, text = self.scan(ask=self.ask)
+        self.assertEqual(status, 0)
         for line in text.splitlines():
             if " matched=" in line:
                 return line.split(" matched=")[1].split()[0]
         raise AssertionError(f"no matched= line in {text!r}")
 
-    def test_a_pattern_added_after_the_run_is_since(self) -> None:
-        self.write_backup(START + timedelta(hours=1), {})
-        status, text = self.scan()
-        self.assertEqual(status, 0)
-        self.assertEqual(self.matched(text), "since")
+    def no_pattern_run(self, at: datetime = START) -> dict[str, object]:
+        return release(1, at, sent_words="cargo build a.txt", notRouted="no pattern")
 
-    def test_a_pattern_present_at_the_run_is_yes(self) -> None:
-        self.write_backup(
-            START + timedelta(hours=1), {"rustling-tulip": ["cargo build*"]}
+    def test_no_pattern_and_a_pattern_now_is_since(self) -> None:
+        self.answer = True
+        self.assertEqual(self.matched(self.no_pattern_run()), "since")
+        self.assertEqual(self.asked, [("rustling-tulip", "cargo build a.txt")])
+
+    def test_no_pattern_and_none_now_is_no(self) -> None:
+        self.assertEqual(self.matched(self.no_pattern_run()), "no")
+        self.assertEqual(self.asked, [("rustling-tulip", "cargo build a.txt")])
+
+    def test_a_shape_asks_the_gate_once(self) -> None:
+        self.matched(
+            self.no_pattern_run(), self.no_pattern_run(START + timedelta(minutes=1))
         )
-        status, text = self.scan()
-        self.assertEqual(status, 0)
-        self.assertEqual(self.matched(text), "yes")
+        self.assertEqual(len(self.asked), 1)
 
-    def test_with_no_later_backup_the_current_file_decides(self) -> None:
-        self.write_backup(START - timedelta(hours=1), {})
-        status, text = self.scan()
-        self.assertEqual(status, 0)
-        self.assertEqual(self.matched(text), "yes")
-
-    def test_the_earliest_later_backup_decides(self) -> None:
-        self.write_backup(START + timedelta(hours=1), {})
-        self.write_backup(
-            START + timedelta(hours=2), {"rustling-tulip": ["cargo build*"]}
+    def test_sent_words_and_no_token_is_yes(self) -> None:
+        self.assertEqual(
+            self.matched(release(1, START, sent_words="cargo build")), "yes"
         )
-        status, text = self.scan()
-        self.assertEqual(status, 0)
-        self.assertEqual(self.matched(text), "since")
+        self.assertEqual(self.asked, [])
 
-    def test_an_unparsable_backup_is_skipped(self) -> None:
-        self.write_backup(START + timedelta(hours=1), {}, text="not json")
-        self.write_backup(
-            START + timedelta(hours=2), {"rustling-tulip": ["cargo build*"]}
+    def test_sent_words_and_another_token_is_yes(self) -> None:
+        self.assertEqual(
+            self.matched(
+                release(1, START, sent_words="cargo build", notRouted="declared local")
+            ),
+            "yes",
         )
-        status, text = self.scan()
-        self.assertEqual(status, 0)
-        self.assertEqual(self.matched(text), "yes")
+        self.assertEqual(self.asked, [])
 
-    def test_a_backup_with_a_bad_name_is_skipped(self) -> None:
-        self.write_backup(START + timedelta(hours=1), {}, name="remote.json.bak-old")
-        status, text = self.scan()
-        self.assertEqual(status, 0)
-        self.assertEqual(self.matched(text), "yes")
-
-    def test_a_tagged_backup_counts(self) -> None:
-        self.write_backup(
-            START + timedelta(hours=1),
-            {},
-            name=f"remote.json.bak-retry-{stamp_name(START + timedelta(hours=1))}",
+    def test_no_sent_words_is_no(self) -> None:
+        self.assertEqual(
+            self.matched(release(1, START, notRouted="--local", reason="x")), "no"
         )
-        status, text = self.scan()
-        self.assertEqual(status, 0)
-        self.assertEqual(self.matched(text), "since")
+        self.assertEqual(self.asked, [])
 
-    def test_a_numbered_backup_counts(self) -> None:
-        self.write_backup(
-            START + timedelta(hours=1),
-            {},
-            name=f"remote.json.bak-{stamp_name(START + timedelta(hours=1))}-2",
+
+class GateMatchTests(unittest.TestCase):
+    """The one call that asks the gate, by its exit status."""
+
+    def run_with(self, status: int, stdout: str = "", stderr: str = "") -> bool:
+        done = subprocess.CompletedProcess([], status, stdout, stderr)
+        with mock.patch.object(watch_local.subprocess, "run", return_value=done) as run:
+            answer = watch_local.gate_match("gate", "cargo test --workspace")
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "pwsh",
+                "-NoProfile",
+                "-File",
+                "tools/gate.ps1",
+                "remote",
+                "match",
+                "gate",
+                "cargo test --workspace",
+            ],
         )
-        status, text = self.scan()
-        self.assertEqual(status, 0)
-        self.assertEqual(self.matched(text), "since")
+        return answer
 
-    def test_a_pattern_added_during_the_run_is_since(self) -> None:
-        self.write_events(
-            release(
-                1,
-                START + timedelta(minutes=10),
-                wall=600.0,
-                processStart=stamp(START),
-            )
-        )
-        self.write_backup(START + timedelta(minutes=5), {})
-        status, text = self.scan()
-        self.assertEqual(status, 0)
-        self.assertEqual(self.matched(text), "since")
+    def test_status_0_is_a_match(self) -> None:
+        self.assertTrue(self.run_with(0, stdout="cargo test*"))
 
-    def test_a_pattern_never_matching_is_no(self) -> None:
-        self.write_remote({})
-        status, text = self.scan()
-        self.assertEqual(status, 0)
-        self.assertEqual(self.matched(text), "no")
+    def test_status_1_is_none(self) -> None:
+        self.assertFalse(self.run_with(1))
 
+    def test_any_other_status_raises_with_the_command_and_its_output(self) -> None:
+        with self.assertRaises(watch_local.LocalRunsError) as caught:
+            self.run_with(2, stderr="gate: remote: unknown verb match")
+        said = str(caught.exception)
+        self.assertIn("remote match gate", said)
+        self.assertIn("status 2", said)
+        self.assertIn("unknown verb match", said)
 
-def stamp_name(moment: datetime) -> str:
-    return moment.strftime("%Y%m%dT%H%M%SZ")
+    def test_a_shell_that_cannot_start_raises(self) -> None:
+        refused = mock.Mock(side_effect=OSError("no pwsh"))
+        with (
+            mock.patch.object(watch_local.subprocess, "run", refused),
+            self.assertRaises(watch_local.LocalRunsError),
+        ):
+            watch_local.gate_match("gate", "cargo test")
 
 
 class MarkTests(Case):

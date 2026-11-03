@@ -302,6 +302,9 @@ pub trait Facts {
     /// for `why`: its worktree could not be opened or settled for its builder.
     fn stage_kept_here(&self, why: &str);
 
+    /// Told the words a command's patterns were asked about, joined as they were matched, and whether one matched.
+    fn matched_against(&self, sent: &str, matched: bool);
+
     /// Whether the gate's folder holds a file the snapshot sends, tracked or untracked and not ignored. Asked only
     /// below the root.
     ///
@@ -1917,6 +1920,7 @@ fn matched(config: &Config, inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Ma
     let (opened, drives, sent) =
         opened_and_sent(config, git_hook, words, facts, |repo| config.is_routed(repo)).map_err(|unopened| unopened.here(git_hook))?;
     let matching = matching(config, &opened.repo, &sent.words);
+    facts.matched_against(&sent.words.join(" "), !matching.is_empty());
     if matching.is_empty() {
         let unmatched = Unmatched {
             opened: &opened,
@@ -3207,11 +3211,19 @@ fn rewritten<'s>(
 /// The builders of [`Config::routes`] one of whose own patterns matches `repo`'s command `words`, rewritten for Windows,
 /// in file order, then `host`, each with the first such pattern of its list.
 fn matching(config: &Config, repo: &str, words: &[String]) -> Vec<(Builder, String)> {
+    let command = words.join(" ");
     config
         .routes(repo)
         .into_iter()
-        .filter_map(|(builder, patterns)| first_match(patterns, words).map(|pattern| (builder.clone(), pattern)))
+        .filter_map(|(builder, patterns)| first_match_text(patterns, &command).map(|pattern| (builder.clone(), pattern)))
         .collect()
+}
+
+/// The pattern a command of `repo` whose words, joined by single spaces, are `text` would match first: what the first
+/// entry of [`matching`] holds, from the same lists by the same match. `None` when no pattern of the repo matches it.
+#[must_use]
+pub fn pattern_for(config: &Config, repo: &str, text: &str) -> Option<String> {
+    config.routes(repo).into_iter().find_map(|(_, patterns)| first_match_text(patterns, text))
 }
 
 /// The `matching` builders of the command `words` of the worktree at `place`, best first, and what their scores were
@@ -3375,10 +3387,14 @@ fn settle(config: &Config, opened: Opened, builder: Builder, facts: &dyn Facts) 
 
 /// The first of `patterns` that matches `words` joined by single spaces.
 fn first_match(patterns: &[Pattern], words: &[String]) -> Option<String> {
-    let command = words.join(" ");
+    first_match_text(patterns, &words.join(" "))
+}
+
+/// The first of `patterns` that matches `text`.
+fn first_match_text(patterns: &[Pattern], text: &str) -> Option<String> {
     patterns
         .iter()
-        .find(|pattern| pattern.is_match(&command))
+        .find(|pattern| pattern.is_match(text))
         .map(|pattern| pattern.as_str().to_owned())
 }
 

@@ -170,6 +170,8 @@ pub struct FakeFacts {
     pub local_p50_asked: Cell<usize>,
     /// Whether the commit's stage may route, as the gate's judge would say; `false` unless a case says otherwise.
     pub commit_stage: bool,
+    /// What the decision last told of the words its patterns were asked about, and whether one matched.
+    pub matched_against: RefCell<Option<(String, bool)>>,
 }
 
 impl FakeFacts {
@@ -224,6 +226,7 @@ impl FakeFacts {
             local_p50: None,
             local_p50_asked: Cell::new(0),
             commit_stage: false,
+            matched_against: RefCell::new(None),
         }
     }
 
@@ -265,6 +268,10 @@ impl Facts for FakeFacts {
     }
 
     fn stage_kept_here(&self, _why: &str) {}
+
+    fn matched_against(&self, sent: &str, matched: bool) {
+        self.matched_against.replace(Some((sent.to_owned(), matched)));
+    }
 
     fn config(&self) -> Result<Option<Config>, ConfigProblem> {
         self.ask("config".to_owned());

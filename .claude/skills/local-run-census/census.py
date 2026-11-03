@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
 
+# The gate's `notRouted` token of a command no pattern matched, which the tables read as no value.
+NO_PATTERN = "no pattern"
 SHELLS = frozenset({"pwsh", "powershell", "bash", "sh", "python", "py", "node", "cmd"})
 PYTHONS = frozenset({"python", "py"})
 SCRIPT_SUFFIXES = (".ps1", ".sh", ".py", ".js", ".mjs", ".cmd", ".bat")
@@ -840,7 +842,7 @@ class Family:
             self.covered += 1
             return
         not_routed = (run.queue or run.release or {}).get("notRouted")
-        if not_routed:
+        if not_routed and not_routed != NO_PATTERN:
             self.not_routed[str(not_routed)] += 1
         self.fallbacks.update(run.fallbacks)
         if run.release is None:

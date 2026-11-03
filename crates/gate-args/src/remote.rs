@@ -1,20 +1,23 @@
 //! `gate remote add|remove <section> <repo> <pattern>... [--builder <host>] [--tag <word>] [--dry-run]`: the words in
 //! any order, the options before, between or after the positionals; a `--` makes every later word a positional.
+//! `gate remote match <repo> <text>` reads the same way and takes none of the options.
 
 use std::ffi::OsString;
 use std::fmt;
 use std::iter::Peekable;
 
 use crate::problem::Problem;
-use crate::request::{REMOTE_BUILDER_SECTIONS, REMOTE_SECTIONS, RemoteRequest, RemoteVerb};
+use crate::request::{Invocation, REMOTE_BUILDER_SECTIONS, REMOTE_SECTIONS, RemoteMatchRequest, RemoteRequest, RemoteVerb};
 use crate::run::next_value;
 use crate::values::escaped;
 
 /// The most characters a `--tag` takes.
 pub(crate) const MAX_TAG: usize = 40;
+/// The verb that asks which pattern matches, in place of an edit.
+const MATCH: &str = "match";
 
 /// Reads the words after `gate remote`.
-pub(crate) fn parse(words: impl Iterator<Item = OsString>) -> Result<RemoteRequest, Vec<Problem>> {
+pub(crate) fn parse(words: impl Iterator<Item = OsString>) -> Result<Invocation, Vec<Problem>> {
     let mut words = words.peekable();
     let mut read = Read::default();
     let mut options_ended = false;
@@ -90,8 +93,51 @@ impl Read {
         value
     }
 
-    /// The request the words make; else every problem found.
-    fn finish(mut self) -> Result<RemoteRequest, Vec<Problem>> {
+    /// The invocation the words make; else every problem found.
+    fn finish(self) -> Result<Invocation, Vec<Problem>> {
+        if self.positional.first().is_some_and(|verb| verb == MATCH) {
+            self.finish_match().map(Invocation::RemoteMatch)
+        } else {
+            self.finish_edit().map(Invocation::Remote)
+        }
+    }
+
+    /// The `match` request the words make; else every problem found.
+    fn finish_match(mut self) -> Result<RemoteMatchRequest, Vec<Problem>> {
+        let mut operands = std::mem::take(&mut self.positional).into_iter().skip(1);
+        let repo = operands.next().unwrap_or_default();
+        let text = operands.next().unwrap_or_default();
+        let missing = if repo.is_empty() {
+            Some("the repo")
+        } else if text.is_empty() {
+            Some("the text")
+        } else {
+            None
+        };
+        let options = [
+            (self.builder.is_some(), "--builder"),
+            (self.tag.is_some(), "--tag"),
+            (self.dry_run, "--dry-run"),
+        ];
+        let refused = options
+            .into_iter()
+            .filter(|(given, _)| *given)
+            .map(|(_, option)| RemoteProblem::NotOnMatch(option));
+        let found = missing
+            .map(RemoteProblem::Missing)
+            .into_iter()
+            .chain(operands.next().map(RemoteProblem::ExtraOperand))
+            .chain(refused);
+        self.problems.extend(found.map(Problem::Remote));
+        if self.problems.is_empty() {
+            Ok(RemoteMatchRequest { repo, text })
+        } else {
+            Err(self.problems)
+        }
+    }
+
+    /// The edit request the words make; else every problem found.
+    fn finish_edit(mut self) -> Result<RemoteRequest, Vec<Problem>> {
         let mut positional = std::mem::take(&mut self.positional).into_iter();
         let verb = verb_of(positional.next().as_deref(), &mut self.problems);
         let section = positional.next().unwrap_or_default();
@@ -140,9 +186,9 @@ fn set(slot: &mut Option<String>, spelled: &str, value: Option<String>, problems
 /// A `gate remote` line it cannot take.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RemoteProblem {
-    /// One of its words is missing: `the verb add or remove`, `the section`, `the repo` or `a pattern`.
+    /// One of its words is missing: `the verb add, remove or match`, `the section`, `the repo`, `a pattern` or `the text`.
     Missing(&'static str),
-    /// A verb other than `add` or `remove`, as given.
+    /// A verb other than `add`, `remove` or `match`, as given.
     UnknownVerb(String),
     /// A section other than the ones it edits, as given.
     UnknownSection(String),
@@ -152,13 +198,17 @@ pub enum RemoteProblem {
     TagOnRemove,
     /// A `--tag` value that is not 1 to 40 ASCII letters, digits, `_` and `-`, as given.
     BadTag(String),
+    /// An option of an edit given to `match`, by its name.
+    NotOnMatch(&'static str),
+    /// A word after `match`'s repo and text, as given.
+    ExtraOperand(String),
 }
 
 impl fmt::Display for RemoteProblem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RemoteProblem::Missing(what) => write!(f, "missing {what}"),
-            RemoteProblem::UnknownVerb(verb) => write!(f, "unknown verb {}; add or remove", escaped(verb)),
+            RemoteProblem::UnknownVerb(verb) => write!(f, "unknown verb {}; add, remove or match", escaped(verb)),
             RemoteProblem::UnknownSection(section) => write!(f, "unknown section {}; one of {}", escaped(section), REMOTE_SECTIONS.join(", ")),
             RemoteProblem::NotABuilderSection(section) => write!(
                 f,
@@ -172,6 +222,8 @@ impl fmt::Display for RemoteProblem {
                 "--tag must be 1 to {MAX_TAG} ASCII letters, digits, '_' and '-', got '{}'",
                 escaped(tag)
             ),
+            RemoteProblem::NotOnMatch(option) => write!(f, "{option} is for add and remove only; match changes nothing"),
+            RemoteProblem::ExtraOperand(word) => write!(f, "match takes a repo and one text, and not {}", escaped(word)),
         }
     }
 }
@@ -186,7 +238,7 @@ fn verb_of(word: Option<&str>, problems: &mut Vec<Problem>) -> Option<RemoteVerb
             None
         }
         None => {
-            problems.push(Problem::Remote(RemoteProblem::Missing("the verb add or remove")));
+            problems.push(Problem::Remote(RemoteProblem::Missing("the verb add, remove or match")));
             None
         }
     }

@@ -54,6 +54,8 @@ const DECLARED_LOCAL: &str = "declared local";
 const GITIGNORED_INPUT: &str = "gitignored input";
 /// The `notRouted` value of a matched command kept here because a sibling the routing file requires is absent.
 const SIBLING_ABSENT: &str = "sibling absent";
+/// The `notRouted` value of a command none of its repo's patterns matched.
+const NO_PATTERN: &str = "no pattern";
 /// The declaration file of the prefixes of the caller's variables a repo's commands read.
 const ENV_NAME: &str = "env.toml";
 /// The largest file of `.gate` the gate reads: 64 KiB.
@@ -112,14 +114,23 @@ impl Placed {
     }
 }
 
+/// The words a command's patterns were asked about, as they were matched, and whether one matched
+/// ([`Facts::matched_against`]).
+pub(crate) struct Sent {
+    pub(crate) text: String,
+    pub(crate) matched: bool,
+}
+
 /// Where a run's command runs ([`route`]), what the decision learnt of the gate's place in its git worktree, the hash of
-/// the routed run's warm-up file when its repo's warm-up is set up ([`consented_hash`]), and what the decision saw,
-/// which a light run held back by a critical request asks again as a heavy one ([`route_as_heavy`]).
+/// the routed run's warm-up file when its repo's warm-up is set up ([`consented_hash`]), what the decision saw, which a
+/// light run held back by a critical request asks again as a heavy one ([`route_as_heavy`]), and what its patterns were
+/// asked about, `None` when the decision asked them nothing.
 pub(crate) struct Decided {
     pub route: Route,
     pub placed: Placed,
     pub warm_hash: Option<String>,
     pub decision: Decision,
+    pub(crate) sent: Option<Sent>,
 }
 
 /// What the routing decision saw of the run, kept so a light run its start decision kept here can ask, once a critical
@@ -254,6 +265,7 @@ pub(crate) fn route(
         placed: machine.found.into_inner(),
         warm_hash,
         decision,
+        sent: machine.sent.into_inner(),
     }
 }
 
@@ -517,8 +529,9 @@ fn consented_hash(remote: &RemoteRun, machine: &Machine<'_>) -> Option<String> {
 /// a matched command whose outside path lies in another git worktree, `declared local` for one its repo's
 /// `.gate/local.toml` keeps here, by a pattern or by a problem, `gitignored input` for one whose word names a gitignored
 /// project input, `sibling absent` for one whose declared sibling the routing file requires and it is not beside the
-/// worktree, else none.
-pub(crate) fn not_routed(route: &Route) -> Option<String> {
+/// worktree, `no pattern` for a run kept here for no reason it says whose decision found that `sent` matched no pattern
+/// of its repo, else none.
+pub(crate) fn not_routed(route: &Route, sent: Option<&Sent>) -> Option<String> {
     match route {
         Route::Local {
             reason: Some(LocalReason::LocalFlag),
@@ -538,6 +551,7 @@ pub(crate) fn not_routed(route: &Route) -> Option<String> {
         Route::Local {
             reason: Some(LocalReason::SiblingAbsent { .. }),
         } => Some(SIBLING_ABSENT.to_owned()),
+        Route::Local { reason: None } if sent.is_some_and(|sent| !sent.matched) => Some(NO_PATTERN.to_owned()),
         _ => None,
     }
 }
@@ -1106,6 +1120,8 @@ pub(crate) struct Machine<'a> {
     /// ([`Facts::windows_change`]): [`CHANGE_DEADLINE`], or the `--test-git-limit-ms` seam when it is given.
     change_deadline: Duration,
     found: RefCell<Placed>,
+    /// What the decision's patterns were last asked about ([`Facts::matched_against`]).
+    sent: RefCell<Option<Sent>>,
     /// The routing file the decision read, when it read one: the warm-up's judgement reads its consent from this.
     config: RefCell<Option<Config>>,
     /// The log lines of the declaration files the decision read ([`Source::log_lines`]), for the log alone.
@@ -1232,6 +1248,7 @@ impl<'a> Machine<'a> {
             change_deadline: CHANGE_DEADLINE,
             listing_cap: git::OUTPUT_CAP,
             found: RefCell::new(Placed::NotAsked),
+            sent: RefCell::new(None),
             config: RefCell::new(None),
             notes: RefCell::new(Vec::new()),
             said: RefCell::new(Vec::new()),
@@ -1741,6 +1758,13 @@ impl Facts for Machine<'_> {
     /// Notes for the log alone why a commit judged a stage runs its hooks here, as the judge's own reason is noted.
     fn stage_kept_here(&self, why: &str) {
         self.notes.borrow_mut().push(format!("gate: the commit's hooks run here: {why}"));
+    }
+
+    fn matched_against(&self, sent: &str, matched: bool) {
+        self.sent.replace(Some(Sent {
+            text: sent.to_owned(),
+            matched,
+        }));
     }
 
     /// `<LOCALAPPDATA>\gate\remote.json`; with LOCALAPPDATA unset, empty or relative there is no routing file. A file
@@ -2656,9 +2680,9 @@ mod tests {
 
     use super::{
         CHANGE_DEADLINE, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, GATE_FILE_NOT_A_FILE, Machine, Origin, SIBLING_GIT_LINK, SIBLING_LINK,
-        SIBLING_NOT_A_FOLDER, Source, balanced_line, change_error, change_limit, checkout_of, holds_existing_path, is_fixed_local, is_share_target,
-        judge_declarations, not_routed, nul_separated, parse_head, parse_place, read_declaration, read_siblings, same_folder, sibling_folder,
-        worktree_of,
+        SIBLING_NOT_A_FOLDER, Sent, Source, balanced_line, change_error, change_limit, checkout_of, holds_existing_path, is_fixed_local,
+        is_share_target, judge_declarations, not_routed, nul_separated, parse_head, parse_place, read_declaration, read_siblings, same_folder,
+        sibling_folder, worktree_of,
     };
     use crate::remote::box_trees;
     use crate::remote::git;
@@ -4412,19 +4436,43 @@ mod tests {
             }),
         };
 
-        assert_eq!(not_routed(&flag).as_deref(), Some("--local"));
-        assert_eq!(not_routed(&absent).as_deref(), Some("sibling absent"));
-        assert_eq!(not_routed(&other).as_deref(), Some("another worktree"));
-        assert_eq!(not_routed(&declared).as_deref(), Some("declared local"));
+        assert_eq!(not_routed(&flag, None).as_deref(), Some("--local"));
+        assert_eq!(not_routed(&absent, None).as_deref(), Some("sibling absent"));
+        assert_eq!(not_routed(&other, None).as_deref(), Some("another worktree"));
+        assert_eq!(not_routed(&declared, None).as_deref(), Some("declared local"));
         assert_eq!(
-            not_routed(&unusable).as_deref(),
+            not_routed(&unusable, None).as_deref(),
             Some("declared local"),
             "a file the gate cannot use keeps it here too"
         );
-        assert_eq!(not_routed(&desktop), None);
-        assert_eq!(not_routed(&outside), None, "an outside word in no other worktree writes none");
-        assert_eq!(not_routed(&failed), None);
-        assert_eq!(not_routed(&Route::Local { reason: None }), None);
+        assert_eq!(not_routed(&desktop, None), None);
+        assert_eq!(not_routed(&outside, None), None, "an outside word in no other worktree writes none");
+        assert_eq!(not_routed(&failed, None), None);
+    }
+
+    fn sent(matched: bool) -> Sent {
+        Sent {
+            text: "dotnet build".to_owned(),
+            matched,
+        }
+    }
+
+    #[test]
+    fn not_routed_says_no_pattern_only_of_a_silent_run_no_pattern_matched() {
+        let silent = Route::Local { reason: None };
+        assert_eq!(not_routed(&silent, Some(&sent(false))).as_deref(), Some("no pattern"));
+        assert_eq!(not_routed(&silent, Some(&sent(true))), None, "matched, then kept here silently");
+        assert_eq!(not_routed(&silent, None), None, "the patterns were asked nothing");
+        let other = Route::Local {
+            reason: Some(LocalReason::OtherWorktree {
+                tree: PathBuf::from(r"X:\dev\other"),
+            }),
+        };
+        assert_eq!(
+            not_routed(&other, Some(&sent(false))).as_deref(),
+            Some("another worktree"),
+            "the worktree the command works in wins"
+        );
     }
 
     #[test]
