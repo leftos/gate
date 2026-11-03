@@ -80,6 +80,11 @@ path = "src/bin/fake-tool.rs"
 required-features = ["test-seams"]
 
 [[bin]]
+name = "fake-gate"
+path = "src/bin/fake-gate.rs"
+required-features = ["test-seams"]
+
+[[bin]]
 name = "fake-ssh"
 path = "src/bin/fake-ssh.rs"
 required-features = ["test-seams"]

@@ -24,7 +24,6 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 use std::thread;
 use std::time::Duration;
 
@@ -36,13 +35,13 @@ use gate_args::{PruneRequest, PruneSeams, PushRequest};
 use gate_router::{BuilderOs, Config, escaped, is_unix_root};
 use gate_win32::{EnvironmentBlock, Job, LaunchError, PipedConsole, PipedFed, PipedLaunch, Running};
 use gate_wire::slots::{MOST_LINE_BYTES, MOST_SLOTS};
-use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT};
 
 use crate::answer::FAILED_STATUS;
 use crate::console::Console;
+use crate::installed::{VERSION_BOUND, installed_gate, local_version};
 use crate::prune_cmd;
 use crate::remote::git;
 use crate::remote::transport::ssh::{BUILDER_ROOT, Ssh, git_ssh_command};
@@ -52,8 +51,6 @@ use crate::route::read_remote_json;
 
 /// How long one builder's call may take before it is killed.
 const BOUND: Duration = Duration::from_secs(300);
-/// How long the installed exe's `--version` may take here.
-const VERSION_BOUND: Duration = Duration::from_secs(30);
 /// What starts each of the builder script's lines this side reads.
 const MARK: &str = "gate-push: ";
 /// What starts a builder script's `note` line.
@@ -589,10 +586,6 @@ exit 0
 main "$@"
 "#;
 
-/// `gate --version`'s line, matched in any letter case as PowerShell's `-match` does: the version is what follows
-/// `gate ` and its white space, trailing white space left out.
-static VERSION: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"(?i)^gate\s+(.+?)\s*$").ok());
-
 /// Runs `gate push` and returns its exit status.
 pub(crate) fn push(request: &PushRequest, environment: &Environment, console: &mut Console) -> u32 {
     let variables: Vec<(OsString, OsString)> = std::env::vars_os().collect();
@@ -764,22 +757,18 @@ fn prepared(
     register_ok: Option<bool>,
     place: Place<'static>,
 ) -> Result<Prepared, String> {
-    let folder = environment
-        .local_app_data
-        .as_deref()
-        .map(Path::new)
-        .filter(|folder| folder.is_absolute())
-        .ok_or_else(|| "push: no remote.json: LOCALAPPDATA is not an absolute folder".to_owned())?;
-    let gate = folder.join("gate");
+    let no_folder = || "push: no remote.json: LOCALAPPDATA is not an absolute folder".to_owned();
+    // `<LOCALAPPDATA>\gate\bin\gate.exe`: its folder is `bin`, and that folder's is the gate's.
+    let exe = installed_gate(environment).ok_or_else(no_folder)?;
+    let bin = exe.parent().ok_or_else(no_folder)?;
+    let gate = bin.parent().ok_or_else(no_folder)?;
     let Listed { hosts: builders, macs, ssh } = builders(&gate.join("remote.json"))?;
-    let bin = gate.join("bin");
-    let exe = bin.join("gate.exe");
     // The lock tools/install.ps1 holds while it replaces and checks the exe and the helper, held for their reads and the
     // version only; with no bin folder there is no exe, which the read says.
-    let lock = if bin.is_dir() { Some(local_lock(&bin)?) } else { None };
+    let lock = if bin.is_dir() { Some(local_lock(bin)?) } else { None };
     let bytes = installed(&exe)?;
     let helper = installed_helper(&bin.join(gate_desktop::HELPER_FILE))?;
-    let raw_version = local_version(&exe, variables)?;
+    let raw_version = local_version(&exe, variables).map_err(|why| format!("push: {why}"))?;
     let source = (!macs.is_empty()).then(|| source_of(&bin.join(SOURCE_FILE), &raw_version));
     let version = shown(&raw_version);
     drop(lock);
@@ -1363,34 +1352,6 @@ fn installed_helper(helper: &Path) -> Result<Vec<u8>, String> {
     fs::read(helper).map_err(|error| format!("push: cannot read {}: {error}", helper.display()))
 }
 
-/// The installed exe's version, from its `--version`, a call bounded as a builder's is, at [`VERSION_BOUND`]; else
-/// the line saying it could not be read.
-fn local_version(exe: &Path, variables: &[(OsString, OsString)]) -> Result<String, String> {
-    let heard = called(&Call {
-        program: exe,
-        args: vec![OsString::from("--version")],
-        input: b"",
-        variables,
-        bound: VERSION_BOUND,
-    });
-    let version = match heard.end {
-        End::Exited(_) => heard.first.as_deref().and_then(version_of),
-        End::TimedOut | End::Failed(_) => None,
-    };
-    version.ok_or_else(|| format!("push: could not read the version of {}", exe.display()))
-}
-
-/// What `--version`'s output says after `gate `, as `tools/install.ps1`'s `Get-GateVersion` reads it: its first line
-/// matched in any letter case, `None` when that line is no `gate <version>`.
-fn version_of(output: &str) -> Option<String> {
-    let first = output.lines().next()?;
-    VERSION
-        .as_ref()?
-        .captures(first)
-        .and_then(|captures| captures.get(1))
-        .map(|version| version.as_str().to_owned())
-}
-
 /// `bytes`' SHA-256 as upper-case hex, as `Get-FileHash` and `Convert.ToHexString` write it.
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().fold(String::with_capacity(64), |mut hex, byte| {
@@ -1413,17 +1374,17 @@ fn encoded_line(script: &str) -> String {
 }
 
 /// One call: the program, its words, what it is fed on stdin, its whole environment and how long it may take.
-struct Call<'a> {
-    program: &'a Path,
-    args: Vec<OsString>,
-    input: &'a [u8],
-    variables: &'a [(OsString, OsString)],
-    bound: Duration,
+pub(crate) struct Call<'a> {
+    pub program: &'a Path,
+    pub args: Vec<OsString>,
+    pub input: &'a [u8],
+    pub variables: &'a [(OsString, OsString)],
+    pub bound: Duration,
 }
 
 /// How a call ended.
 #[derive(Debug, PartialEq, Eq)]
-enum End {
+pub(crate) enum End {
     /// It exited with this status.
     Exited(u32),
     /// The bound ended it.
@@ -1436,9 +1397,9 @@ enum End {
 /// lines as [`Kept::mark`] keeps them, its last standard error line that is not blank, and the first problem feeding or
 /// reading it. Every line is cut to [`LINE_CAP`] bytes.
 #[derive(Debug)]
-struct Heard {
-    end: End,
-    first: Option<String>,
+pub(crate) struct Heard {
+    pub end: End,
+    pub first: Option<String>,
     marked: Vec<String>,
     last_error: Option<String>,
     problem: Option<String>,
@@ -1459,7 +1420,7 @@ impl Heard {
 
 /// Makes `call` in an anonymous job that ends every process in it once the call ends: its stdin fed, its two streams
 /// read, and the whole job ended at the bound.
-fn called(call: &Call<'_>) -> Heard {
+pub(crate) fn called(call: &Call<'_>) -> Heard {
     started(call).unwrap_or_else(Heard::failed)
 }
 
@@ -1762,9 +1723,10 @@ mod tests {
     use super::{
         BOOTSTRAP, BUILD_BOUND, CARGO_BOUND, Call, End, Fact, Heard, LINE_CAP, MAC_SCRIPT, MARKED_CAP, MOST_SLOTS, PWSH, Payload, Place, REGISTER,
         Said, Slots, called, encoded_line, fact, filled, gzipped, installed_lines, kept, mac_build_line, mac_ended, mac_prepare_line, place,
-        push_line, pushed_input, register_command, root_expression, said, sha256_hex, slot_line, succeeded, version_of,
+        push_line, pushed_input, register_command, root_expression, said, sha256_hex, slot_line, succeeded,
     };
     use crate::environment::Variables;
+    use crate::installed::version_of;
     use crate::run::find_program;
 
     const SHA: &str = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";

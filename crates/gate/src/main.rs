@@ -25,6 +25,7 @@ mod environment;
 mod escaped;
 mod expect;
 mod heartbeat;
+mod installed;
 mod journal;
 mod late;
 mod load;

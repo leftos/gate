@@ -9,6 +9,9 @@ use gate_state::{StateRoot, default_root};
 
 use crate::environment::{BOX_JOB_VARIABLE, COMMIT_SLOT_VARIABLE, SLOT_HELD_VARIABLE};
 
+/// The variable a stale gate starts the installed gate it hands its run to with, set to its own build.
+pub(crate) const HANDED_OVER_VARIABLE: &str = "GATE_HANDED_OVER";
+
 /// The environment variables the gate reads.
 pub(crate) struct Environment {
     pub state_dir: Option<OsString>,
@@ -25,6 +28,9 @@ pub(crate) struct Environment {
     /// The variables among those that keep a commit's stage here ([`crate::commit::stage::BLOCKING_VARIABLES`]) that
     /// the gate's environment sets, to any value.
     pub stage_blocking: Vec<&'static str>,
+    /// `GATE_HANDED_OVER`, the build of the stale gate that handed this run over ([`crate::run`]), if any: a gate that
+    /// sees it never hands its run over again.
+    pub handed_over: Option<OsString>,
 }
 
 impl Environment {
@@ -40,6 +46,7 @@ impl Environment {
                 .into_iter()
                 .filter(|name| std::env::var_os(name).is_some())
                 .collect(),
+            handed_over: std::env::var_os(HANDED_OVER_VARIABLE),
         }
     }
 }
@@ -130,6 +137,7 @@ mod tests {
             box_job: None,
             commit_slot: None,
             stage_blocking: Vec::new(),
+            handed_over: None,
         };
         let variable = Environment {
             state_dir: Some(given.clone().into_os_string()),
@@ -139,6 +147,7 @@ mod tests {
             box_job: None,
             commit_slot: None,
             stage_blocking: Vec::new(),
+            handed_over: None,
         };
 
         assert_eq!(root(None, &no_root).err().as_deref(), Some("gate: cannot read the LOCALAPPDATA variable"));

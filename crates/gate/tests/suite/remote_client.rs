@@ -28,7 +28,7 @@ use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS
 use crate::durations::{seed, seed_warm};
 use crate::remote_inputs::inputs_case;
 use crate::support::{
-    ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, GIT_REDIRECTS, Go, Junction, LOCAL_REASON, NetfxKey, Outcome,
+    ANSWERING, Case, FAKE_GATE, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, GIT_REDIRECTS, Go, Junction, LOCAL_REASON, NetfxKey, Outcome,
     PREFLIGHT_SEAMS_VARIABLE, Running, STEPS_VARIABLE, allow_breakaway, assert_in_order, beside, build_version, calls, copy_tool, events, finish,
     git, git_init, heavy_words, log_texts, nothing_back, refuse_breakaway, release, run_words, shown, ssh_steps, start, wait_for_journal_line,
     wait_until, wait_until_closed, write_remote_json,
@@ -2789,6 +2789,179 @@ fn a_builder_of_another_version_hands_the_run_to_the_next_builder() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_handed_on(&case, pid, &outcome, &steps, "version");
+}
+
+/// The build the handover cases' builder says it runs, which no build of the suite's gate is.
+const OTHER_BUILD: &str = "0.0.0-other";
+
+/// Puts fake-gate where the case's gate looks for the installed one, `<LOCALAPPDATA>\gate\bin\gate.exe`, answering
+/// `--version` with `version` and ending a run with `exit` when given; the folder it records its run in.
+fn install_fake_gate(case: &Case, version: &str, exit: Option<&str>) -> PathBuf {
+    let bin = case.local_app_data().join("gate").join("bin");
+    fs::create_dir_all(&bin).expect("the installed gate's folder can be made");
+    fs::copy(FAKE_GATE, bin.join("gate.exe")).expect("fake-gate can be copied in as the installed gate");
+    fs::write(bin.join("version.txt"), version).expect("the stand-in's version can be written");
+    if let Some(exit) = exit {
+        fs::write(bin.join("exit.txt"), exit).expect("the stand-in's status can be written");
+    }
+    bin
+}
+
+/// The gate of a routed run whose builder says it runs [`OTHER_BUILD`], started in the case folder's `start` folder
+/// with `--cd ..` and the relative log `out.log`, `extra` after them; with that `start` folder and its words.
+fn stale_gate(case: &Case, extra: &[&str]) -> (Command, PathBuf, Vec<OsString>) {
+    let step = format!("version {OTHER_BUILD}");
+    let steps = ssh_steps(case, "ssh", &[step.as_str()]);
+    let start = case.folder().join("start");
+    fs::create_dir_all(&start).expect("the start folder can be made");
+    let mut before = vec!["--cd", ".."];
+    before.extend(extra);
+    let tuned = Tuned {
+        extra: &before,
+        ..Tuned::default()
+    };
+    let mut gate = client_gate_tuned(case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran here"]);
+    gate.current_dir(&start);
+    let words = gate.get_args().map(std::ffi::OsStr::to_owned).collect();
+    (gate, start, words)
+}
+
+/// Asserts the stale gate `pid` handed its run to the installed gate recorded in `bin`, which ended 7: the status is the
+/// installed gate's, which got the gate's `words` verbatim, the `start` folder and this gate's build as its marker; the
+/// handover line is said and no verdict of the stale gate's, whose journal holds its version fallback and its release.
+fn assert_handed_over(case: &Case, pid: u32, outcome: &Outcome, (bin, start, words): (&Path, &Path, &[OsString])) {
+    let own_build = build_version(case);
+    assert_eq!(outcome.code, Some(7), "the installed gate's own status: {outcome:?}");
+    assert!(outcome.stdout.contains("fake-gate ran"), "{outcome:?}");
+    let argv = fs::read_to_string(bin.join("argv.txt")).expect("the installed gate ran");
+    let given = words.iter().fold(String::new(), |mut given, word| {
+        given.push_str(&word.to_string_lossy());
+        given.push('\n');
+        given
+    });
+    assert_eq!(argv, given, "the installed gate got the gate's words verbatim");
+    let cwd = fs::read_to_string(bin.join("cwd.txt")).expect("the installed gate wrote its folder");
+    assert_eq!(Path::new(&cwd), start, "it ran in the folder the gate was started in, before --cd");
+    let marker = fs::read_to_string(bin.join("marker.txt")).expect("the installed gate wrote its marker");
+    assert_eq!(marker, own_build, "the marker names the stale gate's build");
+    let line = format!("gate: this gate is {own_build}, the installed one is {OTHER_BUILD}; handing the run to it");
+    assert!(outcome.stderr.lines().any(|said| said == line), "{outcome:?}");
+    assert!(
+        !outcome.stderr.contains("gate: passed") && !outcome.stderr.contains("gate: FAILED"),
+        "the stale gate says no verdict: {outcome:?}"
+    );
+    let own = own(case, pid);
+    assert_eq!(fallbacks(&own), ["version"], "{own:#?}");
+    assert_eq!(own.iter().filter(|said| said["event"] == "release").count(), 1, "{own:#?}");
+}
+
+/// Asserts the run whose builder said it runs [`OTHER_BUILD`] fell back `version` and ran here as it does with no
+/// installed gate to hand it to, and that no installed gate ran.
+fn assert_kept_here(case: &Case, outcome: &Outcome, bin: Option<&Path>) {
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let line = format!("gate: not routed: builder runs gate {OTHER_BUILD}, this PC {}", build_version(case));
+    assert!(outcome.stderr.contains(&line), "{outcome:?}");
+    assert_ran_here_not_handed(case, outcome, bin);
+}
+
+/// Asserts a run that fell back `version` ran here, saying nothing of a handover, and the installed gate in `bin`, if
+/// any, never ran.
+fn assert_ran_here_not_handed(case: &Case, outcome: &Outcome, bin: Option<&Path>) {
+    assert!(outcome.stderr.contains("gate: remote builder version; running here"), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("handing the run"), "{outcome:?}");
+    assert_eq!(fallbacks(&events(case)), ["version"]);
+    if let Some(bin) = bin {
+        assert!(!bin.join("argv.txt").exists(), "the installed gate never ran a run");
+    }
+}
+
+#[test]
+fn a_stale_gate_hands_a_refused_run_to_the_installed_gate() {
+    let case = client_case("client-handover");
+    let bin = install_fake_gate(&case, OTHER_BUILD, Some("7"));
+    let (gate, start, words) = stale_gate(&case, &[]);
+
+    let (pid, outcome) = finish_with_pid(gate);
+
+    assert_handed_over(&case, pid, &outcome, (&bin, &start, &words));
+}
+
+#[test]
+fn a_pinned_stale_gate_hands_its_run_over_too() {
+    let case = client_case("client-handover-pinned");
+    let bin = install_fake_gate(&case, OTHER_BUILD, Some("7"));
+    let (gate, start, words) = stale_gate(&case, &["--builder", HOST]);
+
+    let (pid, outcome) = finish_with_pid(gate);
+
+    assert_handed_over(&case, pid, &outcome, (&bin, &start, &words));
+    let argv = fs::read_to_string(bin.join("argv.txt")).expect("the installed gate ran");
+    assert!(argv.lines().any(|word| word == "--builder"), "{argv}");
+}
+
+#[test]
+fn an_installed_gate_of_this_gate_s_own_version_takes_no_handover() {
+    let case = client_case("client-handover-own");
+    let bin = install_fake_gate(&case, &build_version(&case), Some("7"));
+    let (gate, _, _) = stale_gate(&case, &[]);
+
+    let outcome = finish(gate);
+
+    assert_kept_here(&case, &outcome, Some(&bin));
+}
+
+#[test]
+fn an_installed_gate_unlike_the_builder_takes_no_handover() {
+    let case = client_case("client-handover-unlike");
+    let bin = install_fake_gate(&case, "0.0.0-third", Some("7"));
+    let (gate, _, _) = stale_gate(&case, &[]);
+
+    let outcome = finish(gate);
+
+    assert_kept_here(&case, &outcome, Some(&bin));
+}
+
+#[test]
+fn a_handed_over_gate_never_hands_over_again() {
+    let case = client_case("client-handover-again");
+    let bin = install_fake_gate(&case, OTHER_BUILD, Some("7"));
+    let (mut gate, _, _) = stale_gate(&case, &[]);
+    gate.env("GATE_HANDED_OVER", "x");
+
+    let outcome = finish(gate);
+
+    assert_kept_here(&case, &outcome, Some(&bin));
+}
+
+#[test]
+fn no_installed_gate_keeps_today_s_fallback() {
+    let case = client_case("client-handover-none");
+    let (gate, _, _) = stale_gate(&case, &[]);
+
+    let outcome = finish(gate);
+
+    assert_kept_here(&case, &outcome, None);
+}
+
+/// A builder with no gate box is refused for `version` by what the box said, not by this PC's compare of its build:
+/// no handover, whatever the installed gate runs.
+#[test]
+fn a_box_s_own_version_refusal_takes_no_handover() {
+    let case = client_case("client-handover-box");
+    let bin = install_fake_gate(&case, OTHER_BUILD, Some("7"));
+    let steps = ssh_steps(&case, "ssh", &["exit 9009"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: not routed: builder has no gate box that takes this run (preflight status 9009)"),
+        "{outcome:?}"
+    );
+    assert_ran_here_not_handed(&case, &outcome, Some(&bin));
 }
 
 /// A `builders` entry whose connection drops is tried first, is unreachable, and the run goes on to `host` and runs

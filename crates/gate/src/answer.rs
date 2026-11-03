@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::io;
-use std::path::{Component, Path, Prefix};
+use std::path::{Component, Path, PathBuf, Prefix};
 
 use gate_args::{ExpectRequest, Invocation, Problem, RunRequest, Spelling, StopRequest, USAGE, parse};
 use gate_wire::build_version;
@@ -16,9 +16,23 @@ pub(crate) const FAILED_STATUS: u8 = 1;
 /// The status of a usage error: a missing, unknown or invalid input, or a word the command cannot take.
 pub(crate) const USAGE_STATUS: u8 = 2;
 
+/// How the gate was started: its command line without the program name, as it was given, and the folder it was started
+/// in, before any `--cd`; empty when that folder could not be read. A stale run hands both to the installed gate.
+pub(crate) struct Invoked {
+    pub args: Vec<OsString>,
+    pub folder: PathBuf,
+}
+
+/// What the gate was started with: the variables it read and how it was invoked.
+pub(crate) struct Started<'a> {
+    pub environment: &'a Environment,
+    pub invoked: &'a Invoked,
+}
+
 /// Says the answer for `args`, the command line without the program name, through `console`, and returns the exit
 /// status: a 32-bit code, since a run passes its command's whole exit code through.
 pub(crate) fn answer(args: Vec<OsString>, environment: &Environment, console: &mut Console) -> u32 {
+    let given = args.clone();
     match parse(args) {
         Ok(Invocation::Version) => {
             console.out(&format!("gate {}", build_version()));
@@ -28,7 +42,7 @@ pub(crate) fn answer(args: Vec<OsString>, environment: &Environment, console: &m
             console.out(USAGE);
             0
         }
-        Ok(Invocation::Run(request)) => run(&request, environment, console),
+        Ok(Invocation::Run(request)) => run(&request, given, environment, console),
         Ok(Invocation::StopTree(request)) => u32::from(stop_tree(&request, environment, console)),
         Ok(Invocation::Cutover(request)) => crate::cutover::cutover(&request, environment, console),
         Ok(Invocation::Push(request)) => crate::push::push(&request, environment, console),
@@ -57,7 +71,12 @@ fn usage_error(problems: &[Problem], console: &mut Console) -> u8 {
     USAGE_STATUS
 }
 
-fn run(request: &RunRequest, environment: &Environment, console: &mut Console) -> u32 {
+fn run(request: &RunRequest, args: Vec<OsString>, environment: &Environment, console: &mut Console) -> u32 {
+    // Read before `--cd` is entered: the folder a handed-over run starts in, so a relative `--cd` or log reads alike.
+    let invoked = Invoked {
+        args,
+        folder: std::env::current_dir().unwrap_or_default(),
+    };
     let resolved = resolve::root(request.state_dir.as_deref(), environment).and_then(|root| {
         let log = if request.print_request {
             resolve::log_in(&request.log, request.cd.as_deref())?
@@ -76,7 +95,13 @@ fn run(request: &RunRequest, environment: &Environment, console: &mut Console) -
             console.out(&request_json::run(request, &log, &root));
             0
         }
-        Ok((log, root)) => crate::run::run(request, &log, &root, environment, console),
+        Ok((log, root)) => {
+            let started = Started {
+                environment,
+                invoked: &invoked,
+            };
+            crate::run::run(request, &log, &root, &started, console)
+        }
     }
 }
 

@@ -7,7 +7,7 @@ use std::io;
 use gate_state::StateRoot;
 use gate_win32::{EnvironmentBlock, same_variable_name};
 
-use crate::resolve::ResolvedRoot;
+use crate::resolve::{HANDED_OVER_VARIABLE, ResolvedRoot};
 use crate::slots::ThisGate;
 
 /// The variable a box run gives its command naming the job the run's command runs in, as the box created it: a gate
@@ -106,12 +106,15 @@ impl Variables {
 
 /// What the gate sets over its own environment for the command: the slot marker, the build-server settings of the run
 /// `run` ([`build_servers`]), and the state root when it is not the default. Under the default root an inherited
-/// `GATE_STATE_DIR` is unset, so a gate nested in the command uses the same root.
+/// `GATE_STATE_DIR` is unset, so a gate nested in the command uses the same root. An inherited handover marker
+/// ([`HANDED_OVER_VARIABLE`]) is always unset.
 fn overrides(root: &ResolvedRoot, run: &str, marker: &str) -> Vec<Override> {
     let state_dir = (!root.root.is_default()).then(|| root.path.clone().into_os_string());
     let mut overrides = vec![(OsString::from(SLOT_HELD_VARIABLE), Some(OsString::from(marker)))];
     overrides.extend(build_servers(run));
     overrides.push((OsString::from("GATE_STATE_DIR"), state_dir));
+    // The handover marker is for the handed-over gate alone: a gate nested in its command was handed nothing.
+    overrides.push((OsString::from(HANDED_OVER_VARIABLE), None));
     overrides
 }
 
@@ -281,6 +284,17 @@ mod tests {
             Some(OsStr::new("false")),
             "no compiler server idles in the job of a command that waits for its whole tree"
         );
+    }
+
+    #[test]
+    fn the_command_never_gets_the_handover_marker() {
+        for name in ["GATE_HANDED_OVER", "gate_handed_over"] {
+            let inherited = vec![(OsString::from(name), OsString::from("x"))];
+            let variables = Variables(applied(inherited, overrides(&root(DEFAULT), "gate-1-2", "heavy:1:2")));
+
+            assert_eq!(variables.get("GATE_HANDED_OVER"), None, "{name}");
+            assert_eq!(variables.get("gate_handed_over"), None, "{name}");
+        }
     }
 
     #[test]

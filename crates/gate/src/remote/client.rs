@@ -653,6 +653,10 @@ pub(super) enum End {
     Status(i64),
     /// The builder cannot take the run, for this reason: status 75, and the run falls back here.
     Refused(FallbackReason),
+    /// This PC's own preflight compare refused the builder for running another gate build, its version as the builder
+    /// said it, `None` when it said none: ends as [`End::Refused`] for [`FallbackReason::Version`] does, carrying the
+    /// builder's version into [`RemoteOutcome::other_build`].
+    OtherBuild(Option<String>),
     /// The builder's work folder does not hold the PC's build the run's `SentDigest` names: the box's `sent` tag, which
     /// no fallback answers, as the client runs the call once more with `--no-build` dropped ([`Attempt::run_called`]).
     SentRefused,
@@ -3954,6 +3958,7 @@ impl Attempt<'_, '_> {
         let warm = self.warm_outcome(&end);
         let mut detail = None;
         let mut draining = None;
+        let mut other_build = None;
         let (status, reason) = match end {
             End::Draining(drain) => {
                 draining = Some(drain);
@@ -3966,6 +3971,10 @@ impl Attempt<'_, '_> {
             }
             End::Status(status) => (status, None),
             End::Refused(reason) => (REFUSED, Some(reason)),
+            End::OtherBuild(theirs) => {
+                other_build = theirs;
+                (REFUSED, Some(FallbackReason::Version))
+            }
             // Only a run call carrying a `SentDigest` is refused so, and the one run again carries none.
             End::SentRefused => {
                 self.say(format!("{FAILED_RUN}: the builder refused the PC's build of a run that sent none"));
@@ -4007,6 +4016,7 @@ impl Attempt<'_, '_> {
             command_started: self.marker_seen,
             staged: self.staged,
             checked: self.checked,
+            other_build,
         }
     }
 
@@ -5745,7 +5755,7 @@ fn warm_end(hash: &str, started: bool, end: &End, last_error: Option<&str>) -> W
     let failure = match end {
         End::Interrupted => return WarmEnd::Deleted,
         End::Status(0) if started && last_error == Some(warm_line(Some(hash)).as_str()) => return WarmEnd::Warm,
-        End::Refused(_) | End::NotRouted(_) => WarmFailure::Refused,
+        End::Refused(_) | End::OtherBuild(_) | End::NotRouted(_) => WarmFailure::Refused,
         _ if started => WarmFailure::Commands,
         _ => WarmFailure::Refused,
     };
@@ -5763,6 +5773,7 @@ fn warm_reason(end: &End, started: bool) -> String {
         End::Status(status) if started => format!("command stopped with status {status}"),
         End::Status(status) => format!("the builder ended the warm-up before its commands with status {status}"),
         End::Refused(reason) => format!("the builder refused: {}", reason.as_str()),
+        End::OtherBuild(_) => format!("the builder refused: {}", FallbackReason::Version.as_str()),
         End::SentRefused => "the builder refused: sent".to_owned(),
         End::Draining(_) => "the builder refused: drain".to_owned(),
         End::Killed => "the warm-up was killed: it ran out of its budget or went silent".to_owned(),
@@ -5978,8 +5989,9 @@ fn preflight_ended(host: &str, root: &str, called: &Called) -> Result<(), (Optio
         }
     }
     // The builder's whole text must be this build's, so another build of the same package version is refused too.
-    match version_refusal(host, their_version(&called.lines), &build_version()) {
-        Some(line) => Err((Some(line), End::Refused(FallbackReason::Version))),
+    let theirs = their_version(&called.lines);
+    match version_refusal(host, theirs, &build_version()) {
+        Some(line) => Err((Some(line), End::OtherBuild(theirs.map(str::to_owned)))),
         None => Ok(()),
     }
 }
@@ -8594,9 +8606,28 @@ mod tests {
         assert!(
             matches!(
                 preflight_ended("builder", r"C:\builder", &passed),
-                Err((Some(_), End::Refused(FallbackReason::Version)))
+                Err((Some(_), End::OtherBuild(Some(ref theirs)))) if theirs == "9.9.9"
             ),
             "without the tag the version is refused"
+        );
+    }
+
+    #[test]
+    fn preflight_ended_carries_the_builder_s_version_when_this_pc_refuses_it() {
+        let other = format!("{VERSION_PREFIX}0.0.0-other\n");
+        let (passed, _) = run_call_ended(&other, "", 0, "version-carried");
+        let ended = preflight_ended("builder", r"C:\builder", &passed);
+        assert!(
+            matches!(&ended, Err((Some(line), End::OtherBuild(Some(theirs))))
+                if theirs == "0.0.0-other" && line.starts_with("gate: not routed: builder runs gate 0.0.0-other, this PC ")),
+            "this PC's own compare carries the builder's version: {ended:?}"
+        );
+
+        let (no_box, _) = run_call_ended("", "", super::USAGE, "version-no-box");
+        let ended = preflight_ended("builder", r"C:\builder", &no_box);
+        assert!(
+            matches!(&ended, Err((Some(_), End::Refused(FallbackReason::Version)))),
+            "a builder with no gate box is refused for its version, carrying none: {ended:?}"
         );
     }
 

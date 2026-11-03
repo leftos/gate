@@ -606,7 +606,7 @@ pub(super) fn unexpected(end: &End) -> &'static str {
         End::Killed => "killed",
         End::Lost(_) => "with its connection lost",
         End::NotRouted(_) => "not routed",
-        End::Refused(_) => "refused",
+        End::Refused(_) | End::OtherBuild(_) => "refused",
         End::SentRefused => "refused for the PC's build",
         End::Draining(_) => "refused by the builder's drain",
         End::Failed(_) => "failed",

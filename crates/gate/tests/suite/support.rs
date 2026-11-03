@@ -25,6 +25,9 @@ use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObj
 pub const GATE: &str = env!("CARGO_BIN_EXE_gate");
 /// The helper program the suite's commands run.
 pub const FAKE_TOOL: &str = env!("CARGO_BIN_EXE_fake-tool");
+/// The stand-in for an installed gate of another build (the handover cases copy it to
+/// `<LOCALAPPDATA>\gate\bin\gate.exe`): it answers `--version` from `version.txt` beside it and records any other run.
+pub const FAKE_GATE: &str = env!("CARGO_BIN_EXE_fake-gate");
 /// The stand-in desktop helper a box case puts where the box looks for the installed one; it runs the real helper's
 /// code and breaks the step `GATE_DESKTOP_TEST_FAULT` names.
 pub const FAKE_DESKTOP_HELPER: &str = env!("CARGO_BIN_EXE_fake-desktop-helper");

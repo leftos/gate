@@ -13,12 +13,14 @@ use std::fs::OpenOptions;
 use std::os::windows::ffi::OsStrExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 use std::{fs, io};
 
+use gate_wire::build_version;
 use gate_wire::stamp::{self, Tag};
 
 use gate_args::{
@@ -44,7 +46,7 @@ use proc_table::{ProcessTree, Win32ProcessTable};
 use serde_json::{Map, Value};
 
 use crate::acquire;
-use crate::answer::USAGE_STATUS;
+use crate::answer::{self, Invoked, USAGE_STATUS};
 use crate::boxside::forward::{DRAIN, Forwarders, OutputBytes, Sink, Stamping};
 use crate::commit;
 use crate::commit::forward::Checked;
@@ -55,6 +57,7 @@ use crate::durations::{
 };
 use crate::environment::{self, BOX_JOB_VARIABLE, COMMIT_SLOT_VARIABLE, SLOT_HELD_VARIABLE, STAGE_HEAD_VARIABLE, STAGE_TREE_VARIABLE, Variables};
 use crate::escaped::{self, Found, Reach, Reached, Recorded};
+use crate::installed;
 use crate::journal::{self, RunJournal};
 use crate::late::{Late, LateOf, LateSlot};
 use crate::load::{self, Measuring, When};
@@ -69,7 +72,7 @@ use crate::outputs::{stale, walk::walk};
 use crate::remote::drain::{self, Drain, utc_clock};
 use crate::remote::syncback::Staged;
 use crate::remote::{self, KEY_WAIT_SLICE, KeyWait, RemoteCall, RemoteClient, RemoteOutcome, Split, git};
-use crate::resolve::{Environment, ResolvedRoot};
+use crate::resolve::{Environment, HANDED_OVER_VARIABLE, ResolvedRoot};
 use crate::restore::{self, NotRestoring, RestorePlan};
 use crate::route::{self, Placed};
 use crate::slots::{self, BuilderPool, ClaimOf, LendMarker, Pool, Survey, Taken, Takes, ThisGate, epoch_ms};
@@ -157,11 +160,15 @@ impl Untaken {
 /// word refused before anything was queued, a `--builder` pin refused before anything was queued or an `--alone` gate
 /// whose `--no-build` would be dropped ([`alone_refused`]). A run
 /// pinned with `--builder` that its builder did not run ends with 1.
-pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environment: &Environment, console: &mut Console) -> u32 {
+pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, started: &answer::Started<'_>, console: &mut Console) -> u32 {
+    let answer::Started { environment, invoked } = *started;
     let (nesting, asked) = match admitted(request, log, root, environment, console) {
         Ok(admitted) => admitted,
         Err(status) => return status,
     };
+    if let Some(old) = &environment.handed_over {
+        console.note(&format!("gate: run handed over by gate {}", old.to_string_lossy()));
+    }
     if let Some(orphan) = orphan_refusal(&nesting) {
         console.err(&orphan.line());
         return u32::from(USAGE_STATUS);
@@ -188,7 +195,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         }
     };
     // Held until the run has released its slot, so no other gate readies or writes this log meanwhile.
-    let _log_guard = match take_log(&root.root, log.path()) {
+    let log_guard = match take_log(&root.root, log.path()) {
         Ok(guard) => guard,
         Err(line) => {
             console.err(&line);
@@ -241,6 +248,9 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         hint_after: None,
         closing: Vec::new(),
         builder_call: BuilderCall::NotEnded,
+        environment,
+        invoked,
+        handed_over: None,
     };
     let (route, local) = match run.settle_route(environment, &mut beside, console) {
         Ok(settled) => settled,
@@ -249,17 +259,39 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
     say_nesting(run.nesting, run.request, console);
     run.queue(&route, console);
     let mut hold = Hold::nothing();
-    let status = match panic::catch_unwind(AssertUnwindSafe(|| run.through(&route, plan, local, &mut hold, console))) {
-        Ok(Some((ended, here))) => run.ended_through(hold, &ended, here, console),
-        Ok(None) => CONTROL_C_EXIT,
-        Err(payload) => {
-            run.after_panic(hold, console);
-            panic::resume_unwind(payload);
-        }
-    };
-    run.finish_log(console);
-    run.sweep_after();
-    status
+    let through = panic::catch_unwind(AssertUnwindSafe(|| run.through(&route, plan, local, &mut hold, console)));
+    run.after_through(through, hold, log_guard, console)
+}
+
+impl Run<'_> {
+    /// Ends the run as it went `through` ([`Run::through`]), holding `hold` and the log's mutex `log_guard` until then:
+    /// an ended run's end ([`Run::ended_through`]), a handed-over run's installed gate's ([`Run::hand_over`]), or a
+    /// Ctrl+C's; a panic is passed on once the run's slot is released. The gate's exit status.
+    fn after_through(
+        mut self,
+        through: thread::Result<Option<(Ended, Option<HereWords>)>>,
+        hold: Hold,
+        log_guard: OwnedMutexGuard,
+        console: &mut Console,
+    ) -> u32 {
+        let status = match through {
+            Ok(Some((ended, here))) => self.ended_through(hold, &ended, here, console),
+            // The installed gate's run is the whole run from here: its log, its verdict and its status.
+            Ok(None) => match self.handed_over.take() {
+                Some(handover) => return self.hand_over(hold, log_guard, handover, console),
+                None => CONTROL_C_EXIT,
+            },
+            Err(payload) => {
+                self.after_panic(hold, console);
+                panic::resume_unwind(payload);
+            }
+        };
+        self.finish_log(console);
+        self.sweep_after();
+        // Held until the run has released its slot and finished its log, so no other gate readies or writes it meanwhile.
+        drop(log_guard);
+        status
+    }
 }
 
 /// Whether a routed run's builder call ended, passing or failing its command.
@@ -278,6 +310,67 @@ impl Run<'_> {
         let interrupted = self.host.interrupt.is_some_and(Interrupt::is_raised);
         if self.builder_call == BuilderCall::Ended && !interrupted && !matches!(self.nesting, Nesting::InBox) {
             start_prune_sweep(self.request, &self.root.path);
+        }
+    }
+
+    /// The installed gate this run hands its request to after its own preflight refused the builder `outcome` names
+    /// ([`RemoteOutcome::other_build`]): only when the run is no commit stage and no rerouted held-back run, no gate
+    /// handed it over, no Ctrl+C came, and the installed gate's `--version` is that builder's build, which this gate's
+    /// own is not. `None` in every other case, an installed gate that is missing or whose version cannot be read
+    /// included; the version is read only once every other check passed.
+    fn hands_over(&self, outcome: &RemoteOutcome) -> Option<HandOver> {
+        if self.staging.is_some()
+            || self.rerouted_for.is_some()
+            || self.environment.handed_over.is_some()
+            || self.host.interrupt.is_some_and(Interrupt::is_raised)
+        {
+            return None;
+        }
+        let theirs = outcome.other_build.as_deref()?;
+        // A start folder that could not be read leaves nothing to start the installed gate in.
+        if theirs == build_version() || self.invoked.folder.as_os_str().is_empty() {
+            return None;
+        }
+        let installed = installed::installed_gate(self.environment)?;
+        let variables: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        let version = installed::local_version(&installed, &variables).ok()?;
+        (version == theirs).then_some(HandOver { installed, version })
+    }
+
+    /// Hands the run to the installed gate `handover` names: journals the release of what the run still holds, then,
+    /// unless a Ctrl+C came, lets the log go, drops this gate's notes and starts that gate with the words and in the
+    /// folder the gate was invoked with ([`Run::invoked`]), marked with this gate's build, on this console, and waits for
+    /// it. Its whole exit code; a Ctrl+C before the start ends the run as interrupted, saying so and writing the log
+    /// with the notes held, and a gate that cannot be started or waited for fails it, saying so.
+    fn hand_over(mut self, hold: Hold, log_guard: OwnedMutexGuard, handover: HandOver, console: &mut Console) -> u32 {
+        let HandOver { installed, .. } = handover;
+        self.release(hold, None, console);
+        if self.host.interrupt.is_some_and(Interrupt::is_raised) {
+            console.err("gate: interrupted before handing the run to the installed gate");
+            // Written while the log's mutex is still held, as any run's log is.
+            self.finish_log(console);
+            drop(log_guard);
+            return CONTROL_C_EXIT;
+        }
+        drop(log_guard);
+        // The log is the installed gate's: this gate's notes are not written.
+        drop(console.take_held());
+        let mut command = Command::new(&installed);
+        command
+            .args(&self.invoked.args)
+            .current_dir(&self.invoked.folder)
+            .env(HANDED_OVER_VARIABLE, build_version())
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        // The child shares this console and its group, so a Ctrl+C reaches it; this gate's handler only raises its
+        // flag, so the wait goes on to the child's own end.
+        match gate_win32::spawn(&mut command).and_then(|mut child| child.wait()) {
+            Ok(status) => status.code().map_or(exit_status(GATE_FAILED), i32::cast_unsigned),
+            Err(error) => {
+                console.err(&format!("gate: cannot start the installed gate {}: {error}", installed.display()));
+                exit_status(GATE_FAILED)
+            }
         }
     }
 }
@@ -920,6 +1013,13 @@ struct Run<'a> {
     /// Whether the routed run's builder call ended, passing or failing its command, rather than being refused or
     /// interrupted before it started: such a run may start the background prune sweep ([`start_prune_sweep`]).
     builder_call: BuilderCall,
+    /// The variables the gate read, its `LOCALAPPDATA` and handover marker among them.
+    environment: &'a Environment,
+    /// How the gate was started, which a handover starts the installed gate with.
+    invoked: &'a Invoked,
+    /// The installed gate a stale routed run hands its request to, set as its attempts end ([`Run::through`]); `None`
+    /// for every other run.
+    handed_over: Option<HandOver>,
 }
 
 /// A routed dotnet build that passed and brought everything back: its words, its worktree's root, the routed command's
@@ -1731,6 +1831,15 @@ enum Remotely {
     /// A commit's pre-commit stage ran its command on the builder, and ended as the client's outcome says
     /// ([`Run::stage`]).
     Staged(Box<RemoteOutcome>),
+    /// This gate is stale: its own preflight refused a builder that runs the installed gate's build, so the run, its
+    /// attempt given up, goes to that installed gate ([`Run::hands_over`], [`Run::hand_over`]).
+    HandOver(HandOver),
+}
+
+/// The installed gate a stale run hands its request to, and the build its `--version` said, the refused builder's.
+struct HandOver {
+    installed: PathBuf,
+    version: String,
 }
 
 /// A commit run's forwarder hooks folder, what its stage checked, and the worktree its child commits in.
@@ -2240,6 +2349,10 @@ impl Run<'_> {
                     .plan_local(plan, local, console)
                     .and_then(|(plan, _)| self.plan_here(remote, plan, console)),
                 Remotely::Staged(_) => unreachable!("only a commit's stage ends staged"),
+                Remotely::HandOver(handover) => {
+                    self.handed_over = Some(handover);
+                    return None;
+                }
             },
             Route::Refused(_) => unreachable!("run returns a refused pin's usage status before the run goes through"),
         };
@@ -2297,6 +2410,7 @@ impl Run<'_> {
                     // Back to its wait, in its first place.
                     Remotely::Here => {}
                     Remotely::Staged(_) => unreachable!("only a commit's stage ends staged"),
+                    Remotely::HandOver(_) => unreachable!("a rerouted run never hands over"),
                 },
             }
         }
@@ -2346,6 +2460,7 @@ impl Run<'_> {
                 self.open_log(console);
                 self.after_stage(&called, &host, figures, console)
             }
+            Remotely::HandOver(_) => unreachable!("a commit's stage never hands over"),
         }
     }
 
@@ -2476,6 +2591,7 @@ impl Run<'_> {
             Remotely::Interrupted | Remotely::Ended(_) => return,
             Remotely::Here => (None, StageOutcome::FellBack),
             Remotely::Staged(called) => stage_outcome(called),
+            Remotely::HandOver(_) => unreachable!("a commit's stage never hands over"),
         };
         self.routing.stage = Some(StageFacts {
             host: host.to_owned(),
@@ -2656,6 +2772,19 @@ impl Run<'_> {
                 Attempt::Done(remotely) => return (remotely, None),
                 Attempt::Refused(refusal) => refusal,
             };
+            // A stale gate whose own preflight refused a builder of the installed gate's build gives the attempt up as
+            // any version fallback does and hands the run to that gate; returning lets the key lock go.
+            if let Some(handover) = self.hands_over(&refusal.outcome) {
+                let Refusal { reason, outcome, held } = refusal;
+                hold.took = None;
+                self.give_up(reason, &outcome, held, console);
+                console.err(&format!(
+                    "gate: this gate is {}, the installed one is {}; handing the run to it",
+                    build_version(),
+                    handover.version
+                ));
+                return (Remotely::HandOver(handover), Some(reason));
+            }
             // The builder whose attempt was refused: the one whose slot the attempt took, or whose pool stayed full.
             let refused = walk.current.take();
             let current = refused.as_deref().unwrap_or(remote);

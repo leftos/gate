@@ -112,7 +112,7 @@ It is how a caller in a main checkout gates a command that names another worktre
 
 A name is one or more printable ASCII characters, U+0021 to U+007E, `=` excepted. ASCII only keeps the ASCII-case check of the refused names below equal to Windows' own comparison of names, so a name that is not ASCII can never pass that check and then be read as one the gate protects. A value may hold anything but NUL (CR and LF included) and may be empty.
 
-The gate refuses a name it sets itself (the build-server settings, `UseSharedCompilation`, `GATE_SLOT_HELD`, `GATE_COMMIT_SLOT`, `GATE_STATE_DIR`, the box's `GATE_BOX_JOB` and `GATE_BOX_EXE` and the rest listed under [Command launching](#command-launching) and [The box side](#the-box-side)), any `GATE_` name, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG` and the machine paths the box keeps (`GODOT_PATH` and `UE_ROOT` among them, which a routed run sets itself).
+The gate refuses a name it sets itself (the build-server settings, `UseSharedCompilation`, `GATE_SLOT_HELD`, `GATE_COMMIT_SLOT`, `GATE_HANDED_OVER`, `GATE_STATE_DIR`, the box's `GATE_BOX_JOB` and `GATE_BOX_EXE` and the rest listed under [Command launching](#command-launching) and [The box side](#the-box-side)), any `GATE_` name, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG` and the machine paths the box keeps (`GODOT_PATH` and `UE_ROOT` among them, which a routed run sets itself).
 
 The refusal is the same on both sides so one `--env` means the same on the PC and on a builder.
 
@@ -2303,7 +2303,7 @@ A period with no beat due flushes instead, and the box's flush probes stderr for
 
   The caller's `--env` pairs ([Command environment](#command-environment)) are set over the gate's environment first, so the settings above come last and no pair can undo one.
 
-  A commit run ([Commit run](#critical-drain-and-nesting)) also gives its command `GATE_COMMIT_SLOT=<its marker>`, the same text as its `GATE_SLOT_HELD`; any other gate removes `GATE_COMMIT_SLOT` from its command's environment.
+  A commit run ([Commit run](#critical-drain-and-nesting)) also gives its command `GATE_COMMIT_SLOT=<its marker>`, the same text as its `GATE_SLOT_HELD`; any other gate removes `GATE_COMMIT_SLOT` from its command's environment. Every command's environment also has `GATE_HANDED_OVER` removed ([A stale gate](#routing)).
 
   `GATE_BOX_JOB` and `GATE_BOX_EXE`, given to a box run's command ([The box side](#the-box-side)), pass through a trusted in-box gate to its command, which gets no `GATE_SLOT_HELD`; any other gate removes `GATE_BOX_JOB` from its command's environment.
 
@@ -2445,6 +2445,16 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   A skip for any other reason (the file no longer lists the builder for the repo or no longer matches the command, or the decision would now keep the run here) goes in the log only, as `gate: not trying <alias>: <reason>`, `<reason>` the text `LocalReason::reason` gives after the line's own prefix and without `; running locally`, such as `ignored <path>: repos is missing`, and the walk goes on to the next candidate.
 
   The route-time values (the warm-up consent hash, the declared env prefixes, the route lines said once) stay the first pick's. Each candidate's own route lines (the dropped `--no-build`, no outputs, siblings) are said when it is tried, after the line naming it ([Output lines](#output-lines)).
+
+  **A stale gate.** A gate left running across a reinstall and a `gate push` finds its own preflight refusing a builder for running another gate build (the version compare of The box side, the refusal `RemoteOutcome.other_build` carries). When the installed gate, `%LOCALAPPDATA%\gate\bin\gate.exe`, reports that builder's whole version text by `--version` while this gate's own differs, it hands the run over: it gives the attempt up as a `version` fallback does (the `fallback` line with reason `version`, the remote slot freed, the log discarded), releases its key, its log's mutex and its journal `release`, then says `gate: this gate is <own>, the installed one is <installed>; handing the run to it` on stderr.
+
+  It starts the installed gate with the command line it was invoked with, in the folder it was started in (before any `--cd`), on the same console, with `GATE_HANDED_OVER=<its own build>` set, and exits with that gate's whole 32-bit status. The log is wholly the installed gate's, which notes `gate: run handed over by gate <old>` in it, not on the console; the journal holds two runs and no new field, and the installed gate's ceiling and remote budget start afresh.
+
+  A gate that cannot start the installed one says `gate: cannot start the installed gate <path>: <error>` and exits 1. A Ctrl+C before the start says `gate: interrupted before handing the run to the installed gate` on stderr and in the log, which this gate finishes with its notes, and exits 0xC000013A.
+
+  Nothing is handed over, and the run takes the `version` fallback silently, for a commit stage, a rerouted held-back run, a gate that was itself handed over (`GATE_HANDED_OVER` set, so a run is handed over once), after a Ctrl+C, and when the installed gate is missing, unreadable, of this gate's own build or unlike the builder's. The installed gate's `--version` is read last, once every other check passed, with the 30 s bound `gate push` gives it (`installed.rs`, which `push` shares).
+
+  `GATE_HANDED_OVER` is removed from every command's environment and is among the names a caller's `--env` may not set.
 
   **Words sent to a `macos` builder.** Beyond the recognised spans, a relative word written with `\` (`src\Duel.sln`, `-p:Props=src\a.props`, an MSBuild `/p:Name=value` switch's value) is sent with `/` when it names something the snapshot carries: a file `git --literal-pathspecs ls-files -z --cached --others --exclude-standard` lists (limited to the gate's folder when it is below the root), or a folder holding one, compared in its exact letter case.
 
@@ -3932,7 +3942,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
 A builder runs the same `gate.exe`, under the hidden `gate box` subcommand, from the admin-owned `C:\Program Files\gate\bin`. The exe is pushed to every builder the local `remote.json` names, over ssh, by `gate push` ([`gate push`](#gate-push)), not by the local install script.
 
-A routed run first learns the builder's gate version; when its whole version text, build id included, differs from its own, the run falls back to local, saying `gate: not routed: <host> runs gate <version>, this PC <version>; run gate push`, and journals `fallback` with reason `version`. A builder running another build of the same package version falls back too.
+A routed run first learns the builder's gate version; when its whole version text, build id included, differs from its own, the run falls back to local, saying `gate: not routed: <host> runs gate <version>, this PC <version>; run gate push`, and journals `fallback` with reason `version`. A builder running another build of the same package version falls back too. A PC gate left running across a reinstall hands such a refused run to the installed gate instead (**A stale gate**, under [Routing](#routing)).
 
 Builders are configured only in the local `%LOCALAPPDATA%\gate\remote.json`. The repo, its docs and its tests name no builder; the suite's remote cases run against a stub.
 
@@ -4301,7 +4311,7 @@ Built verbs:
 
   `Env` is the variables for the command, the PC's `--env` pairs ([Command environment](#command-environment)) and the gate's `SourceRevisionId` pair after them, sent only when there is one: an object of texts of at most 64 names and 32 KiB of names and values together, the cap read from the parsed object before any pair is checked. A name is one or more printable ASCII characters (U+0021 to U+007E) but `=`; a value may hold anything but NUL.
 
-  It refuses a name the gate sets (`GATE_SLOT_HELD`, `GATE_COMMIT_SLOT`, `GATE_STATE_DIR`, `SharedCompilationId`, `MSBUILDNODEHANDSHAKESALT`, `MSBUILDUSESERVER`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `UseSharedCompilation`, `MSBUILDDISABLENODEREUSE`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`, and .NET's Event Log logging settings in any spelling: the `__` and `:` forms, a `DOTNET_` or `ASPNETCORE_` prefix, the provider's full type name).
+  It refuses a name the gate sets (`GATE_SLOT_HELD`, `GATE_COMMIT_SLOT`, `GATE_HANDED_OVER`, `GATE_STATE_DIR`, `SharedCompilationId`, `MSBUILDNODEHANDSHAKESALT`, `MSBUILDUSESERVER`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `UseSharedCompilation`, `MSBUILDDISABLENODEREUSE`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`, and .NET's Event Log logging settings in any spelling: the `__` and `:` forms, a `DOTNET_` or `ASPNETCORE_` prefix, the provider's full type name).
 
   It also refuses `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG` (git reads them over the gate's own `safe.directory` entry), any `GATE_` name, and the machine paths `PATH`, `PATHEXT`, `TEMP`, `TMP`, `SystemRoot`, `windir`, `ComSpec`, `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA` and `ProgramData`, and `GODOT_PATH` and `UE_ROOT`, which a run sets itself (the command's environment, below). Names are compared without regard to ASCII case.
 
@@ -5838,6 +5848,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
 - **Own state root per case.** Every case creates a fresh folder under the target directory's temporary folder. The folder is the case's working folder, holding its logs and its `LOCALAPPDATA`, and its `state` subfolder is the `--state-dir`, so cases never touch the machine's real slots, journal or counts, or each other's. Cases run side by side.
 - **No real ssh.** Every case's command runs with a folder first on its `PATH` that holds the suite's fake-ssh as `ssh.exe`, one folder per fake-ssh build, so a routed case that names no remote seam fails its preflight at once with the stand-in's own line and status 2, never running the machine's ssh (the Windows builder's ssh blocks writing a piped stderr, which costs the whole stall window). A case that sets its own `PATH` keeps it.
+- **A stand-in installed gate.** A case of a stale gate's handover puts the test bin `fake-gate` (`required-features = ["test-seams"]`, `support::FAKE_GATE`) at the case's `%LOCALAPPDATA%\gate\bin\gate.exe`. Its `--version` prints `gate ` and the first line of the `version.txt` beside it; any other words write `argv.txt`, `cwd.txt` and `marker.txt` (the `GATE_HANDED_OVER` it got) beside it, print `fake-gate ran` and exit with the integer in `exit.txt`.
 - **Load.** Watchdog-timing cases depend on the scheduler. The gate under test runs at Normal priority, and its command runs at BelowNormal. Under an all-core load, the gate was measured runnable but not running for up to 13.7 s, and a BelowNormal command for up to 31.8 s with no CPU.
 
   So a case never races a fixed sleep against the watcher: its command sleeps past the 600 s hang guard, and only the behaviour under test ends it. A stall window a case relies on is far past those gaps, or the case is ignored and run with `--ignored` on a critical slot (the repo's nextup profile lists them).

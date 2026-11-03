@@ -1304,6 +1304,7 @@ mod tests {
             box_job: job.map(OsString::from),
             commit_slot: None,
             stage_blocking: Vec::new(),
+            handed_over: None,
         }
     }
 

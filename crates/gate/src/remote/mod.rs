@@ -356,6 +356,9 @@ pub(crate) struct RemoteOutcome {
     /// the commit's child is given so the forwarder pre-commit hook can skip the real one, or why they could not be read,
     /// for which the child runs the local hooks again; `None` for any other end.
     pub checked: Option<Result<Checked, String>>,
+    /// The builder's gate version when this PC's own preflight compare refused it for running another build; `None` for
+    /// every other end, a box's refusal and a builder with no gate box included.
+    pub other_build: Option<String>,
 }
 
 /// How long a routed run's parts took: the run call, the command's own time, which its ceiling counts; the push; and the
