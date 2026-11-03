@@ -693,9 +693,15 @@ fn gate_expect_matches_the_run_line() {
     assert_eq!(expected_here(&expected), 5);
     assert_eq!(
         expected.stdout,
-        format!("{} here\n", run.stderr.trim_end_matches('\n')),
+        format!("{} here\n", first_line(&run.stderr)),
         "the figure is the line the next run says: {run:?}"
     );
+}
+
+/// The first line of a run's `stderr`, its expected-time line: a run a busy machine slows says more after it, such as the
+/// still-running line.
+fn first_line(stderr: &str) -> &str {
+    stderr.lines().next().unwrap_or_default()
 }
 
 #[test]
@@ -722,7 +728,7 @@ fn gate_expect_keys_a_worktree_as_the_run_does() {
     assert_eq!(expected_here(&expected), 5);
     assert_eq!(
         expected.stdout,
-        format!("{} here\n", run.stderr.trim_end_matches('\n')),
+        format!("{} here\n", first_line(&run.stderr)),
         "the figure is the line the next run in the worktree says: {run:?}"
     );
 }
