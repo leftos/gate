@@ -3,7 +3,9 @@
 //! through its alternates. Its request names the `Step`: `diff` reads the PC's manifest line of `<oid> <size>` entries
 //! and says which objects the store lacks or holds at another size, and `put` reads the manifest and then an archive of
 //! those objects, each member named by its oid, in the outputs archive's format, to the end of stdin or over the
-//! request's data channel, and installs them.
+//! request's data channel, and installs them. A sibling pair's request is for the main repo's store, or, with an
+//! `LfsRepo` naming one of the pair's siblings, for that sibling's, beside its bare repository as the box derives it;
+//! each repo of a pair has its own calls, manifest and store, and the work folder locked and laid out is the pair's.
 //!
 //! Every folder of the store is made with the box's protected security and an existing one is adopted only when it
 //! holds that security, so no other account and no lower process writes the store; an unelevated box, whose folders are
@@ -26,7 +28,7 @@ use gate_args::BoxSeams;
 use gate_inputs::archive::sent_limit;
 use gate_router::escaped;
 use gate_win32::{Descriptor, Make, Share};
-use gate_wire::{Payload, PutChannel, SHA256_DIGITS, channel_not_completed_line, grandparent, is_lower_hex};
+use gate_wire::{Pair, Payload, PutChannel, SHA256_DIGITS, channel_not_completed_line, grandparent, is_lower_hex};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
     READ_CONTROL,
@@ -58,8 +60,6 @@ const OBJECTS: usize = 50_000;
 const STAGES: &str = "lfs-stage";
 /// The folder in a stage the archive is unpacked into.
 const STAGED_FILES: &str = "files";
-/// The line refusing a request that names a sibling pair.
-const PAIR_REFUSED: &str = "gate box: lfs for a sibling pair is not taken yet";
 /// The line refusing a diff that carries a data channel, which only a put has.
 const DIFF_CHANNEL: &str = "gate: box payload Channel is not taken on a diff step";
 /// The test seam that makes a build with the `test-seams` feature refuse an unelevated box, when it is `check`.
@@ -87,23 +87,27 @@ impl Step {
 struct Asked<'a> {
     key: &'a str,
     work: &'a str,
+    /// The main repo's bare repository, which the work folder is laid out with.
     bare: &'a str,
     lock: &'a str,
     nonce: &'a str,
     step: Step,
     /// The box's root, `{root}\work\{key}` being the work folder, which the stages folder sits in.
     root: &'a str,
+    /// The sibling pair the work folder is laid out for, `None` for one repo.
+    pair: Option<Pair>,
+    /// The bare repository whose store the request is for: the sibling's `LfsRepo` names, resolved once as the request
+    /// is read ([`lfs_repo`]), else the main repo's `bare`.
+    store: String,
     /// The data channel a put's archive comes over instead of stdin, `None` for stdin.
     channel: Option<PutChannel>,
 }
 
 impl Asked<'_> {
-    /// The request `payload` holds; else the usage line. A request naming a sibling pair is refused first. A put's
+    /// The request `payload` holds; else the usage line. A pair the payload reader refuses ([`Payload::pair`]) is
+    /// refused with its line, and an `LfsRepo` that names no sibling of the pair ([`lfs_repo`]) with its own. A put's
     /// `Channel` is read as [`Payload::put_channel`] reads it; a diff's is refused, as the PC never sends one.
     fn read(payload: &Payload) -> Result<Asked<'_>, String> {
-        if payload.sets("Pair") {
-            return Err(PAIR_REFUSED.to_owned());
-        }
         let (key, work) = payload.work_folder()?;
         let bare = payload.path("Bare")?;
         let lock = payload.beside_work("Lock", work, "lock")?;
@@ -115,6 +119,8 @@ impl Asked<'_> {
         };
         let root =
             grandparent(work).ok_or_else(|| format!(r"gate: box payload Work must be <root>\work\<key> to stage objects: {}", escaped(work)))?;
+        let pair = payload.pair()?;
+        let store = lfs_repo(payload, pair.as_ref())?.unwrap_or_else(|| bare.to_owned());
         let channel = match &step {
             Step::Put => payload.put_channel()?,
             Step::Diff if payload.sets("Channel") => return Err(DIFF_CHANNEL.to_owned()),
@@ -128,11 +134,18 @@ impl Asked<'_> {
             nonce,
             step,
             root,
+            pair,
+            store,
             channel,
         })
     }
 
-    /// The work folder and its lock, as [`locked`] takes them.
+    /// The bare repository whose store the request is for.
+    fn store(&self) -> &str {
+        &self.store
+    }
+
+    /// The work folder and its lock, as [`locked`] takes them, laid out for the request's pair when it names one.
     fn work_lock(&self) -> WorkLock<'_> {
         WorkLock {
             key: self.key,
@@ -140,9 +153,27 @@ impl Asked<'_> {
             bare: self.bare,
             lock: self.lock,
             nonce: self.nonce,
-            pair: None,
+            pair: self.pair.as_ref(),
         }
     }
+}
+
+/// The bare repository, as the box derives it ([`gate_wire::PairSibling::bare`]), of the sibling of `pair` the payload's `LfsRepo`
+/// names, matched exactly; `None` when the key is absent or null, the main repo's store. Else the usage line: a value
+/// that is not a text, an `LfsRepo` without a `Pair`, or a name that is no sibling of the pair.
+fn lfs_repo(payload: &Payload, pair: Option<&Pair>) -> Result<Option<String>, String> {
+    if !payload.sets("LfsRepo") {
+        return Ok(None);
+    }
+    let name = payload.optional_text("LfsRepo")?;
+    let Some(pair) = pair else {
+        return Err("gate: box payload LfsRepo needs a Pair".to_owned());
+    };
+    pair.siblings()
+        .iter()
+        .find(|sibling| sibling.name() == name)
+        .map(|sibling| Some(sibling.bare().to_owned()))
+        .ok_or_else(|| format!("gate: box payload LfsRepo {} is not a sibling of the pair", escaped(name)))
 }
 
 /// One object of the PC's manifest: its oid and its size.
@@ -409,7 +440,7 @@ fn opened_bare(bare: &str) -> Result<File, String> {
 /// the status, its lines said.
 fn diff(asked: &Asked<'_>, wanted: &[Wanted], console: &mut Console) -> u32 {
     let lacking = locked(&asked.work_lock(), console, |_, console| {
-        let store = Store::opened(asked.bare, console)?;
+        let store = Store::opened(asked.store(), console)?;
         store
             .lacking(wanted)
             .map(|lacking| lacking.into_iter().map(|object| object.oid.clone()).collect::<Vec<_>>())
@@ -434,7 +465,7 @@ fn diff(asked: &Asked<'_>, wanted: &[Wanted], console: &mut Console) -> u32 {
 /// complete says the `channel` refusal tag and why once the stage is removed, with the refusal status, and nothing is
 /// installed.
 fn put(asked: &Asked<'_>, wanted: &[Wanted], seams: &BoxSeams, console: &mut Console) -> u32 {
-    if let Err(why) = Store::opened(asked.bare, console) {
+    if let Err(why) = Store::opened(asked.store(), console) {
         return refused(asked, &why, console);
     }
     let named = StageNamed {
@@ -529,7 +560,10 @@ fn staged(asked: &Asked<'_>, wanted: &[Wanted], seams: &BoxSeams, stage: &Stage,
         Ok(files) => files,
         Err(why) => return Ok(Err(why)),
     };
-    locked(&asked.work_lock(), console, |_, console| installed(asked.bare, &files, &entries, console)).map_err(Unstaged::Said)
+    locked(&asked.work_lock(), console, |_, console| {
+        installed(asked.store(), &files, &entries, console)
+    })
+    .map_err(Unstaged::Said)
 }
 
 /// Whether each member of `entries` is an object of the manifest `wanted`, at most once, whose SHA-256 is its name and
@@ -707,28 +741,64 @@ impl Scratch {
     }
 }
 
-/// A run's LFS content, covered and held from the cover check through the back commit: the store's lock taken shared,
-/// each store folder on the way to an object held without delete sharing and each object held open to read without
-/// delete sharing, so no other process deletes or renames one meanwhile; the snapshot's pointers; and the run's
-/// [`Scratch`] folder. A run with no `LfsDigest` holds no lock, no object and no pointer, and its scratch folder only
-/// once a repo's snapshot names the LFS filter ([`RunLfs::without_content`], [`RunLfs::with_scratch`]); until then its
-/// `lfs.storage` is one that cannot be made ([`RunLfs::pins`]).
+/// A run's LFS content, covered and held from each repo's cover check through the back commit: each covered repo's
+/// store lock taken shared, in repo order, the main repo's first, each store folder on the way to an object held
+/// without delete sharing and each object held open to read without delete sharing, so no other process deletes or
+/// renames one meanwhile; each covered repo's snapshot's pointers, by the repo's tree; and the run's [`Scratch`]
+/// folder. A run with no LFS digest holds no lock, no object and no pointer, and its scratch folder only once a repo's
+/// snapshot names the LFS filter ([`RunLfs::without_content`], [`RunLfs::with_scratch`]); until then its `lfs.storage`
+/// is one that cannot be made ([`RunLfs::pins`]).
 pub(super) struct RunLfs {
-    _lock: Option<File>,
+    locks: Vec<File>,
     held: Vec<File>,
-    pub(super) pointers: Vec<Pointer>,
+    /// Each covered repo's tree and its snapshot's pointers, whose paths are relative to that tree.
+    pointers: Vec<(String, Vec<Pointer>)>,
     scratch: Option<Scratch>,
 }
 
 impl RunLfs {
-    /// The LFS state of a run with no LFS content, before any repo's snapshot is read: no scratch folder yet.
+    /// The LFS state of a run before any repo's snapshot is read: no content and no scratch folder yet.
     pub(super) fn without_content() -> RunLfs {
         RunLfs {
-            _lock: None,
+            locks: Vec::new(),
             held: Vec::new(),
             pointers: Vec::new(),
             scratch: None,
         }
+    }
+
+    /// The pointers of the covered repo whose tree is `tree`; none for a repo with no LFS digest.
+    pub(super) fn pointers_in(&self, tree: &str) -> &[Pointer] {
+        self.pointers
+            .iter()
+            .find(|(covered, _)| covered == tree)
+            .map_or(&[], |(_, pointers)| pointers.as_slice())
+    }
+
+    /// The LFS content of the repo whose tree is `tree`, which sent the LFS digest `sent`, checked against its
+    /// snapshot's pointers `listed` as the cover check requires it and added to the run's: the digest must be that of
+    /// the manifest of the objects the pointers name, and each object a plain file of its pointer's size in the store
+    /// of the bare repository `bare`, opened without following a link and held, the store's lock taken shared after
+    /// any repo's covered before. `sibling` says the digest came from `SiblingLfsDigests`, not `LfsDigest`, which the
+    /// refusal of a digest with no pointers names. Else why the run is refused `lfs`: a digest with no pointers, a
+    /// digest that differs, an object missing or not that file, an unelevated box, or a store that cannot be readied.
+    pub(super) fn covered(&mut self, (tree, bare): (&str, &str), (sent, sibling): (&str, bool), listed: &Listed) -> Result<(), String> {
+        if listed.pointers.is_empty() {
+            let key = if sibling { "a SiblingLfsDigests entry" } else { "an LfsDigest" };
+            return Err(format!("the run sent {key}, and its snapshot holds no LFS pointer"));
+        }
+        let digest = manifest_digest(&listed.objects)?;
+        if digest != sent {
+            return Err(format!("the snapshot's LFS manifest has the digest {digest}, not the run's {sent}"));
+        }
+        elevation()?;
+        let bare_held = opened_bare(bare)?;
+        let lock = store_lock(&bare_held, bare)?;
+        let held = held_objects(bare_held, bare, &listed.objects)?;
+        self.locks.push(lock);
+        self.held.extend(held);
+        self.pointers.push((tree.to_owned(), listed.pointers.clone()));
+        Ok(())
     }
 
     /// Whether the run has its scratch folder.
@@ -758,13 +828,14 @@ impl RunLfs {
     }
 
     /// Lets the objects go first, as the scratch folder's links to them cannot be deleted while they are held, then
-    /// removes the scratch folder ([`Scratch::close`]) and lets the store's lock go.
+    /// removes the scratch folder ([`Scratch::close`]) and lets the stores' locks go.
     pub(super) fn close(self, console: &mut Console) {
-        let RunLfs { _lock, held, scratch, .. } = self;
+        let RunLfs { locks, held, scratch, .. } = self;
         drop(held);
         if let Some(scratch) = scratch {
             scratch.close(console);
         }
+        drop(locks);
     }
 }
 
@@ -783,32 +854,6 @@ pub(super) const NO_STORAGE_ADD: &str =
 /// git-lfs smudge found no storage it could make ([`no_storage`]), for a file the snapshot's listing did not see.
 pub(super) const NO_STORAGE_CHECKOUT: &str =
     "a file under the LFS filter was found that the run's snapshot does not declare in a tracked .gitattributes; run it with --local";
-
-/// The LFS content of a run that sent the `LfsDigest` `sent`, checked against the snapshot's pointers `listed` as the
-/// cover check requires it: the digest must be that of the manifest of the objects the pointers name, and each object a
-/// plain file of its pointer's size in the store of the bare repository `bare`, opened without following a link and
-/// held ([`RunLfs`]), no scratch folder made yet ([`RunLfs::with_scratch`]). Else why the run is refused `lfs`: a
-/// digest with no pointers, a digest that differs, an object missing or not that file, an unelevated box, or a store
-/// that cannot be readied.
-pub(super) fn covered(bare: &str, sent: &str, listed: &Listed) -> Result<RunLfs, String> {
-    if listed.pointers.is_empty() {
-        return Err("the run sent an LfsDigest, and its snapshot holds no LFS pointer".to_owned());
-    }
-    let digest = manifest_digest(&listed.objects)?;
-    if digest != sent {
-        return Err(format!("the snapshot's LFS manifest has the digest {digest}, not the run's {sent}"));
-    }
-    elevation()?;
-    let bare_held = opened_bare(bare)?;
-    let lock = store_lock(&bare_held, bare)?;
-    let held = held_objects(bare_held, bare, &listed.objects)?;
-    Ok(RunLfs {
-        _lock: Some(lock),
-        held,
-        pointers: listed.pointers.clone(),
-        scratch: None,
-    })
-}
 
 /// Each object of `objects` in the store of the bare repository `bare` opened beneath its held store folder to read its
 /// data (`FILE_READ_DATA`) and shared without delete ([`Share::NoDelete`]), with every store folder on its way held

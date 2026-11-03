@@ -202,9 +202,6 @@ pub(super) struct Request<'a> {
     /// The digest of the manifest of the PC's build the client sent the work folder, `SentDigest`, `None` when it sent
     /// none.
     sent_digest: Option<&'a str>,
-    /// The digest of the LFS manifest of the objects the snapshot's pointers name, `LfsDigest`, `None` when the client
-    /// sent none. Past the checkout's cover check, a run has one exactly when its snapshot holds LFS pointers.
-    lfs_digest: Option<&'a str>,
 }
 
 impl Request<'_> {
@@ -270,7 +267,7 @@ impl Request<'_> {
         let sent_digest = payload.sent_digest()?;
         let lfs_digest = payload.lfs_digest()?;
         // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
-        let (main, siblings) = repos(payload, work, bare, snapshot)?;
+        let (main, siblings) = repos(payload, work, (bare, snapshot), lfs_digest)?;
         Ok(Request {
             key,
             main,
@@ -296,8 +293,13 @@ impl Request<'_> {
             host,
             inputs_digest,
             sent_digest,
-            lfs_digest,
         })
+    }
+
+    /// Whether any repo of the run carries LFS content: an `LfsDigest` for the main repo or a `SiblingLfsDigests` entry
+    /// for a sibling ([`Repo::lfs_digest`]).
+    fn carries_lfs(&self) -> bool {
+        self.repos().any(|repo| repo.lfs_digest.is_some())
     }
 
     /// The main repo's tree, which the command's subfolder, the tool manifests and the outputs are read in.
@@ -552,27 +554,43 @@ fn sent_matched(request: &Request<'_>, held: &File, beat: &Beat<'_>, console: &m
 /// The main repo and the siblings of a run in the work folder `work`: with no `Pair`, the one repo of `bare` checked out
 /// at `snapshot` in `work` itself; with one, the main repo in `{work}\{leaf}` and each sibling in `{work}\{name}` with
 /// its own bare repository and its commit from `SiblingSnapshots`. Each repo's default branch is the main repo's `Base`
-/// or the sibling's from `SiblingBases`. Only the main repo is a commit stage's, with the PC's `HEAD` from the payload's
-/// `Head`, when its `CommitStage` says so. Else the usage line.
-fn repos<'a>(payload: &'a Payload, work: &str, bare: &str, snapshot: &'a str) -> Result<(Repo<'a>, Vec<Repo<'a>>), String> {
+/// or the sibling's from `SiblingBases`, and its LFS digest the main repo's `lfs_digest`, the payload's `LfsDigest`, or
+/// the sibling's from `SiblingLfsDigests`. Only the main repo is a commit stage's, with the PC's `HEAD` from the
+/// payload's `Head`, when its `CommitStage` says so. Else the usage line, a `SiblingLfsDigests` without a `Pair` among
+/// them.
+fn repos<'a>(
+    payload: &'a Payload,
+    work: &str,
+    (bare, snapshot): (&str, &'a str),
+    lfs_digest: Option<&'a str>,
+) -> Result<(Repo<'a>, Vec<Repo<'a>>), String> {
     let base = payload.base()?;
     let head = payload.commit_stage_head()?;
     let Some(pair) = payload.pair()? else {
+        payload.sibling_lfs_digests(None)?;
         let (tree, _) = trees(work, None, PathForm::Windows);
-        return Ok((Repo::new(None, tree, bare, snapshot).based(base).staged(head), Vec::new()));
+        return Ok((
+            Repo::new(None, tree, bare, snapshot).based(base).staged(head).digested(lfs_digest),
+            Vec::new(),
+        ));
     };
     let commits = payload.sibling_snapshots(&pair)?;
     let bases = payload.sibling_bases(&pair)?;
+    let digests = payload.sibling_lfs_digests(Some(&pair))?;
     let names: Vec<&str> = pair.siblings().iter().map(PairSibling::name).collect();
     let (main_tree, sibling_trees) = trees(work, Some((pair.leaf(), &names)), PathForm::Windows);
-    let main = Repo::new(Some(pair.leaf()), main_tree, bare, snapshot).based(base).staged(head);
+    let main = Repo::new(Some(pair.leaf()), main_tree, bare, snapshot)
+        .based(base)
+        .staged(head)
+        .digested(lfs_digest);
     let siblings = pair
         .siblings()
         .iter()
         .zip(commits)
         .zip(bases)
+        .zip(digests)
         .zip(sibling_trees)
-        .map(|(((sibling, commit), base), tree)| Repo::new(Some(sibling.name()), tree, sibling.bare(), commit).based(base))
+        .map(|((((sibling, commit), base), digest), tree)| Repo::new(Some(sibling.name()), tree, sibling.bare(), commit).based(base).digested(digest))
         .collect();
     Ok((main, siblings))
 }
@@ -591,6 +609,10 @@ struct Repo<'a> {
     snapshot: &'a str,
     base: Option<&'a str>,
     head: Option<&'a str>,
+    /// The digest of the LFS manifest of the objects this repo's snapshot's pointers name, as the client sent it,
+    /// `None` when it sent none. Past the repo's cover check, a repo has one exactly when its snapshot holds LFS
+    /// pointers.
+    lfs_digest: Option<&'a str>,
     git_dir: String,
     work_tree: String,
 }
@@ -606,7 +628,13 @@ impl<'a> Repo<'a> {
             snapshot,
             base: None,
             head: None,
+            lfs_digest: None,
         }
+    }
+
+    /// This repo with the LFS digest `lfs_digest`.
+    fn digested(self, lfs_digest: Option<&'a str>) -> Repo<'a> {
+        Repo { lfs_digest, ..self }
     }
 
     /// This repo with the default branch `base`.
@@ -1606,18 +1634,11 @@ pub(super) enum Of {
     StagePrep,
 }
 
-/// Why the run of `request` is refused `lfs` before its checkout begins, so before the checkout's start line: a sibling
-/// pair's run that carries an `LfsDigest`, as no pair takes LFS content. `None` for any other run.
-fn pair_lfs_refusal(request: &Request<'_>) -> Option<&'static str> {
-    (!request.siblings.is_empty() && request.lfs_digest.is_some())
-        .then_some("a sibling pair's run carries an LfsDigest, and no pair takes LFS content")
-}
-
 /// The run up to its command: the snapshot laid out and checked out, the subfolder found, the repo's dotnet tools
 /// restored and, for a pnpm, bun or npm command, its packages installed ([`packages::update`]); else `Err` with the status the
 /// run ends on, its lines said. A refusal is said as such; any other end is followed, on a pair run, by the box's
-/// `gate: remote back commits: failed` line ([`ended_before`]). The run's LFS state, held: its LFS content when it
-/// carries an `LfsDigest`, its scratch folder alone, or nothing, otherwise ([`WorkGit::checkout`]); a refusal of it is said as such
+/// `gate: remote back commits: failed` line ([`ended_before`]). The run's LFS state, held: the LFS content of each repo
+/// that carries an LFS digest, its scratch folder alone, or nothing, otherwise ([`WorkGit::checkout`]); a refusal of it is said as such
 /// ([`lfs_refused`]).
 fn ready(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<RunLfs, u32> {
     let held = match git.lay_out(&request.laid(), console).map_err(NotLaidOut::refusal) {
@@ -1627,9 +1648,6 @@ fn ready(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Bea
     };
     inputs_matched(request, &held, beat, console)?;
     sent_matched(request, &held, beat, console)?;
-    if let Some(why) = pair_lfs_refusal(request) {
-        return Err(lfs_refused(request, &lfs::not_the_snapshots(request.key, why), beat, console));
-    }
     beat.say_protocol(console, &checkout_start_line(request.nonce));
     let checking_out = Instant::now();
     let lfs = match git.checkout(request, console) {
@@ -2022,7 +2040,7 @@ fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut 
         marker: (one.of == Of::Run).then_some(request.nonce),
         record: one.recorded.then_some(record.as_str()),
         refuse_token: beat.seams.refuse_token,
-        keep_restricted: request.lfs_digest.is_some(),
+        keep_restricted: request.carries_lfs(),
     };
     let launched = match start_command(&mut start, donor.as_ref().map_err(String::as_str), beat, console) {
         Ok(launched) => launched,
@@ -2359,7 +2377,7 @@ fn restricted_token(console: &mut Console) -> Option<RestrictedToken> {
 /// The command's restricted token ([`restricted_token`]); for a run with LFS content, which never runs on the box's own
 /// token, a token that cannot be made fails the start instead: `Err` with status 1, its line said.
 fn command_token(request: &Request<'_>, console: &mut Console) -> Result<Option<RestrictedToken>, u32> {
-    if request.lfs_digest.is_none() {
+    if !request.carries_lfs() {
         return Ok(restricted_token(console));
     }
     RestrictedToken::of_this_process().map(Some).map_err(|error| {
@@ -3521,16 +3539,14 @@ impl WorkGit {
     }
 
     /// Each repo's snapshot, fetched from its bare repository at `refs/gate/<key>` ([`WorkGit::fetched`]) and checked
-    /// out, one repo after another, the main one first ([`WorkGit::checked_out_repo`]); between the main repo's fetch
-    /// and its checkout, the run's LFS state is readied ([`WorkGit::run_lfs`]) and given back held, let go on a
-    /// failure. A pair run whose payload carries an `LfsDigest` was refused before ([`pair_lfs_refusal`]).
+    /// out, one repo after another, the main one first ([`WorkGit::checked_out_repo`]); between each repo's fetch and
+    /// its checkout, that repo's LFS content is covered into the run's LFS state ([`WorkGit::lfs_covered`]), so the
+    /// stores' locks are taken in repo order, and the state is given back held, let go on a failure.
     fn checkout(&self, request: &Request<'_>, console: &mut Console) -> Result<RunLfs, NotCheckedOut> {
-        self.fetched(request, &request.main, console)?;
-        let mut lfs = self.run_lfs(request, console)?;
-        let ended = request.repos().enumerate().try_for_each(|(at, repo)| {
-            if at > 0 {
-                self.fetched(request, repo, console)?;
-            }
+        let mut lfs = RunLfs::without_content();
+        let ended = request.repos().try_for_each(|repo| {
+            self.fetched(request, repo, console)?;
+            self.lfs_covered(request, repo, &mut lfs, console)?;
             self.lfs_scratch(request, repo, &mut lfs, console)?;
             self.checked_out_repo(request, repo, &lfs, console)
         });
@@ -3576,29 +3592,33 @@ impl WorkGit {
         Ok(ran.stdout)
     }
 
-    /// The run's LFS state, held from before its first checkout through its back commit. For a run that carries an
-    /// `LfsDigest`, which only a run of one repo may, the LFS content of its fetched snapshot, covered and held
-    /// ([`lfs::covered`]): its pointers read from the snapshot itself as the PC reads them
-    /// ([`crate::remote::lfs::pointers_of`]) and checked against the digest; then its scratch folder made
-    /// ([`RunLfs::with_scratch`]). For a run with none, which lists nothing, no scratch folder yet
-    /// ([`RunLfs::without_content`]): each repo's checkout makes it when its snapshot names the LFS filter
-    /// ([`WorkGit::lfs_scratch`]). Else the git step's failure, or why the run is refused `lfs`: its content, or a scratch
-    /// folder that cannot be made.
-    fn run_lfs(&self, request: &Request<'_>, console: &mut Console) -> Result<RunLfs, NotCheckedOut> {
-        let Some(digest) = request.lfs_digest else {
-            return Ok(RunLfs::without_content());
+    /// The LFS content of `repo`'s fetched snapshot added to the run's LFS state `lfs`, held from before the repo's
+    /// checkout through the run's back commit, when the repo carries an LFS digest ([`Repo::lfs_digest`]): its pointers
+    /// read from the snapshot itself as the PC reads them ([`crate::remote::lfs::pointers_of`]) and checked against the
+    /// digest, its store's objects held ([`RunLfs::covered`]); then the run's scratch folder made
+    /// ([`RunLfs::with_scratch`]). A repo with none lists nothing: its checkout makes the scratch folder when its
+    /// snapshot names the LFS filter ([`WorkGit::lfs_scratch`]). Else the git step's failure, or why the run is refused
+    /// `lfs`: the repo's content, the pair repo's name before it, or a scratch folder that cannot be made.
+    fn lfs_covered(&self, request: &Request<'_>, repo: &Repo<'_>, lfs: &mut RunLfs, console: &mut Console) -> Result<(), NotCheckedOut> {
+        let Some(digest) = repo.lfs_digest else {
+            return Ok(());
         };
-        let repo = &request.main;
         let unreadable = |why: String| Failed::without_status(format!("gate: remote lfs listing failed: {why}"));
         let listed = crate::remote::lfs::pointers_of(
             repo.snapshot,
             &mut |args, feed, cap| self.output(("lfs listing", GitClass::Short), repo, args, (feed, cap), console),
             unreadable,
         )?;
-        let mut lfs = lfs::covered(&repo.bare, digest, &listed).map_err(NotCheckedOut::Refused)?;
+        // Each repo of a pair has a tree of its own.
+        let sibling = repo.tree != request.main.tree;
+        lfs.covered((&repo.tree, &repo.bare), (digest, sibling), &listed).map_err(|why| {
+            NotCheckedOut::Refused(match &repo.name {
+                Some(name) => format!("{name}: {why}"),
+                None => why,
+            })
+        })?;
         lfs.with_scratch(request.work, (request.key, request.nonce), console)
-            .map_err(NotCheckedOut::NoScratch)?;
-        Ok(lfs)
+            .map_err(NotCheckedOut::NoScratch)
     }
 
     /// The run's scratch folder made before the checkout of `repo` ([`RunLfs::with_scratch`]) when the run has none yet
@@ -3705,7 +3725,8 @@ impl WorkGit {
     /// once, with the same pins `pins`, and checked again. Else the git step's failure, or the refusal naming the first
     /// still wrong.
     fn lfs_post_check(&self, repo: &Repo<'_>, lfs: &RunLfs, pins: &[&str], console: &mut Console) -> Result<(), NotCheckedOut> {
-        let wrong = lfs::wrong_files(&repo.tree, &lfs.pointers);
+        let pointers = lfs.pointers_in(&repo.tree);
+        let wrong = lfs::wrong_files(&repo.tree, pointers);
         if wrong.is_empty() {
             return Ok(());
         }
@@ -3722,7 +3743,7 @@ impl WorkGit {
             "--pathspec-file-nul",
         ]);
         self.output(("lfs checkout", GitClass::Long), repo, &args, (Some(&feed), RECHECKOUT_OUTPUT), console)?;
-        let still = lfs::wrong_files(&repo.tree, &lfs.pointers);
+        let still = lfs::wrong_files(&repo.tree, pointers);
         match still.first() {
             None => Ok(()),
             Some(first) => Err(NotCheckedOut::Refused(format!(

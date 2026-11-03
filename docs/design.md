@@ -3906,9 +3906,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     `lfs.url=http://127.0.0.1:0/` (a URL that needs no name lookup, is never proxied and nothing can listen on), `lfs.remote.searchall=false`, empty `lfs.fetchinclude` and `lfs.fetchexclude`, `lfs.skipdownloaderrors=false`, `lfs.standalonetransferagent=`, git-lfs's own `filter.lfs.process`, `smudge` and `clean`, and `filter.lfs.required=true`, with `GIT_LFS_SKIP_SMUDGE` and `GIT_LFS_SKIP_DOWNLOAD_ERRORS` stripped from the box's git environment (`GIT_REDIRECTS`).
 
     The tree's attributes are read as the builder's checkout does, with `-c core.attributesFile=` and `GIT_ATTR_NOSYSTEM=1` on the PC's listing and the box's git calls.
-  - **The command.** A run with an `LfsDigest` never falls back to the box's own token when the restricted start fails; it fails the start, as the pnpm and bun installs do.
+  - **The command.** A run with an `LfsDigest` or a `SiblingLfsDigests` never falls back to the box's own token when the restricted start fails; it fails the start, as the pnpm and bun installs do.
 
-  **The scratch folder.** The box alone decides whether a run has one, per repo, after that repo's fetch and before its checkout: when the run carries an `LfsDigest`, or `git grep -q -F -e filter=lfs <snapshot> -- ':(glob,icase)**/.gitattributes'` exits 0.
+  **The scratch folder.** The box alone decides whether a run has one, per repo, after that repo's fetch and before its checkout: when the run carries a digest for the repo (the `LfsDigest` for the main repo, its `SiblingLfsDigests` entry for a sibling), or `git grep -q -F -e filter=lfs <snapshot> -- ':(glob,icase)**/.gitattributes'` exits 0.
 
   It is `{root}\lfs-run\{key}-{nonce}-{16 hex}` (`lfs-run-medium` on an unelevated box), made new with the protected security of a put's stage and removed when the run ends, and it is git-lfs's `lfs.storage` for the run's checkouts and back commit, so no smudge or clean of the run touches the work folder's `.git\lfs` or the store: git-lfs links the store's objects into it through the alternates, and a plain file committed under the filter checks out as its own bytes.
 
@@ -3918,7 +3918,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   Known limits are booked: the work folder's and the builder's global git config and `info/attributes` (GATE-470), an untracked `.gitattributes` on the PC (GATE-517), the prune's noise for a held stage (GATE-518), naming `info/attributes` in the refusal (GATE-519), GATE-524 and GATE-525.
 
-  A sibling pair holding pointers is refused `lfs` before any call. A changed LFS path in a back commit is refused at sync-back as before, and a back commit adds nothing to the store.
+  A sibling pair holding pointers is refused `lfs` before any call by the PC, which does not send pair content yet; the box takes it (`LfsRepo` on the `lfs` verb, `SiblingLfsDigests` on the run, [The box side](#the-box-side)). A changed LFS path in a back commit is refused at sync-back as before, and a back commit adds nothing to the store.
 - **The per-host failure record** (GATE-27), planned, not built: a record in the state root holds a builder's failure reason and an expiry. A routed gate that finds an unexpired record says `gate: not routed: <host> <reason> <n> s ago`, runs here and journals `fallback` with the reason, rather than paying the snapshot, preflight and push again for the same reason.
 
   The windows per reason: `unreachable` a short one (60 s, distcc's default backoff); `parity` and `tools` until the snapshot's `global.json` or tool manifests change; `busy` and `full` are load, not faults, and are never recorded.
@@ -4235,7 +4235,7 @@ Built verbs:
 
   `gate-remote-adjusted: <nonce> <s.sss>` is also said as any watched command exits, once its output has drained, unless the sampler failed. A failed sample says `gate: sampler failed: <message>; watching by wall time only` and only the backstop is read from then on.
 
-  The checkout lines: just before the checkout, once a pair run's LFS refusal is past, the box says `gate-remote-checkout: <nonce> start` on stderr with the payload's `Nonce`, and just after the checkout succeeds `gate-remote-checkout: <nonce> done <s.sss>`, the seconds it took to three decimals. The span is the whole checkout: the fetch, the LFS scratch folder, the checkout and the clean. A checkout that fails says no done line. They are protocol lines, said without a stamp.
+  The checkout lines: just before the checkout, the box says `gate-remote-checkout: <nonce> start` on stderr with the payload's `Nonce`, and just after the checkout succeeds `gate-remote-checkout: <nonce> done <s.sss>`, the seconds it took to three decimals. The span is the whole checkout: the fetch, the LFS cover check, the LFS scratch folder, the checkout and the clean. A checkout that fails says no done line. They are protocol lines, said without a stamp.
 
   The start marker: just before it launches the command, before the donor console and the launch, the box says `gate-remote-started: <nonce>` on stderr once, with the payload's `Nonce`; a launch then refused or stopped has said it too. A warm-up says it once, after every tool and package restore and before its first command, and not again before the later ones. A commit stage's preparation says none, so a refusal after it still falls back.
 
@@ -4381,7 +4381,13 @@ Built verbs:
 
   Otherwise the run is refused with `gate-remote-refused: <nonce> sent` then `gate: remote build sent to work folder <key> is not the one there: <why>`, said together under the output lock, the command never started, and exit 75. A payload without `SentDigest` skips the check.
 
-  A payload with an `LfsDigest` (64 lower-case hex digits, else `gate: box payload LfsDigest is not 64 lower-case hex digits: <value>` and exit 2) is checked after the fetch and before the checkout, under the work folder's lock; a payload without one makes no such check, and a pair run that carries one is refused `lfs` before any checkout, and before the checkout's start line.
+  A payload with an `LfsDigest` (64 lower-case hex digits, else `gate: box payload LfsDigest is not 64 lower-case hex digits: <value>` and exit 2) is checked after the fetch and before the checkout, under the work folder's lock; a payload without one makes no such check for the main repo.
+
+  A pair run may carry `SiblingLfsDigests`, an object of 64 lower-case hex digests keyed by sibling name, holding only siblings with pointers and sent only when non-empty. Each repo's digest is checked after that repo's fetch and before its checkout, main first, and a pair refusal names the repo first (`<repo>: <why>`).
+
+  The payload exits 2 as `gate: box payload SiblingLfsDigests <name> is not 64 lower-case hex digits: <value>`, `... names <name>, which is not a sibling of the Pair`, `... needs a Pair` or `... is not an object`.
+
+  A sibling digest whose snapshot holds no pointer is refused `lfs` saying `<repo>: the run sent a SiblingLfsDigests entry, and its snapshot holds no LFS pointer`. The stores' shared locks are taken in repo order and held through the back commit. A run whose only digest is a sibling's never runs on the box's own token.
 
   The box lists the pointers from the snapshot itself, as the PC lists them (spec-v1 blobs of at most 1024 bytes whose `filter` is `lfs` at the commit, read with `-c core.attributesFile=` and `GIT_ATTR_NOSYSTEM=1`).
 
@@ -4389,7 +4395,7 @@ Built verbs:
 
   Anything else is `gate-remote-refused: <nonce> lfs` then `gate: remote lfs of work folder <key> is not the snapshot's: <why>`, said together under the output lock, the command never started, and exit 75; the PC reads it as fallback reason `lfs`. A scratch folder that cannot be made, or a foreign `lfs-run`, is refused the same way with `gate: remote cannot make the run's LFS scratch folder: <why>` as the second line.
 
-  The scratch folder is made once per run, after each repo's fetch, for a run with an `LfsDigest` or whose snapshot's `.gitattributes` files name the filter (`git grep -q -F -e filter=lfs <snapshot> -- ':(glob,icase)**/.gitattributes'`, [Routing](#routing), Git LFS); a `git grep` that fails prints `gate: remote lfs listing failed (status <n>): <git's first stderr line>` and fails the step.
+  The scratch folder is made once per run, after each repo's fetch, for a run with an `LfsDigest` or a `SiblingLfsDigests` or whose snapshot's `.gitattributes` files name the filter (`git grep -q -F -e filter=lfs <snapshot> -- ':(glob,icase)**/.gitattributes'`, [Routing](#routing), Git LFS); a `git grep` that fails prints `gate: remote lfs listing failed (status <n>): <git's first stderr line>` and fails the step.
 
   The checkout of a repo takes the pins of Git LFS in Routing on every git call that may run the filter, and `lfs.storage` set to the run's scratch folder. After a checkout of a run with pointers the box checks that every pointer's path is a plain file of the pointer's size, since `checkout --force` leaves a file whose stat is clean and a pointer an earlier run left would survive. A pointer path that is not is deleted and checked out again once, and still not is refused `lfs`.
 
@@ -4587,7 +4593,7 @@ Built verbs:
 
   When the token cannot be made, or a start with it is refused and a start with the box's own token then works, the box prints `gate: the command runs with the builder session's own token: <error>` on stderr, after the start marker, and the command (with the donor and console keeper) runs with the box's own token. A start refused with both tokens says only `could not start`.
 
-  A run with an `LfsDigest` never takes the box's own token: a start with the restricted one that fails says `gate: remote could not start the command with its restricted token, and a run with LFS content never runs with the builder session's own token`, or `cannot make the command's restricted token, and ...` when the token cannot be made, and the run fails.
+  A run with an `LfsDigest` or a `SiblingLfsDigests` never takes the box's own token: a start with the restricted one that fails says `gate: remote could not start the command with its restricted token, and a run with LFS content never runs with the builder session's own token`, or `cannot make the command's restricted token, and ...` when the token cannot be made, and the run fails.
 
   Every MSYS program of one user in one session (Git's `sh.exe` and the tools in `usr\bin`) shares one section, `msys-2.0S5-<install key>\<SID>.1`, whose first word is both its set-up lock and its ready mark. The box's git, the command and the warm-up commands share it in session 0, on either token.
 
@@ -4852,7 +4858,9 @@ Built verbs:
   Deployment prerequisites: no other account may rename or replace `<root>` (a protected root cannot be renamed away by others, since the Authenticated Users grant on `D:\` has no delete-child right); the installer's `Gate work root` step applies and verifies the root's security (owner Administrators, protected DACL); no account outside SYSTEM, Administrators and the builder's user may write in `<root>`; and `<root>\work` is not writable by other accounts.
 
   The stage's protection and the beneath-handle walk assume it; the box checks the stages folder it adopts, not the folders above it.
-- **`lfs`** (GATE-469, `boxside/lfs.rs`) installs a routed run's Git LFS objects into the repo's store in two calls, the payload's `Step` being `diff` or `put`, with the payload keys of `inputs`; a payload with a `Pair` is refused with `gate box: lfs for a sibling pair is not taken yet` and exit 2, and any other refused payload exits 2. The store is `<Bare>\lfs\objects\<aa>\<bb>\<oid>` (Routing, Git LFS).
+- **`lfs`** (GATE-469, `boxside/lfs.rs`) installs a routed run's Git LFS objects into the repo's store in two calls, the payload's `Step` being `diff` or `put`, with the payload keys of `inputs`; a payload with a `Pair` is taken, and its optional `LfsRepo` names the sibling whose store the call uses (the box derives that sibling's bare, the payload never sends it), the main repo's when absent.
+
+  A refused payload exits 2, among them `gate: box payload LfsRepo <name> is not a sibling of the pair` and `gate: box payload LfsRepo needs a Pair`. The store is `<Bare>\lfs\objects\<aa>\<bb>\<oid>` (Routing, Git LFS).
 
   Stdin is the request line, then the PC's LFS manifest as one line (space-separated `<oid> <size>` entries, each oid 64 lower-case hex digits, no oid twice, at most 50,000 entries and 64 MiB), then for `put` the archive of exactly the objects the diff named, in the outputs archive's format, each member named by its oid, to the end of stdin.
 
@@ -5246,7 +5254,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
   A pair run brings back from its main tree only. `OutputsFull` with no globs is taken and does nothing. `--test-outputs-budget-bytes` reaches the run. Every other verb (`inflight`, `lfs`, `register-desktop`) says `gate: box <verb> is not built on this builder` and exits 2.
 
-  The run checks a payload's `InputsDigest` as the Windows box does ([The box side](#the-box-side)), and refuses a `SentDigest` or `LfsDigest` as not built (`gate-remote-refused: <nonce> <tag>`, then `gate: remote <key> is not built on this builder`, status 75), so the PC runs such a run itself. A payload with `CommitStage` true is refused `layout` the same way, naming `CommitStage` in the line.
+  The run checks a payload's `InputsDigest` as the Windows box does ([The box side](#the-box-side)), and refuses a `SentDigest`, `LfsDigest` or `SiblingLfsDigests` as not built (`gate-remote-refused: <nonce> <tag>`, then `gate: remote <key> is not built on this builder`, status 75; a `SiblingLfsDigests` is refused `lfs`), so the PC runs such a run itself. A payload with `CommitStage` true is refused `layout` the same way, naming `CommitStage` in the line.
 
   It has no install tripwire, no desktop helper and no MSYS keeper. Its `test-seams` feature passes `gate-args`' hidden `--test-*` seams through, given before the verb; `--test-heartbeat-ms`, `--test-box-sample-ms`, `--test-box-sampler-fail` and `--test-box-free-percent` reach `box run`.
 - **`boot`** reads `kern.boottime` and prints the same line, with the same format.

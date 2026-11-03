@@ -201,8 +201,8 @@ pub struct Request<'p> {
 impl<'p> Request<'p> {
     /// Reads `payload` in the order the Windows box reads it, each key checked as it does, the outputs asked for
     /// ([`Asked::new`]) read once the output folder is; then notes the first thing asking for what this builder does not
-    /// build: `Desktop`, `CommitStage`, a warm-up's `WarmCommands`, `EngineEnv`, `UnrealVersion`, `SentDigest` or `LfsDigest`; then,
-    /// last, the repos ([`repos`]), a sibling pair as `gate-wire` checks it. A work root holding a `:` is refused just
+    /// build: `Desktop`, `CommitStage`, a warm-up's `WarmCommands`, `EngineEnv`, `UnrealVersion`, `SentDigest`,
+    /// `LfsDigest` or `SiblingLfsDigests`; then, last, the repos ([`repos`]), a sibling pair as `gate-wire` checks it. A work root holding a `:` is refused just
     /// after the work folder is read ([`work_layout`]).
     ///
     /// # Errors
@@ -241,6 +241,8 @@ impl<'p> Request<'p> {
         let inputs_digest = payload.inputs_digest()?;
         let sent = payload.sent_digest()?.is_some();
         let lfs = payload.lfs_digest()?.is_some();
+        // Whatever its entries say, as this builder takes no LFS content of any repo.
+        let sibling_lfs = payload.sets("SiblingLfsDigests");
         // Just before the repos, where the Windows box reads it beside the repos' default branch.
         let commit_stage = payload.commit_stage_head()?.is_some();
         // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
@@ -253,6 +255,7 @@ impl<'p> Request<'p> {
             (unreal, Refusal::Layout, "UnrealVersion"),
             (sent, Refusal::Sent, "SentDigest"),
             (lfs, Refusal::Lfs, "LfsDigest"),
+            (sibling_lfs, Refusal::Lfs, "SiblingLfsDigests"),
         ]
         .into_iter()
         .find_map(|(asked, refusal, key)| asked.then_some(Unbuilt { refusal, key }));
@@ -4041,6 +4044,14 @@ mod tests {
         let case = Case::new("lfs");
         let lfs = json!({ "LfsDigest": DIGEST });
         assert_refused(&case, &lfs, Refusal::Lfs, "gate: remote LfsDigest is not built on this builder");
+        let case = Case::new("sibling-lfs");
+        let sibling = json!({ "SiblingLfsDigests": { "lib": DIGEST } });
+        assert_refused(
+            &case,
+            &sibling,
+            Refusal::Lfs,
+            "gate: remote SiblingLfsDigests is not built on this builder",
+        );
     }
 
     #[test]

@@ -20,7 +20,8 @@ use super::channel_pc::{
 };
 use super::{
     BACK_COMMIT_NONE, Does, after_checkout, after_checkout_start, box_call, field, gate_box, git, has_ref, lines, pair_payload, pair_snapshot,
-    passed, path_for_run, payload, refused_line, renamed, run_box, run_box_with_env, run_box_with_path, snapshot, started_line, stub_git_doing,
+    pair_tree, passed, path_for_run, payload, refused_line, renamed, run_box, run_box_with_env, run_box_with_path, sibling_bare, snapshot,
+    started_line, stub_git_doing,
 };
 use crate::support::{Case, FAKE_TOOL, Outcome, Running, box_payload, shown};
 
@@ -1065,6 +1066,207 @@ fn a_pair_whose_sibling_alone_names_lfs_makes_the_scratch_folder() {
         "{outcome:?}"
     );
     assert_untouched(&planted, &outcome);
+}
+
+/// The payload of an LFS call for the pair of the main checkout `app` and its sibling `lib`, its bare repositories
+/// readied by a preflight first.
+fn pair_lfs_payload(case: &Case) -> Value {
+    let payload = pair_payload(case, &["lib"], &[FAKE_TOOL, "out", "ran"]);
+    passed(&gate_box(case, "preflight", &self::payload(&payload), None));
+    payload
+}
+
+/// The path the store of the bare repository `bare` keeps the object of `bytes` at.
+fn object_in(bare: &str, bytes: &[u8]) -> PathBuf {
+    let oid = sha256(bytes);
+    Path::new(bare).join("lfs").join("objects").join(&oid[..2]).join(&oid[2..4]).join(&oid)
+}
+
+#[test]
+fn a_pair_lfs_put_with_lfs_repo_installs_into_the_sibling_s_store() {
+    let case = Case::new("box_lfs_pair_sibling_put");
+    let mut payload = pair_lfs_payload(&case);
+    payload["LfsRepo"] = json!("lib");
+
+    let diffed = diff(&case, &payload, &[A]);
+    put_all(&case, &payload, &[A]);
+
+    assert_eq!(diffed.code, Some(0), "{diffed:?}");
+    assert_eq!(diffed.stdout, needs(&[A]), "{diffed:?}");
+    let sibling = sibling_bare(&payload, "lib");
+    assert_eq!(fs::read(object_in(&sibling, A)).expect("the object is in the sibling's store"), A);
+    assert!(!object_path(&payload, A).exists(), "nothing reaches the main's store");
+}
+
+#[test]
+fn a_pair_lfs_call_without_lfs_repo_installs_into_the_main_s_store() {
+    let case = Case::new("box_lfs_pair_main_put");
+    let payload = pair_lfs_payload(&case);
+
+    let diffed = diff(&case, &payload, &[A]);
+    put_all(&case, &payload, &[A]);
+
+    assert_eq!(diffed.code, Some(0), "{diffed:?}");
+    assert_eq!(diffed.stdout, needs(&[A]), "{diffed:?}");
+    assert_eq!(fs::read(object_path(&payload, A)).expect("the object is in the main's store"), A);
+    assert!(
+        !object_in(&sibling_bare(&payload, "lib"), A).exists(),
+        "nothing reaches the sibling's store"
+    );
+}
+
+#[test]
+fn an_lfs_repo_that_is_not_a_sibling_is_a_usage_error() {
+    let case = Case::new("box_lfs_pair_unknown_repo");
+    let mut payload = pair_lfs_payload(&case);
+    payload["LfsRepo"] = json!("tools");
+
+    let outcome = diff(&case, &payload, &[A]);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(outcome.stderr, "gate: box payload LfsRepo tools is not a sibling of the pair\n");
+
+    let mut alone = lfs_payload(&case);
+    alone["LfsRepo"] = json!("lib");
+    let outcome = diff(&case, &alone, &[A]);
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stderr, "gate: box payload LfsRepo needs a Pair\n", "{outcome:?}");
+}
+
+/// The content of the sibling's LFS file.
+const SIBLING_CONTENT: &str = "the sibling's LFS file's content, never pointer text\n";
+
+/// The payload of a run of `out ran` for the pair of `app` and its sibling `lib`, whose sibling's snapshot holds `b.bin`
+/// committed through git-lfs's clean as the pointer of [`SIBLING_CONTENT`], and whose main snapshot holds `a.bin` as
+/// the pointer of [`CONTENT`] when `main_lfs`, else one plain file; no digest yet.
+fn lfs_pair(case: &Case, main_lfs: bool) -> Value {
+    let mut payload = pair_payload(case, &["lib"], &[FAKE_TOOL, "out", "ran"]);
+    let main: &[(&str, &str)] = if main_lfs {
+        &[ATTRIBUTES, ("a.bin", CONTENT)]
+    } else {
+        &[("a.txt", "a\n")]
+    };
+    pair_snapshot(case, &mut payload, main, &[("lib", &[ATTRIBUTES, ("b.bin", SIBLING_CONTENT)])]);
+    payload
+}
+
+/// `payload` naming `lib` as its `LfsRepo`, an LFS call for the sibling's store.
+fn for_sibling(payload: &Value) -> Value {
+    let mut sibling = payload.clone();
+    sibling["LfsRepo"] = json!("lib");
+    sibling
+}
+
+/// `payload` carrying `lib`'s `SiblingLfsDigests` entry, the digest of the manifest of `objects`.
+fn sibling_digested(payload: &Value, objects: &[&[u8]]) -> Value {
+    let mut digested = payload.clone();
+    digested["SiblingLfsDigests"] = json!({ "lib": sha256(manifest_line(objects).as_bytes()) });
+    digested
+}
+
+/// The file `path` of the pair repo `name` in `payload`'s work folder, read.
+fn pair_file(payload: &Value, name: &str, path: &str) -> String {
+    fs::read_to_string(Path::new(&pair_tree(payload, name)).join(path)).expect("the file is checked out")
+}
+
+#[test]
+fn a_pair_run_with_both_digests_checks_out_both_repos_with_their_content() {
+    let case = Case::new("box_lfs_run_pair_both");
+    let payload = lfs_pair(&case, true);
+    put_all(&case, &payload, &[CONTENT.as_bytes()]);
+    put_all(&case, &for_sibling(&payload), &[SIBLING_CONTENT.as_bytes()]);
+
+    let run = sibling_digested(&digested(&payload, &[CONTENT.as_bytes()]), &[SIBLING_CONTENT.as_bytes()]);
+    let outcome = run_box(&case, &run);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
+    assert_eq!(pair_file(&payload, "app", "a.bin"), CONTENT, "the main's object, not pointer text");
+    assert_eq!(
+        pair_file(&payload, "lib", "b.bin"),
+        SIBLING_CONTENT,
+        "the sibling's object, not pointer text"
+    );
+    assert!(scratch_left(&payload).is_empty(), "the scratch folder is removed: {outcome:?}");
+}
+
+#[test]
+fn a_pair_run_whose_sibling_alone_holds_pointers_checks_out_its_content() {
+    let case = Case::new("box_lfs_run_pair_sibling_only");
+    let payload = lfs_pair(&case, false);
+    put_all(&case, &for_sibling(&payload), &[SIBLING_CONTENT.as_bytes()]);
+
+    let outcome = run_box(&case, &sibling_digested(&payload, &[SIBLING_CONTENT.as_bytes()]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
+    assert_eq!(
+        pair_file(&payload, "lib", "b.bin"),
+        SIBLING_CONTENT,
+        "the sibling's object, not pointer text"
+    );
+    assert!(scratch_left(&payload).is_empty(), "the scratch folder is removed: {outcome:?}");
+    // The sibling's digest is checked though the main sends none.
+    let wrong = run_box(&case, &sibling_digested(&payload, &[b"another object"]));
+    let line = assert_refused_run(&payload, &wrong, "another sibling digest and no main digest");
+    assert!(line.contains("not the run's"), "{wrong:?}");
+}
+
+#[test]
+fn a_pair_run_with_a_wrong_sibling_digest_is_refused_lfs() {
+    let case = Case::new("box_lfs_run_pair_wrong");
+    let payload = lfs_pair(&case, true);
+    put_all(&case, &payload, &[CONTENT.as_bytes()]);
+    put_all(&case, &for_sibling(&payload), &[SIBLING_CONTENT.as_bytes()]);
+
+    let run = sibling_digested(&digested(&payload, &[CONTENT.as_bytes()]), &[b"another object"]);
+    let outcome = run_box(&case, &run);
+
+    let line = assert_refused_run(&payload, &outcome, "another sibling digest");
+    assert!(line.contains("not the run's"), "{outcome:?}");
+}
+
+#[test]
+fn a_pair_run_with_a_sibling_digest_whose_snapshot_holds_no_pointer_is_refused_lfs() {
+    let case = Case::new("box_lfs_run_pair_no_pointers");
+    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "out", "ran"]);
+    pair_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[("lib", &[("b.txt", "b\n")])]);
+
+    let outcome = run_box(&case, &sibling_digested(&payload, &[SIBLING_CONTENT.as_bytes()]));
+
+    let line = assert_refused_run(&payload, &outcome, "a sibling digest and no pointer");
+    assert!(
+        line.contains("lib: the run sent a SiblingLfsDigests entry, and its snapshot holds no LFS pointer"),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn a_pair_run_rechecks_out_a_sibling_s_stale_pointer() {
+    let case = Case::new("box_lfs_run_pair_repair");
+    let payload = lfs_pair(&case, false);
+    put_all(&case, &for_sibling(&payload), &[SIBLING_CONTENT.as_bytes()]);
+    let digest = sibling_digested(&payload, &[SIBLING_CONTENT.as_bytes()]);
+    let first = run_box(&case, &digest);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let pointer = format!(
+        "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize {}\n",
+        sha256(SIBLING_CONTENT.as_bytes()),
+        SIBLING_CONTENT.len()
+    );
+    fs::write(Path::new(&pair_tree(&payload, "lib")).join("b.bin"), pointer).expect("the pointer text can be planted");
+
+    let outcome = run_box(&case, &renamed(&digest, 1));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
+    assert_eq!(
+        pair_file(&payload, "lib", "b.bin"),
+        SIBLING_CONTENT,
+        "the sibling's object, not pointer text"
+    );
+    assert!(scratch_left(&payload).is_empty(), "the scratch folder is removed: {outcome:?}");
 }
 
 /// What a run with no scratch folder says when its back commit's `add -A` fails and the tree's attributes name the LFS

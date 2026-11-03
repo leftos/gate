@@ -926,26 +926,6 @@ fn a_preflight_reports_a_pair_s_first_run_as_cold() {
     assert!(!said_cold(&after), "the run recorded the pair's layout: {after:?}");
 }
 
-/// A pair run carrying an `LfsDigest` is refused `lfs` before its checkout begins, as no pair takes LFS content, so it
-/// says no checkout line.
-#[test]
-fn box_pair_run_refused_for_its_lfs_digest_says_no_checkout_line() {
-    let case = Case::new("box_pair_lfs_no_checkout");
-    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "out", "ran"]);
-    pair_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[("lib", &[("b.txt", "b\n")])]);
-    payload["LfsDigest"] = json!("0".repeat(64));
-
-    let outcome = run_box(&case, &payload);
-
-    assert_eq!(outcome.code, Some(75), "{outcome:?}");
-    assert_eq!(
-        lines(&outcome.stderr).first().copied(),
-        Some(refused_line(&payload, "lfs").as_str()),
-        "{outcome:?}"
-    );
-    assert!(!outcome.stderr.contains("gate-remote-checkout:"), "no checkout line: {outcome:?}");
-}
-
 #[test]
 fn a_pair_whose_layout_record_names_another_layout_gets_the_cold_raise() {
     let case = Case::new("preflight_pair_relaid_cold");
@@ -2342,7 +2322,9 @@ fn push_repo_snapshot(case: &Case, source: &str, bare: &str, key: &str, files: &
         "snapshot",
     ]);
     let target = format!("HEAD:refs/gate/{key}");
-    git(&["-C", &source_text, "push", "-q", "--force", bare, &target]);
+    // `--no-verify`, as the client pushes a snapshot: git-lfs's pre-push hook would send a snapshot's LFS objects to
+    // the bare repository's LFS server, which it has none of.
+    git(&["-C", &source_text, "push", "-q", "--force", "--no-verify", bare, &target]);
     git(&["-C", &source_text, "rev-parse", "HEAD"])
 }
 

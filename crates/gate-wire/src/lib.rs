@@ -981,6 +981,42 @@ impl Payload {
             })
             .collect()
     }
+
+    /// The LFS digest of each sibling of `pair`, in its order, from the run's `SiblingLfsDigests`, an object naming only
+    /// siblings of the pair that hold LFS pointers, each value 64 lower-case hex digits as [`Payload::lfs_digest`]
+    /// reads one; a sibling it does not name, a null value, or no `SiblingLfsDigests` at all is `None`, and a run of one
+    /// repo (`pair` `None`) that sends none has no sibling. Else the line saying why, a `SiblingLfsDigests` without a
+    /// `Pair` among them.
+    pub fn sibling_lfs_digests(&self, pair: Option<&Pair>) -> Result<Vec<Option<&str>>, String> {
+        let value = match self.object.get("SiblingLfsDigests") {
+            None | Some(Value::Null) => return Ok(vec![None; pair.map_or(0, |pair| pair.siblings.len())]),
+            Some(value) => value,
+        };
+        let Some(pair) = pair else {
+            return Err("gate: box payload SiblingLfsDigests needs a Pair".to_owned());
+        };
+        let Value::Object(object) = value else {
+            return Err("gate: box payload SiblingLfsDigests is not an object".to_owned());
+        };
+        if let Some(name) = object.keys().find(|name| !pair.siblings.iter().any(|sibling| &sibling.name == *name)) {
+            return Err(format!(
+                "gate: box payload SiblingLfsDigests names {}, which is not a sibling of the Pair",
+                escaped(name)
+            ));
+        }
+        pair.siblings
+            .iter()
+            .map(|sibling| match object.get(&sibling.name) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(digest)) if is_lower_hex(digest, SHA256_DIGITS) => Ok(Some(digest.as_str())),
+                Some(other) => Err(format!(
+                    "gate: box payload SiblingLfsDigests {} is not 64 lower-case hex digits: {}",
+                    sibling.name,
+                    escaped(&other.as_str().map_or_else(|| other.to_string(), str::to_owned))
+                )),
+            })
+            .collect()
+    }
 }
 
 /// The most bytes a default branch's name may hold.
@@ -3954,6 +3990,66 @@ mod tests {
             sibling_bases(&json!({"Lib": "main"})),
             Err("gate: box payload SiblingBases names Lib, which is not a sibling of the Pair".to_owned()),
             "a sibling's name exactly"
+        );
+    }
+
+    /// The LFS digest of each sibling of a pair of `lib` and `tools` that `digests` names, or of no pair when `paired`
+    /// is false; else the line refusing them.
+    fn sibling_lfs_digests(digests: &serde_json::Value, paired: bool) -> Result<Vec<Option<String>>, String> {
+        let mut json = if paired {
+            with_pair(json!({"Leaf": "app", "Siblings": ["lib", "tools"]}))
+        } else {
+            json!({})
+        };
+        json["SiblingLfsDigests"] = digests.clone();
+        let payload = decoded(&json.to_string())?;
+        let pair = payload.pair()?;
+        payload
+            .sibling_lfs_digests(pair.as_ref())
+            .map(|digests| digests.into_iter().map(|digest| digest.map(str::to_owned)).collect())
+    }
+
+    /// `SiblingLfsDigests` names only siblings of the pair, each value 64 lower-case hex digits as `LfsDigest` is; a
+    /// sibling it does not name, a null value, or no `SiblingLfsDigests` at all is none; with no `Pair` it is refused.
+    #[test]
+    fn sibling_lfs_digests_are_64_lower_case_hex_digits_of_siblings() {
+        let good = "0a".repeat(32);
+        assert_eq!(
+            sibling_lfs_digests(&json!({ "tools": good, "lib": good }), true),
+            Ok(vec![Some(good.clone()), Some(good.clone())]),
+            "one per sibling, in the pair's order"
+        );
+        assert_eq!(sibling_lfs_digests(&json!({ "tools": good }), true), Ok(vec![None, Some(good.clone())]));
+        assert_eq!(sibling_lfs_digests(&json!(null), true), Ok(vec![None, None]), "null is none for each");
+        let absent = decoded(&with_pair(json!({"Leaf": "app", "Siblings": ["lib"]})).to_string()).and_then(|payload| {
+            let pair = payload.pair()?;
+            payload
+                .sibling_lfs_digests(pair.as_ref())
+                .map(|digests| digests.into_iter().map(|digest| digest.map(str::to_owned)).collect::<Vec<_>>())
+        });
+        assert_eq!(absent, Ok(vec![None]), "no SiblingLfsDigests is none for each");
+        assert_eq!(sibling_lfs_digests(&json!(null), false), Ok(Vec::new()), "no pair and none sent");
+        for bad in [json!(good.to_uppercase()), json!(&good[..63]), json!(format!("{good}0")), json!(12)] {
+            let shown = bad.as_str().map_or_else(|| bad.to_string(), str::to_owned);
+            assert_eq!(
+                sibling_lfs_digests(&json!({ "lib": bad }), true),
+                Err(format!(
+                    "gate: box payload SiblingLfsDigests lib is not 64 lower-case hex digits: {shown}"
+                )),
+                "{shown}"
+            );
+        }
+        assert_eq!(
+            sibling_lfs_digests(&json!({ "app": good }), true),
+            Err("gate: box payload SiblingLfsDigests names app, which is not a sibling of the Pair".to_owned())
+        );
+        assert_eq!(
+            sibling_lfs_digests(&json!({ "lib": good }), false),
+            Err("gate: box payload SiblingLfsDigests needs a Pair".to_owned())
+        );
+        assert_eq!(
+            sibling_lfs_digests(&json!([good]), true),
+            Err("gate: box payload SiblingLfsDigests is not an object".to_owned())
         );
     }
 
