@@ -27,8 +27,8 @@ use gate_args::{
 use gate_inputs::glob::names_tmp;
 use gate_router::warm::{RecordRead, RecordState};
 use gate_router::{
-    BuildSettings, BuildTarget, DEFAULT_OUTPUTS, LaterCandidate, Nested, PinRefusal, Place, RemoteRun, Route, build_settings, builds_in_place,
-    dotnet_builds, dotnet_target, sdk_build_target, without_no_build, work_folder_key,
+    BuildSettings, BuildTarget, CARRIED_INPUT, DEFAULT_OUTPUTS, LaterCandidate, Nested, PinRefusal, Place, RemoteRun, Route, build_settings,
+    builds_in_place, dotnet_builds, dotnet_target, named_worktree_paths, sdk_build_target, without_no_build, work_folder_key,
 };
 use gate_state::{
     Estimate, FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RoutingFacts, RunFacts, RunTrace, StageFacts, StageOutcome,
@@ -64,6 +64,7 @@ use crate::machine::{self, Machine, MachineWait, MachineWaited};
 use crate::nesting::{Nesting, Parent, covers, enclosing_of};
 use crate::no_build::{self, NothingBack, Unfound, Worktree};
 use crate::orphan::{self, Orphan};
+use crate::outputs::glob::Globs;
 use crate::outputs::{stale, walk::walk};
 use crate::remote::drain::{self, Drain, utc_clock};
 use crate::remote::syncback::Staged;
@@ -237,6 +238,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         rerouted_for: None,
         may_reroute: false,
         restore_after: None,
+        hint_after: None,
         closing: Vec::new(),
         builder_call: BuilderCall::NotEnded,
     };
@@ -909,7 +911,11 @@ struct Run<'a> {
     /// The routed dotnet build that passed and brought everything back, whose target a restore here may need once the
     /// run has let its remote hold go ([`Run::restore_and_close`]); `None` for every other run.
     restore_after: Option<RoutedBuild>,
-    /// The verdict's closing lines, held while a restore here is still to run so they stay the run's last lines.
+    /// What the hint of a routed run whose command failed on the builder checks once the run has let its remote hold go
+    /// ([`Run::restore_and_close`]); `None` for every other run.
+    hint_after: Option<HintCheck>,
+    /// The verdict's closing lines, held while a restore here or a hint's check is still to run so they stay the run's
+    /// last lines.
     closing: Vec<Said>,
     /// Whether the routed run's builder call ended, passing or failing its command, rather than being refused or
     /// interrupted before it started: such a run may start the background prune sweep ([`start_prune_sweep`]).
@@ -3048,6 +3054,8 @@ impl Run<'_> {
         let ceiling = outcome.raised.unwrap_or(figures.ceiling);
         self.restore_after = restore_candidate(remote, &outcome, words.as_deref(), ceiling, started);
         let stale = stale_lines(remote, &outcome, words.as_deref());
+        // The hint's git call waits until the run has let its remote slot go ([`Run::restore_and_close`]).
+        self.hint_after = command_failed(&outcome, interrupted).then(|| HintCheck::of(remote, git::GitBounds::of(&self.request.test_seams)));
         let passing = Passing {
             pass: Pass::On(&remote.builder.alias, wall, outcome.split, outcome.adjusted),
             ceiling,
@@ -3166,9 +3174,17 @@ impl Run<'_> {
     /// that cannot restore its target here says why ([`Run::restore_here`]).
     fn restore_and_close(&mut self, ended: &Ended, console: &mut Console) {
         let candidate = self.restore_after.take();
-        let closing = std::mem::take(&mut self.closing);
+        let hint = self.hint_after.take();
+        let mut closing = std::mem::take(&mut self.closing);
         if let Some(build) = candidate.filter(|_| ended.status == 0) {
             self.restore_here(&build, console);
+        }
+        // A failed routed run's hints come before its verdict line, as a passed run's stale lines come before its passed
+        // line; a run whose verdict held no line says none, and a Ctrl+C pressed since the run ended starts no git call.
+        let interrupted = self.host.interrupt.is_some_and(Interrupt::is_raised);
+        if let Some(check) = hint.filter(|_| !closing.is_empty() && !interrupted) {
+            let hints = ignored_hint_lines(&check, console);
+            closing.splice(0..0, hints.into_iter().map(Said::Err));
         }
         say(closing, console);
     }
@@ -4808,8 +4824,9 @@ impl Run<'_> {
             Some(passed) if status == 0 => self.passed_lines(passed, &shown),
             _ => vec![Said::Err(format!("gate: FAILED (status {status}). Full output: {shown}"))],
         };
-        // A routed build whose restore here is still to run keeps its verdict line for after it ([`Run::restore_and_close`]).
-        if self.restore_after.is_some() {
+        // A routed build whose restore here is still to run, and a failed routed run whose hint is still to be checked,
+        // keep their verdict line for after it ([`Run::restore_and_close`]).
+        if self.restore_after.is_some() || self.hint_after.is_some() {
             self.closing = closing;
         } else {
             say(closing, console);
@@ -5798,6 +5815,109 @@ fn restore_due(build: &RoutedBuild, console: &mut Console) -> Option<RestorePlan
             None
         }
     }
+}
+
+/// The most gitignored paths a failed routed run's hints name one by one; the rest are counted on one line.
+const HINTED_PATHS: usize = 5;
+
+/// Whether the command of a routed run that ended on the builder failed by its own status: it ended non-zero, and
+/// neither a kill (the client's, the watchdog's or the box's), a failed transfer, a warm-up nor a Ctrl+C ended it. A
+/// fallback and a commit stage never reach here. The start marker is not asked for: the scripted client never says
+/// one, and a non-fallback end that started no command costs at most the hint lines one failed run says
+/// ([`HINTED_PATHS`] and the line counting the rest).
+fn command_failed(outcome: &RemoteOutcome, interrupted: bool) -> bool {
+    outcome.status != 0 && !outcome.killed && outcome.box_killed.is_none() && !outcome.transfer_failed && outcome.warm.is_none() && !interrupted
+}
+
+/// What the hint of a routed run whose command failed on the builder ([`command_failed`]) checks once the run has let
+/// its remote hold go ([`Run::restore_and_close`]): the worktree root, the gate's folder below it with a trailing `/`
+/// (empty at the root), the words as this PC would run them, the files the run carried and the repo's `inputs` globs,
+/// and the bounds of the run's git calls.
+struct HintCheck {
+    root: String,
+    prefix: String,
+    words: Vec<String>,
+    carried: Vec<String>,
+    globs: Vec<String>,
+    bounds: git::GitBounds,
+}
+
+impl HintCheck {
+    /// The check of the routed run `remote`, its git calls under `bounds`.
+    fn of(remote: &RemoteRun, bounds: git::GitBounds) -> HintCheck {
+        let prefix = if remote.subfolder.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", remote.subfolder)
+        };
+        let (carried, globs) = remote.inputs.iter().fold((Vec::new(), Vec::new()), |(mut carried, mut globs), input| {
+            match input.strip_prefix(CARRIED_INPUT) {
+                Some(file) => carried.push(file.to_owned()),
+                None => globs.push(input.clone()),
+            }
+            (carried, globs)
+        });
+        HintCheck {
+            root: remote.root.clone(),
+            prefix,
+            words: remote.fallback.clone(),
+            carried,
+            globs,
+            bounds,
+        }
+    }
+}
+
+/// The hint lines of a routed run whose command failed on the builder ([`HintCheck`]): each path its words name
+/// ([`named_worktree_paths`]) that is a file in the worktree, git reports ignored, no `inputs` glob of the repo covers
+/// and the run did not carry, so the builder's snapshot had no copy of it. A folder is never named: its files may have
+/// been carried or covered one by one. At most [`HINTED_PATHS`] are named, the first in word order, then a line
+/// counting the rest. When git cannot tell which are ignored, or the inputs globs cannot be read, the log says why and
+/// the run hints nothing.
+fn ignored_hint_lines(check: &HintCheck, console: &mut Console) -> Vec<String> {
+    let root = Path::new(&check.root);
+    let cannot_tell = |why: &str, console: &mut Console| console.note(&format!("gate: cannot tell which words are gitignored: {why}"));
+    let globs = match Globs::inputs(&check.globs, route::NOTHING_EXCLUDED) {
+        Ok(globs) => globs,
+        Err(why) => {
+            cannot_tell(&why, console);
+            return Vec::new();
+        }
+    };
+    let candidates: Vec<String> = named_worktree_paths(&check.words, &check.prefix)
+        .into_iter()
+        .filter(|path| root.join(path).is_file())
+        .filter(|path| !globs.matches(path))
+        .filter(|path| !check.carried.iter().any(|file| file.eq_ignore_ascii_case(path)))
+        .collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let ignored = match route::ignored_paths(root, &candidates, check.bounds) {
+        Ok(ignored) => ignored,
+        Err(why) => {
+            cannot_tell(&why, console);
+            return Vec::new();
+        }
+    };
+    let hinted: Vec<&String> = candidates.iter().filter(|path| ignored.contains(*path)).collect();
+    let mut lines: Vec<String> = hinted
+        .iter()
+        .take(HINTED_PATHS)
+        .map(|path| {
+            format!(
+                concat!(
+                    "gate: hint: {} is gitignored, so the builder had no copy of it; ",
+                    "if the command reads it, add it to the repo's inputs in remote.json, or rerun with --local"
+                ),
+                path
+            )
+        })
+        .collect();
+    if hinted.len() > HINTED_PATHS {
+        lines.push(format!("gate: hint: and {} more gitignored path(s)", hinted.len() - HINTED_PATHS));
+    }
+    lines
 }
 
 /// The lines a passing routed build says of the folders it left stale, none when it says none: the folders in the

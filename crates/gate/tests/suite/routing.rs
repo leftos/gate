@@ -2298,6 +2298,158 @@ fn a_failing_client_status_is_the_gates_and_the_log_is_scanned() {
     assert_eq!((&releases[0]["verdict"], &releases[1]["verdict"]), (&json!("failed"), &json!("passed")));
 }
 
+/// The hint a failed routed run says of an ignored `path` its words named.
+fn ignored_hint(path: &str) -> String {
+    format!(
+        concat!(
+            "gate: hint: {} is gitignored, so the builder had no copy of it; ",
+            "if the command reads it, add it to the repo's inputs in remote.json, or rerun with --local"
+        ),
+        path
+    )
+}
+
+/// Runs `.\tool.exe out <words>` as a routed heavy gate of `case` logging to `out.log`, whose scripted client takes
+/// `steps`; the outcome and the log's text.
+fn run_routed_ending(case: &Case, steps: &[&str], words: &[&str]) -> (Outcome, String) {
+    let steps = shown(&stub(case, steps));
+    let mut command = vec![r".\tool.exe", "out"];
+    command.extend(words);
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &command)));
+    (outcome, log_texts(&case.folder().join("out.log")))
+}
+
+/// The `gate: hint:` lines of `text`, in order.
+fn hint_lines(text: &str) -> Vec<&str> {
+    text.lines().filter(|line| line.starts_with("gate: hint:")).collect()
+}
+
+#[test]
+fn a_failing_routed_run_names_the_gitignored_file_its_words_point_at() {
+    let case = routed_case("routing-hint-ignored");
+    ignore_and_write(&case, ".tmp/\n", ".tmp/a.jsonl");
+
+    let (outcome, log) = run_routed_ending(&case, &["status 1"], &["--", ".tmp/a.jsonl"]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let hint = ignored_hint(".tmp/a.jsonl");
+    for text in [&outcome.stderr, &log] {
+        assert_eq!(hint_lines(text), [hint.as_str()], "{text}");
+        let said = text.find(&hint).expect("the hint is said");
+        let failed = text.find("gate: FAILED (status 1)").expect("the verdict is said");
+        assert!(said < failed, "the hint comes before the verdict: {text}");
+    }
+}
+
+#[test]
+fn a_passing_routed_run_says_no_hint() {
+    let case = routed_case("routing-hint-passing");
+    ignore_and_write(&case, ".tmp/\n", ".tmp/a.jsonl");
+
+    let (outcome, log) = run_routed_ending(&case, &["status 0"], &["--", ".tmp/a.jsonl"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: hint:"), "{outcome:?}");
+    assert!(!log.contains("gate: hint:"), "{log}");
+}
+
+#[test]
+fn a_failing_routed_run_names_no_file_an_inputs_glob_covers() {
+    let case = routed_case("routing-hint-input");
+    let routing = json!({ "host": HOST, "repos": { repo(&case): ["*tool*"] }, "inputs": { repo(&case): [".tmp/*.jsonl"] } });
+    write_remote_json(&case, &routing.to_string());
+    ignore_and_write(&case, ".tmp/\n", ".tmp/a.jsonl");
+
+    let (outcome, log) = run_routed_ending(&case, &["status 1"], &["--", ".tmp/a.jsonl"]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: hint:"), "{outcome:?}");
+    assert!(!log.contains("gate: hint:"), "{log}");
+}
+
+#[test]
+fn a_failing_routed_run_names_no_tracked_or_missing_file() {
+    let case = routed_case("routing-hint-tracked");
+    ignore_and_write(&case, "*.jsonl\n", "src/a.jsonl");
+    git(&case, &["add", "-f", "src/a.jsonl"]);
+
+    let (outcome, log) = run_routed_ending(&case, &["status 1"], &["--", "src/a.jsonl", ".tmp/missing.jsonl"]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: hint:"), "{outcome:?}");
+    assert!(!log.contains("gate: hint:"), "{log}");
+}
+
+#[test]
+fn a_failing_routed_run_names_at_most_five_files() {
+    let case = routed_case("routing-hint-many");
+    let paths = [
+        ".tmp/7.jsonl",
+        ".tmp/1.jsonl",
+        ".tmp/6.jsonl",
+        ".tmp/2.jsonl",
+        ".tmp/5.jsonl",
+        ".tmp/3.jsonl",
+        ".tmp/4.jsonl",
+    ];
+    for path in paths {
+        ignore_and_write(&case, ".tmp/\n", path);
+    }
+
+    let mut words = vec!["--"];
+    words.extend(paths);
+
+    let (outcome, log) = run_routed_ending(&case, &["status 1"], &words);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let mut expected: Vec<String> = paths[..5].iter().map(|path| ignored_hint(path)).collect();
+    expected.push("gate: hint: and 2 more gitignored path(s)".to_owned());
+    assert_eq!(hint_lines(&outcome.stderr), expected, "{outcome:?}");
+    assert_eq!(hint_lines(&log), expected, "{log}");
+}
+
+#[test]
+fn a_failing_routed_run_names_no_gitignored_folder() {
+    let case = routed_case("routing-hint-folder");
+    ignore_and_write(&case, ".tmp/\n", ".tmp/probe/a.txt");
+
+    let (outcome, log) = run_routed_ending(&case, &["status 1"], &["--", ".tmp/probe"]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: hint:"), "{outcome:?}");
+    assert!(!log.contains("gate: hint:"), "{log}");
+}
+
+#[test]
+fn a_failing_routed_run_names_no_carried_file() {
+    let case = routed_case("routing-hint-carried");
+    ignore_and_write(&case, ".tmp/\n", ".tmp/probe/Probe.csproj");
+    let call = case.folder().join("call.json");
+
+    let (outcome, log) = run_routed_ending(&case, &[&format!("record {}", shown(&call)), "status 1"], &[".tmp/probe/Probe.csproj"]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(
+        recorded(&call)["inputs"],
+        json!(["[carried].tmp/probe/Probe.csproj"]),
+        "the file was carried"
+    );
+    assert!(!outcome.stderr.contains("gate: hint:"), "{outcome:?}");
+    assert!(!log.contains("gate: hint:"), "{log}");
+}
+
+#[test]
+fn a_killed_routed_run_says_no_hint() {
+    let case = routed_case("routing-hint-killed");
+    ignore_and_write(&case, ".tmp/\n", ".tmp/a.jsonl");
+
+    let (outcome, log) = run_routed_ending(&case, &["killed", "status 124"], &["--", ".tmp/a.jsonl"]);
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: hint:"), "{outcome:?}");
+    assert!(!log.contains("gate: hint:"), "{log}");
+}
+
 #[test]
 fn a_75_without_a_reason_is_the_commands_own_status() {
     let case = routed_case("routing-75");

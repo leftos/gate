@@ -34,6 +34,8 @@ A property value (`-p:`, `/p:`, `-property:`, `/property:`, `--property:`, or th
 
 A command whose gitignored inputs hold more than 64 MiB or 2000 files, that carries them in a sibling pair (a run carrying siblings; declared siblings that are all absent make a single repo), or whose files cannot be sent (a file the inputs never send, such as a `.env`, among them) stays local, saying `gate: not routed: <path> is gitignored ...` with the reason, and is journalled `notRouted: gitignored input` ([design.md, Routing](design.md#routing)). A sibling pair with no such inputs routes.
 
+A routed run that fails on its builder names, in a `gate: hint:` line before the failure line, each gitignored file (never a folder) its words name that no `inputs` glob covers and that was not carried; the fix is an `inputs` glob for it, or `--local`.
+
 A gitignored project, solution or dotnet folder also stays local when its build reads a gitignored file the run would not send. That is a build file such as `Directory.Build.props`, `Directory.Packages.props`, `nuget.config` or `global.json` in a folder above it (the worktree root included), or a relative path in one of its carried project, props, targets or solution files that points outside its own folder ([design.md, Routing](design.md#routing) lists both).
 
 The line ends `the build reads <file> above its folder, which is not sent` or `the build reads <file> outside its folder, which is not sent`. A throwaway build under `.tmp/` that leans on ignored build files around it therefore stays on the PC by itself, and its caller needs no `--local`; one whose `.targets` or `.props` names the files it compiles routes and carries them.
@@ -251,7 +253,7 @@ A command that matches none of the repo's `repos` patterns stays here whatever t
 A word naming a path outside the worktree keeps a run on this PC, and no pattern overrides it. A long job over a data folder outside the repo (a large private folder on another drive) routes through the `inputs` route instead, with no gate change:
 
 - A PC-side job command mirrors the folder into an ignored folder of the worktree, `.tmp/blender-data/` (`robocopy /MIR`, a real copy that keeps modified times, since `inputs` skips links and its hash cache reads them), runs the repo's wrapper through the gate, then copies the results back.
-- The tracked wrapper reads the mirror by its relative path and writes results to `.tmp/blender-out/`. A script it runs must be tracked too: a gitignored script that no `inputs` glob covers does not reach the builder.
+- The tracked wrapper reads the mirror by its relative path and writes results to `.tmp/blender-out/`. A script it runs must be tracked too: a gitignored script that no `inputs` glob covers does not reach the builder; a failing routed run names such a script in a `gate: hint:` line, and the fix is an `inputs` glob.
 - `remote.json`: `repos` names the wrapper alone, `inputs` gains the mirror's glob, and `outputs` and `failureOutputs` gain the results' glob. A `.tmp` glob must name the folder `.tmp` exactly.
 
 Naming the wrapper rather than the tool keeps ad-hoc runs of the tool on this PC.

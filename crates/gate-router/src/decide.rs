@@ -2298,6 +2298,36 @@ fn input_values(word: &str) -> Vec<&str> {
     std::iter::once(word).chain(pieces).collect()
 }
 
+/// The worktree paths `words` name, in word order and each once: the path ([`input_path`] below the gate's folder
+/// `prefix`) of every value ([`input_values`]) of every word after the program word, up to a script's text
+/// ([`script_start`]), the words after a `--` included. The program word and script text are never read, nor, in a
+/// dotnet command, an output option's value before the first `--` ([`output_values`]), as [`input_candidates`] skips it.
+#[must_use]
+pub fn named_worktree_paths(words: &[String], prefix: &str) -> Vec<String> {
+    let Some((first, _)) = first_word(words) else {
+        return Vec::new();
+    };
+    let words = &words[..script_start(words)];
+    let separator = words.iter().position(|word| word == SEPARATOR).unwrap_or(words.len());
+    let outputs = if folders_from(words).is_some() {
+        output_values(&words[..separator])
+    } else {
+        Vec::new()
+    };
+    let mut named: Vec<String> = Vec::new();
+    for (index, word) in words.iter().enumerate().skip(first + 1) {
+        if outputs.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        for path in input_values(word).into_iter().filter_map(|value| input_path(prefix, value)) {
+            if !named.contains(&path) {
+                named.push(path);
+            }
+        }
+    }
+    named
+}
+
 /// The characters no relative path a candidate names holds: a drive's or a switch's `:`, a glob's wildcards and those
 /// Windows refuses in a name.
 const NOT_IN_INPUT_PATH: [char; 8] = [':', '*', '?', '[', '"', '<', '>', '|'];

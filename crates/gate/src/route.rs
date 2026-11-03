@@ -558,7 +558,34 @@ pub(crate) fn not_routed(route: &Route, sent: Option<&Sent>) -> Option<String> {
 
 /// The exclusions of the input globs a word's project input is matched against ([`Machine::uncovered`]): none, a
 /// regex no path matches. The inputs' own exclusions hold only for paths no project input has.
-const NOTHING_EXCLUDED: &str = r"[^\s\S]";
+pub(crate) const NOTHING_EXCLUDED: &str = r"[^\s\S]";
+
+/// Which of `paths`, relative to `root`, one `git check-ignore -z --stdin` in the root, under `bounds`, reports
+/// ignored; a tracked file is never reported.
+///
+/// # Errors
+///
+/// Why git cannot be started, failed, with its status and last error lines ([`git::git_failure`]), or wrote what
+/// cannot be read.
+pub(crate) fn ignored_paths(root: &Path, paths: &[String], bounds: git::GitBounds) -> Result<Vec<String>, String> {
+    let input: Vec<u8> = paths.iter().flat_map(|path| path.bytes().chain([0])).collect();
+    let args = ["check-ignore", "-z", "--stdin"];
+    let call = git::Call {
+        stdin: Some(&input),
+        ..git::Call::bounded(root, &args, bounds)
+    };
+    let (mut ran, errors) = git::Git::find(root)?.run_kept(&call)?;
+    // 1 says no path is ignored; anything but 0 and 1 is git's own failure.
+    if !matches!(ran.status.code(), Some(0 | 1)) {
+        return Err(format!("git check-ignore failed: {}", git::git_failure(ran.status.code(), &errors)));
+    }
+    let mut listing = Vec::new();
+    ran.stdout
+        .read_to_end(&mut listing)
+        .map_err(|error| format!("cannot read git check-ignore's output: {error}"))?;
+    let listing = String::from_utf8(listing).map_err(|_| "git check-ignore's output is not valid UTF-8".to_owned())?;
+    Ok(listing.split('\0').filter(|file| !file.is_empty()).map(str::to_owned).collect())
+}
 
 /// The folders a sweep ([`swept_folder`]) never enters, at any depth below the swept folder, in any ASCII letter case.
 const NOT_SWEPT: &str = r"(^|/)(bin|obj)/";
@@ -1382,23 +1409,12 @@ impl<'a> Machine<'a> {
     /// Why git cannot be started, failed, with its status and last error lines ([`git::git_failure`]), or wrote what
     /// cannot be read.
     fn check_ignore(&self, root: &Path, files: &[&String]) -> Result<Vec<String>, String> {
-        let input: Vec<u8> = files.iter().flat_map(|file| file.bytes().chain([0])).collect();
-        let args = ["check-ignore", "-z", "--stdin"];
-        let call = git::Call {
-            stdin: Some(&input),
-            ..self.git_call(root, &args)
+        let files: Vec<String> = files.iter().map(|file| (*file).clone()).collect();
+        let bounds = git::GitBounds {
+            limit: self.git_limit,
+            drain: self.git_drain,
         };
-        let (mut ran, errors) = git::Git::find(root)?.run_kept(&call)?;
-        // 1 says no path is ignored; anything but 0 and 1 is git's own failure.
-        if !matches!(ran.status.code(), Some(0 | 1)) {
-            return Err(format!("git check-ignore failed: {}", git::git_failure(ran.status.code(), &errors)));
-        }
-        let mut listing = Vec::new();
-        ran.stdout
-            .read_to_end(&mut listing)
-            .map_err(|error| format!("cannot read git check-ignore's output: {error}"))?;
-        let listing = String::from_utf8(listing).map_err(|_| "git check-ignore's output is not valid UTF-8".to_owned())?;
-        Ok(listing.split('\0').filter(|file| !file.is_empty()).map(str::to_owned).collect())
+        ignored_paths(root, &files, bounds)
     }
 
     /// Says in the log why which words are gitignored cannot be told.

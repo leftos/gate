@@ -11,7 +11,7 @@ use gate_router::{
     BuildSettings, BuildTarget, Builder, BuilderOs, CARRIED_INPUT, Config, ConfigProblem, CrossBlocked, CrossTarget, DROPPED_NO_BUILD_LINE,
     DotnetTarget, Facts, GitignoredInput, Inputs, LocalReason, NO_OUTPUTS_LINE, Nested, PROJECT_EXTENSIONS, Pattern, PinRefusal, Place, RemoteRun,
     Route, SiblingFolder, Slot, Target, build_settings, builder_words, decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet, is_usable_host,
-    later_run, pattern_for, sdk_build_target, target, without_no_build, work_folder_key,
+    later_run, named_worktree_paths, pattern_for, sdk_build_target, target, without_no_build, work_folder_key,
 };
 
 use crate::support::{FakeFacts, HEAD, ROOT, carried, fake_id, heavy, light, place_at, sibling_root, words};
@@ -7132,5 +7132,71 @@ fn a_commit_stage_never_picks_a_macos_builder() {
         decide(&heavy(&command), &only_mac),
         SILENT,
         "with only a Mac, the commit runs as it would with no stage"
+    );
+}
+
+#[test]
+fn named_worktree_paths_takes_every_value_after_the_program_word_past_a_separator() {
+    let named = named_worktree_paths(
+        &words(&["dotnet", "run", "--project", "src/A", "--", "--in", ".tmp/a.jsonl", "--out=.tmp/r.txt"]),
+        "",
+    );
+
+    assert_eq!(named, ["run", "src/A", ".tmp/a.jsonl", ".tmp/r.txt"]);
+}
+
+#[test]
+fn named_worktree_paths_skips_a_dotnet_output_option_value() {
+    let command = words(&[
+        "dotnet",
+        "test",
+        "--results-directory",
+        ".tmp/tr",
+        "-bl:.tmp/b.binlog",
+        "--",
+        "--out",
+        ".tmp/x",
+    ]);
+
+    assert_eq!(named_worktree_paths(&command, ""), ["test", ".tmp/x"]);
+}
+
+#[test]
+fn named_worktree_paths_never_returns_the_program_word() {
+    assert_eq!(
+        named_worktree_paths(&words(&[".tmp/tool.exe", "x", ".tmp/a.jsonl"]), ""),
+        ["x", ".tmp/a.jsonl"]
+    );
+}
+
+#[test]
+fn named_worktree_paths_never_returns_script_text() {
+    assert_eq!(
+        named_worktree_paths(&words(&["pwsh", "-c", "Get-Content .tmp/a.jsonl"]), ""),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn named_worktree_paths_leaves_out_paths_outside_the_worktree() {
+    assert_eq!(
+        named_worktree_paths(&words(&["tool.exe", r"C:\elsewhere\a", "../outside"]), ""),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn named_worktree_paths_says_a_duplicate_once() {
+    assert_eq!(
+        named_worktree_paths(&words(&["tool.exe", ".tmp/a.jsonl", "./.tmp/a.jsonl", r".tmp\a.jsonl"]), ""),
+        [".tmp/a.jsonl"]
+    );
+}
+
+#[test]
+fn named_worktree_paths_joins_a_path_below_the_gate_folder() {
+    assert_eq!(
+        named_worktree_paths(&words(&["tool.exe", "a.txt", "../b.txt"]), "sub/"),
+        ["sub/a.txt", "b.txt"]
     );
 }
