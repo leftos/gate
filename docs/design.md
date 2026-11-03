@@ -2438,7 +2438,10 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   Each is tried at most once, and a `sent` rerun stays inside its builder's attempt. A builder whose slot a several-pool wait took is tried, and every builder such a wait listed that ran out counts as tried ([Slots](#slots), Taking a slot).
 
-  Every other reason (`client`, `inputs`, `lfs`, `layout`, `desktop`, `rebooted`, `root`) runs here at once, as does a work-folder key still held by another run of the worktree past the run's wait for it (`busy` before any remote slot: the key is the worktree's on every builder). A desktop run never runs here: at each of these it ends failed instead, as it does when the last candidate refuses, with `a desktop run never runs here` (Output lines), and a connection it lost after its command's start marker looks for no other builder. The key lock is taken once and held across the attempts; each attempt takes a remote slot of its builder's pool, after the refusing builder's slot is let go.
+  Every other reason (`client`, `inputs`, `lfs`, `layout`, `desktop`, `rebooted`, `root`) runs here at once, as does a work-folder key still held by another run of the worktree past the run's wait for it (`busy` before any remote slot: the key is the worktree's on every builder).
+  A desktop run never runs here: at each of these it ends failed instead, as it does when the last candidate refuses, with `a desktop run never runs here` (Output lines), and a connection it lost after its command's start marker looks for no other builder.
+  The box's `helper` tag (a desktop helper of another build, [The desktop run's design](#the-desktop-runs-design)) is read as the `version` reason: the journal and `fellBack` say `version`. A desktop run, pinned or not, refused `helper` says once `gate: remote <alias> helper; the builder's desktop helper and gate differ in version, trying it again in 5 s` and calls the same builder once more with a fresh remote slot, only while the remote budget left exceeds the wait and never after a run lost mid-run, because during `gate push` an old box process meets the new helper and a fresh call runs the new gate. A second refusal ends the run as `version` does, `gate: remote <alias> version; a desktop run never runs here`, exit 1. The hidden seam `--test-helper-retry-ms <n>` replaces the 5 s wait.
+  The key lock is taken once and held across the attempts; each attempt takes a remote slot of its builder's pool, after the refusing builder's slot is let go.
 
   A later candidate is built when it is tried, through the same pick pipeline as the first pick, a fresh `Machine` per candidate, and `remote.json` as it reads then. The macOS, backslash, Windows-only-test and Windows-paths steer-offs skip it silently.
 
@@ -3247,7 +3250,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     `-o RequestTTY=no` leads the options of every `gate box` call and `gate push`'s, so stdin never passes through a pseudo-terminal. The last option, `-o Compression=yes`, is the run call's alone: the preflight, stop, boot and outputs calls, git's ssh command and `gate push` ask for none. The run call's compression covers both directions of its connection: the command's output and protocol lines one way, the request and the outputs manifest the other.
 
-    The box's output passes through to the log and the console, except the box's heartbeats and its machine lines, which the client hides from both and keeps out of the lines it holds: the start marker `gate-remote-started: <nonce>` and the refusal tag `gate-remote-refused: <nonce> busy|tools|layout|inputs|sent|lfs|desktop|install|drain|full`, each naming this run's `Nonce` and read on stderr only, as a whole line, and the kill tag, the adjusted line and the checkout lines below.
+    The box's output passes through to the log and the console, except the box's heartbeats and its machine lines, which the client hides from both and keeps out of the lines it holds: the start marker `gate-remote-started: <nonce>` and the refusal tag `gate-remote-refused: <nonce> busy|tools|layout|inputs|sent|lfs|desktop|helper|install|drain|full`, each naming this run's `Nonce` and read on stderr only, as a whole line, and the kill tag, the adjusted line and the checkout lines below.
 
     The client matches those protocol lines on the raw line, before any unstamping, so a command's own line, stamped by the box, never reads as one.
 
@@ -3263,7 +3266,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The adjusted line `gate-remote-adjusted: <nonce> <s.sss>` carries the load-adjusted seconds the box counted, said once the command's output has drained unless the sampler failed, read like the tag on stderr only and the last one winning; another run's, a malformed one or one whose seconds are not a finite number is a line like any other.
 
-    A status 75 is a refusal only when this run's refusal tag came on stderr before any start marker (`busy`, `tools`, `layout`, `inputs`, `lfs`, `desktop`, `install` or `full`, the fallback reason; `full` is a builder whose own slots are all held, the preflight's tag read as the run's is; `drain` is a refusal the run waits on, never a fallback reason, see Builder drain below); a tag after the marker is ignored, so a command that prints the human busy, tools, layout, inputs, lfs, desktop or install line, or a tag of its own, and exits 75 ends with status 75 and no fallback.
+    A status 75 is a refusal only when this run's refusal tag came on stderr before any start marker (`busy`, `tools`, `layout`, `inputs`, `lfs`, `desktop`, `helper`, `install` or `full`, the fallback reason, `helper` read as `version`; `full` is a builder whose own slots are all held, the preflight's tag read as the run's is; `drain` is a refusal the run waits on, never a fallback reason, see Builder drain below); a tag after the marker is ignored, so a command that prints the human busy, tools, layout, inputs, lfs, desktop or install line, or a tag of its own, and exits 75 ends with status 75 and no fallback.
 
     The `sent` tag, read the same way, is no fallback: the client makes the run call once more with `--no-build` dropped ([Routing](#routing)).
 
@@ -4555,7 +4558,7 @@ Built verbs:
 
   The start marker follows, then the run's usual park seam, stop look and resume, and the command is watched to its end as any run's command is. A zero `DesktopWait` is one try for the lock, with no busy line.
 
-  Before the start marker every failure is a refusal (the `desktop` tag, exit 75, no back commits line), except a helper that is there and not installed where only administrators can change it: that is refused with the `install` tag (Install tripwire, above), also exit 75 with no back commits line. A helper file that is not found stays a `desktop` refusal.
+  Before the start marker every failure is a refusal (the `desktop` tag, exit 75, no back commits line), except a helper that is there and not installed where only administrators can change it: that is refused with the `install` tag (Install tripwire, above), also exit 75 with no back commits line. A helper file that is not found stays a `desktop` refusal. A helper whose hello names another build than the box is refused with the `helper` tag, also exit 75 with no back commits line.
 
   Every hand-off refusal line starts with `gate: not routed: the builder has no desktop session: `, a helper that never started or connected included, so the prefix names the refusal's tag and does not report the builder's session state.
 
@@ -5195,7 +5198,7 @@ The rules behind the desktop run (GATE-231) that a later change to the helper, t
 | Lies (bad handle values, a pid that does not match, a running process) | Verification fails, the sweep runs, the box refuses. A helper's copy can never carry more access than the helper had. |
 | Impersonated (another client connects first) | Pid mismatch, disconnect, keep listening. Endless reconnects run out the deadline and refuse: a denial of service that ends in a local run. |
 | Squatter of another identity | The box's `CreateNamedPipe` with `FIRST_PIPE_INSTANCE` fails and it refuses before `RunEx`. A pipe the helper reaches is the helper's check, above. |
-| Helper of another build | The hello carries the version text; a mismatch refuses `desktop`. |
+| Helper of another build | The hello carries the version text; a mismatch refuses with the `helper` tag (exit 75, `gate: not routed: the builder has no desktop session: the desktop helper runs gate <helper>, the box <box>`), which the PC reads as the `version` reason and retries once for a desktop run (Routing). |
 
 **The task's settings.** The registered definition is part of the design, and the box reads it on each desktop run:
 
@@ -5901,6 +5904,8 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   `--test-remote-wait-ms <n>` (whole milliseconds above 0) replaces the 60 s budget of the waits for a remote slot, which all the builders of a run share. `--test-print-request` shows them as `testSeams.remoteClient` and `testSeams.remoteWaitMs`.
 
   `--test-git-limit-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 60 s limit of each git call of the routing decision, of the remote client and of the `--test-remote-snapshot` client; `--test-print-request` shows it as `testSeams.gitLimitMs`, after `remoteWaitMs`.
+
+  `--test-helper-retry-ms <n>` (whole milliseconds, on `gate run` only, hidden) replaces the 5 s wait before a desktop run refused `helper` calls its builder once more.
 
   `--test-key-wait-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 90 s bound of a routed run's wait for its work folder's key, the 2 s brief retry of a passing build here taking that key to write its built-here record, and that build's bounded wait for it to remove the outputs-from record, and the switch `--test-interrupt-before-key` raises the interrupt before the key is taken; `--test-heartbeat-ms` sets the wait's step.
 

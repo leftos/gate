@@ -399,6 +399,9 @@ pub struct TestSeams {
     /// back with reason `busy`; also the bounds a passing build here takes the key with to write its built-here record:
     /// its brief retry and its wait to remove the outputs-from record.
     pub key_wait_ms: Option<u64>,
+    /// How long a desktop run the builder refused by its `helper` tag waits before it calls the same builder once more,
+    /// in place of 5 s.
+    pub helper_retry_ms: Option<u64>,
     /// How long each git call of the routing decision may take before git is killed and the run goes ahead here, and
     /// each git call the remote client's bounds give before that call fails, in place of their defaults.
     pub git_limit_ms: Option<u64>,

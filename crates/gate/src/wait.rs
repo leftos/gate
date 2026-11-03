@@ -49,6 +49,16 @@ pub(crate) fn remote_budget(request: &RunRequest, desktop: bool) -> Duration {
     request.test_seams.remote_wait_ms.map_or(unseamed, Duration::from_millis)
 }
 
+/// How long a desktop run the builder refused by its `helper` tag waits before it calls the same builder once more: a
+/// box started before a push meets the helper the push installed, and a new call starts the new box.
+const HELPER_RETRY: Duration = Duration::from_secs(5);
+
+/// The wait of a desktop run before it calls again the builder that refused it by its `helper` tag:
+/// `--test-helper-retry-ms`, else [`HELPER_RETRY`].
+pub(crate) fn helper_retry(request: &RunRequest) -> Duration {
+    request.test_seams.helper_retry_ms.map_or(HELPER_RETRY, Duration::from_millis)
+}
+
 /// A probe of a pool's slots: for each, whether some gate has it open, `None` for a slot that could not be probed.
 type Probe = Vec<Option<bool>>;
 

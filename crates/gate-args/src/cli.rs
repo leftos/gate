@@ -410,6 +410,7 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-remote-client" => Some(RunOption::Value(ValueOption::RemoteClient)),
         "test-remote-wait-ms" => Some(RunOption::Value(ValueOption::RemoteWaitMs)),
         "test-key-wait-ms" => Some(RunOption::Value(ValueOption::KeyWaitMs)),
+        "test-helper-retry-ms" => Some(RunOption::Value(ValueOption::HelperRetryMs)),
         "test-git-limit-ms" => Some(RunOption::Value(ValueOption::GitLimitMs)),
         "test-git-drain-ms" => Some(RunOption::Value(ValueOption::GitDrainMs)),
         "test-restore-limit-ms" => Some(RunOption::Value(ValueOption::RestoreLimitMs)),

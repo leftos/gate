@@ -1693,6 +1693,9 @@ struct Walk {
     built: Vec<RemoteRun>,
     /// The run of the builder the walk is on; `None` for the routed run's first builder.
     current: Option<Box<RemoteRun>>,
+    /// Whether the run called a builder again after its `helper` refusal ([`Run::retry_helper`]): once a run, never
+    /// reset, as a helper of another build that a new call does not match is a fault no wait cures.
+    helper_retry: bool,
 }
 
 impl Walk {
@@ -1706,6 +1709,7 @@ impl Walk {
             tried: HashSet::new(),
             built: Vec::new(),
             current: None,
+            helper_retry: false,
         }
     }
 }
@@ -2659,6 +2663,17 @@ impl Run<'_> {
             // The builder whose attempt was refused: the one whose slot the attempt took, or whose pool stayed full.
             let refused = walk.current.take();
             let current = refused.as_deref().unwrap_or(remote);
+            // A desktop run, pinned or not, calls the builder whose desktop helper is another build once more.
+            if self.helper_retry_due(current, &refusal.outcome, &walk) {
+                let reason = refusal.reason;
+                match self.retry_helper(current, refusal, (&mut walk, hold), console) {
+                    Ok(next) => {
+                        walk.current = Some(next);
+                        continue;
+                    }
+                    Err(remotely) => return (remotely, Some(reason)),
+                }
+            }
             if pinned {
                 // A pinned run ends on its builder's refusal, its slot kept in the hold its release lets go; one the
                 // full pool turned away took none, so its take is still unset.
@@ -2729,6 +2744,52 @@ impl Run<'_> {
         }
         let next = next.ok_or(Remotely::Here)?;
         next.lines().iter().for_each(|line| console.err(line));
+        self.tag = Some(RemoteTag {
+            host: next.builder.alias.clone(),
+            key: next.key.clone(),
+            critical_pid: self.rerouted_for,
+        });
+        Ok(next)
+    }
+
+    /// Whether the refused attempt on `current`, which the client's `outcome` ended, calls the same builder once more
+    /// ([`Run::retry_helper`]): a desktop run the box refused by its `helper` tag before the command started, that has
+    /// not called a builder again so already, with more of its remote budget left than the wait takes.
+    fn helper_retry_due(&self, current: &RemoteRun, outcome: &RemoteOutcome, walk: &Walk) -> bool {
+        outcome.helper_refused
+            && !outcome.lost_mid_run
+            && !walk.helper_retry
+            && self.is_desktop(current)
+            && self.remote_left(true, walk.waited) > wait::helper_retry(self.request)
+    }
+
+    /// Calls the builder of `current` again after the box refused the desktop run by its `helper` tag ([`Refusal`]):
+    /// its desktop helper runs another build of gate than the box, as a box started before a push meets the helper the
+    /// push installed, and a new call starts the box the push installed. Gives the attempt up ([`Run::give_up`]), its
+    /// slot let go, says so once, then waits [`wait::helper_retry`], counted against the run's remote budget, the
+    /// console interrupt looked at; the retry takes a fresh slot. Once a run ([`Walk::helper_retry`]). The same
+    /// builder's run, the run's remote tag naming it; a Ctrl+C during the wait ends the run as an interrupt before the
+    /// command started.
+    fn retry_helper(
+        &mut self,
+        current: &RemoteRun,
+        refusal: Refusal,
+        (walk, hold): (&mut Walk, &mut Hold),
+        console: &mut Console,
+    ) -> Result<Box<RemoteRun>, Remotely> {
+        let Refusal { reason, outcome, held } = refusal;
+        walk.helper_retry = true;
+        hold.took = None;
+        let host = self.give_up(reason, &outcome, held, console);
+        let pause = wait::helper_retry(self.request);
+        console.err(&helper_retry_line(&host, pause));
+        let begun = Instant::now();
+        let waited = slept(pause, self.host.interrupt);
+        walk.waited += begun.elapsed();
+        if !waited {
+            return Err(Remotely::Ended(self.interrupted_before_start(console)));
+        }
+        let next = Box::new(current.clone());
         self.tag = Some(RemoteTag {
             host: next.builder.alias.clone(),
             key: next.key.clone(),
@@ -5607,6 +5668,15 @@ fn warm_up_holds(state: &Path, key: &str, console: &mut Console, said: &mut bool
 fn fallback_line(host: &str, reason: FallbackReason, detail: Option<&str>, next: Option<&str>) -> String {
     let goes = next.map_or_else(|| "running here".to_owned(), |next| format!("trying {next}"));
     format!("{}; {goes}", fallback_head(host, reason, detail))
+}
+
+/// What a desktop run says once, the builder `host` having refused it by its `helper` tag, before it waits `pause` and
+/// calls the same builder again ([`Run::retry_helper`]): the seconds as a plain number, `5` or `0.05`.
+fn helper_retry_line(host: &str, pause: Duration) -> String {
+    format!(
+        "gate: remote {host} helper; the builder's desktop helper and gate differ in version, trying it again in {} s",
+        pause.as_secs_f64()
+    )
 }
 
 /// Why the builder `host` did not run the command, as a fallback line says it before where the run goes

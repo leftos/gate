@@ -136,12 +136,18 @@ fn unfetched_payload(case: &Case) -> Value {
 /// Checks `outcome` is the box's desktop refusal of `payload` saying `line`: exit 75, the `desktop` tag once and
 /// `line` right after it, no start marker and no back commits line.
 fn refused_with(outcome: &Outcome, payload: &Value, line: &str) {
+    refused_tagged(outcome, payload, "desktop", line);
+}
+
+/// Checks `outcome` is the box's refusal of `payload` under the tag `word` saying `line`: exit 75, the tag once and
+/// `line` right after it, no start marker and no back commits line.
+fn refused_tagged(outcome: &Outcome, payload: &Value, word: &str, line: &str) {
     assert_eq!(outcome.code, Some(75), "{outcome:?}");
-    let tag = refused_line(payload, "desktop");
+    let tag = refused_line(payload, word);
     assert_eq!(
         lines_starting(outcome, "gate-remote-refused:"),
         [tag.as_str()],
-        "one desktop tag: {outcome:?}"
+        "one {word} tag: {outcome:?}"
     );
     let lines: Vec<&str> = outcome.stderr.lines().collect();
     let at = lines.iter().position(|said| *said == tag).expect("the tag is said");
@@ -658,16 +664,17 @@ fn a_helper_that_exits_before_hello_refuses_desktop_with_its_exit_why() {
 }
 
 #[test]
-fn a_helper_of_another_build_refuses_desktop_naming_both_versions() {
+fn a_helper_of_another_build_refuses_helper_naming_both_versions() {
     let case = Case::new("desktop_wrong_version");
     let payload = ready_payload(&case, COMMAND);
 
     let outcome = handed_off(&case, &payload, "wrong-version");
 
     let ours = build_version(&case);
-    refused_with(
+    refused_tagged(
         &outcome,
         &payload,
+        "helper",
         &format!("{NO_DESKTOP}the desktop helper runs gate 0.0.0+fault, the box {ours}"),
     );
 }

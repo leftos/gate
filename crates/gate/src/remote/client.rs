@@ -489,6 +489,7 @@ impl RustClient {
             marker_seen: false,
             run_call_started: false,
             lost_mid_run: false,
+            helper_refused: false,
             staged: None,
             checked: None,
             raised: None,
@@ -1340,8 +1341,16 @@ impl Called {
     fn refusal(&self) -> Option<FallbackReason> {
         match self.refused.filter(|_| !self.started) {
             Some(Tagged::Fallback(reason)) => Some(reason),
+            // The journal and the walk read a helper of another build as the builder's `version`.
+            Some(Tagged::Helper) => Some(FallbackReason::Version),
             Some(Tagged::Sent | Tagged::Drain | Tagged::Channel) | None => None,
         }
+    }
+
+    /// Whether the box refused the run by its `helper` tag, read as [`Called::refusal`] reads a tag: its desktop helper
+    /// runs another build of gate than the box, which a new call of the same builder may match.
+    fn helper_refused(&self) -> bool {
+        self.refused == Some(Tagged::Helper) && !self.started
     }
 
     /// Whether the box refused the call's data channel by its `channel` tag, read as [`Called::refusal`] reads a tag:
@@ -1398,6 +1407,8 @@ impl Called {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tagged {
     Fallback(FallbackReason),
+    /// The box's `helper` refusal of a desktop run, whose helper runs another build of gate: a `version` fallback.
+    Helper,
     Sent,
     Drain,
     /// The box's `channel` refusal of an outputs or put call's data channel, which the pull or put over ssh answers.
@@ -1545,6 +1556,9 @@ pub(super) struct Attempt<'c, 'a> {
     /// Whether the run call's connection was lost after the start marker and the attempt fell back after it
     /// ([`Attempt::falls_back_after_loss`]): the command may have run on the builder.
     lost_mid_run: bool,
+    /// Whether the box refused the run call by its `helper` tag ([`Called::helper_refused`]): a `version` refusal the
+    /// same builder may answer once more.
+    helper_refused: bool,
     /// How a commit stage's sync-back ended, once it has; `None` before, and for a call that is no stage.
     pub(super) staged: Option<syncback::Staged>,
     /// What a commit stage whose hooks passed checked, its fixes applied: the `HEAD` it sent and the checked tree, or why
@@ -3156,6 +3170,7 @@ impl Attempt<'_, '_> {
             return Ok(End::Refused(FallbackReason::Install));
         }
         let end = status_end(&called, output);
+        self.helper_refused = matches!(end, End::Refused(FallbackReason::Version)) && called.helper_refused();
         // The box refused the run for its install with its `install` tag instead: say the same line the call's plain
         // refusal says, so `gate check --builder` is pointed at on both paths.
         if matches!(end, End::Refused(FallbackReason::Install))
@@ -4004,6 +4019,7 @@ impl Attempt<'_, '_> {
             draining,
             run_called: self.run_call_started,
             lost_mid_run: self.lost_mid_run,
+            helper_refused: self.helper_refused && reason == Some(FallbackReason::Version),
             command_started: self.marker_seen,
             staged: self.staged,
             checked: self.checked,
@@ -4073,6 +4089,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             marker_seen: false,
             run_call_started: false,
             lost_mid_run: false,
+            helper_refused: false,
             staged: None,
             checked: None,
             raised: None,
@@ -4848,6 +4865,9 @@ impl Heard {
             }
             Protocol::SentRefused => {
                 self.refused.get_or_insert(Tagged::Sent);
+            }
+            Protocol::HelperRefused => {
+                self.refused.get_or_insert(Tagged::Helper);
             }
             Protocol::Drain => {
                 self.refused.get_or_insert(Tagged::Drain);
@@ -6068,6 +6088,9 @@ enum Protocol {
     /// The box's refusal tag for a work folder that does not hold the PC's build the run's `SentDigest` names, which
     /// no fallback answers: the client runs the call again with `--no-build` dropped ([`End::SentRefused`]).
     SentRefused,
+    /// The box's `helper` refusal tag of a desktop run whose helper runs another build of gate: a `version` fallback
+    /// ([`Called::helper_refused`]).
+    HelperRefused,
     /// The box's `drain` refusal tag, which no fallback answers ([`End::Draining`]).
     Drain,
     /// The place or barrier line the box says after its `drain` tag ([`drain::line_of`]).
@@ -6107,7 +6130,7 @@ impl CheckoutSaid {
 /// What starts the box's line saying what it sent over a data channel ([`gate_wire::channel_sent_line`]).
 const CHANNEL_SENT: &str = "gate: data channel sent ";
 
-/// The start marker, the eleven refusal tags, the two kill tags and the adjusted line's prefix of one call, made once for
+/// The start marker, the twelve refusal tags, the two kill tags and the adjusted line's prefix of one call, made once for
 /// its readers, and the run call's checkout lines.
 struct ProtocolLines {
     drain: String,
@@ -6118,6 +6141,7 @@ struct ProtocolLines {
     inputs: String,
     sent: String,
     desktop: String,
+    helper: String,
     install: String,
     lfs: String,
     full: String,
@@ -6153,6 +6177,7 @@ impl ProtocolLines {
             inputs: refused_line(nonce, Refusal::Inputs),
             sent: refused_line(nonce, Refusal::Sent),
             desktop: refused_line(nonce, Refusal::Desktop),
+            helper: refused_line(nonce, Refusal::Helper),
             install: refused_line(nonce, Refusal::Install),
             lfs: refused_line(nonce, Refusal::Lfs),
             full: refused_line(nonce, Refusal::Full),
@@ -6192,6 +6217,7 @@ impl ProtocolLines {
             (&self.inputs, Protocol::Refused(FallbackReason::Inputs)),
             (&self.sent, Protocol::SentRefused),
             (&self.desktop, Protocol::Refused(FallbackReason::Desktop)),
+            (&self.helper, Protocol::HelperRefused),
             (&self.install, Protocol::Refused(FallbackReason::Install)),
             (&self.lfs, Protocol::Refused(FallbackReason::Lfs)),
             (&self.full, Protocol::Refused(FallbackReason::Full)),
@@ -6472,6 +6498,7 @@ mod tests {
             marker_seen: false,
             run_call_started: false,
             lost_mid_run: false,
+            helper_refused: false,
             staged: None,
             checked: None,
             raised: None,
@@ -9078,6 +9105,17 @@ mod tests {
 
         assert_eq!(called.refusal(), Some(FallbackReason::Desktop), "{said:?}");
         assert!(matches!(status_end(&called, 0..0), End::Refused(FallbackReason::Desktop)), "{said:?}");
+        assert!(!called.helper_refused(), "{said:?}");
+    }
+
+    #[test]
+    fn a_helper_refusal_is_a_version_fallback_told_from_the_pc_s_own() {
+        let tag = refused_line(NONCE, Refusal::Helper);
+        let (called, said) = run_call_said("", &format!("{tag}\n"), "helper-refusal");
+
+        assert_eq!(called.refusal(), Some(FallbackReason::Version), "{said:?}");
+        assert!(called.helper_refused(), "{said:?}");
+        assert!(matches!(status_end(&called, 0..0), End::Refused(FallbackReason::Version)), "{said:?}");
     }
 
     #[test]

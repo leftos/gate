@@ -80,6 +80,16 @@ struct ConsoleRefused {
 }
 
 impl ConsoleRefused {
+    /// The refusal tag the run is refused under: `helper` for a desktop helper of another build, which a new call of
+    /// the builder can match, `desktop` for every other refusal.
+    fn tag(&self) -> Refusal {
+        if matches!(self.refusal, DesktopRefusal::HelperOtherVersion { .. }) {
+            Refusal::Helper
+        } else {
+            Refusal::Desktop
+        }
+    }
+
     /// The lines refusing the run after its tag: the refusal's, then the system's error when there is one.
     fn lines(&self) -> Vec<String> {
         let mut lines = vec![self.refusal.line()];
@@ -103,7 +113,7 @@ pub(super) fn console_takes_it(request: &Request<'_>, seams: &BoxSeams, console:
     match account_and_console(seams) {
         Ok(_) => Ok(()),
         Err(refused) => {
-            stamping::protocol(console, &refused_line(request.nonce, Refusal::Desktop));
+            stamping::protocol(console, &refused_line(request.nonce, refused.tag()));
             for line in refused.lines() {
                 stamping::err(console, &line);
             }
@@ -176,7 +186,14 @@ fn locked(
     let guard = match wait_for_desktop(&mutex, turns, &record, beat, console) {
         Ok(guard) => guard,
         Err(Unheld::Ended(status)) => return Err(DesktopEnd::Ended(status)),
-        Err(Unheld::Busy) => return Err(said_refused(request, &[busy_timeout_line(turns.total)], beat, console)),
+        Err(Unheld::Busy) => {
+            return Err(said_refused(
+                request,
+                (Refusal::Desktop, &[busy_timeout_line(turns.total)]),
+                beat,
+                console,
+            ));
+        }
         Err(Unheld::Failed(error)) => {
             let refusal = DesktopRefusal::Machinery(format!("the builder's desktop lock cannot be waited for: {error}"));
             return Err(desktop_refused(request, &refusal.into(), beat, console));
@@ -384,14 +401,15 @@ fn waited<G>(
 
 /// Refuses the run for the builder's desktop as `refused` says.
 fn desktop_refused(request: &Request<'_>, refused: &ConsoleRefused, beat: &Beat<'_>, console: &mut Console) -> DesktopEnd {
-    said_refused(request, &refused.lines(), beat, console)
+    said_refused(request, (refused.tag(), &refused.lines()), beat, console)
 }
 
-/// Refuses the run for the builder's desktop: the `desktop` refusal tag, then `lines`, said together under the box's
-/// output lock, so the PC ends the run with the reason, never running a desktop command itself.
-fn said_refused(request: &Request<'_>, lines: &[String], beat: &Beat<'_>, console: &mut Console) -> DesktopEnd {
+/// Refuses the run for the builder's desktop: the refusal tag `tag` (`desktop`, or `helper` for a helper of another
+/// build), then `lines`, said together under the box's output lock, so the PC ends the run with the reason, never
+/// running a desktop command itself.
+fn said_refused(request: &Request<'_>, (tag, lines): (Refusal, &[String]), beat: &Beat<'_>, console: &mut Console) -> DesktopEnd {
     let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
-    stamping::protocol(console, &refused_line(request.nonce, Refusal::Desktop));
+    stamping::protocol(console, &refused_line(request.nonce, tag));
     for line in lines {
         stamping::err(console, line);
     }

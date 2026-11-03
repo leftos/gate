@@ -346,6 +346,10 @@ pub(crate) struct RemoteOutcome {
     /// Whether the run call's connection to the builder was lost after the box's start marker and the client fell back
     /// after it, `rebooted` or `unreachable`: the command may have run there.
     pub lost_mid_run: bool,
+    /// Whether the builder refused a desktop run by the box's `helper` tag, its desktop helper running another build of
+    /// gate than the box: `reason` is `version`, and a new call of the same builder may match the helper. `false` for
+    /// the PC's own `version` refusal.
+    pub helper_refused: bool,
     /// Whether a call of the attempt said the box's start marker, however the call ended: the box started the command.
     /// A commit's stage counts as started only then.
     pub command_started: bool,
@@ -694,7 +698,8 @@ mod snapshot_only {
 /// <place|none> <raised> <lapses>` so ends the one call of that number, counted from 1; `wait-at <call> <path>` waits
 /// until the path exists at the start of the call of that number, before its drain refusal; `interrupt-at <call>` raises
 /// the call's interrupt at the start of the call of that number, after its `wait-at` steps; `refuse-at <call> <reason>`
-/// ends the call of that number, one no drain step ends, as that refusal, and nothing else of it runs; a drain poll no drain step
+/// ends the call of that number, one no drain step ends, as that refusal, and nothing else of it runs; `refuse helper`
+/// and `refuse-at <call> helper` refuse as the box's `helper` tag, a `version` refusal marked as the desktop helper's; a drain poll no drain step
 /// ends performs only the `wait`, `interrupt`, `refuse` and `fail-start` steps, and admits the run when none refuses it. `on
 /// <alias>` starts a block of steps that run only for a call to that builder; the steps before the first `on` line run
 /// for every builder without a block of its own, and an alias has one block at most. `lost-after-start` marks the
@@ -716,6 +721,8 @@ mod scripted {
     use super::{BoxKill, FolderId, REFUSED, RemoteCall, RemoteClient, RemoteOutcome, Sibling, WarmEnd, Warmth};
     use crate::run::CONTROL_C_EXIT;
 
+    /// The word a `refuse` or `refuse-at` step names the box's `helper` refusal by, which the client reads as `version`.
+    const HELPER: &str = "helper";
     /// How often `wait` looks for its path and the interrupt.
     const WAIT_STEP: Duration = Duration::from_millis(20);
     /// Every reason a `refuse` step may give.
@@ -770,6 +777,10 @@ mod scripted {
         InterruptAt(usize),
         /// Ends the client's call of this number as this refusal.
         RefuseAt(usize, FallbackReason),
+        /// Ends the run as the box's `helper` refusal: a `version` refusal marked as the desktop helper's.
+        RefuseHelper,
+        /// Ends the client's call of this number as the box's `helper` refusal.
+        RefuseHelperAt(usize),
     }
 
     pub(crate) struct ScriptedClient {
@@ -827,6 +838,7 @@ mod scripted {
                             reason: Some(*reason),
                             ..RemoteOutcome::default()
                         }),
+                        Step::RefuseHelperAt(at) if *at == calls => Some(helper_refusal()),
                         _ => None,
                     })
                 })
@@ -845,7 +857,7 @@ mod scripted {
                         Ok(came) => came,
                         Err(why) => return RemoteOutcome::not_started(why),
                     },
-                    Step::Interrupt | Step::Refuse(_) | Step::FailStart(_) => settle(step, call, &mut outcome),
+                    Step::Interrupt | Step::Refuse(_) | Step::RefuseHelper | Step::FailStart(_) => settle(step, call, &mut outcome),
                     _ => true,
                 };
                 if !goes_on {
@@ -955,6 +967,7 @@ mod scripted {
                 .find(|kill| kill.word() == operand)
                 .map(Step::BoxKilled)
                 .ok_or_else(|| format!("box-killed takes timed-out or backstop, got '{operand}'")),
+            "refuse" if operand == HELPER => Ok(Step::RefuseHelper),
             "refuse" => REASONS
                 .into_iter()
                 .find(|reason| reason.as_str() == operand)
@@ -986,6 +999,9 @@ mod scripted {
         let wrong = || format!("refuse-at takes a call's number and a reason, got '{operand}'");
         let (call, word) = operand.split_once(' ').ok_or_else(wrong)?;
         let call = call.parse().map_err(|_| wrong())?;
+        if word == HELPER {
+            return Ok(Step::RefuseHelperAt(call));
+        }
         let reason = REASONS.into_iter().find(|reason| reason.as_str() == word).ok_or_else(wrong)?;
         Ok(Step::RefuseAt(call, reason))
     }
@@ -1052,6 +1068,7 @@ mod scripted {
                 outcome.status = REFUSED;
                 outcome.reason = Some(*reason);
             }
+            Step::RefuseHelper => *outcome = helper_refusal(),
             Step::FailStart(why) => {
                 *outcome = RemoteOutcome::not_started(why.clone());
                 return false;
@@ -1078,9 +1095,21 @@ mod scripted {
             | Step::DrainingAt(..)
             | Step::WaitAt(..)
             | Step::InterruptAt(_)
-            | Step::RefuseAt(..) => {}
+            | Step::RefuseAt(..)
+            | Step::RefuseHelperAt(_) => {}
         }
         true
+    }
+
+    /// The outcome of a run the box refused by its `helper` tag, as the client hands it back: a `version` refusal
+    /// marked as the helper's.
+    fn helper_refusal() -> RemoteOutcome {
+        RemoteOutcome {
+            status: REFUSED,
+            reason: Some(FallbackReason::Version),
+            helper_refused: true,
+            ..RemoteOutcome::default()
+        }
     }
 
     /// Appends `text` to the log, says it on `stream` and keeps it in the outcome's lines.

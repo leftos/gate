@@ -12621,10 +12621,15 @@ fn desktop_case(name: &str, second: bool) -> Case {
 /// scripted client takes `steps`: the gate's pid, its outcome and the marker file, which exists only once the command
 /// ran here.
 fn run_marking(case: &Case, steps: &[&str]) -> (u32, Outcome, PathBuf) {
+    run_marking_with(case, steps, &[])
+}
+
+/// [`run_marking`] with the gate's own `extra` words besides the routed ones.
+fn run_marking_with(case: &Case, steps: &[&str], extra: &[&str]) -> (u32, Outcome, PathBuf) {
     let marker = case.folder().join("marker.txt");
     let stub = shown(&crate::routing::stub(case, steps));
     let marked = shown(&marker);
-    let words = crate::routing::routed_words("out.log", &stub, &[], &[r".\tool.exe", "mark", &marked, "out", "ran here"]);
+    let words = crate::routing::routed_words("out.log", &stub, extra, &[r".\tool.exe", "mark", &marked, "out", "ran here"]);
     let running = case.start(&words);
     let pid = running.id();
     (pid, running.finish(), marker)
@@ -12700,6 +12705,68 @@ fn a_desktop_run_hops_to_the_next_builder_before_it_fails() {
         outcome.stderr.lines().any(|line| line.ends_with(&format!(" busy{DESKTOP_NOT_HERE}"))),
         "the second builder's refusal ends the run: {outcome:?}"
     );
+}
+
+/// The wait seam the `helper` cases shorten the retry's 5 s to.
+const HELPER_RETRY: [&str; 2] = ["--test-helper-retry-ms", "50"];
+
+/// The line a desktop run says once before it calls the builder its `helper` refusal came from again.
+fn helper_retry_line() -> String {
+    format!("gate: remote {HOST} helper; the builder's desktop helper and gate differ in version, trying it again in 0.05 s")
+}
+
+#[test]
+fn a_desktop_run_refused_helper_retries_the_same_builder_once_and_runs() {
+    let case = desktop_case("client-desktop-helper-retry", false);
+
+    let (_, outcome, marker) = run_marking_with(&case, &["refuse-at 1 helper", "out ran there", "status 0"], &HELPER_RETRY);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let line = helper_retry_line();
+    assert_eq!(
+        outcome.stderr.lines().filter(|said| *said == line).count(),
+        1,
+        "the retry is said once: {outcome:?}"
+    );
+    assert!(log_texts(&case.folder().join("out.log")).contains("ran there"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("; running here"), "{outcome:?}");
+    assert!(!marker.exists(), "nothing ran here: {outcome:?}");
+}
+
+#[test]
+fn a_desktop_run_refused_helper_twice_fails_and_never_runs_here() {
+    let case = desktop_case("client-desktop-helper-twice", false);
+
+    let (pid, outcome, marker) = run_marking_with(&case, &["refuse helper"], &HELPER_RETRY);
+
+    let line = helper_retry_line();
+    assert_eq!(
+        outcome.stderr.lines().filter(|said| *said == line).count(),
+        1,
+        "one retry a run: {outcome:?}"
+    );
+    // The first call's refusal is the one fallback journaled; the second call's ends the run: two run calls.
+    assert_desktop_ended(&case, (pid, &outcome, &marker), &format!("gate: remote {HOST} version"), &["version"]);
+}
+
+#[test]
+fn a_desktop_run_refused_desktop_is_not_retried() {
+    let case = desktop_case("client-desktop-desktop-not-retried", false);
+
+    let (pid, outcome, marker) = run_marking_with(&case, &["refuse desktop"], &HELPER_RETRY);
+
+    assert!(!outcome.stderr.contains(" helper; "), "no retry: {outcome:?}");
+    assert_desktop_ended(&case, (pid, &outcome, &marker), &format!("gate: remote {HOST} desktop"), &[]);
+}
+
+#[test]
+fn a_pc_side_version_refusal_of_a_desktop_run_is_not_retried_on_the_same_builder() {
+    let case = desktop_case("client-desktop-version-not-retried", false);
+
+    let (pid, outcome, marker) = run_marking_with(&case, &["refuse version"], &HELPER_RETRY);
+
+    assert!(!outcome.stderr.contains(" helper; "), "no retry: {outcome:?}");
+    assert_desktop_ended(&case, (pid, &outcome, &marker), &format!("gate: remote {HOST} version"), &[]);
 }
 
 /// The first builder's call spoils the routing file, so the next builder's run cannot be built as the walk reaches it.
