@@ -23,6 +23,10 @@ use crate::route;
 /// The last number a backup's name takes when the names before it are taken.
 const LAST_BACKUP_NUMBER: u32 = 99;
 
+/// What `gate remote match` answers when it cannot tell whether a pattern matches, as `grep` answers a file it cannot
+/// read: 2, with a match staying 0 and no match staying 1.
+const CANNOT_ANSWER_STATUS: u32 = 2;
+
 /// Runs `gate remote` and returns its exit status: 0 changed or nothing to do, 1 refused or failed, the file untouched.
 pub(crate) fn remote(request: &RemoteRequest, environment: &Environment, console: &mut Console) -> u32 {
     let Some(path) = route::remote_json_path(environment.local_app_data.as_deref()) else {
@@ -44,21 +48,22 @@ pub(crate) fn remote(request: &RemoteRequest, environment: &Environment, console
 }
 
 /// Runs `gate remote match` and returns its exit status: 0 with the first pattern of the repo that matches the text on
-/// stdout, 1 with nothing on it when none matches or, saying why on stderr, when `remote.json` cannot be read.
+/// stdout, 1 with nothing on it when none matches, or [`CANNOT_ANSWER_STATUS`] saying why on stderr when `remote.json`
+/// cannot be read.
 pub(crate) fn remote_match(request: &RemoteMatchRequest, environment: &Environment, console: &mut Console) -> u32 {
     let Some(path) = route::remote_json_path(environment.local_app_data.as_deref()) else {
         console.err("remote: no remote.json: LOCALAPPDATA is not an absolute folder");
-        return u32::from(FAILED_STATUS);
+        return CANNOT_ANSWER_STATUS;
     };
     let config = match route::read_remote_json(&path) {
         Ok(Some(config)) => config,
         Ok(None) => {
             console.err(&format!("remote: no remote.json at {}", path.display()));
-            return u32::from(FAILED_STATUS);
+            return CANNOT_ANSWER_STATUS;
         }
         Err(problem) => {
             console.err(&format!("remote: ignored {}: {}", problem.path.display(), problem.reason));
-            return u32::from(FAILED_STATUS);
+            return CANNOT_ANSWER_STATUS;
         }
     };
     match pattern_for(&config, &request.repo, &request.text) {

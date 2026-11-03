@@ -151,6 +151,8 @@ pub struct FakeFacts {
     pub gitignored: Vec<GitignoredInput>,
     /// Each gitignored-inputs question, its paths then `|` and the input globs, kept apart from [`FakeFacts::asked`].
     pub gitignored_asked: RefCell<Vec<String>>,
+    /// Each gitignored-inputs question's `named` paths, joined by spaces, kept apart from [`FakeFacts::gitignored_asked`].
+    pub named_asked: RefCell<Vec<String>>,
     /// The entry of the built-here record that says the last build of the command's project ran here.
     pub built_here: Option<String>,
     /// How many times that was asked, kept apart from [`FakeFacts::asked`].
@@ -217,6 +219,7 @@ impl FakeFacts {
             windows_change_named: RefCell::new(Vec::new()),
             gitignored: Vec::new(),
             gitignored_asked: RefCell::new(Vec::new()),
+            named_asked: RefCell::new(Vec::new()),
             built_here: None,
             built_here_asked: Cell::new(0),
             project_files: Vec::new(),
@@ -372,10 +375,11 @@ impl Facts for FakeFacts {
     }
 
     /// Each input of [`FakeFacts::gitignored`] whose path was asked, in the order asked.
-    fn gitignored_inputs(&self, _place: &Place, paths: &[String], inputs: &[String]) -> Vec<GitignoredInput> {
+    fn gitignored_inputs(&self, _place: &Place, paths: &[String], named: &[String], inputs: &[String]) -> Vec<GitignoredInput> {
         self.gitignored_asked
             .borrow_mut()
             .push(format!("{} | {}", paths.join(" "), inputs.join(" ")));
+        self.named_asked.borrow_mut().push(named.join(" "));
         paths
             .iter()
             .filter_map(|path| self.gitignored.iter().find(|input| input.path == *path).cloned())

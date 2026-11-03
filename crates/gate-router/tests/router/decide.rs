@@ -6074,6 +6074,55 @@ fn a_word_naming_a_gitignored_project_input_is_carried_in_the_run_s_inputs() {
     }
 }
 
+/// The `named` paths the facts are asked for the dotnet `command`'s gitignored inputs, once.
+fn named_for(command: &[&str], ignored: &[&str]) -> Vec<String> {
+    let facts = ignoring("", ignored);
+    routed(decide(&heavy(&words(command)), &facts));
+    let asked = facts.named_asked.borrow().clone();
+    assert_eq!(asked.len(), 1, "asked once: {asked:?}");
+    asked
+}
+
+#[test]
+fn a_property_value_is_named() {
+    assert_eq!(
+        named_for(&["dotnet", "build", "-p:ProbeSource=.tmp/a.cs"], &[".tmp/a.cs"]),
+        [".tmp/a.cs".to_owned()]
+    );
+}
+
+#[test]
+fn a_logger_word_names_nothing() {
+    assert_eq!(
+        named_for(
+            &["dotnet", "test", "src/App.csproj", "--logger", "trx;LogFileName=.tmp/r.trx"],
+            &[".tmp/r.trx"]
+        ),
+        [String::new()]
+    );
+}
+
+#[test]
+fn a_binary_log_switch_names_nothing() {
+    assert_eq!(
+        named_for(&["dotnet", "build", "src/App.csproj", "/bl:.tmp/b.binlog"], &[".tmp/b.binlog"]),
+        [String::new()]
+    );
+}
+
+#[test]
+fn an_output_property_names_nothing() {
+    assert_eq!(named_for(&["dotnet", "build", "-p:OutDir=.tmp/o.txt"], &[".tmp/o.txt"]), [String::new()]);
+}
+
+#[test]
+fn a_two_word_property_value_is_named() {
+    assert_eq!(
+        named_for(&["dotnet", "build", "-p", "ProbeSource=.tmp/a.cs"], &[".tmp/a.cs"]),
+        [".tmp/a.cs".to_owned()]
+    );
+}
+
 /// The routed words of the dotnet `command` from the gate's folder `prefix`, the facts reporting `.tmp/a.targets` and
 /// `.tmp/copy/X.csproj` and `.tmp/x.runsettings` carried.
 fn carrying_words(prefix: &str, command: &[&str]) -> Vec<String> {

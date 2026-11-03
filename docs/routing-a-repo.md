@@ -28,7 +28,7 @@ A command run from one worktree that names a path in another worktree of a liste
 
 A command whose word names an existing gitignored project input (a project, solution, `.targets`, `.props`, `.rsp` or `.runsettings` file, or a dotnet folder whose project files are all ignored) that no `inputs` glob covers routes and carries those files to the builder as inputs, with no `inputs` entry needed.
 
-A gitignored `.targets` or `.props` file a word names also carries each file its text names by a quoted relative path, and each file those name in turn through imports; a project or solution file, a wildcard and a folder named that way are not carried. A gitignored file of any other extension that a dotnet command names after its verb carries itself.
+A gitignored `.targets` or `.props` file a word names also carries each file its text names by a quoted relative path, and each file those name in turn through imports; a project or solution file and a folder named that way are not carried, and a wildcard keeps the run here, since the gate does not follow one. A gitignored file of any other extension that a dotnet property value names (`-p:ProbeSource=.tmp/a.cs`) carries itself; one that a run's own logger or output option names does not.
 
 A property value (`-p:`, `/p:`, `-property:`, `/property:`, `--property:`, or the switch and its value as two words) that names a carried file reaches the builder as `{gate-folder}/<path>`, and the box replaces the mark with the folder the command runs in, since MSBuild reads such a value from the project's folder.
 

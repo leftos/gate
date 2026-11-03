@@ -189,12 +189,43 @@ class ShapeTests(unittest.TestCase):
         event = release(
             1, START, command=f"cargo test {WT}/a.txt", sent_words="cargo test a.txt"
         )
-        self.assertEqual(watch_local.words_of(event), "cargo test a.txt")
+        self.assertEqual(watch_local.command_text(event), "cargo test a.txt")
 
     def test_a_run_with_no_sent_words_is_read_from_its_command(self) -> None:
         self.assertEqual(
-            watch_local.words_of(release(1, START, command="cargo test -p a")),
+            watch_local.command_text(release(1, START, command="cargo test -p a")),
             "cargo test -p a",
+        )
+
+    def test_a_local_run_shapes_like_its_relative_command(self) -> None:
+        event = release(
+            1,
+            START,
+            command=r"uv run python X:\dev\repo\.tmp\a1.py",
+            cwd=r"X:\dev\repo",
+        )
+        self.assertEqual(
+            watch_local.shape_of(watch_local.command_text(event)),
+            "uv run python .tmp/*",
+        )
+
+    def test_another_worktree_shares_the_shape(self) -> None:
+        main = release(
+            1,
+            START,
+            command=r"uv run python X:\dev\repo\.tmp\a1.py",
+            cwd=r"X:\dev\repo",
+        )
+        worktree = release(
+            2,
+            START,
+            command=r"uv run python X:\dev\repo.wt\t\.tmp\a1.py",
+            cwd=r"X:\dev\repo.wt\t",
+        )
+        self.assertEqual(
+            watch_local.shape_of(watch_local.command_text(main)),
+            watch_local.shape_of(watch_local.command_text(worktree)),
+            "one command in two worktrees",
         )
 
 
@@ -291,6 +322,16 @@ class ReportTests(Case):
         status, text = self.scan()
         self.assertEqual(status, 0)
         self.assertIn("matched=yes", text)
+
+    def test_a_no_pattern_run_shows_no_reason(self) -> None:
+        self.write_events(
+            release(
+                1, START, sent_words="cargo build a.txt", notRouted="no pattern"
+            )
+        )
+        status, text = self.scan(ask=lambda repo, words: False)
+        self.assertEqual(status, 0)
+        self.assertIn("reason=none", text)
 
     def test_a_repo_with_no_patterns_has_no_nearest(self) -> None:
         self.write_events(release(1, START))

@@ -63,6 +63,31 @@ fn no_match_prints_nothing_and_ends_one() {
 }
 
 #[test]
+fn a_match_with_no_remote_json_ends_two() {
+    let case = Case::new("remote_match_missing");
+    let path = case.local_app_data().join("gate").join("remote.json");
+
+    let outcome = case.run(&["remote", "match", "gate", "cargo test --workspace"]);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(lines(&outcome.stderr), [format!("remote: no remote.json at {}", path.display())]);
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+}
+
+#[test]
+fn a_match_with_a_broken_remote_json_ends_two() {
+    let case = Case::new("remote_match_broken");
+    let path = write_remote_json(&case, "{\"host\": \"builder@example\", \"repos\": ");
+
+    let outcome = case.run(&["remote", "match", "gate", "cargo test --workspace"]);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    let prefix = format!("remote: ignored {}: ", path.display());
+    assert!(outcome.stderr.lines().any(|line| line.starts_with(&prefix)), "{prefix}: {outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+}
+
+#[test]
 fn remote_cmd_a_malformed_file_is_left_byte_identical_with_no_backup() {
     let case = Case::new("remote_cmd_malformed");
     let malformed = "{\"host\": \"builder@example\", \"repos\": ";

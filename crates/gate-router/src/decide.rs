@@ -388,14 +388,15 @@ pub trait Facts {
 
     /// Which of `paths`, each `/`-separated and relative to the worktree root of `place`, name a project input the
     /// snapshot leaves out. A path with an input file's extension ([`is_input_file`]) counts only when it is a file on
-    /// this PC that none of the repo's input globs `inputs` matches and git reports ignored. Any other path counts only
-    /// when it is a folder on this PC directly holding a project or solution file ([`is_project_or_solution`]), each
-    /// of which no input glob matches and git reports ignored. A path whose answer cannot be told is left out, so the
+    /// this PC that none of the repo's input globs `inputs` matches and git reports ignored. Any other path counts as a
+    /// file only when `named`, the property values [`carried_inputs`] reads, holds it; otherwise it counts only when it is
+    /// a folder on this PC directly holding a project or solution file ([`is_project_or_solution`]), each of which no
+    /// input glob matches and git reports ignored. A path whose answer cannot be told is left out, so the
     /// command routes. Each path given back carries the gitignored files no input glob matches below its folder (a
     /// folder candidate's own, a project or solution file's parent below the root), swept at any depth past each `bin`
     /// and `obj` folder; any other file carries only itself. A path that cannot be carried whole says why. Asked
     /// once, with every candidate ([`carried_inputs`]), of every matched command that would otherwise route.
-    fn gitignored_inputs(&self, place: &Place, paths: &[String], inputs: &[String]) -> Vec<GitignoredInput>;
+    fn gitignored_inputs(&self, place: &Place, paths: &[String], named: &[String], inputs: &[String]) -> Vec<GitignoredInput>;
 
     /// What the drive `letter` (upper case) stands for, as `QueryDosDevice` gives it (`\??\X:\dev` for a subst drive);
     /// `None` when there is no such device.
@@ -2062,9 +2063,25 @@ fn is_property_switch(word: &str) -> bool {
 /// `word` with its value marked when it is a property switch joined to its value by `:` ([`marked_values`]). Any other
 /// word, a tool's option value that its tool reads from the working folder among them, is given back as it is.
 fn carried_property(word: &str, prefix: &str, carried: &[String]) -> String {
-    match word.split_once(':') {
-        Some((switch, value)) if is_property_switch(switch) => format!("{switch}:{}", marked_values(value, prefix, carried)),
-        _ => word.to_owned(),
+    match property_switch_value(word) {
+        Some((switch, value)) => format!("{switch}:{}", marked_values(value, prefix, carried)),
+        None => word.to_owned(),
+    }
+}
+
+/// The switch `word` joins to its value by `:` and that value: `Some(("-p", "ProbeSource=a.cs"))` for
+/// `-p:ProbeSource=a.cs`; none for any other word.
+fn property_switch_value(word: &str) -> Option<(&str, &str)> {
+    word.split_once(':').filter(|(switch, _)| is_property_switch(switch))
+}
+
+/// The property `(name, value)` one piece of a property list sets: the text up to and including its first `=`, and the
+/// text after it with the piece's own `;` or `,` left off; a piece with no `=` sets no name and is all value.
+fn property_piece(piece: &str) -> (&str, &str) {
+    let text = piece.strip_suffix([';', ',']).unwrap_or(piece);
+    match text.find('=') {
+        Some(at) => (&text[..=at], &text[at + 1..]),
+        None => ("", text),
     }
 }
 
@@ -2074,16 +2091,46 @@ fn carried_property(word: &str, prefix: &str, carried: &[String]) -> String {
 fn marked_values(value: &str, prefix: &str, carried: &[String]) -> String {
     let mut marked = String::with_capacity(value.len());
     for piece in value.split_inclusive([';', ',']) {
-        let text = piece.strip_suffix([';', ',']).unwrap_or(piece);
-        let (name, named) = text.split_at(text.find('=').map_or(0, |at| at + 1));
+        let (name, named) = property_piece(piece);
         marked.push_str(name);
         if input_path(prefix, named).is_some_and(|path| carried.iter().any(|file| file.eq_ignore_ascii_case(&path))) {
             marked.push_str(GATE_FOLDER_MARK);
             marked.push('/');
         }
-        marked.push_str(&piece[name.len()..]);
+        marked.push_str(named);
+        if let Some(separator) = piece.chars().last().filter(|last| matches!(last, ';' | ',')) {
+            marked.push(separator);
+        }
     }
     marked
+}
+
+/// The paths the `matched` command's property words name, as [`mark_carried_properties`] reads them: each piece of the
+/// value of a property switch joined to it by `:` ([`property_switch_value`]) or of the word after a switch standing
+/// alone, through [`input_path`], less each piece setting one of [`OUTPUT_PROPERTIES`].
+fn named_inputs(matched: &Matched) -> Vec<String> {
+    let prefix = &matched.target.place.prefix;
+    let mut named = Vec::new();
+    let mut after_switch = false;
+    for word in &matched.words {
+        let value = if after_switch {
+            Some(word.as_str())
+        } else {
+            property_switch_value(word).map(|(_, value)| value)
+        };
+        for piece in value.into_iter().flat_map(|value| value.split_inclusive([';', ','])) {
+            let (name, path) = property_piece(piece);
+            let sets = name.strip_suffix('=').unwrap_or(name);
+            if OUTPUT_PROPERTIES.iter().any(|known| eq_ignoring_case(sets, known)) {
+                continue;
+            }
+            if let Some(path) = input_path(prefix, path) {
+                named.push(path);
+            }
+        }
+        after_switch = is_property_switch(word);
+    }
+    named
 }
 
 /// The files the run of the `matched` command carries to its builder as exact input paths beside the repo's input
@@ -2110,7 +2157,8 @@ fn carried_inputs(matched: &Matched, facts: &dyn Facts) -> Result<Vec<String>, L
         .map(|(_, path)| path.clone())
         .collect();
     let inputs = &matched.target.inputs;
-    let ignored = facts.gitignored_inputs(&matched.target.place, &asked, inputs);
+    let named = named_inputs(matched);
+    let ignored = facts.gitignored_inputs(&matched.target.place, &asked, &named, inputs);
     let given: Vec<(&str, &GitignoredInput)> = candidates
         .iter()
         .filter_map(|(shown, path)| ignored.iter().find(|input| input.path == *path).map(|input| (*shown, input)))

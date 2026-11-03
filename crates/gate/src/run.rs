@@ -3319,11 +3319,11 @@ impl Run<'_> {
         let mut marker_said = drain::ProbeSaid::default();
         let mut past_bound_said = false;
         let desktop = self.is_desktop(remote);
-        let patient = waits_its_ceiling(self.request, desktop, self.staging.is_some());
+        let patient = waits_its_ceiling(self.request, desktop, self.staging.is_some() || self.nesting.hook_of_commit());
         if warm_up_sends_busy(patient, || warm_up_holds(&self.root.path, &remote.key, console, &mut probe_said)) {
             return Err(busy(self, console));
         }
-        let bound = key_limit(self.request, patient);
+        let bound = key_limit(self.request, desktop, patient);
         let heartbeat = self.request.test_seams.heartbeat_ms.map_or(wait::HEARTBEAT, Duration::from_millis);
         let mut next = heartbeat;
         let left = holder_time_left(&mut self.survey, &self.root.path, call.key, console);
@@ -5609,11 +5609,15 @@ fn waits_its_ceiling(request: &RunRequest, desktop: bool, staged: bool) -> bool 
 }
 
 /// How long a routed run of `request` waits for its worktree's work folder while another of its runs holds it
-/// ([`Run::take_key`]): `--test-key-wait-ms`, else the run's own ceiling for a run that `patient` waits its ceiling
-/// ([`waits_its_ceiling`]), which waits for the folder as long as it may run there, else [`KEY_WAIT`].
-fn key_limit(request: &RunRequest, patient: bool) -> Duration {
-    let unseamed = if patient {
-        Duration::from_secs(request.timeout.floor())
+/// ([`Run::take_key`]): `--test-key-wait-ms`, else the run's own ceiling for a `desktop` run, which never runs here and
+/// waits for the folder as long as it may run there, else the longer of that ceiling and [`KEY_WAIT`] for a run that
+/// `patient` waits its ceiling ([`waits_its_ceiling`]), else [`KEY_WAIT`].
+fn key_limit(request: &RunRequest, desktop: bool, patient: bool) -> Duration {
+    let ceiling = Duration::from_secs(request.timeout.floor());
+    let unseamed = if desktop {
+        ceiling
+    } else if patient {
+        ceiling.max(KEY_WAIT)
     } else {
         KEY_WAIT
     };
@@ -5947,25 +5951,45 @@ mod tests {
     }
 
     #[test]
-    fn a_patient_runs_key_limit_is_its_ceiling_and_any_other_runs_is_the_key_wait() {
+    fn a_desktop_runs_key_limit_is_its_ceiling_and_a_patient_runs_is_at_least_the_key_wait() {
         let mut request = crate::wait::scratch::request(Slot::Heavy);
         request.timeout = gate_args::Ceiling::Given(900);
         assert_eq!(
-            super::key_limit(&request, true),
+            super::key_limit(&request, false, true),
             Duration::from_mins(15),
             "a patient run waits up to its ceiling"
         );
-        assert_eq!(super::key_limit(&request, false), super::KEY_WAIT, "any other run waits the key wait");
+        assert_eq!(
+            super::key_limit(&request, true, true),
+            Duration::from_mins(15),
+            "a desktop run waits its ceiling"
+        );
+        assert_eq!(
+            super::key_limit(&request, false, false),
+            super::KEY_WAIT,
+            "any other run waits the key wait"
+        );
         request.test_seams.key_wait_ms = Some(250);
         assert_eq!(
-            super::key_limit(&request, true),
+            super::key_limit(&request, false, true),
             Duration::from_millis(250),
             "the seam wins for a patient run"
         );
         assert_eq!(
-            super::key_limit(&request, false),
+            super::key_limit(&request, false, false),
             Duration::from_millis(250),
             "the seam wins for any other run"
+        );
+    }
+
+    #[test]
+    fn a_heavy_run_with_a_short_ceiling_keeps_the_key_wait() {
+        let mut request = crate::wait::scratch::request(Slot::Heavy);
+        request.timeout = gate_args::Ceiling::Given(60);
+        assert_eq!(
+            super::key_limit(&request, false, true),
+            super::KEY_WAIT,
+            "a ceiling under the key wait keeps the key wait"
         );
     }
 

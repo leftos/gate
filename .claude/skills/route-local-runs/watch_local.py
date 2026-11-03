@@ -148,13 +148,21 @@ def utcnow() -> datetime:
 # ---------------------------------------------------------------- shapes
 
 
-def words_of(event: dict[str, Any]) -> str:
-    """The words a run's shape is read from: those the gate matched, else its command.
+def command_text(event: dict[str, Any]) -> str:
+    """The words a run's shape is read from: those the gate matched, else its command with its folder taken out.
 
     A ``--local`` run and a line written before the gate journalled its words have only
-    the command.
+    the command, written as the words given in the run's own folder, so that folder and the
+    separator after it are taken out, in either letter case and with either separator.
     """
-    return str(event.get("sentWords") or event.get("command") or "")
+    sent = event.get("sentWords")
+    if sent:
+        return str(sent)
+    command = str(event.get("command") or "")
+    cwd = str(event.get("cwd") or "")
+    if not cwd:
+        return command
+    return re.sub(re.escape(cwd) + r"[\\/]", "", command, count=1, flags=re.IGNORECASE)
 
 
 def shape_of(text: str) -> str:
@@ -381,7 +389,7 @@ def counted_runs(
         runs.append(
             Run(
                 repo=NAMER(str(event.get("cwd") or "")),
-                shape=shape_of(words_of(event)),
+                shape=shape_of(command_text(event)),
                 at=moment,
                 started=start,
                 seconds=seconds,
@@ -655,9 +663,12 @@ def match_state(event: dict[str, Any], repo: str, ask: Ask) -> str:
 
 
 def reason_of(event: dict[str, Any]) -> str:
-    """A run's ``notRouted`` token, with a ``--local`` run's own reason after it."""
+    """A run's ``notRouted`` token, with a ``--local`` run's own reason after it.
+
+    A run that matched no pattern shows no reason: the shape's ``matched=`` already says so.
+    """
     token = event.get("notRouted")
-    if not isinstance(token, str) or not token:
+    if not isinstance(token, str) or not token or token == NO_PATTERN:
         return "none"
     text = event.get("reason")
     if token == "--local" and isinstance(text, str) and text:
@@ -680,7 +691,7 @@ def routed_counter(events: list[dict[str, Any]]) -> Counter[tuple[str, str]]:
         if event.get("event") != "release" or event.get("remote") is not True:
             continue
         repo = NAMER(str(event.get("cwd") or "")).lower()
-        counter[(repo, census.family_of(shape_of(words_of(event))))] += 1
+        counter[(repo, census.family_of(shape_of(command_text(event))))] += 1
     return counter
 
 

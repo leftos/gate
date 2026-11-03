@@ -340,6 +340,13 @@ impl Nesting {
         matches!(self, Nesting::Covered(parent) | Nesting::Refused(parent) | Nesting::Under(parent) if parent.commit)
     }
 
+    /// Whether this gate runs inside the hooks of a live commit run, whose slot covers, refuses or does not cover it, or
+    /// that holds no slot beside it ([`Nesting::Beside`], which [`Nesting::in_commit`] leaves out): a routed gate
+    /// beside its commit run keeps the short key wait as its covered self does.
+    pub(crate) fn hook_of_commit(&self) -> bool {
+        self.in_commit() || matches!(self, Nesting::Beside(parent) if parent.commit)
+    }
+
     /// The parent this gate takes a slot of its own under: one whose slot does not cover it, or one that holds no slot.
     /// The gate's `take` names it; a take of a slot or of the machine tells the parent not to judge its own slot by the
     /// CPU both used, while a no-slot gate's take, of nothing, leaves the parent's judgement as it is.
@@ -742,6 +749,28 @@ mod tests {
             stand_in: false,
             commit: false,
         }
+    }
+
+    /// The parent [`parent`] gives for `held`, as the commit run whose hooks this gate runs in.
+    fn commit(held: Slot) -> Parent {
+        Parent {
+            commit: true,
+            ..parent(held)
+        }
+    }
+
+    #[test]
+    fn a_gate_beside_a_commit_is_one_of_its_hooks() {
+        assert!(Nesting::Beside(commit(Slot::None)).hook_of_commit(), "beside a commit run");
+        assert!(Nesting::Covered(commit(Slot::Heavy)).hook_of_commit(), "covered by a commit run");
+        assert!(Nesting::Refused(commit(Slot::Light)).hook_of_commit(), "refused by a commit run");
+        assert!(Nesting::Under(commit(Slot::Light)).hook_of_commit(), "under a commit run");
+    }
+
+    #[test]
+    fn a_gate_beside_a_plain_run_is_no_hook() {
+        assert!(!Nesting::Beside(parent(Slot::None)).hook_of_commit());
+        assert!(!Nesting::Own.hook_of_commit());
     }
 
     #[test]
