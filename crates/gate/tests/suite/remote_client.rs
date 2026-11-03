@@ -7248,7 +7248,7 @@ fn a_no_build_command_sends_no_manifest() {
         "the box's build gets the path map, printed after argv: {outcome:?}"
     );
     assert!(
-        outcome.stderr.contains("gate: outputs: none brought back for a --no-build command"),
+        outcome.stderr.contains("gate: outputs: bins not brought back for a --no-build command"),
         "{outcome:?}"
     );
     assert!(!outcome.stderr.contains("gate-remote-outputs:"), "no globs were sent: {outcome:?}");
@@ -9539,6 +9539,85 @@ fn a_routed_no_build_test_whose_outputs_are_withheld_writes_the_pending_marker_a
     assert_eq!(nothing_back(&case).as_deref(), Some(RELEASE_RECORD), "{outcome:?}");
 }
 
+/// The builder builds for a dotnet test whose `--no-build` it dropped, and the command writes `.tmp/x.jsonl`: the data
+/// glob's file comes back, while the bins stay withheld, so the run is no whole pull: the marker and the nothing-back
+/// record stand, and no builder is recorded as the last complete outputs pull.
+#[test]
+fn a_routed_no_build_run_brings_its_data_glob_back_and_keeps_the_withheld_marker() {
+    let case = data_glob_case("client-withheld-data-glob");
+    let write_both = ["write", r".tmp\x.jsonl", "data", "write", r"src\A\bin\Release\a.dll", "built"];
+
+    let outcome = passing_build(&case, &["ok", "ok", "ok"], &wrapped_dotnet(&write_both, &NO_BUILD_RELEASE_TEST));
+
+    assert!(outcome.stderr.contains("gate: dropped --no-build"), "{outcome:?}");
+    assert_eq!(
+        worktree_text(&case, r".tmp\x.jsonl"),
+        "data",
+        "the data glob's file comes back: {outcome:?}"
+    );
+    assert!(
+        !case.folder().join(r"src\A\bin\Release\a.dll").exists(),
+        "the builder's bins stay withheld: {outcome:?}"
+    );
+    assert!(pending_marker(&case).exists(), "the next run asks for every output: {outcome:?}");
+    assert_eq!(nothing_back(&case).as_deref(), Some(RELEASE_RECORD), "{outcome:?}");
+    let from = case.root().join("remote").join(format!("{}.outputs-from", key_of(&events(&case))));
+    assert!(!from.exists(), "a withheld run records no complete outputs pull: {outcome:?}");
+}
+
+/// An [`outputs_case`] with the output globs `**/bin/**` and `.tmp/*.jsonl`, holding fake-tool as `pwsh.exe` too, and
+/// its `.gitignore` committed so a routed build has a `HEAD` to pin.
+fn data_glob_case(name: &str) -> Case {
+    let case = outputs_case(name, &["**/bin/**", ".tmp/*.jsonl"]);
+    copy_tool(&case, "pwsh.exe");
+    git(&case, &["add", ".gitignore"]);
+    git(&case, &["commit", "--quiet", "-m", "start"]);
+    case
+}
+
+/// The steps of a withheld run's command that writes `.tmp/x.jsonl`, under the data glob of [`data_glob_case`].
+const WRITE_DATA: [&str; 3] = ["write", r".tmp\x.jsonl", "data"];
+
+/// A withheld run leaves the worktree's outputs cap record as it is: two fetches past the cap in a row keep each run's
+/// pass and count no hit, since every withheld run asks for everything again.
+#[test]
+fn a_withheld_run_past_the_fetch_cap_twice_keeps_its_pass_and_the_count() {
+    let case = data_glob_case("client-withheld-cap-twice");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", PAST_THE_CAP, "ok", "ok", PAST_THE_CAP]);
+    plant_cap_hit(&case, 1);
+    let command = wrapped_dotnet(&WRITE_DATA, &NO_BUILD_RELEASE_TEST);
+
+    let first = low_budget_run(&case, &steps, "first.log", &command);
+    let after_first = cap_record_text(&case);
+    let second = low_budget_run(&case, &steps, "second.log", &command);
+
+    for run in [&first, &second] {
+        assert_eq!(run.code, Some(0), "the pass stands: {run:?}");
+        assert!(run.stderr.contains(CAPPED_LINE), "{run:?}");
+        assert!(!run.stderr.contains("passed the cap again"), "{run:?}");
+    }
+    assert_eq!(after_first.as_deref(), Some(r#"{"v":1,"hits":1}"#), "{first:?}");
+    assert_eq!(cap_record_text(&case).as_deref(), Some(r#"{"v":1,"hits":1}"#), "{second:?}");
+}
+
+/// A withheld run whose fetch ends whole brings its data back but leaves the outputs cap record in place.
+#[test]
+fn a_withheld_run_whose_fetch_ends_whole_leaves_the_count() {
+    let case = data_glob_case("client-withheld-cap-whole");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+    let planted = plant_cap_hit(&case, 1);
+
+    let outcome = low_budget_run(&case, &steps, "out.log", &wrapped_dotnet(&WRITE_DATA, &NO_BUILD_RELEASE_TEST));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(worktree_text(&case, r".tmp\x.jsonl"), "data", "the data came back: {outcome:?}");
+    assert_eq!(
+        fs::read_to_string(&planted).ok().as_deref(),
+        Some(r#"{"v":1,"hits":1}"#),
+        "the count is left as it was: {outcome:?}"
+    );
+}
+
 /// A dotnet test whose `--no-build` the builder dropped, in a repo with output and failure output globs: the run still
 /// carries its failure output globs, and its passing end leaves the withheld run's marker as one without them does.
 #[test]
@@ -9645,7 +9724,7 @@ fn a_routed_no_build_test_in_a_repo_without_output_globs_writes_the_record() {
 
     assert!(outcome.stderr.contains("gate: dropped --no-build"), "{outcome:?}");
     assert!(
-        !outcome.stderr.contains("gate: outputs: none brought back"),
+        !outcome.stderr.contains("gate: outputs: bins not brought back"),
         "nothing is withheld: {outcome:?}"
     );
     assert!(!pending_marker(&case).exists(), "{outcome:?}");

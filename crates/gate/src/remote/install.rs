@@ -331,8 +331,10 @@ pub(super) fn installed(attempt: &mut Attempt<'_, '_>, fetched: &Fetched<'_>) ->
     // A complete install brought the worktree's outputs back whole: it records the builder before it clears the marker,
     // as `step_end` records it for a passing run whose box packed nothing. A record it cannot write is said, and the
     // marker is left, so the next run is full. A failed run's reports never record one, nor a refusal that leaves the
-    // install short.
+    // install short, nor a dropped `--no-build` run whose outputs the route withheld: its other globs came back, but the
+    // PC's bins are stale.
     let recorded = !(complete && bringing == Bringing::Outputs)
+        || attempt.call.outputs_withheld
         || match outputs::recorded(attempt) {
             Ok(()) => true,
             Err(why) => {

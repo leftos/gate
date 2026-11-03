@@ -1312,7 +1312,7 @@ fn no_build_stays_on_any_other_command() {
 }
 
 #[test]
-fn a_dotnet_no_build_command_brings_no_outputs_back() {
+fn a_dotnet_no_build_command_brings_no_bins_back() {
     let command = words(&["dotnet", "test", "--no-build"]);
     let run = routed(decide(&heavy(&command), &FakeFacts::at_root()));
     assert_eq!(
@@ -1328,7 +1328,7 @@ fn a_dotnet_no_build_command_brings_no_outputs_back() {
     assert_eq!(run.outputs, Vec::<String>::new());
     assert!(run.outputs_withheld);
     assert_eq!(run.lines(), [DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE]);
-    assert_eq!(NO_OUTPUTS_LINE, "gate: outputs: none brought back for a --no-build command");
+    assert_eq!(NO_OUTPUTS_LINE, "gate: outputs: bins not brought back for a --no-build command");
 }
 
 /// The facts of [`send_facts`] whose built-here record says the last build of the project `one` ran here.
@@ -2348,12 +2348,27 @@ fn no_switch_file_is_derived_for_a_command_naming_a_response_file() {
 }
 
 #[test]
-fn a_run_whose_no_build_is_dropped_brings_back_no_switch_file() {
+fn a_run_whose_no_build_is_dropped_brings_back_its_switch_file() {
     let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
     let command = words(&["dotnet", "test", "src/App/App.csproj", "--no-build", r"-bl:logs\b.binlog"]);
     let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
     assert!(run.outputs_withheld);
-    assert_eq!(run.outputs, Vec::<String>::new());
+    assert_eq!(run.outputs, ["logs/b.binlog"], "the bin glob is withheld, the switch file is not a bin");
+}
+
+#[test]
+fn a_dropped_no_build_run_keeps_its_data_globs_and_withholds_its_bin_globs() {
+    let config = Config::parse(
+        r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]},
+            "outputs": {"yaat": ["**/bin/**", ".tmp/*.jsonl", "tests/*/bin/*/*/TestResults/*.trx"]}}"#,
+    )
+    .expect("usable");
+    let command = words(&["dotnet", "run", "--no-build", "--project", "src/A"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert!(run.dropped_no_build);
+    assert_eq!(run.outputs, [".tmp/*.jsonl", "tests/*/bin/*/*/TestResults/*.trx"]);
+    assert!(run.outputs_withheld);
+    assert!(run.lines().iter().any(|line| line == NO_OUTPUTS_LINE), "{:?}", run.lines());
 }
 
 #[test]
@@ -6692,6 +6707,19 @@ fn a_dropped_no_build_run_of_an_opted_in_repo_withholds_its_bins_and_drops_its_b
     assert!(run.outputs_withheld, "its outputs are withheld already");
     assert!(run.bins_withheld, "opted in needs no outputs");
     assert_eq!(run.failure_outputs, words(&["**/*.trx"]));
+}
+
+#[test]
+fn a_dropped_no_build_mac_run_with_a_data_glob_plans_no_cross_build() {
+    let config = mac_routing(r#"{"yaat": "win-x64"}"#, &["**/bin/**", ".tmp/*.jsonl"], &[]);
+    let command = words(&["dotnet", "test", "--no-build"]);
+    let run = routed(decide(&heavy(&command), &cross_facts(config)));
+
+    assert!(run.dropped_no_build, "{:?}", run.words);
+    assert!(run.outputs_withheld);
+    assert_eq!(run.outputs, words(&[".tmp/*.jsonl"]), "the data glob survives");
+    assert!(run.cross_build.is_none(), "a withheld run plans no cross build: {:?}", run.cross_build);
+    assert!(run.bins_withheld);
 }
 
 #[test]

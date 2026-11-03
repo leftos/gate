@@ -248,7 +248,8 @@ pub(super) struct Sent<'a> {
     /// and for a run whose outputs the route withheld, whose marker is [`Sent::withheld`] alone.
     marker: Option<PathBuf>,
     /// The pending marker a run whose outputs the route withheld writes after the push ([`marked`]) and never clears:
-    /// the builder builds and nothing comes back, so the next run asks for every output that differs from the PC's.
+    /// the builder builds and its bins do not come back, so the next run asks for every output that differs from the
+    /// PC's.
     /// Taken out when its send of the PC's build lands ([`Sent::take_withheld`]), so such a run writes no marker.
     withheld: Option<PathBuf>,
     /// The manifest the line holds, its files' stamps, which the install checks the PC's files against: over the output
@@ -289,9 +290,9 @@ impl Sent<'_> {
     }
 }
 
-/// What `attempt`'s run call carries of its outputs. A run whose outputs the route withheld records the marker's path
-/// as [`Sent::withheld`] alone, for [`marked`] to write unless its send of the PC's build lands, and no end to clear,
-/// whatever globs it has. A run with no output globs and no failure output globs carries none, and reads neither the
+/// What `attempt`'s run call carries of its outputs. A run whose outputs the route withheld (its bin globs dropped, its
+/// other globs kept) records the marker's path as [`Sent::withheld`] alone, for [`marked`] to write unless its send of
+/// the PC's build lands, and no end to clear, whatever globs it has. A run with no output globs and no failure output globs carries none, and reads neither the
 /// pending marker nor the record of the work folder's last complete outputs pull. One with either reads both, asking for
 /// every output that differs from the PC's ([`Sent::full`]) when the marker is there or that record
 /// ([`v1::outputs_from_path`]) names another builder, builds the manifest over both lists ([`manifest_over`]), polling
@@ -338,8 +339,9 @@ pub(super) fn sent<'a>(attempt: &mut Attempt<'_, 'a>) -> Result<Sent<'a>, End> {
     match manifested.built {
         None => return Ok(sent),
         Some(Ok((line, files, next))) => {
-            // A withheld run's manifest covers its failure output globs alone, and one whose bins were withheld covers no
-            // bin glob: saved, either would replace hashes the next run needs, which would then hash every file again.
+            // A withheld run's manifest covers its non-bin and failure output globs alone, and one whose bins were withheld
+            // covers no bin glob: saved, either would replace hashes the next run needs, which would then hash every file
+            // again.
             if !call.outputs_withheld && !call.bins_withheld && previous.as_ref() != Some(&next) {
                 next.save(&hashes);
             }
@@ -387,11 +389,13 @@ pub(super) fn marked(sent: &Sent<'_>) -> Result<(), End> {
 /// The attempt's outputs are marked brought back only when a passing run's install ends complete, as
 /// [`install::installed`] says, or when its box packed nothing for a manifest that held files under its output globs
 /// ([`holds_outputs`]); never when the box said it skipped outputs for names this PC cannot take, nor for a run whose
-/// bin globs the route withheld ([`RemoteCall::bins_withheld`]), nor for a failed run, whatever its reports' install
-/// did. Every other end marks them not brought back.
+/// bin globs the route withheld ([`RemoteCall::bins_withheld`], [`RemoteCall::outputs_withheld`]), whose other globs'
+/// files still come back, nor for a failed run, whatever its reports' install did. Every other end marks them not
+/// brought back.
 pub(super) fn ended(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synced: Synced, brought: Option<&Brought>) -> End {
     let (end, complete) = step_end(attempt, sent, ran, synced, brought);
-    attempt.brought_back = Some(complete && !ran.names_skipped && !attempt.call.bins_withheld);
+    let withheld = attempt.call.bins_withheld || attempt.call.outputs_withheld;
+    attempt.brought_back = Some(complete && !ran.names_skipped && !withheld);
     end
 }
 
@@ -596,7 +600,8 @@ impl Bringing {
 }
 
 /// What the outputs step of a run whose box packed an archive keeps for its pull and install: the run's output globs,
-/// the PC's manifest and the pending marker, `None` for a withheld run whose send of the PC's build landed; the files
+/// the PC's manifest and the pending marker, `None` for a run whose outputs the route withheld, whose marker no end
+/// clears; the files
 /// the box said it packed, and the archive's size in bytes when it said one; and, for a failed run, its narrowed set
 /// ([`reports_end`]), which the install is held to, and what the set holds.
 struct Kept<'k> {
@@ -664,8 +669,9 @@ pub(super) fn trees_of<'a>(
 /// said one, and fails the run, but one whose archive passed the fetch cap installs nothing and is judged as [`capped`]
 /// says. Each of these removes what was fetched, and says so when it cannot; each says the outputs were not brought back
 /// but the interrupt. The worktree's outputs cap record ([`uncapped`]) is removed once the fetch ends whole, before the
-/// install, and on every other end but the cap and a Ctrl+C during the fetch. With the end, whether the install was
-/// complete; a fetch that did not end whole installs nothing.
+/// install, and on every other end but the cap and a Ctrl+C during the fetch; a run whose outputs the route withheld
+/// leaves it as it is on every end. With the end, whether the install was complete; a fetch that did not end whole
+/// installs nothing.
 ///
 /// The pull says its start ([`pull_start_line`]) before the outputs call, and its progress while it runs, as the call's
 /// watch does; one that did not end whole says how long it ran and what it received ([`pull_ended_line`]) before any
@@ -724,8 +730,8 @@ fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced
             match judged(attempt, (&archive, bringing), (&called, exhausted), synced, interrupted) {
                 End::Status(_) if whole => {
                     // The fetch ended whole, under the cap: how the install ends no longer bears on the count, which a
-                    // failed run's pull never does.
-                    if bringing == Bringing::Outputs {
+                    // failed run's pull never does, nor a withheld run's.
+                    if bringing == Bringing::Outputs && !attempt.call.outputs_withheld {
                         uncapped(attempt);
                     }
                     let (main_tree, sibling_trees) = box_trees(ran.location, attempt.call);
@@ -843,10 +849,11 @@ fn channel_pull_line(called: &Called) -> Option<String> {
 }
 
 /// `end`, that of a fetch of what `bringing` names that did not end whole, the worktree's outputs cap record removed
-/// first ([`uncapped`]) unless the fetch ended `at_the_cap` or by a Ctrl+C, or brought a failed run's test reports,
-/// whose pull never bears on the record.
+/// first ([`uncapped`]) unless the fetch ended `at_the_cap` or by a Ctrl+C, or brought a failed run's test reports, or
+/// is a run's whose outputs the route withheld ([`RemoteCall::outputs_withheld`]), whose pull never bears on the record.
 fn settled(attempt: &mut Attempt<'_, '_>, bringing: Bringing, at_the_cap: bool, end: End) -> End {
-    if bringing == Bringing::Outputs && !at_the_cap && !matches!(end, End::Interrupted) {
+    let counts = bringing == Bringing::Outputs && !attempt.call.outputs_withheld;
+    if counts && !at_the_cap && !matches!(end, End::Interrupted) {
         uncapped(attempt);
     }
     end
@@ -913,9 +920,14 @@ fn stopped_reason(received: Option<client::Received>) -> String {
 /// The end of a fetch cut for the archive it passed, `reason` saying so, the run's end so far `synced`: the outputs are
 /// said not brought back, `archive` is removed and the hit is counted in the worktree's outputs cap record. The first
 /// hit in a row keeps the run's status: the box's work is sound, the archive of it is not, and the next routed run asks
-/// for it again. A later hit in a row says the cap was passed again and fails the run.
+/// for it again. A later hit in a row says the cap was passed again and fails the run. A run whose outputs the route
+/// withheld ([`RemoteCall::outputs_withheld`]) counts no hit and keeps its status: its marker makes every such run ask
+/// for everything again, so its hits would fail a run of sound work.
 fn capped(attempt: &mut Attempt<'_, '_>, archive: &Archive, reason: &str, synced: End) -> End {
     let end = unfetched(attempt, (archive, Bringing::Outputs), reason, synced);
+    if attempt.call.outputs_withheld {
+        return end;
+    }
     let hits = counted_hit(attempt);
     if hits < 2 {
         return end;
@@ -951,7 +963,8 @@ fn hits_read(path: &Path) -> u64 {
 }
 
 /// Removes the worktree's outputs cap record, its outputs step having ended other than at the fetch cap; one already
-/// gone counts as removed, and one that cannot be removed is said and changes no end.
+/// gone counts as removed, and one that cannot be removed is said and changes no end. Never called for a run whose
+/// outputs the route withheld, which leaves the record as it is.
 pub(super) fn uncapped(attempt: &mut Attempt<'_, '_>) {
     let path = v1::outputs_capped_path(attempt.call.state_dir, attempt.call.builder.id.as_deref(), attempt.call.key);
     if let Err(error) = fs::remove_file(&path)
@@ -2250,12 +2263,13 @@ mod tests {
         use std::fs;
         use std::path::{Path, PathBuf};
         use std::sync::LazyLock;
+        use std::time::SystemTime;
 
         use gate_router::{Builder, BuilderOs};
         use gate_state::{StateRoot, v1};
 
-        use super::super::{Brought, OUTPUTS_FROM_LIMIT, Ran, sent, step_end};
-        use super::{KEY, NONCE, cached_worktree, scratch, sentinel};
+        use super::super::{Brought, OUTPUTS_FROM_LIMIT, Ran, ended, sent, step_end};
+        use super::{HOUR, KEY, NONCE, cached_worktree, scratch, sentinel, written_at};
         use crate::outputs::hash::sha256_of;
         use crate::remote::client::{Attempt, End};
         use crate::remote::payload::Location;
@@ -2396,6 +2410,32 @@ mod tests {
                 sent(&mut attempt_of(&call, &transport)).expect("the manifest is built");
 
                 assert_eq!(v1::outputs_hashes_path(&state, None, KEY).exists(), saved, "bins withheld: {withheld}");
+            }
+        }
+
+        /// A run whose outputs the route withheld covers only its data and failure globs, so its manifest's cache is not
+        /// saved over the one the next run needs: that run would hash every bin file again.
+        #[test]
+        fn a_withheld_run_with_a_data_glob_saves_no_hash_cache() {
+            let globs = [".tmp/*.jsonl".to_owned()];
+            for (withheld, saved) in [(false, true), (true, false)] {
+                let name = format!("outputs-withheld-cache-{withheld}");
+                let (root, state, log) = worktree(&name);
+                fs::create_dir_all(root.join(".tmp")).expect("the folder can be made");
+                let file = root.join(".tmp").join("x.jsonl");
+                fs::write(&file, "data").expect("the file can be written");
+                written_at(&file, SystemTime::now() - HOUR);
+                let root = root.to_string_lossy().into_owned();
+                let call = RemoteCall {
+                    commit_stage: false,
+                    outputs_withheld: withheld,
+                    ..on(&crate::test_support::HOST, &root, &globs, &state, &log)
+                };
+                let transport = nowhere();
+
+                sent(&mut attempt_of(&call, &transport)).expect("the manifest is built");
+
+                assert_eq!(v1::outputs_hashes_path(&state, None, KEY).exists(), saved, "outputs withheld: {withheld}");
             }
         }
 
@@ -2546,7 +2586,7 @@ mod tests {
             assert_eq!(
                 fs::read_to_string(&record).expect("the record is there"),
                 "mac-1",
-                "a withheld run brings nothing back"
+                "a withheld run records no builder"
             );
             let failed = on(&crate::test_support::HOST, &root, &globs, &state, &log);
             let mut attempt = attempt_of(&failed, &transport);
@@ -2576,6 +2616,47 @@ mod tests {
                 fs::read_to_string(&record).expect("the record is there"),
                 "mac-1",
                 "a failed run's report pull leaves it"
+            );
+        }
+
+        /// A run whose bins the route withheld still brings back its data glob's files, but its outputs step never
+        /// counts as a whole pull: the PC's bins stay stale, so the record stands and the outputs are not brought back.
+        #[test]
+        fn a_withheld_run_with_a_data_glob_that_completes_is_not_brought_back() {
+            let (root, state, log) = worktree("withheld-data-complete");
+            fs::create_dir_all(root.join(".tmp")).expect("the folder can be made");
+            fs::write(root.join(".tmp").join("x.jsonl"), "data").expect("the file can be written");
+            let globs = [".tmp/*.jsonl".to_owned()];
+            let record = record_of_another_builder(&state);
+            let place = location();
+            let root = root.to_string_lossy().into_owned();
+            let transport = nowhere();
+            let held = RemoteCall {
+                commit_stage: false,
+                outputs_withheld: true,
+                bins_withheld: false,
+                ..on(&crate::test_support::HOST, &root, &globs, &state, &log)
+            };
+            let mut attempt = attempt_of(&held, &transport);
+            let sent = sent(&mut attempt).expect("the withheld run's manifest is built");
+
+            let end = ended(
+                &mut attempt,
+                &sent,
+                &passed(&place),
+                Synced {
+                    end: End::Status(0),
+                    reason: None,
+                },
+                Some(&Brought::Nothing),
+            );
+
+            assert!(matches!(end, End::Status(0)), "{end:?}");
+            assert_eq!(attempt.brought_back, Some(false), "a withheld run's bins never came back");
+            assert_eq!(
+                fs::read_to_string(&record).expect("the record is there"),
+                "mac-1",
+                "a withheld run records no builder"
             );
         }
 

@@ -219,8 +219,9 @@ pub(crate) struct RemoteCall<'a> {
     pub words: &'a [String],
     /// The output globs the run brings back.
     pub outputs: &'a [String],
-    /// Whether the route withheld the run's outputs, its command a dotnet `--no-build` one whose word the builder
-    /// dropped: the builder builds, and nothing comes back.
+    /// Whether the route withheld the run's bins, its command a dotnet `--no-build` one whose word the builder dropped:
+    /// the builder builds, so [`RemoteCall::outputs`] holds only the globs that name no `bin` folder, whose files come
+    /// back while the run never counts as a whole outputs pull.
     pub outputs_withheld: bool,
     /// Whether the route dropped the run's bin globs, its macOS builder cross-building the repo but not this run
     /// ([`gate_router::RemoteRun::bins_withheld`]): what comes back is never every output.

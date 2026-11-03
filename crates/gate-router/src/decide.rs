@@ -23,8 +23,9 @@ pub const DROPPED_NO_BUILD_LINE: &str = "gate: dropped --no-build: the last buil
 /// The line said when `--no-build` was dropped from the builder's words because the send of the PC's build, planned for
 /// a run whose last build ran here ([`SendPlan::built_here`]), did not land.
 pub const DROPPED_UNSENT_LINE: &str = "gate: dropped --no-build: the PC's build could not be sent";
-/// The line said when a `--no-build` command brings no outputs back.
-pub const NO_OUTPUTS_LINE: &str = "gate: outputs: none brought back for a --no-build command";
+/// The line said when a `--no-build` command's word was dropped: the builder built, so the run's bins are not brought
+/// back.
+pub const NO_OUTPUTS_LINE: &str = "gate: outputs: bins not brought back for a --no-build command";
 
 const NO_BUILD: &str = "--no-build";
 
@@ -852,7 +853,8 @@ pub struct RemoteRun {
     /// Whether the rewrite sent the command's first word as a program's name ([`Rewritten::program_named`]):
     /// [`RemoteRun::lines`] says the word as given and the name it is sent as.
     pub program_named: bool,
-    /// The output globs the run brings back; none for a dotnet `--no-build` command.
+    /// The output globs the run brings back; for a dotnet `--no-build` command whose word was dropped, only those that
+    /// name no `bin` folder ([`names_bin_folder`]).
     pub outputs: Vec<String>,
     /// The failure output globs a failed run brings back beside its test reports: the routing file's `failureOutputs`
     /// for the repo on the builder, none when it names none; kept for a dotnet `--no-build` command.
@@ -868,7 +870,9 @@ pub struct RemoteRun {
     /// ([`Facts::built_here`]): the PC's build of its one project sent first, then the kept words run. `None` for every
     /// other run; a send that does not land runs [`RemoteRun::words`], `--no-build` dropped.
     pub send: Option<SendPlan>,
-    /// Whether outputs were withheld from a `--no-build` command.
+    /// Whether the run's bins were withheld from a `--no-build` command whose word was dropped, for a repo with output
+    /// globs: the builder builds, so its globs that name a `bin` folder are dropped and the rest come back, while the
+    /// run never counts as a whole outputs pull.
     pub outputs_withheld: bool,
     /// How the run uses the builder's desktop, `None` for not at all: the mode of the first `.gate/desktop.toml` pattern
     /// its rewritten words match, which `remote.json` allows the repo ([`check_desktop`]).
@@ -3858,9 +3862,11 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
             outputs.push(glob);
         }
     }
+    // The builder builds a dropped `--no-build` run, so its bins must not come back over the PC's build; its other
+    // globs (data the command writes, switch files, test reports) still do.
     let outputs_withheld = fallback.len() != given.len() && !outputs.is_empty();
     if outputs_withheld {
-        outputs.clear();
+        outputs.retain(|glob| !names_bin_folder(glob));
     }
     let mut failure_outputs = config.failure_outputs_on(&target.builder, &target.repo);
     // Opted in whatever the run's outputs: a failure-only run or a dropped `--no-build` one still builds the Mac's bins.
