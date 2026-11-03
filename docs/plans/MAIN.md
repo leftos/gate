@@ -12,8 +12,8 @@
 - [!] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [!] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
 - [!] GATE-839 Route race-anywhere's Unreal editor and game runs: a desktop route with a GPU — High · Remote
-- [!] GATE-978 Send the gitignored .tmp files a routed dotnet probe names as inputs — High · Remote
 - [!] GATE-991 Route yaat's GuideCapture once its capture no longer reads this PC's CRC aliases — High · Remote
+- [!] GATE-1061 Route long headless Blender jobs, with a repo's data folder, to the Windows builder — High · Remote
 - [!] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
@@ -36,6 +36,7 @@
 
 ## Remote
 
+- [ ] GATE-1056 Have the desktop helper report the hidden desktop it created
 - [ ] GATE-1050 Covered-gate log notes and the desktop helper's dropped setup errors
 - [ ] GATE-1049 Refuse a hidden desktop name another process created first
 - [ ] GATE-1048 Covered and held-back desktop edges from GATE-1043's review
@@ -355,6 +356,8 @@
   - [ ] GATE-1030 Do not repeat a commit stage's lines in the run's closing tail
   - [ ] GATE-1031 Say the global.json sdk-pin note once per run
 - [ ] GATE-1035 Decide LFS on the Unix box: carry LFS objects, or refuse a payload that names them
+- [ ] GATE-1055 Guard the launcher's CLI value options against gate-args drift
+- [ ] GATE-1063 Close the stage prep's two edge cases: ceiling share and repeats across builders
 
 ## Cutover sweep
 
