@@ -27,7 +27,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use gate_args::{BoxSeams, is_godot_console};
-use gate_router::escaped;
+use gate_router::{GATE_FOLDER_MARK, escaped};
 use gate_watchdog::{Kill, Pump, is_wsl_command};
 use gate_win32::{
     Donor, EnvironmentBlock, Job, LaunchError, NamedEvent, PipedConsole, PipedLaunch, PipedSuspended, RestrictedToken, Running, Utf8Console,
@@ -2093,7 +2093,8 @@ fn prepared<'w>(request: &Request<'_>, one: &One<'w>, console: &mut Console) -> 
     let environment = variables
         .block()
         .map_err(|error| Err(failed(console, &format!("cannot build the command's environment: {error}"))))?;
-    let rest: Vec<OsString> = rest.iter().map(OsString::from).collect();
+    let folder = one.place.to_string_lossy();
+    let rest: Vec<OsString> = rest.iter().map(|word| OsString::from(word.replace(GATE_FOLDER_MARK, &folder))).collect();
     let program = match found {
         Ok(program) => program,
         Err(message) => return Err(Ok(Ran::NotStarted(not_started(console, word, None, &message)))),

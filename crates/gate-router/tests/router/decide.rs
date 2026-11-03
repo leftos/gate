@@ -6005,6 +6005,74 @@ fn a_word_naming_a_gitignored_project_input_is_carried_in_the_run_s_inputs() {
     }
 }
 
+/// The routed words of the dotnet `command` from the gate's folder `prefix`, the facts reporting `.tmp/a.targets` and
+/// `.tmp/copy/X.csproj` and `.tmp/x.runsettings` carried.
+fn carrying_words(prefix: &str, command: &[&str]) -> Vec<String> {
+    let facts = ignoring(prefix, &[".tmp/a.targets", ".tmp/copy/X.csproj", ".tmp/x.runsettings"]);
+    routed(decide(&heavy(&words(command)), &facts)).words
+}
+
+/// That the routed `command` holds the word `expected`.
+fn holds_word(command: &[&str], expected: &str) {
+    let sent = carrying_words("", command);
+    assert!(sent.iter().any(|word| word == expected), "{sent:?}");
+}
+
+#[test]
+fn a_property_naming_a_carried_file_is_marked() {
+    holds_word(
+        &["dotnet", "build", "-p:CustomAfterMicrosoftCommonTargets=.tmp/a.targets"],
+        "-p:CustomAfterMicrosoftCommonTargets={gate-folder}/.tmp/a.targets",
+    );
+}
+
+#[test]
+fn a_property_list_marks_only_the_carried_piece() {
+    holds_word(
+        &["dotnet", "build", "-p:Configuration=Release;Custom=.tmp/a.targets"],
+        "-p:Configuration=Release;Custom={gate-folder}/.tmp/a.targets",
+    );
+}
+
+#[test]
+fn a_long_property_switch_is_marked_in_any_case() {
+    holds_word(
+        &["dotnet", "build", "/PROPERTY:Custom=.tmp/a.targets"],
+        "/PROPERTY:Custom={gate-folder}/.tmp/a.targets",
+    );
+}
+
+#[test]
+fn a_property_naming_no_carried_file_is_left_alone() {
+    holds_word(&["dotnet", "build", "-p:Configuration=Release"], "-p:Configuration=Release");
+}
+
+#[test]
+fn a_two_word_property_naming_a_carried_file_is_marked() {
+    holds_word(&["dotnet", "build", "-p", "Custom=.tmp/a.targets"], "Custom={gate-folder}/.tmp/a.targets");
+}
+
+#[test]
+fn a_two_word_property_naming_no_carried_file_is_left_alone() {
+    holds_word(&["dotnet", "build", "-p", "Configuration=Release"], "Configuration=Release");
+}
+
+#[test]
+fn a_settings_word_is_not_marked() {
+    holds_word(&["dotnet", "test", "--settings", ".tmp/x.runsettings"], ".tmp/x.runsettings");
+}
+
+#[test]
+fn a_positional_carried_project_is_not_marked() {
+    holds_word(&["dotnet", "build", ".tmp/copy/X.csproj"], ".tmp/copy/X.csproj");
+}
+
+#[test]
+fn a_property_from_a_subfolder_is_marked_by_its_carried_path() {
+    let sent = carrying_words("src/", &["dotnet", "build", "-p:Custom=../.tmp/a.targets"]);
+    assert!(sent.iter().any(|word| word == "-p:Custom={gate-folder}/../.tmp/a.targets"), "{sent:?}");
+}
+
 #[test]
 fn a_word_the_facts_do_not_call_gitignored_routes_as_before() {
     let cases: [(&[&str], &str); 5] = [
@@ -6392,6 +6460,24 @@ fn a_dotnet_build_to_an_opted_in_mac_gets_a_cross_build_of_its_target_configurat
     assert_eq!(cross.words, expected);
     assert_eq!(run.cross_build_blocked, None);
     assert_eq!(run.lines(), Vec::<String>::new());
+}
+
+#[test]
+fn a_cross_build_step_marks_a_carried_property() {
+    let facts = FakeFacts {
+        gitignored: vec![GitignoredInput {
+            path: ".tmp/a.targets".to_owned(),
+            files: Ok(vec![(".tmp/a.targets".to_owned(), 1)]),
+        }],
+        ..cross_facts(cross_routing(r#"{"yaat": "win-x64"}"#))
+    };
+    let command = words(&["dotnet", "build", "src/App/App.csproj", "-p:Custom=.tmp/a.targets"]);
+
+    let run = routed(decide(&heavy(&command), &facts));
+
+    let cross = run.cross_build.expect("a cross build");
+    let marked = "-p:Custom={gate-folder}/.tmp/a.targets";
+    assert!(cross.words.iter().any(|word| word == marked), "{:?}", cross.words);
 }
 
 #[test]

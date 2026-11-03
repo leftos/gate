@@ -838,7 +838,8 @@ pub struct RemoteRun {
     /// The words the builder runs: paths rewritten, `--no-build` dropped from a dotnet command, the worktree's `HEAD`
     /// sha pinned onto a dotnet command that builds as `SourceRevisionId`, a bare first word naming a file of the
     /// gate's folder written `./name`, and a first word naming a program by a path outside the worktree sent as the
-    /// program's name ([`RemoteRun::program_named`]), which is never the file of the folder.
+    /// program's name ([`RemoteRun::program_named`]), which is never the file of the folder; a property value naming a
+    /// carried file holds [`GATE_FOLDER_MARK`].
     pub words: Vec<String>,
     /// The command as given, each exact `--no-build` word of a dotnet command dropped from it: read only to say the
     /// first word the caller gave, for a run whose first word was sent as a program's name
@@ -2016,9 +2017,69 @@ fn ended(config: &Config, matched: Matched, given: &[String], facts: &dyn Facts)
         return Err(Some(LocalReason::NothingSent { subfolder }));
     }
     let carried = carried_inputs(&matched, facts).map_err(Some)?;
+    let prefix = place.prefix.clone();
     let mut run = remote_run(config, matched, subfolder, given, facts)?;
+    mark_carried_properties(&mut run.words, &prefix, &carried);
+    if let Some(plan) = &mut run.send {
+        mark_carried_properties(&mut plan.words, &prefix, &carried);
+    }
+    if let Some(cross) = &mut run.cross_build {
+        mark_carried_properties(&mut cross.words, &prefix, &carried);
+    }
     run.inputs.extend(carried.into_iter().map(|file| format!("{CARRIED_INPUT}{file}")));
     Ok(run)
+}
+
+/// Stands in a routed word for the folder the builder runs the command in, which only the builder knows.
+pub const GATE_FOLDER_MARK: &str = "{gate-folder}";
+
+/// The switches of a dotnet command whose value sets `MSBuild` properties, matched in any letter case.
+const PROPERTY_SWITCHES: [&str; 5] = ["-p", "/p", "-property", "/property", "--property"];
+
+/// Each of `words` with its property values naming a `carried` file marked: a value joined to its switch by `:`
+/// ([`carried_property`]), or the word after a switch standing alone ([`marked_values`]).
+fn mark_carried_properties(words: &mut [String], prefix: &str, carried: &[String]) {
+    let mut after_switch = false;
+    for word in words {
+        *word = if after_switch {
+            marked_values(word, prefix, carried)
+        } else {
+            carried_property(word, prefix, carried)
+        };
+        after_switch = is_property_switch(word);
+    }
+}
+
+/// Whether `word` is one of [`PROPERTY_SWITCHES`], in any letter case.
+fn is_property_switch(word: &str) -> bool {
+    PROPERTY_SWITCHES.iter().any(|known| eq_ignoring_case(word, known))
+}
+
+/// `word` with its value marked when it is a property switch joined to its value by `:` ([`marked_values`]). Any other
+/// word, a tool's option value that its tool reads from the working folder among them, is given back as it is.
+fn carried_property(word: &str, prefix: &str, carried: &[String]) -> String {
+    match word.split_once(':') {
+        Some((switch, value)) if is_property_switch(switch) => format!("{switch}:{}", marked_values(value, prefix, carried)),
+        _ => word.to_owned(),
+    }
+}
+
+/// The property list `value` with [`GATE_FOLDER_MARK`] before each piece that names a `carried` file from the gate's
+/// folder `prefix` ([`input_path`]), in any letter case: `MSBuild` reads such a value from the project's folder or the
+/// importing file's, so only an absolute path finds the file. A list naming no carried file is given back as it is.
+fn marked_values(value: &str, prefix: &str, carried: &[String]) -> String {
+    let mut marked = String::with_capacity(value.len());
+    for piece in value.split_inclusive([';', ',']) {
+        let text = piece.strip_suffix([';', ',']).unwrap_or(piece);
+        let (name, named) = text.split_at(text.find('=').map_or(0, |at| at + 1));
+        marked.push_str(name);
+        if input_path(prefix, named).is_some_and(|path| carried.iter().any(|file| file.eq_ignore_ascii_case(&path))) {
+            marked.push_str(GATE_FOLDER_MARK);
+            marked.push('/');
+        }
+        marked.push_str(&piece[name.len()..]);
+    }
+    marked
 }
 
 /// The files the run of the `matched` command carries to its builder as exact input paths beside the repo's input

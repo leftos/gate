@@ -14,8 +14,8 @@ use std::io;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use gate_args::{EnvRefusal, MAX_WHOLE_NUMBER, MOST_ENV_BYTES, MOST_ENV_NAMES, env_refusal, over_cap, repeated_name, shown_name};
-pub use gate_router::escaped;
 use gate_router::warm::MOST_COMMANDS;
+pub use gate_router::{GATE_FOLDER_MARK, escaped};
 use gate_router::{is_layout_name, repo_name};
 use serde_json::{Map, Value};
 

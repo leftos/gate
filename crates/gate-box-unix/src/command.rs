@@ -21,7 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use gate_args::is_godot_console;
 use gate_watchdog::{Config, CpuSource, Kill, Machine, Pump, Sample, SystemTimes, Ticks};
 use gate_wire::stamp::Tag;
-use gate_wire::{BoxKill, adjusted_line, escaped, killed_line, started_line};
+use gate_wire::{BoxKill, GATE_FOLDER_MARK, adjusted_line, escaped, killed_line, started_line};
 
 use crate::console::{Forwarding, GAT, LineSink, Output, Stamp, Stream};
 use crate::cpu::{GroupCpu, LoadTotals, host_cpu_load};
@@ -732,6 +732,12 @@ pub(crate) fn removed_if_held<S: LineSink>(record: &str, lock: &HeldLock, output
     }
 }
 
+/// `words` with [`GATE_FOLDER_MARK`] replaced by `folder`, the folder the command runs in.
+fn with_folder(words: &[String], folder: &Path) -> Vec<String> {
+    let folder = folder.to_string_lossy();
+    words.iter().map(|word| word.replace(GATE_FOLDER_MARK, &folder)).collect()
+}
+
 /// The command `program` with the arguments `rest`, run in `launch`'s place with the environment
 /// [`command_environment`] composes, the build servers named by the run id `gate-box-<nonce>`.
 fn command_of(launch: &Launch<'_>, program: &str, rest: &[String]) -> Command {
@@ -743,7 +749,11 @@ fn command_of(launch: &Launch<'_>, program: &str, rest: &[String]) -> Command {
     };
     let environment = command_environment(std::env::vars_os().collect(), along, launch.env, &run, launch.job);
     let mut command = Command::new(program);
-    command.args(rest).current_dir(launch.place).env_clear().envs(environment);
+    command
+        .args(with_folder(rest, launch.place))
+        .current_dir(launch.place)
+        .env_clear()
+        .envs(environment);
     // SAFETY: the closure runs in the child between fork and exec, and calls only `umask`, `sigaction`, `sigemptyset` and
     // `sigprocmask`, which are async-signal-safe, on values on its own stack; it allocates nothing and takes no lock.
     unsafe {
@@ -836,12 +846,22 @@ mod tests {
 
     use super::{
         Beat, Ceiling, CrossEnd, Launch, Sampler, Verdict, command_record, cross_end, cross_of, ended, removed_if_held, run_command, run_with,
+        with_folder,
     };
     use crate::console::{Forwarding, HungUpSink, LineSink, Output, RecordingSink, Stamp, Stream};
     use crate::files::{HeldLock, held_for_test};
     use crate::heartbeat;
     use crate::lines::{CommandEnd, Godot, command_status};
     use crate::process::{EndedBy, Halt, NotRan, Ran, still_there_why};
+
+    #[test]
+    fn a_word_s_folder_mark_becomes_the_run_s_folder() {
+        let words = ["-p:A={gate-folder}/.tmp/a;B={gate-folder}/.tmp/b".to_owned(), "plain".to_owned()];
+        assert_eq!(
+            with_folder(&words, std::path::Path::new("/work/k")),
+            ["-p:A=/work/k/.tmp/a;B=/work/k/.tmp/b", "plain"]
+        );
+    }
 
     const NONCE: &str = "0123456789ab";
     const JOB: &str = "gate-remote-k-0123456789ab";

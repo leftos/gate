@@ -1977,6 +1977,34 @@ fn a_dotnet_command_naming_a_gitignored_project_folder_routes_carrying_its_files
 }
 
 #[test]
+fn a_dotnet_probe_targets_file_routes_carrying_what_it_includes() {
+    let case = routed_case("routing-probe-targets");
+    copy_tool(&case, "dotnet.exe");
+    ignore_and_write(&case, ".tmp/\n", ".tmp/probe/Probe.cs");
+    let targets = case.folder().join(".tmp").join("probe").join("p.targets");
+    fs::write(
+        targets,
+        "<Project><Compile Include=\"$(MSBuildThisFileDirectory)Probe.cs\" /></Project>\n",
+    )
+    .expect("the file can be written");
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let property = "-p:CustomAfterMicrosoftCommonTargets=.tmp/probe/p.targets";
+
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\dotnet.exe", "test", property])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let call = recorded(&call);
+    assert_eq!(
+        call["inputs"],
+        json!(["[carried].tmp/probe/p.targets", "[carried].tmp/probe/Probe.cs"]),
+        "{call}"
+    );
+    let marked = "-p:CustomAfterMicrosoftCommonTargets={gate-folder}/.tmp/probe/p.targets";
+    assert!(recorded_words(&call).contains(&marked), "{call}");
+}
+
+#[test]
 fn a_dotnet_command_naming_a_folder_with_a_tracked_project_still_routes() {
     let case = routed_case("routing-gitignored-folder-mixed");
     copy_tool(&case, "dotnet.exe");

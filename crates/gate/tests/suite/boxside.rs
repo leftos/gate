@@ -7182,6 +7182,20 @@ fn box_run_whose_command_changes_a_file_says_no_back_commit_none_line() {
 }
 
 #[test]
+fn a_box_run_replaces_the_folder_mark_with_its_folder() {
+    let case = Case::new("box_run_folder_mark");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "{gate-folder}/a.txt"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let expected = format!("{}/a.txt", field(&payload, "Work"));
+    assert!(outcome.stdout.contains(&expected), "the word starts with the run's folder: {outcome:?}");
+    assert!(!outcome.stdout.contains("{gate-folder}"), "{outcome:?}");
+}
+
+#[test]
 fn box_run_with_a_pair_says_no_back_commit_none_line() {
     let case = Case::new("box_run_pair_no_none_line");
     let (payload, _) = changing_pair(&case);

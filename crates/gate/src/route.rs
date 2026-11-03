@@ -584,24 +584,36 @@ fn folder_of(file: &str) -> &str {
     file.rsplit_once('/').map_or("", |(folder, _)| folder)
 }
 
-/// The folder of the candidate `path`, `/`-separated below the root: a file's folder, else the path itself when it names
-/// a folder.
-fn candidate_folder(path: &str) -> &str {
-    if is_input_file(path) { folder_of(path) } else { path }
+/// Whether the candidate `path`, `/`-separated below `root`, counts as a file: it is one on disk, whatever its extension,
+/// or, missing, it has an input file's extension ([`is_input_file`]).
+fn names_a_file(root: &Path, path: &str) -> bool {
+    is_input_file(path) || root.join(path).is_file()
+}
+
+/// The folder of the candidate `path`, `/`-separated below `root`: a file's folder ([`names_a_file`]), else the path
+/// itself when it names a folder.
+fn candidate_folder<'p>(root: &Path, path: &'p str) -> &'p str {
+    if names_a_file(root, path) { folder_of(path) } else { path }
+}
+
+/// Whether the candidate `path`, `/`-separated below `root`, is sent by name rather than with its folder's files: any
+/// file but a project or solution file ([`is_project_or_solution`]) below the root.
+fn sent_by_name(root: &Path, path: &str) -> bool {
+    names_a_file(root, path) && (folder_of(path).is_empty() || !is_project_or_solution(path))
 }
 
 /// The files the gitignored candidate `path`, `/`-separated below `root`, carries to the builder, each with its size:
 /// a folder, and a project or solution file ([`is_project_or_solution`]) below the root, carry their folder's files
-/// ([`swept_folder`]); any other file candidate carries only itself.
+/// ([`swept_folder`]); any other file candidate is sent by name ([`sent_by_name`]), with the files it names
+/// ([`named_files`]).
 ///
 /// # Errors
 ///
 /// Why the candidate cannot be carried whole: its folder is, or lies under, a link or a junction ([`IN_LINK`]), one of
-/// its project files `own` lies in another repository ([`IN_NESTED`]) or is left out of its folder's files, or its
-/// folder or file cannot be read.
+/// its project files `own` lies in another repository ([`IN_NESTED`]) or is left out of its folder's files, its folder
+/// or file cannot be read, or a file it sends by name cannot be sent ([`named_files`]).
 fn swept(root: &Path, path: &str, own: &[String], globs: &Globs, log: Option<&str>) -> Result<Vec<(String, u64)>, String> {
-    let file = is_input_file(path);
-    let folder = candidate_folder(path);
+    let folder = candidate_folder(root, path);
     if under_link(root, folder) {
         return Err(IN_LINK.to_owned());
     }
@@ -609,15 +621,79 @@ fn swept(root: &Path, path: &str, own: &[String], globs: &Globs, log: Option<&st
     if own.iter().any(|own| nested_folder(root, own, &mut known).is_some()) {
         return Err(IN_NESTED.to_owned());
     }
-    if file && (folder.is_empty() || !is_project_or_solution(path)) {
-        let metadata = fs::metadata(root.join(path)).map_err(|error| format!("cannot read {}: {error}", escaped(path)))?;
-        return Ok(vec![(path.to_owned(), metadata.len())]);
+    if sent_by_name(root, path) {
+        return named_files(root, path, &mut known);
     }
     let carried = swept_folder(root, folder, globs, log, &mut known)?;
     match own.iter().find(|own| !carried.iter().any(|(file, _)| file.eq_ignore_ascii_case(own))) {
         Some(left) => Err(format!("{} is left out of the files its folder sends", escaped(left))),
         None => Ok(carried),
     }
+}
+
+/// The files the candidate `path`, sent by name, carries, each with its size: itself first, then, for any candidate but
+/// a project or solution file, breadth first, each file a scanned file among them names ([`is_scanned`],
+/// [`files_named_in`]), once each in any ASCII letter case, so a cycle ends. A wildcard names no file, so `Include="$(MSBuildThisFileDirectory)*.cs"` carries nothing. Which of them
+/// git ignores is not asked here. A path named that is a folder or does not exist is left to [`references_outside`].
+///
+/// # Errors
+///
+/// Why a file cannot be carried: a named file is, or lies under, a link or a junction ([`IN_LINK`]) or lies in another
+/// repository ([`IN_NESTED`], the answers kept in `known`), the last part of its path is one the inputs never send,
+/// or a file cannot be read.
+fn named_files(root: &Path, path: &str, known: &mut HashMap<String, bool>) -> Result<Vec<(String, u64)>, String> {
+    let sweep = Globs::inputs(&["**".to_owned()], &format!("(?i){EXCLUDED}|{NOT_SWEPT}"))?;
+    let sized = |file: String| {
+        if !sweep.matches(file.rsplit('/').next().unwrap_or(&file)) {
+            return Err(format!("the inputs never send {}", escaped(&file)));
+        }
+        let metadata = fs::metadata(root.join(&file)).map_err(|error| format!("cannot read {}: {error}", escaped(&file)))?;
+        Ok((file, metadata.len()))
+    };
+    let mut listed = vec![sized(path.to_owned())?];
+    if is_project_or_solution(path) {
+        return Ok(listed);
+    }
+    let mut seen = HashSet::from([path.to_ascii_lowercase()]);
+    let mut next = 0;
+    while let Some((file, _)) = listed.get(next) {
+        next += 1;
+        if !is_scanned(file) {
+            continue;
+        }
+        for named in files_named_in(root, file)? {
+            if !seen.insert(named.to_ascii_lowercase()) {
+                continue;
+            }
+            if under_link(root, &named) {
+                return Err(IN_LINK.to_owned());
+            }
+            if nested_folder(root, &named, known).is_some() {
+                return Err(IN_NESTED.to_owned());
+            }
+            listed.push(sized(named)?);
+        }
+    }
+    Ok(listed)
+}
+
+/// The existing files below `root` that the scanned `file` names: each quoted value ([`quoted_values`]) of its text
+/// without comments that is a relative path ([`relative_reference`]), resolved against its own folder
+/// ([`referenced_below`]). A project or solution file is left out: it needs its folder's files, so
+/// [`references_outside`] keeps asking about it.
+///
+/// # Errors
+///
+/// Why the file cannot be read ([`build_text`]).
+fn files_named_in(root: &Path, file: &str) -> Result<Vec<String>, String> {
+    let text = without_comments(&build_text(root, file)?);
+    let at = folder_of(file);
+    Ok(text
+        .lines()
+        .flat_map(quoted_values)
+        .filter_map(|value| relative_reference(value, false).and_then(|value| referenced_below(at, value)))
+        .filter(|named| !is_project_or_solution(named) && root.join(named).is_file())
+        .collect())
 }
 
 /// Every file at any depth below `folder`, `/`-separated below `root` (the root itself when empty), that a walk lists
@@ -674,11 +750,10 @@ fn under_link(root: &Path, folder: &str) -> bool {
 /// included, `/`-separated below `root`, nearest first. The candidate's own folder is not asked: its sweep carries its
 /// files. A path that is neither a folder nor a project or solution file names none.
 fn build_context_above(root: &Path, path: &str) -> Vec<String> {
-    let file = is_input_file(path);
-    if file && !is_project_or_solution(path) {
+    if names_a_file(root, path) && !is_project_or_solution(path) {
         return Vec::new();
     }
-    let folder = candidate_folder(path);
+    let folder = candidate_folder(root, path);
     let mut parts: Vec<&str> = folder.split('/').filter(|part| !part.is_empty()).collect();
     parts.pop();
     let mut above = Vec::new();
@@ -703,15 +778,16 @@ fn build_context_above(root: &Path, path: &str) -> Vec<String> {
 /// back that a build reads ([`is_scanned`]), every quoted value ([`quoted_values`]) that is a relative path
 /// ([`relative_reference`]), resolved against that file's own folder ([`referenced_below`]), `/`-separated below
 /// `root`, that lies outside what the candidate carries, in any ASCII letter case, and exists as a file or a folder. A
-/// candidate that carries only itself ([`carries_only_itself`]) follows every relative path but its own; any other
-/// follows those that climb. A folder is asked as itself, since git reports an ignored folder.
+/// candidate sent by name ([`sent_by_name`]) follows every relative path but its own, and
+/// [`Machine::unsent_build_context`] drops those it carries; any other follows those that climb. A folder is asked as
+/// itself, since git reports an ignored folder.
 ///
 /// # Errors
 ///
 /// Why a scanned file cannot be read: the build reads it, so nothing tells whether it is sent.
 fn references_outside(root: &Path, path: &str, carried: &[(String, u64)]) -> Result<Vec<String>, String> {
-    let alone = carries_only_itself(path, carried);
-    let folder = candidate_folder(path);
+    let alone = sent_by_name(root, path);
+    let folder = candidate_folder(root, path);
     let mut found = Vec::new();
     for (file, _) in carried {
         if !is_scanned(file) {
@@ -736,11 +812,6 @@ fn references_outside(root: &Path, path: &str, carried: &[(String, u64)]) -> Res
         }
     }
     Ok(found)
-}
-
-/// Whether the candidate `path` carries only itself: a file the sweep sends alone.
-fn carries_only_itself(path: &str, carried: &[(String, u64)]) -> bool {
-    matches!(carried, [(file, _)] if file.as_str() == path)
 }
 
 /// The relative path `value` names, its leading `$(MSBuildThisFileDirectory)` dropped with the separator after it: none
@@ -881,8 +952,8 @@ type Ignored = (HashSet<String>, HashMap<String, String>);
 ///
 /// Why a carried file a build reads cannot be read ([`references_outside`]).
 fn build_reads(root: &Path, path: &str, carried: &[(String, u64)]) -> BuildReads {
-    let alone = carries_only_itself(path, carried);
-    let folder = candidate_folder(path);
+    let alone = sent_by_name(root, path);
+    let folder = candidate_folder(root, path);
     let beside = |file: &str| alone && folder_of(file) == folder;
     let above = build_context_above(root, path).into_iter().map(|file| {
         let said = if beside(&file) { BESIDE } else { ABOVE };
@@ -940,16 +1011,17 @@ fn kept_ignored(carried: &[(String, u64)], ignored: &HashSet<String>) -> Vec<(St
     carried.iter().filter(|(file, _)| ignored.contains(file)).cloned().collect()
 }
 
-/// The files the candidate `path`, `/`-separated below `root`, names as a build's input: itself when it has an input
-/// file's extension ([`is_input_file`]) and is a file; else, when it is a folder, each file directly in it that is a
-/// project or solution file ([`is_project_or_solution`]), in the order the folder lists them; else none.
+/// The files the candidate `path`, `/`-separated below `root`, names as a build's input: itself when it is a file
+/// ([`names_a_file`]); none when it is a missing path with an input file's extension; else, when it is a folder, each
+/// file directly in it that is a project or solution file ([`is_project_or_solution`]), in the order the folder lists
+/// them; else none.
 ///
 /// # Errors
 ///
 /// Why the folder `path` names cannot be listed.
 fn input_files(root: &Path, path: &str) -> Result<Vec<String>, String> {
     let on_disk = root.join(path);
-    if is_input_file(path) {
+    if names_a_file(root, path) {
         return Ok(if on_disk.is_file() { vec![path.to_owned()] } else { Vec::new() });
     }
     if !on_disk.is_dir() {
@@ -1375,7 +1447,7 @@ impl<'a> Machine<'a> {
             files.retain(|(file, _)| {
                 let carried = sent
                     .iter()
-                    .any(|carried| carried.as_str() == file.as_str() || inside_folder(file, carried));
+                    .any(|carried| carried.eq_ignore_ascii_case(file) || inside_folder(file, carried));
                 !globs.matches(file) && !carried
             });
         }
@@ -3002,6 +3074,152 @@ mod tests {
             machine.gitignored_inputs(&place_of(&root), &["A.csproj".to_owned()], &[]),
             [carrying("A.csproj", &[("A.csproj", 1)])]
         );
+    }
+
+    /// The probe's targets file, which the cases below ask about.
+    const TARGETS: &str = ".tmp/probe/p.targets";
+
+    /// Writes `text` to `path` below `root`, its folder made, and gives back its size.
+    fn wrote(root: &Path, path: &str, text: &str) -> u64 {
+        let file = root.join(path);
+        fs::create_dir_all(file.parent().expect("the file has a folder")).expect("the folder can be made");
+        fs::write(file, text).expect("the file can be written");
+        text.len() as u64
+    }
+
+    /// What `machine` answers for the single candidate `path` below `root`.
+    fn asking(machine: &Machine<'_>, root: &Path, path: &str) -> Vec<GitignoredInput> {
+        machine.gitignored_inputs(&place_of(root), &[path.to_owned()], &[])
+    }
+
+    /// The text of a build file including `value`.
+    fn including(value: &str) -> String {
+        format!("  <Compile Include=\"{value}\" />\n")
+    }
+
+    #[test]
+    fn an_ignored_targets_file_carries_the_file_it_includes() {
+        let (root, _removed, machine) = ignoring_tree("carried-this-folder", ".tmp/\n", &[".tmp/probe/Probe.cs"]);
+        let size = wrote(&root, TARGETS, &including("$(MSBuildThisFileDirectory)Probe.cs"));
+        assert_eq!(
+            asking(&machine, &root, TARGETS),
+            [carrying(TARGETS, &[(TARGETS, size), (".tmp/probe/Probe.cs", 1)])]
+        );
+    }
+
+    #[test]
+    fn a_targets_file_with_a_relative_include_carries_it() {
+        let (root, _removed, machine) = ignoring_tree("carried-relative", ".tmp/\n", &[".tmp/probe/Probe.cs"]);
+        let size = wrote(&root, TARGETS, &including("Probe.cs"));
+        assert_eq!(
+            asking(&machine, &root, TARGETS),
+            [carrying(TARGETS, &[(TARGETS, size), (".tmp/probe/Probe.cs", 1)])]
+        );
+    }
+
+    #[test]
+    fn a_targets_file_reaches_a_file_above_it() {
+        let (root, _removed, machine) = ignoring_tree("carried-above", ".tmp/\n", &[".tmp/Probe.cs"]);
+        let size = wrote(&root, TARGETS, &including(r"..\Probe.cs"));
+        assert_eq!(
+            asking(&machine, &root, TARGETS),
+            [carrying(TARGETS, &[(TARGETS, size), (".tmp/Probe.cs", 1)])]
+        );
+    }
+
+    #[test]
+    fn a_targets_file_follows_an_import_it_names() {
+        let (root, _removed, machine) = ignoring_tree("carried-import", ".tmp/\n", &[".tmp/probe/Q.cs"]);
+        let size = wrote(&root, TARGETS, "  <Import Project=\"q.props\" />\n");
+        let props = wrote(&root, ".tmp/probe/q.props", &including("Q.cs"));
+        assert_eq!(
+            asking(&machine, &root, TARGETS),
+            [carrying(
+                TARGETS,
+                &[(TARGETS, size), (".tmp/probe/q.props", props), (".tmp/probe/Q.cs", 1)]
+            )]
+        );
+    }
+
+    #[test]
+    fn two_targets_files_naming_each_other_are_each_carried_once() {
+        let (root, _removed, machine) = ignoring_tree("carried-cycle", ".tmp/\n", &[]);
+        let size = wrote(&root, TARGETS, "  <Import Project=\"q.targets\" />\n");
+        let other = wrote(&root, ".tmp/probe/q.targets", "  <Import Project=\"P.TARGETS\" />\n");
+        assert_eq!(
+            asking(&machine, &root, TARGETS),
+            [carrying(TARGETS, &[(TARGETS, size), (".tmp/probe/q.targets", other)])]
+        );
+    }
+
+    #[test]
+    fn a_targets_file_naming_a_missing_file_carries_itself() {
+        let (root, _removed, machine) = ignoring_tree("carried-missing", ".tmp/\n", &[]);
+        let size = wrote(&root, TARGETS, &including("Gone.cs"));
+        assert_eq!(asking(&machine, &root, TARGETS), [carrying(TARGETS, &[(TARGETS, size)])]);
+    }
+
+    #[test]
+    fn a_targets_file_naming_a_tracked_file_sends_it_by_the_snapshot() {
+        let (root, _removed, machine) = ignoring_tree("carried-tracked", ".tmp/\n", &["src/Tracked.cs"]);
+        git_in(&root, &["add", "--", "src/Tracked.cs"]);
+        let size = wrote(&root, TARGETS, &including(r"..\..\src\Tracked.cs"));
+        assert_eq!(asking(&machine, &root, TARGETS), [carrying(TARGETS, &[(TARGETS, size)])]);
+    }
+
+    #[test]
+    fn a_targets_file_naming_an_ignored_folder_stays_here() {
+        let (root, _removed, machine) = ignoring_tree("carried-folder", ".tmp/\n", &[".tmp/probe/stuff/a.cs"]);
+        wrote(&root, TARGETS, &including("stuff"));
+        assert_eq!(
+            asking(&machine, &root, TARGETS),
+            [unsent(TARGETS, "the build reads .tmp/probe/stuff outside its folder, which is not sent")]
+        );
+    }
+
+    #[test]
+    fn a_targets_file_naming_an_ignored_project_stays_here() {
+        let (root, _removed, machine) = ignoring_tree("carried-project", ".tmp/\n", &[".tmp/probe/Core.csproj"]);
+        wrote(&root, TARGETS, &including("Core.csproj"));
+        assert_eq!(
+            asking(&machine, &root, TARGETS),
+            [unsent(
+                TARGETS,
+                "the build reads .tmp/probe/Core.csproj outside its folder, which is not sent"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_targets_file_naming_an_env_file_stays_here() {
+        let (root, _removed, machine) = ignoring_tree("carried-env", ".tmp/\n", &[".tmp/probe/.env"]);
+        wrote(&root, TARGETS, &including(".env"));
+        assert_eq!(
+            asking(&machine, &root, TARGETS),
+            [unsent(TARGETS, "the inputs never send .tmp/probe/.env")]
+        );
+    }
+
+    #[test]
+    fn an_ignored_env_file_a_word_names_stays_here() {
+        let (root, _removed, machine) = ignoring_tree("carried-env-word", ".tmp/\n", &[".tmp/.env"]);
+        assert_eq!(
+            asking(&machine, &root, ".tmp/.env"),
+            [unsent(".tmp/.env", "the inputs never send .tmp/.env")]
+        );
+    }
+
+    #[test]
+    fn an_ignored_source_file_a_word_names_carries_itself() {
+        let (root, _removed, machine) = ignoring_tree("carried-source", ".tmp/\n", &[".tmp/a.cs", ".tmp/b.cs"]);
+        assert_eq!(asking(&machine, &root, ".tmp/a.cs"), [carrying(".tmp/a.cs", &[(".tmp/a.cs", 1)])]);
+    }
+
+    #[test]
+    fn a_commented_out_include_is_not_carried() {
+        let (root, _removed, machine) = ignoring_tree("carried-comment", ".tmp/\n", &[".tmp/probe/Probe.cs"]);
+        let size = wrote(&root, TARGETS, "<!-- <Compile Include=\"Probe.cs\" /> -->\n");
+        assert_eq!(asking(&machine, &root, TARGETS), [carrying(TARGETS, &[(TARGETS, size)])]);
     }
 
     #[test]
