@@ -105,9 +105,9 @@ const END_PASSES: usize = 5;
 /// The wall time under which a passed run is too short to judge its slot by, so it gets no cores line.
 const HINT_MIN_WALL: Duration = Duration::from_secs(10);
 /// How long a routed run waits for its worktree's work folder while another of its runs holds it, before it falls back
-/// here as `busy` ([`Run::take_key`]), but a desktop run, which waits its ceiling ([`key_limit`]); also the
-/// bound of a finished local build's one waiting take of the key, which no
-/// drain marker holds off ([`KeyTake::Bounded`]).
+/// here as `busy` ([`Run::take_key`]), but a run that waits its ceiling ([`waits_its_ceiling`], [`key_limit`]); also the
+/// bound of a finished local build's one waiting take of the key, which no drain marker holds off
+/// ([`KeyTake::Bounded`]).
 const KEY_WAIT: Duration = Duration::from_secs(90);
 /// How long a passing build here retries the work folder's key to write its built-here record, as another write here
 /// holds it for milliseconds ([`Run::try_folder_key`]).
@@ -3253,8 +3253,9 @@ impl Run<'_> {
     /// Takes the lock of the call's work-folder key: at once when no other run of the worktree holds it, and else after
     /// waiting up to the run's key-wait bound for the holder to let it go, saying the wait in a line with the holder's
     /// time left when its remote claim carries a usual run time, and a still-waiting line each heartbeat; the lock and
-    /// how long the run waited for it. When a warm-up of the work folder holds the key, the run falls back at once, as
-    /// it did before the wait, but a desktop run waits it out as it waits out any holder ([`warm_up_sends_busy`]). Else
+    /// how long the run waited for it. When a warm-up of the work folder holds the key, a run that keeps the short wait
+    /// falls back at once, as it did before the wait, but a run that waits its ceiling ([`waits_its_ceiling`]) waits
+    /// the warm-up out as it waits out any holder ([`warm_up_sends_busy`]). Else
     /// how the run goes on: `busy`, when the lock is held past the bound or cannot be opened or taken, which says why,
     /// here or, for a pinned or desktop run, ended ([`Run::fell_back`]); or interrupted during the wait, which says so
     /// and journals the abandon.
@@ -3309,10 +3310,11 @@ impl Run<'_> {
         let mut marker_said = drain::ProbeSaid::default();
         let mut past_bound_said = false;
         let desktop = self.is_desktop(remote);
-        if warm_up_sends_busy(desktop, || warm_up_holds(&self.root.path, &remote.key, console, &mut probe_said)) {
+        let patient = waits_its_ceiling(self.request, desktop, self.staging.is_some());
+        if warm_up_sends_busy(patient, || warm_up_holds(&self.root.path, &remote.key, console, &mut probe_said)) {
             return Err(busy(self, console));
         }
-        let bound = key_limit(self.request, desktop);
+        let bound = key_limit(self.request, patient);
         let heartbeat = self.request.test_seams.heartbeat_ms.map_or(wait::HEARTBEAT, Duration::from_millis);
         let mut next = heartbeat;
         let left = holder_time_left(&mut self.survey, &self.root.path, call.key, console);
@@ -3348,8 +3350,8 @@ impl Run<'_> {
                 say_once(console, &mut past_bound_said, KEY_HELD_OFF_LINE);
             }
             if waited >= next {
-                // A warm-up that took the key during the wait is not waited for either, but by a desktop run.
-                if warm_up_sends_busy(desktop, || warm_up_holds(&self.root.path, &remote.key, console, &mut probe_said)) {
+                // A warm-up that took the key during the wait is not waited for either, but by a run that waits its ceiling.
+                if warm_up_sends_busy(patient, || warm_up_holds(&self.root.path, &remote.key, console, &mut probe_said)) {
                     return Err(busy(self, console));
                 }
                 console.err(&format!(
@@ -5590,11 +5592,18 @@ fn fallback_head(host: &str, reason: FallbackReason, detail: Option<&str>) -> St
     }
 }
 
+/// Whether a routed run of `request` waits out its work folder's other holders up to its own ceiling: a `desktop` run,
+/// which never runs here, and a heavy run, which here would take a heavy slot for its whole length and build again what
+/// the work folder already holds. A commit's stage (`staged`) and a light run keep the short wait.
+fn waits_its_ceiling(request: &RunRequest, desktop: bool, staged: bool) -> bool {
+    desktop || (request.slot == Slot::Heavy && !staged)
+}
+
 /// How long a routed run of `request` waits for its worktree's work folder while another of its runs holds it
-/// ([`Run::take_key`]): `--test-key-wait-ms`, else the run's own ceiling for a `desktop` run, which never runs here and
-/// so waits for the folder as long as it may run there, else [`KEY_WAIT`].
-fn key_limit(request: &RunRequest, desktop: bool) -> Duration {
-    let unseamed = if desktop {
+/// ([`Run::take_key`]): `--test-key-wait-ms`, else the run's own ceiling for a run that `patient` waits its ceiling
+/// ([`waits_its_ceiling`]), which waits for the folder as long as it may run there, else [`KEY_WAIT`].
+fn key_limit(request: &RunRequest, patient: bool) -> Duration {
+    let unseamed = if patient {
         Duration::from_secs(request.timeout.floor())
     } else {
         KEY_WAIT
@@ -5603,9 +5612,10 @@ fn key_limit(request: &RunRequest, desktop: bool) -> Duration {
 }
 
 /// Whether a warm-up holding the work folder's key, which `held` probes, sends a routed run `busy` at once: it does for
-/// any run but a `desktop` one, which never runs here and waits the warm-up out within its key limit ([`key_limit`]).
-fn warm_up_sends_busy(desktop: bool, held: impl FnOnce() -> bool) -> bool {
-    !desktop && held()
+/// any run that keeps the short wait, and not for one that `patient` waits its ceiling out within its key limit
+/// ([`waits_its_ceiling`], [`key_limit`]).
+fn warm_up_sends_busy(patient: bool, held: impl FnOnce() -> bool) -> bool {
+    !patient && held()
 }
 
 /// Whether a routed run asking for the desktop as `desktop` says is a desktop run, which never runs here: never a
@@ -5893,8 +5903,8 @@ mod tests {
     }
 
     #[test]
-    fn a_desktop_run_waits_out_a_warm_up_holding_its_key_and_any_other_run_goes_busy() {
-        assert!(!super::warm_up_sends_busy(true, || true), "a desktop run waits the warm-up out");
+    fn a_patient_run_waits_out_a_warm_up_holding_its_key_and_any_other_run_goes_busy() {
+        assert!(!super::warm_up_sends_busy(true, || true), "a patient run waits the warm-up out");
         assert!(super::warm_up_sends_busy(false, || true), "any other run goes busy at once");
         assert!(!super::warm_up_sends_busy(false, || false), "no warm-up holds the key");
     }
@@ -5928,26 +5938,52 @@ mod tests {
     }
 
     #[test]
-    fn a_desktop_runs_key_limit_is_its_ceiling_and_any_other_runs_is_the_key_wait() {
+    fn a_patient_runs_key_limit_is_its_ceiling_and_any_other_runs_is_the_key_wait() {
         let mut request = crate::wait::scratch::request(Slot::Heavy);
         request.timeout = gate_args::Ceiling::Given(900);
         assert_eq!(
             super::key_limit(&request, true),
             Duration::from_mins(15),
-            "a desktop run waits up to its ceiling"
+            "a patient run waits up to its ceiling"
         );
         assert_eq!(super::key_limit(&request, false), super::KEY_WAIT, "any other run waits the key wait");
         request.test_seams.key_wait_ms = Some(250);
         assert_eq!(
             super::key_limit(&request, true),
             Duration::from_millis(250),
-            "the seam wins for a desktop run"
+            "the seam wins for a patient run"
         );
         assert_eq!(
             super::key_limit(&request, false),
             Duration::from_millis(250),
             "the seam wins for any other run"
         );
+    }
+
+    #[test]
+    fn a_heavy_run_waits_its_ceiling() {
+        let request = crate::wait::scratch::request(Slot::Heavy);
+        assert!(super::waits_its_ceiling(&request, false, false), "a heavy run waits its ceiling");
+    }
+
+    #[test]
+    fn a_light_run_keeps_the_short_wait() {
+        let request = crate::wait::scratch::request(Slot::Light);
+        assert!(!super::waits_its_ceiling(&request, false, false), "a light run keeps the short wait");
+    }
+
+    #[test]
+    fn a_commit_stage_keeps_the_short_wait() {
+        let request = crate::wait::scratch::request(Slot::Heavy);
+        assert!(!super::waits_its_ceiling(&request, false, true), "a commit's stage keeps the short wait");
+    }
+
+    #[test]
+    fn a_desktop_run_waits_its_ceiling_whatever_its_slot() {
+        let light = crate::wait::scratch::request(Slot::Light);
+        let heavy = crate::wait::scratch::request(Slot::Heavy);
+        assert!(super::waits_its_ceiling(&light, true, false), "a desktop light run waits its ceiling");
+        assert!(super::waits_its_ceiling(&heavy, true, true), "a desktop commit stage waits its ceiling");
     }
 
     #[test]

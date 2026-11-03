@@ -496,6 +496,8 @@ pub(super) fn dotnet_gate(case: &Case, log: &str, steps: &Path, command: &[&str]
 /// options before the command.
 pub(super) struct Tuned<'a> {
     pub(super) kind: &'a str,
+    /// The run's `--slot`, `heavy` unless the case is about a light run.
+    pub(super) slot: &'a str,
     pub(super) timeout: &'a str,
     /// The run's `--stall`, [`CLIENT_STALL`] unless the case is about the window itself.
     pub(super) stall: &'a str,
@@ -515,6 +517,7 @@ impl Default for Tuned<'_> {
     fn default() -> Self {
         Tuned {
             kind: "local",
+            slot: "heavy",
             timeout: "3600",
             stall: CLIENT_STALL,
             extra: &[],
@@ -545,6 +548,7 @@ pub(super) fn client_gate_tuned(case: &Case, log: &str, steps: &Path, tuned: &Tu
     seams.extend(tuned.extra);
     let mut words = heavy_words(log, &seams, command);
     assert_eq!(words[3], "--timeout", "the ceiling's value follows it");
+    words[2] = tuned.slot;
     words[4] = tuned.timeout;
     let mut gate = case.gate(&words);
     gate.env(STEPS_VARIABLE, steps)
@@ -1957,10 +1961,10 @@ fn a_ctrl_c_already_raised_at_the_key_take_abandons_before_busy() {
 }
 
 #[test]
-fn a_routed_run_behind_a_warm_up_falls_back_busy_without_waiting() {
+fn a_light_run_behind_a_warm_up_falls_back_busy_without_waiting() {
     // A work folder with no warm-up consent of its own is warmed by a warm-up the route never probes the lock for, and
     // the run reaches the key with a warm-up holding it. The warm-up lock is held here as a warm-up holds it, and the
-    // run falls back at once rather than wait a warm-up out.
+    // light run falls back at once rather than wait a warm-up out, as it keeps the short wait.
     let case = client_case_of("client-warm-holder", 1);
     let go = Go(case.folder().join("ssh").join("go"));
     let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
@@ -1979,6 +1983,7 @@ fn a_routed_run_behind_a_warm_up_falls_back_busy_without_waiting() {
     let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
     let tuned = Tuned {
         extra: &["--test-key-wait-ms", "3600000"],
+        slot: "light",
         ..Tuned::default()
     };
 
