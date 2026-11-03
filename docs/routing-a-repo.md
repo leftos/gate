@@ -322,6 +322,12 @@ A repo whose short routed runs (a filtered test of a minute) would meet a cold b
 
 Routed runs go to the builder from a new worktree's first run, warm or not: the first run in a new work folder is cold, with its ceiling raised, and says to prewarm the next new worktree with `gate warm`. Run `gate warm` in a new worktree before its first routed run to find the folder warm.
 
+## A repo that fans out many routed runs at once
+
+A worktree has one work folder on each builder, and its routed runs take turns on it: a second run says `gate: waiting for this worktree's work folder on <host>, which another of its runs holds` until the first ends ([design.md](design.md#routing)). So a script that starts many short routed runs in parallel from one worktree runs them one at a time, each paying its own push and fetch.
+
+To fan out, loop over the runs inside one gate call (a tracked wrapper script the repo routes), which keeps one warm folder and pays one push. A fan-out of long, independent runs can use one worktree per lane instead, each lane a cold folder on its first run. The gate gives one worktree no second work folder, since each would be a cold build and its own disk on the builder.
+
 ## A repo that builds with Unreal Engine
 
 The engine is not in the worktree and not on the builder's `PATH`: the builder holds its engines side by side under `GATE_UNREAL_ROOT`, one subfolder per version named `x.y.z`, each with `Engine\Build\Build.version` ([design.md, Tool probes](design.md#the-box-side)). The engine install is not part of `tools/builder/install-toolchains.ps1`: a session installs an engine by hand over ssh. `gate check --builder` shows the versions it lists.
