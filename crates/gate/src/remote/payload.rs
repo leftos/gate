@@ -158,6 +158,10 @@ pub(crate) struct RunCall<'a> {
     /// The SHA-256 of the LFS manifest line of the objects the snapshot's pointers name, without its newline
     /// (`LfsDigest`), `None` for a run whose snapshot holds no pointer.
     pub lfs_digest: Option<&'a str>,
+    /// Each sibling's name and the SHA-256 of the LFS manifest line of the objects its snapshot's pointers name, for
+    /// the siblings that hold any (`SiblingLfsDigests`, sent only when one does), which a warm-up sends too, as it
+    /// sends their content and checks them out.
+    pub sibling_lfs_digests: &'a [(String, String)],
     /// The SHA-256 of the manifest line of the PC's build the send sent the work folder, without its newline
     /// (`SentDigest`), `None` for a run whose send did not land or that has none.
     pub sent_digest: Option<&'a str>,
@@ -212,13 +216,31 @@ pub(crate) fn inputs_word(location: &Location, nonce: &str, step: InputsStep, se
 /// standard input. A diff carries no channel, so only a put's word has one.
 pub(crate) fn put_word(location: &Location, nonce: &str, sent_bin: Option<&str>, channel: Option<(&Asked, u64, &[u8; 32])>) -> String {
     let mut object = inputs_object(location, nonce, InputsStep::Put, sent_bin);
+    insert_put_channel(&mut object, channel);
+    word(&object)
+}
+
+/// The payload word of an LFS diff or put, the [`inputs_word`] of `step`, with a put's `channel` as [`put_word`] adds
+/// it (a diff is given none), and `LfsRepo`, the sibling `repo` whose store the call is for, when it is one; a call for
+/// the main repo's store carries no `LfsRepo`.
+pub(crate) fn lfs_word(location: &Location, nonce: &str, step: InputsStep, repo: Option<&str>, channel: Option<(&Asked, u64, &[u8; 32])>) -> String {
+    let mut object = inputs_object(location, nonce, step, None);
+    if let Some(repo) = repo {
+        object.insert("LfsRepo".to_owned(), json!(repo));
+    }
+    insert_put_channel(&mut object, channel);
+    word(&object)
+}
+
+/// Adds a put's data channel `channel`, when it has one, to `object` as `Channel`, with the archive's `Length` and
+/// `Sha256` ([`put_word`]).
+fn insert_put_channel(object: &mut Map<String, Value>, channel: Option<(&Asked, u64, &[u8; 32])>) {
     if let Some((asked, length, sha256)) = channel {
         let mut channel = channel_object(asked);
         channel.insert("Length".to_owned(), json!(length));
         channel.insert("Sha256".to_owned(), json!(lower_hex(sha256)));
         object.insert("Channel".to_owned(), Value::Object(channel));
     }
-    word(&object)
 }
 
 /// The payload object of an inputs call ([`inputs_word`]).
@@ -411,8 +433,9 @@ fn identity() -> Value {
     )
 }
 
-/// Adds `run`'s `SiblingSnapshots`, when it has any, its `InputsDigest`, when it has one, its `GodotVersion` and
-/// `UnrealVersion`, each when one is chosen, and its `EngineEnv`, when it names any, to `object`.
+/// Adds `run`'s `SiblingSnapshots`, when it has any, its `InputsDigest`, `LfsDigest` and `SentDigest`, each when it has
+/// one, its `SiblingLfsDigests`, when a sibling holds pointers, its `GodotVersion` and `UnrealVersion`, each when one is
+/// chosen, and its `EngineEnv`, when it names any, to `object`.
 fn insert_siblings_and_inputs(object: &mut Map<String, Value>, run: &RunCall<'_>) {
     if let Some(version) = run.godot_version {
         object.insert("GodotVersion".to_owned(), json!(version));
@@ -441,6 +464,14 @@ fn insert_siblings_and_inputs(object: &mut Map<String, Value>, run: &RunCall<'_>
     }
     if let Some(digest) = run.lfs_digest {
         object.insert("LfsDigest".to_owned(), json!(digest));
+    }
+    if !run.sibling_lfs_digests.is_empty() {
+        let digests: Map<String, Value> = run
+            .sibling_lfs_digests
+            .iter()
+            .map(|(name, digest)| (name.clone(), Value::String(digest.clone())))
+            .collect();
+        object.insert("SiblingLfsDigests".to_owned(), Value::Object(digests));
     }
     if let Some(digest) = run.sent_digest {
         object.insert("SentDigest".to_owned(), json!(digest));
@@ -498,7 +529,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        InputsStep, Location, Pair, RunCall, WarmCall, input, inputs_word, job_nonce, location_word, outputs_word, pc_name, preflight_word,
+        InputsStep, Location, Pair, RunCall, WarmCall, input, inputs_word, job_nonce, lfs_word, location_word, outputs_word, pc_name, preflight_word,
         run_nonce, run_word, warm_word,
     };
     use crate::remote::transport::Profile;
@@ -662,6 +693,7 @@ mod tests {
             commit_stage_head: None,
             inputs_digest: None,
             lfs_digest: None,
+            sibling_lfs_digests: &[],
             sent_digest: None,
             env: &[],
             godot_version: None,
@@ -812,6 +844,91 @@ mod tests {
     }
 
     #[test]
+    fn a_run_with_sibling_lfs_digests_sends_them_and_the_box_reads_them_back() {
+        let digest = "cd".repeat(32);
+        let digests = [("tools".to_owned(), digest.clone())];
+        let run = RunCall {
+            sibling_lfs_digests: &digests,
+            ..warm_run(&[], None)
+        };
+
+        let word = run_word(&paired(), &run);
+
+        assert_eq!(
+            decoded(&word)["SiblingLfsDigests"],
+            json!({ "tools": digest }),
+            "only the siblings that hold pointers"
+        );
+        let payload = on_the_box(&word);
+        let pair = payload.pair().expect("the box takes the pair");
+        assert_eq!(
+            payload.sibling_lfs_digests(pair.as_ref()),
+            Ok(vec![None, Some(digest.as_str())]),
+            "in the pair's order, none for the sibling without pointers"
+        );
+    }
+
+    #[test]
+    fn a_run_without_sibling_lfs_digests_sends_none() {
+        let paired_word = run_call(&[]);
+        assert!(
+            decoded(&paired_word).get("SiblingLfsDigests").is_none(),
+            "no SiblingLfsDigests key: {paired_word}"
+        );
+        let payload = on_the_box(&paired_word);
+        let pair = payload.pair().expect("the box takes the pair");
+        assert_eq!(payload.sibling_lfs_digests(pair.as_ref()), Ok(vec![None, None]));
+        let alone = decoded(&run_word(&location(), &warm_run(&[], None)));
+        assert!(alone.get("SiblingLfsDigests").is_none(), "a run of one repo sends none: {alone}");
+    }
+
+    /// A warm-up sends the siblings' content and checks them out, so it carries their digests as a run does.
+    #[test]
+    fn a_warm_call_sends_sibling_lfs_digests_as_a_run_does() {
+        let digest = "cd".repeat(32);
+        let digests = [("lib".to_owned(), digest.clone())];
+        let run = RunCall {
+            sibling_lfs_digests: &digests,
+            ..warm_run(&[], None)
+        };
+        let commands = warm_commands();
+        let warm = WarmCall {
+            commands: &commands,
+            hash: WARM_HASH,
+        };
+
+        let sent = decoded(&warm_word(&paired(), &run, &warm));
+
+        assert_eq!(sent["SiblingLfsDigests"], json!({ "lib": digest }), "{sent}");
+        let payload = on_the_box(&warm_word(&paired(), &run, &warm));
+        let pair = payload.pair().expect("the box takes the pair");
+        assert_eq!(payload.sibling_lfs_digests(pair.as_ref()), Ok(vec![Some(digest.as_str()), None]));
+        let none = decoded(&warm_word(&paired(), &warm_run(&[], None), &warm));
+        assert!(none.get("SiblingLfsDigests").is_none(), "no sibling holds pointers, none sent: {none}");
+    }
+
+    /// An LFS call for a sibling's store names it as `LfsRepo`, which the box resolves against the pair; a call for the
+    /// main repo's store is the inputs word of its step, with no `LfsRepo`.
+    #[test]
+    fn an_lfs_word_for_a_sibling_carries_lfs_repo_and_one_for_the_main_carries_none() {
+        let diff = decoded(&lfs_word(&paired(), NONCE, InputsStep::Diff, Some("lib"), None));
+        assert_eq!(diff["LfsRepo"], json!("lib"));
+        assert_eq!((&diff["Step"], &diff["Nonce"]), (&json!("diff"), &json!(NONCE)));
+        let put = decoded(&lfs_word(&paired(), NONCE, InputsStep::Put, Some("tools"), None));
+        assert_eq!((&put["LfsRepo"], &put["Step"]), (&json!("tools"), &json!("put")));
+        assert_eq!(
+            decoded(&lfs_word(&paired(), NONCE, InputsStep::Diff, None, None)),
+            decoded(&inputs_word(&paired(), NONCE, InputsStep::Diff, None)),
+            "the main's diff carries no LfsRepo"
+        );
+        assert_eq!(
+            decoded(&lfs_word(&location(), NONCE, InputsStep::Put, None, None)),
+            decoded(&super::put_word(&location(), NONCE, None, None)),
+            "the main's put is the put word"
+        );
+    }
+
+    #[test]
     fn a_commit_stage_run_word_sends_commit_stage_and_head() {
         let head = "0123456789abcdef0123456789abcdef01234567";
         let run = RunCall {
@@ -914,6 +1031,7 @@ mod tests {
             commit_stage_head: None,
             inputs_digest: None,
             lfs_digest: None,
+            sibling_lfs_digests: &[],
             sent_digest: None,
             env: &[],
             godot_version: None,
@@ -965,6 +1083,7 @@ mod tests {
             commit_stage_head: None,
             inputs_digest: Some("ab"),
             lfs_digest: None,
+            sibling_lfs_digests: &[],
             sent_digest: None,
             env: &[],
             godot_version: None,
@@ -1041,6 +1160,7 @@ mod tests {
             commit_stage_head: None,
             inputs_digest: None,
             lfs_digest: None,
+            sibling_lfs_digests: &[],
             sent_digest: None,
             env: &env,
             godot_version: None,
@@ -1085,6 +1205,7 @@ mod tests {
             commit_stage_head: None,
             inputs_digest: None,
             lfs_digest: None,
+            sibling_lfs_digests: &[],
             sent_digest: None,
             env: &[],
             godot_version: Some("4.7.2"),
@@ -1135,6 +1256,7 @@ mod tests {
             commit_stage_head: None,
             inputs_digest: None,
             lfs_digest: None,
+            sibling_lfs_digests: &[],
             sent_digest: None,
             env: &[],
             godot_version: None,
@@ -1186,6 +1308,7 @@ mod tests {
             commit_stage_head: None,
             inputs_digest: None,
             lfs_digest: None,
+            sibling_lfs_digests: &[],
             sent_digest: None,
             env: &[],
             godot_version: None,
@@ -1241,6 +1364,7 @@ mod tests {
             commit_stage_head: None,
             inputs_digest: None,
             lfs_digest: None,
+            sibling_lfs_digests: &[],
             sent_digest: None,
             env: &[],
             godot_version: None,
@@ -1328,6 +1452,7 @@ mod tests {
             commit_stage_head: None,
             inputs_digest: None,
             lfs_digest: None,
+            sibling_lfs_digests: &[],
             sent_digest: None,
             env: &[],
             godot_version: None,
@@ -1381,6 +1506,7 @@ mod tests {
             commit_stage_head: None,
             inputs_digest: None,
             lfs_digest: None,
+            sibling_lfs_digests: &[],
             sent_digest: None,
             env: &[],
             godot_version: None,
@@ -1451,6 +1577,7 @@ mod tests {
             commit_stage_head: None,
             inputs_digest,
             lfs_digest: None,
+            sibling_lfs_digests: &[],
             sent_digest: None,
             env: &[],
             godot_version: None,

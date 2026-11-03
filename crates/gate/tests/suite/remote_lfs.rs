@@ -296,19 +296,203 @@ fn a_scratch_folder_the_builder_cannot_make_falls_back_lfs_naming_it() {
     );
 }
 
-#[test]
-fn a_pair_with_pointers_falls_back_lfs_before_any_call() {
-    let (case, main, _, sibling) = pair_case("client-lfs-pair", &[], sibling_repository);
-    with_lfs_file(&case);
-    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+/// The content of a pair's sibling's LFS file, `b.bin`, which its snapshot holds as a pointer.
+const SIBLING_CONTENT: &str = "the sibling's LFS file's content, never pointer text\n";
 
-    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran"]));
+/// Makes `sibling` a repository of its own, beside `lib.txt`, whose `*.bin` files git-lfs keeps, its filter set in the
+/// repository alone, and commits `b.bin` holding [`SIBLING_CONTENT`], so the sibling's LFS store holds its object.
+fn sibling_with_lfs_file(case: &Case, sibling: &Path) {
+    sibling_repository(case, sibling);
+    let at = shown(sibling);
+    git(case, &["-C", &at, "lfs", "install", "--local", "--skip-repo"]);
+    fs::write(sibling.join(".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n").expect("the sibling's attributes can be written");
+    fs::write(sibling.join("b.bin"), SIBLING_CONTENT).expect("the sibling's LFS file can be written");
+    git(case, &["-C", &at, "add", "-A"]);
+    git(case, &["-C", &at, "commit", "--quiet", "-m", "lfs"]);
+}
+
+/// Has the pair case's routing file send its `cmd *` commands to the builder too, beside the sibling `sibling_name`.
+fn pair_routed(case: &Case, sibling_name: &str) {
+    let repo = repo_name(&leaf(case));
+    let routing = json!({
+        "host": HOST,
+        "slots": 2,
+        "repos": { &repo: ["*tool*", "cmd *"] },
+        "outputs": { &repo: [] },
+        "siblings": { &repo: [sibling_name] },
+    });
+    crate::support::write_remote_json(case, &routing.to_string());
+}
+
+/// The path of the object of `content` in the LFS store of the git folder `git_folder`, a worktree's `.git` or a bare.
+fn object_in(git_folder: &Path, content: &str) -> PathBuf {
+    let oid = sha256(content.as_bytes());
+    git_folder.join("lfs").join("objects").join(&oid[..2]).join(&oid[2..4]).join(&oid)
+}
+
+/// The `LfsDigest` of a snapshot whose one pointer names `content`.
+fn digest_of(content: &str) -> String {
+    sha256(format!("{} {}", sha256(content.as_bytes()), content.len()).as_bytes())
+}
+
+/// The command that prints the main repo's `a.bin` and then the sibling `sibling_name`'s `b.bin`.
+fn print_both(sibling_name: &str) -> [String; 5] {
+    ["cmd", "/c", "type", "a.bin", &format!(r"..\{sibling_name}\b.bin")].map(str::to_owned)
+}
+
+/// A pair both of whose repos hold pointers sends each repo's content to its own store, the main repo's first: a diff
+/// and a put each, the sibling's carrying `LfsRepo`; the run call carries both digests, and the command reads both.
+#[test]
+fn a_pair_whose_repos_both_hold_pointers_sends_each_repo_s_content() {
+    let (case, _, name, sibling) = pair_case("client-lfs-pair", &[], sibling_with_lfs_file);
+    with_lfs_file(&case);
+    pair_routed(&case, &name);
+    let steps = run_kept(&case, 6);
+    let words = print_both(&name);
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &words));
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        calls(&steps),
+        ["preflight", "lfs", "lfs", "lfs", "lfs", "run"],
+        "the main's diff and put, then the sibling's"
+    );
+    let request = kept_request(&steps);
+    assert_eq!(request["LfsDigest"], json!(digest_of(CONTENT)), "{request}");
+    assert_eq!(request["SiblingLfsDigests"], json!({ &name: digest_of(SIBLING_CONTENT) }), "{request}");
+    let builder = case.folder().join("builder");
+    assert!(
+        object_in(&builder.join(format!("{}.git", repo_name(&leaf(&case)))), CONTENT).is_file(),
+        "the main's store holds its object"
+    );
+    assert!(
+        object_in(&builder.join(format!("{}.git", repo_name(&name))), SIBLING_CONTENT).is_file(),
+        "the sibling's store holds its object"
+    );
+    assert!(outcome.stdout.contains(CONTENT.trim_end()), "the main's object's bytes: {outcome:?}");
+    assert!(
+        outcome.stdout.contains(SIBLING_CONTENT.trim_end()),
+        "the sibling's object's bytes: {outcome:?}"
+    );
+    assert!(!outcome.stdout.contains("git-lfs.github.com"), "no pointer text: {outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+/// A pair whose sibling alone holds pointers sends the sibling's content alone: the run call carries no `LfsDigest` and
+/// the sibling's entry of `SiblingLfsDigests`.
+#[test]
+fn a_pair_whose_sibling_alone_holds_pointers_sends_only_the_sibling_s_content() {
+    let (case, _, name, sibling) = pair_case("client-lfs-pair-sibling-alone", &[], sibling_with_lfs_file);
+    pair_routed(&case, &name);
+    let steps = run_kept(&case, 4);
+    let file = format!(r"..\{name}\b.bin");
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &["cmd", "/c", "type", &file]));
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "lfs", "lfs", "run"], "the sibling's diff, then its put");
+    let request = kept_request(&steps);
+    assert!(request.get("LfsDigest").is_none(), "the main holds no pointer: {request}");
+    assert_eq!(request["SiblingLfsDigests"], json!({ &name: digest_of(SIBLING_CONTENT) }), "{request}");
+    assert!(
+        outcome.stdout.contains(SIBLING_CONTENT.trim_end()),
+        "the sibling's object's bytes: {outcome:?}"
+    );
+    assert!(!outcome.stdout.contains("git-lfs.github.com"), "no pointer text: {outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+/// The steps file `name` of a run of `count` calls whose call at `kept`, counted from 0, the stand-in keeps the input
+/// of, its go file `{name}-go` made first; a second run of the case names its own.
+fn kept_steps_named(case: &Case, name: &str, count: usize, kept: usize) -> PathBuf {
+    let go = case.folder().join("ssh").join(format!("{name}-go"));
+    fs::create_dir_all(case.folder().join("ssh")).expect("the stand-in's folder can be made");
+    fs::write(&go, "").expect("the go file can be made");
+    let held = format!("fed-hold {}", shown(&go));
+    let mut steps = vec!["ok"; count];
+    steps[kept] = held.as_str();
+    ssh_steps(case, name, &steps)
+}
+
+/// A pair whose main repo alone holds pointers sends the main's content as a run of one repo does: its calls carry no
+/// `LfsRepo`, and the run call carries `LfsDigest` and no `SiblingLfsDigests`.
+#[test]
+fn a_pair_whose_main_alone_holds_pointers_sends_no_lfs_repo() {
+    let (case, _, name, sibling) = pair_case("client-lfs-pair-main-alone", &[], sibling_repository);
+    with_lfs_file(&case);
+    pair_routed(&case, &name);
+    let first = kept_steps_named(&case, "first", 4, 2);
+    let sent = finish(client_gate(&case, "first.log", &first, &PRINT));
+    let put = kept_put_request(&first);
+    let second = kept_steps_named(&case, "second", 3, 2);
+
+    let outcome = finish(client_gate(&case, "second.log", &second, &PRINT));
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+
+    assert_eq!(sent.code, Some(0), "{sent:?}");
+    assert_eq!(calls(&first), ["preflight", "lfs", "lfs", "run"], "the main's diff and put");
+    assert_eq!(put["Step"], json!("put"), "{put}");
+    assert!(put.get("LfsRepo").is_none(), "the main's put names no repo: {put}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&second), ["preflight", "lfs", "run"], "the main's diff alone");
+    let request = kept_request(&second);
+    assert_eq!(request["LfsDigest"], json!(digest_of(CONTENT)), "{request}");
+    assert!(request.get("SiblingLfsDigests").is_none(), "no sibling holds pointers: {request}");
+    assert!(outcome.stdout.contains(CONTENT.trim_end()), "the object's bytes: {outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+/// A pair whose sibling holds pointers and a non-empty `info/attributes` falls back `lfs` before any call, as a run of
+/// one such repo does, the line naming the sibling.
+#[test]
+fn a_pair_whose_sibling_has_info_attributes_falls_back_lfs_naming_it() {
+    let (case, _, name, sibling) = pair_case("client-lfs-pair-sibling-info", &[], sibling_with_lfs_file);
+    pair_routed(&case, &name);
+    let info = sibling.join(".git").join("info");
+    fs::create_dir_all(&info).expect("the sibling's info folder can be made");
+    fs::write(info.join("attributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n").expect("info/attributes can be written");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+    let file = format!(r"..\{name}\b.bin");
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &["cmd", "/c", "type", &file]));
     fs::remove_dir_all(&sibling).expect("the sibling can be removed");
 
     assert_eq!(calls(&steps), Vec::<String>::new(), "no call reached the builder");
-    assert!(outcome.stdout.contains("ran"), "the command ran here: {outcome:?}");
-    let why = format!("{main} holds LFS pointers, and a sibling pair does not send LFS content yet");
-    assert_fell_back(&case, &outcome, "out.log", &why);
+    assert!(outcome.stdout.contains(SIBLING_CONTENT.trim_end()), "the command ran here: {outcome:?}");
+    assert_fell_back(&case, &outcome, "out.log", &format!("gate: remote lfs not sent: {name}: "));
+    assert!(
+        not_sent(&case, "out.log").ends_with(r"\info\attributes sets attributes the builder cannot see"),
+        "{}",
+        not_sent(&case, "out.log")
+    );
+}
+
+/// A pair whose sibling's object the PC lacks falls back `lfs` once the main's content is sent, the line naming the
+/// sibling.
+#[test]
+fn a_pair_whose_sibling_object_is_missing_falls_back_lfs_naming_the_sibling() {
+    let (case, _, name, sibling) = pair_case("client-lfs-pair-sibling-lacks", &[], sibling_with_lfs_file);
+    with_lfs_file(&case);
+    pair_routed(&case, &name);
+    fs::remove_file(object_in(&sibling.join(".git"), SIBLING_CONTENT)).expect("the sibling's object can be removed");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 6]);
+    let words = print_both(&name);
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &words));
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+
+    assert_eq!(
+        calls(&steps),
+        ["preflight", "lfs", "lfs", "lfs"],
+        "the main's diff and put, then the sibling's diff alone"
+    );
+    assert_fell_back(&case, &outcome, "out.log", &format!("gate: remote lfs not sent: {name}: "));
+    assert!(not_sent(&case, "out.log").contains("git lfs fetch"), "the line says to fetch it");
 }
 
 #[test]

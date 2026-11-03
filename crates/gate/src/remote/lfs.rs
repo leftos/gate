@@ -677,24 +677,79 @@ pub(crate) const NO_SCRATCH: &str = "gate: remote cannot make the run's LFS scra
 /// Why a run the box refused `lfs` for its scratch folder falls back.
 const SCRATCH_UNMADE: &str = "the builder could not make the run's LFS scratch folder";
 
-/// A run's LFS content, listed before its preflight: the objects its snapshot's pointers name, their manifest line with
-/// its newline, and the SHA-256 of that line without it, the run call's `LfsDigest`.
+/// One repo's LFS content, listed before the run's preflight: the objects its snapshot's pointers name, their manifest
+/// line with its newline, and the SHA-256 of that line without it, the run call's `LfsDigest` for the main repo or the
+/// repo's entry of `SiblingLfsDigests` for a sibling; and the repo it is of.
 pub(super) struct Sending {
     objects: Vec<Object>,
     line: String,
     pub(super) digest: String,
+    /// The repo's name, which a sibling's LFS calls carry as `LfsRepo` and a pair's failed send names.
+    pub(super) repo: String,
+    /// The repo's root, whose LFS store the objects are read from.
+    root: PathBuf,
+    /// The repo's place among the run's repos, 0 for the main one.
+    pub(super) at: usize,
+    /// Whether the run is a sibling pair's, whose failed send names the repo.
+    paired: bool,
 }
 
-/// The content the pointers `listed` name; else the refusal of more objects than one route carries, or why the
-/// manifest could not be hashed.
-pub(super) fn sending(listed: Listed) -> Result<Sending, String> {
-    let line = manifest_line(&listed.objects)?;
-    let digest = manifest_digest(&listed.objects)?;
+impl Sending {
+    /// The sibling whose store the LFS calls are for, `None` for the main repo's.
+    fn sibling(&self) -> Option<&str> {
+        (self.at > 0).then_some(self.repo.as_str())
+    }
+
+    /// The repo the send's lines name, in a pair; `None` in a run of one repo, whose lines name none.
+    fn named(&self) -> Option<&str> {
+        self.paired.then_some(self.repo.as_str())
+    }
+}
+
+/// The part of an LFS line naming the repo `repo`, `{repo}: `, in a pair; empty with none.
+fn repo_part(repo: Option<&str>) -> String {
+    repo.map_or_else(String::new, |repo| format!("{repo}: "))
+}
+
+/// The content the pointers `listed` of the repo `repo`, at `root` and at `at` among the run's repos, name, `paired`
+/// for a run of a sibling pair; else the refusal of more objects than one route carries, or why the manifest could not
+/// be hashed, naming the repo in a pair ([`of_repo`]).
+pub(super) fn sending(listed: Listed, repo: &str, root: &Path, at: usize, paired: bool) -> Result<Sending, String> {
+    let line = manifest_line(&listed.objects).map_err(|why| of_repo(repo, paired, &why))?;
+    let digest = manifest_digest(&listed.objects).map_err(|why| of_repo(repo, paired, &why))?;
     Ok(Sending {
         objects: listed.objects,
         line,
         digest,
+        repo: repo.to_owned(),
+        root: root.to_path_buf(),
+        at,
+        paired,
     })
+}
+
+/// Why the LFS content of the repo `repo` was not sent, for `why`: named `{repo}: {why}` in a run of a sibling pair
+/// (`paired`), else `why` alone.
+pub(super) fn of_repo(repo: &str, paired: bool, why: &str) -> String {
+    if paired { format!("{repo}: {why}") } else { why.to_owned() }
+}
+
+/// The name, in the main worktree's `.tmp`, of the LFS archive of the repo at `at` among the run's repos, for the run
+/// of `nonce` in the work folder `key`: `{key}-{nonce}.lfs.tar.zst` for the main repo, `{key}-{nonce}.lfs{at}.tar.zst`
+/// for a sibling.
+pub(super) fn archive_name(key: &str, nonce: &str, at: usize) -> String {
+    format!("{key}-{nonce}.{}.tar.zst", file_kind(at))
+}
+
+/// The name, in the main worktree's `.tmp`, of the LFS diff answer of the repo at `at` among the run's repos, as
+/// [`archive_name`] names its archive: `{key}-{nonce}.lfs-diff`, `{key}-{nonce}.lfs{at}-diff` for a sibling.
+pub(super) fn diff_name(key: &str, nonce: &str, at: usize) -> String {
+    format!("{key}-{nonce}.{}-diff", file_kind(at))
+}
+
+/// The kind part of the LFS file names of the repo at `at`: `lfs` for the main repo, `lfs{at}` for a sibling.
+fn file_kind(at: usize) -> String {
+    if at == 0 { "lfs".to_owned() } else { format!("lfs{at}") }
 }
 
 /// The log line saying a run's LFS content was not sent, for `why`.
@@ -708,21 +763,34 @@ pub(super) fn refused(attempt: &mut Attempt<'_, '_>, why: &str) -> End {
     End::Refused(FallbackReason::Lfs)
 }
 
-/// The end of a run call the box refused `lfs`, why said in the log: it could not make the run's LFS scratch folder when
-/// its last error line `last_error` says so ([`NO_SCRATCH`]), else its store does not hold what the snapshot's pointers
-/// name.
+/// The end of a run call the box refused `lfs`, why said in the log ([`run_refused_why`]).
 pub(super) fn run_refused(attempt: &mut Attempt<'_, '_>, last_error: Option<&str>) -> End {
-    let why = if last_error.is_some_and(|line| line.starts_with(NO_SCRATCH)) {
-        SCRATCH_UNMADE
-    } else {
-        NOT_HELD
-    };
-    refused(attempt, why)
+    refused(attempt, &run_refused_why(last_error))
 }
 
-/// Why a pair whose repository `repo` holds LFS pointers sends none.
-pub(super) fn pair_why(repo: &str) -> String {
-    format!("{repo} holds LFS pointers, and a sibling pair does not send LFS content yet")
+/// The start of the box's line for a run whose LFS content is not what the snapshot needs, the work folder's key after
+/// it, then [`NOT_THE_SNAPSHOTS`] and the box's reason (`boxside::lfs::not_the_snapshots`).
+const NOT_THE_SNAPSHOTS_START: &str = "gate: remote lfs of work folder ";
+/// What comes between the key and the box's reason in that line.
+const NOT_THE_SNAPSHOTS: &str = " is not the snapshot's: ";
+
+/// Why a run call the box refused `lfs` falls back, from its last error line `last_error`: it could not make the run's
+/// LFS scratch folder when the line says so ([`NO_SCRATCH`]); else its store does not hold what the snapshot's pointers
+/// name, followed by the box's whole reason, the repo it names in a pair included, when the line gives one.
+fn run_refused_why(last_error: Option<&str>) -> String {
+    let Some(line) = last_error else {
+        return NOT_HELD.to_owned();
+    };
+    if line.starts_with(NO_SCRATCH) {
+        return SCRATCH_UNMADE.to_owned();
+    }
+    match line
+        .strip_prefix(NOT_THE_SNAPSHOTS_START)
+        .and_then(|rest| rest.split_once(NOT_THE_SNAPSHOTS))
+    {
+        Some((_, why)) => format!("{NOT_HELD}: {why}"),
+        None => NOT_HELD.to_owned(),
+    }
 }
 
 /// Why the LFS pointers of the repository `repo` could not be listed, for `why`.
@@ -730,33 +798,53 @@ pub(super) fn unlisted(repo: &str, why: &str) -> String {
     format!("cannot list the LFS pointers of {repo}: {why}")
 }
 
-/// Sends `sending` to the store of the repo at `location` for the run of `nonce`: the diff call, then, when the box
-/// lacks any object, the put of an archive of exactly those, timed in the run's split. `--test-remote-interrupt-at lfs`
-/// raises the console interrupt first. A Ctrl+C ends the run; any other failure refuses the route `lfs`, its reason in
-/// the log. An end no LFS call returns fails the run.
-pub(super) fn send(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, sending: &Sending) -> Result<(), End> {
+/// Sends each repo's content of `sendings`, in their order (the main repo first, then the siblings in the pair's
+/// order), to its store on the builder at `location` for the run of `nonce` ([`sent_to`]): the diff call, then, when
+/// the box lacks any object, the put of an archive of exactly those, each repo's time added to the run's split.
+/// `--test-remote-interrupt-at lfs` raises the console interrupt once, before the first. A Ctrl+C ends the run; any
+/// other failure refuses the route `lfs` at the first repo whose send fails, its reason in the log, naming the repo in
+/// a pair; the objects already put stay in their stores. An end no LFS call returns fails the run. With no content,
+/// nothing is sent.
+pub(super) fn send(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, sendings: &[Sending]) -> Result<(), End> {
+    if sendings.is_empty() {
+        return Ok(());
+    }
     if let Some(interrupt) = attempt.call.interrupt.filter(|_| attempt.raises_at("lfs")) {
         interrupt.raise();
     }
-    attempt.go_on()?;
-    let started = Instant::now();
-    let ended = sent_to(attempt, location, nonce, sending);
-    attempt.split.lfs = Some(started.elapsed());
-    match ended {
-        Ok(()) => Ok(()),
-        Err(Unsent::Ended(End::Interrupted)) => Err(End::Interrupted),
-        Err(Unsent::Ended(End::Failed(why)) | Unsent::Refused(why)) => Err(refused(attempt, &why)),
-        // The box refused for its install, its line said: the run falls back for that, not for its LFS content.
-        Err(Unsent::Ended(End::Refused(FallbackReason::Install))) => Err(End::Refused(FallbackReason::Install)),
-        // The builder's drain refused a session no longer live: the run waits behind it, then starts again.
-        Err(Unsent::Ended(End::Draining(drain))) => Err(End::Draining(drain)),
-        Err(Unsent::Ended(End::Refused(reason))) => Err(refused(attempt, &format!("the LFS call ended {}", reason.as_str()))),
-        Err(Unsent::Ended(other)) => Err(End::Failed(format!("the LFS call ended {}, which no LFS call does", unexpected(&other)))),
+    for sending in sendings {
+        attempt.go_on()?;
+        let started = Instant::now();
+        let ended = sent_to(attempt, location, nonce, sending);
+        let took = started.elapsed();
+        attempt.split.lfs = Some(attempt.split.lfs.map_or(took, |before| before + took));
+        let named = |why: &str| of_repo(&sending.repo, sending.paired, why);
+        match ended {
+            Ok(()) => {}
+            Err(Unsent::Ended(End::Interrupted)) => return Err(End::Interrupted),
+            Err(Unsent::Ended(End::Failed(why)) | Unsent::Refused(why)) => return Err(refused(attempt, &named(&why))),
+            // The box refused for its install, its line said: the run falls back for that, not for its LFS content.
+            Err(Unsent::Ended(End::Refused(FallbackReason::Install))) => return Err(End::Refused(FallbackReason::Install)),
+            // The builder's drain refused a session no longer live: the run waits behind it, then starts again.
+            Err(Unsent::Ended(End::Draining(drain))) => return Err(End::Draining(drain)),
+            Err(Unsent::Ended(End::Refused(reason))) => {
+                return Err(refused(attempt, &named(&format!("the LFS call ended {}", reason.as_str()))));
+            }
+            Err(Unsent::Ended(other)) => {
+                return Err(End::Failed(named(&format!(
+                    "the LFS call ended {}, which no LFS call does",
+                    unexpected(&other)
+                ))));
+            }
+        }
     }
+    Ok(())
 }
 
-/// The diff, then the put of what it needs ([`send`]), the worktree's `.tmp` held from before the diff's answer is made
-/// until the put has ended. Says the put as it starts, with the objects it sends, once the diff says there are any.
+/// The diff, then the put of what it needs, of one repo's content ([`send`]), the main worktree's `.tmp` held from
+/// before the diff's answer is made until the put has ended, the objects read from the LFS store of the repo's own root
+/// as [`Attempt::lfs_bound`] bounds it. Says the put as it starts, with the objects it sends, once the diff says there
+/// are any.
 fn sent_to(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, sending: &Sending) -> Result<(), Unsent> {
     let root = Path::new(attempt.call.root);
     let folder = root.join(TMP);
@@ -766,7 +854,7 @@ fn sent_to(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, send
         .map_err(|error| Unsent::Refused(format!("cannot hold {}: {error}", folder.display())))?;
     let needed = diffed(attempt, location, nonce, sending)?;
     if needed.is_empty() {
-        attempt.logged(&present_line(sending.objects.len()));
+        attempt.logged(&present_line(sending.named(), sending.objects.len()));
         return Ok(());
     }
     let bytes = needed.iter().fold(0_u64, |total, object| total.saturating_add(object.size));
@@ -777,19 +865,11 @@ fn sent_to(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, send
         )));
     }
     // Said as the pack begins, once the diff says there is something to send: a run that sends nothing says nothing new.
-    attempt.say(format!(
-        "gate: sending lfs objects to {}: {} object(s)",
-        attempt.call.host(),
-        needed.len()
-    ));
+    attempt.say(sending_line(attempt.call.host(), sending.named(), needed.len()));
     let started = Instant::now();
-    let alone = Bounded {
-        root,
-        ceiling: root.parent().unwrap_or(root),
-        place: None,
-    };
-    let objects = objects_folder(alone, attempt.git, attempt.call.interrupt).map_err(unsent)?;
-    let path = folder.join(format!("{}-{nonce}.lfs.tar.zst", attempt.call.key));
+    let bound = attempt.lfs_bound(&sending.root).map_err(Unsent::Refused)?;
+    let objects = objects_folder(bound, attempt.git, attempt.call.interrupt).map_err(unsent)?;
+    let path = folder.join(archive_name(attempt.call.key, nonce, sending.at));
     let archive = tmp_file(root, &path, "the LFS archive").map_err(Unsent::Refused)?;
     // The archive's SHA-256 is read back only for a put that asks for the builder's data channel, which declares it.
     let hashed = matches!(channel::planned(attempt.call.builder), Ok(Some(_)));
@@ -797,7 +877,7 @@ fn sent_to(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, send
     put(attempt, location, sending, (&archive, (compressed, sha256.as_ref()), needed.len()))?;
     drop(archive);
     drop(held);
-    attempt.say(sent_line(needed.len(), bytes, started.elapsed()));
+    attempt.say(sent_line(sending.named(), needed.len(), bytes, started.elapsed()));
     Ok(())
 }
 
@@ -809,15 +889,25 @@ fn unsent(unbuilt: Unbuilt) -> Unsent {
     }
 }
 
-/// The log line of a diff that found the store holding all `count` objects.
-fn present_line(count: usize) -> String {
-    format!("gate: lfs: {count} object(s) present")
+/// The log line of a diff that found the store holding all `count` objects, naming the repo `repo` in a pair.
+fn present_line(repo: Option<&str>, count: usize) -> String {
+    format!("gate: lfs: {}{count} object(s) present", repo_part(repo))
 }
 
-/// The console line of a put that sent `count` objects of `bytes` bytes in `took`.
+/// The console line of a put of `count` objects to `host` as it starts, naming the repo `repo` in a pair.
+fn sending_line(host: &str, repo: Option<&str>, count: usize) -> String {
+    format!("gate: sending lfs objects to {host}: {}{count} object(s)", repo_part(repo))
+}
+
+/// The console line of a put that sent `count` objects of `bytes` bytes in `took`, naming the repo `repo` in a pair.
 #[expect(clippy::cast_precision_loss, reason = "a size said to one decimal of a megabyte")]
-fn sent_line(count: usize, bytes: u64, took: Duration) -> String {
-    format!("gate: lfs: {count} object(s), {:.1} MB in {:.1} s", bytes as f64 / MB, took.as_secs_f64())
+fn sent_line(repo: Option<&str>, count: usize, bytes: u64, took: Duration) -> String {
+    format!(
+        "gate: lfs: {}{count} object(s), {:.1} MB in {:.1} s",
+        repo_part(repo),
+        bytes as f64 / MB,
+        took.as_secs_f64()
+    )
 }
 
 /// The objects of `sending` the box's diff call says the store lacks or holds at another size; else why not. Its
@@ -827,9 +917,10 @@ fn diffed<'s>(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, s
     // Each call's word carries a nonce new to it, which the box's refusal tags for the call name; the PC's own files
     // keep the run's.
     let call_nonce = payload::run_nonce();
-    let head = payload::input(&payload::inputs_word(location, &call_nonce, InputsStep::Diff, None), Some(&sending.line));
+    let word = payload::lfs_word(location, &call_nonce, InputsStep::Diff, sending.sibling(), None);
+    let head = payload::input(&word, Some(&sending.line));
     let root = Path::new(attempt.call.root);
-    let path = root.join(TMP).join(format!("{}-{nonce}.lfs-diff", attempt.call.key));
+    let path = root.join(TMP).join(diff_name(attempt.call.key, nonce, sending.at));
     let answer = tmp_file(root, &path, "the LFS diff answer").map_err(Unsent::Refused)?;
     let cap = NonZeroU64::new(2 * (sending.line.len() as u64) + 1024 * 1024).unwrap_or(NonZeroU64::MIN);
     let shown = path.display().to_string();
@@ -868,7 +959,7 @@ fn put(attempt: &mut Attempt<'_, '_>, location: &Location, sending: &Sending, se
     let head = |asked: Option<&channel::Asked>| {
         let nonce = payload::run_nonce();
         let channel = asked.zip(sha256).map(|(asked, sha256)| (asked, length, sha256));
-        let word = payload::put_word(location, &nonce, None, channel);
+        let word = payload::lfs_word(location, &nonce, InputsStep::Put, sending.sibling(), channel);
         (nonce, payload::input(&word, Some(&sending.line)))
     };
     let watch = Watch::Put(attempt.limits_for("lfs"));
@@ -905,8 +996,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ATTRIBUTES_MOST, Blob, Listed, Object, as_the_builder, installed_all, listed, manifest_line, names_lfs_filter_among, not_sent, object_path,
-        objects_folder, packed, pair_why, pointers_of, present_line, sending, sent_line, small_blobs,
+        ATTRIBUTES_MOST, Blob, Listed, NO_SCRATCH, Object, as_the_builder, installed_all, listed, manifest_line, names_lfs_filter_among, not_sent,
+        object_path, objects_folder, of_repo, packed, pointers_of, present_line, run_refused_why, sending, sending_line, sent_line, small_blobs,
     };
 
     /// Every listing call on the PC reads a path's attributes as the builder does: no `core.attributesFile` and no
@@ -1026,15 +1117,50 @@ mod tests {
     #[test]
     fn the_lfs_lines_are_worded_as_the_console_and_the_log_say_them() {
         assert_eq!(
-            sent_line(2, 3 * 1024 * 1024 / 2, Duration::from_millis(2_340)),
+            sent_line(None, 2, 3 * 1024 * 1024 / 2, Duration::from_millis(2_340)),
             "gate: lfs: 2 object(s), 1.5 MB in 2.3 s"
         );
-        assert_eq!(present_line(3), "gate: lfs: 3 object(s) present");
+        assert_eq!(present_line(None, 3), "gate: lfs: 3 object(s) present");
+        assert_eq!(sending_line("builder", None, 2), "gate: sending lfs objects to builder: 2 object(s)");
         assert_eq!(
-            not_sent(&pair_why("app-sibling")),
-            "gate: remote lfs not sent: app-sibling holds LFS pointers, and a sibling pair does not send LFS content yet"
+            sent_line(Some("app-sibling"), 2, 3 * 1024 * 1024 / 2, Duration::from_millis(2_340)),
+            "gate: lfs: app-sibling: 2 object(s), 1.5 MB in 2.3 s",
+            "a pair's lines name the repo"
+        );
+        assert_eq!(present_line(Some("app-sibling"), 3), "gate: lfs: app-sibling: 3 object(s) present");
+        assert_eq!(
+            sending_line("builder", Some("app-sibling"), 2),
+            "gate: sending lfs objects to builder: app-sibling: 2 object(s)"
+        );
+        assert_eq!(
+            not_sent(&of_repo("app-sibling", true, "the LFS call ended lfs")),
+            "gate: remote lfs not sent: app-sibling: the LFS call ended lfs",
+            "a pair's line names the repo whose send failed"
+        );
+        assert_eq!(
+            not_sent(&of_repo("app", false, "the LFS call ended lfs")),
+            "gate: remote lfs not sent: the LFS call ended lfs",
+            "a run of one repo names none"
         );
         assert_eq!(not_sent("a\nb"), format!("gate: remote lfs not sent: {}", escaped("a\nb")));
+    }
+
+    /// A run call the box refused `lfs` keeps the box's whole reason, the repo it names in a pair included.
+    #[test]
+    fn a_run_refused_lfs_keeps_the_box_s_whole_reason() {
+        let held = "the builder's LFS store does not hold the content the snapshot's pointers name";
+        let line = "gate: remote lfs of work folder app-1a2b3c4d is not the snapshot's: app-sibling: the store lacks an object";
+        assert_eq!(run_refused_why(Some(line)), format!("{held}: app-sibling: the store lacks an object"));
+        assert_eq!(
+            run_refused_why(Some("gate: something else")),
+            held,
+            "a line of another shape keeps the reason alone"
+        );
+        assert_eq!(run_refused_why(None), held);
+        assert_eq!(
+            run_refused_why(Some(&format!("{NO_SCRATCH}denied"))),
+            "the builder could not make the run's LFS scratch folder"
+        );
     }
 
     /// The git calls a listing of the tree `listing` makes, by their first word, every other call answering nothing.
@@ -1114,7 +1240,7 @@ mod tests {
             objects: vec![object],
         };
 
-        let sending = sending(listed).expect("one object is sent");
+        let sending = sending(listed, "app", Path::new("app"), 0, false).expect("one object is sent");
 
         assert_eq!(sending.line, format!("{} 3\n", "a".repeat(64)));
         assert_eq!(sending.digest, sha(format!("{} 3", "a".repeat(64)).as_bytes()));

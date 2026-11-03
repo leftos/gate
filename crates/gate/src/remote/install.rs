@@ -1400,8 +1400,11 @@ mod tests {
                 names.push(format!("{key}-{nonce}.{}.tar.zst", kind.file()));
                 names.push(format!("{key}-{nonce}.{}-diff", kind.file()));
             }
-            names.push(format!("{key}-{nonce}.lfs.tar.zst"));
-            names.push(format!("{key}-{nonce}.lfs-diff"));
+            // The main repo's LFS files, then a sibling's.
+            for at in [0, 1] {
+                names.push(crate::remote::lfs::archive_name(&key, &nonce, at));
+                names.push(crate::remote::lfs::diff_name(&key, &nonce, at));
+            }
             for name in names {
                 let path = format!(".tmp/{name}");
                 let globs = Globs::new(&[".tmp/**".to_owned(), path.clone()]).expect("the globs can be matched");

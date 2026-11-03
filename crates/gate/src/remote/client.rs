@@ -1611,6 +1611,18 @@ fn sibling_fields(repos: &[Repo], siblings: &[Snapshot]) -> (BySibling, BySiblin
     (snapshots, bases)
 }
 
+/// The run call's LFS digests of the content `lfs` sends: the main repository's `LfsDigest`, `None` when it sends none,
+/// and each sibling's name and digest for the siblings that send some (`SiblingLfsDigests`).
+fn lfs_digests(lfs: &[lfs::Sending]) -> (Option<&str>, BySibling) {
+    let main = lfs.iter().find(|sending| sending.at == 0).map(|sending| sending.digest.as_str());
+    let siblings = lfs
+        .iter()
+        .filter(|sending| sending.at > 0)
+        .map(|sending| (sending.repo.clone(), sending.digest.clone()))
+        .collect();
+    (main, siblings)
+}
+
 impl Attempt<'_, '_> {
     /// The profile of the call's builder over the transport ([`super::transport::Transport::profile`]).
     pub(super) fn profile(&self) -> Profile {
@@ -1652,7 +1664,7 @@ impl Attempt<'_, '_> {
             .and_then(Option::as_ref)
             .map(|tree| tree.needs(godot_command))
             .unwrap_or_default();
-        let git_lfs = self.git_lfs_needed(lfs.is_some(), &repos, &trees, &mut needs)?;
+        let git_lfs = self.git_lfs_needed(!lfs.is_empty(), &repos, &trees, &mut needs)?;
         let prepared = self.preflight(&location, &needs)?;
         self.carried.add(self.call.host(), prepared.new_tree, &prepared.created);
         let chosen = self.parity(&repos, &snapshots, &trees, &prepared, git_lfs)?;
@@ -1663,7 +1675,7 @@ impl Attempt<'_, '_> {
         self.release_run()?;
         // After the push, so a route refused before it sends no input, and before the marker, so one the inputs refuse
         // leaves none.
-        let inputs_landed = self.sent_contents(&location, &nonce, inputs.as_ref(), lfs.as_ref())?;
+        let inputs_landed = self.sent_contents(&location, &nonce, inputs.as_ref(), &lfs)?;
         let (sent_digest, withheld) = self
             .sent_build(&location, &mut sent)?
             .map_or((None, None), |landed| (Some(landed.digest), landed.withheld));
@@ -1679,6 +1691,7 @@ impl Attempt<'_, '_> {
             (true, Some(head)) => Some(head),
             (true, None) => return Err(End::Failed("a commit stage needs the commit of the PC's HEAD".to_owned())),
         };
+        let (lfs_digest, sibling_lfs_digests) = lfs_digests(&lfs);
         // After the preflight, whose installs the Godot and Unreal Engine versions are chosen from, and after the send,
         // whose landing keeps `--no-build`.
         let run = RunCall {
@@ -1696,7 +1709,8 @@ impl Attempt<'_, '_> {
             host: self.call.host(),
             sibling_snapshots: &sibling_snapshots,
             inputs_digest: inputs.as_ref().filter(|_| inputs_landed).map(|built| built.digest.as_str()),
-            lfs_digest: lfs.as_ref().map(|sending| sending.digest.as_str()),
+            lfs_digest,
+            sibling_lfs_digests: &sibling_lfs_digests,
             sent_digest: sent_digest.as_deref(),
             env: self.call.env,
             godot_version: chosen.godot.as_deref(),
@@ -1768,17 +1782,15 @@ impl Attempt<'_, '_> {
         Ok(git_lfs)
     }
 
-    /// The run's inputs `inputs` and its LFS content `lfs` sent to `location` for the run of `nonce`, each when the run
-    /// has some ([`inputs::send`], [`lfs::send`]), the inputs first: whether the inputs landed, so the run call carries
-    /// their digest, which a run with none never does; else the end a send ended the attempt on.
-    fn sent_contents(&mut self, location: &Location, nonce: &str, inputs: Option<&inputs::Built>, lfs: Option<&lfs::Sending>) -> Result<bool, End> {
+    /// The run's inputs `inputs` and each repository's LFS content `lfs` sent to `location` for the run of `nonce`, each
+    /// when the run has some ([`inputs::send`], [`lfs::send`]), the inputs first: whether the inputs landed, so the run
+    /// call carries their digest, which a run with none never does; else the end a send ended the attempt on.
+    fn sent_contents(&mut self, location: &Location, nonce: &str, inputs: Option<&inputs::Built>, lfs: &[lfs::Sending]) -> Result<bool, End> {
         let landed = match inputs {
             Some(built) => inputs::send(self, location, nonce, built)?,
             None => false,
         };
-        if let Some(sending) = lfs {
-            lfs::send(self, location, nonce, sending)?;
-        }
+        lfs::send(self, location, nonce, lfs)?;
         Ok(landed)
     }
 
@@ -2247,25 +2259,32 @@ impl Attempt<'_, '_> {
         Ok(trees)
     }
 
-    /// The LFS content the run sends ([`lfs::sending`]): the objects the pointers of the main repository's snapshot
-    /// name, `None` when it holds none. The main repository's blobs come from its tree's listing (`trees`), and a
-    /// sibling's from a listing of its own ([`Attempt::lfs_listed`]). A pair any of whose snapshots holds a pointer is
-    /// refused `lfs`, naming the repository; a Ctrl+C ends the run.
-    fn lfs_sending(&mut self, repos: &[Repo], snapshots: &[Snapshot], trees: &[Option<Tree>]) -> Result<Option<lfs::Sending>, End> {
-        let mut sending = None;
+    /// The LFS content the run sends ([`lfs::sending`]): one per repository whose snapshot holds pointers, the objects
+    /// they name, the main repository first, then the siblings in the pair's order; empty when none holds any. The main
+    /// repository's blobs come from its tree's listing (`trees`), and a sibling's from a listing of its own
+    /// ([`Attempt::lfs_listed`]). Content that cannot be listed refuses the route `lfs`, naming the repository in a
+    /// pair; a Ctrl+C ends the run.
+    fn lfs_sending(&mut self, repos: &[Repo], snapshots: &[Snapshot], trees: &[Option<Tree>]) -> Result<Vec<lfs::Sending>, End> {
+        let mut sending = Vec::new();
+        let paired = repos.len() > 1;
         let main_small = trees.first().and_then(Option::as_ref).map(|tree| &tree.small);
         for (at, (repo, snapshot)) in repos.iter().zip(snapshots).enumerate() {
             self.go_on()?;
-            let Some(listed) = self.lfs_listed(repo, snapshot, (at == 0).then_some(main_small))? else {
+            // A tree that could not be listed is a sibling's here (the main's has no LFS phase): its check runs.
+            let attributes = match trees.get(at).and_then(Option::as_ref) {
+                Some(tree) if at == 0 => tree.small.attributes,
+                Some(tree) => tree.names.iter().any(|name| lfs::is_attributes(name)),
+                None => true,
+            };
+            let named = paired.then_some(repo.name.as_str());
+            let Some(listed) = self.lfs_listed(repo, snapshot, (at == 0).then_some(main_small), (attributes, named))? else {
                 continue;
             };
             if listed.pointers.is_empty() {
                 continue;
             }
-            if repos.len() > 1 {
-                return Err(lfs::refused(self, &lfs::pair_why(&repo.name)));
-            }
-            sending = Some(lfs::sending(listed).map_err(|why| lfs::refused(self, &why))?);
+            let repo_sending = lfs::sending(listed, &repo.name, Path::new(&repo.root), at, paired);
+            sending.push(repo_sending.map_err(|why| lfs::refused(self, &why))?);
         }
         Ok(sending)
     }
@@ -2273,11 +2292,18 @@ impl Attempt<'_, '_> {
     /// The pointers of `repo`'s `snapshot`: for the main repository (`main` given), those among the blobs of its tree's
     /// listing ([`lfs::listed_among`]), `None` when its tree could not be listed (past the git output cap, not UTF-8,
     /// not of `ls-tree`'s form), which has no LFS phase, as before LFS content was sent; for a sibling (`main` not
-    /// given), those of a listing of its own ([`lfs::listed`]). A main tree holding a `.gitattributes` in a repository
-    /// whose `info/attributes` is not empty is refused `lfs` first ([`lfs::unseen_attributes`]) when the repository
-    /// uses LFS at all ([`lfs::tracks_lfs_filter`]), and so is a listing git fails; a Ctrl+C ends the run.
+    /// given), those of a listing of its own ([`lfs::listed`]). A repository whose tree holds a `.gitattributes`
+    /// (`attributes`) and whose `info/attributes` is not empty is refused `lfs` first ([`lfs::unseen_attributes`]) when
+    /// it uses LFS at all ([`lfs::tracks_lfs_filter`]), the line naming it as `named` in a pair, and so is a listing git
+    /// fails; a Ctrl+C ends the run.
     #[expect(clippy::option_option, reason = "the main repository's listing, given, may be one that could not be made")]
-    fn lfs_listed(&mut self, repo: &Repo, snapshot: &Snapshot, main: Option<Option<&lfs::Small>>) -> Result<Option<lfs::Listed>, End> {
+    fn lfs_listed(
+        &mut self,
+        repo: &Repo,
+        snapshot: &Snapshot,
+        main: Option<Option<&lfs::Small>>,
+        (attributes, named): (bool, Option<&str>),
+    ) -> Result<Option<lfs::Listed>, End> {
         let root = Path::new(&repo.root);
         let (bounds, interrupt) = (self.git, self.call.interrupt);
         let small = match main {
@@ -2285,12 +2311,16 @@ impl Attempt<'_, '_> {
             Some(Some(small)) => Some(small),
             None => None,
         };
-        if small.is_some_and(|small| small.attributes) {
+        if attributes {
             let unseen = self.lfs_bound(root).map_err(Unbuilt::Failed);
             let unseen = unseen.and_then(|bound| lfs::unseen_attributes(bound, bounds, interrupt));
             if let Some(why) = self.lfs_unbuilt(repo, unseen)? {
                 let uses = lfs::tracks_lfs_filter(root, bounds, interrupt).map_err(lfs::unbuilt);
                 if self.lfs_unbuilt(repo, uses)? {
+                    let why = match named {
+                        Some(name) => lfs::of_repo(name, true, &why),
+                        None => why,
+                    };
                     return Err(lfs::refused(self, &why));
                 }
             }
@@ -2335,7 +2365,7 @@ impl Attempt<'_, '_> {
 
     /// The repository whose root is `root` as the LFS listing asks git about it: a pair's as [`Attempt::bound_at`]
     /// gives it; the run's one repository bounded at its root's parent folder.
-    fn lfs_bound<'b>(&'b self, root: &'b Path) -> Result<Bounded<'b>, String> {
+    pub(super) fn lfs_bound<'b>(&'b self, root: &'b Path) -> Result<Bounded<'b>, String> {
         let alone = Bounded {
             root,
             ceiling: root.parent().unwrap_or(root),
@@ -6562,7 +6592,7 @@ mod tests {
 
         let sending = attempt.lfs_sending(&repos, &[snapshot()], &[None]);
 
-        assert!(matches!(sending, Ok(None)), "no LFS phase and no refusal");
+        assert!(matches!(sending, Ok(ref none) if none.is_empty()), "no LFS phase and no refusal");
         assert!(attempt.lines.is_empty(), "nothing said: {:?}", attempt.lines);
         assert!(!log.exists(), "nothing logged");
     }
