@@ -886,6 +886,271 @@ fn a_run_switching_between_one_repo_and_a_pair_ends_with_each_input_in_its_tree(
     assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
 }
 
+/// The gitignored file a pair case's sibling holds for its command to name, `/`-separated below the sibling's tree,
+/// and the bytes it holds.
+const SIBLING_CARRIED: (&str, &str) = (".tmp/probe.targets", "<Project><!-- the sibling's --></Project>");
+
+/// A pair case declaring no input glob for either repo, holding the gitignored probe project `.tmp/probe` in its main
+/// tree and [`SIBLING_CARRIED`] in its sibling: the case, its folder name, the sibling's name and its folder.
+fn carried_pair_case(name: &str) -> (Case, String, String, PathBuf) {
+    let (case, leaf, sibling_name, sibling) = pair_inputs_case(name, &[], &[]);
+    write(&case, ".tmp/probe/Probe.csproj", "<Project />");
+    write(&case, ".tmp/probe/Program.cs", "class P {}");
+    fs::create_dir_all(sibling.join(".tmp")).expect("the sibling's .tmp can be made");
+    fs::write(sibling.join(SIBLING_CARRIED.0.replace('/', "\\")), SIBLING_CARRIED.1).expect("the sibling's file can be written");
+    (case, leaf, sibling_name, sibling)
+}
+
+/// The word naming [`SIBLING_CARRIED`] from the main worktree's root, as the rewrite lands a path in the sibling `name`.
+fn sibling_word(name: &str) -> String {
+    format!(r"..\{name}\{}", SIBLING_CARRIED.0.replace('/', "\\"))
+}
+
+#[test]
+fn a_pair_carries_a_gitignored_project_of_its_main_tree_into_the_main_tree() {
+    let (case, leaf, name, sibling) = carried_pair_case("client-inputs-pair-carried-main");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &PROBE_RAN));
+    remove_sibling(&sibling);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "inputs", "inputs", "run"], "the diff, then the put");
+    assert_eq!(in_tree(&case, &leaf, ".tmp/probe/Probe.csproj").as_deref(), Some("<Project />"));
+    assert_eq!(in_tree(&case, &leaf, ".tmp/probe/Program.cs").as_deref(), Some("class P {}"));
+    assert!(
+        !work_folder(&case).join(&name).join(".tmp").join("probe").exists(),
+        "nothing lands in the sibling"
+    );
+    assert_eq!(carried_markers(&case.root()), Vec::<PathBuf>::new(), "a pair writes no carried marker");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_pair_carries_a_gitignored_file_of_its_sibling_into_the_sibling_s_tree() {
+    let (case, leaf, name, sibling) = carried_pair_case("client-inputs-pair-carried-sibling");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+    let word = sibling_word(&name);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", &word]));
+    remove_sibling(&sibling);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "inputs", "inputs", "run"], "the diff, then the put");
+    assert_eq!(in_tree(&case, &name, SIBLING_CARRIED.0).as_deref(), Some(SIBLING_CARRIED.1));
+    assert_eq!(
+        in_tree(&case, &leaf, SIBLING_CARRIED.0),
+        None,
+        "nothing of the sibling lands in the main tree"
+    );
+    assert_eq!(carried_markers(&case.root()), Vec::<PathBuf>::new(), "a pair writes no carried marker");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_tracked_sibling_file_a_pair_s_command_names_is_not_carried() {
+    let (case, _, name, sibling) = carried_pair_case("client-inputs-pair-carried-tracked");
+    let added = std::process::Command::new("git")
+        .args(["-C", &shown(&sibling), "add", "--force", SIBLING_CARRIED.0])
+        .output()
+        .expect("git can be started");
+    assert!(added.status.success(), "the sibling's file is tracked: {added:?}");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+    let word = sibling_word(&name);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", &word]));
+    remove_sibling(&sibling);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "no carried entry, so no inputs call: {outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_plain_pair_run_after_a_carried_pair_run_sweeps_the_carried_copies() {
+    let (case, leaf, name, sibling) = carried_pair_case("client-inputs-pair-carried-swept");
+    let first = ssh_steps(&case, "first", &["ok"; 4]);
+    let word = sibling_word(&name);
+    let ran = [r".\tool.exe", "out", ".tmp/probe/Probe.csproj", "out", &word];
+    let carried = finish(client_gate(&case, "first.log", &first, &ran));
+    assert_eq!(carried.code, Some(0), "{carried:?}");
+    assert_eq!(in_tree(&case, &leaf, ".tmp/probe/Probe.csproj").as_deref(), Some("<Project />"));
+    assert_eq!(in_tree(&case, &name, SIBLING_CARRIED.0).as_deref(), Some(SIBLING_CARRIED.1));
+
+    let second = ssh_steps(&case, "second", &["ok"; 4]);
+    let swept = finish(client_gate(&case, "second.log", &second, &RAN));
+    remove_sibling(&sibling);
+
+    assert_eq!(swept.code, Some(0), "{swept:?}");
+    assert_eq!(calls(&second), ["preflight", "inputs", "run"], "the empty manifest's diff, no put");
+    assert_eq!(
+        in_tree(&case, &leaf, ".tmp/probe/Probe.csproj"),
+        None,
+        "the main tree's carried copy is swept"
+    );
+    assert_eq!(in_tree(&case, &name, SIBLING_CARRIED.0), None, "and the sibling's");
+    let said = log_of(&case, "second.log");
+    assert!(has_line(&said, "gate: inputs: removed the old copies of every tree"), "{said}");
+    assert_eq!(carried_markers(&case.root()), Vec::<PathBuf>::new(), "no carried marker at any point");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_pair_s_carried_files_past_the_caps_across_both_trees_keep_the_command_here() {
+    let (case, _, name, sibling) = carried_pair_case("client-inputs-pair-carried-capped");
+    for index in 0..998 {
+        write(&case, &format!(".tmp/probe/{index}.cs"), "x");
+    }
+    let folder = sibling.join(".tmp").join("sprobe");
+    fs::create_dir_all(&folder).expect("the sibling's probe folder can be made");
+    fs::write(folder.join("S.csproj"), "<Project />").expect("the sibling's project can be written");
+    for index in 0..1000 {
+        fs::write(folder.join(format!("{index}.cs")), "x").expect("the sibling's source can be written");
+    }
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+    let word = format!(r"..\{name}\.tmp\sprobe\S.csproj");
+
+    let ran = [r".\tool.exe", "out", ".tmp/probe/Probe.csproj", "out", &word];
+    let outcome = finish(client_gate(&case, "out.log", &steps, &ran));
+    remove_sibling(&sibling);
+
+    assert_eq!(outcome.code, Some(0), "the command ran here: {outcome:?}");
+    let line = "gate: not routed: .tmp/probe/Probe.csproj is gitignored and a command's inputs carry at most 64 MiB in 2000 files; \
+                its files hold 1 MiB in 2001 files (the pair's trees together)\n";
+    assert!(
+        outcome.stderr.contains(line),
+        "each tree is under the caps, the two together are not: {outcome:?}"
+    );
+    assert!(!calls(&steps).iter().any(|call| call == "run"), "{:?}", calls(&steps));
+}
+
+#[test]
+fn a_worktree_whose_siblings_are_all_absent_carries_as_a_single_repo() {
+    let (case, _, _, sibling) = carried_pair_case("client-inputs-pair-carried-absent");
+    remove_sibling(&sibling);
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &PROBE_RAN));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "inputs", "inputs", "run"], "the diff, then the put");
+    let probe = work_folder(&case).join(".tmp").join("probe");
+    assert_eq!(
+        fs::read_to_string(probe.join("Probe.csproj")).ok().as_deref(),
+        Some("<Project />"),
+        "in the work folder itself"
+    );
+    assert_eq!(carried_markers(&case.root()).len(), 1, "a single repo's carried run leaves its marker");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+/// The project file `.tmp/probe/Probe.csproj` of a pair case's main tree, importing the file at `path` written as from
+/// its own folder.
+fn probe_importing(path: &str) -> String {
+    format!(r#"<Project><Import Project="{path}" /></Project>"#)
+}
+
+#[test]
+fn a_pair_candidate_whose_build_reads_a_gitignored_sibling_file_not_sent_stays_here() {
+    let (case, _, name, sibling) = carried_pair_case("client-inputs-pair-cross-unsent");
+    write(
+        &case,
+        ".tmp/probe/Probe.csproj",
+        &probe_importing(&format!(r"..\..\..\{name}\.tmp\gen.props")),
+    );
+    fs::write(sibling.join(".tmp").join("gen.props"), "<Project />").expect("the sibling's props can be written");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &PROBE_RAN));
+    remove_sibling(&sibling);
+
+    assert_eq!(outcome.code, Some(0), "the command ran here: {outcome:?}");
+    let line = format!(
+        "gate: not routed: .tmp/probe/Probe.csproj is gitignored and its files cannot be sent: the build reads \
+         ../{name}/.tmp/gen.props outside its folder, which is not sent\n"
+    );
+    assert!(outcome.stderr.contains(&line), "{outcome:?}");
+    assert!(!calls(&steps).iter().any(|call| call == "run"), "{:?}", calls(&steps));
+}
+
+#[test]
+fn a_sibling_candidate_s_refusal_names_its_build_file_from_the_main_root() {
+    let (case, _, name, sibling) = carried_pair_case("client-inputs-pair-sibling-above");
+    let app = sibling.join(".tmp").join("app");
+    fs::create_dir_all(&app).expect("the sibling's app folder can be made");
+    fs::write(app.join("App.csproj"), "<Project />").expect("the sibling's project can be written");
+    fs::write(sibling.join(".tmp").join("Directory.Packages.props"), "<Project />").expect("the sibling's props can be written");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+    let word = format!(r"..\{name}\.tmp\app\App.csproj");
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", &word]));
+    remove_sibling(&sibling);
+
+    assert_eq!(outcome.code, Some(0), "the command ran here: {outcome:?}");
+    let said = format!("the build reads ../{name}/.tmp/Directory.Packages.props above its folder, which is not sent\n");
+    assert!(outcome.stderr.contains(&said), "{outcome:?}");
+    assert!(!calls(&steps).iter().any(|call| call == "run"), "{:?}", calls(&steps));
+}
+
+#[test]
+fn a_sibling_candidate_whose_build_reads_a_main_tree_file_the_run_carries_routes() {
+    let (case, leaf, name, sibling) = carried_pair_case("client-inputs-pair-cross-carried");
+    write(&case, ".tmp/probe/x.props", "<Project />");
+    let folder = sibling.join(".tmp").join("sprobe");
+    fs::create_dir_all(&folder).expect("the sibling's probe folder can be made");
+    let import = format!(r#"<Project><Import Project="..\..\..\{leaf}\.tmp\probe\x.props" /></Project>"#);
+    fs::write(folder.join("S.csproj"), import).expect("the sibling's project can be written");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+    let word = format!(r"..\{name}\.tmp\sprobe\S.csproj");
+
+    let ran = [r".\tool.exe", "out", ".tmp/probe/Probe.csproj", "out", &word];
+    let outcome = finish(client_gate(&case, "out.log", &steps, &ran));
+    remove_sibling(&sibling);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "inputs", "inputs", "run"], "{outcome:?}");
+    assert_eq!(in_tree(&case, &leaf, ".tmp/probe/x.props").as_deref(), Some("<Project />"));
+    assert!(
+        in_tree(&case, &name, ".tmp/sprobe/S.csproj").is_some(),
+        "the sibling's candidate is carried"
+    );
+}
+
+#[test]
+fn a_main_tree_candidate_whose_build_reads_a_sibling_file_its_inputs_send_routes() {
+    let (case, _, name, sibling) = pair_inputs_case("client-inputs-pair-cross-declared", &[], &["secrets/**"]);
+    let import = format!(r"..\..\..\{name}\{}", SIBLING_INPUT.0.replace('/', "\\"));
+    write(&case, ".tmp/probe/Probe.csproj", &probe_importing(&import));
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &PROBE_RAN));
+    remove_sibling(&sibling);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "inputs", "inputs", "run"], "{outcome:?}");
+    assert_eq!(in_tree(&case, &name, SIBLING_INPUT.0).as_deref(), Some(SIBLING_INPUT.1));
+}
+
+#[test]
+fn a_failing_pair_run_names_a_gitignored_sibling_file_and_the_sibling_s_inputs() {
+    let (case, _, name, sibling) = pair_inputs_case("client-inputs-pair-hint", &[], &[]);
+    fs::create_dir_all(sibling.join(".tmp")).expect("the sibling's .tmp can be made");
+    fs::write(sibling.join(".tmp").join("a.jsonl"), "{}").expect("the sibling's file can be written");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+    let word = format!(r"..\{name}\.tmp\a.jsonl");
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "exit", "1", &word]));
+    remove_sibling(&sibling);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let hint = format!(
+        "gate: hint: ../{name}/.tmp/a.jsonl is gitignored, so the builder had no copy of it; if the command reads it, add \
+         it to {}'s inputs in remote.json, or rerun with --local\n",
+        repo_name(&name)
+    );
+    assert!(outcome.stderr.contains(&hint), "{outcome:?}");
+}
+
 /// Removes the pair case's sibling folder.
 fn remove_sibling(sibling: &Path) {
     fs::remove_dir_all(sibling).expect("the sibling can be removed");

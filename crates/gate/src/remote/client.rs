@@ -6506,6 +6506,51 @@ mod tests {
         }
     }
 
+    /// A sibling pair's run carrying a path a command named, in its main tree or its sibling's, falls back `inputs` on
+    /// a macOS builder with the macOS pair line: the carried entries count as declared inputs.
+    #[test]
+    fn a_macos_pair_run_carrying_a_command_named_path_falls_back_with_the_macos_line() {
+        let pair = Pair::new("client-macos-pair-carried", &["lib"]);
+        let mut run = pair.run(&pair.root, &["lib"]);
+        let log = pair.top.join("out.log");
+        let state = pair.top.join("state");
+        let mac = gate_router::Builder {
+            alias: "mac-1".to_owned(),
+            os: BuilderOs::Macos,
+            root: Some("/Users/b/gate-remote".to_owned()),
+            slots: 1,
+            id: None,
+            data: None,
+        };
+        let transport = nowhere();
+        let main = [format!("{}.tmp/p.targets", gate_router::CARRIED_INPUT)];
+        for in_sibling in [false, true] {
+            if in_sibling {
+                run.siblings[0].inputs = vec![format!("{}.tmp/q.props", gate_router::CARRIED_INPUT)];
+            }
+            let siblings = carried(&run.root, &run.siblings).expect("the run's siblings check");
+            let call = RemoteCall {
+                builder: &mac,
+                inputs: if in_sibling { &[] } else { &main },
+                state_dir: &state,
+                ..pair_call(&run, siblings, &log)
+            };
+            let mut on_mac = attempt(&call, &transport);
+
+            let refused = super::super::inputs::sent(&mut on_mac);
+
+            assert!(
+                matches!(refused, Err(End::Refused(FallbackReason::Inputs))),
+                "in the sibling: {in_sibling}"
+            );
+            assert_eq!(
+                on_mac.lines,
+                ["gate: remote inputs not sent: the macOS builder does not take a sibling pair's inputs yet"],
+                "in the sibling: {in_sibling}"
+            );
+        }
+    }
+
     /// A sibling pair's run decides its inputs by its builder before any tree is picked (`inputs::pair_inputs`): on a
     /// macOS builder, declared globs refuse the route `inputs` with the macOS line rather than any tree's failure, and
     /// with none declared, the pair inputs marker that makes a Windows builder's run sweep makes no manifest at all.

@@ -7,8 +7,8 @@ use gate_router::balance::{self, BuilderFigures};
 use gate_router::desktop::DesktopDeclaration;
 use gate_router::windows::WindowsChange;
 use gate_router::{
-    Builder, CarriedSibling, Config, ConfigProblem, CrossTarget, Facts, FolderId, GitignoredInput, Inputs, Nested, Pattern, Place, SiblingFolder,
-    SiblingRoot, Slot, Target,
+    Builder, CarriedSibling, Config, ConfigProblem, CrossTarget, Facts, FolderId, GitignoredInput, Inputs, Nested, OtherTree, Pattern, Place,
+    SiblingFolder, SiblingRoot, Slot, Target,
 };
 
 /// The worktree root the fixtures use.
@@ -151,7 +151,10 @@ pub struct FakeFacts {
     /// The paths, `/`-separated from the root, that name a gitignored project input the snapshot leaves out, each with
     /// the files that carry it.
     pub gitignored: Vec<GitignoredInput>,
-    /// Each gitignored-inputs question, its paths then `|` and the input globs, kept apart from [`FakeFacts::asked`].
+    /// The same for a sibling's tree: each `(root, input)`, its paths `/`-separated from that sibling's root.
+    pub sibling_gitignored: Vec<(String, GitignoredInput)>,
+    /// Each gitignored-inputs question, its paths then `|` and the input globs, kept apart from [`FakeFacts::asked`]; a
+    /// question of a sibling's tree starts with that sibling's root and `: `.
     pub gitignored_asked: RefCell<Vec<String>>,
     /// Each gitignored-inputs question's `named` paths, joined by spaces, kept apart from [`FakeFacts::gitignored_asked`].
     pub named_asked: RefCell<Vec<String>>,
@@ -220,6 +223,7 @@ impl FakeFacts {
             windows_change_asked: Cell::new(0),
             windows_change_named: RefCell::new(Vec::new()),
             gitignored: Vec::new(),
+            sibling_gitignored: Vec::new(),
             gitignored_asked: RefCell::new(Vec::new()),
             named_asked: RefCell::new(Vec::new()),
             built_here: None,
@@ -376,15 +380,26 @@ impl Facts for FakeFacts {
         paths.iter().filter(|path| carried(path)).cloned().collect()
     }
 
-    /// Each input of [`FakeFacts::gitignored`] whose path was asked, in the order asked.
-    fn gitignored_inputs(&self, _place: &Place, paths: &[String], named: &[String], inputs: &[String]) -> Vec<GitignoredInput> {
+    /// Each input of [`FakeFacts::gitignored`] whose path was asked, in the order asked; of a sibling's tree, each of
+    /// [`FakeFacts::sibling_gitignored`] for its root.
+    fn gitignored_inputs(&self, root: &str, paths: &[String], named: &[String], inputs: &[String], _others: &[OtherTree]) -> Vec<GitignoredInput> {
+        let tree = if root == ROOT { String::new() } else { format!("{root}: ") };
         self.gitignored_asked
             .borrow_mut()
-            .push(format!("{} | {}", paths.join(" "), inputs.join(" ")));
-        self.named_asked.borrow_mut().push(named.join(" "));
+            .push(format!("{tree}{} | {}", paths.join(" "), inputs.join(" ")));
+        self.named_asked.borrow_mut().push(format!("{tree}{}", named.join(" ")));
+        let known: Vec<&GitignoredInput> = if root == ROOT {
+            self.gitignored.iter().collect()
+        } else {
+            self.sibling_gitignored
+                .iter()
+                .filter(|(known, _)| *known == root)
+                .map(|(_, input)| input)
+                .collect()
+        };
         paths
             .iter()
-            .filter_map(|path| self.gitignored.iter().find(|input| input.path == *path).cloned())
+            .filter_map(|path| known.iter().find(|input| input.path == *path).map(|input| (*input).clone()))
             .collect()
     }
 

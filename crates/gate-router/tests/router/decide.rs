@@ -9,9 +9,9 @@ use gate_router::desktop::{DesktopDeclaration, DesktopMode};
 use gate_router::windows::WindowsChange;
 use gate_router::{
     BuildSettings, BuildTarget, Builder, BuilderOs, CARRIED_INPUT, Config, ConfigProblem, CrossBlocked, CrossTarget, DROPPED_NO_BUILD_LINE,
-    DotnetTarget, Facts, GitignoredInput, Inputs, LocalReason, NO_OUTPUTS_LINE, Nested, PROJECT_EXTENSIONS, Pattern, PinRefusal, Place, RemoteRun,
-    Route, SiblingFolder, Slot, Target, build_settings, builder_words, decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet, is_usable_host,
-    later_run, named_worktree_paths, pattern_for, sdk_build_target, target, without_no_build, work_folder_key,
+    DotnetTarget, ElsewhereRead, Facts, GitignoredInput, Inputs, LocalReason, NO_OUTPUTS_LINE, Nested, PROJECT_EXTENSIONS, Pattern, PinRefusal,
+    Place, RemoteRun, Route, SiblingFolder, Slot, Target, build_settings, builder_words, decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet,
+    is_usable_host, later_run, named_tree_paths, pattern_for, sdk_build_target, target, without_no_build, work_folder_key,
 };
 
 use crate::support::{FakeFacts, HEAD, ROOT, carried, fake_id, heavy, light, place_at, sibling_root, words};
@@ -6031,6 +6031,7 @@ fn ignoring(prefix: &str, ignored: &[&str]) -> FakeFacts {
             .map(|path| GitignoredInput {
                 path: (*path).to_owned(),
                 files: Ok(vec![((*path).to_owned(), 1)]),
+                elsewhere: Vec::new(),
             })
             .collect(),
         ..FakeFacts::at(prefix)
@@ -6305,7 +6306,7 @@ fn a_folder_is_a_candidate_only_after_a_dotnet_command_s_verb() {
             !matches!(
                 route,
                 Route::Local {
-                    reason: Some(LocalReason::GitignoredPastCap { .. } | LocalReason::GitignoredPair { .. })
+                    reason: Some(LocalReason::GitignoredPastCap { .. } | LocalReason::GitignoredUnsent { .. })
                 }
             ),
             "{command:?}: {route:?}"
@@ -6339,6 +6340,7 @@ fn carrying(inputs: &[&str], ignored: &[(&str, &[&str])]) -> FakeFacts {
             .map(|(path, files)| GitignoredInput {
                 path: (*path).to_owned(),
                 files: Ok(files.iter().map(|file| ((*file).to_owned(), 1)).collect()),
+                elsewhere: Vec::new(),
             })
             .collect(),
         ..FakeFacts::at_root()
@@ -6389,6 +6391,7 @@ fn probe_of(files: Vec<(String, u64)>) -> FakeFacts {
         gitignored: vec![GitignoredInput {
             path: ".tmp/probe".to_owned(),
             files: Ok(files),
+            elsewhere: Vec::new(),
         }],
         ..ignoring("", &[])
     }
@@ -6445,10 +6448,12 @@ fn a_candidate_that_cannot_be_sent_keeps_the_command_here_saying_why() {
             GitignoredInput {
                 path: ".tmp/a.props".to_owned(),
                 files: Ok(vec![(".tmp/a.props".to_owned(), 1)]),
+                elsewhere: Vec::new(),
             },
             GitignoredInput {
                 path: ".tmp/probe".to_owned(),
                 files: Err("it is inside a nested repository".to_owned()),
+                elsewhere: Vec::new(),
             },
         ],
         ..ignoring("", &[])
@@ -6461,29 +6466,254 @@ fn a_candidate_that_cannot_be_sent_keeps_the_command_here_saying_why() {
 }
 
 /// A gate at the root of a worktree with the sibling `b`, whose facts report `.tmp/probe` as a gitignored project
-/// input carried by its project file.
-fn pair_probe() -> FakeFacts {
+/// input carried by its project file, and each of `sibling`, `/`-separated from `b`'s root, as a gitignored input of
+/// `b`'s tree carried by one file of its own name.
+fn pair_probe_with(sibling: &[&str]) -> FakeFacts {
     FakeFacts {
         gitignored: vec![GitignoredInput {
             path: ".tmp/probe".to_owned(),
             files: Ok(vec![(".tmp/probe/Probe.csproj".to_owned(), 1)]),
+            elsewhere: Vec::new(),
         }],
+        sibling_gitignored: sibling
+            .iter()
+            .map(|path| {
+                let input = GitignoredInput {
+                    path: (*path).to_owned(),
+                    files: Ok(vec![((*path).to_owned(), 1)]),
+                    elsewhere: Vec::new(),
+                };
+                (sibling_root("b"), input)
+            })
+            .collect(),
         ..FakeFacts::with_siblings("", &["b"], &["b"])
     }
 }
 
-/// The reason a sibling pair's run naming the probe is kept here for.
-const PAIR_PROBE: &str = r".tmp\probe is gitignored, and a sibling pair does not send a command's gitignored files yet";
+/// [`pair_probe_with`] with no gitignored input in `b`'s tree.
+fn pair_probe() -> FakeFacts {
+    pair_probe_with(&[])
+}
+
+/// The input globs of each sibling `run` carries, in order.
+fn sibling_inputs(run: &RemoteRun) -> Vec<Vec<String>> {
+    run.siblings.iter().map(|sibling| sibling.inputs.clone()).collect()
+}
 
 #[test]
-fn a_sibling_pair_s_gitignored_input_keeps_the_command_here_saying_so() {
+fn a_sibling_pair_carries_a_gitignored_input_of_its_main_tree_in_the_run_s_inputs() {
     let command = words(&["dotnet", "test", r".tmp\probe"]);
+    let run = routed(decide(&heavy(&command), &pair_probe()));
+    assert_eq!(run.inputs, marked(&[".tmp/probe/Probe.csproj"]));
+    assert_eq!(sibling_inputs(&run), [Vec::<String>::new()], "the sibling carries nothing");
+}
+
+#[test]
+fn a_sibling_pair_carries_a_gitignored_input_of_its_sibling_in_that_sibling_s_inputs() {
+    let word = r"-p:CustomBeforeMicrosoftCommonTargets=..\b\.tmp\probe\probe.targets";
+    let command = words(&["dotnet", "build", word]);
+    let facts = pair_probe_with(&[".tmp/probe/probe.targets"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert!(run.inputs.is_empty(), "{:?}", run.inputs);
+    assert_eq!(sibling_inputs(&run), [marked(&[".tmp/probe/probe.targets"])]);
+    let sent = r"-p:CustomBeforeMicrosoftCommonTargets={gate-folder}/..\b\.tmp\probe\probe.targets";
+    assert!(run.words.iter().any(|routed| routed == sent), "{:?}", run.words);
+    let asked = facts.gitignored_asked.borrow();
+    assert!(
+        asked.contains(&format!("{}: .tmp/probe/probe.targets | ", sibling_root("b"))),
+        "the sibling's own tree is asked: {asked:?}"
+    );
+}
+
+#[test]
+fn a_sibling_path_written_with_slashes_is_asked_of_the_sibling() {
+    let command = words(&["dotnet", "build", "../b/.tmp/p.targets"]);
+    let facts = pair_probe_with(&[".tmp/p.targets"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(sibling_inputs(&run), [marked(&[".tmp/p.targets"])]);
+}
+
+#[test]
+fn a_tracked_sibling_file_a_pair_s_command_names_is_not_carried() {
+    let command = words(&["dotnet", "build", r"..\b\src\B.targets"]);
     let facts = pair_probe();
+    let run = routed(decide(&heavy(&command), &facts));
+    assert!(run.inputs.is_empty(), "{:?}", run.inputs);
+    assert_eq!(sibling_inputs(&run), [Vec::<String>::new()]);
+    let asked = facts.gitignored_asked.borrow();
+    assert!(asked.contains(&format!("{}: src/B.targets | ", sibling_root("b"))), "{asked:?}");
+}
+
+#[test]
+fn a_path_outside_both_trees_is_asked_of_neither() {
+    for path in [r"..\..\x.targets", r"..\other\x.targets", r"..\b\..\..\x.targets"] {
+        let command = words(&["dotnet", "build", path]);
+        let facts = pair_probe();
+        let route = decide(&heavy(&command), &facts);
+        assert!(!matches!(route, Route::Routed(_)), "{path}: {route:?}");
+        let asked = facts.gitignored_asked.borrow();
+        assert!(asked.iter().all(|question| !question.contains("x.targets")), "{path}: {asked:?}");
+    }
+}
+
+#[test]
+fn a_pair_s_carried_files_count_against_the_caps_across_both_trees() {
+    let command = words(&["dotnet", "test", r".tmp\probe", r"-p:Extra=..\b\.tmp\s.props"]);
+    let sibling: Vec<(String, u64)> = (0..600).map(|index| (format!(".tmp/s/{index}.cs"), 1)).collect();
+    let facts = FakeFacts {
+        gitignored: vec![GitignoredInput {
+            path: ".tmp/probe".to_owned(),
+            files: Ok(probe_files(1500, 1)),
+            elsewhere: Vec::new(),
+        }],
+        sibling_gitignored: vec![(
+            sibling_root("b"),
+            GitignoredInput {
+                path: ".tmp/s.props".to_owned(),
+                files: Ok(sibling),
+                elsewhere: Vec::new(),
+            },
+        )],
+        ..FakeFacts::with_siblings("", &["b"], &["b"])
+    };
     assert_eq!(
         local_line(&decide(&heavy(&command), &facts)),
-        Some(format!("gate: not routed: {PAIR_PROBE}"))
+        Some(format!(
+            "gate: not routed: {} (the pair's trees together)",
+            past_cap("1 MiB in 2100 files")
+        ))
     );
     assert_eq!(head_asks(&facts), 0, "a command kept here asks no HEAD");
+}
+
+/// A read of `path` in the tree `tree` that the tree does not send, as [`GitignoredInput::elsewhere`] gives it.
+fn unsent_in(tree: Option<usize>, path: &str) -> ElsewhereRead {
+    ElsewhereRead {
+        tree,
+        path: path.to_owned(),
+        untold: None,
+    }
+}
+
+#[test]
+fn a_cross_tree_read_git_cannot_tell_of_says_so_and_why() {
+    let command = words(&["dotnet", "test", r".tmp\probe"]);
+    let mut facts = reading_the_sibling();
+    facts.gitignored[0].elsewhere[0].untold = Some("git failed".to_owned());
+    assert_eq!(
+        local_line(&decide(&heavy(&command), &facts)),
+        Some(
+            "gate: not routed: .tmp\\probe is gitignored and its files cannot be sent: the build reads ../b/.tmp/gen.props \
+             outside its folder, and git cannot tell whether it is sent: git failed"
+                .to_owned()
+        )
+    );
+}
+
+#[test]
+fn a_cross_tree_folder_read_is_not_carried_by_one_file_of_it() {
+    let command = words(&["dotnet", "build", r".tmp\probe", r"..\b\.tmp\gen\a.cs"]);
+    let facts = FakeFacts {
+        gitignored: vec![GitignoredInput {
+            path: ".tmp/probe".to_owned(),
+            files: Ok(vec![(".tmp/probe/Probe.csproj".to_owned(), 1)]),
+            elsewhere: vec![unsent_in(Some(0), ".tmp/gen")],
+        }],
+        sibling_gitignored: vec![(
+            sibling_root("b"),
+            GitignoredInput {
+                path: ".tmp/gen/a.cs".to_owned(),
+                files: Ok(vec![(".tmp/gen/a.cs".to_owned(), 1)]),
+                elsewhere: Vec::new(),
+            },
+        )],
+        ..FakeFacts::with_siblings("", &["b"], &["b"])
+    };
+    assert_eq!(
+        local_line(&decide(&heavy(&command), &facts)),
+        Some(
+            "gate: not routed: .tmp\\probe is gitignored and its files cannot be sent: the build reads ../b/.tmp/gen outside \
+             its folder, which is not sent"
+                .to_owned()
+        )
+    );
+}
+
+#[test]
+fn a_pair_whose_one_tree_is_past_the_caps_alone_says_the_single_tree_line() {
+    let command = words(&["dotnet", "test", r".tmp\probe"]);
+    let facts = FakeFacts {
+        gitignored: vec![GitignoredInput {
+            path: ".tmp/probe".to_owned(),
+            files: Ok(probe_files(2100, 1)),
+            elsewhere: Vec::new(),
+        }],
+        ..FakeFacts::with_siblings("", &["b"], &["b"])
+    };
+    assert_eq!(
+        local_line(&decide(&heavy(&command), &facts)),
+        Some(format!("gate: not routed: {}", past_cap("1 MiB in 2100 files")))
+    );
+}
+
+/// A pair case's facts: the main tree's `.tmp/probe` carries `.tmp/probe/Probe.csproj` and its build reads the
+/// sibling b's `.tmp/gen.props`, which b neither sends nor reports not ignored; b's `.tmp/s.props` carries itself.
+fn reading_the_sibling() -> FakeFacts {
+    FakeFacts {
+        gitignored: vec![GitignoredInput {
+            path: ".tmp/probe".to_owned(),
+            files: Ok(vec![(".tmp/probe/Probe.csproj".to_owned(), 1)]),
+            elsewhere: vec![unsent_in(Some(0), ".tmp/gen.props")],
+        }],
+        sibling_gitignored: vec![(
+            sibling_root("b"),
+            GitignoredInput {
+                path: ".tmp/gen.props".to_owned(),
+                files: Ok(vec![(".tmp/gen.props".to_owned(), 1)]),
+                elsewhere: Vec::new(),
+            },
+        )],
+        ..FakeFacts::with_siblings("", &["b"], &["b"])
+    }
+}
+
+#[test]
+fn a_cross_tree_read_the_run_carries_in_that_tree_routes() {
+    let command = words(&["dotnet", "test", r".tmp\probe", r"-p:Extra=..\b\.tmp\gen.props"]);
+    let facts = reading_the_sibling();
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.inputs, marked(&[".tmp/probe/Probe.csproj"]));
+    assert_eq!(sibling_inputs(&run), [marked(&[".tmp/gen.props"])]);
+}
+
+#[test]
+fn a_cross_tree_read_the_run_does_not_carry_keeps_the_command_here_saying_so() {
+    let command = words(&["dotnet", "test", r".tmp\probe"]);
+    let facts = reading_the_sibling();
+    assert_eq!(
+        local_line(&decide(&heavy(&command), &facts)),
+        Some(
+            "gate: not routed: .tmp\\probe is gitignored and its files cannot be sent: the build reads ../b/.tmp/gen.props \
+             outside its folder, which is not sent"
+                .to_owned()
+        )
+    );
+}
+
+#[test]
+fn a_worktree_whose_siblings_are_all_absent_carries_as_a_single_repo() {
+    let command = words(&["dotnet", "test", r".tmp\probe"]);
+    let facts = FakeFacts {
+        gitignored: vec![GitignoredInput {
+            path: ".tmp/probe".to_owned(),
+            files: Ok(vec![(".tmp/probe/Probe.csproj".to_owned(), 1)]),
+            elsewhere: Vec::new(),
+        }],
+        ..FakeFacts::with_siblings("", &["b"], &[])
+    };
+    let run = routed(decide(&heavy(&command), &facts));
+    assert!(run.siblings.is_empty(), "{:?}", run.siblings);
+    assert_eq!(run.inputs, marked(&[".tmp/probe/Probe.csproj"]));
 }
 
 #[test]
@@ -6508,13 +6738,10 @@ fn a_pinned_run_past_the_size_cap_cannot_route_saying_why() {
 }
 
 #[test]
-fn a_pinned_pair_run_naming_a_gitignored_input_cannot_route_saying_why() {
+fn a_pinned_pair_run_carries_a_gitignored_input() {
     let command = words(&["dotnet", "test", r".tmp\probe"]);
-    let facts = pair_probe();
-    assert_eq!(
-        local_line(&decide(&pinned_to(&command, "builder-1"), &facts)),
-        Some(format!("gate: --builder builder-1 cannot route this run: {PAIR_PROBE}"))
-    );
+    let run = routed(decide(&pinned_to(&command, "builder-1"), &pair_probe()));
+    assert_eq!(run.inputs, marked(&[".tmp/probe/Probe.csproj"]));
 }
 
 #[test]
@@ -6601,6 +6828,7 @@ fn a_cross_build_step_marks_a_carried_property() {
         gitignored: vec![GitignoredInput {
             path: ".tmp/a.targets".to_owned(),
             files: Ok(vec![(".tmp/a.targets".to_owned(), 1)]),
+            elsewhere: Vec::new(),
         }],
         ..cross_facts(cross_routing(r#"{"yaat": "win-x64"}"#))
     };
@@ -7135,9 +7363,20 @@ fn a_commit_stage_never_picks_a_macos_builder() {
     );
 }
 
+/// The paths [`named_tree_paths`] gives `words` below the gate's folder `prefix` with no sibling, each in the worktree.
+fn worktree_paths(words: &[String], prefix: &str) -> Vec<String> {
+    named_tree_paths(words, prefix, &[])
+        .into_iter()
+        .map(|(tree, path)| {
+            assert_eq!(tree, None, "{path} is in the worktree");
+            path
+        })
+        .collect()
+}
+
 #[test]
-fn named_worktree_paths_takes_every_value_after_the_program_word_past_a_separator() {
-    let named = named_worktree_paths(
+fn named_tree_paths_takes_every_value_after_the_program_word_past_a_separator() {
+    let named = worktree_paths(
         &words(&["dotnet", "run", "--project", "src/A", "--", "--in", ".tmp/a.jsonl", "--out=.tmp/r.txt"]),
         "",
     );
@@ -7146,7 +7385,7 @@ fn named_worktree_paths_takes_every_value_after_the_program_word_past_a_separato
 }
 
 #[test]
-fn named_worktree_paths_skips_a_dotnet_output_option_value() {
+fn named_tree_paths_skips_a_dotnet_output_option_value() {
     let command = words(&[
         "dotnet",
         "test",
@@ -7158,45 +7397,39 @@ fn named_worktree_paths_skips_a_dotnet_output_option_value() {
         ".tmp/x",
     ]);
 
-    assert_eq!(named_worktree_paths(&command, ""), ["test", ".tmp/x"]);
+    assert_eq!(worktree_paths(&command, ""), ["test", ".tmp/x"]);
 }
 
 #[test]
-fn named_worktree_paths_never_returns_the_program_word() {
-    assert_eq!(
-        named_worktree_paths(&words(&[".tmp/tool.exe", "x", ".tmp/a.jsonl"]), ""),
-        ["x", ".tmp/a.jsonl"]
-    );
+fn named_tree_paths_never_returns_the_program_word() {
+    assert_eq!(worktree_paths(&words(&[".tmp/tool.exe", "x", ".tmp/a.jsonl"]), ""), ["x", ".tmp/a.jsonl"]);
 }
 
 #[test]
-fn named_worktree_paths_never_returns_script_text() {
+fn named_tree_paths_never_returns_script_text() {
     assert_eq!(
-        named_worktree_paths(&words(&["pwsh", "-c", "Get-Content .tmp/a.jsonl"]), ""),
+        worktree_paths(&words(&["pwsh", "-c", "Get-Content .tmp/a.jsonl"]), ""),
         Vec::<String>::new()
     );
 }
 
 #[test]
-fn named_worktree_paths_leaves_out_paths_outside_the_worktree() {
+fn named_tree_paths_leaves_out_paths_outside_the_worktree() {
     assert_eq!(
-        named_worktree_paths(&words(&["tool.exe", r"C:\elsewhere\a", "../outside"]), ""),
+        worktree_paths(&words(&["tool.exe", r"C:\elsewhere\a", "../outside"]), ""),
         Vec::<String>::new()
     );
 }
 
 #[test]
-fn named_worktree_paths_says_a_duplicate_once() {
+fn named_tree_paths_says_a_duplicate_once() {
     assert_eq!(
-        named_worktree_paths(&words(&["tool.exe", ".tmp/a.jsonl", "./.tmp/a.jsonl", r".tmp\a.jsonl"]), ""),
+        worktree_paths(&words(&["tool.exe", ".tmp/a.jsonl", "./.tmp/a.jsonl", r".tmp\a.jsonl"]), ""),
         [".tmp/a.jsonl"]
     );
 }
 
 #[test]
-fn named_worktree_paths_joins_a_path_below_the_gate_folder() {
-    assert_eq!(
-        named_worktree_paths(&words(&["tool.exe", "a.txt", "../b.txt"]), "sub/"),
-        ["sub/a.txt", "b.txt"]
-    );
+fn named_tree_paths_joins_a_path_below_the_gate_folder() {
+    assert_eq!(worktree_paths(&words(&["tool.exe", "a.txt", "../b.txt"]), "sub/"), ["sub/a.txt", "b.txt"]);
 }

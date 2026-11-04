@@ -30,7 +30,7 @@ use gate_inputs::glob::names_tmp;
 use gate_router::warm::{RecordRead, RecordState};
 use gate_router::{
     BuildSettings, BuildTarget, CARRIED_INPUT, DEFAULT_OUTPUTS, LaterCandidate, Nested, PinRefusal, Place, RemoteRun, Route, build_settings,
-    builds_in_place, dotnet_builds, dotnet_target, named_worktree_paths, sdk_build_target, without_no_build, work_folder_key,
+    builds_in_place, dotnet_builds, dotnet_target, named_tree_paths, sdk_build_target, without_no_build, work_folder_key,
 };
 use gate_state::{
     Estimate, FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RoutingFacts, RunFacts, RunTrace, StageFacts, StageOutcome,
@@ -5959,16 +5959,41 @@ fn command_failed(outcome: &RemoteOutcome, interrupted: bool) -> bool {
 }
 
 /// What the hint of a routed run whose command failed on the builder ([`command_failed`]) checks once the run has let
-/// its remote hold go ([`Run::restore_and_close`]): the worktree root, the gate's folder below it with a trailing `/`
-/// (empty at the root), the words as this PC would run them, the files the run carried and the repo's `inputs` globs,
-/// and the bounds of the run's git calls.
+/// its remote hold go ([`Run::restore_and_close`]): the gate's folder below the worktree root with a trailing `/`
+/// (empty at the root), the words as this PC would run them, the worktree's tree, each carried sibling's by its
+/// declared name and its repo as the routing file keys it, in order, and the bounds of the run's git calls.
 struct HintCheck {
-    root: String,
     prefix: String,
     words: Vec<String>,
+    main: HintTree,
+    siblings: Vec<(String, String, HintTree)>,
+    bounds: git::GitBounds,
+}
+
+/// A tree [`HintCheck`] checks: its root, the files the run carried in it and its repo's `inputs` globs.
+struct HintTree {
+    root: String,
     carried: Vec<String>,
     globs: Vec<String>,
-    bounds: git::GitBounds,
+}
+
+impl HintTree {
+    /// The tree at `root` whose run's input globs are `inputs`: the paths after [`CARRIED_INPUT`] carried, the rest
+    /// the repo's globs.
+    fn of(root: &str, inputs: &[String]) -> HintTree {
+        let (carried, globs) = inputs.iter().fold((Vec::new(), Vec::new()), |(mut carried, mut globs), input| {
+            match input.strip_prefix(CARRIED_INPUT) {
+                Some(file) => carried.push(file.to_owned()),
+                None => globs.push(input.clone()),
+            }
+            (carried, globs)
+        });
+        HintTree {
+            root: root.to_owned(),
+            carried,
+            globs,
+        }
+    }
 }
 
 impl HintCheck {
@@ -5979,67 +6004,83 @@ impl HintCheck {
         } else {
             format!("{}/", remote.subfolder)
         };
-        let (carried, globs) = remote.inputs.iter().fold((Vec::new(), Vec::new()), |(mut carried, mut globs), input| {
-            match input.strip_prefix(CARRIED_INPUT) {
-                Some(file) => carried.push(file.to_owned()),
-                None => globs.push(input.clone()),
-            }
-            (carried, globs)
-        });
         HintCheck {
-            root: remote.root.clone(),
             prefix,
             words: remote.fallback.clone(),
-            carried,
-            globs,
+            main: HintTree::of(&remote.root, &remote.inputs),
+            siblings: remote
+                .siblings
+                .iter()
+                .map(|sibling| (sibling.name.clone(), sibling.repo.clone(), HintTree::of(&sibling.root, &sibling.inputs)))
+                .collect(),
             bounds,
         }
     }
 }
 
 /// The hint lines of a routed run whose command failed on the builder ([`HintCheck`]): each path its words name
-/// ([`named_worktree_paths`]) that is a file in the worktree, git reports ignored, no `inputs` glob of the repo covers
-/// and the run did not carry, so the builder's snapshot had no copy of it. A folder is never named: its files may have
-/// been carried or covered one by one. At most [`HINTED_PATHS`] are named, the first in word order, then a line
-/// counting the rest. When git cannot tell which are ignored, or the inputs globs cannot be read, the log says why and
-/// the run hints nothing.
+/// ([`named_tree_paths`]) that is a file in its tree (the worktree's, or a carried sibling's), git reports ignored
+/// there, no `inputs` glob of that tree's repo covers and the run did not carry, so the builder's snapshot had no copy
+/// of it. A path in a sibling is named from the worktree root (`../<sibling>/<path>`), and its hint says to add it to
+/// that sibling's repo's inputs, by the repo's name as the routing file keys it. A folder is never named: its files may
+/// have been carried or covered one by one. At most [`HINTED_PATHS`] are named, the first in word order, then a line
+/// counting the rest. When git cannot tell which are ignored, or a tree's inputs globs cannot be read, the log says
+/// why and the run hints nothing.
 fn ignored_hint_lines(check: &HintCheck, console: &mut Console) -> Vec<String> {
-    let root = Path::new(&check.root);
     let cannot_tell = |why: &str, console: &mut Console| console.note(&format!("gate: cannot tell which words are gitignored: {why}"));
-    let globs = match Globs::inputs(&check.globs, route::NOTHING_EXCLUDED) {
-        Ok(globs) => globs,
-        Err(why) => {
-            cannot_tell(&why, console);
-            return Vec::new();
+    let names: Vec<&str> = check.siblings.iter().map(|(name, _, _)| name.as_str()).collect();
+    let named = named_tree_paths(&check.words, &check.prefix, &names);
+    let trees = std::iter::once(&check.main).chain(check.siblings.iter().map(|(_, _, tree)| tree));
+    let mut ignored: Vec<(Option<usize>, Vec<String>)> = Vec::new();
+    for (index, tree) in trees.enumerate() {
+        let of = index.checked_sub(1);
+        let root = Path::new(&tree.root);
+        let globs = match Globs::inputs(&tree.globs, route::NOTHING_EXCLUDED) {
+            Ok(globs) => globs,
+            Err(why) => {
+                cannot_tell(&why, console);
+                return Vec::new();
+            }
+        };
+        let candidates: Vec<String> = named
+            .iter()
+            .filter(|(tree, _)| *tree == of)
+            .map(|(_, path)| path)
+            .filter(|path| root.join(path).is_file())
+            .filter(|path| !globs.matches(path))
+            .filter(|path| !tree.carried.iter().any(|file| file.eq_ignore_ascii_case(path)))
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            continue;
         }
-    };
-    let candidates: Vec<String> = named_worktree_paths(&check.words, &check.prefix)
-        .into_iter()
-        .filter(|path| root.join(path).is_file())
-        .filter(|path| !globs.matches(path))
-        .filter(|path| !check.carried.iter().any(|file| file.eq_ignore_ascii_case(path)))
-        .collect();
-    if candidates.is_empty() {
-        return Vec::new();
+        match route::ignored_paths(root, &candidates, check.bounds) {
+            Ok(found) => ignored.push((of, candidates.into_iter().filter(|path| found.contains(path)).collect())),
+            Err(why) => {
+                cannot_tell(&why, console);
+                return Vec::new();
+            }
+        }
     }
-    let ignored = match route::ignored_paths(root, &candidates, check.bounds) {
-        Ok(ignored) => ignored,
-        Err(why) => {
-            cannot_tell(&why, console);
-            return Vec::new();
-        }
-    };
-    let hinted: Vec<&String> = candidates.iter().filter(|path| ignored.contains(*path)).collect();
+    // Each hinted path from the worktree root, with whose inputs would carry it: the repo's, or the sibling's repo.
+    let hinted: Vec<(String, String)> = named
+        .iter()
+        .filter(|(tree, path)| ignored.iter().any(|(of, paths)| of == tree && paths.contains(path)))
+        .map(|(tree, path)| match tree {
+            None => (path.clone(), "the repo's".to_owned()),
+            Some(index) => (format!("../{}/{path}", names[*index]), format!("{}'s", check.siblings[*index].1)),
+        })
+        .collect();
     let mut lines: Vec<String> = hinted
         .iter()
         .take(HINTED_PATHS)
-        .map(|path| {
+        .map(|(path, whose)| {
             format!(
                 concat!(
                     "gate: hint: {} is gitignored, so the builder had no copy of it; ",
-                    "if the command reads it, add it to the repo's inputs in remote.json, or rerun with --local"
+                    "if the command reads it, add it to {} inputs in remote.json, or rerun with --local"
                 ),
-                path
+                path, whose
             )
         })
         .collect();

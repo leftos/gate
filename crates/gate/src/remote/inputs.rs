@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gate_inputs::manifest::tree_split;
-use gate_router::{BuilderOs, CARRIED_INPUT, escaped, work_folder_key};
+use gate_router::{BuilderOs, CARRIED_INPUT, PAIR_CAPS, escaped, work_folder_key};
 use gate_state::{FallbackReason, v1};
 use gate_win32::Interrupt;
 use gate_wire::layout_text;
@@ -117,15 +117,13 @@ impl Tree {
     }
 }
 
-/// What a pair's cap refusal adds to the cap's line: the caps apply to the pair's trees together.
-const PAIR_CAPS: &str = " (the pair's trees together)";
-
 /// What a landed inputs step does with its work folder's carried marker ([`v1::inputs_carried_path`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Marking {
-    /// Nothing: the step carried no path a command named.
+    /// Nothing: the step carried no path a command named, or it is a sibling pair's, whose pair inputs marker sweeps
+    /// the paths it carried ([`pair_marked`]).
     Leave,
-    /// Writes the marker: the step carried a path a command named.
+    /// Writes the marker: a single repo's step carried a path a command named.
     Write,
     /// Removes the marker and the inputs hash cache: the step was the empty manifest that removed the carried copies.
     Clear,
@@ -263,10 +261,6 @@ pub(super) struct PairAsked<'a> {
     pub(super) interrupt: Option<Interrupt>,
 }
 
-/// Why a sibling pair sends no inputs for a tree whose list carries a path a command named: the router refuses such a
-/// pair first, so this only keeps a pair from ever dropping the carried marker.
-const PAIR_CARRIED: &str = "a sibling pair does not send a command's gitignored files yet";
-
 impl PairTree<'_> {
     /// What this tree's files are chosen and hashed under, from the pair's `asked`.
     fn asked<'t>(&'t self, asked: &'t PairAsked<'_>) -> Asked<'t> {
@@ -293,8 +287,10 @@ impl PairTree<'_> {
 /// so far pass the member cap together and before any file is hashed; then each tree hashed within its own read
 /// boundary and hash cache, each path prefixed with its tree's folder name, into one manifest naming the pair's layout,
 /// held to the caps as a whole, its lines naming the tree's repo. A tree past a cap on its own is refused naming its
-/// repo; only the trees together past one add [`PAIR_CAPS`]. A tree carrying a path a command named is refused
-/// ([`PAIR_CARRIED`]). [`Unbuilt::Interrupted`] once `go_on` says no; else why it is not sent.
+/// repo; only the trees together past one add [`PAIR_CAPS`]. A tree's paths a command named (its `[carried]` entries)
+/// are chosen as any single tree's are, and the pair's marking stays [`Marking::Leave`]: the pair inputs marker, not
+/// the carried one, sweeps them ([`pair_marked`]). [`Unbuilt::Interrupted`] once `go_on` says no; else why it is not
+/// sent.
 pub(super) fn built_pair(trees: &[PairTree<'_>], asked: &PairAsked<'_>, go_on: impl Fn() -> bool) -> Result<Built, Unbuilt> {
     let mut chosen = Vec::new();
     let mut members = 0_usize;
@@ -303,9 +299,6 @@ pub(super) fn built_pair(trees: &[PairTree<'_>], asked: &PairAsked<'_>, go_on: i
             Unbuilt::Failed(why) => tree.failed(&why),
             Unbuilt::Interrupted => Unbuilt::Interrupted,
         })?;
-        if picked.marking == Marking::Write {
-            return Err(Unbuilt::Failed(PAIR_CARRIED.to_owned()));
-        }
         if picked.kept.len() > asked.caps.members {
             return Err(tree.failed(&past_members(picked.kept.len(), asked.caps.members)));
         }
@@ -1432,8 +1425,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        Asked, Built, Caps, End, PAST_THE_CAP, Pack, PairAsked, PairInputs, PairTree, Unsent, built, built_pair, installed_all, made_in_tmp, needed,
-        packed, pair_inputs, relative,
+        Asked, Built, Caps, End, Marking, PAST_THE_CAP, Pack, PairAsked, PairInputs, PairTree, Unsent, built, built_pair, installed_all, made_in_tmp,
+        needed, packed, pair_inputs, relative,
     };
     use crate::outputs::hash::sha256_of;
     use crate::outputs::walk::Found;
@@ -1641,19 +1634,32 @@ mod tests {
     }
 
     #[test]
-    fn a_pair_tree_carrying_a_path_a_command_named_is_refused() {
-        let (app, lib) = (worktree("pair-carried-app", "probe/\n"), worktree("pair-carried-lib", "secrets/\n"));
+    fn a_pair_carries_each_tree_s_command_named_paths_in_that_tree_under_the_pair_marker() {
+        let (app, lib) = (worktree("pair-carried-app", "probe/\n"), worktree("pair-carried-lib", ".tmp/\n"));
         put(&app, "probe/P.csproj", "x");
-        put(&lib, "secrets/a", "a");
-        let carried = format!("{CARRIED_INPUT}probe/P.csproj");
+        put(&lib, ".tmp/probe.targets", "t");
+        let (app_carried, lib_carried) = (format!("{CARRIED_INPUT}probe/P.csproj"), format!("{CARRIED_INPUT}.tmp/probe.targets"));
+        let name = |root: &Path| root.file_name().expect("the tree has a name").to_string_lossy().into_owned();
 
-        let refused = failure(build_pair(
-            &[(&app, &[carried.as_str()]), (&lib, &["secrets/**"])],
+        let built = build_pair(
+            &[(&app, &[app_carried.as_str()]), (&lib, &[lib_carried.as_str()])],
             Caps::FULL,
             &Cell::new(0),
-        ));
+        )
+        .map_err(|unbuilt| failure(Err(unbuilt)));
 
-        assert_eq!(refused, "a sibling pair does not send a command's gitignored files yet");
+        let expected = vec![format!("{}/probe/P.csproj", name(&app)), format!("{}/.tmp/probe.targets", name(&lib))];
+        assert_eq!(
+            built
+                .as_ref()
+                .map(|built| paths(built).into_iter().map(str::to_owned).collect::<Vec<_>>()),
+            Ok::<_, &String>(expected),
+            "each carried path lands under its own tree's prefix"
+        );
+        assert!(
+            built.is_ok_and(|built| built.marking == Marking::Leave),
+            "a pair writes no carried marker: the pair inputs marker sweeps its copies"
+        );
     }
 
     #[test]

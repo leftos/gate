@@ -266,11 +266,40 @@ pub struct Place {
 /// with the gitignored files that carry it to the builder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitignoredInput {
-    /// The candidate, `/`-separated from the worktree root, as it was asked.
+    /// The candidate, `/`-separated from the root of the tree it was asked in, as it was asked.
     pub path: String,
-    /// Each gitignored file to carry, `/`-separated from the worktree root, with its size in bytes; else why the
-    /// candidate cannot be carried whole, on one line.
+    /// Each gitignored file to carry, `/`-separated from the root of the tree it was asked in, with its size in bytes;
+    /// else why the candidate cannot be carried whole, on one line.
     pub files: Result<Vec<(String, u64)>, String>,
+    /// Each path its build reads in another tree of the pair ([`OtherTree`]) that that tree neither sends by its input
+    /// globs nor has git report not ignored: the tree, as [`OtherTree::tree`] names it, and the path, `/`-separated from
+    /// that tree's root. The decision drops each that the run carries in that tree ([`carried_inputs`]); any other keeps
+    /// the command here. None outside a sibling pair.
+    pub elsewhere: Vec<ElsewhereRead>,
+}
+
+/// A path a candidate's build reads in another tree of a sibling pair that that tree does not send
+/// ([`GitignoredInput::elsewhere`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ElsewhereRead {
+    /// The tree, as [`OtherTree::tree`] names it.
+    pub tree: Option<usize>,
+    /// The path, `/`-separated from that tree's root.
+    pub path: String,
+    /// Why git could not tell whether that tree sends it; `None` when git reports it ignored.
+    pub untold: Option<String>,
+}
+
+/// Another tree of a sibling pair than the one [`Facts::gitignored_inputs`] is asked of, whose files a candidate's
+/// build may read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OtherTree {
+    /// The tree as [`TreePath`] names it: `None` for the worktree's, else the index of a carried sibling.
+    pub tree: Option<usize>,
+    /// Its root, as the place or the carried sibling gives it.
+    pub root: String,
+    /// Its repo's input globs.
+    pub inputs: Vec<String>,
 }
 
 /// The facts the decision asks the caller for, each only when a rule needs it.
@@ -387,8 +416,8 @@ pub trait Facts {
     /// Asked once, with every candidate, only of a macOS pick whose words hold a relative path written with `\`.
     fn snapshot_carries(&self, place: &Place, paths: &[String]) -> Vec<String>;
 
-    /// Which of `paths`, each `/`-separated and relative to the worktree root of `place`, name a project input the
-    /// snapshot leaves out. A path with an input file's extension ([`is_input_file`]) counts only when it is a file on
+    /// Which of `paths`, each `/`-separated and relative to the tree root `root`, name a project input the snapshot
+    /// leaves out. A path with an input file's extension ([`is_input_file`]) counts only when it is a file on
     /// this PC that none of the repo's input globs `inputs` matches and git reports ignored. Any other path counts as a
     /// file only when `named`, the property values [`carried_inputs`] reads, holds it; otherwise it counts only when it is
     /// a folder on this PC directly holding a project or solution file ([`is_project_or_solution`]), each of which no
@@ -396,8 +425,11 @@ pub trait Facts {
     /// command routes. Each path given back carries the gitignored files no input glob matches below its folder (a
     /// folder candidate's own, a project or solution file's parent below the root), swept at any depth past each `bin`
     /// and `obj` folder; any other file carries only itself. A path that cannot be carried whole says why. Asked
-    /// once, with every candidate ([`carried_inputs`]), of every matched command that would otherwise route.
-    fn gitignored_inputs(&self, place: &Place, paths: &[String], named: &[String], inputs: &[String]) -> Vec<GitignoredInput>;
+    /// once per tree holding a candidate, with its every candidate ([`carried_inputs`]), of every matched command that
+    /// would otherwise route. In a sibling pair, `others` are the pair's other trees: a path a candidate's build reads
+    /// in one of them is checked there, and given back in [`GitignoredInput::elsewhere`] unless that tree's input globs
+    /// match it or git reports it not ignored in that tree.
+    fn gitignored_inputs(&self, root: &str, paths: &[String], named: &[String], inputs: &[String], others: &[OtherTree]) -> Vec<GitignoredInput>;
 
     /// What the drive `letter` (upper case) stands for, as `QueryDosDevice` gives it (`\??\X:\dev` for a subst drive);
     /// `None` when there is no such device.
@@ -504,7 +536,8 @@ pub struct FolderId {
 /// A sibling a routed run carries: its folder name as declared, its root as [`sibling_root`] spells it, the id
 /// [`Facts::sibling_folder`] gave its folder, its repo's name (its main checkout's folder name, as [`Place::checkout`]
 /// names the run's own, read by [`Facts::checkout_of`]; its declared name when that cannot be read), and the `inputs`
-/// globs the same routing file gives that repo, which apply to the sibling's own tree.
+/// globs the same routing file gives that repo, which apply to the sibling's own tree; a routed run's are followed by
+/// the exact path of each gitignored file the command names in that tree, after [`CARRIED_INPUT`] ([`carried_inputs`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CarriedSibling {
     pub name: String,
@@ -689,11 +722,9 @@ pub enum LocalReason {
     DeclaredLocal { file: String, pattern: String },
     /// A matched command's word names `path`, as the word wrote it, a gitignored project input
     /// ([`Facts::gitignored_inputs`]), and the gitignored files its run would carry hold `bytes` in `files`, past the
-    /// 64 MiB or the 2,000 files a command's inputs carry.
-    GitignoredPastCap { path: String, bytes: u64, files: usize },
-    /// A matched command's word names `path`, as the word wrote it, a gitignored project input
-    /// ([`Facts::gitignored_inputs`]), and its run is a sibling pair's, which carries no inputs.
-    GitignoredPair { path: String },
+    /// 64 MiB or the 2,000 files a command's inputs carry; `pair` when the run is a sibling pair's, whose trees count
+    /// together.
+    GitignoredPastCap { path: String, bytes: u64, files: usize, pair: bool },
     /// A matched command's word names `path`, as the word wrote it, a gitignored project input
     /// ([`Facts::gitignored_inputs`]) whose files cannot all be carried, for the reason `why`.
     GitignoredUnsent { path: String, why: String },
@@ -746,16 +777,13 @@ impl LocalReason {
                 format!("{file}: {problem}")
             }
             Self::DeclaredLocal { file, pattern } => format!("{file} keeps it here ({})", escaped(pattern)),
-            Self::GitignoredPastCap { path, bytes, files } => format!(
+            Self::GitignoredPastCap { path, bytes, files, pair } => format!(
                 "{} is gitignored and a command's inputs carry at most {} MiB in {CARRIED_FILES} files; its files hold {} MiB in \
-                 {files} files",
+                 {files} files{}",
                 escaped(path),
                 CARRIED_BYTES / MIB,
-                bytes.div_ceil(MIB)
-            ),
-            Self::GitignoredPair { path } => format!(
-                "{} is gitignored, and a sibling pair does not send a command's gitignored files yet",
-                escaped(path)
+                bytes.div_ceil(MIB),
+                if *pair { PAIR_CAPS } else { "" }
             ),
             Self::GitignoredUnsent { path, why } => format!("{} is gitignored and its files cannot be sent: {why}", escaped(path)),
             Self::BuiltHere { project } => format!("the last build of {} ran here; --no-build kept", escaped(project)),
@@ -2034,17 +2062,42 @@ fn ended(config: &Config, matched: Matched, given: &[String], facts: &dyn Facts)
         return Err(Some(LocalReason::NothingSent { subfolder }));
     }
     let carried = carried_inputs(&matched, facts).map_err(Some)?;
-    let prefix = place.prefix.clone();
+    let marks = Marks {
+        prefix: place.prefix.clone(),
+        siblings: sibling_names(&matched).into_iter().map(str::to_owned).collect(),
+        carried,
+    };
     let mut run = remote_run(config, matched, subfolder, given, facts)?;
-    mark_carried_properties(&mut run.words, &prefix, &carried);
+    mark_carried_properties(&mut run.words, &marks);
     if let Some(plan) = &mut run.send {
-        mark_carried_properties(&mut plan.words, &prefix, &carried);
+        mark_carried_properties(&mut plan.words, &marks);
     }
     if let Some(cross) = &mut run.cross_build {
-        mark_carried_properties(&mut cross.words, &prefix, &carried);
+        mark_carried_properties(&mut cross.words, &marks);
     }
-    run.inputs.extend(carried.into_iter().map(|file| format!("{CARRIED_INPUT}{file}")));
+    let Carried { main, siblings } = marks.carried;
+    run.inputs.extend(main.into_iter().map(|file| format!("{CARRIED_INPUT}{file}")));
+    for (sibling, files) in run.siblings.iter_mut().zip(siblings) {
+        sibling.inputs.extend(files.into_iter().map(|file| format!("{CARRIED_INPUT}{file}")));
+    }
     Ok(run)
+}
+
+/// What [`mark_carried_properties`] reads a word's paths by: the gate's folder below the root (`sub/dir/`, empty at
+/// the root), the declared names of the carried siblings in order, and the files the run carries in each tree.
+struct Marks {
+    prefix: String,
+    siblings: Vec<String>,
+    carried: Carried,
+}
+
+impl Marks {
+    /// Whether the path `named`, as a word wrote it, is a file the run carries in its tree ([`tree_path`]), in any
+    /// letter case.
+    fn names_carried(&self, named: &str) -> bool {
+        tree_path(&self.prefix, &self.siblings, named)
+            .is_some_and(|(tree, path)| self.carried.of(tree).iter().any(|file| file.eq_ignore_ascii_case(&path)))
+    }
 }
 
 /// Stands in a routed word for the folder the builder runs the command in, which only the builder knows.
@@ -2055,13 +2108,13 @@ const PROPERTY_SWITCHES: [&str; 5] = ["-p", "/p", "-property", "/property", "--p
 
 /// Each of `words` with its property values naming a `carried` file marked: a value joined to its switch by `:`
 /// ([`carried_property`]), or the word after a switch standing alone ([`marked_values`]).
-fn mark_carried_properties(words: &mut [String], prefix: &str, carried: &[String]) {
+fn mark_carried_properties(words: &mut [String], marks: &Marks) {
     let mut after_switch = false;
     for word in words {
         *word = if after_switch {
-            marked_values(word, prefix, carried)
+            marked_values(word, marks)
         } else {
-            carried_property(word, prefix, carried)
+            carried_property(word, marks)
         };
         after_switch = is_property_switch(word);
     }
@@ -2074,9 +2127,9 @@ fn is_property_switch(word: &str) -> bool {
 
 /// `word` with its value marked when it is a property switch joined to its value by `:` ([`marked_values`]). Any other
 /// word, a tool's option value that its tool reads from the working folder among them, is given back as it is.
-fn carried_property(word: &str, prefix: &str, carried: &[String]) -> String {
+fn carried_property(word: &str, marks: &Marks) -> String {
     match property_switch_value(word) {
-        Some((switch, value)) => format!("{switch}:{}", marked_values(value, prefix, carried)),
+        Some((switch, value)) => format!("{switch}:{}", marked_values(value, marks)),
         None => word.to_owned(),
     }
 }
@@ -2097,15 +2150,17 @@ fn property_piece(piece: &str) -> (&str, &str) {
     }
 }
 
-/// The property list `value` with [`GATE_FOLDER_MARK`] before each piece that names a `carried` file from the gate's
-/// folder `prefix` ([`input_path`]), in any letter case: `MSBuild` reads such a value from the project's folder or the
-/// importing file's, so only an absolute path finds the file. A list naming no carried file is given back as it is.
-fn marked_values(value: &str, prefix: &str, carried: &[String]) -> String {
+/// The property list `value` with [`GATE_FOLDER_MARK`] before each piece that names a carried file from the gate's
+/// folder ([`Marks::names_carried`]), in any letter case: `MSBuild` reads such a value from the project's folder or the
+/// importing file's, so only an absolute path finds the file. A sibling's file keeps its `..` climb after the mark,
+/// which the builder's pair layout resolves into that sibling's tree. A list naming no carried file is given back as
+/// it is.
+fn marked_values(value: &str, marks: &Marks) -> String {
     let mut marked = String::with_capacity(value.len());
     for piece in value.split_inclusive([';', ',']) {
         let (name, named) = property_piece(piece);
         marked.push_str(name);
-        if input_path(prefix, named).is_some_and(|path| carried.iter().any(|file| file.eq_ignore_ascii_case(&path))) {
+        if marks.names_carried(named) {
             marked.push_str(GATE_FOLDER_MARK);
             marked.push('/');
         }
@@ -2119,9 +2174,10 @@ fn marked_values(value: &str, prefix: &str, carried: &[String]) -> String {
 
 /// The paths the `matched` command's property words name, as [`mark_carried_properties`] reads them: each piece of the
 /// value of a property switch joined to it by `:` ([`property_switch_value`]) or of the word after a switch standing
-/// alone, through [`input_path`], less each piece setting one of [`OUTPUT_PROPERTIES`].
-fn named_inputs(matched: &Matched) -> Vec<String> {
+/// alone, through [`tree_path`], each in its tree, less each piece setting one of [`OUTPUT_PROPERTIES`].
+fn named_inputs(matched: &Matched) -> Vec<TreePath> {
     let prefix = &matched.target.place.prefix;
+    let siblings = sibling_names(matched);
     let mut named = Vec::new();
     let mut after_switch = false;
     for word in &matched.words {
@@ -2136,7 +2192,7 @@ fn named_inputs(matched: &Matched) -> Vec<String> {
             if OUTPUT_PROPERTIES.iter().any(|known| eq_ignoring_case(sets, known)) {
                 continue;
             }
-            if let Some(path) = input_path(prefix, path) {
+            if let Some(path) = tree_path(prefix, &siblings, path) {
                 named.push(path);
             }
         }
@@ -2147,72 +2203,251 @@ fn named_inputs(matched: &Matched) -> Vec<String> {
 
 /// The files the run of the `matched` command carries to its builder as exact input paths beside the repo's input
 /// globs, because one of its words before a script's text names a project input the snapshot leaves out
-/// ([`input_candidates`]). The facts are asked once, with every candidate and the repo's input globs
-/// ([`Facts::gitignored_inputs`]); each file of each candidate they give back is carried once, in their order, unless
-/// one of the repo's input globs is that very path. None when there is no candidate or none is given back.
+/// ([`input_candidates`]). The facts are asked once per tree holding a candidate ([`asked_trees`]); each file of each
+/// candidate they give back is carried once, in their order, unless one of its tree's input globs is that very path.
+/// None when there is no candidate or none is given back.
 ///
 /// # Errors
 ///
 /// Why the run stays here instead, naming the first candidate in word order the facts give back, as the word wrote it:
-/// a sibling pair's run carries no inputs, a candidate whose files cannot all be carried names it and why, and the
-/// files carried, the repo's own input globs left out, hold at most
-/// [`CARRIED_BYTES`] by their sizes in at most [`CARRIED_FILES`] files. Either is told before anything is sent.
-fn carried_inputs(matched: &Matched, facts: &dyn Facts) -> Result<Vec<String>, LocalReason> {
+/// a candidate whose files cannot all be carried names it and why; one whose build reads a path in another tree of the
+/// pair that the run does not carry there ([`GitignoredInput::elsewhere`]) names it and that path; and the files
+/// carried, each tree's own input globs left out, hold at most [`CARRIED_BYTES`] by their sizes in at most
+/// [`CARRIED_FILES`] files, a sibling pair's trees counted together. Each is told before anything is sent.
+fn carried_inputs(matched: &Matched, facts: &dyn Facts) -> Result<Carried, LocalReason> {
+    let mut carried = Carried::none(matched.target.siblings.len());
     let candidates = input_candidates(matched);
     if candidates.is_empty() {
-        return Ok(Vec::new());
+        return Ok(carried);
     }
-    let mut seen = HashSet::new();
-    let asked: Vec<String> = candidates
-        .iter()
-        .filter(|(_, path)| seen.insert(path.as_str()))
-        .map(|(_, path)| path.clone())
-        .collect();
-    let inputs = &matched.target.inputs;
-    let named = named_inputs(matched);
-    let ignored = facts.gitignored_inputs(&matched.target.place, &asked, &named, inputs);
-    let given: Vec<(&str, &GitignoredInput)> = candidates
-        .iter()
-        .filter_map(|(shown, path)| ignored.iter().find(|input| input.path == *path).map(|input| (*shown, input)))
-        .collect();
-    let Some((shown, _)) = given.first() else {
-        return Ok(Vec::new());
+    let trees = pair_trees(matched);
+    let answers = asked_trees(matched, &trees, &candidates, facts);
+    let given = given_inputs(&candidates, &answers);
+    if given.is_empty() {
+        return Ok(carried);
+    }
+    if let Some(refused) = uncarried(&given) {
+        return Err(refused);
+    }
+    let sizes = tally(&trees, &answers, &mut carried);
+    if let Some(refused) = unsent_read(&given, &carried, &sibling_names(matched)) {
+        return Err(refused);
+    }
+    match past_caps(&candidates, &given, &sizes, &carried) {
+        Some(refused) => Err(refused),
+        None => Ok(carried),
+    }
+}
+
+/// The cap refusal of the run's `carried` files, whose bytes `sizes` gives per tree; `None` within the caps. A tree
+/// past a cap on its own is refused with its own figures, naming its first candidate in word order the facts gave back
+/// (`given`); else the trees together past one are refused with their figures and [`PAIR_CAPS`], naming the first
+/// candidate of all, as the client's pair cap refusal does.
+fn past_caps(
+    candidates: &[(&str, TreePath)],
+    given: &[(&str, &GitignoredInput)],
+    sizes: &[(Option<usize>, u64)],
+    carried: &Carried,
+) -> Option<LocalReason> {
+    let (first, _) = given.first()?;
+    let past = |bytes: u64, files: usize| bytes > CARRIED_BYTES || files > CARRIED_FILES;
+    for (tree, bytes) in sizes {
+        let files = carried.of(*tree).len();
+        if past(*bytes, files) {
+            let shown = candidates
+                .iter()
+                .find(|(shown, (of, _))| of == tree && given.iter().any(|(known, _)| known == shown))
+                .map_or(*first, |(shown, _)| *shown);
+            return Some(LocalReason::GitignoredPastCap {
+                path: shown.to_owned(),
+                bytes: *bytes,
+                files,
+                pair: false,
+            });
+        }
+    }
+    let bytes = sizes.iter().map(|(_, bytes)| *bytes).fold(0_u64, u64::saturating_add);
+    let files = carried.count();
+    past(bytes, files).then(|| LocalReason::GitignoredPastCap {
+        path: (*first).to_owned(),
+        bytes,
+        files,
+        pair: true,
+    })
+}
+
+/// What [`Facts::gitignored_inputs`] gave back for one tree ([`TreePath`]).
+type Answer = (Option<usize>, Vec<GitignoredInput>);
+
+/// The trees of the `matched` command's run, each with its root and input globs: the worktree's, then each carried
+/// sibling's, in order.
+fn pair_trees(matched: &Matched) -> Vec<OtherTree> {
+    let target = &matched.target;
+    let main = OtherTree {
+        tree: None,
+        root: target.place.root.clone(),
+        inputs: target.inputs.clone(),
     };
-    let path = (*shown).to_owned();
-    if !matched.target.siblings.is_empty() {
-        return Err(LocalReason::GitignoredPair { path });
+    let siblings = target.siblings.iter().enumerate().map(|(index, sibling)| OtherTree {
+        tree: Some(index),
+        root: sibling.root.clone(),
+        inputs: sibling.inputs.clone(),
+    });
+    std::iter::once(main).chain(siblings).collect()
+}
+
+/// [`Facts::gitignored_inputs`] asked of each of `trees` holding one of `candidates`, the worktree's first: with that
+/// tree's root, its candidates once each, the property values naming a path in it ([`named_inputs`]), its input globs,
+/// and the pair's other trees.
+fn asked_trees(matched: &Matched, trees: &[OtherTree], candidates: &[(&str, TreePath)], facts: &dyn Facts) -> Vec<Answer> {
+    let named = named_inputs(matched);
+    let mut answers = Vec::new();
+    for tree in trees {
+        let mut seen = HashSet::new();
+        let asked: Vec<String> = candidates
+            .iter()
+            .filter(|(_, (of, path))| *of == tree.tree && seen.insert(path.as_str()))
+            .map(|(_, (_, path))| path.clone())
+            .collect();
+        if asked.is_empty() {
+            continue;
+        }
+        let named: Vec<String> = named.iter().filter(|(of, _)| *of == tree.tree).map(|(_, path)| path.clone()).collect();
+        let others: Vec<OtherTree> = trees.iter().filter(|other| other.tree != tree.tree).cloned().collect();
+        answers.push((tree.tree, facts.gitignored_inputs(&tree.root, &asked, &named, &tree.inputs, &others)));
     }
-    if let Some((shown, why)) = given.iter().find_map(|(shown, input)| input.files.as_ref().err().map(|why| (shown, why))) {
-        return Err(LocalReason::GitignoredUnsent {
+    answers
+}
+
+/// Each of `candidates` the facts gave back in `answers`, in word order, as the word wrote it.
+fn given_inputs<'c, 'a>(candidates: &[(&'c str, TreePath)], answers: &'a [Answer]) -> Vec<(&'c str, &'a GitignoredInput)> {
+    candidates
+        .iter()
+        .filter_map(|(shown, (tree, path))| {
+            let (_, ignored) = answers.iter().find(|(of, _)| of == tree)?;
+            ignored.iter().find(|input| input.path == *path).map(|input| (*shown, input))
+        })
+        .collect()
+}
+
+/// The refusal of the first of `given` whose files cannot all be carried, naming it as the word wrote it and why.
+fn uncarried(given: &[(&str, &GitignoredInput)]) -> Option<LocalReason> {
+    given.iter().find_map(|(shown, input)| {
+        input.files.as_ref().err().map(|why| LocalReason::GitignoredUnsent {
             path: (*shown).to_owned(),
             why: why.clone(),
-        });
+        })
+    })
+}
+
+/// Each file `answers` carry put in its tree of `carried`, once each and none one of its tree's input globs is; the
+/// bytes they hold in each tree.
+fn tally(trees: &[OtherTree], answers: &[Answer], carried: &mut Carried) -> Vec<(Option<usize>, u64)> {
+    let mut sizes = Vec::with_capacity(answers.len());
+    for (tree, ignored) in answers {
+        let mut bytes = 0_u64;
+        let globs = trees
+            .iter()
+            .find(|known| known.tree == *tree)
+            .map_or(&[][..], |known| known.inputs.as_slice());
+        let mut seen: HashSet<&str> = globs.iter().map(String::as_str).collect();
+        let list = carried.of_mut(*tree);
+        for (file, size) in ignored.iter().filter_map(|input| input.files.as_ref().ok()).flatten() {
+            if seen.insert(file.as_str()) {
+                bytes = bytes.saturating_add(*size);
+                list.push(file.clone());
+            }
+        }
+        sizes.push((*tree, bytes));
     }
-    let mut seen: HashSet<&str> = inputs.iter().map(String::as_str).collect();
-    let carried: Vec<&(String, u64)> = ignored
-        .iter()
-        .filter_map(|input| input.files.as_ref().ok())
-        .flatten()
-        .filter(|(file, _)| seen.insert(file.as_str()))
-        .collect();
-    let bytes = carried.iter().map(|(_, size)| size).sum();
-    if bytes > CARRIED_BYTES || carried.len() > CARRIED_FILES {
-        return Err(LocalReason::GitignoredPastCap {
-            path,
-            bytes,
-            files: carried.len(),
-        });
+    sizes
+}
+
+/// The refusal of the first of `given` whose build reads a path in another tree of the pair
+/// ([`GitignoredInput::elsewhere`]) that `carried` does not hold in that tree: the line names the path from the
+/// worktree root, `../<sibling>/<path>` for one in the sibling of that declared name among `names`, as the build file
+/// check names a path of the candidate's own tree. A read git could not tell of ([`ElsewhereRead::untold`]) says so
+/// and why, as that check does; any other is not sent.
+fn unsent_read(given: &[(&str, &GitignoredInput)], carried: &Carried, names: &[&str]) -> Option<LocalReason> {
+    given.iter().find_map(|(shown, input)| {
+        let read = input.elsewhere.iter().find(|read| !carried.holds(read.tree, &read.path))?;
+        let path = &read.path;
+        let said = match read.tree.and_then(|index| names.get(index)) {
+            Some(name) => escaped(&format!("../{name}/{path}")),
+            None => escaped(path),
+        };
+        let why = match &read.untold {
+            Some(why) => format!("the build reads {said} outside its folder, and git cannot tell whether it is sent: {why}"),
+            None => format!("the build reads {said} outside its folder, which is not sent"),
+        };
+        Some(LocalReason::GitignoredUnsent {
+            path: (*shown).to_owned(),
+            why,
+        })
+    })
+}
+
+/// What a sibling pair's carried cap refusal adds to its line, the router's and the client's alike, when only the
+/// pair's trees together are past a cap.
+pub const PAIR_CAPS: &str = " (the pair's trees together)";
+
+/// The gitignored files a routed run carries ([`carried_inputs`]), each `/`-separated from its tree's root: the
+/// worktree's, then each carried sibling's, in the run's order.
+struct Carried {
+    main: Vec<String>,
+    siblings: Vec<Vec<String>>,
+}
+
+impl Carried {
+    /// No file carried in the worktree or in any of its `siblings` carried siblings.
+    fn none(siblings: usize) -> Carried {
+        Carried {
+            main: Vec::new(),
+            siblings: vec![Vec::new(); siblings],
+        }
     }
-    Ok(carried.into_iter().map(|(file, _)| file.clone()).collect())
+
+    /// The files carried in `tree` ([`TreePath`]).
+    fn of(&self, tree: Option<usize>) -> &[String] {
+        match tree {
+            None => &self.main,
+            Some(index) => self.siblings.get(index).map_or(&[], Vec::as_slice),
+        }
+    }
+
+    /// The files carried in `tree` ([`TreePath`]), to add to.
+    fn of_mut(&mut self, tree: Option<usize>) -> &mut Vec<String> {
+        match tree {
+            None => &mut self.main,
+            // A sibling's index comes from `tree_path`, bounded by the run's siblings, and `Carried::none` sizes the list.
+            Some(index) => &mut self.siblings[index],
+        }
+    }
+
+    /// How many files are carried in every tree together.
+    fn count(&self) -> usize {
+        self.main.len() + self.siblings.iter().map(Vec::len).sum::<usize>()
+    }
+
+    /// Whether the run carries `path` in `tree`: it is one of the tree's carried entries or lies under one, in any ASCII
+    /// letter case. A carried folder covers its files; a carried file does not cover the folder it lies in.
+    fn holds(&self, tree: Option<usize>, path: &str) -> bool {
+        self.of(tree).iter().any(|entry| {
+            path.get(..entry.len()).is_some_and(|start| start.eq_ignore_ascii_case(entry))
+                && matches!(path.as_bytes().get(entry.len()), None | Some(b'/'))
+        })
+    }
 }
 
 /// The candidates of the `matched` command's words before a script's text ([`script_start`]), each as the word wrote
 /// it and as the path it names: each value of each word ([`input_values`]) that names a path below the root
-/// ([`input_path`]) is a candidate when it has an input file's extension ([`is_input_file`]), or, as a folder, when it
+/// ([`tree_path`]) is a candidate when it has an input file's extension ([`is_input_file`]), or, as a folder, when it
 /// comes after a dotnet command's verb ([`folders_from`]). No word after the first `--` is read, nor, in a dotnet
-/// command, an output option's value ([`output_values`]).
-fn input_candidates(matched: &Matched) -> Vec<(&str, String)> {
+/// command, an output option's value ([`output_values`]). A path in a carried sibling ([`tree_path`]) is that
+/// sibling's candidate.
+fn input_candidates(matched: &Matched) -> Vec<(&str, TreePath)> {
     let place = &matched.target.place;
+    let siblings = sibling_names(matched);
     let words = &matched.words[..script_start(&matched.words)];
     let words = &words[..words.iter().position(|word| word == SEPARATOR).unwrap_or(words.len())];
     let folders = folders_from(words);
@@ -2227,13 +2462,18 @@ fn input_candidates(matched: &Matched) -> Vec<(&str, String)> {
         .filter(|(index, _)| !outputs[*index])
         .flat_map(|(index, word)| input_values(word).into_iter().map(move |value| (index, value)))
         .filter(|(index, value)| is_input_file(value) || folders.is_some_and(|from| *index >= from))
-        .filter_map(|(_, value)| input_path(&place.prefix, value).map(|path| (value, path)))
+        .filter_map(|(_, value)| tree_path(&place.prefix, &siblings, value).map(|path| (value, path)))
         .collect()
+}
+
+/// The declared names of the siblings the `matched` command's run carries, in order.
+fn sibling_names(matched: &Matched) -> Vec<&str> {
+    matched.target.siblings.iter().map(|sibling| sibling.name.as_str()).collect()
 }
 
 /// The start of each entry of a routed run's input globs ([`RemoteRun::inputs`]) that is the exact path of a gitignored
 /// file the command names ([`carried_inputs`]), not one of the repo's globs: no input glob holds `[`, nor does a path a
-/// word names ([`input_path`]).
+/// word names ([`tree_path`]).
 pub const CARRIED_INPUT: &str = "[carried]";
 
 /// The bytes of a mebibyte.
@@ -2306,12 +2546,14 @@ fn input_values(word: &str) -> Vec<&str> {
     std::iter::once(word).chain(pieces).collect()
 }
 
-/// The worktree paths `words` name, in word order and each once: the path ([`input_path`] below the gate's folder
-/// `prefix`) of every value ([`input_values`]) of every word after the program word, up to a script's text
-/// ([`script_start`]), the words after a `--` included. The program word and script text are never read, nor, in a
-/// dotnet command, an output option's value before the first `--` ([`output_values`]), as [`input_candidates`] skips it.
+/// The paths `words` name, in word order and each once, each in its tree: the path ([`tree_path`] below the gate's
+/// folder `prefix`) of every value ([`input_values`]) of every word after the program word, up to a script's text
+/// ([`script_start`]), the words after a `--` included, in the worktree's tree or, for a sibling pair, in one of the
+/// carried `siblings` (their declared names, in order) a path climbs into as the rewrite lands it ([`TreePath`]). The
+/// program word and script text are never read, nor, in a dotnet command, an output option's value before the first
+/// `--` ([`output_values`]), as [`input_candidates`] skips it.
 #[must_use]
-pub fn named_worktree_paths(words: &[String], prefix: &str) -> Vec<String> {
+pub fn named_tree_paths(words: &[String], prefix: &str, siblings: &[&str]) -> Vec<TreePath> {
     let Some((first, _)) = first_word(words) else {
         return Vec::new();
     };
@@ -2322,12 +2564,12 @@ pub fn named_worktree_paths(words: &[String], prefix: &str) -> Vec<String> {
     } else {
         Vec::new()
     };
-    let mut named: Vec<String> = Vec::new();
+    let mut named: Vec<TreePath> = Vec::new();
     for (index, word) in words.iter().enumerate().skip(first + 1) {
         if outputs.get(index).copied().unwrap_or(false) {
             continue;
         }
-        for path in input_values(word).into_iter().filter_map(|value| input_path(prefix, value)) {
+        for path in input_values(word).into_iter().filter_map(|value| tree_path(prefix, siblings, value)) {
             if !named.contains(&path) {
                 named.push(path);
             }
@@ -2340,25 +2582,44 @@ pub fn named_worktree_paths(words: &[String], prefix: &str) -> Vec<String> {
 /// Windows refuses in a name.
 const NOT_IN_INPUT_PATH: [char; 8] = [':', '*', '?', '[', '"', '<', '>', '|'];
 
+/// The tree a path a word names lies in and the path, `/`-separated from that tree's root: `None` for the worktree's,
+/// else the index of a carried sibling in the run's siblings.
+pub type TreePath = (Option<usize>, String);
+
 /// The path `value`, written with `/` or `\`, names below the gate's folder `prefix` (`sub/dir/`, empty at the root),
-/// `/`-separated from the worktree root with its `.` segments dropped and each `..` taking off the segment before it.
-/// `None` for a value that is empty, starts with a separator or `-`, holds any of [`NOT_IN_INPUT_PATH`], climbs above
-/// the root, or names the root itself.
-fn input_path(prefix: &str, value: &str) -> Option<String> {
+/// `/`-separated from the worktree root with its `.` segments dropped and each `..` taking off the segment before it;
+/// or, in a sibling pair, in one of the carried `siblings` (their declared names, in order), as the rewrite lands such
+/// a path: its `..` climb exactly to the root's parent, the next segment is a sibling's name in any letter case, and
+/// the rest is `/`-separated from that sibling's root. `None` for a value that is empty, starts with a separator or
+/// `-`, holds any of [`NOT_IN_INPUT_PATH`], or names the root or a sibling itself, and for a climb past the root's
+/// parent, into a folder of the parent that is no sibling, or out of the sibling again.
+fn tree_path(prefix: &str, siblings: &[impl AsRef<str>], value: &str) -> Option<TreePath> {
     if value.is_empty() || value.starts_with(['-', '/', '\\']) || value.contains(NOT_IN_INPUT_PATH) {
         return None;
     }
     let mut segments: Vec<&str> = prefix.split('/').filter(|segment| !segment.is_empty()).collect();
+    // `Some(None)` while in the worktree, `None` at the root's parent, `Some(Some(index))` in that sibling.
+    let mut tree: Option<Option<usize>> = Some(None);
     for segment in value.split(['/', '\\']) {
-        match segment {
-            "" | "." => {}
-            ".." => {
+        match (segment, tree) {
+            ("" | ".", _) => {}
+            ("..", Some(None)) => {
+                if segments.pop().is_none() {
+                    tree = None;
+                }
+            }
+            ("..", _) => {
                 segments.pop()?;
             }
-            _ => segments.push(segment),
+            (_, None) => {
+                let index = siblings.iter().position(|name| name.as_ref().eq_ignore_ascii_case(segment))?;
+                tree = Some(Some(index));
+            }
+            (_, Some(_)) => segments.push(segment),
         }
     }
-    (!segments.is_empty()).then(|| segments.join("/"))
+    let tree = tree?;
+    (!segments.is_empty()).then(|| (tree, segments.join("/")))
 }
 
 /// What a pick of `builder` runs as far as a macOS builder's rewrite goes: for a macOS builder, the opened worktree's
@@ -4484,7 +4745,73 @@ fn project_folder(project: &str, place: &Place) -> Option<String> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{PinRefusal, Place, derived_outputs, names_bin_folder, send_bin, switch_outputs};
+    use super::{PinRefusal, Place, TreePath, derived_outputs, input_values, names_bin_folder, send_bin, switch_outputs, tree_path};
+
+    /// The carried siblings of the matcher cases: `b` alone.
+    const SIBLINGS: [&str; 1] = ["b"];
+
+    /// `path` in the sibling `b`.
+    fn in_sibling(path: &str) -> TreePath {
+        (Some(0), path.to_owned())
+    }
+
+    #[test]
+    fn a_backslashed_climb_into_a_sibling_names_a_path_in_that_sibling() {
+        assert_eq!(tree_path("", &SIBLINGS, r"..\b\.tmp\p.targets"), Some(in_sibling(".tmp/p.targets")));
+        assert_eq!(
+            tree_path("sub/", &SIBLINGS, r"..\..\b\x.props"),
+            Some(in_sibling("x.props")),
+            "one more `..` a level"
+        );
+        assert_eq!(
+            tree_path("", &SIBLINGS, r"..\B\x.props"),
+            Some(in_sibling("x.props")),
+            "the name in any letter case"
+        );
+    }
+
+    #[test]
+    fn a_slashed_climb_into_a_sibling_names_a_path_in_that_sibling() {
+        assert_eq!(tree_path("", &SIBLINGS, "../b/.tmp/p.targets"), Some(in_sibling(".tmp/p.targets")));
+    }
+
+    #[test]
+    fn a_property_value_after_its_equals_names_a_path_in_a_sibling() {
+        let word = r"-p:CustomBeforeMicrosoftCommonTargets=..\b\.tmp\probe\probe.targets";
+        let found: Vec<TreePath> = input_values(word)
+            .into_iter()
+            .filter_map(|value| tree_path("", &SIBLINGS, value))
+            .collect();
+        assert_eq!(found, [(Some(0), ".tmp/probe/probe.targets".to_owned())]);
+    }
+
+    #[test]
+    fn a_climb_above_both_trees_names_no_path() {
+        assert_eq!(tree_path("", &SIBLINGS, r"..\..\x.targets"), None);
+    }
+
+    #[test]
+    fn a_climb_into_a_folder_that_is_no_sibling_names_no_path() {
+        assert_eq!(tree_path("", &SIBLINGS, r"..\other\x.targets"), None);
+        assert_eq!(tree_path("", &[] as &[&str], r"..\b\x.targets"), None, "a single repo has no sibling");
+    }
+
+    #[test]
+    fn a_climb_out_of_a_sibling_names_no_path() {
+        assert_eq!(tree_path("", &SIBLINGS, r"..\b\..\..\x.targets"), None);
+        assert_eq!(tree_path("", &SIBLINGS, r"..\b\..\a\x.targets"), None, "nor back into the worktree");
+        assert_eq!(tree_path("", &SIBLINGS, r"..\b"), None, "the sibling itself");
+    }
+
+    #[test]
+    fn a_path_below_the_root_names_the_worktree_s_tree() {
+        assert_eq!(tree_path("sub/", &SIBLINGS, r"..\x.props"), Some((None, "x.props".to_owned())));
+        assert_eq!(
+            tree_path("", &SIBLINGS, r"b\x.props"),
+            Some((None, "b/x.props".to_owned())),
+            "a folder named like a sibling"
+        );
+    }
 
     #[test]
     fn a_glob_names_a_bin_folder_by_a_bin_segment_unless_it_names_test_results_too() {

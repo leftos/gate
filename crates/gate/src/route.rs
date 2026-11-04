@@ -18,9 +18,9 @@ use gate_router::desktop::DesktopDeclaration;
 use gate_router::warm::FileRead;
 use gate_router::windows::{self, WindowsChange};
 use gate_router::{
-    Builder, Config, ConfigProblem, CrossTarget, Facts, FolderId, GitignoredInput, Inputs, LaterCandidate, LocalReason, Nested, Pattern, PinRefusal,
-    Place, RemoteRun, Route, SiblingFolder, SiblingRoot, Target, decide, dropped_env, dropped_env_line, escaped, is_input_file,
-    is_project_or_solution, repo_name, work_folder_key,
+    Builder, Config, ConfigProblem, CrossTarget, ElsewhereRead, Facts, FolderId, GitignoredInput, Inputs, LaterCandidate, LocalReason, Nested,
+    OtherTree, Pattern, PinRefusal, Place, RemoteRun, Route, SiblingFolder, SiblingRoot, Target, TreePath, decide, dropped_env, dropped_env_line,
+    escaped, is_input_file, is_project_or_solution, repo_name, work_folder_key,
 };
 use gate_win32::Share;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -546,7 +546,7 @@ pub(crate) fn not_routed(route: &Route, sent: Option<&Sent>) -> Option<String> {
             reason: Some(LocalReason::DeclaredLocal { .. } | LocalReason::LocalFile { .. }),
         } => Some(DECLARED_LOCAL.to_owned()),
         Route::Local {
-            reason: Some(LocalReason::GitignoredPastCap { .. } | LocalReason::GitignoredPair { .. } | LocalReason::GitignoredUnsent { .. }),
+            reason: Some(LocalReason::GitignoredPastCap { .. } | LocalReason::GitignoredUnsent { .. }),
         } => Some(GITIGNORED_INPUT.to_owned()),
         Route::Local {
             reason: Some(LocalReason::SiblingAbsent { .. }),
@@ -835,44 +835,117 @@ fn build_context_above(root: &Path, path: &str) -> Vec<String> {
     above
 }
 
-/// The files below the root that a candidate `path`'s build reads outside its own folder: from each file `carried` gives
-/// back that a build reads ([`is_scanned`]), every quoted value ([`quoted_values`]) that is a relative path
-/// ([`relative_reference`]), resolved against that file's own folder ([`referenced_below`]), `/`-separated below
-/// `root`, that lies outside what the candidate carries, in any ASCII letter case, and exists as a file or a folder. A
-/// candidate sent by name ([`sent_by_name`]) follows every relative path but its own, and
-/// [`Machine::unsent_build_context`] drops those it carries; any other follows those that climb. A folder is asked as
-/// itself, since git reports an ignored folder.
+/// Each quoted value ([`quoted_values`]) of the text without comments of each file `carried` gives back that a build
+/// reads ([`is_scanned`]), piece by piece ([`reference_pieces`]), with the folder of the file it is written in.
 ///
 /// # Errors
 ///
 /// Why a scanned file cannot be read: the build reads it, so nothing tells whether it is sent.
-fn references_outside(root: &Path, path: &str, carried: &[(String, u64)]) -> Result<Vec<String>, String> {
+fn scanned_values(root: &Path, carried: &[(String, u64)]) -> Result<Vec<(String, String)>, String> {
+    let mut values = Vec::new();
+    for (file, _) in carried.iter().filter(|(file, _)| is_scanned(file)) {
+        let text = without_comments(&build_text(root, file)?);
+        let at = folder_of(file);
+        values.extend(
+            text.lines()
+                .flat_map(quoted_values)
+                .flat_map(reference_pieces)
+                .map(|value| (at.to_owned(), value.to_owned())),
+        );
+    }
+    Ok(values)
+}
+
+/// The files below the root that a candidate `path`'s build reads outside its own folder: of the scanned `values`
+/// ([`scanned_values`]), each that is a relative path ([`relative_reference`]), resolved against its file's own folder
+/// ([`referenced_below`]), `/`-separated below `root`, that lies outside what the candidate carries, in any ASCII
+/// letter case, and exists as a file or a folder. A candidate sent by name ([`sent_by_name`]) follows every relative
+/// path but its own, and [`Machine::unsent_build_context`] drops those it carries; any other follows those that climb.
+/// A folder is asked as itself, since git reports an ignored folder.
+fn references_outside(root: &Path, path: &str, values: &[(String, String)]) -> Vec<String> {
     let alone = sent_by_name(root, path);
     let folder = candidate_folder(root, path);
     let mut found = Vec::new();
-    for (file, _) in carried {
-        if !is_scanned(file) {
+    for (at, value) in values {
+        let Some(referenced) = relative_reference(value, !alone).and_then(|value| referenced_below(at, value)) else {
             continue;
-        }
-        let text = without_comments(&build_text(root, file)?);
-        let at = folder_of(file);
-        for line in text.lines() {
-            for value in quoted_values(line).into_iter().flat_map(reference_pieces) {
-                let Some(referenced) = relative_reference(value, !alone).and_then(|value| referenced_below(at, value)) else {
-                    continue;
-                };
-                let outside = if alone {
-                    !referenced.eq_ignore_ascii_case(path)
-                } else {
-                    !inside_folder(folder, &referenced)
-                };
-                if outside && root.join(&referenced).exists() && !found.contains(&referenced) {
-                    found.push(referenced);
-                }
-            }
+        };
+        let outside = if alone {
+            !referenced.eq_ignore_ascii_case(path)
+        } else {
+            !inside_folder(folder, &referenced)
+        };
+        if outside && root.join(&referenced).exists() && !found.contains(&referenced) {
+            found.push(referenced);
         }
     }
-    Ok(found)
+    found
+}
+
+/// The paths in another tree of a sibling pair, `others`, that the scanned `values` ([`scanned_values`]) name: each
+/// relative path ([`relative_reference`]) that climbs out of `root` ([`referenced_below`] names none) into one of
+/// those trees ([`other_tree_path`]), once each.
+fn reads_elsewhere(root: &Path, values: &[(String, String)], others: &[OtherTree]) -> Vec<TreePath> {
+    let mut found = Vec::new();
+    for (at, value) in values {
+        let Some(value) = relative_reference(value, true).filter(|value| referenced_below(at, value).is_none()) else {
+            continue;
+        };
+        if let Some(read) = other_tree_path(root, at, value, others)
+            && !found.contains(&read)
+        {
+            found.push(read);
+        }
+    }
+    found
+}
+
+/// The tree among `others` that the reference `value` (trimmed, as [`relative_reference`] gives it), written in the
+/// folder `folder` below `root`, climbs into, and the path it names there, `/`-separated from that tree's root: the
+/// reference is resolved against `root`'s own path ([`resolved`]) and must lie below that tree's root, compared part by
+/// part in any ASCII letter case, and exist there as a file or a folder. None for an empty or rooted value
+/// ([`unrooted`]), and for one that lies in no other tree.
+fn other_tree_path(root: &Path, folder: &str, value: &str, others: &[OtherTree]) -> Option<TreePath> {
+    let value = unrooted(value)?;
+    let root = root.to_string_lossy();
+    let parts_of = |text: &'_ str| -> Vec<String> {
+        text.split(['/', '\\'])
+            .filter(|part| !part.is_empty() && *part != ".")
+            .map(str::to_owned)
+            .collect()
+    };
+    let start: Vec<&str> = root
+        .split(['/', '\\'])
+        .chain(folder.split('/'))
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let parts = resolved(start, value)?;
+    others.iter().find_map(|other| {
+        let base = parts_of(&other.root);
+        let below = parts.len() > base.len() && base.iter().zip(&parts).all(|(known, part)| known.eq_ignore_ascii_case(part));
+        let path = below.then(|| parts[base.len()..].join("/"))?;
+        Path::new(&other.root).join(&path).exists().then_some((other.tree, path))
+    })
+}
+
+/// `value`, `None` when it is empty or rooted: a reference [`referenced_below`] and [`other_tree_path`] resolve.
+fn unrooted(value: &str) -> Option<&str> {
+    (!value.is_empty() && !Path::new(value).is_absolute() && !value.starts_with(['/', '\\'])).then_some(value)
+}
+
+/// `parts` with each part of the relative `value`, split on `/` and `\`, applied: an empty or `.` part dropped, a `..`
+/// taking off the last part, any other added; `None` when a `..` finds no part left.
+fn resolved<'a>(mut parts: Vec<&'a str>, value: &'a str) -> Option<Vec<&'a str>> {
+    for part in value.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            part => parts.push(part),
+        }
+    }
+    Some(parts)
 }
 
 /// The relative path `value` names, its leading `$(MSBuildThisFileDirectory)` dropped with the separator after it: none
@@ -944,23 +1017,21 @@ fn without_comments(text: &str) -> String {
     kept
 }
 
-/// The `/`-separated path below the root that the reference `value`, written in the folder `folder`, names: none when it
-/// is empty or rooted, or rises above the root by a `..`.
+/// The folder of the tree at `root` as a refusal names it from the worktree root: `../<folder name>/` for a sibling of
+/// a pair, which `others` tells by holding the worktree's tree; empty for the worktree itself or a single repo.
+fn shown_from_main(root: &Path, others: &[OtherTree]) -> String {
+    match root.file_name().filter(|_| others.iter().any(|other| other.tree.is_none())) {
+        Some(name) => format!("../{}/", name.to_string_lossy()),
+        None => String::new(),
+    }
+}
+
+/// The `/`-separated path below the root that the reference `value` (trimmed, as [`relative_reference`] gives it),
+/// written in the folder `folder`, names ([`resolved`]): none when it is empty or rooted ([`unrooted`]), or rises above
+/// the root by a `..`.
 fn referenced_below(folder: &str, value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty() || Path::new(value).is_absolute() || value.starts_with(['/', '\\']) {
-        return None;
-    }
-    let mut parts: Vec<&str> = folder.split('/').filter(|part| !part.is_empty()).collect();
-    for part in value.split(['/', '\\']) {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop()?;
-            }
-            part => parts.push(part),
-        }
-    }
+    let value = unrooted(value)?;
+    let parts = resolved(folder.split('/').filter(|part| !part.is_empty()).collect(), value)?;
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
@@ -1007,12 +1078,12 @@ type Ignored = (HashSet<String>, HashMap<String, String>);
 
 /// The paths a candidate's build reads outside its own folder: the build files above the candidate
 /// ([`build_context_above`]) then the references its carried files name ([`references_outside`]), each with where it
-/// lies.
+/// lies; and the paths those references name in another tree of the pair, `others` ([`reads_elsewhere`]).
 ///
 /// # Errors
 ///
-/// Why a carried file a build reads cannot be read ([`references_outside`]).
-fn build_reads(root: &Path, path: &str, carried: &[(String, u64)]) -> BuildReads {
+/// Why a carried file a build reads cannot be read ([`scanned_values`]).
+fn build_reads(root: &Path, path: &str, carried: &[(String, u64)], others: &[OtherTree]) -> Result<(Vec<Asked>, Vec<TreePath>), String> {
     let alone = sent_by_name(root, path);
     let folder = candidate_folder(root, path);
     let beside = |file: &str| alone && folder_of(file) == folder;
@@ -1020,29 +1091,30 @@ fn build_reads(root: &Path, path: &str, carried: &[(String, u64)]) -> BuildReads
         let said = if beside(&file) { BESIDE } else { ABOVE };
         (file, said)
     });
-    let outside = references_outside(root, path, carried)?.into_iter().map(|file| (file, OUTSIDE));
-    Ok(above.chain(outside).collect())
+    let values = scanned_values(root, carried)?;
+    let outside = references_outside(root, path, &values).into_iter().map(|file| (file, OUTSIDE));
+    Ok((above.chain(outside).collect(), reads_elsewhere(root, &values, others)))
 }
 
 /// The candidate's `carried` files, or why a file its build reads outside its own folder keeps it here: the first asked
 /// path git reports ignored (`which is not sent`), or whose own call cannot tell (`and git cannot tell whether it is
-/// sent`).
+/// sent`). The path is named after `shown`, the tree's folder from the worktree root (`../<sibling>/` in a sibling,
+/// empty in the worktree).
 fn build_verdict(
     carried: Result<Vec<(String, u64)>, String>,
     asked: BuildReads,
     ignored: &HashSet<String>,
     untold: &HashMap<String, String>,
+    shown: &str,
 ) -> Result<Vec<(String, u64)>, String> {
     let files = carried?;
     for (file, said) in asked? {
+        let named = escaped(&format!("{shown}{file}"));
         if let Some(why) = untold.get(&file) {
-            return Err(format!(
-                "the build reads {} {said}, and git cannot tell whether it is sent: {why}",
-                escaped(&file)
-            ));
+            return Err(format!("the build reads {named} {said}, and git cannot tell whether it is sent: {why}"));
         }
         if ignored.contains(&file) {
-            return Err(format!("the build reads {} {said}, which is not sent", escaped(&file)));
+            return Err(format!("the build reads {named} {said}, which is not sent"));
         }
     }
     Ok(files)
@@ -1458,6 +1530,7 @@ impl<'a> Machine<'a> {
                 .map(|(path, files)| GitignoredInput {
                     path: (*path).clone(),
                     files: files.clone(),
+                    elsewhere: Vec::new(),
                 })
                 .collect();
         }
@@ -1472,7 +1545,11 @@ impl<'a> Machine<'a> {
                         .check_ignore(root, &carried_of(&[one]))
                         .map(|ignored| kept_ignored(carried, &set(ignored))),
                 };
-                GitignoredInput { path: one.0.clone(), files }
+                GitignoredInput {
+                    path: one.0.clone(),
+                    files,
+                    elsewhere: Vec::new(),
+                }
             })
             .collect()
     }
@@ -1481,15 +1558,27 @@ impl<'a> Machine<'a> {
     /// given back as one that cannot be carried ([`build_verdict`]): the build files above it ([`build_context_above`])
     /// and the references its carried files name ([`references_outside`]) are asked together of one `git check-ignore`,
     /// or of one each when that fails ([`Machine::asks_ignored`]). A path the run already sends, by one of `globs` or
-    /// with any candidate's files, is not asked.
-    fn unsent_build_context<'p>(&self, root: &Path, globs: &Globs, swept: Vec<Swept<'p>>) -> Vec<Swept<'p>> {
-        let mut asked: Vec<BuildReads> = swept
-            .iter()
-            .map(|(path, carried)| match carried {
-                Err(_) => Ok(Vec::new()),
-                Ok(files) => build_reads(root, path, files),
-            })
-            .collect();
+    /// with any candidate's files, is not asked. Beside each candidate, the paths its build reads in another tree of the
+    /// pair, `others`, that that tree does not send ([`Machine::unsent_elsewhere`]).
+    fn unsent_build_context<'p>(
+        &self,
+        root: &Path,
+        globs: &Globs,
+        swept: Vec<Swept<'p>>,
+        others: &[OtherTree],
+        shown: &str,
+    ) -> (Vec<Swept<'p>>, Vec<Vec<ElsewhereRead>>) {
+        let mut asked: Vec<BuildReads> = Vec::with_capacity(swept.len());
+        let mut elsewhere: Vec<Vec<TreePath>> = Vec::with_capacity(swept.len());
+        for (path, carried) in &swept {
+            let (reads, other) = match carried.as_ref().map(|files| build_reads(root, path, files, others)) {
+                Err(_) => (Ok(Vec::new()), Vec::new()),
+                Ok(Ok((reads, other))) => (Ok(reads), other),
+                Ok(Err(why)) => (Err(why), Vec::new()),
+            };
+            asked.push(reads);
+            elsewhere.push(other);
+        }
         let sent: Vec<&String> = swept
             .iter()
             .filter_map(|(_, files)| files.as_ref().ok())
@@ -1514,10 +1603,55 @@ impl<'a> Machine<'a> {
             }
             self.asks_ignored(root, &every)
         };
-        swept
+        let swept = swept
             .into_iter()
             .zip(asked)
-            .map(|((path, carried), asked)| (path, build_verdict(carried, asked, &ignored, &untold)))
+            .map(|((path, carried), asked)| (path, build_verdict(carried, asked, &ignored, &untold, shown)))
+            .collect();
+        (swept, self.unsent_elsewhere(others, elsewhere))
+    }
+
+    /// Each list of `elsewhere`, the paths candidates' builds read in the pair's `others`, as the reads its tree does not
+    /// send: less each path its tree's input globs match, and each that one `git check-ignore` in its tree's root
+    /// ([`Machine::asks_ignored`]) does not report ignored. A path whose own call cannot tell is kept with git's reason
+    /// ([`ElsewhereRead::untold`]). A tree's globs are read only when a path lies in it; when they cannot be read, the
+    /// log says why ([`Machine::cannot_tell`]) and none of its paths is dropped by a glob, though one git does not
+    /// report ignored still is.
+    fn unsent_elsewhere(&self, others: &[OtherTree], elsewhere: Vec<Vec<TreePath>>) -> Vec<Vec<ElsewhereRead>> {
+        let mut kept: HashMap<TreePath, Option<String>> = HashMap::new();
+        for other in others {
+            let mut seen = HashSet::new();
+            let mut asked: Vec<&String> = elsewhere
+                .iter()
+                .flatten()
+                .filter(|(tree, path)| *tree == other.tree && seen.insert(path.as_str()))
+                .map(|(_, path)| path)
+                .collect();
+            if asked.is_empty() {
+                continue;
+            }
+            if let Ok(globs) = Globs::inputs(&other.inputs, NOTHING_EXCLUDED).inspect_err(|why| self.cannot_tell(why)) {
+                asked.retain(|path| !globs.matches(path));
+            }
+            let (ignored, mut untold) = self.asks_ignored(Path::new(&other.root), &asked);
+            for path in asked {
+                let why = untold.remove(path);
+                if why.is_some() || ignored.contains(path) {
+                    kept.insert((other.tree, path.clone()), why);
+                }
+            }
+        }
+        elsewhere
+            .into_iter()
+            .map(|reads| {
+                reads
+                    .into_iter()
+                    .filter_map(|(tree, path)| {
+                        let untold = kept.get(&(tree, path.clone()))?.clone();
+                        Some(ElsewhereRead { tree, path, untold })
+                    })
+                    .collect()
+            })
             .collect()
     }
 
@@ -1953,8 +2087,10 @@ impl Facts for Machine<'_> {
     /// such a path is swept, carrying its swept files git reports ignored, or why it cannot be carried
     /// ([`Machine::carried_ignored`]); a candidate whose build reads a file outside its own folder that git reports
     /// ignored cannot be carried either ([`Machine::unsent_build_context`]).
-    fn gitignored_inputs(&self, place: &Place, paths: &[String], named: &[String], inputs: &[String]) -> Vec<GitignoredInput> {
-        let root = Path::new(&place.root);
+    /// A path a candidate's build reads in another tree of the pair, `others`, is asked there
+    /// ([`Machine::unsent_elsewhere`]) and given back unsent when that tree does not send it.
+    fn gitignored_inputs(&self, root: &str, paths: &[String], named: &[String], inputs: &[String], others: &[OtherTree]) -> Vec<GitignoredInput> {
+        let root = Path::new(root);
         let globs = match Globs::inputs(inputs, NOTHING_EXCLUDED) {
             Ok(globs) => globs,
             Err(why) => {
@@ -1977,8 +2113,12 @@ impl Facts for Machine<'_> {
             .into_iter()
             .map(|(path, own)| (*path, swept(root, path, own, &globs, log.as_deref())))
             .collect();
-        let swept = self.unsent_build_context(root, &globs, swept);
-        self.carried_ignored(root, &swept)
+        let (swept, elsewhere) = self.unsent_build_context(root, &globs, swept, others, &shown_from_main(root, others));
+        let mut found = self.carried_ignored(root, &swept);
+        for (input, reads) in found.iter_mut().zip(elsewhere) {
+            input.elsewhere = reads;
+        }
+        found
     }
 
     fn subst_target(&self, letter: char) -> Option<String> {
@@ -3031,6 +3171,12 @@ mod tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
+    /// What `machine` gives back asked of the root of `place` alone, outside any sibling pair
+    /// ([`Machine::gitignored_inputs`]).
+    fn asked(machine: &Machine, place: &Place, paths: &[String], named: &[String], inputs: &[String]) -> Vec<GitignoredInput> {
+        machine.gitignored_inputs(&place.root, paths, named, inputs, &[])
+    }
+
     /// The place of a gate at the root of the worktree `root`.
     fn place_of(root: &Path) -> Place {
         let root = root.to_string_lossy().into_owned();
@@ -3068,6 +3214,7 @@ mod tests {
         GitignoredInput {
             path: path.to_owned(),
             files: Ok(files.iter().map(|(file, size)| ((*file).to_owned(), *size)).collect()),
+            elsewhere: Vec::new(),
         }
     }
 
@@ -3076,6 +3223,7 @@ mod tests {
         GitignoredInput {
             path: path.to_owned(),
             files: Err(why.to_owned()),
+            elsewhere: Vec::new(),
         }
     }
 
@@ -3118,7 +3266,7 @@ mod tests {
         let (root, _removed, machine) = ignoring_tree("gitignored-tracked", "*.log\n", &["src/A.csproj"]);
         git_in(&root, &["add", "--", "src/A.csproj"]);
         let held = held_open(&root.join("src").join("locked"));
-        let found = machine.gitignored_inputs(&place_of(&root), &["src/A.csproj".to_owned(), "src".to_owned()], &[], &[]);
+        let found = asked(&machine, &place_of(&root), &["src/A.csproj".to_owned(), "src".to_owned()], &[], &[]);
         drop(held);
         assert_eq!(found, []);
         assert_eq!(*machine.notes.borrow(), Vec::<String>::new(), "no folder was walked, so none failed");
@@ -3129,7 +3277,7 @@ mod tests {
         let files = [".tmp/probe/x.props", ".tmp/probe/Program.cs"];
         let (root, _removed, machine) = ignoring_tree("gitignored-settings", ".tmp/\n", &files);
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &[".tmp/probe/x.props".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &[".tmp/probe/x.props".to_owned()], &[], &[]),
             [carrying(".tmp/probe/x.props", &[(".tmp/probe/x.props", 1)])]
         );
     }
@@ -3138,7 +3286,7 @@ mod tests {
     fn an_ignored_project_at_the_root_carries_only_itself() {
         let (root, _removed, machine) = ignoring_tree("gitignored-root", "A.csproj\nother.txt\n", &["A.csproj", "other.txt"]);
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &["A.csproj".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &["A.csproj".to_owned()], &[], &[]),
             [carrying("A.csproj", &[("A.csproj", 1)])]
         );
     }
@@ -3156,7 +3304,7 @@ mod tests {
 
     /// What `machine` answers for the single candidate `path` below `root`.
     fn asking(machine: &Machine<'_>, root: &Path, path: &str) -> Vec<GitignoredInput> {
-        machine.gitignored_inputs(&place_of(root), &[path.to_owned()], &[], &[])
+        asked(machine, &place_of(root), &[path.to_owned()], &[], &[])
     }
 
     /// The text of a build file including `value`.
@@ -3271,7 +3419,7 @@ mod tests {
     fn an_ignored_env_file_a_word_names_stays_here() {
         let (root, _removed, machine) = ignoring_tree("carried-env-word", ".tmp/\n", &[".tmp/.env"]);
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &[".tmp/.env".to_owned()], &[".tmp/.env".to_owned()], &[]),
+            asked(&machine, &place_of(&root), &[".tmp/.env".to_owned()], &[".tmp/.env".to_owned()], &[]),
             [unsent(".tmp/.env", "the inputs never send .tmp/.env")]
         );
     }
@@ -3280,7 +3428,7 @@ mod tests {
     fn an_ignored_source_file_a_word_names_carries_itself() {
         let (root, _removed, machine) = ignoring_tree("carried-source", ".tmp/\n", &[".tmp/a.cs", ".tmp/b.cs"]);
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &[".tmp/a.cs".to_owned()], &[".tmp/a.cs".to_owned()], &[]),
+            asked(&machine, &place_of(&root), &[".tmp/a.cs".to_owned()], &[".tmp/a.cs".to_owned()], &[]),
             [carrying(".tmp/a.cs", &[(".tmp/a.cs", 1)])]
         );
     }
@@ -3288,14 +3436,14 @@ mod tests {
     #[test]
     fn an_ignored_output_file_no_property_names_is_not_carried() {
         let (root, _removed, machine) = ignoring_tree("carried-output", ".tmp/\n", &[".tmp/r.trx"]);
-        assert_eq!(machine.gitignored_inputs(&place_of(&root), &[".tmp/r.trx".to_owned()], &[], &[]), []);
+        assert_eq!(asked(&machine, &place_of(&root), &[".tmp/r.trx".to_owned()], &[], &[]), []);
     }
 
     #[test]
     fn a_folder_candidate_needs_no_name() {
         let (root, _removed, machine) = ignoring_tree("carried-folder", ".tmp/\n", &[".tmp/probe/Probe.csproj"]);
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &[".tmp/probe".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &[".tmp/probe".to_owned()], &[], &[]),
             [carrying(".tmp/probe", &[(".tmp/probe/Probe.csproj", 1)])]
         );
     }
@@ -3346,7 +3494,7 @@ mod tests {
         let (root, _removed, machine) = ignoring_tree("gitignored-nested", ".tmp/\n", &[".tmp/clone/P.csproj"]);
         git_in(&root.join(".tmp").join("clone"), &["init", "--quiet"]);
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &[".tmp/clone/P.csproj".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &[".tmp/clone/P.csproj".to_owned()], &[], &[]),
             [unsent(".tmp/clone/P.csproj", "it is inside a nested repository")]
         );
     }
@@ -3355,9 +3503,9 @@ mod tests {
     fn a_candidate_whose_sweep_fails_stays_here_saying_why() {
         let (root, _removed, machine) = ignoring_tree("gitignored-unswept", ".tmp/\n", &[".tmp/probe/P.csproj"]);
         let held = held_open(&root.join(".tmp").join("probe").join("locked"));
-        let found = machine.gitignored_inputs(&place_of(&root), &[".tmp/probe/P.csproj".to_owned()], &[], &[]);
+        let found = asked(&machine, &place_of(&root), &[".tmp/probe/P.csproj".to_owned()], &[], &[]);
         drop(held);
-        let [GitignoredInput { path, files: Err(why) }] = found.as_slice() else {
+        let [GitignoredInput { path, files: Err(why), .. }] = found.as_slice() else {
             panic!("the candidate cannot be carried: {found:?}");
         };
         assert_eq!(path, ".tmp/probe/P.csproj");
@@ -3369,7 +3517,7 @@ mod tests {
         let (root, _removed, machine) = ignoring_tree("gitignored-junction", ".tmp/\n", &[".tmp/real/P.csproj"]);
         junction(&root.join(".tmp").join("link"), &root.join(".tmp").join("real"));
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &[".tmp/link/P.csproj".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &[".tmp/link/P.csproj".to_owned()], &[], &[]),
             [unsent(".tmp/link/P.csproj", "the folder is a link or junction")]
         );
     }
@@ -3379,7 +3527,7 @@ mod tests {
         let files = [".tmp/install/Directory.Packages.props", ".tmp/install/app/App.csproj"];
         let (root, _removed, machine) = ignoring_tree("gitignored-build-above", ".tmp/\n", &files);
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &[".tmp/install/app/App.csproj".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &[".tmp/install/app/App.csproj".to_owned()], &[], &[]),
             [unsent(
                 ".tmp/install/app/App.csproj",
                 "the build reads .tmp/install/Directory.Packages.props above its folder, which is not sent"
@@ -3392,7 +3540,7 @@ mod tests {
         let files = [".tmp/install/nuget.config", ".tmp/install/app/App.csproj"];
         let (root, _removed, machine) = ignoring_tree("gitignored-folder-above", ".tmp/\n", &files);
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &[".tmp/install/app".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &[".tmp/install/app".to_owned()], &[], &[]),
             [unsent(
                 ".tmp/install/app",
                 "the build reads .tmp/install/nuget.config above its folder, which is not sent"
@@ -3405,7 +3553,7 @@ mod tests {
         let files = [".tmp/app/Directory.Packages.props", ".tmp/app/App.csproj"];
         let (root, _removed, machine) = ignoring_tree("gitignored-build-beside", ".tmp/\n", &files);
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &[".tmp/app/App.csproj".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &[".tmp/app/App.csproj".to_owned()], &[], &[]),
             [carrying(
                 ".tmp/app/App.csproj",
                 &[(".tmp/app/App.csproj", 1), (".tmp/app/Directory.Packages.props", 1)]
@@ -3419,7 +3567,7 @@ mod tests {
         let (root, _removed, machine) = ignoring_tree("gitignored-build-tracked", ".tmp/\nsrc/.scratch/\n", &files);
         git_in(&root, &["add", "--", "src/Directory.Build.props"]);
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &["src/.scratch/App.csproj".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &["src/.scratch/App.csproj".to_owned()], &[], &[]),
             [carrying("src/.scratch/App.csproj", &[("src/.scratch/App.csproj", 1)])]
         );
     }
@@ -3429,7 +3577,7 @@ mod tests {
         let files = [".tmp/Directory.Build.props", ".tmp/probe/x.props"];
         let (root, _removed, machine) = ignoring_tree("gitignored-settings-above", ".tmp/\n", &files);
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &[".tmp/probe/x.props".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &[".tmp/probe/x.props".to_owned()], &[], &[]),
             [carrying(".tmp/probe/x.props", &[(".tmp/probe/x.props", 1)])]
         );
     }
@@ -3441,7 +3589,7 @@ mod tests {
         let project = root.join(".tmp").join("spike").join("project").join("App.csproj");
         fs::write(project, "  <ProjectReference Include=\"../src/Core.csproj\" />\n").expect("the project can be written");
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &[".tmp/spike/project/App.csproj".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &[".tmp/spike/project/App.csproj".to_owned()], &[], &[]),
             [unsent(
                 ".tmp/spike/project/App.csproj",
                 "the build reads .tmp/spike/src/Core.csproj outside its folder, which is not sent"
@@ -3456,7 +3604,7 @@ mod tests {
         let project = root.join(".tmp").join("spike").join("project").join("App.csproj");
         fs::write(project, "  <ProjectReference Include=\"../src/Core.csproj\" />\n").expect("the project can be written");
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &[".tmp/spike/project".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &[".tmp/spike/project".to_owned()], &[], &[]),
             [unsent(
                 ".tmp/spike/project",
                 "the build reads .tmp/spike/src/Core.csproj outside its folder, which is not sent"
@@ -3484,7 +3632,7 @@ mod tests {
             fs::create_dir_all(file.parent().expect("the solution has a folder")).expect("the folder can be made");
             fs::write(&file, content).expect("the solution can be written");
             assert_eq!(
-                machine.gitignored_inputs(&place_of(&root), std::slice::from_ref(&path), &[], &[]),
+                asked(&machine, &place_of(&root), std::slice::from_ref(&path), &[], &[]),
                 [unsent(
                     &path,
                     "the build reads .tmp/spike/src/Core.csproj outside its folder, which is not sent"
@@ -3505,7 +3653,7 @@ mod tests {
         )
         .expect("the project can be written");
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &[".tmp/refs/app/App.csproj".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &[".tmp/refs/app/App.csproj".to_owned()], &[], &[]),
             [unsent(
                 ".tmp/refs/app/App.csproj",
                 "the build reads .tmp/refs/one/One.csproj outside its folder, which is not sent"
@@ -3520,7 +3668,7 @@ mod tests {
         let project = root.join(".tmp").join("pre").join("app").join("App.csproj");
         fs::write(project, "  <Import Project=\"$(MSBuildThisFileDirectory)..\\shared\\x.props\" />\n").expect("the project can be written");
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &[".tmp/pre/app/App.csproj".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &[".tmp/pre/app/App.csproj".to_owned()], &[], &[]),
             [unsent(
                 ".tmp/pre/app/App.csproj",
                 "the build reads .tmp/pre/shared/x.props outside its folder, which is not sent"
@@ -3535,7 +3683,7 @@ mod tests {
         let props = root.join(".tmp").join("pre").join("app").join("Directory.Build.props");
         fs::write(props, "  <Import Project=\"../shared.props\" />\n").expect("the props can be written");
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &[".tmp/pre/app/App.csproj".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &[".tmp/pre/app/App.csproj".to_owned()], &[], &[]),
             [unsent(
                 ".tmp/pre/app/App.csproj",
                 "the build reads .tmp/pre/shared.props outside its folder, which is not sent"
@@ -3548,7 +3696,7 @@ mod tests {
         let files = ["nuget.config", ".tmp/app/App.csproj"];
         let (root, _removed, machine) = ignoring_tree("gitignored-root-nuget", ".tmp/\nnuget.config\n", &files);
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &[".tmp/app/App.csproj".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &[".tmp/app/App.csproj".to_owned()], &[], &[]),
             [unsent(
                 ".tmp/app/App.csproj",
                 "the build reads nuget.config above its folder, which is not sent"
@@ -3561,7 +3709,7 @@ mod tests {
         let files = ["src/global.json", "src/app/App.csproj"];
         let (root, _removed, machine) = ignoring_tree("gitignored-global-json", "src/app/\nsrc/global.json\n", &files);
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &["src/app/App.csproj".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &["src/app/App.csproj".to_owned()], &[], &[]),
             [unsent(
                 "src/app/App.csproj",
                 "the build reads src/global.json above its folder, which is not sent"
@@ -3578,7 +3726,7 @@ mod tests {
         fs::write(project, content).expect("the project can be written");
         let size = u64::try_from(content.len()).expect("the project's size fits");
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &[".tmp/App/App.csproj".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &[".tmp/App/App.csproj".to_owned()], &[], &[]),
             [carrying(
                 ".tmp/App/App.csproj",
                 &[(".tmp/App/App.csproj", size), (".tmp/App/src/Core.csproj", 1)]
@@ -3597,7 +3745,7 @@ mod tests {
         }
         fs::write(project, bytes).expect("the project can be written");
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &[".tmp/utf16/app/App.csproj".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &[".tmp/utf16/app/App.csproj".to_owned()], &[], &[]),
             [unsent(
                 ".tmp/utf16/app/App.csproj",
                 "the build reads .tmp/utf16/src/Core.csproj outside its folder, which is not sent"
@@ -3614,9 +3762,9 @@ mod tests {
             .share_mode(0)
             .open(&project)
             .expect("the project can be held open sharing nothing");
-        let found = machine.gitignored_inputs(&place_of(&root), &[".tmp/app/App.csproj".to_owned()], &[], &[]);
+        let found = asked(&machine, &place_of(&root), &[".tmp/app/App.csproj".to_owned()], &[], &[]);
         drop(held);
-        let [GitignoredInput { path, files: Err(why) }] = found.as_slice() else {
+        let [GitignoredInput { path, files: Err(why), .. }] = found.as_slice() else {
             panic!("the candidate cannot be carried: {found:?}");
         };
         assert_eq!(path, ".tmp/app/App.csproj");
@@ -3632,7 +3780,7 @@ mod tests {
         fs::write(project, content).expect("the project can be written");
         let size = u64::try_from(content.len()).expect("the project's size fits");
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &[".tmp/note/app/App.csproj".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &[".tmp/note/app/App.csproj".to_owned()], &[], &[]),
             [carrying(".tmp/note/app/App.csproj", &[(".tmp/note/app/App.csproj", size)])]
         );
     }
@@ -3647,7 +3795,7 @@ mod tests {
         let size = u64::try_from(content.len()).expect("the project's size fits");
         let globs = [".tmp/shared/**".to_owned()];
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &[".tmp/app/App.csproj".to_owned()], &[], &globs),
+            asked(&machine, &place_of(&root), &[".tmp/app/App.csproj".to_owned()], &[], &globs),
             [carrying(".tmp/app/App.csproj", &[(".tmp/app/App.csproj", size)])]
         );
     }
@@ -3659,7 +3807,7 @@ mod tests {
         let project = root.join("App.csproj");
         fs::write(project, "  <ProjectReference Include=\"lib/Core.csproj\" />\n").expect("the project can be written");
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &["App.csproj".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &["App.csproj".to_owned()], &[], &[]),
             [unsent(
                 "App.csproj",
                 "the build reads lib/Core.csproj outside its folder, which is not sent"
@@ -3690,7 +3838,7 @@ mod tests {
         let machine = Machine::at(None, Duration::from_secs(60), Duration::from_secs(5));
         let globs = ["probe/keys.json".to_owned()];
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &["probe".to_owned()], &[], &globs),
+            asked(&machine, &place_of(&root), &["probe".to_owned()], &[], &globs),
             [carrying(
                 "probe",
                 &[("probe/Probe.csproj", 1), ("probe/Program.cs", 5), ("probe/sub/deep.props", 1)]
@@ -3714,7 +3862,7 @@ mod tests {
         }
         let machine = Machine::at(None, Duration::from_secs(60), Duration::from_secs(5));
         assert_eq!(
-            machine.gitignored_inputs(&place_of(&root), &[".tmp/probe/Probe.csproj".to_owned()], &[], &[]),
+            asked(&machine, &place_of(&root), &[".tmp/probe/Probe.csproj".to_owned()], &[], &[]),
             [carrying(
                 ".tmp/probe/Probe.csproj",
                 &[(".tmp/probe/Probe.csproj", 1), (".tmp/probe/Program.cs", 1)]

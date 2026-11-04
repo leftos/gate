@@ -10,4 +10,6 @@ A routed run sends a repo's declared ignored inputs to the builder's work folder
 
 **I14. Destination safety** (GATE-335 adds the same refusal of a hard-linked file on the PC). The box side, including the refusal of a target with more than one link, is under `inputs` in [design.md, The box side](../design.md#the-box-side).
 
-**I15. Pairs** (GATE-332). Each repo's own `inputs` list applies to its own tree; the manifest's paths are prefixed with the tree's folder name (`{leaf}/…`, `{sibling}/…`). Built for the Windows box: a pair's manifest also carries a top-level `layout` key, and each tree gets its own exclude, hash cache and read boundary ([design.md](../design.md), Inputs). The macOS box still refuses a pair's inputs, so on a macOS builder a pair whose repos declare inputs falls back `inputs` before any inputs call; its port is GATE-1089.
+**I15. Pairs** (GATE-332). Each repo's own `inputs` list applies to its own tree; the manifest's paths are prefixed with the tree's folder name (`{leaf}/…`, `{sibling}/…`). Built for the Windows box: a pair's manifest also carries a top-level `layout` key, and each tree gets its own exclude, hash cache and read boundary ([design.md](../design.md), Inputs).
+
+The macOS box still refuses a pair's inputs, so on a macOS builder a pair whose repos declare inputs falls back `inputs` before any inputs call; its port is GATE-1089. A pair also carries command-named gitignored files, in either tree, on the Windows box (GATE-1093); a carried pair on a macOS builder falls back `inputs` the same way.
