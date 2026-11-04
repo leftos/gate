@@ -920,6 +920,40 @@ try {
         }
         return ''
     }
+
+    Test-Case 'the Playwright 1.64.1 and mock-three steps come in that order directly after the Playwright 1.63.0 step' {
+        $names = @(Get-StepName $sourceScript)
+        $index = $names.IndexOf('Playwright 1.63.0 browsers')
+        if ($index -lt 0) { return "the Playwright 1.63.0 step is missing from: $($names -join ', ')" }
+        $expected = 'Playwright 1.64.1 browsers', 'mock-three (claude-config tool)'
+        $after = @($names | Select-Object -Skip ($index + 1) -First $expected.Count)
+        if (($after -join ' | ') -ne ($expected -join ' | ')) {
+            return "the steps after it are '$($after -join ''', ''')', expected '$($expected -join ''', ''')'"
+        }
+        return ''
+    }
+
+    Test-Case 'the Playwright 1.64.1 step installs chromium only' {
+        $block = Get-StepBlock 'Playwright 1.64.1 browsers'
+        if (-not $block) { return 'install-toolchains.ps1 has no Playwright 1.64.1 browsers step' }
+        $text = $block.Extent.Text
+        foreach ($wanted in 'playwright@1.64.1', 'chromium') {
+            if (-not $text.Contains($wanted)) { return "the step does not name '$wanted'" }
+        }
+        if ($text.Contains('webkit')) { return 'the step names webkit' }
+        return ''
+    }
+
+    Test-Case 'the mock-three step mirrors the staged copy, installs from the lock and writes its marker' {
+        $block = Get-StepBlock 'mock-three (claude-config tool)'
+        if (-not $block) { return 'install-toolchains.ps1 has no mock-three step' }
+        $text = $block.Extent.Text
+        foreach ($wanted in 'stage\mock-three', '/XD node_modules', '--frozen-lockfile', '.installed-from',
+            'mock-three: no staged copy at', 'stage claude-config''s tools/mock-three there (tracked files only) and rerun -Only mock-three') {
+            if (-not $text.Contains($wanted)) { return "the step does not name '$wanted'" }
+        }
+        return ''
+    }
 }
 finally {
     if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
