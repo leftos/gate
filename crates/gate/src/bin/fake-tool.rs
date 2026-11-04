@@ -44,6 +44,10 @@
 //! (`CREATE_BREAKAWAY_FROM_JOB`, which the job must allow) with no standard handles, writes the line
 //! `<its pid> <its start>` to the file at the pid path, the start in 100 ns ticks since 1601, prints `spawned <its pid>`
 //! and goes on without waiting for it, so a case can stand it in for a packaged app the command's descendant starts;
+//! `spawn-in-job <pid-path> <n> <stop-path>` starts `fake-tool spin <n> <stop-path>`, or, when n is 0, `fake-tool sleep
+//! 600000`, suspended, in a job of its own nested in this process's, that ends it when its handle closes, as Godot's
+//! console wrapper starts Godot, writes `<its pid> <its start>` to the file at the pid path and waits for it to end
+//! without output;
 //! `token` prints what this process's token says of itself, one line each: `elevated` or `not-elevated`, its integrity
 //! level's relative ID as `integrity 0x<hex>`, `owner user` when the objects it creates are owned by its user, else
 //! `owner other`, and its default DACL as `dacl <sid>:0x<mask> …`, each entry's SID in its string form and the access
@@ -206,6 +210,7 @@ fn run(args: &[OsString]) -> Result<i32, String> {
                 }
             }
             "spawn-away" => spawn_away(&mut steps, &mut stdout)?,
+            "spawn-in-job" => spawn_in_job(&mut steps)?,
             "token" => token(&mut stdout)?,
             "token-to" => token_to(&operand(&mut steps, "token-to")?)?,
             "--hook-stage" => return hook_steps(&mut steps, &mut stdout),
@@ -432,6 +437,55 @@ fn spawn_away<'a>(steps: &mut impl Iterator<Item = &'a OsString>, stdout: &mut i
     write_file(&pid_path, &format!("{pid} {}\n", times.created))?;
     writeln!(stdout, "spawned {pid}").map_err(|error| write_failed(&error))?;
     stdout.flush().map_err(|error| write_failed(&error))
+}
+
+/// The `spawn-in-job <pid-path> <n> <stop-path>` step, as Godot's console wrapper starts Godot: creates a job of its own
+/// that ends its processes when its handle closes, nested in the jobs this process is in, starts `fake-tool spin <n>
+/// <stop-path>`, or `fake-tool sleep` for [`WAIT_LIMIT`] when n is 0, suspended, puts it in that job and resumes it,
+/// writes `<its pid> <its start>` to the file at the pid path while this process holds its handle, the start in 100 ns
+/// ticks since 1601, then waits for it to end without a byte of output.
+fn spawn_in_job<'a>(steps: &mut impl Iterator<Item = &'a OsString>) -> Result<(), String> {
+    let pid_path = operand(steps, "spawn-in-job")?;
+    let threads = operand(steps, "spawn-in-job")?;
+    let idle = count(&threads, "spawn-in-job")? == 0;
+    let stop = operand(steps, "spawn-in-job")?;
+    let me = std::env::current_exe().map_err(|error| format!("cannot find this program: {error}"))?;
+    let words = if idle {
+        vec!["sleep".to_owned(), WAIT_LIMIT.as_millis().to_string()]
+    } else {
+        vec!["spin".to_owned(), threads, stop]
+    };
+    let line = std::iter::once(me.to_string_lossy().into_owned())
+        .chain(words)
+        .map(|word| format!(r#""{word}""#))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let job = gate_win32::Job::anonymous_kill_on_close().map_err(|error| format!("cannot create the child's job: {error}"))?;
+    let launch = gate_win32::Launch {
+        application: me.clone(),
+        command_line: line.encode_utf16().collect(),
+        directory: std::env::current_dir().map_err(|error| format!("cannot read the working folder: {error}"))?,
+        environment: gate_win32::EnvironmentBlock::new(std::env::vars_os())
+            .map_err(|error| format!("cannot build the child's environment: {error}"))?,
+        output: gate_win32::LaunchOutput::Pipes,
+        priority: None,
+    };
+    let suspended = launch.start_suspended().map_err(|error| format!("cannot start the child: {error}"))?;
+    let child = suspended
+        .assign_and_resume(&job)
+        .map_err(|error| format!("cannot put the child in its job: {error}"))?;
+    let pid = child.pid();
+    let times = gate_win32::process_times(pid)
+        .map_err(|error| format!("cannot read the start of the child {pid}: {error}"))?
+        .ok_or_else(|| format!("the child {pid} ended as it started"))?;
+    write_file(&pid_path, &format!("{pid} {}\n", times.created))?;
+    loop {
+        match child.wait(WAIT_LIMIT) {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(error) => return Err(format!("cannot wait for the child {pid}: {error}")),
+        }
+    }
 }
 
 /// The `token` step: prints whether this process's token is elevated, its integrity level, whether the objects it

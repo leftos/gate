@@ -59,6 +59,28 @@ pub struct Sample {
     pub escaped: BTreeMap<(u32, u64), u64>,
     /// The WSL VM's cumulative CPU time in 100 ns ticks, or `None` when it is not read, or could not be.
     pub vm_cpu: Option<u64>,
+    /// The threads of the processes in the job, and of the processes outside it in `escaped`, that waited for a
+    /// processor when the sample read them; `None` when the threads were not read, or could not be.
+    pub waiting: Option<BTreeSet<ThreadKey>>,
+}
+
+/// One thread of a watched command: its process by pid and start (in 100 ns ticks since 1601), and its own id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ThreadKey {
+    /// Its process's id.
+    pub pid: u32,
+    /// Its process's start, in 100 ns ticks since 1601.
+    pub created: u64,
+    /// The thread's id.
+    pub tid: usize,
+}
+
+/// Whether a sample whose waiting threads are `now`, after one whose waiting threads were `previous`, is starved: the
+/// same thread waited for a processor at both. A starved busy thread waits at every sample; a hung process's brief
+/// timer wake, caught waiting once, is no starvation. A sample with no sample before it, or either side unread, is not
+/// starved.
+fn starved(previous: Option<&BTreeSet<ThreadKey>>, now: Option<&BTreeSet<ThreadKey>>) -> bool {
+    previous.zip(now).is_some_and(|(previous, now)| !previous.is_disjoint(now))
 }
 
 /// The state of one watched command: the load-adjusted seconds it has accrued, the seconds it spent paused, where the
@@ -83,6 +105,14 @@ pub struct Watch {
     /// The CPU the processes outside the job gained, sample by sample, since the last progress: one that exits takes
     /// none of it with it.
     escaped_busy: u64,
+    /// The intervals of the starved samples since the last progress ([`starved`]), each from the last sample's begin
+    /// stamp to its own, clamped to the last progress: the stall clock stops for them, as the command was starved, not
+    /// idle.
+    starved: Duration,
+    /// The CPU of the job and of the processes outside it since the last progress, in 100 ns ticks, under the floor:
+    /// what a STALLED line says the command used.
+    quiet_cpu: u128,
+    threads: ThreadReads,
     vm_cpu: Option<u64>,
     vm_busy: u64,
     vm_percent: f64,
@@ -92,6 +122,18 @@ pub struct Watch {
     /// The wall time `adjusted` counted at a share the samples found: every unpaused sample's interval, and the stretch
     /// after the last sample to the exit, which a failed sampler leaves out.
     share_wall: Duration,
+}
+
+/// What the samples' reads of the command's thread states left the watch.
+#[derive(Clone, Debug, Default)]
+struct ThreadReads {
+    /// The threads the last sample found waiting for a processor, `None` before the first sample and when it could
+    /// not read them: what the next sample's own are matched against.
+    waiting: Option<BTreeSet<ThreadKey>>,
+    /// Whether the last sample counted as starved: not progress, and [`starved`].
+    last_starved: bool,
+    /// Whether a sample since the last progress could not read them.
+    unread: bool,
 }
 
 /// The command's busy and free cores counted so far, which [`Watch::cores`] reads.
@@ -133,6 +175,9 @@ impl Watch {
             pids: BTreeSet::new(),
             escaped: BTreeMap::new(),
             escaped_busy: 0,
+            starved: Duration::ZERO,
+            quiet_cpu: 0,
+            threads: ThreadReads::default(),
             vm_cpu,
             vm_busy: 0,
             vm_percent: 0.0,
@@ -158,19 +203,39 @@ impl Watch {
     /// when the log's size changed either way, the CPU of the job and of the processes outside it since the last
     /// progress reached 1% of one core over the stall window, a pid appeared in the job that the last sample did not
     /// have or a process outside it the last sample did not have, the WSL VM passed its floor, the job holds a nested
-    /// gate, or the run is paused. Only the pause stops the clock; a nested gate's time is counted as any other.
+    /// gate, or the run is paused. Only the pause stops the clock; a nested gate's time is counted as any other. A sample
+    /// that is not progress but is starved ([`starved`]: the same thread waited for a processor at it and at the sample
+    /// before) stops the stall clock, without resetting it, from the last sample's begin stamp to its own, clamped to the
+    /// last progress: the command was starved, not idle.
     pub fn sample(&mut self, sample: &Sample) {
         let interval = sample.at.saturating_sub(self.last_at).max(MIN_INTERVAL);
         let escaped = measure_cpu(&self.escaped, &sample.escaped);
         let own_gained = own_gained(sample.job_cpu.saturating_sub(self.job_cpu), escaped);
         let vm_working = self.vm_working(sample.vm_cpu, interval);
         self.escaped_busy = self.escaped_busy.saturating_add(escaped.gained);
-        if self.progressed(sample, escaped, vm_working) {
+        let (progressed, busy) = self.progressed(sample, escaped, vm_working);
+        let starved = starved(self.threads.waiting.as_ref(), sample.waiting.as_ref());
+        if progressed {
             self.last_progress = sample.at;
             self.progress_cpu = sample.job_cpu;
             self.escaped_busy = 0;
             self.vm_busy = 0;
+            self.starved = Duration::ZERO;
+            self.quiet_cpu = 0;
+            self.threads.unread = false;
+        } else {
+            self.quiet_cpu = busy;
+            self.threads.unread |= sample.waiting.is_none();
+            // A paused sample is progress, so it never gets here: a paused interval is neither quiet nor starved.
+            // Counted on the begin timeline, where the quiet time is judged: from the later of the last sample's begin
+            // stamp and the last progress to this sample's begin stamp. Consecutive starved samples tile the window, the
+            // reads' own time included, and the total never leaves it.
+            if starved {
+                self.starved += sample.began.saturating_sub(self.last_began.max(self.last_progress));
+            }
         }
+        self.threads.last_starved = !progressed && starved;
+        self.threads.waiting.clone_from(&sample.waiting);
         let free_cores = free_cores(self.machine, self.system, sample.system, own_gained, interval.as_secs_f64());
         let free = share_of(self.machine, free_cores);
         if sample.paused {
@@ -194,14 +259,34 @@ impl Watch {
     /// Whether `sample` is progress: the log changed either way, the job's CPU since the last progress and the CPU the
     /// processes outside it gained sample by sample since then reached 1% of one core over the stall window together,
     /// a pid appeared in the job or a process outside it that the last sample did not have, the WSL VM worked, the job
-    /// holds a live nested gate, or a gate under this one waits.
-    fn progressed(&self, sample: &Sample, escaped: CpuMove, vm_working: bool) -> bool {
-        let floor = self.config.stall.as_nanos() / FLOOR_NANOS_PER_TICK;
+    /// holds a live nested gate, or a gate under this one waits; with that CPU since the last progress, in ticks.
+    fn progressed(&self, sample: &Sample, escaped: CpuMove, vm_working: bool) -> (bool, u128) {
         let grew = sample.output_size != self.output_size;
         let job_busy = u128::from(sample.job_cpu.saturating_sub(self.progress_cpu).0);
-        let working = job_busy + u128::from(self.escaped_busy) >= floor;
+        let busy = job_busy + u128::from(self.escaped_busy);
+        let working = busy >= self.floor_ticks();
         let appeared = !sample.pids.is_subset(&self.pids) || escaped.appeared;
-        grew || working || appeared || sample.paused || sample.nested_gate || vm_working
+        (grew || working || appeared || sample.paused || sample.nested_gate || vm_working, busy)
+    }
+
+    /// The CPU floor in 100 ns ticks: 1% of one core over the stall window. A command's CPU since the last progress
+    /// that reaches it is progress, and a STALLED line says it.
+    fn floor_ticks(&self) -> u128 {
+        self.config.stall.as_nanos() / FLOOR_NANOS_PER_TICK
+    }
+
+    /// Whether the last sample counted as starved: it was not progress, and the same thread of the command waited for
+    /// a processor at it and at the sample before. `false` before the first sample.
+    #[must_use]
+    pub fn last_sample_starved(&self) -> bool {
+        self.threads.last_starved
+    }
+
+    /// The CPU of the job and of the processes outside it since the last progress, under the floor: zero right after a
+    /// progress sample.
+    #[must_use]
+    pub fn quiet_cpu(&self) -> Duration {
+        ticks_duration(self.quiet_cpu)
     }
 
     /// Adds the WSL VM's CPU since the last reading to the ticks accrued since the last progress, and says whether
@@ -391,11 +476,18 @@ impl Watch {
             // The stall is judged at the last sample's begin stamp: a watcher starved of CPU wakes late, and the delay
             // it spent descheduled between its two stamps is not the command's quiet time.
             let judged_at = if self.sampled { self.last_began.min(now) } else { now };
-            let quiet = judged_at.saturating_sub(self.last_progress);
+            // The starved samples' intervals stopped the stall clock: the command waited for a processor then.
+            let quiet = judged_at.saturating_sub(self.last_progress).saturating_sub(self.starved);
             // The seam's quiet start: while the command has written no byte, its window has not begun.
             let quiet_start = self.config.stall_from_output && self.output_size == 0;
             if !quiet_start && quiet >= self.config.stall {
-                return Some(Kill::Stalled { quiet, free_percent });
+                return Some(Kill::Stalled {
+                    quiet,
+                    free_percent,
+                    cpu: ticks_duration(self.quiet_cpu),
+                    floor: ticks_duration(self.floor_ticks()),
+                    threads_unread: self.threads.unread,
+                });
             }
             if self.adjusted >= self.config.timeout as f64 {
                 return Some(Kill::TimedOut {
@@ -451,6 +543,11 @@ fn ticks_seconds(ticks: Ticks) -> f64 {
     Duration::from_nanos(ticks.0.saturating_mul(100)).as_secs_f64()
 }
 
+/// `ticks` of CPU, 100 ns each, as a duration; a count past a `u64` of nanoseconds saturates.
+fn ticks_duration(ticks: u128) -> Duration {
+    Duration::from_nanos(u64::try_from(ticks.saturating_mul(100)).unwrap_or(u64::MAX))
+}
+
 /// The command's own CPU over the interval, in ticks: its job's gain and the gain of the processes that left it.
 fn own_gained(job: Ticks, escaped: CpuMove) -> Ticks {
     Ticks(job.0 + escaped.gained)
@@ -460,12 +557,20 @@ fn own_gained(job: Ticks, escaped: CpuMove) -> Ticks {
 /// written whenever the caller is ready.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Kill {
-    /// No output and no CPU for the stall window.
+    /// No output and CPU under the floor for the stall window, the starved samples' intervals left out.
     Stalled {
-        /// The seconds without progress.
+        /// The seconds without progress, the starved samples' intervals left out: the quiet time as judged.
         quiet: Duration,
         /// The share of the machine free on average.
         free_percent: f64,
+        /// The CPU the command used since the last progress, under the floor: its job's and that of the processes
+        /// outside it.
+        cpu: Duration,
+        /// The CPU floor over the stall window: 1% of one core, so a hundredth of the window.
+        floor: Duration,
+        /// Whether a sample since the last progress could not read the command's thread states, so the quiet time may
+        /// hold time it waited for a processor.
+        threads_unread: bool,
     },
     /// The load-adjusted clock reached the ceiling.
     TimedOut {
@@ -530,10 +635,23 @@ impl Kill {
     /// The line for this kill, `place` right after its verdict words.
     fn said(&self, spoken: &str, place: &str) -> String {
         match *self {
-            Kill::Stalled { quiet, free_percent } => format!(
-                "gate: STALLED{place}: no output and no CPU for {} s (machine free {free_percent}% on average); \
-                 killed {spoken} and its children",
-                quiet.as_secs_f64().round_ties_even()
+            Kill::Stalled {
+                quiet,
+                free_percent,
+                cpu,
+                floor,
+                threads_unread,
+            } => format!(
+                "gate: STALLED{place}: no output and {:.2} s of CPU (under the {:.2} s floor) for {} s {} (machine free \
+                 {free_percent}% on average); killed {spoken} and its children",
+                cpu.as_secs_f64(),
+                floor.as_secs_f64(),
+                quiet.as_secs_f64().round_ties_even(),
+                if threads_unread {
+                    "(thread states unread)"
+                } else {
+                    "not waiting for a processor"
+                }
             ),
             Kill::TimedOut { timeout, wall, free_percent } => format!(
                 "gate: TIMED OUT{place} after {timeout} s of load-adjusted time (wall {} s, machine free \
@@ -705,7 +823,14 @@ mod tests {
             nested_gate: false,
             escaped: BTreeMap::new(),
             vm_cpu: None,
+            waiting: Some(BTreeSet::new()),
         }
+    }
+
+    /// `sample` with the threads `tids` of process 10, started at tick 1, waiting for a processor.
+    fn waiting(mut sample: Sample, tids: &[usize]) -> Sample {
+        sample.waiting = Some(tids.iter().map(|&tid| ThreadKey { pid: 10, created: 1, tid }).collect());
+        sample
     }
 
     /// A sample at `ms`, stamping its begin and its end both there, reading `system` as the machine's times since the
@@ -722,6 +847,7 @@ mod tests {
             nested_gate: false,
             escaped: BTreeMap::new(),
             vm_cpu: None,
+            waiting: Some(BTreeSet::new()),
         }
     }
 
@@ -1016,6 +1142,85 @@ mod tests {
         watch.sample(&tick(1000, 99_999, 0, &[10], false));
         watch.sample(&tick(2000, 199_999, 0, &[10], false));
         assert!(watch.kill_check(Duration::from_millis(2000)).is_none(), "the floor itself is progress");
+    }
+
+    #[test]
+    fn a_starved_sample_stops_the_stall_clock_without_resetting_it() {
+        // GATE-1092: a command whose thread waits for a processor is starved, not idle. A 1 s window; nothing is
+        // written, no CPU is used and the pid set never changes after the first sample.
+        let mut watch = watching(config(1000, 5000));
+        watch.sample(&tick(1000, 0, 0, &[10], false));
+        watch.sample(&waiting(tick(1500, 0, 0, &[10], false), &[1]));
+        watch.sample(&waiting(tick(3500, 0, 0, &[10], false), &[1]));
+        assert!(
+            watch.kill_check(Duration::from_millis(3500)).is_none(),
+            "0.5 s quiet and 2 s starved, the same thread waiting at both ends, is half a window of quiet time"
+        );
+        watch.sample(&tick(4000, 0, 0, &[10], false));
+        assert!(
+            matches!(watch.kill_check(Duration::from_millis(4000)), Some(Kill::Stalled { .. })),
+            "0.5 s more with every thread waiting makes the window: the starved stretch paused the clock, it did not reset it"
+        );
+    }
+
+    #[test]
+    fn a_command_starved_below_the_floor_for_many_windows_is_no_stall() {
+        // The field shape: 0.3% of one core, what Windows' starvation boost gives a Ready BelowNormal thread (measured),
+        // a third of the floor, with the same thread waiting for a processor at every sample, for ten windows.
+        let mut watch = watching(config(1000, 5000));
+        watch.sample(&waiting(tick(1000, 3_000, 0, &[10], false), &[1]));
+        for second in 2..=11_u64 {
+            watch.sample(&waiting(tick(second * 1000, 3_000 * second, 0, &[10], false), &[1]));
+            assert!(
+                watch.kill_check(Duration::from_millis(second * 1000)).is_none(),
+                "starved through second {second}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_thread_waiting_at_one_sample_only_does_not_stop_the_stall_clock() {
+        // GATE-1092, the owner's rule: a hung process's brief timer wake, caught waiting for a processor at one sample,
+        // is no starvation. A 1 s window; nothing is written, no CPU is used and the pid set never changes.
+        let mut watch = watching(config(1000, 5000));
+        watch.sample(&tick(1000, 0, 0, &[10], false));
+        watch.sample(&tick(1500, 0, 0, &[10], false));
+        watch.sample(&waiting(tick(3500, 0, 0, &[10], false), &[1]));
+        assert!(
+            matches!(watch.kill_check(Duration::from_millis(3500)), Some(Kill::Stalled { quiet, .. }) if quiet == Duration::from_millis(2500)),
+            "a thread waiting at the last sample alone stops nothing: 2.5 s quiet"
+        );
+        assert!(!watch.last_sample_starved(), "the sample did not count as starved");
+    }
+
+    #[test]
+    fn a_starved_command_beside_a_slow_watcher_is_no_stall() {
+        // GATE-1092: a watcher on a contended core spends most of each 1 s period in its own reads (begin at n s, end
+        // at n.8 s). The same thread waits at every sample, with no output and no CPU: the command is starved through,
+        // so its reads' time must not pile up as quiet time.
+        let mut watch = watching(config(1000, 5000));
+        for second in 1..=6_u64 {
+            let mut slow = waiting(tick(second * 1000, 0, 0, &[10], false), &[1]);
+            slow.at = Duration::from_millis(second * 1000 + 800);
+            watch.sample(&slow);
+            assert!(
+                watch.kill_check(slow.at).is_none(),
+                "starved at every sample through second {second}, whatever the reads took"
+            );
+        }
+    }
+
+    #[test]
+    fn two_different_threads_each_waiting_once_do_not_stop_it() {
+        let mut watch = watching(config(1000, 5000));
+        watch.sample(&tick(1000, 0, 0, &[10], false));
+        watch.sample(&waiting(tick(1500, 0, 0, &[10], false), &[1]));
+        watch.sample(&waiting(tick(3500, 0, 0, &[10], false), &[2]));
+        assert!(
+            matches!(watch.kill_check(Duration::from_millis(3500)), Some(Kill::Stalled { quiet, .. }) if quiet == Duration::from_millis(2500)),
+            "thread 1 waited at one sample and thread 2 at the next: neither was starved"
+        );
+        assert!(!watch.last_sample_starved(), "the sample did not count as starved");
     }
 
     #[test]
@@ -1323,6 +1528,9 @@ mod tests {
         let stalled = Kill::Stalled {
             quiet: Duration::from_millis(2500),
             free_percent: 37.0,
+            cpu: Duration::ZERO,
+            floor: Duration::from_millis(25),
+            threads_unread: false,
         };
         assert!(backstop.is_backstop(), "a backstop is a backstop");
         assert_eq!(backstop.note_word(), "backstop");
@@ -1338,11 +1546,26 @@ mod tests {
         let stalled = Kill::Stalled {
             quiet: Duration::from_millis(2500),
             free_percent: 37.0,
+            cpu: Duration::from_millis(310),
+            floor: Duration::from_millis(1250),
+            threads_unread: false,
         };
         assert_eq!(
             stalled.line(SPOKEN),
-            "gate: STALLED: no output and no CPU for 2 s (machine free 37% on average); \
-             killed cargo test -p gate-watchdog and its children"
+            "gate: STALLED: no output and 0.31 s of CPU (under the 1.25 s floor) for 2 s not waiting for a processor \
+             (machine free 37% on average); killed cargo test -p gate-watchdog and its children"
+        );
+        let unread = Kill::Stalled {
+            quiet: Duration::from_millis(2500),
+            free_percent: 37.0,
+            cpu: Duration::from_millis(310),
+            floor: Duration::from_millis(1250),
+            threads_unread: true,
+        };
+        assert_eq!(
+            unread.line(SPOKEN),
+            "gate: STALLED: no output and 0.31 s of CPU (under the 1.25 s floor) for 2 s (thread states unread) \
+             (machine free 37% on average); killed cargo test -p gate-watchdog and its children"
         );
 
         let timed_out = Kill::TimedOut {

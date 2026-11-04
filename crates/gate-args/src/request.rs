@@ -419,6 +419,11 @@ pub struct TestSeams {
     /// The file each wait of a build here for the work folder's key, bounded or held off by a drain marker, appends
     /// one line to as it begins, so a case counts the waits a passing build makes.
     pub key_waits: Option<PathBuf>,
+    /// The file each sample of the local watch appends one line to, `<at_ms> starved=<0|1> quiet_cpu_us=<n>`: when the
+    /// sample read the job's accounting, in milliseconds of the watch, whether it counted as starved (not progress, and
+    /// the same thread of the command waited for a processor at it and at the sample before), and the command's CPU
+    /// since the last progress in microseconds, so a case waits on samples, not on time.
+    pub sample_trace: Option<PathBuf>,
     /// How long the remote client's `dotnet --list-sdks` of this PC may take before it is killed and the SDK list
     /// counts as unreadable, in place of 30 s.
     pub dotnet_limit_ms: Option<u64>,

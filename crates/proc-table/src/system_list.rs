@@ -106,6 +106,14 @@ pub struct Thread {
     pub start_address: usize,
 }
 
+/// Whether a thread in the `KTHREAD_STATE` `state` waits for a processor: `Ready` (1), `Standby` (3, picked to run
+/// next on a processor), `Transition` (6, ready but its kernel stack paged out) or `DeferredReady` (7, readied but not
+/// yet given a processor). A running, waiting, terminated or new thread waits for none.
+#[must_use]
+pub fn is_runnable(state: u32) -> bool {
+    matches!(state, 1 | 3 | 6 | 7)
+}
+
 /// The thread of the thread entry `bytes`, one whole entry of a thread array.
 fn thread_at(bytes: &[u8]) -> io::Result<Thread> {
     Ok(Thread {
@@ -272,8 +280,30 @@ mod tests {
     use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadId, GetProcessTimes, PROCESS_QUERY_LIMITED_INFORMATION};
 
-    use super::{PID_AT, THREAD_COUNT_AT, THREAD_ID_AT, THREAD_SIZE, THREAD_STATE_AT, THREADS_AT, Thread, as_bytes, process_list, walk};
+    use super::{PID_AT, THREAD_COUNT_AT, THREAD_ID_AT, THREAD_SIZE, THREAD_STATE_AT, THREADS_AT, Thread, as_bytes, is_runnable, process_list, walk};
     use crate::win32::{open_process, parent_pid_of};
+
+    #[test]
+    fn only_a_thread_waiting_for_a_processor_is_runnable() {
+        // KTHREAD_STATE: 0 Initialized, 1 Ready, 2 Running, 3 Standby, 4 Terminated, 5 Waiting, 6 Transition,
+        // 7 DeferredReady, 8 GateWaitObsolete, 9 WaitingForProcessOutSwap.
+        let rows: [(u32, bool); 11] = [
+            (0, false),
+            (1, true),
+            (2, false),
+            (3, true),
+            (4, false),
+            (5, false),
+            (6, true),
+            (7, true),
+            (8, false),
+            (9, false),
+            (u32::MAX, false),
+        ];
+        for (state, want) in rows {
+            assert_eq!(is_runnable(state), want, "state {state}");
+        }
+    }
 
     /// A list of one entry, the last, for process `pid`, that says it has `count` threads and holds room for one: the
     /// thread of id `tid` in state `state`.

@@ -4,18 +4,21 @@
 //! or past the backstop, or a Ctrl+C.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet};
-use std::io;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fs::OpenOptions;
+use std::io::{self, Write as _};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gate_args::{RunRequest, Slot};
 use gate_state::{RunTrace, SlotKind};
 use gate_watchdog::{
     Config, Cores, JOB_LINES, Kill, Machine, OUTSIDE_LINES, ProcessFacts, Report, SSH_STALL_LINE, Sample, SampleFacts, SampleHistory, SystemTimes,
-    Ticks, Watch, WslVm, failed_block, is_ssh_command, is_wsl_command, lines, wsl_unavailable_line,
+    ThreadKey, Ticks, Watch, WslVm, failed_block, is_ssh_command, is_wsl_command, lines, wsl_unavailable_line,
 };
 use gate_win32::{Interrupt, Job, Priority, ProcessTimes, Running, Waited};
 use jiff::Timestamp;
+use proc_table::system_list::{self, Thread};
 use proc_table::{ProcessInfo, ProcessTable, ProcessTree, Win32ProcessTable, filetime_to_timestamp};
 
 use crate::boxside::forward::OutputBytes;
@@ -90,6 +93,13 @@ pub(crate) struct Watcher<'a> {
     memory_said: Option<String>,
     /// The flags the run's `--test-*` seams set ([`WatchSeams`]).
     seams: WatchSeams,
+    /// The file each sample appends its `<at_ms> starved=<0|1> quiet_cpu_us=<n>` line to (`--test-sample-trace`);
+    /// `None` unless the suite sets one.
+    sample_trace: Option<PathBuf>,
+    /// Whether a sample has said that the command's thread states could not be read, which a watch says once.
+    runnable_said: bool,
+    /// Whether a sample has said that a process's threads could not be decoded, which a watch says once.
+    undecoded_said: bool,
     /// The milliseconds a gathering of the kill's diagnostics may take before it is cut
     /// (`--test-diagnostics-budget-ms`), the gate's own budget unless the suite sets one.
     diagnostics_budget_ms: u128,
@@ -143,6 +153,10 @@ struct HangHint {
 /// The CPU time in 100 ns ticks of the processes outside the job under its members, by pid and start, as a sample
 /// carries them.
 type EscapedCpu = BTreeMap<(u32, u64), u64>;
+
+/// The command's threads one read found waiting for a processor, with each process whose threads could not be decoded,
+/// by pid, and why.
+type Waiting = (BTreeSet<ThreadKey>, Vec<(u32, io::Error)>);
 
 /// A read of the WSL VM's cumulative CPU in 100 ns ticks, `None` when no VM runs.
 type VmRead = fn() -> io::Result<Option<u64>>;
@@ -284,6 +298,9 @@ impl<'a> Watcher<'a> {
                 diagnostics_fail: request.test_seams.diagnostics_fail,
                 interrupt_awaits_output: request.test_seams.interrupt_from_output,
             },
+            sample_trace: request.test_seams.sample_trace.clone(),
+            runnable_said: false,
+            undecoded_said: false,
             diagnostics_budget_ms: request.test_seams.diagnostics_budget_ms.map_or(DIAGNOSTICS_BUDGET_MS, u128::from),
             samples: 0,
             interrupt_after: request.test_seams.interrupt_after_samples,
@@ -485,6 +502,7 @@ impl<'a> Watcher<'a> {
                     self.seams.interrupt_awaits_output = false;
                 }
                 self.watch.sample(&sample);
+                self.trace_sample(console, &sample);
                 self.record(&sample, out_bytes, err_bytes, vm_failed);
             }
             Err(error) => {
@@ -493,6 +511,30 @@ impl<'a> Watcher<'a> {
                 // The pause read this pass answers for the stretch the failed sample would have measured.
                 self.watch.wall_only(self.started.elapsed(), paused);
             }
+        }
+    }
+
+    /// Appends the line of `sample`, which the watch has just taken, to the sample-trace test seam's file, when it is
+    /// set: `<at_ms> starved=<0|1> quiet_cpu_us=<n>`, whether the sample counted as starved
+    /// ([`Watch::last_sample_starved`]) and the command's CPU since the last progress in microseconds. A file that
+    /// cannot be written is said.
+    fn trace_sample(&self, console: &mut Console, sample: &Sample) {
+        let Some(path) = self.sample_trace.as_deref() else {
+            return;
+        };
+        let line = format!(
+            "{} starved={} quiet_cpu_us={}\n",
+            sample.at.as_millis(),
+            u8::from(self.watch.last_sample_starved()),
+            self.watch.quiet_cpu().as_micros()
+        );
+        let appended = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut file| file.write_all(line.as_bytes()));
+        if let Err(error) = appended {
+            console.err(&format!("gate: cannot write {}: {error}", path.display()));
         }
     }
 
@@ -636,11 +678,13 @@ impl<'a> Watcher<'a> {
     }
 
     /// The facts of one sample that began at `began`: the bytes the command wrote to its stdout and its stderr, the
-    /// two kept apart for the diagnostics block and no gate line among them, the job's processes created since the command started, the processes outside the job
-    /// under its members and their CPU, the WSL VM's CPU for a wsl command (its unreadable line said once, when it
-    /// first fails), and last the system's times and the job's accounting, stamped with the watch's end time: the
-    /// interval the watch counts them over is exactly the stretch the end stamp closes. Under `--test-sampler-fail`
-    /// every sample fails.
+    /// two kept apart for the diagnostics block and no gate line among them, the job's processes created since the
+    /// command started, the processes outside the job under its members and their CPU, the WSL VM's CPU for a wsl
+    /// command (its unreadable line said once, when it first fails), the threads of the job's members and of the
+    /// recorded processes outside it, each by pid and start, that wait for a processor (an unreadable list and an
+    /// undecodable process each said once; a failed read leaves them unread, and an undecodable process is skipped),
+    /// and last the system's times and the job's accounting, stamped with the watch's end time: the interval the watch
+    /// counts them over is exactly the stretch the end stamp closes. Under `--test-sampler-fail` every sample fails.
     fn sample(&mut self, console: &mut Console, began: Duration, paused: bool) -> io::Result<Gathered> {
         if self.seams.sampler_fail {
             return Err(io::Error::other(SAMPLER_FAIL));
@@ -658,6 +702,12 @@ impl<'a> Watcher<'a> {
         }
         let tree = ProcessTree::new(processes);
         let nested_gate = holds_nested_gate(&tree, &started, std::process::id());
+        let members: HashSet<u32> = before.iter().chain(&after).copied().collect();
+        // The job's members by pid and start, as the snapshot lists them: a pid a newer process took lends it nothing.
+        let mut wanted: HashSet<(u32, Timestamp)> = members
+            .iter()
+            .filter_map(|&pid| tree.get(pid).and_then(|info| info.created).map(|created| (pid, created)))
+            .collect();
         let look = Look {
             before,
             after,
@@ -673,6 +723,32 @@ impl<'a> Watcher<'a> {
         if let Some(line) = line {
             console.err(&line);
         }
+        // Every recorded process outside the job, whether or not its CPU could be read, by pid and start.
+        wanted.extend(
+            self.recorded
+                .borrow()
+                .processes(&tree)
+                .into_iter()
+                .filter_map(|info| info.created.map(|created| (info.pid, created))),
+        );
+        let waiting = match waiting_threads(&wanted) {
+            Ok((waiting, skipped)) => {
+                if let Some((pid, error)) = skipped.first()
+                    && !self.undecoded_said
+                {
+                    self.undecoded_said = true;
+                    console.err(&threads_undecoded_line(*pid, &error.to_string()));
+                }
+                Some(waiting)
+            }
+            Err(error) => {
+                if !self.runnable_said {
+                    self.runnable_said = true;
+                    console.err(&runnable_unavailable_line(&error.to_string()));
+                }
+                None
+            }
+        };
         let system = system_times()?;
         let accounting = self.job.accounting()?;
         let job_cpu = Ticks(accounting.cpu);
@@ -690,6 +766,7 @@ impl<'a> Watcher<'a> {
             nested_gate,
             escaped,
             vm_cpu: vm.as_ref().ok().copied().flatten(),
+            waiting,
         };
         Ok(Gathered {
             sample,
@@ -698,6 +775,72 @@ impl<'a> Watcher<'a> {
             vm_failed: vm.is_err(),
         })
     }
+}
+
+/// The threads of the command's processes, `wanted` by pid and start (the job's members and the processes outside it
+/// the watch recorded), that wait for a processor, as one read of the system's process list finds them; with each
+/// process whose threads could not be decoded, skipped, and why. A process whose pid a newer process took is not read;
+/// nor is any process outside `wanted`.
+///
+/// # Errors
+///
+/// The list's error when it cannot be read or walked.
+fn waiting_threads(wanted: &HashSet<(u32, Timestamp)>) -> io::Result<Waiting> {
+    let list = system_list::process_list()?;
+    let entries = system_list::walk(system_list::as_bytes(&list), |entry| {
+        u32::try_from(entry.pid)
+            .ok()
+            .zip(filetime_to_timestamp(entry.create))
+            .is_some_and(|key| wanted.contains(&key))
+    })?;
+    Ok(waiting_of(entries.iter().filter_map(|entry| {
+        let pid = u32::try_from(entry.pid).ok()?;
+        let created = u64::try_from(entry.create).ok()?;
+        Some((pid, created, entry.threads()))
+    })))
+}
+
+/// The threads of `processes`, each by pid, start and its threads as decoded, that wait for a processor
+/// ([`system_list::is_runnable`]); with each process whose threads could not be decoded, skipped, and why: the others
+/// are still read.
+fn waiting_of(processes: impl IntoIterator<Item = (u32, u64, io::Result<Vec<Thread>>)>) -> Waiting {
+    let mut waiting = BTreeSet::new();
+    let mut skipped = Vec::new();
+    for (pid, created, threads) in processes {
+        match threads {
+            Ok(threads) => waiting.extend(
+                threads
+                    .iter()
+                    .filter(|thread| system_list::is_runnable(thread.state))
+                    .map(|thread| ThreadKey {
+                        pid,
+                        created,
+                        tid: thread.tid,
+                    }),
+            ),
+            Err(error) => skipped.push((pid, error)),
+        }
+    }
+    (waiting, skipped)
+}
+
+/// The line the gate says once a sample cannot read the command's thread states: every later sample tries again, and
+/// until one succeeds a command waiting for a processor counts as quiet.
+fn runnable_unavailable_line(message: &str) -> String {
+    format!(
+        "gate: thread states unavailable ({message}); retrying each sample, and until a read succeeds a command waiting \
+         for a processor counts as quiet"
+    )
+}
+
+/// The line the gate says once a sample cannot decode the threads of the command's process `pid`: that process is left
+/// out of the check for a thread waiting for a processor while its threads cannot be read, and the others are still
+/// checked.
+fn threads_undecoded_line(pid: u32, message: &str) -> String {
+    format!(
+        "gate: cannot read the thread states of process {pid} ({message}); it is left out of the check for a thread waiting \
+         for a processor while they cannot be read, and the command's other processes are still checked"
+    )
 }
 
 /// What one sample finds outside the job at `look` and records in `recorded` ([`Recorded::record`]): the CPU of each
@@ -932,7 +1075,8 @@ mod tests {
     use gate_win32::Priority;
 
     use super::{
-        ACCESS_DENIED, VmReader, config, holds_nested_gate, is_ssh, lowered, machine, members, own_kind_after_take, sample_due, sample_facts, slice,
+        ACCESS_DENIED, Thread, ThreadKey, VmReader, config, holds_nested_gate, is_ssh, lowered, machine, members, own_kind_after_take, sample_due,
+        sample_facts, slice, waiting_of,
     };
 
     /// The test moment `second` seconds past 10:00 on the test day.
@@ -999,6 +1143,7 @@ mod tests {
             nested_gate: false,
             escaped: std::collections::BTreeMap::from([((2, 10), 15_000_000), ((3, 20), 10_000_000)]),
             vm_cpu: None,
+            waiting: None,
         };
 
         let facts = sample_facts(&sample, (4.0, 50), (0, 0), gate_watchdog::WslVm::NotWatched);
@@ -1196,5 +1341,38 @@ mod tests {
             "created since, still running, and readable"
         );
         assert!(members([1, 9], 10, times).is_err(), "any other failure fails the sample");
+    }
+
+    #[test]
+    fn a_process_whose_threads_cannot_be_decoded_is_skipped_and_the_others_still_read() {
+        // GATE-1092: one bad entry of the process list does not blind the check to the command's other processes.
+        let thread = |tid: usize, state: u32| Thread {
+            tid,
+            state,
+            wait_reason: 0,
+            wait_time: 0,
+            start_address: 0,
+        };
+        let processes = vec![
+            (7, 70, Err(io::Error::other("process 7's 3 threads run past its entry"))),
+            (8, 80, Ok(vec![thread(81, 5), thread(82, 1), thread(83, 2)])),
+        ];
+
+        let (waiting, skipped) = waiting_of(processes);
+
+        assert_eq!(
+            waiting,
+            BTreeSet::from([ThreadKey {
+                pid: 8,
+                created: 80,
+                tid: 82
+            }]),
+            "process 8's Ready thread, not its waiting or running ones"
+        );
+        assert_eq!(
+            skipped.iter().map(|(pid, _)| *pid).collect::<Vec<_>>(),
+            vec![7],
+            "process 7 is skipped and named"
+        );
     }
 }

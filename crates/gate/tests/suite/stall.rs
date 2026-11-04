@@ -1,5 +1,6 @@
-//! The watch: a command with no output and no CPU for the stall window is killed with the STALLED line, its job's
-//! processes terminated and the run failed with status 124, and a run that passes journals its load-adjusted seconds.
+//! The watch: a command with no output and CPU under the floor for the stall window, the stretches it was starved of a
+//! processor left out, is killed with the STALLED line, its job's processes terminated and the run failed with status
+//! 124, and a run that passes journals its load-adjusted seconds.
 
 use std::fs;
 use std::io::Read as _;
@@ -14,6 +15,7 @@ use gate_win32::{EnvironmentBlock, Job, Launch, LaunchOutput, StoppableProcess};
 use regex::Regex;
 use serde_json::Value;
 
+use crate::harness::pin_to_one_core_at_normal;
 use crate::support::{
     CORE_SECOND, Case, Escapee, FAKE_TOOL, UNTIL_KILLED, assert_in_order, copy_tool, cpu_ticks, exit_of, log_texts, process_lines, release,
     run_words, said_pid, shown, start, tool, wait_until, wait_until_closed,
@@ -112,6 +114,243 @@ fn a_command_whose_child_outside_its_job_idles_is_still_stalled() {
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     assert!(outcome.stderr.contains("gate: STALLED: "), "{outcome:?}");
     assert_eq!(release(&case)["verdict"], "stalled", "{outcome:?}");
+}
+
+/// A child a case's command starts in a job of its own nested in the command's, with fake-tool's `spawn-in-job`, as
+/// Godot's console wrapper starts Godot: spinning until its stop file exists, or, idle, sleeping without ever looking at
+/// it. Its stop file is written on every path out of the case, a panic included; an idle one ends with the job of the
+/// command that holds its own job's only handle.
+struct InJob {
+    pid_file: PathBuf,
+    stop: PathBuf,
+}
+
+impl InJob {
+    /// The child whose pid file and stop file are `in-job.pid` and `stop` in `case`'s folder.
+    fn new(case: &Case) -> InJob {
+        InJob {
+            pid_file: case.folder().join("in-job.pid"),
+            stop: case.folder().join("stop"),
+        }
+    }
+
+    /// The words of a command that starts the child spinning on `threads` threads (`0`: sleeping), then waits for it to
+    /// end without output.
+    fn command(&self, threads: &str) -> Vec<String> {
+        [FAKE_TOOL, "spawn-in-job", &shown(&self.pid_file), threads, &shown(&self.stop)]
+            .map(str::to_owned)
+            .to_vec()
+    }
+
+    /// The child's pid and the process, once the pid file holds its whole line, checked to be the process that started
+    /// then. Fails at once, rather than at the hang guard, when `ended` says the command has ended without writing it.
+    #[expect(clippy::panic, reason = "a command that ended before it wrote the pid file fails the case saying so")]
+    fn open(&self, mut ended: impl FnMut() -> bool) -> (u32, StoppableProcess) {
+        let mut said = None;
+        wait_until(
+            &format!("{} holding a pid and a start, or the command ending", self.pid_file.display()),
+            || {
+                said = fs::read_to_string(&self.pid_file).ok().and_then(|text| {
+                    let (pid, start) = text.strip_suffix('\n')?.split_once(' ')?;
+                    Some((pid.parse::<u32>().ok()?, start.parse::<i64>().ok()?))
+                });
+                said.is_some() || ended()
+            },
+        );
+        let Some((pid, start)) = said else {
+            panic!("the command ended before it wrote {}", self.pid_file.display());
+        };
+        let process = StoppableProcess::open(pid)
+            .expect("the child is opened")
+            .expect("it runs: it spins until its stop file exists, or sleeps");
+        let created = process.created().expect("the child's start is read");
+        assert_eq!(
+            Some(created),
+            proc_table::filetime_to_timestamp(start),
+            "pid {pid} is the child spawn-in-job started"
+        );
+        (pid, process)
+    }
+
+    /// Writes the child's stop file.
+    fn stop(&self) {
+        fs::write(&self.stop, "").expect("the child's stop file can be written");
+    }
+}
+
+impl Drop for InJob {
+    fn drop(&mut self) {
+        // Fails only when the case's folder is gone, and with it anything that would read the file.
+        let _ = fs::write(&self.stop, "");
+    }
+}
+
+/// The words of a gate with a 3 s stall window and a 100 ms sample.
+const IN_JOB_SEAMS: [&str; 4] = ["--test-stall-ms", "3000", "--test-sample-ms", "100"];
+
+#[test]
+#[ignore = "needs the machine alone: run with -Slot critical and --ignored"]
+fn a_command_whose_only_work_is_a_child_in_a_job_of_its_own_is_not_stalled() {
+    let case = Case::new("a_command_whose_only_work_is_a_child_in_a_job_of_its_own_is_not_stalled");
+    // GATE-1090: the child's job is nested in the command's, so the command's job counts the child's CPU.
+    let child = InJob::new(&case);
+    let command = child.command("2");
+    let words: Vec<&str> = command.iter().map(String::as_str).collect();
+
+    let mut running = case.start(&run_words("out.log", &IN_JOB_SEAMS, &words));
+    let (pid, _held) = child.open(|| !running.is_running());
+    // Eight core-seconds on two threads take at least 4 s: more than a stall window in which the command itself only waits.
+    wait_until("the child using 8 core-seconds, or the gate ending", || {
+        cpu_ticks(pid) >= 8 * CORE_SECOND || !running.is_running()
+    });
+    child.stop();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "the child's CPU is the quiet command's progress: {outcome:?}");
+    assert!(!outcome.stderr.contains("STALLED"), "{outcome:?}");
+    let release = release(&case);
+    assert!(
+        release["cpuSeconds"].as_f64().is_some_and(|seconds| seconds >= 8.0),
+        "the job's CPU counts the child's: {release}"
+    );
+}
+
+#[test]
+fn a_stall_kill_ends_a_child_in_a_job_of_its_own() {
+    let case = Case::new("a_stall_kill_ends_a_child_in_a_job_of_its_own");
+    // GATE-1090: the child sleeps, so neither it nor the command does anything that is progress; the stall kill ends the
+    // command's job, and with it the job nested in it.
+    let child = InJob::new(&case);
+    let command = child.command("0");
+    let words: Vec<&str> = command.iter().map(String::as_str).collect();
+
+    let mut running = case.start(&run_words("out.log", &IN_JOB_SEAMS, &words));
+    let (pid, process) = child.open(|| !running.is_running());
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: STALLED: "), "{outcome:?}");
+    assert_eq!(
+        Escapee::exit_code_once_ended(&process),
+        Some(124),
+        "the child {pid} in a job of its own was ended by the kill with the kill's status: {outcome:?}"
+    );
+    let log_path = case.folder().join("out.log");
+    wait_until_closed(&log_path);
+    let lines = process_lines(&log_path);
+    let ended = format!("exit pid={pid} code=124 ");
+    assert!(
+        lines.iter().any(|line| line.starts_with(&ended)),
+        "the log has the child's {ended:?} line: {lines:#?}"
+    );
+}
+
+/// One line of a sample trace: when the sample read the job's accounting, in milliseconds of the watch, whether it
+/// counted as starved, and the command's CPU since the last progress, in microseconds.
+#[derive(Debug)]
+struct Traced {
+    at_ms: u128,
+    starved: bool,
+    quiet_cpu_us: u128,
+}
+
+/// The samples the trace at `trace` holds so far, each whole line of `<at_ms> starved=<0|1> quiet_cpu_us=<n>`; a line
+/// still being written is left out.
+fn traced(trace: &Path) -> Vec<Traced> {
+    let text = fs::read_to_string(trace).unwrap_or_default();
+    text.split_inclusive('\n')
+        .filter_map(|line| {
+            let mut words = line.strip_suffix('\n')?.split(' ');
+            let at_ms = words.next()?.parse().ok()?;
+            let starved = match words.next()? {
+                "starved=1" => true,
+                "starved=0" => false,
+                _ => return None,
+            };
+            let quiet_cpu_us = words.next()?.strip_prefix("quiet_cpu_us=")?.parse().ok()?;
+            Some(Traced {
+                at_ms,
+                starved,
+                quiet_cpu_us,
+            })
+        })
+        .collect()
+}
+
+/// A normal-priority `fake-tool burn` this test process started outside any gate, burning until its stop file exists.
+/// Dropped, it writes that file, then kills the burner and waits for it, so a failing case leaves no burner.
+struct Burner {
+    child: std::process::Child,
+    stop: PathBuf,
+}
+
+impl Burner {
+    /// A burner that burns until `stop` exists, inheriting this process's core pin and priority class.
+    fn start(stop: &Path) -> Burner {
+        let child = Command::new(FAKE_TOOL)
+            .args(["burn", &shown(stop)])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("the burner starts");
+        Burner {
+            child,
+            stop: stop.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for Burner {
+    fn drop(&mut self) {
+        // Each step fails only when the burner or its folder is already gone, which leaves nothing to end.
+        let _ = fs::write(&self.stop, "");
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+#[expect(clippy::panic, reason = "a wait that failed is said again with the trace read so far")]
+fn a_command_starved_by_a_busier_thread_on_its_core_is_not_stalled() {
+    let case = Case::new("a_command_starved_by_a_busier_thread_on_its_core_is_not_stalled");
+    // GATE-1092: the command is held off its processor by a normal-priority thread on the only core it may use, so the
+    // same thread waits for a processor sample after sample whatever the machine's load, getting only the starvation
+    // boost (about 0.3% of a core), under the floor. It is starved, not idle: three stall windows of such samples are
+    // no stall. The wait is on the samples the gate traces, never on time, and fails at once when the gate ends; a gate
+    // that never sampled fills no trace and the case fails as hung.
+    pin_to_one_core_at_normal();
+    let stop = case.folder().join("stop");
+    let trace = case.folder().join("trace.txt");
+    let trace_word = shown(&trace);
+    let seams = ["--test-stall-ms", "2000", "--test-sample-ms", "100", "--test-sample-trace", &trace_word];
+    let stop_word = shown(&stop);
+    let _burner = Burner::start(&stop);
+    let command = [FAKE_TOOL, "burn", &stop_word];
+
+    let running = case.start(&run_words("out.log", &seams, &command));
+    // A wait that fails is said again with the trace read so far, the evidence of which samples counted as starved.
+    let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        running.wait_until("a starved sample three stall windows in", || {
+            traced(&trace).iter().any(|sample| sample.starved && sample.at_ms >= 6000)
+        });
+    }));
+    if let Err(payload) = waited {
+        let said = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+            .unwrap_or_default();
+        panic!("{said}\ntrace so far:\n{}", fs::read_to_string(&trace).unwrap_or_default());
+    }
+    fs::write(&stop, "").expect("the stop file can be written");
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: STALLED"), "{outcome:?}");
+    assert_eq!(release(&case)["verdict"], "passed", "{outcome:?}");
+    // The floor of a 2 s window is 20 ms of CPU: every sample that stopped the stall clock found the command under it.
+    let samples = traced(&trace);
+    let over: Vec<&Traced> = samples.iter().filter(|sample| sample.starved && sample.quiet_cpu_us >= 20_000).collect();
+    assert!(over.is_empty(), "starved samples over the floor: {over:?}; every sample: {samples:?}");
 }
 
 /// The line a stalled ssh command says right after its STALLED line. A copy of the gate's own constant on purpose: it
@@ -294,7 +533,8 @@ fn a_silent_idle_command_is_killed_as_stalled() {
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     let stalled = Regex::new(&format!(
         concat!(
-            r"(?m)^gate: STALLED: no output and no CPU for \d+ s \(machine free \d+% on average\); ",
+            r"(?m)^gate: STALLED: no output and \d+\.\d{{2}} s of CPU \(under the \d+\.\d{{2}} s floor\) ",
+            r"for \d+ s not waiting for a processor \(machine free \d+% on average\); ",
             r"killed {} pid-to {} out hi sleep {} and its children$"
         ),
         regex::escape(FAKE_TOOL),
@@ -483,7 +723,8 @@ fn a_stall_window_from_the_first_output_does_not_count_a_quiet_start() {
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     let stalled = Regex::new(&format!(
         concat!(
-            r"(?m)^gate: STALLED: no output and no CPU for \d+ s \(machine free \d+% on average\); ",
+            r"(?m)^gate: STALLED: no output and \d+\.\d{{2}} s of CPU \(under the \d+\.\d{{2}} s floor\) ",
+            r"for \d+ s not waiting for a processor \(machine free \d+% on average\); ",
             r"killed {} sleep 3000 pid-to {} out hi sleep {} and its children$"
         ),
         regex::escape(FAKE_TOOL),

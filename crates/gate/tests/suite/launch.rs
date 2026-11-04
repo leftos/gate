@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use gate_state::{KernelObject, StateRoot};
 use gate_win32::{NamedEvent, StoppableProcess};
 
+use crate::harness::pin_to_one_core_at_normal;
 use crate::support::{
     Case, Escapee, FAKE_TOOL, GATE, Go, assert_in_order, copy_tool, events, exit_of, finish, log_texts, none_words, process_lines, run_words,
     said_pid, shown, spawn_of, start, wait_for_file, wait_for_journal_line, wait_until, wait_until_closed, write_counts,
@@ -657,35 +658,6 @@ fn a_process_left_in_the_job_ends_with_the_run() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(child, Some(STOPPED), "the gate ended the child at the run's end: {outcome:?}");
     assert!(!outcome.stderr.contains("cannot end the run's job"), "{outcome:?}");
-}
-
-/// Pins this process, and so the gate it starts and the command under it, to its lowest core at normal priority. Each
-/// failure is that call's Win32 error.
-fn pin_to_one_core_at_normal() {
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, GetProcessAffinityMask, NORMAL_PRIORITY_CLASS, SetPriorityClass, SetProcessAffinityMask,
-    };
-
-    let process = unsafe { GetCurrentProcess() };
-    let (mut own, mut system) = (0, 0);
-    // SAFETY: the pseudo handle names this process, and both pointers are writable.
-    let read = unsafe { GetProcessAffinityMask(process, &raw mut own, &raw mut system) };
-    assert!(read != 0, "GetProcessAffinityMask failed: {}", std::io::Error::last_os_error());
-    let lowest = own.isolate_lowest_one();
-    // SAFETY: the pseudo handle names this process, which this case owns.
-    let pinned = unsafe { SetProcessAffinityMask(process, lowest) };
-    assert!(
-        pinned != 0,
-        "SetProcessAffinityMask({lowest:#x}) failed: {}",
-        std::io::Error::last_os_error()
-    );
-    // SAFETY: as above.
-    let at_normal = unsafe { SetPriorityClass(process, NORMAL_PRIORITY_CLASS) };
-    assert!(
-        at_normal != 0,
-        "SetPriorityClass(NORMAL_PRIORITY_CLASS) failed: {}",
-        std::io::Error::last_os_error()
-    );
 }
 
 /// The command's own exit is no process left in the run's job, even when the gate wakes on the exit before the job's

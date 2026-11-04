@@ -97,6 +97,35 @@ fn a_failed_git_setup_call_names_its_status_and_output() {
     assert!(message.contains("\"commit\""), "the arguments are named: {message}");
 }
 
+/// Pins this process, and so the gate it starts and the command under it, to its lowest core at normal priority. Each
+/// failure is that call's Win32 error.
+pub(crate) fn pin_to_one_core_at_normal() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessAffinityMask, NORMAL_PRIORITY_CLASS, SetPriorityClass, SetProcessAffinityMask,
+    };
+
+    let process = unsafe { GetCurrentProcess() };
+    let (mut own, mut system) = (0, 0);
+    // SAFETY: the pseudo handle names this process, and both pointers are writable.
+    let read = unsafe { GetProcessAffinityMask(process, &raw mut own, &raw mut system) };
+    assert!(read != 0, "GetProcessAffinityMask failed: {}", std::io::Error::last_os_error());
+    let lowest = own.isolate_lowest_one();
+    // SAFETY: the pseudo handle names this process, which this case owns.
+    let pinned = unsafe { SetProcessAffinityMask(process, lowest) };
+    assert!(
+        pinned != 0,
+        "SetProcessAffinityMask({lowest:#x}) failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: as above.
+    let at_normal = unsafe { SetPriorityClass(process, NORMAL_PRIORITY_CLASS) };
+    assert!(
+        at_normal != 0,
+        "SetPriorityClass(NORMAL_PRIORITY_CLASS) failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
 /// The text the panic `payload` carried, whether it was a `String` or a `&str`.
 fn panic_text(payload: &(dyn Any + Send)) -> String {
     if let Some(text) = payload.downcast_ref::<String>() {

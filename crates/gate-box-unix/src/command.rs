@@ -298,6 +298,7 @@ impl Watching {
             nested_gate: false,
             escaped: BTreeMap::new(),
             vm_cpu: None,
+            waiting: None,
         })
     }
 }

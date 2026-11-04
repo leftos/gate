@@ -2464,7 +2464,7 @@ fn a_75_without_a_reason_is_the_commands_own_status() {
 #[test]
 fn a_killed_client_run_is_a_kill_and_a_124_of_its_own_is_not() {
     let case = routed_case("routing-killed");
-    let stalled = "err gate: STALLED: no output and no CPU for 120 s";
+    let stalled = "err gate: STALLED: no output and 0.00 s of CPU (under the 1.20 s floor) for 120 s not waiting for a processor";
     let killed = shown(&stub(&case, &["killed", stalled, "status 124"]));
     let own = shown(&stub(&case, &[stalled, "status 124"]));
     let first = finish(case.gate(&routed_words("killed.log", &killed, &[], &[r".\tool.exe", "out", "hi"])));

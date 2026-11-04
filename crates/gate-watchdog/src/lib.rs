@@ -16,5 +16,6 @@ pub use diagnostics::{JOB_LINES, OUTSIDE_LINES, ProcessFacts, Report, SampleFact
 pub use heartbeat::{BeatClock, CpuSource, Pump, Ticker, start_failed_line};
 pub use share::{Machine, SystemTimes, Ticks};
 pub use watch::{
-    Config, CpuMove, Kill, SSH_STALL_LINE, Sample, Watch, is_ssh_command, is_wsl_command, measure_cpu, sampler_failed_line, wsl_unavailable_line,
+    Config, CpuMove, Kill, SSH_STALL_LINE, Sample, ThreadKey, Watch, is_ssh_command, is_wsl_command, measure_cpu, sampler_failed_line,
+    wsl_unavailable_line,
 };

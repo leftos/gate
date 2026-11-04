@@ -2052,11 +2052,27 @@ All kept, with each knob's default unchanged:
 - The sampler (W1): every 5 s while the command runs, it reads, in order, the pause state, the bytes the command has written to its stdout and stderr (counted by the readers of its pipes), the job's pids, one process snapshot, then the WSL VM, the system times and the job's accounting; nothing goes through WMI.
 
   Each sample carries two stamps: `began`, taken before its reads, and `at`, taken after them, next to the system times and the job's accounting. The `interval`, the load-adjusted clock, the paused time, the free share and the exit use `at`; the PowerShell gate stamps once, before its reads.
-- Stall (W2): no output, no CPU (at least 1% of one core over the window), no new process in the job, no WSL VM CPU, no nested gate paused behind a critical request and no live nested gate in the job, for `--stall` seconds: `gate: STALLED: ...`.
+- Stall (W2): no output, no CPU (at least 1% of one core over the window), no new process in the job, no starved sample, no WSL VM CPU, no nested gate paused behind a critical request and no live nested gate in the job, for `--stall` seconds: `gate: STALLED: ...`.
 
   The quiet time runs from the last progress sample's `at` to the latest sample's `began`, not to the moment the watcher checks: a watcher starved of CPU wakes late, and the time it spends in its reads, and after them up to the check, is not the command's quiet time, so the next sample decides.
 
   A quiet command is therefore killed up to one sample period after its window, plus the read time of the last progress sample and of the latest sample, never before; the PowerShell gate measures to the check and can kill earlier. The ceiling and the backstop read the check's own time.
+
+  A starved command is not a quiet one (GATE-1092). A sample is starved when the same thread (same thread id, of the same process by pid and create time) of a job member, or of a recorded escaped process, is waiting for a processor (state Ready, Standby, Transition or DeferredReady, `proc_table::system_list::is_runnable`) at this sample and at the previous one, and the sample is not progress; one system process list is read per sample.
+
+  The first sample of a watch is never starved. A starved busy thread, waiting at every sample, counts; a hung process's brief timer wakes, caught waiting once, do not, and a hung process whose one timer thread is caught waiting twice running runs to its timeout instead of the stall window.
+
+  A starved sample stops the stall clock, without resetting it, from the later of the previous sample's `began` and the last progress to this sample's `began`. Quiet time is judged on that `began` timeline, so a command starved at every sample accrues no quiet time, even while the watcher's own reads are slow. Progress resets the starved total.
+
+  Job members and recorded escaped processes are matched to the system's process list by pid and create time, so a reused pid lends nothing. An escaped process whose CPU cannot be read still has its threads checked.
+
+  So a healthy command that Windows gives next to no processor is not judged stalled: a BelowNormal thread behind busier work gets about 0.3% of a core from the starvation boost, under the 1% floor. Idle, I/O-blocked and suspended commands have no thread waiting twice running and still stall; a command starved for good is ended by the ceiling or the backstop.
+
+  The floor, the free share, the load clock, the WSL rule and the box side are unchanged. A process in a job nested in the command's (Godot_console.exe starts Godot in one) is a member of the command's job, so its CPU counts and a kill ends it.
+
+  When the thread states cannot be read, the first such sample says once per watch `gate: thread states unavailable (<message>); retrying each sample, and until a read succeeds a command waiting for a processor counts as quiet`; every sample retries, and a failed sample is not starved.
+
+  A process whose threads cannot be read says once per watch `gate: cannot read the thread states of process <pid> (<message>); it is left out of the check for a thread waiting for a processor while they cannot be read, and the command's other processes are still checked`.
 
   Progress as the watchdog crate counts it resets the stall clock when the sum of the bytes the command wrote to its stdout and stderr changed (it only grows), the CPU of the job and of the processes outside it under its members (the escaped tree, below) since the last progress reached 1% of one core over the stall window together, a pid appeared in the job that the last sample did not have, a process outside it appeared that the last sample did not have (by pid and start), a nested gate is paused, or the job holds a live nested gate.
 
@@ -2214,7 +2230,9 @@ All kept, with each knob's default unchanged:
 
 The arithmetic (stall progress, the free share, the clock, the three kills and their lines, the box heartbeat) is a pure crate driven by samples and an injected clock; the Win32 layer takes the samples. The cores hint's average, peak, free cores and verdict are in it too. The kill lines are:
 
-- `gate: STALLED: no output and no CPU for <quiet> s (machine free <p>% on average); killed <command> and its children`, followed for an `ssh` command by the ssh line (W6a)
+- `gate: STALLED: no output and <c> s of CPU (under the <f> s floor) for <quiet> s not waiting for a processor (machine free <p>% on average); killed <command> and its children`, `<c>` the CPU of the job and of the escaped tree since the last progress and `<f>` the stall window over 100, both with two decimals.
+
+  `<quiet>` is the quiet time as judged, the starved stretches left out; `not waiting for a processor` reads `(thread states unread)` when the thread states could not be read during the window; followed for an `ssh` command by the ssh line (W6a)
 - `gate: TIMED OUT after <timeout> s of load-adjusted time (wall <wall> s, machine free <p>% on average); killed <command> and its children`
 - `gate: BACKSTOP: <wall> s of wall time (5 x <timeout> s ceiling, load-adjusted <adjusted> s, machine free <p>% on average); killed <command> and its children`, where the middle clause reads `machine load unknown: the sampler failed` after a sampler failure.
 
@@ -5939,6 +5957,8 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   `--test-key-waits <file>` (on `gate run` only) makes each take of that key that waits (the bounded wait for the outputs-from removal, and the nothing-back add's wait that a drain marker holds off) append one line `wait` to `<file>` as it begins, so a case counts the waits a passing build makes.
 
   Before it waits it writes the empty file `<file>.reached`, so a case can tell the gate is at the seam; when that cannot be written the gate says `gate: cannot write the seam's arrival <path>: <error>` and waits on. `--test-print-request` does not show the seam.
+
+  `--test-sample-trace <file>` (on `gate run` only) makes each sample of the local watch append one line `<at_ms> starved=<0|1> quiet_cpu_us=<n>` to `<file>`: the sample's `at` stamp in milliseconds of the watch, whether the sample was starved, and the command's CPU since the last progress in microseconds, so a case waits on samples, not on time. A file that cannot be written is said once per sample: `gate: cannot write <path>: <error>`. `--test-print-request` does not show it.
 
   `--test-remote-snapshot` (a switch, on `gate run` only) sends the run to the Rust remote client's snapshot alone ([The remote client](#routing)); `--test-print-request` shows it as `testSeams.remoteSnapshot`, after `gitDrainMs`.
 

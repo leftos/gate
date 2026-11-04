@@ -127,6 +127,12 @@ To hold a gate between its claim and its take, hold the case root's light slot b
 
 The suspend rig freezes a whole process and reads the process tree once per cycle: it cannot starve one thread of a gate, a case whose gate lives under one `-FreezeMs` is never frozen (use about 300 ms frozen, 20 ms running for a short case), and a child that lives less than one running burst is never frozen.
 
+To starve a gated BelowNormal command without loading the machine, pin it and a Normal-priority `gate burn --cores 1` to one logical processor (`ProcessorAffinity`), the burner started outside any gate; the suite does so with `pin_to_one_core_at_normal` in `suite/harness.rs`, and it holds under any load.
+
+A nested hard CPU cap was seen to let no thread wait twice running under load, so it does not starve a command reliably. Its thread reads `Ready` (waiting for a processor), which the suspend rig cannot produce: a suspended thread reads `Waiting Suspended`. A copy of gate.exe renamed (`spin.exe burn`) is a native spinner the watch does not take for a nested gate.
+
+Starvation's signature in a stall capture or a sample trace: the job's CPU still rising but under the floor, the machine at its free floor, and the command's threads `Ready`. A starved BelowNormal thread gets only Windows' starvation boost, about 0.3% of a core. A process in a nested job object (Godot_console.exe's, for one) is a member of the command's job: its CPU counts and a kill ends it.
+
 To starve one thread, drive the real `gate_win32` type from a scratch crate under `.tmp/` with an empty `[workspace]` table and `SuspendThread` the thread found by its name (`GetThreadDescription`, e.g. `job-memory`); GATE-812 was found that way.
 
 A stall case whose first output byte opens the window (`--test-stall-from-output`) must not need a later step inside the window: make the line the case reads the first byte, or write a pid with the silent `pid-to` step. To starve a stand-in without changing the job's process count, put a stand-in that implements the steps the case uses, with a delay, in place of `fake-tool.exe`, rather than a wrapper that runs the real one as a child.

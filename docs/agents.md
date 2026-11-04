@@ -133,7 +133,9 @@ A gated command carries no `nice`, priority class or other priority setting of i
 
 ## Stalls and exit codes
 
-**The stall window is 120 s** by default (`--stall <seconds>` sets it): a command with no output, no CPU use and no new process for that long is killed as STALLED, with its whole process tree. A test suite whose hang guards are about 2 minutes takes `--stall` well above its longest guard (300 for 2-minute guards), so a hung test fails with its own message instead.
+**The stall window is 120 s** by default (`--stall <seconds>` sets it): a command with no output, no CPU use, no new process and no thread caught waiting for a processor twice running for that long is killed as STALLED, with its whole process tree.
+
+A command the machine starves of CPU is not idle, so it is not stalled; one starved for good ends at the timeout. A test suite whose hang guards are about 2 minutes takes `--stall` well above its longest guard (300 for 2-minute guards), so a hung test fails with its own message instead.
 
 | Exit | Meaning |
 |---|---|
