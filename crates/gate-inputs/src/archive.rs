@@ -27,10 +27,10 @@ use crate::names::is_plain_path;
 
 /// The name of the archive's last member, the list of every path the archive brings back.
 pub const LIST_NAME: &str = ".gate-outputs.json";
-/// The most bytes the list member is read to.
-const LIST_LIMIT: u64 = 4 * 1024 * 1024;
-/// The most files an archive may hold: more than a list of `LIST_LIMIT` (4 MiB) bytes can name, each of its items
-/// taking at least 98 bytes.
+/// The most bytes the list member is read to: room for a list naming `MEMBER_LIMIT` files at typical path lengths, as
+/// a .NET build tree whose every output differs from the PC's brings back.
+const LIST_LIMIT: u64 = 32 * 1024 * 1024;
+/// The most files an archive may hold, members and copies together.
 pub const MEMBER_LIMIT: usize = 50_000;
 /// The most bytes one member may hold.
 pub const MEMBER_SIZE_LIMIT: u64 = 16 * 1024 * 1024 * 1024;
@@ -731,7 +731,8 @@ pub(crate) mod tests {
     use tar::{EntryType, Header};
 
     use super::{
-        CopyFrom, Entry, Item, LIST_NAME, LONG_NAME_LIMIT, Limits, MEMBER_LIMIT, Place, UnpackError, extract, list_json, member_path, read_members,
+        CopyFrom, Entry, Item, LIST_LIMIT, LIST_NAME, LONG_NAME_LIMIT, Limits, MEMBER_LIMIT, Place, UnpackError, extract, list_json, member_path,
+        read_list, read_members,
     };
     use crate::hash::sha256_of;
     use crate::manifest::{Held, HeldBy, Manifest, Stamp, Wrote};
@@ -1220,6 +1221,28 @@ pub(crate) mod tests {
         let members: Vec<Member<'_>> = names.iter().map(|name| (name.as_bytes(), EntryType::Regular, &b""[..])).collect();
         let error = read_members(&unlisted(&members)[..], LIMIT, MEMBER_LIMIT, &HeldBy::new(), |_, _, _| Ok(())).expect_err("too many files");
         assert_members(&error, &format!("the outputs archive holds more than {MEMBER_LIMIT} files"));
+    }
+
+    #[test]
+    fn a_list_past_four_mib_within_the_limit_is_read() {
+        let floor = 4 * 1024 * 1024 + 1024;
+        // Each item names a 94-byte path and a 64-digit SHA-256, so it takes more than 150 bytes.
+        let names: Vec<String> = (0..=floor / 150).map(|index| format!("out/{index:090}")).collect();
+        let entries: Vec<Entry> = names.iter().map(|name| entry(name, b"")).collect();
+        let items: Vec<Item> = names.iter().map(|name| member(name, b"")).collect();
+        let list = list_json(&items);
+        assert!(list.len() > floor, "the list is past 4 MiB + 1 KiB: {} bytes", list.len());
+        let members: Vec<Member<'_>> = names.iter().map(|name| (name.as_bytes(), EntryType::Regular, &b""[..])).collect();
+        let (result, memory) = extracted(&raw(&members, &entries), LIMIT);
+        assert_eq!(result.expect("the archive reads"), items, "every item reads back");
+        assert_eq!(memory.members.len(), names.len(), "every member is handed on");
+    }
+
+    #[test]
+    fn a_list_past_the_limit_is_refused_naming_it() {
+        let mut data = io::repeat(b' ').take(LIST_LIMIT + 1);
+        let error = read_list(&mut data, SystemTime::now()).expect_err("a list past the limit");
+        assert_members(&error, "the outputs archive's list is longer than 33554432 bytes");
     }
 
     #[test]

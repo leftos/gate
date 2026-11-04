@@ -5145,6 +5145,7 @@ The packer (`Packer`: `add` a member, `copy` an item with no member, `finish` th
   The rule is `is_plain_path` in `gate-inputs`'s `names`. The globs and the walk apply it too, so the box never packs such a name; the pack still refuses one (`the output '<path>' has a name the outputs archive's reader refuses`), a backstop the walk leaves unreachable.
 - A GNU long name over 4096 bytes, a listed path of more than 4096 bytes (`the outputs archive lists a path of more than 4096 bytes: '<first 200 chars>…'`), and any pax, `g`, `K` or `S` entry.
 - More than 50,000 files or folders.
+- A list member of more than 32 MiB (`the outputs archive's list is longer than 33554432 bytes`).
 - A member over the bytes left of the caller's limit (and over 16 GiB). Each copy counts against that limit by its listed size, and in the 50,000-file limit above.
 - Input as sent past the limit plus limit/64 plus 1 MiB, zstd's worst case for the limit, or a zstd window over 2^27.
 - A last write in base-256 form, before 1970 or more than a day ahead of the machine's clock; a copy's `modified` is held to the same day (`the outputs archive copy '<path>' has a last write <reason>`).
