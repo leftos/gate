@@ -579,13 +579,31 @@ fn a_parent_line_is_the_one_the_fixture_holds() {
 
 #[test]
 fn a_covered_line_carries_the_parent_pid_after_the_identity() {
-    let line = journal_line(&identity(), ts(NOW), &JournalEvent::Covered { parent_pid: 70000 }, None, None);
+    let covered = JournalEvent::Covered {
+        parent_pid: 70000,
+        routable: None,
+    };
+    let line = journal_line(&identity(), ts(NOW), &covered, None, None);
 
     assert_eq!(parsed(&line)["event"], "covered");
     assert_eq!(keys(&parsed(&line)), with_common(&["parentPid"]));
     assert_eq!(parsed(&line)["parentPid"], json!(70000));
-    let under_abandoned_lock = journal_line(&identity(), ts(NOW), &JournalEvent::Covered { parent_pid: 70000 }, None, Some(LOCK_NAME));
+    let under_abandoned_lock = journal_line(&identity(), ts(NOW), &covered, None, Some(LOCK_NAME));
     assert_eq!(own_keys(&under_abandoned_lock), ["parentPid", "abandoned"]);
+}
+
+#[test]
+fn a_covered_line_names_the_routing_pattern_it_matches_after_the_parent_pid() {
+    let covered = JournalEvent::Covered {
+        parent_pid: 70000,
+        routable: Some("dotnet format *".into()),
+    };
+    let line = journal_line(&identity(), ts(NOW), &covered, None, None);
+
+    assert_eq!(keys(&parsed(&line)), with_common(&["parentPid", "routable"]));
+    assert!(line.contains(r#""parentPid":70000,"routable":"dotnet format *""#), "{line}");
+    let under_abandoned_lock = journal_line(&identity(), ts(NOW), &covered, None, Some(LOCK_NAME));
+    assert_eq!(own_keys(&under_abandoned_lock), ["parentPid", "routable", "abandoned"]);
 }
 
 #[test]

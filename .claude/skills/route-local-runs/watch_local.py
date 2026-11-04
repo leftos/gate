@@ -676,6 +676,49 @@ def reason_of(event: dict[str, Any]) -> str:
     return token
 
 
+ROUTABLE_UNDER_PARENT = "routable under parent"
+
+Routable = dict[int, list[tuple[datetime, str]]]
+
+
+def routable_index(events: list[dict[str, Any]]) -> Routable:
+    """The ``covered`` lines naming a routing pattern their command matches, by parent pid.
+
+    Each parent pid maps to the lines' times and patterns, in the order they were read.
+    """
+    index: Routable = {}
+    for event in events:
+        if event.get("event") != "covered":
+            continue
+        pattern = event.get("routable")
+        parent = event.get("parentPid")
+        moment = census.parse_time(event.get("time"))
+        if not isinstance(pattern, str) or not pattern or moment is None:
+            continue
+        if not isinstance(parent, int) or isinstance(parent, bool):
+            continue
+        index.setdefault(parent, []).append((moment, pattern))
+    return index
+
+
+def routable_inside(event: dict[str, Any], routable: Routable) -> list[str]:
+    """The distinct routing patterns a release's covered gates matched, first seen first.
+
+    A covered line counts when it names the run's pid and falls between the run's start
+    (``started_at``) and its release, which guards against pid reuse.
+    """
+    pid = event.get("pid")
+    start = started_at(event)
+    end = census.parse_time(event.get("time"))
+    if not isinstance(pid, int) or isinstance(pid, bool) or start is None or end is None:
+        return []
+    patterns: list[str] = []
+    for moment, pattern in routable.get(pid, []):
+        if start <= moment <= end and pattern not in patterns:
+            patterns.append(pattern)
+    return patterns
+
+
 def fell_back(event: dict[str, Any]) -> str:
     """A run's fallback reasons joined by ``; ``; empty when it has none."""
     reasons = event.get("fellBack")
@@ -708,18 +751,27 @@ def block_of(
     *,
     patterns: dict[str, list[str]],
     counter: Counter[tuple[str, str]],
+    routable: Routable,
     ask: Ask,
     state: dict[str, Any],
 ) -> list[str]:
-    """One shape's report block: its line, then its shape, nearest and differs lines."""
+    """One shape's report block: its line, then its shape, nearest and differs lines.
+
+    When the latest run's covered gates matched routing patterns, a ``routable inside``
+    line follows, and a run that says no reason of its own reads ``routable under parent``.
+    """
     own = patterns_for(patterns, group.repo)
     latest = group.latest
+    inside = routable_inside(latest.event, routable)
+    reason = reason_of(latest.event)
+    if inside and reason == "none":
+        reason = ROUTABLE_UNDER_PARENT
     facts = [
         f"runs={len(group.runs)}",
         f"seconds={group.seconds}",
         f"matched={match_state(latest.event, group.repo, ask)}",
         f"routed={routed_count(counter, group)}",
-        f"reason={reason_of(latest.event)}",
+        f"reason={reason}",
     ]
     fallbacks = fell_back(latest.event)
     if fallbacks:
@@ -733,6 +785,8 @@ def block_of(
         changes = differs(nearest, group.shape)
         if changes:
             lines.append(f"  differs: {' '.join(changes)}")
+    if inside:
+        lines.append(f"  routable inside: {', '.join(inside)}")
     return lines
 
 
@@ -756,11 +810,13 @@ def report(options: Options, view: View, cursor: datetime) -> list[str]:
     pending = pending_of(view.groups, state)
     patterns = load_patterns(options.remote) if pending else {}
     counter = routed_counter(view.events) if pending else Counter()
+    routable = routable_index(view.events) if pending else {}
     blocks = {
         group.id: block_of(
             group,
             patterns=patterns,
             counter=counter,
+            routable=routable,
             ask=options.ask,
             state=state,
         )

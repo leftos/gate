@@ -2095,7 +2095,7 @@ fn a_dotnet_command_naming_a_folder_with_a_tracked_project_still_routes() {
 
 /// Makes the case's folder `sub` a repository of its own holding a committed `A.csproj`, added to the case's index as
 /// a submodule's entry, which `git check-ignore` refuses to judge a path in.
-fn with_submodule(case: &Case) {
+pub(crate) fn with_submodule(case: &Case) {
     let sub = case.folder().join("sub");
     git(case, &["init", "--quiet", "sub"]);
     fs::write(sub.join("A.csproj"), "<Project />\n").expect("the file can be written");

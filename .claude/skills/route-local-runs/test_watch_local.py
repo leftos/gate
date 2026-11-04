@@ -55,6 +55,22 @@ def release(
     return event
 
 
+def covered_line(parent_pid: int, at: datetime, routable: str) -> dict[str, object]:
+    """A ``covered`` line of a light gate under ``parent_pid`` naming the routing pattern ``routable``."""
+    return {
+        "v": 1,
+        "time": stamp(at),
+        "event": "covered",
+        "pid": 9000 + next(SEQUENCE),
+        "processStart": stamp(at - timedelta(seconds=1)),
+        "kind": "light",
+        "cwd": WT,
+        "command": routable,
+        "parentPid": parent_pid,
+        "routable": routable,
+    }
+
+
 class Clock:
     """A clock whose sleep advances its own time."""
 
@@ -332,6 +348,56 @@ class ReportTests(Case):
         status, text = self.scan(ask=lambda repo, words: False)
         self.assertEqual(status, 0)
         self.assertIn("reason=none", text)
+
+    def test_a_parent_whose_covered_gates_would_route_says_so(self) -> None:
+        self.write_events(
+            covered_line(7, START - timedelta(seconds=90), "dotnet csharpier *"),
+            covered_line(7, START - timedelta(seconds=60), "dotnet format *"),
+            covered_line(7, START - timedelta(seconds=30), "dotnet csharpier *"),
+            release(
+                7, START, sent_words="pwsh career.ps1 format", notRouted="no pattern"
+            ),
+        )
+        status, text = self.scan(ask=lambda repo, words: False)
+        self.assertEqual(status, 0)
+        self.assertIn("reason=routable under parent", text)
+        self.assertIn(
+            "\n  routable inside: dotnet csharpier *, dotnet format *", text
+        )
+
+    def test_a_covered_line_outside_the_parents_run_is_not_its(self) -> None:
+        self.write_events(
+            covered_line(7, START + timedelta(minutes=1), "dotnet format *"),
+            covered_line(7, START - timedelta(minutes=10), "dotnet format *"),
+            release(
+                7,
+                START,
+                sent_words="pwsh career.ps1 format",
+                notRouted="no pattern",
+                processStart=stamp(START - timedelta(minutes=2)),
+            ),
+        )
+        status, text = self.scan(ask=lambda repo, words: False)
+        self.assertEqual(status, 0)
+        self.assertIn("reason=none", text)
+        self.assertNotIn("routable", text)
+
+    def test_a_parent_with_its_own_reason_keeps_it_and_names_the_routable_child(
+        self,
+    ) -> None:
+        self.write_events(
+            covered_line(7, START - timedelta(seconds=30), "dotnet format *"),
+            release(
+                7,
+                START,
+                sent_words="pwsh career.ps1 format",
+                notRouted="declared local",
+            ),
+        )
+        status, text = self.scan(ask=lambda repo, words: False)
+        self.assertEqual(status, 0)
+        self.assertIn("reason=declared local", text)
+        self.assertIn("\n  routable inside: dotnet format *", text)
 
     def test_a_repo_with_no_patterns_has_no_nearest(self) -> None:
         self.write_events(release(1, START))

@@ -567,6 +567,17 @@ fn a_lent_gate_whose_desktop_command_runs_on_this_pc_says_so() {
     assert!(lent_gate.stderr.contains(UNDER_PARENT_LINE), "{lent_gate:?}");
     let lent_pid = lent_to(&case, process::id());
     assert_eq!(events_of(&case, lent_pid), ["parent"], "lent before it queued, it journals no queue");
+    let routable = finish(marked(
+        &case,
+        &heavy_words("routable.log", &extra, &[r".\tool.exe", "out", "hi"]),
+        &marker,
+    ));
+    assert_passed(&routable);
+    assert!(routable.stderr.contains(&lent(process::id())), "{routable:?}");
+    assert!(
+        !routable.stderr.contains("matches routing pattern"),
+        "a lent gate whose command matches the routing pattern says nothing of it: {routable:?}"
+    );
     let_go(&go);
     assert_passed(&critical.finish());
     assert_passed(&held.finish());

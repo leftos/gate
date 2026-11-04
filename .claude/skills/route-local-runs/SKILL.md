@@ -23,6 +23,8 @@ It exits 0 with a report when something is pending, and 1 after 8 hours with not
 
 Read the report largest first. In it, `seconds` sums the shape's runs in this report; `routed` counts this repo's routed runs of the same family; `matched` is what the gate reports: `yes` (a pattern matched at the run and it stayed here anyway), `since` (the gate matched no pattern at the run and one matches its words now) or `no` (none matches them, or the gate gave the run no words).
 
+`reason=` is the gate's own `notRouted` token (`none` when it gave none), or `routable under parent` when a run that gave none is a gate whose command ran gates of its own under it that said they match routing patterns; a `routable inside:` line then names those patterns, and it follows any run whose command ran such gates.
+
 Take the first row that holds, then record the decision with `watch_local.py mark <id>... --verdict routed|local|booked --note "<why>"`, which takes several ids.
 
 | # | The report shows | Decision |
@@ -30,9 +32,10 @@ Take the first row that holds, then record the decision with `watch_local.py mar
 | 1 | `STILL-LOCAL-AFTER-FIX` | The fix did not take. Find why, book it, mark `booked`. |
 | 2 | `matched=since` | Covered now. Mark `routed`, note `pattern added since`. |
 | 3 | `fellBack=` | A route failed and fell back. Book it with the reason, mark `booked`. `fellBack=push` with `promisor remote` in the run's log is a partial clone missing objects, not a down builder: the run's repo can run `git backfill`, or the gate now routes it without history refs. |
-| 4 | `reason=declared local` | The repo keeps it here in `.gate/local.toml`. Mark `local`, its reason there as the note. |
+| 4 | `reason=declared local` | The repo keeps it here in `.gate/local.toml`. Mark `local`, its reason there as the note. When the block also has a `routable inside:` line, book the caller as in row 5r too (mark `booked`). |
 | 5 | `reason=--local: <text>` where the text names something no work can move off this PC | Mark `local`, the reason as the note. |
 | 4a | `reason=gitignored folder` | The run's folder is gitignored, so the snapshot cannot send it: scratch work. Mark `local`, note `gitignored folder`. |
+| 5r | `reason=routable under parent` | A caller wrapped a command that gates its own steps in an outer gate, and those steps match routing patterns: the caller should run it bare. Inbox request to the caller repo naming the family and the `routable inside:` patterns; mark `booked`. |
 | 5a | `reason=` any other value: `--local` with a removable reason, `sibling absent`, `gitignored input`, `another worktree`, `nothing sent`, `outside path`, `built here` | The gate said why it stayed. Book that cause, mark `booked`. |
 | 5b | `matched=yes` and `reason=none` | A matching command stayed here with no reason given. Book it, mark `booked`. |
 | 6 | The command drives this PC's own state: a window, a GPU session, an install into this PC's folders, a rig or measurement of its own processes, a build whose exes are started on this PC by a repo with no `outputs` for them | Mark `local`, the reason as the note. |

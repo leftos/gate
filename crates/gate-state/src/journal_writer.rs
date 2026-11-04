@@ -150,6 +150,9 @@ pub enum JournalEvent {
     Covered {
         /// The parent gate's process id.
         parent_pid: u32,
+        /// The first routing pattern of its repo the gate's command matches, when it says it would route without its
+        /// parent gate (`routable`, written after `parentPid` only when there is one).
+        routable: Option<String>,
     },
     /// The gate runs on the slot of a parent gate that lends it while a critical request drains, taking no slot of its
     /// own.
@@ -648,7 +651,13 @@ fn insert_own_fields(line: &mut Map<String, Value>, event: &JournalEvent) {
         JournalEvent::Fallback { reason } => {
             line.insert("reason".to_owned(), Value::from(reason.as_str()));
         }
-        JournalEvent::Covered { parent_pid } | JournalEvent::Parent { parent_pid } => {
+        JournalEvent::Covered { parent_pid, routable } => {
+            line.insert("parentPid".to_owned(), Value::from(*parent_pid));
+            if let Some(routable) = routable {
+                line.insert("routable".to_owned(), Value::from(routable.as_str()));
+            }
+        }
+        JournalEvent::Parent { parent_pid } => {
             line.insert("parentPid".to_owned(), Value::from(*parent_pid));
         }
     }

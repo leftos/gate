@@ -2151,6 +2151,20 @@ fn a_run_lists_an_abandoned_journal_mutex_from_its_covered_line() {
     assert_eq!(history.runs[0].abandoned, [journal], "the run's covered line names the abandoned mutex");
 }
 
+#[test]
+fn a_covered_line_naming_the_routing_pattern_it_matches_is_a_covered_run() {
+    let gate = Gate::new(1, START, COMMAND);
+    let lines = vec![gate.line("covered", &ago(5), json!({"parentPid": 9, "routable": "dotnet format *"}))];
+
+    let history = history_of("a_covered_line_naming_the_routing_pattern_it_matches_is_a_covered_run", &lines);
+
+    assert_eq!(
+        (history.runs.len(), history.runs[0].state, history.runs[0].parent_pid),
+        (1, RunState::Covered, Some(9)),
+        "the routable field is read past"
+    );
+}
+
 /// A hand-written v1 journal: a light gate (56000) whose slot is lent to 55000 before it queued, a critical gate (52000)
 /// whose take carries its snapshot and under which 54000 runs covered, and a critical gate (52100) whose snapshot failed.
 const V1_JOURNAL: &str = include_str!("fixtures/v1-journal.jsonl");

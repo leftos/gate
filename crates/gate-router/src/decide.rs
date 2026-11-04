@@ -1,6 +1,6 @@
 //! The routing decision: whether a gate's command runs on the builder and, when it does, the words, folder, key and
 //! outputs of that run. The rules apply in order, and each fact is asked of the caller ([`Facts`]) only at the rule
-//! that needs it: a critical or no-slot gate, `--local` or a covering parent read no routing file, and a machine with
+//! that needs it: a critical or no-slot gate, `--local` or a box run read no routing file, and a machine with
 //! no routing file costs no git call. A heavy and a light gate route alike, except that a light one stays here when its
 //! learned local run time proves it faster here ([`balance::faster_here`]).
 
@@ -218,8 +218,11 @@ pub enum Slot {
 pub enum Nested {
     /// Nothing: the gate takes its own slot.
     None,
-    /// A covering or lending parent slot holds the gate, which then runs on the parent's slot.
+    /// A covering parent slot holds the gate, which then runs on the parent's slot.
     Covering,
+    /// A light parent lends its slot while a critical request drains: the gate runs here on it, decided as a covered
+    /// gate but by the desktop check alone ([`desktop_under_parent`]), saying only a desktop line.
+    Lent,
     /// The gate runs inside a box run on a builder, which keeps it here saying nothing, whatever its command.
     BoxRun,
 }
@@ -316,8 +319,9 @@ pub enum FolderSends {
 /// The facts the decision asks the caller for, each only when a rule needs it.
 pub trait Facts {
     /// The routing file, read and given to [`Config::parse`]: `Ok(None)` when there is no such file. Asked only of a
-    /// heavy or light gate outside a box run without `--local`; of one under a covering or lending parent only for its
-    /// desktop consent ([`covered_here`]).
+    /// heavy or light gate outside a box run without `--local`; of one under a covering parent for its desktop consent
+    /// and then by its uncovered decision ([`covered_here`]), and of one under a lending parent only for its desktop
+    /// consent ([`desktop_under_parent`]).
     ///
     /// # Errors
     ///
@@ -448,8 +452,9 @@ pub trait Facts {
 
     /// The folder names the worktree root's `.gate/siblings.toml` declares, read from disk as it stands; none when
     /// there is no such file. Asked only once the routing file lists the repo, before the words are rewritten; of a gate
-    /// under a covering or lending parent only when the routing file routes its repo and allows it a desktop pattern
-    /// ([`covered_here`]).
+    /// under a covering parent as its uncovered decision asks it ([`covered_here`]), after the desktop check has, and of
+    /// one under a lending parent only when the routing file routes its repo and allows it a desktop pattern
+    /// ([`desktop_under_parent`]).
     ///
     /// # Errors
     ///
@@ -459,8 +464,10 @@ pub trait Facts {
 
     /// The patterns the worktree root's `.gate/desktop.toml` declares, of each desktop mode, read from disk as it
     /// stands; none when there is no such file. Asked only of a command one of its repo's patterns matched, once its
-    /// siblings pass their checks; of a gate under a covering or lending parent only when the routing file routes its
-    /// repo and allows it a desktop pattern, and its rewritten command does not stay on this PC ([`covered_here`]).
+    /// siblings pass their checks; of a gate under a covering or lending parent by the desktop check only when the
+    /// routing file routes its repo and allows it a desktop pattern, and its rewritten command does not stay on this PC
+    /// ([`desktop_under_parent`]); of one under a covering parent also as its uncovered decision asks it
+    /// ([`covered_here`]).
     ///
     /// # Errors
     ///
@@ -746,8 +753,11 @@ pub enum LocalReason {
     /// or its solution as named.
     BuiltHere { project: String },
     /// A gate a parent gate's slot covers runs here with its parent, though its command matches `pattern`, the first
-    /// declared desktop pattern it matches that `remote.json` allows the repo ([`covered_here`]).
+    /// declared desktop pattern it matches that `remote.json` allows the repo ([`desktop_under_parent`]).
     DesktopUnderParent { pattern: String },
+    /// A gate a parent gate's slot covers runs here with its parent, though its command matches `pattern`, the first
+    /// routing pattern of its repo its rewritten words match ([`covered_here`]).
+    RoutableUnderParent { pattern: String },
 }
 
 impl LocalReason {
@@ -757,7 +767,7 @@ impl LocalReason {
     pub fn line(&self) -> String {
         match self {
             Self::Ignored { path, reason } => ignored_line(path, reason),
-            Self::DesktopUnderParent { .. } => format!("gate: {}", self.reason()),
+            Self::DesktopUnderParent { .. } | Self::RoutableUnderParent { .. } => format!("gate: {}", self.reason()),
             _ => format!("gate: not routed: {}", self.reason()),
         }
     }
@@ -802,6 +812,11 @@ impl LocalReason {
             Self::BuiltHere { project } => format!("the last build of {} ran here; --no-build kept", escaped(project)),
             Self::DesktopUnderParent { pattern } => format!(
                 "a desktop command runs on this PC because its parent gate runs here (desktop pattern '{}')",
+                escaped(pattern)
+            ),
+            Self::RoutableUnderParent { pattern } => format!(
+                "this command matches routing pattern '{}' but runs on this PC because its parent gate runs here; run the \
+                 outer command without a gate around it to route this one",
                 escaped(pattern)
             ),
             Self::SiblingRefused { name, reason } => format!("sibling {name} {reason}"),
@@ -1553,14 +1568,16 @@ fn eligible(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Config, Here> {
 
 /// The routing file when the gate may route at all, read only after the slot, parent and `--local` checks: what a
 /// commit stage is judged under ([`commit_stage`]) before the rules of [`routable`]. A gate inside a box run stays here
-/// saying nothing, and one a parent's slot covers stays here saying only what [`covered_here`] says.
+/// saying nothing, one a parent's slot covers stays here saying only what [`covered_here`] says, and one a light parent
+/// lends its slot stays here saying only what the desktop check ([`desktop_under_parent`]) says.
 fn configured(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Config, Here> {
     if !routes_on(inputs.slot) {
         return Err(None);
     }
     match inputs.parent {
         Nested::BoxRun => return Err(None),
-        Nested::Covering => return Err(if inputs.local { None } else { covered_here(inputs.words, facts) }),
+        Nested::Covering => return Err(if inputs.local { None } else { covered_here(inputs, facts) }),
+        Nested::Lent => return Err(if inputs.local { None } else { desktop_under_parent(inputs.words, facts) }),
         Nested::None => {}
     }
     if inputs.local {
@@ -1572,7 +1589,32 @@ fn configured(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Config, Here> {
         .ok_or(None)
 }
 
-/// Why a gate a parent's slot covers runs here with its parent: [`LocalReason::DesktopUnderParent`] when its `words`,
+/// Why a gate a parent's slot covers runs here with its parent: the desktop check ([`desktop_under_parent`]) first,
+/// then, only when it says nothing, the routable check: [`LocalReason::RoutableUnderParent`] with the run's pattern
+/// when the uncovered decision of the same inputs ([`decide`] under [`Nested::None`]) routes the run as no desktop
+/// run, else nothing said. That decision reads what an uncovered gate's would. A command that stays on this PC
+/// ([`stays_local`]), as a routed run's does, reads nothing.
+fn covered_here(inputs: &Inputs<'_>, facts: &dyn Facts) -> Here {
+    if stays_local(inputs.words) {
+        return None;
+    }
+    if let Some(reason) = desktop_under_parent(inputs.words, facts) {
+        return Some(reason);
+    }
+    // A pinned or `--desktop hidden` covered gate was refused before `configured`, so neither is set here.
+    let uncovered = Inputs {
+        parent: Nested::None,
+        ..*inputs
+    };
+    match decide(&uncovered, facts) {
+        Route::Routed(run) if run.desktop.is_none() => Some(LocalReason::RoutableUnderParent {
+            pattern: run.pattern.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// The desktop check of a gate a parent's slot covers or lends: [`LocalReason::DesktopUnderParent`] when its `words`,
 /// rewritten as a routed run's are ([`opened_and_sent`]), match a declared desktop pattern ([`desktop_pattern`]) that
 /// `remote.json` allows its repo ([`desktop_consent`]); else nothing said. The facts are read cheapest first and the
 /// first that rules the line out ends the check: a command that stays on this PC ([`stays_local`]), as a routed run's
@@ -1580,7 +1622,7 @@ fn configured(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Config, Here> {
 /// whether its repo is routed and allowed one, the worktree's siblings file and the rewrite, and only then its
 /// `.gate/desktop.toml`. A routing file, place, worktree or desktop file that cannot be read or used says nothing
 /// either: the gate runs here with its parent whatever they hold.
-fn covered_here(words: &[String], facts: &dyn Facts) -> Here {
+fn desktop_under_parent(words: &[String], facts: &dyn Facts) -> Here {
     if stays_local(words) {
         return None;
     }

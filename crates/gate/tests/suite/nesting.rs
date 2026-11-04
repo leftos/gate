@@ -21,11 +21,15 @@ use jiff::Timestamp;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::routing::{UNDER_PARENT_LINE, declare_desktop, heavy_words_with_limit, routed_case};
+use crate::routing::{HOST, UNDER_PARENT_LINE, declare_desktop, heavy_words_with_limit, repo, routed_case, with_submodule};
 use crate::support::{
     Case, Escapee, FAKE_TOOL, GATE, Outcome, POLL, Running, assert_in_order, critical_words, events, events_of, finish, heavy_words, log_texts,
-    none_words, run_words, said_pid, shown, start, take_of, tool, wait_for_file, wait_for_journal_line, wait_until, write_counts,
+    none_words, run_words, said_pid, shown, start, take_of, tool, wait_for_file, wait_for_journal_line, wait_until, write_counts, write_remote_json,
 };
+
+/// The line a covered gate says when its command matches the routing pattern `*tool*`.
+const ROUTABLE_UNDER_PARENT_LINE: &str = "gate: this command matches routing pattern '*tool*' but runs on this PC because its parent gate \
+                                          runs here; run the outer command without a gate around it to route this one\n";
 
 /// A heavy pool of one slot.
 const ONE_HEAVY: &str = r#"{"v":1,"heavy":1}"#;
@@ -200,10 +204,56 @@ fn a_covered_gate_whose_desktop_command_runs_on_this_pc_says_so() {
         !other.stderr.contains("desktop pattern"),
         "a command matching no desktop pattern says nothing of it: {other:?}"
     );
+    assert!(
+        other.stderr.contains(ROUTABLE_UNDER_PARENT_LINE),
+        "a command matching the repo's routing pattern says it would route: {other:?}"
+    );
     assert_eq!(
         sequence(&case).iter().filter(|(event, _)| event == "covered").count(),
         2,
         "both ran covered, here"
+    );
+}
+
+#[test]
+fn a_covered_gate_whose_command_would_route_says_so_and_journals_it() {
+    let case = routed_case("nesting-routable-under-parent");
+    let routing = serde_json::json!({ "host": HOST, "repos": { repo(&case): ["*tool*"] } });
+    write_remote_json(&case, &routing.to_string());
+    let marker = test_marker(&case, "heavy");
+    let routable = finish(marked(
+        &case,
+        &heavy_words_with_limit("routable.log", &[], &[r".\tool.exe", "out", "hi"]),
+        &marker,
+    ));
+
+    assert_passed(&routable);
+    assert!(routable.stdout.contains("hi"), "{routable:?}");
+    assert!(routable.stderr.contains(ROUTABLE_UNDER_PARENT_LINE), "{routable:?}");
+    assert!(
+        log_texts(&case.folder().join("routable.log")).contains(ROUTABLE_UNDER_PARENT_LINE),
+        "the log holds the line too"
+    );
+    assert_eq!(covered(&case)["routable"], "*tool*", "the covered line names the pattern");
+}
+
+#[test]
+fn a_covered_gate_logs_none_of_its_decision_s_notes() {
+    let case = routed_case("nesting-covered-no-notes");
+    with_submodule(&case);
+    let marker = test_marker(&case, "heavy");
+    let routable = finish(marked(
+        &case,
+        &heavy_words_with_limit("noted.log", &[], &[r".\tool.exe", "out", "sub/A.csproj"]),
+        &marker,
+    ));
+
+    assert_passed(&routable);
+    let log = log_texts(&case.folder().join("noted.log"));
+    assert!(log.contains("gate: this command matches routing pattern '*tool*'"), "{log}");
+    assert!(
+        !log.contains("cannot tell which words are gitignored") && !routable.stderr.contains("cannot tell which words are gitignored"),
+        "a covered gate says only its one line of the decision: {log}"
     );
 }
 

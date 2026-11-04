@@ -221,7 +221,7 @@ mod tests {
     fn only_a_take_naming_the_parent_at_or_after_its_start_counts() {
         let since = at("2026-10-11T10:00:00Z");
         let named = take("2026-10-11T10:00:00.0000000Z", r#","parentPid":42"#);
-        let rows: [(&str, String, bool); 6] = [
+        let rows: [(&str, String, bool); 7] = [
             ("a take naming the parent at its start", named.clone(), true),
             (
                 "a take naming another gate",
@@ -237,6 +237,11 @@ mod tests {
             (
                 "a covered line naming the parent",
                 r#"{"v":1,"time":"2026-10-11T10:00:01.0000000Z","event":"covered","pid":9,"parentPid":42}"#.to_owned(),
+                false,
+            ),
+            (
+                "a covered line naming the parent and the routing pattern it matches",
+                r#"{"v":1,"time":"2026-10-11T10:00:01.0000000Z","event":"covered","pid":9,"parentPid":42,"routable":"dotnet format *"}"#.to_owned(),
                 false,
             ),
             ("a torn line", named[..named.len() - 2].to_owned(), false),

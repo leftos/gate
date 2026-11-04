@@ -2045,7 +2045,7 @@ impl<'a> Run<'a> {
             if let Some(line) = self.nesting.line(self.request.slot, self.request.spelling) {
                 console.err(&line);
             }
-            self.cover(parent.pid, console);
+            self.cover(parent.pid, None, console);
         }
     }
 }
@@ -2086,8 +2086,9 @@ fn prepare_log(log: &Log, console: &mut Console) -> Result<(), u32> {
 impl Run<'_> {
     /// Decides where the command runs, and sets the remote tag of a routed run. A gate a parent's slot covers runs
     /// here, as does one whose light parent lends it its slot before it queues, while a critical request drains, which
-    /// is not routed ([`Run::on_parent`]) but is decided as a covered gate, so a desktop command says it runs here
-    /// ([`gate_router::LocalReason::DesktopUnderParent`]); a run pinned with `--builder` or given `--desktop hidden`
+    /// is not routed ([`Run::on_parent`]) but is decided as a lent gate ([`Nested::Lent`]), so a desktop command says it
+    /// runs here ([`gate_router::LocalReason::DesktopUnderParent`]); a covered gate also says a routable one does
+    /// ([`gate_router::LocalReason::RoutableUnderParent`]); a run pinned with `--builder` or given `--desktop hidden`
     /// asks for no lend, so it is decided as itself whatever a critical request is doing. The route, and what the
     /// decision learnt of the gate's place in its worktree. The hash of the warm-up file the route asks the builder's
     /// work folder to be warm with is kept for the call. `given` holds the words as the caller wrote them for a run
@@ -2095,7 +2096,7 @@ impl Run<'_> {
     fn route(&mut self, environment: &Environment, given: Option<&[String]>, console: &mut Console) -> (Route, Placed) {
         if self.request.builder.is_none() && !self.request.desktop_hidden && self.lend_before_queue(console) {
             self.lent = true;
-            let decided = route::route(self.request, environment, (Nested::Covering, given), (self.root, &self.gate), console);
+            let decided = route::route(self.request, environment, (Nested::Lent, given), (self.root, &self.gate), console);
             assert!(
                 matches!(decided.route, Route::Local { .. }),
                 "a covered gate's decision keeps it here: {:?}",
@@ -2303,7 +2304,13 @@ impl Run<'_> {
             self.queued_at = Some(Instant::now());
         }
         if let Some(parent) = self.nesting.covering() {
-            self.cover(parent.pid, console);
+            let routable = match route {
+                Route::Local {
+                    reason: Some(gate_router::LocalReason::RoutableUnderParent { pattern }),
+                } => Some(pattern.clone()),
+                _ => None,
+            };
+            self.cover(parent.pid, routable, console);
             return;
         }
         let sent = self.sent.take();
@@ -2320,10 +2327,12 @@ impl Run<'_> {
         self.journal.write(&event, self.tag.as_ref(), console);
     }
 
-    /// Journals `covered` with the pid of the parent gate `parent_pid` whose slot covers the run, then writes its covered
-    /// marker ([`Covered`]).
-    fn cover(&mut self, parent_pid: u32, console: &mut Console) {
-        self.journal.write(&JournalEvent::Covered { parent_pid }, self.tag.as_ref(), console);
+    /// Journals `covered` with the pid of the parent gate `parent_pid` whose slot covers the run and, when its command
+    /// would route without that parent ([`gate_router::LocalReason::RoutableUnderParent`]), the `routable` pattern it
+    /// matches, then writes its covered marker ([`Covered`]).
+    fn cover(&mut self, parent_pid: u32, routable: Option<String>, console: &mut Console) {
+        self.journal
+            .write(&JournalEvent::Covered { parent_pid, routable }, self.tag.as_ref(), console);
         self.covered = Some(Covered::write(&self.root.path, &self.gate, parent_pid, console));
     }
 

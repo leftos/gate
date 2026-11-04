@@ -221,7 +221,8 @@ impl Decision {
 /// the names the repo's declared prefixes start among them, after them. A command that would route but has a word that
 /// is not valid Unicode runs here, saying so, but for a desktop run, which is refused ([`PinRefusal::DesktopNotHere`]).
 /// A gate a parent's slot covers ([`Nested::Covering`]) runs here, saying only that a desktop command runs here with
-/// its parent ([`LocalReason::DesktopUnderParent`]), and a gate inside a box run ([`Nested::BoxRun`]) says nothing. A
+/// its parent ([`LocalReason::DesktopUnderParent`]) or that a routable one does
+/// ([`LocalReason::RoutableUnderParent`]), and a gate inside a box run ([`Nested::BoxRun`]) says nothing. A
 /// run that dropped its `--no-build` before its decision names the words the caller wrote as `given`, which the repo's
 /// `.gate/local.toml` is matched against too ([`Inputs::given`]). With the route, what the decision learnt of the
 /// gate's place in its git worktree, and, for a routed run of a repo whose warm-up is set up, the hash of its warm-up
@@ -271,7 +272,9 @@ pub(crate) fn route(
     };
     // A refused pin never readies its log, so the notes it would have written there are said now.
     let refused = matches!(route, Route::Refused(_));
-    for line in machine.unsaid_notes() {
+    // A gate under a parent says only its one line of the decision, never its notes.
+    let notes = if parent == Nested::None { machine.unsaid_notes() } else { Vec::new() };
+    for line in notes {
         if refused {
             console.err(&line);
         } else {
@@ -571,17 +574,21 @@ fn consented_hash(remote: &RemoteRun, machine: &Machine<'_>) -> Option<String> {
 ///   ([`LocalReason::GitignoredPastCap`], [`LocalReason::GitignoredUnsent`]);
 /// - `built here`: a `--no-build` run whose last build ran here and cannot be sent ([`LocalReason::BuiltHere`]).
 ///
-/// An unusable routing file ([`LocalReason::Ignored`]) and a desktop command under a parent gate
-/// ([`LocalReason::DesktopUnderParent`]) write none. A run kept here for no reason it says writes `no pattern` when its
-/// decision found that `sent` matched no pattern of its repo; any other writes none.
+/// An unusable routing file ([`LocalReason::Ignored`]), a desktop command under a parent gate
+/// ([`LocalReason::DesktopUnderParent`]) and a routable command under one ([`LocalReason::RoutableUnderParent`]) write
+/// none. A run kept here for no reason it says writes `no pattern` when its decision found that `sent` matched no
+/// pattern of its repo; any other writes none.
 pub(crate) fn not_routed(route: &Route, sent: Option<&Sent>) -> Option<String> {
     let token = match route {
         Route::Local { reason: Some(reason) } => match reason {
             LocalReason::LocalFlag => LOCAL_FLAG,
             LocalReason::FasterHere { .. } => FASTER_HERE,
             // Ignored: said on every run's line; a machine-wide fault, not a reason of the run's shape.
-            // DesktopUnderParent: a covered gate writes the `covered` line, never a queue line with `notRouted`.
-            LocalReason::Ignored { .. } | LocalReason::DesktopUnderParent { .. } => return None,
+            // DesktopUnderParent, RoutableUnderParent: a covered gate writes the `covered` line, never a queue line with
+            // `notRouted`.
+            LocalReason::Ignored { .. } | LocalReason::DesktopUnderParent { .. } | LocalReason::RoutableUnderParent { .. } => {
+                return None;
+            }
             LocalReason::Outside { .. } => OUTSIDE_PATH,
             LocalReason::OtherWorktree { .. } => ANOTHER_WORKTREE,
             LocalReason::NothingSent { ignored: false, .. } => NOTHING_SENT,
@@ -4788,6 +4795,7 @@ mod tests {
             (LocalReason::GitignoredUnsent { path: x(), why: x() }, "gitignored input"),
             (LocalReason::BuiltHere { project: x() }, "built here"),
             (LocalReason::DesktopUnderParent { pattern: x() }, NO_TOKEN),
+            (LocalReason::RoutableUnderParent { pattern: x() }, NO_TOKEN),
         ];
         for (reason, token) in table {
             let token = (token != NO_TOKEN).then_some(token);

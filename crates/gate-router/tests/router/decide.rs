@@ -353,7 +353,7 @@ fn a_light_gate_with_one_capable_builder_still_compares() {
 }
 
 #[test]
-fn a_light_gate_under_a_covering_parent_stays_silent() {
+fn a_light_gate_under_a_covering_parent_is_judged_as_its_uncovered_decision_would_route() {
     let command = words(&["dotnet", "build"]);
     let facts = FakeFacts {
         local_p50: Some(9.0),
@@ -363,14 +363,24 @@ fn a_light_gate_under_a_covering_parent_stays_silent() {
         parent: Nested::Covering,
         ..light(&command)
     };
-    assert_eq!(decide(&inputs, &facts), SILENT);
     assert_eq!(
-        facts.asked(),
-        ["config"],
-        "the routing file consents no repo a desktop pattern, so git is never asked"
+        decide(&inputs, &facts),
+        Route::Local {
+            reason: Some(LocalReason::RoutableUnderParent {
+                pattern: "dotnet *".to_owned()
+            })
+        }
     );
-    assert_eq!(facts.desktop_read.get(), 0);
-    assert_eq!(facts.local_p50_asked.get(), 0);
+    assert_eq!(
+        facts.desktop_read.get(),
+        1,
+        "the uncovered decision reads it, as an uncovered gate's does"
+    );
+    assert_eq!(
+        facts.local_p50_asked.get(),
+        1,
+        "the uncovered decision asks the local p50, as an uncovered light gate's does"
+    );
 }
 
 #[test]
@@ -719,7 +729,11 @@ fn a_covered_gate_matching_a_consented_session_pattern_says_it_runs_here_under_p
 fn a_covered_gate_matching_an_unconsented_desktop_pattern_stays_silent() {
     let facts = desktop_facts(Some(r#"{"yaat": ["dotnet build*"]}"#), &["dotnet test*"]);
     assert_eq!(decide(&covered(&words(&["dotnet", "test"])), &facts), SILENT);
-    assert_eq!(facts.desktop_read.get(), 1);
+    assert_eq!(
+        facts.desktop_read.get(),
+        2,
+        "the desktop check reads it, then the uncovered decision, which the unallowed pattern keeps here"
+    );
     let unreadable = FakeFacts {
         desktop: Err("bad toml".to_owned()),
         ..desktop_facts(Some(r#"{"yaat": ["dotnet test*"]}"#), &[])
@@ -741,7 +755,11 @@ fn a_covered_gate_matching_an_unconsented_desktop_pattern_stays_silent() {
         SILENT,
         "nor an unusable routing file"
     );
-    assert_eq!(unusable.asked(), ["config"]);
+    assert_eq!(
+        unusable.asked(),
+        ["config", "config"],
+        "the desktop check reads it, then the uncovered decision"
+    );
 }
 
 #[test]
@@ -769,11 +787,15 @@ fn a_covered_git_command_matching_a_consented_desktop_pattern_says_nothing() {
 }
 
 #[test]
-fn a_covered_gate_in_a_repo_with_no_desktop_consent_reads_no_desktop_file() {
+fn a_covered_gate_in_a_repo_with_no_desktop_consent_matching_a_declared_desktop_pattern_says_nothing() {
     for (case, desktop) in [("no key", None), ("another repo", Some(r#"{"other": ["dotnet test*"]}"#))] {
         let facts = desktop_facts(desktop, &["dotnet test*"]);
         assert_eq!(decide(&covered(&words(&["dotnet", "test"])), &facts), SILENT, "{case}");
-        assert_eq!(facts.desktop_read.get(), 0, "{case}");
+        assert_eq!(
+            facts.desktop_read.get(),
+            1,
+            "{case}: only the uncovered decision reads it, and the unallowed pattern keeps the run here"
+        );
     }
     let unplaced = FakeFacts {
         place: Ok(None),
@@ -781,6 +803,160 @@ fn a_covered_gate_in_a_repo_with_no_desktop_consent_reads_no_desktop_file() {
     };
     assert_eq!(decide(&covered(&words(&["dotnet", "test"])), &unplaced), SILENT, "no worktree");
     assert_eq!(unplaced.desktop_read.get(), 0);
+}
+
+/// The route of a covered gate that says its command matches the routing `pattern` but runs here because its parent
+/// gate does.
+fn routable_under_parent(pattern: &str) -> Route {
+    Route::Local {
+        reason: Some(LocalReason::RoutableUnderParent { pattern: pattern.to_owned() }),
+    }
+}
+
+#[test]
+fn a_covered_gate_matching_a_routing_pattern_says_it_would_route_without_its_parent() {
+    let facts = desktop_facts(None, &[]);
+    let command = words(&["dotnet", "test"]);
+    let route = decide(&covered(&command), &facts);
+    assert_eq!(route, routable_under_parent("dotnet *"));
+    assert_eq!(
+        local_line(&route).as_deref(),
+        Some(
+            "gate: this command matches routing pattern 'dotnet *' but runs on this PC because its parent gate runs here; \
+             run the outer command without a gate around it to route this one"
+        )
+    );
+    assert_eq!(
+        facts.desktop_read.get(),
+        1,
+        "the uncovered decision reads it, as an uncovered gate's does"
+    );
+    assert_eq!(facts.local_read.get(), 1);
+    let heavy_covered = Inputs {
+        slot: Slot::Heavy,
+        ..covered(&command)
+    };
+    assert_eq!(
+        decide(&heavy_covered, &facts),
+        routable_under_parent("dotnet *"),
+        "a heavy gate says it too"
+    );
+}
+
+#[test]
+fn a_covered_gate_its_local_file_keeps_here_says_nothing() {
+    let facts = FakeFacts {
+        local: Ok(patterns(&["dotnet test*"])),
+        ..desktop_facts(None, &[])
+    };
+    assert_eq!(decide(&covered(&words(&["dotnet", "test"])), &facts), SILENT);
+    assert_eq!(facts.local_read.get(), 1);
+    let unreadable = FakeFacts {
+        local: Err("bad".to_owned()),
+        ..desktop_facts(None, &[])
+    };
+    assert_eq!(
+        decide(&covered(&words(&["dotnet", "test"])), &unreadable),
+        SILENT,
+        "a covered gate never says a local file problem"
+    );
+}
+
+#[test]
+fn a_covered_gate_whose_command_no_routing_pattern_of_a_routed_repo_matches_says_nothing() {
+    let facts = desktop_facts(None, &[]);
+    assert_eq!(decide(&covered(&words(&["node", "x"])), &facts), SILENT, "no pattern matches");
+    let unrouted = FakeFacts::with_config(Config::parse(r#"{"host": "builder-1", "repos": {"other": ["dotnet *"]}}"#).expect("usable"));
+    assert_eq!(
+        decide(&covered(&words(&["dotnet", "test"])), &unrouted),
+        SILENT,
+        "the routing file does not route the repo"
+    );
+    assert_eq!(unrouted.local_read.get(), 0);
+    let git = desktop_facts(None, &[]);
+    assert_eq!(decide(&covered(&words(&["git", "status"])), &git), SILENT, "git stays here");
+    assert_eq!(git.asked(), Vec::<String>::new(), "a command that stays on this PC asks nothing");
+}
+
+#[test]
+fn a_covered_gate_in_a_git_hook_whose_repo_hooks_does_not_name_says_nothing() {
+    let facts = desktop_facts(None, &[]);
+    let command = words(&["dotnet", "test"]);
+    let hooked = Inputs {
+        git_hook: true,
+        ..covered(&command)
+    };
+    assert_eq!(decide(&hooked, &facts), SILENT);
+}
+
+#[test]
+fn a_covered_light_gate_its_uncovered_decision_finds_faster_here_says_nothing() {
+    let facts = FakeFacts {
+        local_p50: Some(9.0),
+        ..FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, TWO_WINDOWS))
+    }
+    .with_figures("win-2", figures(0.0, Some(14.0)))
+    .with_figures("win-3", figures(0.0, Some(20.0)));
+    let command = words(&["dotnet", "build"]);
+    assert!(
+        matches!(
+            decide(&light(&command), &facts),
+            Route::Local {
+                reason: Some(LocalReason::FasterHere { .. })
+            }
+        ),
+        "uncovered, it is proven faster here"
+    );
+    assert_eq!(decide(&covered(&command), &facts), SILENT);
+}
+
+#[test]
+fn a_covered_gate_whose_given_words_its_local_file_keeps_here_says_nothing() {
+    let facts = FakeFacts {
+        local: Ok(patterns(&["dotnet test --no-build*"])),
+        ..desktop_facts(None, &[])
+    };
+    let given = words(&["dotnet", "test", "--no-build"]);
+    let command = words(&["dotnet", "test"]);
+    let dropped = Inputs {
+        given: Some(&given),
+        ..covered(&command)
+    };
+    assert_eq!(decide(&dropped, &facts), SILENT);
+    assert_eq!(facts.local_read.get(), 1);
+}
+
+#[test]
+fn a_covered_gate_whose_word_names_a_path_outside_the_worktree_says_nothing() {
+    let facts = desktop_facts(None, &[]);
+    assert_eq!(decide(&covered(&words(&["dotnet", "test", r"..\b\x"])), &facts), SILENT);
+}
+
+/// A light gate a light parent lends its slot while a critical request drains, running `command`.
+fn lent(command: &[String]) -> Inputs<'_> {
+    Inputs {
+        parent: Nested::Lent,
+        ..light(command)
+    }
+}
+
+#[test]
+fn a_lent_gate_matching_a_routing_pattern_says_nothing_and_reads_only_the_routing_file() {
+    let facts = desktop_facts(None, &[]);
+    assert_eq!(decide(&lent(&words(&["dotnet", "test"])), &facts), SILENT);
+    assert_eq!(
+        facts.asked(),
+        ["config"],
+        "the desktop check finds no repo allowed a desktop pattern and asks nothing more"
+    );
+    assert_eq!((facts.desktop_read.get(), facts.local_read.get()), (0, 0));
+}
+
+#[test]
+fn a_lent_gate_matching_a_consented_desktop_pattern_says_it_runs_here_under_parent() {
+    let facts = desktop_facts(Some(r#"{"yaat": ["dotnet test*"]}"#), &["dotnet test*"]);
+    assert_eq!(decide(&lent(&words(&["dotnet", "test"])), &facts), under_parent("dotnet test*"));
+    assert_eq!(facts.local_read.get(), 0, "a lent gate asks no uncovered decision");
 }
 
 #[test]
@@ -3534,18 +3710,22 @@ fn an_unlisted_repo_never_reads_the_siblings_file() {
                 ..heavy(&command)
             },
         ),
-        (
-            "covered",
-            Inputs {
-                parent: Nested::Covering,
-                ..heavy(&command)
-            },
-        ),
     ] {
         let facts = declaring();
         assert!(matches!(decide(&inputs, &facts), Route::Local { .. }), "{case}");
         assert_eq!(facts.siblings_read.get(), 0, "{case}");
     }
+    let covered = Inputs {
+        parent: Nested::Covering,
+        ..heavy(&command)
+    };
+    let covered_facts = declaring();
+    assert!(matches!(decide(&covered, &covered_facts), Route::Local { .. }), "covered");
+    assert_eq!(
+        covered_facts.siblings_read.get(),
+        1,
+        "a covered gate's uncovered decision reads it once, as a listed repo's does"
+    );
     let listed = declaring();
     assert_eq!(decide(&heavy(&words(&["node", "x"])), &listed), SILENT, "no pattern matches");
     assert_eq!(
