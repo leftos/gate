@@ -302,6 +302,17 @@ pub struct OtherTree {
     pub inputs: Vec<String>,
 }
 
+/// What the snapshot sends of a gate's folder below the root ([`Facts::folder_sends`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderSends {
+    /// A file, tracked or untracked and not ignored, that is still on disk.
+    Files,
+    /// Nothing, and the folder is not gitignored.
+    Nothing,
+    /// Nothing: the folder is gitignored.
+    Ignored,
+}
+
 /// The facts the decision asks the caller for, each only when a rule needs it.
 pub trait Facts {
     /// The routing file, read and given to [`Config::parse`]: `Ok(None)` when there is no such file. Asked only of a
@@ -335,13 +346,13 @@ pub trait Facts {
     /// Told the words a command's patterns were asked about, joined as they were matched, and whether one matched.
     fn matched_against(&self, sent: &str, matched: bool);
 
-    /// Whether the gate's folder holds a file the snapshot sends, tracked or untracked and not ignored. Asked only
-    /// below the root.
+    /// What the snapshot sends of the gate's folder ([`FolderSends`]): a file, tracked or untracked and not ignored, or
+    /// nothing, the folder itself gitignored or not. Asked only below the root.
     ///
     /// # Errors
     ///
     /// Why it could not be told; the gate then runs here, saying so.
-    fn folder_has_files(&self, place: &Place) -> Result<bool, String>;
+    fn folder_sends(&self, place: &Place) -> Result<FolderSends, String>;
 
     /// The sha of the worktree root's `HEAD`, `Ok(None)` when it has none: a `git rev-parse --verify -q HEAD` that
     /// fails (an unborn branch among them) or writes anything but one sha is no sha. Asked only of a command that gets
@@ -685,8 +696,9 @@ pub enum LocalReason {
     /// A matched command's outside word names a path in the git worktree `tree`, neither the run's own nor a declared
     /// sibling's: a gate started there, or given `--cd` it, can route the command.
     OtherWorktree { tree: PathBuf },
-    /// The gate's folder holds nothing the snapshot sends; `subfolder` is the prefix without its trailing `/`.
-    NothingSent { subfolder: String },
+    /// The gate's folder holds nothing the snapshot sends; `subfolder` is the prefix without its trailing `/`, and
+    /// `ignored` when the folder is gitignored.
+    NothingSent { subfolder: String, ignored: bool },
     /// A fact could not be read; `reason` is on one line.
     Failed { reason: String },
     /// The siblings file `file` ([`Facts::declaration_said`]) cannot be read or has a problem; `problem` is its first,
@@ -771,7 +783,8 @@ impl LocalReason {
                 let tree = cd_value(tree);
                 format!("the command works in {tree}; run it with --cd {tree}")
             }
-            Self::NothingSent { subfolder } => format!("{subfolder} holds nothing the snapshot sends"),
+            Self::NothingSent { subfolder, ignored: false } => format!("{subfolder} holds nothing the snapshot sends"),
+            Self::NothingSent { subfolder, ignored: true } => format!("{subfolder} is gitignored, so the snapshot does not send it"),
             Self::Failed { reason } => reason.clone(),
             Self::SiblingsFile { file, problem } | Self::DesktopFile { file, problem } | Self::LocalFile { file, problem } => {
                 format!("{file}: {problem}")
@@ -2058,8 +2071,16 @@ fn ended(config: &Config, matched: Matched, given: &[String], facts: &dyn Facts)
     }
     let place = &matched.target.place;
     let subfolder = place.prefix.trim_end_matches('/').to_owned();
-    if !place.prefix.is_empty() && !facts.folder_has_files(place).map_err(|reason| Some(failed(&reason)))? {
-        return Err(Some(LocalReason::NothingSent { subfolder }));
+    if !place.prefix.is_empty() {
+        match facts.folder_sends(place).map_err(|reason| Some(failed(&reason)))? {
+            FolderSends::Files => {}
+            sends => {
+                return Err(Some(LocalReason::NothingSent {
+                    subfolder,
+                    ignored: sends == FolderSends::Ignored,
+                }));
+            }
+        }
     }
     let carried = carried_inputs(&matched, facts).map_err(Some)?;
     let marks = Marks {

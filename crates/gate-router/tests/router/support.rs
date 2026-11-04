@@ -7,8 +7,8 @@ use gate_router::balance::{self, BuilderFigures};
 use gate_router::desktop::DesktopDeclaration;
 use gate_router::windows::WindowsChange;
 use gate_router::{
-    Builder, CarriedSibling, Config, ConfigProblem, CrossTarget, Facts, FolderId, GitignoredInput, Inputs, Nested, OtherTree, Pattern, Place,
-    SiblingFolder, SiblingRoot, Slot, Target,
+    Builder, CarriedSibling, Config, ConfigProblem, CrossTarget, Facts, FolderId, FolderSends, GitignoredInput, Inputs, Nested, OtherTree, Pattern,
+    Place, SiblingFolder, SiblingRoot, Slot, Target,
 };
 
 /// The worktree root the fixtures use.
@@ -95,7 +95,8 @@ pub fn light(words: &[String]) -> Inputs<'_> {
 pub struct FakeFacts {
     pub config: Result<Option<Config>, ConfigProblem>,
     pub place: Result<Option<Place>, String>,
-    pub has_files: Result<bool, String>,
+    /// What the snapshot sends of the gate's folder.
+    pub sends: Result<FolderSends, String>,
     pub head: Result<Option<String>, String>,
     pub files: Vec<String>,
     /// The files the snapshot carries, `/`-separated from the root; a folder above one is carried too.
@@ -193,7 +194,7 @@ impl FakeFacts {
         Self {
             config: Ok(Some(config())),
             place: Ok(Some(place_at(prefix))),
-            has_files: Ok(true),
+            sends: Ok(FolderSends::Files),
             head: Ok(Some(HEAD.to_owned())),
             files: Vec::new(),
             snapshot: Vec::new(),
@@ -292,9 +293,9 @@ impl Facts for FakeFacts {
         self.place.clone()
     }
 
-    fn folder_has_files(&self, place: &Place) -> Result<bool, String> {
-        self.ask(format!("folder_has_files {}", place.prefix));
-        self.has_files.clone()
+    fn folder_sends(&self, place: &Place) -> Result<FolderSends, String> {
+        self.ask(format!("folder_sends {}", place.prefix));
+        self.sends.clone()
     }
 
     fn head_sha(&self, _place: &Place) -> Result<Option<String>, String> {

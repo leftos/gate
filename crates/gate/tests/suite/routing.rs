@@ -661,8 +661,8 @@ fn a_matched_command_holding_a_path_outside_the_worktree_runs_here_saying_so() {
         "a share path is looked up in no worktree: {share:?}"
     );
     let events = events(&case);
-    assert_local(&events[..3], None);
-    assert_local(&events[3..], None);
+    assert_local(&events[..3], Some("outside path"));
+    assert_local(&events[3..], Some("outside path"));
 }
 
 /// The folder beside the case's named the case's folder name and `suffix`, made empty.
@@ -1051,7 +1051,31 @@ fn a_folder_that_holds_nothing_the_snapshot_sends_runs_here_saying_so() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(outcome.stderr.contains(NOTHING_SENT_LINE), "{outcome:?}");
-    assert_local(&events(&case), None);
+    assert_local(&events(&case), Some("nothing sent"));
+}
+
+#[test]
+fn a_folder_git_ignores_runs_here_saying_it_is_gitignored_and_journals_gitignored_folder() {
+    let case = routed_case("routing-ignored-folder");
+    sub_folder(&case, "sub", true);
+    fs::write(case.folder().join(".gitignore"), "*.exe\n*.log\nsub/\n").expect("the ignore file can be written");
+    let log = log_path(&case, "out.log");
+    let outcome = finish(case.gate_in("sub", &heavy_words_with_limit(&log, &[], &[r".\tool.exe", "out", "ran here"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: not routed: sub is gitignored, so the snapshot does not send it\n"),
+        "{outcome:?}"
+    );
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_local(&events(&case), Some("gitignored folder"));
+    let log = log_texts(Path::new(&log));
+    assert!(
+        log.contains("gate: not routed: sub is gitignored, so the snapshot does not send it"),
+        "{log}"
+    );
 }
 
 /// A routed case holding a checkout of its own, `other`, whose repo the routing file routes too, so a gate started in
@@ -1344,7 +1368,7 @@ fn a_declared_sibling_folder_with_no_git_keeps_the_run_local_saying_so() {
         outcome.stderr.contains(&format!("gate: not routed: sibling {name} has no .git\n")),
         "{outcome:?}"
     );
-    assert_local(&events(&case), None);
+    assert_local(&events(&case), Some("sibling refused"));
 }
 
 #[test]
@@ -1379,7 +1403,7 @@ fn a_declared_sibling_the_routing_file_does_not_allow_runs_here_saying_so() {
             .contains(&format!("gate: not routed: sibling {name} is not allowed in remote.json\n")),
         "a name allowed in another letter case is not allowed: {outcome:?}"
     );
-    assert_local(&events(&case), None);
+    assert_local(&events(&case), Some("sibling not allowed"));
 }
 
 /// Names `folder` as the case repo's declarations folder in the case's routing file, the rest of it kept.
@@ -1466,7 +1490,7 @@ fn a_broken_siblings_file_in_the_declarations_folder_names_its_path() {
     let start = format!("gate: not routed: {}: ", folder.join("siblings.toml").display());
     assert!(outcome.stderr.lines().any(|line| line.starts_with(&start)), "{start}: {outcome:?}");
     assert!(!outcome.stderr.contains(".gate/siblings.toml:"), "{outcome:?}");
-    assert_local(&events(&case), None);
+    assert_local(&events(&case), Some("siblings file"));
 }
 
 #[test]
@@ -1509,7 +1533,7 @@ fn a_broken_siblings_file_in_the_worktree_wins_and_notes_the_copy_it_shadows() {
     let log = log_texts(&case.folder().join("out.log"));
     let note = format!("gate: .gate/siblings.toml shadows {}", folder.join("siblings.toml").display());
     assert!(log.lines().any(|line| line == note), "{note}: {log}");
-    assert_local(&events(&case), None);
+    assert_local(&events(&case), Some("siblings file"));
 }
 
 #[test]
@@ -1619,7 +1643,7 @@ fn a_worktree_with_unstaged_deletes_does_not_count_a_deleted_folder_as_holding_f
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(outcome.stderr.contains(NOTHING_SENT_LINE), "{outcome:?}");
-    assert_local(&events(&case), None);
+    assert_local(&events(&case), Some("nothing sent"));
 }
 
 #[test]
@@ -2274,7 +2298,7 @@ fn a_declared_desktop_pattern_the_routing_file_does_not_allow_runs_here_saying_s
         "a pattern allowed in another letter case is not allowed: {outcome:?}"
     );
     assert!(!call.exists(), "the client never ran");
-    assert_local(&events(&case), None);
+    assert_local(&events(&case), Some("desktop not allowed"));
 }
 
 #[test]
@@ -4723,7 +4747,7 @@ fn a_word_that_is_not_valid_unicode_runs_here_saying_so() {
         outcome.stderr.contains("gate: not routed: a word of the command is not valid Unicode\n"),
         "{outcome:?}"
     );
-    assert_local(&events(&case), None);
+    assert_local(&events(&case), Some("could not decide"));
 }
 
 #[test]
@@ -4738,7 +4762,7 @@ fn a_git_that_does_not_answer_within_the_limit_runs_here_saying_so() {
         "{outcome:?}"
     );
     assert!(outcome.stdout.contains("ran here"), "the command ran here: {outcome:?}");
-    assert_local(&events(&case), None);
+    assert_local(&events(&case), Some("could not decide"));
 }
 
 /// The `builders` entry a two-builder case tries first.

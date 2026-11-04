@@ -18,9 +18,9 @@ use gate_router::desktop::DesktopDeclaration;
 use gate_router::warm::FileRead;
 use gate_router::windows::{self, WindowsChange};
 use gate_router::{
-    Builder, Config, ConfigProblem, CrossTarget, ElsewhereRead, Facts, FolderId, GitignoredInput, Inputs, LaterCandidate, LocalReason, Nested,
-    OtherTree, Pattern, PinRefusal, Place, RemoteRun, Route, SiblingFolder, SiblingRoot, Target, TreePath, decide, dropped_env, dropped_env_line,
-    escaped, is_input_file, is_project_or_solution, repo_name, work_folder_key,
+    Builder, Config, ConfigProblem, CrossTarget, ElsewhereRead, Facts, FolderId, FolderSends, GitignoredInput, Inputs, LaterCandidate, LocalReason,
+    Nested, OtherTree, Pattern, PinRefusal, Place, RemoteRun, Route, SiblingFolder, SiblingRoot, Target, TreePath, decide, dropped_env,
+    dropped_env_line, escaped, is_input_file, is_project_or_solution, repo_name, work_folder_key,
 };
 use gate_win32::Share;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -54,6 +54,30 @@ const DECLARED_LOCAL: &str = "declared local";
 const GITIGNORED_INPUT: &str = "gitignored input";
 /// The `notRouted` value of a matched command kept here because a sibling the routing file requires is absent.
 const SIBLING_ABSENT: &str = "sibling absent";
+/// The `notRouted` value of a matched command kept here because a word names a path outside the worktree.
+const OUTSIDE_PATH: &str = "outside path";
+/// The `notRouted` value of a matched command kept here because the gate's folder, not gitignored, holds nothing the
+/// snapshot sends.
+const NOTHING_SENT: &str = "nothing sent";
+/// The `notRouted` value of a matched command kept here because the gate's folder is gitignored.
+const GITIGNORED_FOLDER: &str = "gitignored folder";
+/// The `notRouted` value of a gate kept here because the decision could not be made: a fact it needed could not be
+/// read, or a word of the command is not valid Unicode.
+const COULD_NOT_DECIDE: &str = "could not decide";
+/// The `notRouted` value of a matched command kept here because its siblings file cannot be read or has a problem.
+const SIBLINGS_FILE: &str = "siblings file";
+/// The `notRouted` value of a matched command kept here because a declared sibling cannot be carried.
+const SIBLING_REFUSED: &str = "sibling refused";
+/// The `notRouted` value of a matched command kept here because the routing file does not allow its declared siblings.
+const SIBLING_NOT_ALLOWED: &str = "sibling not allowed";
+/// The `notRouted` value of a matched command kept here because the builder cannot lay out its worktree's folder name.
+const LEAF_NOT_LAID_OUT: &str = "leaf not laid out";
+/// The `notRouted` value of a matched command kept here because its desktop file cannot be read or has a problem.
+const DESKTOP_FILE: &str = "desktop file";
+/// The `notRouted` value of a matched command kept here because the routing file does not allow its desktop pattern.
+const DESKTOP_NOT_ALLOWED: &str = "desktop not allowed";
+/// The `notRouted` value of a dotnet `--no-build` run kept here because its last build ran here and cannot be sent.
+const BUILT_HERE: &str = "built here";
 /// The `notRouted` value of a command none of its repo's patterns matched.
 const NO_PATTERN: &str = "no pattern";
 /// The declaration file of the prefixes of the caller's variables a repo's commands read.
@@ -524,36 +548,60 @@ fn consented_hash(remote: &RemoteRun, machine: &Machine<'_>) -> Option<String> {
     }
 }
 
-/// The queue line's `notRouted`: `--local` for a heavy or light gate its caller kept here with `--local`, `faster here`
-/// for a light gate its learned local run time proves faster here ([`LocalReason::FasterHere`]), `another worktree` for
-/// a matched command whose outside path lies in another git worktree, `declared local` for one its repo's
-/// `.gate/local.toml` keeps here, by a pattern or by a problem, `gitignored input` for one whose word names a gitignored
-/// project input, `sibling absent` for one whose declared sibling the routing file requires and it is not beside the
-/// worktree, `no pattern` for a run kept here for no reason it says whose decision found that `sent` matched no pattern
-/// of its repo, else none.
+/// The queue line's `notRouted`. A run kept here for a reason it says writes that reason's token:
+///
+/// - `--local`: a heavy or light gate its caller kept here with `--local` ([`LocalReason::LocalFlag`]);
+/// - `faster here`: a light gate its learned local run time proves faster here ([`LocalReason::FasterHere`]);
+/// - `outside path`: a matched command whose word names a path outside the worktree ([`LocalReason::Outside`]);
+/// - `another worktree`: one whose outside path lies in another git worktree ([`LocalReason::OtherWorktree`]);
+/// - `nothing sent`: one whose folder, not gitignored, holds nothing the snapshot sends ([`LocalReason::NothingSent`]);
+/// - `gitignored folder`: one whose folder is gitignored ([`LocalReason::NothingSent`]);
+/// - `could not decide`: a fact the decision needed could not be read, or a word is not valid Unicode
+///   ([`LocalReason::Failed`]);
+/// - `siblings file`: a siblings file that cannot be read or has a problem ([`LocalReason::SiblingsFile`]);
+/// - `sibling refused`: a declared sibling that cannot be carried ([`LocalReason::SiblingRefused`]);
+/// - `sibling absent`: a sibling the routing file requires is not beside the worktree ([`LocalReason::SiblingAbsent`]);
+/// - `sibling not allowed`: declared siblings the routing file does not allow ([`LocalReason::SiblingsNotAllowed`]);
+/// - `leaf not laid out`: a worktree folder name the builder cannot lay out ([`LocalReason::LeafNotLaidOut`]);
+/// - `desktop file`: a desktop file that cannot be read or has a problem ([`LocalReason::DesktopFile`]);
+/// - `desktop not allowed`: a desktop pattern the routing file does not allow ([`LocalReason::DesktopNotAllowed`]);
+/// - `declared local`: one its repo's `.gate/local.toml` keeps here, by a pattern or by a problem
+///   ([`LocalReason::DeclaredLocal`], [`LocalReason::LocalFile`]);
+/// - `gitignored input`: one whose word names a gitignored project input it cannot carry
+///   ([`LocalReason::GitignoredPastCap`], [`LocalReason::GitignoredUnsent`]);
+/// - `built here`: a `--no-build` run whose last build ran here and cannot be sent ([`LocalReason::BuiltHere`]).
+///
+/// An unusable routing file ([`LocalReason::Ignored`]) and a desktop command under a parent gate
+/// ([`LocalReason::DesktopUnderParent`]) write none. A run kept here for no reason it says writes `no pattern` when its
+/// decision found that `sent` matched no pattern of its repo; any other writes none.
 pub(crate) fn not_routed(route: &Route, sent: Option<&Sent>) -> Option<String> {
-    match route {
-        Route::Local {
-            reason: Some(LocalReason::LocalFlag),
-        } => Some(LOCAL_FLAG.to_owned()),
-        Route::Local {
-            reason: Some(LocalReason::FasterHere { .. }),
-        } => Some(FASTER_HERE.to_owned()),
-        Route::Local {
-            reason: Some(LocalReason::OtherWorktree { .. }),
-        } => Some(ANOTHER_WORKTREE.to_owned()),
-        Route::Local {
-            reason: Some(LocalReason::DeclaredLocal { .. } | LocalReason::LocalFile { .. }),
-        } => Some(DECLARED_LOCAL.to_owned()),
-        Route::Local {
-            reason: Some(LocalReason::GitignoredPastCap { .. } | LocalReason::GitignoredUnsent { .. }),
-        } => Some(GITIGNORED_INPUT.to_owned()),
-        Route::Local {
-            reason: Some(LocalReason::SiblingAbsent { .. }),
-        } => Some(SIBLING_ABSENT.to_owned()),
-        Route::Local { reason: None } if sent.is_some_and(|sent| !sent.matched) => Some(NO_PATTERN.to_owned()),
-        _ => None,
-    }
+    let token = match route {
+        Route::Local { reason: Some(reason) } => match reason {
+            LocalReason::LocalFlag => LOCAL_FLAG,
+            LocalReason::FasterHere { .. } => FASTER_HERE,
+            // Ignored: said on every run's line; a machine-wide fault, not a reason of the run's shape.
+            // DesktopUnderParent: a covered gate writes the `covered` line, never a queue line with `notRouted`.
+            LocalReason::Ignored { .. } | LocalReason::DesktopUnderParent { .. } => return None,
+            LocalReason::Outside { .. } => OUTSIDE_PATH,
+            LocalReason::OtherWorktree { .. } => ANOTHER_WORKTREE,
+            LocalReason::NothingSent { ignored: false, .. } => NOTHING_SENT,
+            LocalReason::NothingSent { ignored: true, .. } => GITIGNORED_FOLDER,
+            LocalReason::Failed { .. } => COULD_NOT_DECIDE,
+            LocalReason::SiblingsFile { .. } => SIBLINGS_FILE,
+            LocalReason::SiblingRefused { .. } => SIBLING_REFUSED,
+            LocalReason::SiblingAbsent { .. } => SIBLING_ABSENT,
+            LocalReason::SiblingsNotAllowed { .. } => SIBLING_NOT_ALLOWED,
+            LocalReason::LeafNotLaidOut { .. } => LEAF_NOT_LAID_OUT,
+            LocalReason::DesktopFile { .. } => DESKTOP_FILE,
+            LocalReason::DesktopNotAllowed { .. } => DESKTOP_NOT_ALLOWED,
+            LocalReason::LocalFile { .. } | LocalReason::DeclaredLocal { .. } => DECLARED_LOCAL,
+            LocalReason::GitignoredPastCap { .. } | LocalReason::GitignoredUnsent { .. } => GITIGNORED_INPUT,
+            LocalReason::BuiltHere { .. } => BUILT_HERE,
+        },
+        Route::Local { reason: None } if sent.is_some_and(|sent| !sent.matched) => NO_PATTERN,
+        _ => return None,
+    };
+    Some(token.to_owned())
 }
 
 /// The exclusions of the input globs a word's project input is matched against ([`Machine::uncovered`]): none, a
@@ -1960,9 +2008,12 @@ impl Facts for Machine<'_> {
         placed
     }
 
-    /// The first path `git ls-files` lists, tracked or untracked and not ignored, that is still on disk: an unstaged
-    /// delete sends nothing. The prefix is a literal path, its spaces and wildcards as written.
-    fn folder_has_files(&self, place: &Place) -> Result<bool, String> {
+    /// [`FolderSends::Files`] when `git ls-files` lists a path, tracked or untracked and not ignored, that is still on
+    /// disk: an unstaged delete sends nothing. The prefix is a literal path, its spaces and wildcards as written.
+    /// Otherwise the folder holds nothing the snapshot sends, and `git check-ignore -q --no-index` of the prefix without
+    /// its trailing `/` tells whether it is gitignored ([`unsent_folder`]); a check that cannot run or fails leaves
+    /// [`FolderSends::Nothing`], which is known.
+    fn folder_sends(&self, place: &Place) -> Result<FolderSends, String> {
         let root = Path::new(&place.root);
         let args = [
             "--literal-pathspecs",
@@ -1974,12 +2025,20 @@ impl Facts for Machine<'_> {
             "--",
             &place.prefix,
         ];
-        let ran = git::Git::find(root)?.run(&self.git_call(root, &args))?;
+        let git = git::Git::find(root)?;
+        let ran = git.run(&self.git_call(root, &args))?;
         if !ran.status.success() {
             let code = ran.status.code().map_or_else(|| "unknown".to_owned(), |code| code.to_string());
             return Err(format!("git ls-files failed with status {code}"));
         }
-        holds_existing_path(BufReader::new(ran.stdout), root).map_err(|error| format!("cannot read git ls-files' output: {error}"))
+        if holds_existing_path(BufReader::new(ran.stdout), root).map_err(|error| format!("cannot read git ls-files' output: {error}"))? {
+            return Ok(FolderSends::Files);
+        }
+        let folder = place.prefix.trim_end_matches('/');
+        let args = ["check-ignore", "-q", "--no-index", "--", folder];
+        Ok(git
+            .run(&self.git_call(root, &args))
+            .map_or(FolderSends::Nothing, |ran| unsent_folder(ran.status.code())))
     }
 
     /// The root's `HEAD` sha, `Ok(None)` when the worktree has none: a `git rev-parse --verify -q HEAD` that fails (an
@@ -2820,6 +2879,13 @@ fn parse_head(text: &str) -> Option<String> {
     (sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))).then(|| sha.to_owned())
 }
 
+/// What the snapshot sends of a folder `git ls-files` found nothing in, by the status `code` of `git check-ignore -q`
+/// of it: [`FolderSends::Ignored`] for 0, else [`FolderSends::Nothing`], which is known whether the check said no (1),
+/// failed or was killed.
+fn unsent_folder(code: Option<i32>) -> FolderSends {
+    if code == Some(0) { FolderSends::Ignored } else { FolderSends::Nothing }
+}
+
 /// Whether a NUL-separated `git ls-files -z` listing, its paths relative to `root`, names a path still on disk; it
 /// reads no further than the first that does.
 fn holds_existing_path(listing: impl BufRead, root: &Path) -> io::Result<bool> {
@@ -2852,8 +2918,8 @@ mod tests {
     use gate_router::balance::{Balanced, BalancedEntry};
     use gate_router::windows::WindowsChange;
     use gate_router::{
-        CarriedSibling, Config, CrossBlocked, CrossTarget, Facts, FolderId, GitignoredInput, LocalReason, Place, Route, SiblingFolder, SiblingRoot,
-        Target,
+        CarriedSibling, Config, CrossBlocked, CrossTarget, Facts, FolderId, FolderSends, GitignoredInput, LocalReason, Place, Route, SiblingFolder,
+        SiblingRoot, Target,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -2863,7 +2929,7 @@ mod tests {
         CHANGE_DEADLINE, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, GATE_FILE_NOT_A_FILE, Machine, Origin, SIBLING_GIT_LINK, SIBLING_LINK,
         SIBLING_NOT_A_FOLDER, Sent, Source, balanced_line, change_error, change_limit, checkout_of, holds_existing_path, is_fixed_local,
         is_share_target, judge_declarations, not_routed, nul_separated, parse_head, parse_place, read_declaration, read_siblings, same_folder,
-        sibling_folder, worktree_of,
+        sibling_folder, unsent_folder, worktree_of,
     };
     use crate::remote::box_trees;
     use crate::remote::git;
@@ -4639,58 +4705,98 @@ mod tests {
     }
 
     #[test]
-    fn only_the_named_reasons_write_not_routed() {
-        let flag = Route::Local {
-            reason: Some(LocalReason::LocalFlag),
-        };
-        let declared = Route::Local {
-            reason: Some(LocalReason::DeclaredLocal {
-                file: ".gate/local.toml".to_owned(),
-                pattern: "x*".to_owned(),
-            }),
-        };
-        let unusable = Route::Local {
-            reason: Some(LocalReason::LocalFile {
-                file: ".gate/local.toml".to_owned(),
-                problem: "x".to_owned(),
-            }),
-        };
-        let desktop = Route::Local {
-            reason: Some(LocalReason::DesktopFile {
-                file: ".gate/desktop.toml".to_owned(),
-                problem: "x".to_owned(),
-            }),
-        };
-        let other = Route::Local {
-            reason: Some(LocalReason::OtherWorktree {
-                tree: PathBuf::from(r"X:\dev\other"),
-            }),
-        };
-        let outside = Route::Local {
-            reason: Some(LocalReason::Outside { word: r"X:\x".to_owned() }),
-        };
-        let failed = Route::Local {
-            reason: Some(LocalReason::Failed { reason: "x".to_owned() }),
-        };
-        let absent = Route::Local {
-            reason: Some(LocalReason::SiblingAbsent {
-                names: vec!["b".to_owned()],
-                problem: None,
-            }),
-        };
-
-        assert_eq!(not_routed(&flag, None).as_deref(), Some("--local"));
-        assert_eq!(not_routed(&absent, None).as_deref(), Some("sibling absent"));
-        assert_eq!(not_routed(&other, None).as_deref(), Some("another worktree"));
-        assert_eq!(not_routed(&declared, None).as_deref(), Some("declared local"));
-        assert_eq!(
-            not_routed(&unusable, None).as_deref(),
-            Some("declared local"),
-            "a file the gate cannot use keeps it here too"
-        );
-        assert_eq!(not_routed(&desktop, None), None);
-        assert_eq!(not_routed(&outside, None), None, "an outside word in no other worktree writes none");
-        assert_eq!(not_routed(&failed, None), None);
+    fn each_reason_writes_its_not_routed_or_none() {
+        /// A row whose reason writes no `notRouted`.
+        const NO_TOKEN: &str = "";
+        let x = || "x".to_owned();
+        let table = [
+            (LocalReason::LocalFlag, "--local"),
+            (
+                LocalReason::FasterHere {
+                    here_tenths: 10,
+                    builder: x(),
+                    there_tenths: 20,
+                },
+                "faster here",
+            ),
+            (
+                LocalReason::Ignored {
+                    path: PathBuf::from(r"X:\remote.json"),
+                    reason: x(),
+                },
+                NO_TOKEN,
+            ),
+            (LocalReason::Outside { word: r"X:\x".to_owned() }, "outside path"),
+            (
+                LocalReason::OtherWorktree {
+                    tree: PathBuf::from(r"X:\dev\other"),
+                },
+                "another worktree",
+            ),
+            (
+                LocalReason::NothingSent {
+                    subfolder: x(),
+                    ignored: false,
+                },
+                "nothing sent",
+            ),
+            (
+                LocalReason::NothingSent {
+                    subfolder: x(),
+                    ignored: true,
+                },
+                "gitignored folder",
+            ),
+            (LocalReason::Failed { reason: x() }, "could not decide"),
+            (LocalReason::SiblingsFile { file: x(), problem: x() }, "siblings file"),
+            (LocalReason::SiblingRefused { name: x(), reason: x() }, "sibling refused"),
+            (
+                LocalReason::SiblingAbsent {
+                    names: vec![x()],
+                    problem: None,
+                },
+                "sibling absent",
+            ),
+            (
+                LocalReason::SiblingsNotAllowed {
+                    names: vec![x()],
+                    problem: None,
+                },
+                "sibling not allowed",
+            ),
+            (LocalReason::LeafNotLaidOut { leaf: x() }, "leaf not laid out"),
+            (LocalReason::DesktopFile { file: x(), problem: x() }, "desktop file"),
+            (
+                LocalReason::DesktopNotAllowed {
+                    pattern: x(),
+                    mode: gate_router::desktop::DesktopMode::Locked,
+                    problem: None,
+                },
+                "desktop not allowed",
+            ),
+            (LocalReason::LocalFile { file: x(), problem: x() }, "declared local"),
+            (LocalReason::DeclaredLocal { file: x(), pattern: x() }, "declared local"),
+            (
+                LocalReason::GitignoredPastCap {
+                    path: x(),
+                    bytes: 1,
+                    files: 1,
+                    pair: false,
+                },
+                "gitignored input",
+            ),
+            (LocalReason::GitignoredUnsent { path: x(), why: x() }, "gitignored input"),
+            (LocalReason::BuiltHere { project: x() }, "built here"),
+            (LocalReason::DesktopUnderParent { pattern: x() }, NO_TOKEN),
+        ];
+        for (reason, token) in table {
+            let token = (token != NO_TOKEN).then_some(token);
+            let route = Route::Local {
+                reason: Some(reason.clone()),
+            };
+            assert_eq!(not_routed(&route, None).as_deref(), token, "{reason:?}");
+            assert_eq!(not_routed(&route, Some(&sent(true))).as_deref(), token, "{reason:?}, matched");
+        }
     }
 
     fn sent(matched: bool) -> Sent {
@@ -4698,6 +4804,14 @@ mod tests {
             text: "dotnet build".to_owned(),
             matched,
         }
+    }
+
+    #[test]
+    fn a_failed_ignore_check_leaves_a_folder_that_sends_nothing() {
+        assert_eq!(unsent_folder(Some(0)), FolderSends::Ignored);
+        assert_eq!(unsent_folder(Some(1)), FolderSends::Nothing);
+        assert_eq!(unsent_folder(Some(128)), FolderSends::Nothing, "check-ignore failed");
+        assert_eq!(unsent_folder(None), FolderSends::Nothing, "check-ignore was killed");
     }
 
     #[test]

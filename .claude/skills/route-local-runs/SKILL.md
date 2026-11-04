@@ -32,7 +32,8 @@ Take the first row that holds, then record the decision with `watch_local.py mar
 | 3 | `fellBack=` | A route failed and fell back. Book it with the reason, mark `booked`. |
 | 4 | `reason=declared local` | The repo keeps it here in `.gate/local.toml`. Mark `local`, its reason there as the note. |
 | 5 | `reason=--local: <text>` where the text names something no work can move off this PC | Mark `local`, the reason as the note. |
-| 5a | `reason=` any other value: `--local` with a removable reason, `sibling absent`, `gitignored input`, `another worktree` | The gate said why it stayed. Book that cause, mark `booked`. |
+| 4a | `reason=gitignored folder` | The run's folder is gitignored, so the snapshot cannot send it: scratch work. Mark `local`, note `gitignored folder`. |
+| 5a | `reason=` any other value: `--local` with a removable reason, `sibling absent`, `gitignored input`, `another worktree`, `nothing sent`, `outside path`, `built here` | The gate said why it stayed. Book that cause, mark `booked`. |
 | 5b | `matched=yes` and `reason=none` | A matching command stayed here with no reason given. Book it, mark `booked`. |
 | 6 | The command drives this PC's own state: a window, a GPU session, an install into this PC's folders, a rig or measurement of its own processes, a build whose exes are started on this PC by a repo with no `outputs` for them | Mark `local`, the reason as the note. |
 | 7 | The repo is `(no repo)` | No repo owns it. Mark `local`, note `no repo`. |

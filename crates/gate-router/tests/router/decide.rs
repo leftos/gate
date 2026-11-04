@@ -9,9 +9,9 @@ use gate_router::desktop::{DesktopDeclaration, DesktopMode};
 use gate_router::windows::WindowsChange;
 use gate_router::{
     BuildSettings, BuildTarget, Builder, BuilderOs, CARRIED_INPUT, Config, ConfigProblem, CrossBlocked, CrossTarget, DROPPED_NO_BUILD_LINE,
-    DotnetTarget, ElsewhereRead, Facts, GitignoredInput, Inputs, LocalReason, NO_OUTPUTS_LINE, Nested, PROJECT_EXTENSIONS, Pattern, PinRefusal,
-    Place, RemoteRun, Route, SiblingFolder, Slot, Target, build_settings, builder_words, decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet,
-    is_usable_host, later_run, named_tree_paths, pattern_for, sdk_build_target, target, without_no_build, work_folder_key,
+    DotnetTarget, ElsewhereRead, Facts, FolderSends, GitignoredInput, Inputs, LocalReason, NO_OUTPUTS_LINE, Nested, PROJECT_EXTENSIONS, Pattern,
+    PinRefusal, Place, RemoteRun, Route, SiblingFolder, Slot, Target, build_settings, builder_words, decide, dotnet_builds, dotnet_target, is_cargo,
+    is_dotnet, is_usable_host, later_run, named_tree_paths, pattern_for, sdk_build_target, target, without_no_build, work_folder_key,
 };
 
 use crate::support::{FakeFacts, HEAD, ROOT, carried, fake_id, heavy, light, place_at, sibling_root, words};
@@ -863,7 +863,7 @@ fn a_word_outside_the_worktree_says_so() {
 fn a_word_outside_the_worktree_wins_over_a_folder_holding_nothing() {
     let command = words(&["dotnet", "test", r"..\..\..\other\x.csproj"]);
     let facts = FakeFacts {
-        has_files: Ok(false),
+        sends: Ok(FolderSends::Nothing),
         ..FakeFacts::at("src/empty/")
     };
     let route = decide(&heavy(&command), &facts);
@@ -1188,7 +1188,7 @@ fn another_spelling_of_the_own_root_is_not_told_to_cd() {
 fn a_folder_holding_nothing_the_snapshot_sends_says_so() {
     let command = words(&["dotnet", "test"]);
     let facts = FakeFacts {
-        has_files: Ok(false),
+        sends: Ok(FolderSends::Nothing),
         ..FakeFacts::at("src/empty/")
     };
     let route = decide(&heavy(&command), &facts);
@@ -1196,18 +1196,18 @@ fn a_folder_holding_nothing_the_snapshot_sends_says_so() {
         local_line(&route).as_deref(),
         Some("gate: not routed: src/empty holds nothing the snapshot sends")
     );
-    assert_eq!(facts.asked(), ["config", "place", "folder_has_files src/empty/"]);
+    assert_eq!(facts.asked(), ["config", "place", "folder_sends src/empty/"]);
 }
 
 #[test]
 fn the_root_is_never_asked_whether_it_holds_files() {
     let command = words(&["dotnet", "test"]);
     let facts = FakeFacts {
-        has_files: Ok(false),
+        sends: Ok(FolderSends::Nothing),
         ..FakeFacts::at_root()
     };
     assert!(matches!(decide(&heavy(&command), &facts), Route::Routed(_)));
-    assert!(!facts.asked().iter().any(|question| question.starts_with("folder_has_files")));
+    assert!(!facts.asked().iter().any(|question| question.starts_with("folder_sends")));
 }
 
 #[test]
@@ -1229,12 +1229,35 @@ fn a_fact_that_fails_says_not_routed_on_one_line() {
         Some("gate: not routed: git could not be started: access denied")
     );
     let listing_fails = FakeFacts {
-        has_files: Err("git ls-files of sub/ failed (status 128)".to_owned()),
+        sends: Err("git ls-files of sub/ failed (status 128)".to_owned()),
         ..FakeFacts::at("sub/")
     };
     assert_eq!(
         local_line(&decide(&heavy(&command), &listing_fails)).as_deref(),
         Some("gate: not routed: git ls-files of sub/ failed (status 128)")
+    );
+}
+
+#[test]
+fn a_gitignored_folder_says_the_snapshot_does_not_send_it() {
+    let command = words(&["dotnet", "test"]);
+    let facts = FakeFacts {
+        sends: Ok(FolderSends::Ignored),
+        ..FakeFacts::at("src/ignored/")
+    };
+    let route = decide(&heavy(&command), &facts);
+    assert_eq!(
+        route,
+        Route::Local {
+            reason: Some(LocalReason::NothingSent {
+                subfolder: "src/ignored".to_owned(),
+                ignored: true,
+            }),
+        }
+    );
+    assert_eq!(
+        local_line(&route).as_deref(),
+        Some("gate: not routed: src/ignored is gitignored, so the snapshot does not send it")
     );
 }
 
@@ -5367,13 +5390,26 @@ fn a_desktop_run_naming_a_path_outside_the_worktree_is_refused() {
 #[test]
 fn a_desktop_run_whose_folder_holds_nothing_the_snapshot_sends_is_refused() {
     let base = FakeFacts {
-        has_files: Ok(false),
+        sends: Ok(FolderSends::Nothing),
         ..FakeFacts::at("src/empty/")
     };
     let facts = desktop_run_facts(r#""repos": {"yaat": ["dotnet *"]}"#, &["dotnet *"], base);
     assert_eq!(
         decide(&heavy(&words(&["dotnet", "test"])), &facts),
         desktop_refused("src/empty holds nothing the snapshot sends")
+    );
+}
+
+#[test]
+fn a_desktop_run_whose_folder_is_gitignored_is_refused() {
+    let base = FakeFacts {
+        sends: Ok(FolderSends::Ignored),
+        ..FakeFacts::at("src/ignored/")
+    };
+    let facts = desktop_run_facts(r#""repos": {"yaat": ["dotnet *"]}"#, &["dotnet *"], base);
+    assert_eq!(
+        decide(&heavy(&words(&["dotnet", "test"])), &facts),
+        desktop_refused("src/ignored is gitignored, so the snapshot does not send it")
     );
 }
 
