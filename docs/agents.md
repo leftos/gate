@@ -23,6 +23,8 @@ A repo with no launcher yet gets one by copying `tools/gate.ps1` from this repo 
 
 A routed run does not carry the caller's environment. `--env NAME=value` sets a variable for the command whether it routes or not, and a bare `--env NAME` forwards the caller's value, the form for a secret.
 
+The gate passes a value through as it receives it, so quote it as the calling shell needs: in Bash, an unquoted backslash is an escape the shell removes before the gate sees it (`--env X=C:\Windows\x.exe` arrives as `C:Windowsx.exe`), so write `--env 'X=C:\Windows\x.exe'` or use forward slashes.
+
 ### Commits and pushes
 
 A gated commit holds a slot for all of its hooks: `--slot light` when the hooks only check the staged files, `--slot heavy` when they build or test across cores. A commit on `--slot none` takes a light slot and says `gate: a commit's hooks take a slot: pass --slot heavy or --slot light`.
