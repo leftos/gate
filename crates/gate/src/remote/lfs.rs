@@ -34,7 +34,7 @@ use super::snapshot::{self, Bounded};
 use super::syncback::{SLICE_CAP, attribute_values, slices_asking};
 use crate::outputs::archive::pack;
 use crate::outputs::hash::sha256_of;
-use crate::outputs::manifest::{Chosen, HeldBy};
+use crate::outputs::manifest::{Chosen, HeldBy, Wrote};
 use crate::outputs::walk::{Found, stamp_of};
 
 /// The most bytes a blob read as a pointer may hold.
@@ -579,7 +579,8 @@ pub(super) fn packed(
     if !go_on() {
         return Err(Unbuilt::Interrupted);
     }
-    let chosen: Vec<Chosen<'_>> = found.iter().map(Chosen::from).collect();
+    // The box's own unpack stamps nothing by the mark, so every file is listed as the run's.
+    let chosen: Vec<Chosen<'_>> = found.iter().map(|file| Chosen::new(file, Wrote::ThisRun)).collect();
     let stopped = Cell::new(false);
     let sink = Asking {
         inner: archive,

@@ -183,22 +183,6 @@ impl Globs {
         })
     }
 
-    /// This matcher narrowed to its globs that name a `.tmp` folder ([`tmp_segments`]), in their order and held by the
-    /// same exclusions: those the box lists before the command under `OutputsFull`, where only a `.tmp` file's stamp
-    /// decides whether it comes back. `None` when no glob names one.
-    #[must_use]
-    pub fn tmp_only(&self) -> Option<Globs> {
-        let patterns: Vec<Pattern> = self.patterns.iter().filter(|pattern| pattern.tmp.is_some()).cloned().collect();
-        if patterns.is_empty() {
-            return None;
-        }
-        Some(Globs {
-            patterns,
-            excluded: self.excluded.clone(),
-            never_lifted: self.never_lifted.clone(),
-        })
-    }
-
     /// This matcher's globs followed by `more`'s, in their order, held by this matcher's exclusions: the set a failed
     /// command brings back, its test reports' globs joined with its failure output globs, both output matchers.
     #[must_use]

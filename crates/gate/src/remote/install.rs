@@ -8,9 +8,11 @@
 //! `--bring-tracked` glob matches it, or whose PC file is in use or read-only, or that records one of the run's box
 //! trees but is not text the install can rewrite, skipped and said; each of the run's trees on the box rewritten to its
 //! root on this PC in the files that record it (the work folder to the worktree for one repo; for a pair, the main's
-//! tree to the worktree and each sibling's to the sibling's root); and each file, its last write set in the stage to
-//! the time the attempt began its snapshot, clamped to this PC's clock, so a source changed here after the snapshot is
-//! newer than every output the run built from it, and checked against the manifest once more, moved into place, unless
+//! tree to the worktree and each sibling's to the sibling's root); and each file, its last write set in the stage: one
+//! the run wrote to the time the attempt began its snapshot, clamped to this PC's clock, so a source changed here after
+//! the snapshot is newer than every output the run built from it, and one the archive's list marks as not written by
+//! the run to the box's own last write, clamped to that same time, so an output an earlier build left on the box never
+//! looks newer than the sources it was built from; then checked against the manifest once more, moved into place, unless
 //! its PC file is now in place by the same rule, which is left as it is, or something holds it open against the move,
 //! which is skipped as in use and said. A complete install also keeps the hash of each file it put in place, at the
 //! stamp that file's handle reads after the move, in the worktree's hash cache, so the next run takes it instead of
@@ -26,6 +28,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
+use gate_inputs::archive::Item;
 use gate_router::{escaped, is_layout_char};
 use gate_state::v1;
 use gate_wire::ordinal_upper;
@@ -41,7 +44,7 @@ use crate::outputs::archive::{Entry, PcFiles, UnpackError, below, check_folder, 
 use crate::outputs::cache::{HashCache, file_time_now};
 use crate::outputs::glob::Globs;
 use crate::outputs::hash::file_sha256;
-use crate::outputs::manifest::Manifest;
+use crate::outputs::manifest::{Manifest, Wrote};
 use crate::outputs::walk::{Stamp, in_context, stamp_of};
 use crate::route::is_run_log;
 
@@ -90,8 +93,8 @@ pub(super) struct Fetched<'f> {
     pub(super) sibling_trees: Vec<(String, &'f str)>,
     pub(super) started: Instant,
     /// The moment the attempt began making its snapshot, by this PC's clock, less the `--test-remote-snapshot-age-ms` age
-    /// when a test gives one: the last write every file the install moves into place takes, clamped to this PC's clock
-    /// as the moves begin.
+    /// when a test gives one: the last write each file the run wrote takes as the install moves it into place, clamped
+    /// to this PC's clock as the moves begin, and the latest a file the run did not write keeps of the box's own.
     pub(super) snapshot: SystemTime,
     /// How long the fetch alone took, from its start to the archive's last byte.
     pub(super) pulled: Duration,
@@ -395,7 +398,7 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
     };
     let unpacking = unpacked(file, &fetched.stage, attempt.outputs_budget, &pc, &stopped);
     staged.set(stage_made(&unpacking));
-    let entries = unpacking.map_err(|error| {
+    let items = unpacking.map_err(|error| {
         if stopped.get() {
             Unmet::Interrupted { done: 0, total: 0 }
         } else {
@@ -410,13 +413,16 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
         &all
     };
     let log = super::inputs::relative(Path::new(attempt.call.root), attempt.call.log);
-    let (entries, mut skipped) = own_logs(entries, log.as_deref());
-    let checks = checked(&root, &entries, globs, fetched.manifest).map_err(Unmet::Refused)?;
+    let (items, mut skipped) = own_logs(items, log.as_deref());
+    let checks = checked(&root, &items, globs, fetched.manifest).map_err(Unmet::Refused)?;
     let in_place: HashSet<&str> = checks.in_place.iter().map(String::as_str).collect();
-    let entries: Vec<Entry> = entries.into_iter().filter(|entry| !in_place.contains(entry.path.as_str())).collect();
-    skipped.extend(skips(attempt, &root, &entries, &checks.in_use)?);
+    let items: Vec<Item> = items.into_iter().filter(|item| !in_place.contains(item.entry.path.as_str())).collect();
+    skipped.extend(skips(attempt, &root, &items, &checks.in_use)?);
     let skipped_paths: HashSet<&str> = skipped.iter().map(|(path, _)| path.as_str()).collect();
-    let entries: Vec<Entry> = entries.into_iter().filter(|entry| !skipped_paths.contains(entry.path.as_str())).collect();
+    let items: Vec<Item> = items
+        .into_iter()
+        .filter(|item| !skipped_paths.contains(item.entry.path.as_str()))
+        .collect();
     let siblings = fetched.sibling_trees.iter().map(|(tree, pc_root)| {
         pc_spelling(pc_root)
             .map(|pc_root| (tree.clone(), pc_root.display().to_string()))
@@ -425,15 +431,15 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
     let trees = std::iter::once(Ok((fetched.main_tree.clone(), root.display().to_string())))
         .chain(siblings)
         .collect::<Result<Vec<_>, _>>()?;
-    let unrewritable = rewritten(&fetched.stage, &entries, &trees).map_err(Unmet::Refused)?;
+    let unrewritable = rewritten(&fetched.stage, &items, &trees).map_err(Unmet::Refused)?;
     let unrewritten: HashSet<&str> = unrewritable.iter().map(|(path, _)| path.as_str()).collect();
-    let entries: Vec<Entry> = entries.into_iter().filter(|entry| !unrewritten.contains(entry.path.as_str())).collect();
+    let items: Vec<Item> = items.into_iter().filter(|item| !unrewritten.contains(item.entry.path.as_str())).collect();
     skipped.extend(unrewritable);
     let raise = attempt.call.interrupt.filter(|_| attempt.raises_at(INSTALL));
-    let total = entries.len();
+    let total = items.len();
     // The file time the moves begin at, from which the racy rule keeps the hash of a file written long enough before.
     let started = file_time_now();
-    let moves = moved((&fetched.stage, &root), &entries, fetched.manifest, fetched.snapshot, |done| {
+    let moves = moved((&fetched.stage, &root), &items, fetched.manifest, fetched.snapshot, |done| {
         if done == 1
             && let Some(interrupt) = raise
         {
@@ -467,16 +473,34 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
 /// member whose path is `log`, the run's log as a `/`-separated path relative to the worktree, or that path with `.err`
 /// after it, compared without regard to ASCII letter case ([`is_run_log`]). A log outside the worktree (`None`) skips
 /// nothing.
-fn own_logs(entries: Vec<Entry>, log: Option<&str>) -> (Vec<Entry>, Vec<(String, Skip)>) {
-    let (own, kept): (Vec<Entry>, Vec<Entry>) = entries.into_iter().partition(|entry| is_run_log(&entry.path, log));
-    (kept, own.into_iter().map(|entry| (entry.path, Skip::OwnLog)).collect())
+fn own_logs<M: Member>(entries: Vec<M>, log: Option<&str>) -> (Vec<M>, Vec<(String, Skip)>) {
+    let (own, kept): (Vec<M>, Vec<M>) = entries.into_iter().partition(|member| is_run_log(&member.entry().path, log));
+    (kept, own.iter().map(|member| (member.entry().path.clone(), Skip::OwnLog)).collect())
+}
+
+/// A member of the archive as the install's checks read it: its entry, alone or in the list's item it was unpacked as.
+trait Member {
+    /// The member's entry.
+    fn entry(&self) -> &Entry;
+}
+
+impl Member for Entry {
+    fn entry(&self) -> &Entry {
+        self
+    }
+}
+
+impl Member for Item {
+    fn entry(&self) -> &Entry {
+        &self.entry
+    }
 }
 
 /// What the install skips of `entries`, below the worktree `root`, `in_use` being the paths of those whose PC file is in
 /// use or read-only: each member that counts as tracked and no `--bring-tracked` glob matches ([`tracked`]), its index
 /// read with one `git ls-files -z -s` over the whole of it, and each in use ([`reasons`]). An archive with no members
 /// asks git nothing. Else why the install is refused, or the interrupt ([`unmet_of`]).
-fn skips(attempt: &Attempt<'_, '_>, root: &Path, entries: &[Entry], in_use: &[String]) -> Result<Vec<(String, Skip)>, Unmet> {
+fn skips(attempt: &Attempt<'_, '_>, root: &Path, entries: &[impl Member], in_use: &[String]) -> Result<Vec<(String, Skip)>, Unmet> {
     if entries.is_empty() {
         return Ok(Vec::new());
     }
@@ -584,10 +608,11 @@ fn record_parts(record: &[u8]) -> Option<(&str, &[u8])> {
 
 /// The paths of the `entries` below the worktree `root` that count as tracked, but for those a `bring` glob matches:
 /// each `index` holds ([`Index::holds`]), and each below a folder holding a repository of its own ([`nested`]).
-fn tracked<'e>(index: &Index, root: &Path, entries: &'e [Entry], bring: &Globs) -> HashSet<&'e str> {
+fn tracked<'e, M: Member>(index: &Index, root: &Path, entries: &'e [M], bring: &Globs) -> HashSet<&'e str> {
     let mut seen = HashMap::new();
     entries
         .iter()
+        .map(Member::entry)
         .filter(|entry| !bring.matches(&entry.path) && (index.holds(&entry.path) || nested(root, &entry.path, &mut seen)))
         .map(|entry| entry.path.as_str())
         .collect()
@@ -614,9 +639,10 @@ fn holds_git(folder: &Path) -> bool {
 
 /// Each of `entries` the install skips and why, in order: one in `tracked` as tracked, whether or not it is also
 /// `in_use`, then one in `in_use` as in use.
-fn reasons(entries: &[Entry], tracked: &HashSet<&str>, in_use: &HashSet<&str>) -> Vec<(String, Skip)> {
+fn reasons(entries: &[impl Member], tracked: &HashSet<&str>, in_use: &HashSet<&str>) -> Vec<(String, Skip)> {
     entries
         .iter()
+        .map(Member::entry)
         .filter_map(|entry| {
             let skip = if tracked.contains(entry.path.as_str()) {
                 Skip::Tracked
@@ -677,15 +703,15 @@ pub(super) fn one_decimal(value: f64) -> String {
 
 /// Whether an unpack into the stage folder that ended as `unpacking` made the folder, which is then this run's to
 /// remove: not when the folder was there before, which the unpack refuses and leaves as it is.
-fn stage_made(unpacking: &Result<Vec<Entry>, UnpackError>) -> bool {
+fn stage_made<T>(unpacking: &Result<T, UnpackError>) -> bool {
     !matches!(unpacking, Err(error) if error.is_fault(io::ErrorKind::AlreadyExists))
 }
 
 /// Unpacks the archive `source` into the folder `stage`, which must not exist yet, to at most `limit` bytes, each copy
 /// it lists made from its member or from a file of `pc` whose bytes still hash to it, asking `pc`'s `go_on` before each
 /// read of the archive, before each copy and after each buffer a copy writes, and marking `stopped` once it says no.
-/// The entries of every path, else why not.
-fn unpacked(source: impl Read, stage: &Path, limit: u64, pc: &PcFiles<'_>, stopped: &Cell<bool>) -> Result<Vec<Entry>, UnpackError> {
+/// The list's item of every path, which says whether the run wrote it, else why not.
+fn unpacked(source: impl Read, stage: &Path, limit: u64, pc: &PcFiles<'_>, stopped: &Cell<bool>) -> Result<Vec<Item>, UnpackError> {
     let go_on = || {
         let on = (pc.go_on)();
         if !on {
@@ -727,8 +753,8 @@ struct Checked {
 /// together ([`Refused::changed`]), of the kind [`Kind::PcChanged`] when every one of them is a PC file that changed
 /// during the run and [`Kind::Transient`] when one was deleted, is not a file or cannot be read.
 /// What the checks found ([`Checked`]).
-fn checked(root: &Path, entries: &[Entry], globs: &Globs, manifest: &Manifest) -> Result<Checked, Refused> {
-    if let Some(outside) = entries.iter().find(|entry| !globs.matches(&entry.path)) {
+fn checked(root: &Path, entries: &[impl Member], globs: &Globs, manifest: &Manifest) -> Result<Checked, Refused> {
+    if let Some(outside) = entries.iter().map(Member::entry).find(|entry| !globs.matches(&entry.path)) {
         return Err(Refused::deterministic(format!(
             "the archive member {} is not under the output globs",
             outside.path
@@ -737,7 +763,7 @@ fn checked(root: &Path, entries: &[Entry], globs: &Globs, manifest: &Manifest) -
     let mut checks = Checked::default();
     let mut found = Vec::new();
     let mut kind = Kind::PcChanged;
-    for entry in entries {
+    for entry in entries.iter().map(Member::entry) {
         match pc_file(root, entry, manifest) {
             Ok(Pc::AsHeld) if !writable(root, entry) => checks.in_use.push(entry.path.clone()),
             Ok(Pc::AsHeld) => {}
@@ -819,13 +845,13 @@ fn writable(root: &Path, entry: &Entry) -> bool {
 /// records a root ([`records_a_root`]), as [`rewrite_file`] does: the paths, in order, of those that are not text the
 /// install can rewrite, each with its [`Skip`], since one installed as it stands would keep the box's paths; else why
 /// one cannot be read or written.
-fn rewritten(stage: &Path, entries: &[Entry], trees: &[(String, String)]) -> Result<Vec<(String, Skip)>, Refused> {
+fn rewritten(stage: &Path, entries: &[impl Member], trees: &[(String, String)]) -> Result<Vec<(String, Skip)>, Refused> {
     let trees: Vec<(String, String)> = trees
         .iter()
         .map(|(tree, pc_root)| (tree.trim_end_matches('\\').to_owned(), pc_root.trim_end_matches('\\').to_owned()))
         .collect();
     let mut skipped = Vec::new();
-    for entry in entries.iter().filter(|entry| records_a_root(&entry.path)) {
+    for entry in entries.iter().map(Member::entry).filter(|entry| records_a_root(&entry.path)) {
         match rewrite_file(&below(stage, &entry.path), &entry.path, &trees) {
             Ok(()) => {}
             Err(CannotRewrite::Skipped(why)) => skipped.push((entry.path.clone(), Skip::Unrewritable(why))),
@@ -1034,30 +1060,32 @@ struct Moves {
     in_use: Vec<String>,
 }
 
-/// Moves each of `entries` from `stage` into place below `root`, as [`move_one`] does against `manifest`, each file moved
-/// taking as its last write the `snapshot` time, or this PC's clock as the moves begin when that is earlier, asking
+/// Moves each of `items` from `stage` into place below `root`, as [`move_one`] does against `manifest`, asking
 /// `go_on`, given the files moved so far, before each one; else the interrupt once `go_on` says no, or why a file
-/// failed, the files handled before it counted and left in place. A member whose PC file changed after the checks
-/// ([`Placed::Changed`]) ends them as [`Unmoved::PcChanged`] when none was moved yet, and as the failure naming it
-/// otherwise. What the moves did ([`Moves`]); a member left in place ([`Placed::InPlace`]) is in neither list.
+/// failed, the files handled before it counted and left in place. Each file the run wrote ([`Wrote::ThisRun`]) takes as
+/// its last write the `snapshot` time, or this PC's clock as the moves begin when that is earlier; each written before
+/// it ([`Wrote::Earlier`]) keeps the box's last write when that is earlier still. A member whose PC file changed after the
+/// checks ([`Placed::Changed`]) ends them as [`Unmoved::PcChanged`] when none was moved yet, and as the failure naming
+/// it otherwise. What the moves did ([`Moves`]); a member left in place ([`Placed::InPlace`]) is in neither list.
 fn moved(
     (stage, root): (&Path, &Path),
-    entries: &[Entry],
+    items: &[Item],
     manifest: &Manifest,
     snapshot: SystemTime,
     mut go_on: impl FnMut(usize) -> bool,
 ) -> Result<Moves, Unmoved> {
     let stamped = snapshot.min(SystemTime::now());
-    let total = entries.len();
+    let total = items.len();
     let mut moves = Moves {
         moved: Vec::with_capacity(total),
         in_use: Vec::new(),
     };
-    for (done, entry) in entries.iter().enumerate() {
+    for (done, item) in items.iter().enumerate() {
         if !go_on(done) {
             return Err(Unmoved::Interrupted { done });
         }
-        let placed = move_one(stage, root, entry, manifest, stamped)
+        let entry = &item.entry;
+        let placed = move_one(stage, root, item, manifest, stamped)
             .map_err(|error| Unmoved::Failed(format!("{done} of {total} files were installed before {} failed: {error}", entry.path)))?;
         match placed {
             Placed::Moved(stamp) => moves.moved.push(Moved { entry: entry.clone(), stamp }),
@@ -1094,19 +1122,22 @@ enum Placed {
     Changed,
 }
 
-/// Moves the staged file of `entry` below `stage` to the same path below `root`, replacing a file there, each folder
+/// Moves the staged file of `item` below `stage` to the same path below `root`, replacing a file there, each folder
 /// between `root` and it made when missing and refused when it is a link, a junction or not a folder. Its last write is
-/// set to `stamped` in the stage, before the move, whatever the box wrote; the PC's file is then checked against `manifest`
-/// once more ([`pc_file`]), just before the move, and one in place is left ([`Placed::InPlace`]): one already holding the
-/// member's bytes, or one recording a root that a PC writer changed or made. One that changed is [`Placed::Changed`], and
-/// one the PC deleted during the run is the failure saying so. Any member whose rename is refused because
+/// set in the stage, before the move: to `stamped` when the run wrote it ([`Wrote::ThisRun`]), whatever the box wrote;
+/// else to the box's last write the unpack gave the staged file, or `stamped` when that is earlier, a failure to read
+/// it the failure. The PC's file is then checked against `manifest` once more ([`pc_file`]), just before the move, and
+/// one in place is left ([`Placed::InPlace`]): one already holding the member's bytes, or one recording a root that a
+/// PC writer changed or made. One that changed is [`Placed::Changed`], and one the PC deleted during the run is the
+/// failure saying so. Any member whose rename is refused because
 /// something holds a file open ([`held_open`]) is not moved when its PC file is the one held, as it is when that file
 /// cannot be opened for deletion ([`held_against_replacing`]) ([`Placed::InUse`]); else the rename is tried once more,
 /// and its error, a held staged file's included, is the failure. Any other rename error is the failure at once.
 /// The stamp read after the move through a handle opened on the staged file before it, `stamped` included, is returned:
 /// the moved file's own, never that of a file put at its path after the move. None when the handle cannot be opened or
 /// read, which costs the file its hash cache entry only.
-fn move_one(stage: &Path, root: &Path, entry: &Entry, manifest: &Manifest, stamped: SystemTime) -> io::Result<Placed> {
+fn move_one(stage: &Path, root: &Path, item: &Item, manifest: &Manifest, stamped: SystemTime) -> io::Result<Placed> {
+    let entry = &item.entry;
     let path = entry.path.as_str();
     let source = below(stage, path);
     let (parents, _) = path.rsplit_once('/').unwrap_or(("", path));
@@ -1119,10 +1150,16 @@ fn move_one(stage: &Path, root: &Path, entry: &Entry, manifest: &Manifest, stamp
         }
     }
     // Its attributes alone: a handle open on the staged file, sharing its deletion, then neither refuses nor is moved.
-    OpenOptions::new()
-        .access_mode(FILE_WRITE_ATTRIBUTES)
-        .open(&source)?
-        .set_modified(stamped)?;
+    let staged = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+        .open(&source)?;
+    // The unpack set the box's last write on the staged file; one the run did not write keeps it when it is earlier.
+    let last_write = match item.wrote {
+        Wrote::ThisRun => stamped,
+        Wrote::Earlier => staged.metadata()?.modified()?.min(stamped),
+    };
+    staged.set_modified(last_write)?;
+    drop(staged);
     // A file refused here was checked before the moves; one that changed in between is [`Placed::Changed`], which ends a
     // run whose moves began with none as the checks' own refusal did, one deleted in between is the failure saying so,
     // and one in place is left as it is.
@@ -1215,8 +1252,10 @@ mod tests {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use gate_inputs::archive::{Item, WINDOW_LOG_MAX};
+    use gate_inputs::pack::Packer;
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
     use super::outputs::Narrowed;
@@ -1229,7 +1268,7 @@ mod tests {
     use crate::outputs::cache::{HashCache, file_time_now};
     use crate::outputs::glob::Globs;
     use crate::outputs::hash::{file_sha256, sha256_of};
-    use crate::outputs::manifest::{Chosen, Held, HeldBy, Manifest};
+    use crate::outputs::manifest::{Chosen, Held, HeldBy, Manifest, Wrote};
     use crate::outputs::walk::{Stamp, walk};
     use crate::remote::client::End;
     use crate::remote::git::GitError;
@@ -1280,6 +1319,18 @@ mod tests {
             size,
             sha256,
         }
+    }
+
+    /// The list's items of `entries`, each a member the run wrote.
+    fn this_run(entries: &[Entry]) -> Vec<Item> {
+        entries
+            .iter()
+            .map(|entry| Item {
+                entry: entry.clone(),
+                copy: None,
+                wrote: Wrote::ThisRun,
+            })
+            .collect()
     }
 
     /// The stamp of the file at `full`.
@@ -2084,7 +2135,8 @@ mod tests {
         fs::create_dir_all(root.join("bin").join("b.txt")).expect("a folder in the file's place");
         let entries = [entry("bin/a.txt"), entry("bin/b.txt"), entry("bin/c.txt")];
 
-        let unmoved = moved((&stage, &root), &entries, &Manifest::default(), an_hour_ago(), |_| true).expect_err("b cannot be moved over a folder");
+        let unmoved =
+            moved((&stage, &root), &this_run(&entries), &Manifest::default(), an_hour_ago(), |_| true).expect_err("b cannot be moved over a folder");
 
         let reason = failure(unmoved);
         assert!(reason.starts_with("1 of 3 files were installed before bin/b.txt failed: "), "{reason}");
@@ -2101,7 +2153,7 @@ mod tests {
         fs::create_dir_all(&root).expect("the root can be made");
         let entries = [entry("bin/a.txt"), entry("bin/b.txt")];
 
-        let unmoved = moved((&stage, &root), &entries, &Manifest::default(), an_hour_ago(), |done| done < 1);
+        let unmoved = moved((&stage, &root), &this_run(&entries), &Manifest::default(), an_hour_ago(), |done| done < 1);
 
         assert_eq!(unmoved, Err(Unmoved::Interrupted { done: 1 }));
         assert_eq!(files_below(&root), ["bin/a.txt"]);
@@ -2128,8 +2180,14 @@ mod tests {
         fs::create_dir_all(&outside).expect("the outside folder can be made");
         junction(&root.join("bin"), &outside);
 
-        let unmoved =
-            moved((&stage, &root), &[entry("bin/a.txt")], &Manifest::default(), an_hour_ago(), |_| true).expect_err("the junction is refused");
+        let unmoved = moved(
+            (&stage, &root),
+            &this_run(&[entry("bin/a.txt")]),
+            &Manifest::default(),
+            an_hour_ago(),
+            |_| true,
+        )
+        .expect_err("the junction is refused");
 
         let reason = failure(unmoved);
         assert!(reason.starts_with("0 of 1 files were installed before bin/a.txt failed: "), "{reason}");
@@ -2141,13 +2199,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_box_last_write_either_side_of_this_clock_gives_way_to_the_snapshot_time() {
-        let folder = scratch("move-clamp");
-        let (stage, root) = (folder.join("stage"), folder.join("root"));
-        let ahead = put(&stage, "bin/ahead.txt", b"a");
-        let behind = put(&stage, "bin/behind.txt", b"b");
-        fs::create_dir_all(&root).expect("the root can be made");
+    /// Stages `bin/ahead.txt`, last written three hours past this clock, and `bin/behind.txt`, three hours before it,
+    /// below `stage`, and makes `root`; the time `behind.txt` was given.
+    fn staged_either_side_of_this_clock(stage: &Path, root: &Path) -> SystemTime {
+        let ahead = put(stage, "bin/ahead.txt", b"a");
+        let behind = put(stage, "bin/behind.txt", b"b");
+        fs::create_dir_all(root).expect("the root can be made");
         let past = SystemTime::now() - Duration::from_hours(3);
         for (full, time) in [(&ahead, SystemTime::now() + Duration::from_hours(3)), (&behind, past)] {
             File::options()
@@ -2156,13 +2213,53 @@ mod tests {
                 .and_then(|file| file.set_modified(time))
                 .expect("the last write can be set");
         }
+        past
+    }
+
+    #[test]
+    fn a_box_last_write_either_side_of_this_clock_gives_way_to_the_snapshot_time() {
+        let folder = scratch("move-clamp");
+        let (stage, root) = (folder.join("stage"), folder.join("root"));
+        staged_either_side_of_this_clock(&stage, &root);
 
         let entries = [entry("bin/ahead.txt"), entry("bin/behind.txt")];
         let snapshot = an_hour_ago();
-        assert!(moved((&stage, &root), &entries, &Manifest::default(), snapshot, |_| true).is_ok());
+        assert!(moved((&stage, &root), &this_run(&entries), &Manifest::default(), snapshot, |_| true).is_ok());
 
-        assert_eq!(modified(&root.join("bin").join("ahead.txt")), snapshot, "a box write ahead of this clock");
-        assert_eq!(modified(&root.join("bin").join("behind.txt")), snapshot, "a box write behind it");
+        assert_eq!(
+            modified(&root.join("bin").join("ahead.txt")),
+            snapshot,
+            "a written box write ahead of this clock"
+        );
+        assert_eq!(modified(&root.join("bin").join("behind.txt")), snapshot, "a written box write behind it");
+    }
+
+    #[test]
+    fn a_file_the_run_did_not_write_keeps_its_box_time_clamped_to_the_snapshot_and_now() {
+        let folder = scratch("move-unwritten");
+        let (stage, root) = (folder.join("stage"), folder.join("root"));
+        let past = staged_either_side_of_this_clock(&stage, &root);
+        let items: Vec<Item> = this_run(&[entry("bin/ahead.txt"), entry("bin/behind.txt")])
+            .into_iter()
+            .map(|item| Item {
+                wrote: Wrote::Earlier,
+                ..item
+            })
+            .collect();
+
+        let snapshot = an_hour_ago();
+        assert!(moved((&stage, &root), &items, &Manifest::default(), snapshot, |_| true).is_ok());
+
+        assert_eq!(
+            modified(&root.join("bin").join("ahead.txt")),
+            snapshot,
+            "a box write ahead of this clock gives way to the snapshot time"
+        );
+        assert_eq!(
+            modified(&root.join("bin").join("behind.txt")),
+            past,
+            "a box write before the snapshot is kept"
+        );
     }
 
     #[test]
@@ -2183,7 +2280,7 @@ mod tests {
         let kept = modified(&in_place);
         let entries = [entry("bin/a.txt"), member("bin/b.txt", b"box")];
 
-        let moves = moved((&stage, &root), &entries, &Manifest::default(), snapshot, |_| true).expect("the files are handled");
+        let moves = moved((&stage, &root), &this_run(&entries), &Manifest::default(), snapshot, |_| true).expect("the files are handled");
 
         let paths: Vec<&str> = moves.moved.iter().map(|moved| moved.entry.path.as_str()).collect();
         assert_eq!(paths, ["bin/a.txt"], "b is left in place: {moves:?}");
@@ -2196,7 +2293,7 @@ mod tests {
 
         put(&stage, "bin/c.txt", b"box");
         let future = SystemTime::now() + Duration::from_hours(3);
-        moved((&stage, &root), &[entry("bin/c.txt")], &Manifest::default(), future, |_| true).expect("c is moved");
+        moved((&stage, &root), &this_run(&[entry("bin/c.txt")]), &Manifest::default(), future, |_| true).expect("c is moved");
         let clamped = modified(&root.join("bin").join("c.txt"));
         assert!(clamped < future, "a snapshot time past this clock is clamped to it: {clamped:?}");
         assert!(clamped <= SystemTime::now(), "clamped to this clock: {clamped:?}");
@@ -2253,7 +2350,7 @@ mod tests {
         use super::{put, scratch};
         use crate::outputs::archive::pack;
         use crate::outputs::glob::Globs;
-        use crate::outputs::manifest::{Chosen, HeldBy, Manifest};
+        use crate::outputs::manifest::{Chosen, HeldBy, Manifest, Wrote};
         use crate::outputs::walk::walk;
         use crate::remote::client::{Attempt, End};
         use crate::remote::outputs::{Archive, Narrowed};
@@ -2384,7 +2481,7 @@ mod tests {
             let archive = folder.join("outputs.tar.zst");
             let file = File::create(&archive).expect("the archive can be made");
             let found = walk(&source, &Globs::new(&["**".to_owned()]).expect("a glob")).expect("the source is walked");
-            let chosen: Vec<Chosen<'_>> = found.iter().map(Chosen::from).collect();
+            let chosen: Vec<Chosen<'_>> = found.iter().map(|file| Chosen::new(file, Wrote::ThisRun)).collect();
             pack(file, &source, &chosen, &HeldBy::new()).expect("the archive is packed");
             let state = folder.join("state");
             fs::create_dir_all(state.join("remote")).expect("the remote folder can be made");
@@ -2542,9 +2639,15 @@ mod tests {
         aged(&put(&stage, "bin/a.txt", b"box"), Duration::from_hours(2));
         fs::create_dir_all(&root).expect("the root can be made");
 
-        let moved = moved((&stage, &root), &[entry("bin/a.txt")], &Manifest::default(), an_hour_ago(), |_| true)
-            .expect("the file is moved")
-            .moved;
+        let moved = moved(
+            (&stage, &root),
+            &this_run(&[entry("bin/a.txt")]),
+            &Manifest::default(),
+            an_hour_ago(),
+            |_| true,
+        )
+        .expect("the file is moved")
+        .moved;
 
         assert_eq!(moved.len(), 1, "{moved:?}");
         assert_eq!(moved[0].entry.path, "bin/a.txt");
@@ -2565,11 +2668,23 @@ mod tests {
         // Taken before the moves, as the install takes it: the clamp to this clock then falls at or after it.
         let started = file_time_now();
         let future = SystemTime::now() + Duration::from_hours(3);
-        let mut moved_files = moved((&stage, &root), &[entry("bin/ahead.txt")], &Manifest::default(), future, |_| true)
-            .expect("the file of a snapshot time ahead is moved")
-            .moved;
-        let behind = moved((&stage, &root), &[entry("bin/behind.txt")], &Manifest::default(), an_hour_ago(), |_| true)
-            .expect("the file of a snapshot time behind is moved");
+        let mut moved_files = moved(
+            (&stage, &root),
+            &this_run(&[entry("bin/ahead.txt")]),
+            &Manifest::default(),
+            future,
+            |_| true,
+        )
+        .expect("the file of a snapshot time ahead is moved")
+        .moved;
+        let behind = moved(
+            (&stage, &root),
+            &this_run(&[entry("bin/behind.txt")]),
+            &Manifest::default(),
+            an_hour_ago(),
+            |_| true,
+        )
+        .expect("the file of a snapshot time behind is moved");
         moved_files.extend(behind.moved);
         let moved = moved_files;
         let clamped = moved
@@ -2601,7 +2716,7 @@ mod tests {
         }
         fs::create_dir_all(&root).expect("the root can be made");
         let entries: Vec<Entry> = paths.iter().map(|path| entry(path)).collect();
-        let moved = moved((&stage, &root), &entries, &Manifest::default(), an_hour_ago(), |_| true)
+        let moved = moved((&stage, &root), &this_run(&entries), &Manifest::default(), an_hour_ago(), |_| true)
             .expect("every file is moved")
             .moved;
         let path = cache_path(&folder);
@@ -2621,9 +2736,15 @@ mod tests {
         let (stage, root) = (folder.join("stage"), folder.join("root"));
         aged(&put(&stage, "bin/a.txt", b"a"), Duration::from_hours(2));
         fs::create_dir_all(&root).expect("the root can be made");
-        let moved = moved((&stage, &root), &[entry("bin/a.txt")], &Manifest::default(), an_hour_ago(), |_| true)
-            .expect("the file is moved")
-            .moved;
+        let moved = moved(
+            (&stage, &root),
+            &this_run(&[entry("bin/a.txt")]),
+            &Manifest::default(),
+            an_hour_ago(),
+            |_| true,
+        )
+        .expect("the file is moved")
+        .moved;
         let mut installed = installed_of(moved);
         installed.skipped = vec![("bin/held.dll".to_owned(), Skip::InUse)];
         let path = cache_path(&folder);
@@ -2653,7 +2774,13 @@ mod tests {
             .expect("the file can be held");
 
         let snapshot = an_hour_ago();
-        let result = moved((&stage, &root), &[entry("bin/ahead.txt")], &Manifest::default(), snapshot, |_| true);
+        let result = moved(
+            (&stage, &root),
+            &this_run(&[entry("bin/ahead.txt")]),
+            &Manifest::default(),
+            snapshot,
+            |_| true,
+        );
         drop(held);
 
         assert!(result.is_ok(), "{result:?}");
@@ -2670,7 +2797,7 @@ mod tests {
         let manifest = manifest_of(&root, &["bin/b.txt"]);
         let entries = [entry("bin/a.txt"), entry("bin/b.txt")];
 
-        let unmoved = moved((&stage, &root), &entries, &manifest, an_hour_ago(), |done| {
+        let unmoved = moved((&stage, &root), &this_run(&entries), &manifest, an_hour_ago(), |done| {
             if done == 1 {
                 fs::write(&pc, b"edited after the checks").expect("the file can be written");
             }
@@ -2692,7 +2819,7 @@ mod tests {
         let manifest = manifest_of(&root, &["bin/a.txt"]);
         let entries = [entry("bin/a.txt")];
 
-        let unmoved = moved((&stage, &root), &entries, &manifest, an_hour_ago(), |done| {
+        let unmoved = moved((&stage, &root), &this_run(&entries), &manifest, an_hour_ago(), |done| {
             if done == 0 {
                 fs::write(&pc, b"edited after the checks").expect("the file can be written");
             }
@@ -2715,7 +2842,7 @@ mod tests {
         fs::write(&roots, b"the PC writer's roots").expect("the file can be written");
         let entries = [member("bin/.msCoverageSourceRootsMapping_X", b"box"), entry("bin/b.txt")];
 
-        let unmoved = moved((&stage, &root), &entries, &manifest, an_hour_ago(), |done| {
+        let unmoved = moved((&stage, &root), &this_run(&entries), &manifest, an_hour_ago(), |done| {
             if done == 1 {
                 fs::write(&pc, b"edited after the checks").expect("the file can be written");
             }
@@ -2736,7 +2863,7 @@ mod tests {
         let manifest = manifest_of(&root, &["bin/b.txt"]);
         let entries = [entry("bin/a.txt"), member("bin/b.txt", b"box")];
 
-        let installed = moved((&stage, &root), &entries, &manifest, an_hour_ago(), |done| {
+        let installed = moved((&stage, &root), &this_run(&entries), &manifest, an_hour_ago(), |done| {
             if done == 1 {
                 fs::write(&pc, b"box").expect("the file can be written");
             }
@@ -2763,7 +2890,7 @@ mod tests {
         let manifest = manifest_of(&root, &["bin/b.txt"]);
         let entries = [entry("bin/a.txt"), member("bin/b.txt", b"box")];
 
-        let unmoved = moved((&stage, &root), &entries, &manifest, an_hour_ago(), |done| {
+        let unmoved = moved((&stage, &root), &this_run(&entries), &manifest, an_hour_ago(), |done| {
             if done == 1 {
                 fs::write(&pc, b"xyz").expect("the file can be written");
             }
@@ -2781,7 +2908,7 @@ mod tests {
         let source = folder.join("source");
         put(&source, "bin/a.txt", b"a");
         let found = walk(&source, &Globs::new(&["**".to_owned()]).expect("a glob")).expect("the walk");
-        let chosen: Vec<Chosen<'_>> = found.iter().map(Chosen::from).collect();
+        let chosen: Vec<Chosen<'_>> = found.iter().map(|file| Chosen::new(file, Wrote::ThisRun)).collect();
         let mut archive = Vec::new();
         pack(&mut archive, &source, &chosen, &HeldBy::new()).expect("the file packs");
         let stage = folder.join("stage");
@@ -3084,7 +3211,7 @@ mod tests {
 
         assert_eq!(checked(&root, &entries, &bin_globs(), &manifest), Ok(Checked::default()));
         assert_eq!(rewritten(&stage, &entries, &one_tree()), Ok(Vec::new()));
-        let installed = moved((&stage, &root), &entries, &manifest, an_hour_ago(), |_| true);
+        let installed = moved((&stage, &root), &this_run(&entries), &manifest, an_hour_ago(), |_| true);
 
         let paths: Vec<&str> = installed
             .as_ref()
@@ -3121,7 +3248,7 @@ mod tests {
     /// on for reading, with the sharing paired with it; what the moves returned.
     fn moved_holding(stage: &Path, root: &Path, entries: &[Entry], manifest: &Manifest, holds: &[(&Path, u32)]) -> Result<Moves, Unmoved> {
         let mut held = Vec::new();
-        let installed = moved((stage, root), entries, manifest, an_hour_ago(), |done| {
+        let installed = moved((stage, root), &this_run(entries), manifest, an_hour_ago(), |done| {
             if done == 1 {
                 for (full, sharing) in holds {
                     let file = fs::OpenOptions::new()
@@ -3238,7 +3365,7 @@ mod tests {
             entry("bin/b.txt"),
         ];
 
-        let unmoved = moved((&stage, &root), &entries, &manifest, an_hour_ago(), |done| {
+        let unmoved = moved((&stage, &root), &this_run(&entries), &manifest, an_hour_ago(), |done| {
             if done == 2 {
                 fs::write(&pc, b"edited after the checks").expect("the file can be written");
             }
@@ -3274,7 +3401,7 @@ mod tests {
         let manifest = manifest_of(&root, &["bin/.msCoverageSourceRootsMapping_X"]);
         let entries = [entry("bin/a.txt"), member("bin/.msCoverageSourceRootsMapping_X", b"the builder's roots")];
 
-        let installed = moved((&stage, &root), &entries, &manifest, an_hour_ago(), |done| {
+        let installed = moved((&stage, &root), &this_run(&entries), &manifest, an_hour_ago(), |done| {
             if done == 1 {
                 fs::write(&pc, b"the PC writer's roots").expect("the file can be written");
             }
@@ -3349,7 +3476,7 @@ mod tests {
         random_file(&source.join("bin").join("large.bin"), LARGE);
         let found = walk(&source, &Globs::new(&["**".to_owned()]).expect("a glob")).expect("the walk");
         let archive = folder.join("archive.tar.zst");
-        let chosen: Vec<Chosen<'_>> = found.iter().map(Chosen::from).collect();
+        let chosen: Vec<Chosen<'_>> = found.iter().map(|file| Chosen::new(file, Wrote::ThisRun)).collect();
         pack(File::create(&archive).expect("the archive can be made"), &source, &chosen, &HeldBy::new()).expect("the file packs");
         let stage = folder.join("stage");
         let target = stage.join("bin").join("large.bin");
@@ -3361,9 +3488,9 @@ mod tests {
             widest: &widest,
         };
 
-        let entries = unpacked_from(watched, &stage, &folder, &Manifest::default()).expect("the archive unpacks");
+        let items = unpacked_from(watched, &stage, &folder, &Manifest::default()).expect("the archive unpacks");
 
-        assert_eq!(entries.iter().map(|entry| entry.size).collect::<Vec<_>>(), [LARGE]);
+        assert_eq!(items.iter().map(|item| item.entry.size).collect::<Vec<_>>(), [LARGE]);
         assert!(widest.get() <= HELD_BACK, "the unpack held back {} bytes", widest.get());
     }
 
@@ -3373,7 +3500,7 @@ mod tests {
         let source = folder.join("source");
         put(&source, "bin/a.txt", b"a");
         let found = walk(&source, &Globs::new(&["**".to_owned()]).expect("a glob")).expect("the walk");
-        let chosen: Vec<Chosen<'_>> = found.iter().map(Chosen::from).collect();
+        let chosen: Vec<Chosen<'_>> = found.iter().map(|file| Chosen::new(file, Wrote::ThisRun)).collect();
         let mut archive = Vec::new();
         pack(&mut archive, &source, &chosen, &HeldBy::new()).expect("the file packs");
         let stopped = Cell::new(false);
@@ -3393,13 +3520,82 @@ mod tests {
 
     /// `unpacked` of `source` into `stage` under the box's budget, never stopped, each copy from its member or from
     /// the file below `root` that `manifest` holds with its bytes.
-    fn unpacked_from(source: impl Read, stage: &Path, root: &Path, manifest: &Manifest) -> Result<Vec<Entry>, UnpackError> {
+    fn unpacked_from(source: impl Read, stage: &Path, root: &Path, manifest: &Manifest) -> Result<Vec<Item>, UnpackError> {
         let pc = PcFiles {
             root,
             manifest,
             go_on: &|| true,
         };
         unpacked(source, stage, OUTPUTS_BUDGET, &pc, &Cell::new(false))
+    }
+
+    /// The archive `archive` unpacked into `stage` and moved into place below `root`, which holds no file of it, as
+    /// the install does: each file the list marks unwritten moved as one the run did not write, against `snapshot`.
+    fn installed_from(archive: &[u8], stage: &Path, root: &Path, snapshot: SystemTime) -> Moves {
+        let manifest = Manifest::default();
+        let items = unpacked_from(archive, stage, root, &manifest).expect("the archive unpacks");
+        moved((stage, root), &items, &manifest, snapshot, |_| true).expect("the files move")
+    }
+
+    /// The last write a file the run did not write is listed or packed with, in seconds since 1970: well before any
+    /// snapshot a test takes.
+    const BOX_WRITTEN: u64 = 1_700_000_000;
+
+    #[test]
+    fn a_listed_copy_the_run_did_not_write_keeps_its_listed_time() {
+        let folder = scratch("unwritten-copy");
+        let root = folder.join("pc");
+        fs::create_dir_all(&root).expect("the root can be made");
+        let (sha256, size) = sha256_of(&b"same"[..]).expect("bytes hash");
+        let mut archive = Vec::new();
+        let mut packer = Packer::new(&mut archive, WINDOW_LOG_MAX).expect("a packer");
+        packer
+            .add("bin/a.dll", size, BOX_WRITTEN - 100, &b"same"[..], Wrote::ThisRun)
+            .expect("a packs");
+        packer
+            .copy("bin/b.dll", size, BOX_WRITTEN, &sha256, Wrote::Earlier)
+            .expect("the copy is listed");
+        packer.finish().expect("the archive ends");
+        let snapshot = an_hour_ago();
+
+        let moves = installed_from(&archive, &folder.join("stage"), &root, snapshot);
+
+        assert_eq!(moves.moved.len(), 2, "{moves:?}");
+        assert_eq!(modified(&root.join("bin").join("a.dll")), snapshot, "the member the run wrote");
+        assert_eq!(
+            modified(&root.join("bin").join("b.dll")),
+            UNIX_EPOCH + Duration::from_secs(BOX_WRITTEN),
+            "the copy the run did not write keeps its listed last write"
+        );
+    }
+
+    #[test]
+    fn an_archive_without_unwritten_marks_installs_every_file_with_the_snapshot_time() {
+        let folder = scratch("unmarked-archive");
+        let (source, root) = (folder.join("box"), folder.join("pc"));
+        for path in ["bin/a.dll", "bin/b.dll"] {
+            let full = put(&source, path, path.as_bytes());
+            File::options()
+                .write(true)
+                .open(&full)
+                .and_then(|file| file.set_modified(UNIX_EPOCH + Duration::from_secs(BOX_WRITTEN)))
+                .expect("the last write can be set");
+        }
+        fs::create_dir_all(&root).expect("the root can be made");
+        let found = walk(&source, &Globs::new(&["**".to_owned()]).expect("a glob")).expect("the walk");
+        let chosen: Vec<Chosen<'_>> = found.iter().map(|file| Chosen::new(file, Wrote::ThisRun)).collect();
+        let mut archive = Vec::new();
+        pack(&mut archive, &source, &chosen, &HeldBy::new()).expect("the files pack");
+        let tar = zstd::decode_all(&archive[..]).expect("the archive decompresses");
+        assert!(!tar.windows(9).any(|bytes| bytes == b"unwritten"), "the list marks no file");
+        let snapshot = an_hour_ago();
+
+        let moves = installed_from(&archive, &folder.join("stage"), &root, snapshot);
+
+        assert_eq!(moves.moved.len(), 2, "{moves:?}");
+        for path in ["a.dll", "b.dll"] {
+            assert_eq!(modified(&root.join("bin").join(path)), snapshot, "{path}");
+        }
     }
 
     /// A manifest holding each of `paths` below `root` with its stamp and its SHA-256 now.
@@ -3425,6 +3621,7 @@ mod tests {
             .map(|file| Chosen {
                 file,
                 sha256: Some(file_sha256(&file.full).expect("the file hashes")),
+                wrote: Wrote::ThisRun,
             })
             .collect();
         let mut archive = Vec::new();
@@ -3444,11 +3641,11 @@ mod tests {
         let archive = deduplicated(&source, &manifest);
         let stage = folder.join("stage");
 
-        let entries = unpacked_from(&archive[..], &stage, &root, &manifest).expect("the archive unpacks");
+        let items = unpacked_from(&archive[..], &stage, &root, &manifest).expect("the archive unpacks");
 
-        let paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+        let paths: Vec<&str> = items.iter().map(|item| item.entry.path.as_str()).collect();
         assert_eq!(paths, ["bin/new.dll", "bin/other.dll"], "the copy is listed with the member");
-        moved((&stage, &root), &entries, &manifest, an_hour_ago(), |_| true).expect("the files move");
+        moved((&stage, &root), &items, &manifest, an_hour_ago(), |_| true).expect("the files move");
         assert_eq!(fs::read(root.join("bin").join("new.dll")).expect("the copy is installed"), b"kept");
         assert_eq!(fs::read(root.join("bin").join("other.dll")).expect("the member is installed"), b"fresh");
         assert_eq!(fs::read(root.join("bin").join("held.dll")).expect("the source stays"), b"kept");
@@ -3490,9 +3687,9 @@ mod tests {
         put(&root, "bin/a.dll", b"knot");
         let stage = folder.join("stage");
 
-        let entries = unpacked_from(&archive[..], &stage, &root, &manifest).expect("the second path holds the content");
+        let items = unpacked_from(&archive[..], &stage, &root, &manifest).expect("the second path holds the content");
 
-        assert_eq!(entries.len(), 1);
+        assert_eq!(items.len(), 1);
         assert_eq!(fs::read(stage.join("bin").join("new.dll")).expect("the copy was made"), b"kept");
     }
 
@@ -3513,9 +3710,9 @@ mod tests {
         assert_ne!(stamp(&held), manifest.get("bin/held.dll").expect("held").stamp, "the source was touched");
         let stage = folder.join("stage");
 
-        let entries = unpacked_from(&archive[..], &stage, &root, &manifest).expect("the same bytes are a source");
+        let items = unpacked_from(&archive[..], &stage, &root, &manifest).expect("the same bytes are a source");
 
-        moved((&stage, &root), &entries, &manifest, an_hour_ago(), |_| true).expect("the copy moves");
+        moved((&stage, &root), &items, &manifest, an_hour_ago(), |_| true).expect("the copy moves");
         assert_eq!(fs::read(root.join("bin").join("new.dll")).expect("the copy is installed"), b"kept");
     }
 
@@ -3528,10 +3725,10 @@ mod tests {
         put(&source, "b/bin/MvcTestingAppManifest.json", recorded(BOX_WORK).as_bytes());
         let archive = deduplicated(&source, &Manifest::default());
         let stage = folder.join("stage");
-        let entries = unpacked_from(&archive[..], &stage, &folder, &Manifest::default()).expect("the archive unpacks");
+        let items = unpacked_from(&archive[..], &stage, &folder, &Manifest::default()).expect("the archive unpacks");
         let read = |path: &str| fs::read_to_string(super::below(&stage, path)).expect("the staged file is there");
 
-        let skipped = rewritten(&stage, &entries[1..], &one_tree());
+        let skipped = rewritten(&stage, &items[1..], &one_tree());
 
         assert_eq!(skipped, Ok(Vec::new()));
         assert_eq!(read("b/bin/MvcTestingAppManifest.json"), recorded(PC_ROOT), "the copy is rewritten");
@@ -3540,7 +3737,7 @@ mod tests {
             recorded(BOX_WORK),
             "the member it was copied from is a file of its own"
         );
-        assert_eq!(rewritten(&stage, &entries[..1], &one_tree()), Ok(Vec::new()));
+        assert_eq!(rewritten(&stage, &items[..1], &one_tree()), Ok(Vec::new()));
         assert_eq!(read("a/bin/MvcTestingAppManifest.json"), recorded(PC_ROOT));
     }
 }

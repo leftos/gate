@@ -390,6 +390,77 @@ fn box_run_packs_the_files_the_pc_lacks_or_holds_otherwise() {
     );
 }
 
+/// The items of the list of the outputs archive at `path`, as its JSON holds them.
+fn archive_list(path: &Path) -> Vec<Value> {
+    let file = File::open(path).expect("the archive can be opened");
+    let decoder = zstd::stream::read::Decoder::new(file).expect("the archive is zstd");
+    let mut archive = tar::Archive::new(decoder);
+    let mut list = Vec::new();
+    for entry in archive.entries().expect("the archive is a tar stream") {
+        let mut entry = entry.expect("a member can be read");
+        if entry.path().expect("a member has a path").to_string_lossy() == ".gate-outputs.json" {
+            entry.read_to_end(&mut list).expect("the list can be read");
+        }
+    }
+    serde_json::from_slice(&list).expect("the list is a JSON array")
+}
+
+/// Each path the list of the outputs archive at `path` names, with its `"unwritten"` value when it has one.
+fn unwritten_marks(path: &Path) -> BTreeMap<String, Option<Value>> {
+    archive_list(path)
+        .iter()
+        .map(|item| {
+            let path = item["path"].as_str().expect("an item has a path").to_owned();
+            (path, item.get("unwritten").cloned())
+        })
+        .collect()
+}
+
+#[test]
+fn a_box_output_the_command_did_not_write_is_listed_unwritten() {
+    let case = Case::new("box_outputs_unwritten");
+    let mut first = outputs_payload(&case, &[FAKE_TOOL, "write", r"bin\old.txt", "old"], &["bin/**"]);
+    snapshot(&case, &mut first, &[IGNORE_BIN]);
+    let built = run_with_manifest(&case, &first, &manifest(&[]));
+    assert!(has_line(&built.stderr, &packed_line(&first, 1)), "{built:?}");
+
+    let mut second = renamed(&first, 1);
+    second["Command"] = json!([FAKE_TOOL, "write", r"bin\new.txt", "new"]);
+    let outcome = run_with_manifest(&case, &second, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(has_line(&outcome.stderr, &packed_line(&second, 2)), "{outcome:?}");
+    let expected: BTreeMap<String, Option<Value>> = [("bin/new.txt".to_owned(), None), ("bin/old.txt".to_owned(), Some(Value::Bool(true)))].into();
+    assert_eq!(
+        unwritten_marks(&archive_path(&second)),
+        expected,
+        "the file an earlier run left is marked unwritten; the one this command wrote carries no mark"
+    );
+}
+
+#[test]
+fn under_outputs_full_a_box_output_the_command_did_not_write_is_listed_unwritten() {
+    let case = Case::new("box_outputs_full_unwritten");
+    let mut first = outputs_payload(&case, &[FAKE_TOOL, "write", r"bin\old.txt", "old"], &["bin/**"]);
+    snapshot(&case, &mut first, &[IGNORE_BIN]);
+    let built = run_with_manifest(&case, &first, &manifest(&[]));
+    assert!(has_line(&built.stderr, &packed_line(&first, 1)), "{built:?}");
+
+    let mut full = renamed(&first, 1);
+    full["Command"] = json!([FAKE_TOOL, "out", "idle"]);
+    full["OutputsFull"] = json!(true);
+    let outcome = run_with_manifest(&case, &full, &manifest(&[("bin/old.txt", "pc-old")]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(has_line(&outcome.stderr, &packed_line(&full, 1)), "{outcome:?}");
+    let expected: BTreeMap<String, Option<Value>> = [("bin/old.txt".to_owned(), Some(Value::Bool(true)))].into();
+    assert_eq!(
+        unwritten_marks(&archive_path(&full)),
+        expected,
+        "OutputsFull sends the file an earlier run left, which the PC holds otherwise, marked unwritten"
+    );
+}
+
 #[test]
 fn a_glob_naming_test_results_packs_the_trx_below_it() {
     let case = Case::new("box_outputs_test_results");

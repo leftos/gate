@@ -3388,7 +3388,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     An outputs install that completes (no member skipped but ones it cannot rewrite) therefore also saves the hashes of the files it put in place, so the next run does not rehash them.
 
-    Each entry takes the stamp the installed file's handle reads after the move and the future-time clamp, with the SHA-256 the unpack verified against the box's manifest, under the 2 s rule below measured against the PC's clock when the moves began: a file clamped to the PC's clock is not kept. The stamp read after the move is the snapshot time (below), so a run that took over 2 s keeps its hashes under that rule.
+    Each entry takes the stamp the installed file's handle reads after the move and the future-time clamp, with the SHA-256 the unpack verified against the box's manifest, under the 2 s rule below measured against the PC's clock when the moves began: a file clamped to the PC's clock is not kept.
+
+    The stamp read after the move is the snapshot time (below) for a file the run wrote, so a run that took over 2 s keeps those hashes under that rule; a file the run did not write carries its box write time, which may lie further back.
 
     A member the install rewrites after the hash check (the files that record a box tree's path) is not kept, its bytes no longer being the hash's. The install loads the cache file again, adds its entries and saves once; a failed, refused, partial or interrupted install saves nothing.
 
@@ -3706,9 +3708,11 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     A rewritten file over 16 MiB, or whose body is not text in that encoding (not UTF-8, or UTF-16 of an odd length or with an unpaired surrogate), is skipped, not refused, as below. The client does not skip the back-commit paths again; the box does.
 
-    Each file is then moved with a rename, after a link and junction check on the way, its last write set in the stage before the move to the snapshot time and the PC file checked against the manifest once more just before the rename (a file found holding the member's bytes only then is left in place, as above).
+    Each file is then moved with a rename, after a link and junction check on the way, its last write set in the stage before the move (the snapshot time below) and the PC file checked against the manifest once more just before the rename (a file found holding the member's bytes only then is left in place, as above).
 
-    **The snapshot time.** The last write every moved file takes, whatever the box wrote, is the time the attempt began its snapshot on the PC, clamped to the PC's clock as the moves begin; a sibling pair's roots take the same attempt's time, and a retried attempt takes its own.
+    **The snapshot time.** The last write a moved file takes, when the archive's list does not mark it `unwritten` (the run wrote it), whatever the box wrote, is the time the attempt began its snapshot on the PC, clamped to the PC's clock as the moves begin; a sibling pair's roots take the same attempt's time, and a retried attempt takes its own.
+
+    A file the list marks `unwritten` (sent because the PC lacks it, or under `OutputsFull`, or because the box's listing before the command failed) takes its own box write time (a member's whole-second tar time, a copy's listed `modified`), clamped to the least of that, the snapshot time and the PC's clock, so an output an earlier build left on the box never looks newer than a source edited after it was built. An archive whose list carries no such key installs every file as written by the run.
 
     A file left in place, a skipped file and an in-use file keep their own times. A source changed on the PC after the snapshot is then newer than every output the run built from it, so incremental tools (MSBuild, Godot's assembly reload) rebuild; the box's own time could be older than a source restored locally afterwards.
 
@@ -4785,7 +4789,7 @@ Built verbs:
   - Once the heartbeat beats and before the checkout, `run` reads the PC's manifest from stdin, the line after the request, up to its newline (at most 64 MiB; a manifest that cannot be read is said only once the command has passed), then removes the old archives from `OutputFolder`: each file named `<key>-<32 lower-case hex digits>.tar.zst`, whatever the key, last written more than a day ago, and no other file.
 
     An archive already gone counts as removed; one that cannot be removed, or a folder that cannot be listed, is said (`gate: remote could not remove the old outputs archive <path>`, `gate: remote could not list the old outputs archives in <folder>`) and fails nothing.
-  - Just before the command, unless `OutputsFull`, it lists the files under the globs (size and last write); a listing that fails is said (`gate: remote could not list the outputs before the command: <error>`) and leaves every file counting as changed.
+  - Just before the command, `OutputsFull` or not, it lists the files under the globs (size and last write); a listing that fails is said (`gate: remote could not list the outputs before the command: <error>`) and leaves every file counting as changed, and none as written by the run.
   - After a command that exited 0 and its back commit, or one that ran to its end and failed (nonzero exit, not killed) with its back commit made, with the commit pushed, it reads the commit's paths (`git diff-tree`) and packs the files to bring back into `<OutputFolder>\<key>-<nonce>.tar.zst`, created new.
 
     It says `gate-remote-outputs: <n> <archive name>` on stderr (`<n>` counts every path the archive lists, copies included), or `gate-remote-outputs: 0` with no archive when nothing is to come back. Just before the first it says `gate-remote-outputs-size: <bytes>`, the pack's own count of the archive's compressed bytes (nothing reads the archive's size back). The paths are read only after the push, so failing to read them fails the outputs and never the sync-back.
@@ -5088,9 +5092,9 @@ Built verbs:
 
   A `.tmp` folder (any letter case) is brought back from only by a glob that names it: every `.tmp` folder in the path must be matched by a glob folder segment that is exactly `.tmp`. `*`, `?` and `**` never match a `.tmp` folder, and a `.tmp` segment after a segment that mixes `**` with other text does not count.
 
-  `.tmp/x.json`, `.tmp/dumps/**`, `**/.tmp/x` and `src/.tmp/x` reach; `**`, `.t*p/x` and `x**/.tmp/a` do not. Under a glob naming `.tmp`, a gate-named member is refused at install with the "is not under the output globs" line. The check is `gate_inputs::glob::names_tmp` and `Globs::tmp_only`.
+  `.tmp/x.json`, `.tmp/dumps/**`, `**/.tmp/x` and `src/.tmp/x` reach; `**`, `.t*p/x` and `x**/.tmp/a` do not. Under a glob naming `.tmp`, a gate-named member is refused at install with the "is not under the output globs" line. The check is `gate_inputs::glob::names_tmp`.
 
-  A file below a `.tmp` folder comes back only when this run created or changed it (the box's listing before the command, taken under `OutputsFull` too, over the output and failure globs together; under `OutputsFull` only over the globs that name `.tmp`; `Listing::under_outputs_full`), so old files the builder kept are not resent and a file written but not installed is not resent by later runs.
+  A file below a `.tmp` folder comes back only when this run created or changed it (the box's listing before the command, taken under `OutputsFull` too, over the output and failure globs together, the same globs as without it; `Listing::under_outputs_full`), so old files the builder kept are not resent and a file written but not installed is not resent by later runs.
 
   A box that cannot take that listing says `gate: remote could not list the outputs before the command: <error>; outputs under .tmp are not brought back this run`; files outside `.tmp` count as changed as before.
 
@@ -5112,14 +5116,18 @@ Built verbs:
 
   The box's pack takes each file the manifest lacks, and each it holds that the run created or changed (the box's stat listing from just before the command lacks it or holds another size or last write) whose SHA-256 differs from the manifest's, skipping the paths of the run's back commit.
 
-  Under `OutputsFull` the listing is still taken for the files below a `.tmp` folder (over the globs that name `.tmp`), so those come back only from the run that wrote them; every other file counts as changed and each that differs from the PC's comes back.
+  Under `OutputsFull` the listing is still taken over every glob, so a file below a `.tmp` folder comes back only from the run that wrote it; every other file counts as changed and each that differs from the PC's comes back. `OutputsFull` only widens what is sent: a file counts as written by the run only when the listing lacks it or holds another stamp.
 - Archive: a tar stream compressed with zstd (level 3, long-distance matching, a window of log2 = clamp(ceil(log2(total bytes of the chosen files)), 20, 27), so a small archive uses a small window; the reader accepts a window up to 2^27), named `<key>-<nonce>.tar.zst`, each file read once and hashed as it is packed.
 
-  The last member, `.gate-outputs.json`, is a JSON array with one item per chosen path in pack order, `{"path","size","sha256"}` for a member and `{"path","size","sha256","copy":true,"modified":<seconds since 1970>}` for a copy, and the reader checks the members against it after extraction. Both ends stream; memory does not grow with a file's size.
+  The last member, `.gate-outputs.json`, is a JSON array with one item per chosen path in pack order, `{"path","size","sha256"}` for a member and `{"path","size","sha256","copy":true,"modified":<seconds since 1970>}` for a copy.
+
+  Each item also carries `"unwritten":true` when the run did not write that file (the box's listing before the command holds the file with the same stamp, or no listing could be taken); an item without the key, or with `false`, was written by the run, and a value that is not a boolean refuses the archive like the list's other bad values.
+
+  The reader checks the members against the list after extraction. Both ends stream; memory does not grow with a file's size.
 
   A **copy** is an item carrying `"copy":true` and having no tar member: the tar holds only the first path of each distinct content that the PC does not already hold, and every later path with that content is listed as a copy.
 
-  The PC holds a content when a file of the manifest sent with the run has its SHA-256 and is outside the paths of the run's back commit; the box never uses a back-commit path as a copy source. A copy carries the box file's own last write as `modified`, not its source's, and the install stamps it as it does a member (the snapshot time, not `modified`).
+  The PC holds a content when a file of the manifest sent with the run has its SHA-256 and is outside the paths of the run's back commit; the box never uses a back-commit path as a copy source. A copy carries the box file's own last write as `modified`, not its source's, and the install stamps it as it does a member: a copy of a file the run wrote takes the snapshot time, not `modified`, and one marked `unwritten` takes `modified` clamped to the snapshot time and the PC's clock.
 
   Before the pack the box hashes only the chosen files whose size matches another chosen file's or a manifest-held file's, since only those can be copies. Copy or member is decided at the file's turn: a file hashed before the pack becomes a copy only when its size and last write still match the walk and its hash matches an earlier member's, or a manifest hash outside the back commit; otherwise it is packed as a member, with the hash from that read.
 - Payload: `Nonce` is 32 lower-case hex digits, `OutputFolder` is `<root>\outputs` for the work folder `<root>\work\<key>`, `Outputs` and `FailureOutputs` lists of non-empty globs holding no `[` or `]` (`gate: box payload FailureOutputs is not a list of texts`, `... holds an empty glob`, `... glob '<glob>' holds '[' or ']'`), `OutputsFull` true or false, and `Name` an archive name of the payload's own key and nonce, so that the outputs verb reaches no file in `OutputFolder` but an archive of this work folder.

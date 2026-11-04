@@ -27,7 +27,7 @@ mod unix {
     use base64::engine::general_purpose::STANDARD;
     use gate_inputs::archive::{UnpackError, read_members};
     use gate_inputs::hash::sha256_of;
-    use gate_inputs::manifest::{Held, Manifest, Stamp, read_sent};
+    use gate_inputs::manifest::{Held, Manifest, Stamp, Wrote, read_sent};
     use gate_inputs::pack::Packer;
     use gate_wire::stamp::{Tag, unstamped};
     use gate_wire::{BACK_COMMIT_NONE, BoxKill, Refusal, adjusted_prefix, busy_line, escaped, killed_line, refused_line, started_line};
@@ -930,7 +930,9 @@ mod unix {
         let mut sink = Vec::new();
         let mut packer = Packer::new(&mut sink, 20).expect("a packer is made");
         for (path, bytes) in files {
-            packer.add(path, bytes.len() as u64, WRITTEN, *bytes).expect("an input is packed");
+            packer
+                .add(path, bytes.len() as u64, WRITTEN, *bytes, Wrote::ThisRun)
+                .expect("an input is packed");
         }
         packer.finish().expect("the archive ends");
         sink

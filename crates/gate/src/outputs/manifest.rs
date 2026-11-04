@@ -5,7 +5,7 @@ use std::io;
 
 use gate_wire::SHA256_DIGITS;
 
-pub(crate) use gate_inputs::manifest::{Chosen, Held, HeldBy, Listing, MANIFEST_LIMIT, Manifest, hash_possible_copies, select};
+pub(crate) use gate_inputs::manifest::{Chosen, Held, HeldBy, Listing, MANIFEST_LIMIT, Manifest, Wrote, hash_possible_copies, select};
 
 use crate::outputs::walk::{Found, Stamp};
 

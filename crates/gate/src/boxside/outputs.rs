@@ -110,14 +110,12 @@ impl<'a> Asked<'a> {
     }
 
     /// The globs the listing before the command walks: the output globs and the failure output globs together, so a
-    /// failed command's outputs are judged by it as a passing one's are; under `OutputsFull` only those of them that
-    /// name a `.tmp` folder ([`Globs::tmp_only`]), the only files whose stamps then count. `None` when none is left.
-    fn listed_globs(&self) -> Option<Globs> {
-        let globs = self
-            .failure
+    /// failed command's outputs are judged by it as a passing one's are, under `OutputsFull` too, where the listing
+    /// still tells each file the run wrote from one it did not ([`Listing::written`]).
+    fn listed_globs(&self) -> Globs {
+        self.failure
             .as_ref()
-            .map_or_else(|| self.globs.clone(), |failure| self.globs.joined(failure));
-        if self.full { globs.tmp_only() } else { Some(globs) }
+            .map_or_else(|| self.globs.clone(), |failure| self.globs.joined(failure))
     }
 }
 
@@ -360,12 +358,14 @@ fn trim_to_fit(archives: &[Archive], mine: &Archive, mut total: u64, budget: u64
 /// `OutputsFull`; or, when the walk fails, no listing and the line saying so ([`unlisted_line`]): then every file
 /// outside a `.tmp` folder counts as changed and none below one comes back ([`select`]).
 pub(super) fn listing(asked: &Asked<'_>, work: &Path) -> (Option<Listing>, Option<String>) {
-    let found = match asked.listed_globs() {
-        Some(globs) if !globs.is_empty() => match walk(work, &globs) {
+    let globs = asked.listed_globs();
+    let found = if globs.is_empty() {
+        Vec::new()
+    } else {
+        match walk(work, &globs) {
             Ok(found) => found,
             Err(error) => return (None, Some(unlisted_line(&error.to_string()))),
-        },
-        _ => Vec::new(),
+        }
     };
     let listing = Listing::of(&found);
     (Some(if asked.full { listing.under_outputs_full() } else { listing }), None)

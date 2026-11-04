@@ -773,8 +773,8 @@ fn staged(job: Job<'_>, seams: &BoxSeams, input: &mut impl BufRead, stage: &Stag
     };
     let mut place = Staging::new(&stage.folder, &stage.path);
     // Copies come from the archive's own members only: no file of the box's is a copy's source.
-    let entries = match extract(&mut *input, limits, &HeldBy::new(), &|| true, &mut place) {
-        Ok(entries) => entries,
+    let entries: Vec<_> = match extract(&mut *input, limits, &HeldBy::new(), &|| true, &mut place) {
+        Ok(items) => items.into_iter().map(|item| item.entry).collect(),
         Err(error) => return Ok(Err(error.to_string())),
     };
     let staged = Staged {
@@ -1589,7 +1589,7 @@ mod tests {
     use gate_args::BoxSeams;
     use gate_inputs::archive::{CopyFrom, Entry, Place, copy_mismatch, no_pc_file};
     use gate_inputs::hash::sha256_of;
-    use gate_inputs::manifest::{Held, Manifest, Stamp as HeldStamp, read_sent};
+    use gate_inputs::manifest::{Held, Manifest, Stamp as HeldStamp, Wrote, read_sent};
     use gate_inputs::pack::Packer;
     use gate_wire::{PathForm, Payload, ROOT_STATUS, Refusal, busy_line, ordinal_upper, refused_line, root_unsafe_line};
     use serde_json::{Map, Value, json};
@@ -1784,10 +1784,14 @@ mod tests {
         let mut sink = Vec::new();
         let mut packer = Packer::new(&mut sink, 20).expect("a packer is made");
         for (path, bytes) in members {
-            packer.add(path, bytes.len() as u64, WRITTEN, *bytes).expect("a member is packed");
+            packer
+                .add(path, bytes.len() as u64, WRITTEN, *bytes, Wrote::ThisRun)
+                .expect("a member is packed");
         }
         for (path, bytes) in copies {
-            packer.copy(path, bytes.len() as u64, WRITTEN, &sha(bytes)).expect("a copy is listed");
+            packer
+                .copy(path, bytes.len() as u64, WRITTEN, &sha(bytes), Wrote::ThisRun)
+                .expect("a copy is listed");
         }
         packer.finish().expect("the archive ends");
         sink

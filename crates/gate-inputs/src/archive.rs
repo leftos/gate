@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use tar::{EntryType, Header};
 
 use crate::hash::Hashing;
-use crate::manifest::HeldBy;
+use crate::manifest::{HeldBy, Wrote};
 use crate::names::is_plain_path;
 
 /// The name of the archive's last member, the list of every path the archive brings back.
@@ -67,11 +67,13 @@ pub struct Entry {
 
 /// One item of an archive's list: a file packed as a member, or a copy, whose bytes the archive does not hold, as an
 /// earlier member or a file the PC holds has them. `copy` is a copy's own last write, in seconds since 1970 as a
-/// member's header holds it; `None` for a member.
+/// member's header holds it; `None` for a member. `wrote` is when the file was written ([`Wrote`]), which the list
+/// marks only on one written before the run (`"unwritten":true`); an item without the mark is one the run wrote.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item {
     pub entry: Entry,
     pub copy: Option<u64>,
+    pub wrote: Wrote,
 }
 
 /// Where a box writes what an archive brings back. The reader has checked each member's name, kind, size and last write
@@ -112,19 +114,20 @@ pub struct Limits {
 /// Reads the `.tar.zst` stream `source` as [`read_members`] does, within `limits`, each copy's SHA-256 a member's
 /// before it or one `held` holds, handing each member to `place`; then hands `place` each copy, asking `go_on` before
 /// each, with the last write its item lists and the first member holding its SHA-256, else the PC's file. Returns the
-/// entries of every path listed; else the refusal, or the interrupt once `go_on` says no.
+/// list's item of every path listed, with whether the run wrote it; else the refusal, or the interrupt once `go_on`
+/// says no.
 pub fn extract(
     source: impl Read,
     limits: Limits,
     held: &HeldBy<'_>,
     go_on: &dyn Fn() -> bool,
     place: &mut impl Place,
-) -> Result<Vec<Entry>, UnpackError> {
+) -> Result<Vec<Item>, UnpackError> {
     let items = read_members(source, limits.bytes, limits.files, held, |path, modified, data| {
         place.member(path, modified, data)
     })?;
     hand_copies(&items, go_on, place)?;
-    Ok(items.into_iter().map(|item| item.entry).collect())
+    Ok(items)
 }
 
 /// Hands `place` each copy of `items`, asking `go_on` before each: from the first member holding its SHA-256, else from
@@ -132,7 +135,7 @@ pub fn extract(
 fn hand_copies(items: &[Item], go_on: &dyn Fn() -> bool, place: &mut impl Place) -> Result<(), UnpackError> {
     let now = SystemTime::now();
     let mut members: HashMap<&str, &str> = HashMap::new();
-    for Item { entry, copy } in items {
+    for Item { entry, copy, .. } in items {
         let Some(seconds) = copy else {
             members.entry(entry.sha256.as_str()).or_insert(entry.path.as_str());
             continue;
@@ -504,7 +507,8 @@ fn read_list(data: &mut impl Read, now: SystemTime) -> Result<Vec<Item>, UnpackE
     Ok(items)
 }
 
-/// The list item `value` holds; `None` when it holds none.
+/// The list item `value` holds; `None` when it holds none. An item without `"unwritten"` is one the run wrote, and one
+/// whose `"unwritten"` is not `true` or `false` is none.
 fn list_item(value: &Value) -> Option<Item> {
     let path = value.get("path")?.as_str()?;
     let size = value.get("size")?.as_u64()?;
@@ -514,6 +518,11 @@ fn list_item(value: &Value) -> Option<Item> {
         (Some(Value::Bool(true)), Some(modified)) => Some(modified.as_u64()?),
         _ => return None,
     };
+    let wrote = match value.get("unwritten") {
+        None | Some(Value::Bool(false)) => Wrote::ThisRun,
+        Some(Value::Bool(true)) => Wrote::Earlier,
+        Some(_) => return None,
+    };
     Some(Item {
         entry: Entry {
             path: path.to_owned(),
@@ -521,6 +530,7 @@ fn list_item(value: &Value) -> Option<Item> {
             sha256: sha256.to_owned(),
         },
         copy,
+        wrote,
     })
 }
 
@@ -559,16 +569,19 @@ fn shown(path: &str) -> String {
 }
 
 /// The list member's text for `items`: a JSON array of `{"path","size","sha256"}` objects, a copy's with `"copy":true`
-/// and its own last write, `"modified"`.
+/// and its own last write, `"modified"`, and one the run did not write with `"unwritten":true`.
 #[must_use]
 pub fn list_json(items: &[Item]) -> String {
     let items: Vec<Value> = items
         .iter()
-        .map(|Item { entry, copy }| {
+        .map(|Item { entry, copy, wrote }| {
             let mut item = json!({ "path": entry.path, "size": entry.size, "sha256": entry.sha256 });
             if let Some(modified) = copy {
                 item["copy"] = Value::Bool(true);
                 item["modified"] = json!(modified);
+            }
+            if *wrote == Wrote::Earlier {
+                item["unwritten"] = Value::Bool(true);
             }
             item
         })
@@ -582,7 +595,7 @@ pub fn list_json(items: &[Item]) -> String {
 fn agree(seen: &[Entry], listed: &[Item], held: &HeldBy<'_>) -> io::Result<()> {
     let mut members = seen.iter();
     let mut sent: HashMap<&str, u64> = HashMap::new();
-    for Item { entry, copy } in listed {
+    for Item { entry, copy, .. } in listed {
         if copy.is_some() {
             copy_known(entry, &sent, held)?;
             continue;
@@ -714,13 +727,14 @@ pub(crate) mod tests {
     use std::io::{self, Read, Write};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use serde_json::Value;
     use tar::{EntryType, Header};
 
     use super::{
         CopyFrom, Entry, Item, LIST_NAME, LONG_NAME_LIMIT, Limits, MEMBER_LIMIT, Place, UnpackError, extract, list_json, member_path, read_members,
     };
     use crate::hash::sha256_of;
-    use crate::manifest::{Held, HeldBy, Manifest, Stamp};
+    use crate::manifest::{Held, HeldBy, Manifest, Stamp, Wrote};
     use crate::names::is_device;
 
     /// The byte limit the cases read under, far above what any of them holds.
@@ -780,10 +794,66 @@ pub(crate) mod tests {
 
     /// What [`extract`] of `archive` under `limit` gives, no file of the PC's held and `go_on` always saying yes, and
     /// what it handed its place.
-    fn extracted(archive: &[u8], limit: u64) -> (Result<Vec<Entry>, UnpackError>, Memory) {
+    fn extracted(archive: &[u8], limit: u64) -> (Result<Vec<Item>, UnpackError>, Memory) {
         let mut memory = Memory::default();
         let result = extract(archive, within(limit), &HeldBy::new(), &|| true, &mut memory);
         (result, memory)
+    }
+
+    /// A `.tar.zst` stream of the members `a` and `b` holding `a` and `b`, its list the text `list`, as written.
+    fn listed_as(list: &str) -> Vec<u8> {
+        unlisted(&[
+            (b"a", EntryType::Regular, b"a"),
+            (b"b", EntryType::Regular, b"b"),
+            (LIST_NAME.as_bytes(), EntryType::Regular, list.as_bytes()),
+        ])
+    }
+
+    /// The list text of the members `a` and `b`, each item's JSON object closed by `a_end` and `b_end`.
+    fn list_of_a_and_b(a_end: &str, b_end: &str) -> String {
+        let (a, b) = (entry("a", b"a"), entry("b", b"b"));
+        format!(
+            r#"[{{"path":"a","size":1,"sha256":"{}"{a_end}}},{{"path":"b","size":1,"sha256":"{}"{b_end}}}]"#,
+            a.sha256, b.sha256
+        )
+    }
+
+    #[test]
+    fn an_unwritten_item_is_listed_with_unwritten_true_and_a_written_one_without_the_key() {
+        let written = member("a", b"a");
+        let unwritten = Item {
+            wrote: Wrote::Earlier,
+            ..member("b", b"b")
+        };
+        let list = list_json(&[written.clone(), unwritten.clone()]);
+        let values: Vec<Value> = serde_json::from_str(&list).expect("the list is JSON");
+        assert_eq!(values[0].get("unwritten"), None, "a written item carries no mark: {list}");
+        assert_eq!(values[1].get("unwritten"), Some(&Value::Bool(true)), "{list}");
+
+        let items = extracted(&listed_as(&list), LIMIT).0.expect("the archive reads");
+        assert_eq!(items, [written, unwritten], "the mark reads back");
+    }
+
+    #[test]
+    fn a_list_without_the_key_reads_every_item_as_written() {
+        let items = extracted(&listed_as(&list_of_a_and_b("", "")), LIMIT).0.expect("the archive reads");
+        assert_eq!(items, [member("a", b"a"), member("b", b"b")]);
+        assert!(items.iter().all(|item| item.wrote == Wrote::ThisRun));
+
+        let marked = extracted(&listed_as(&list_of_a_and_b(r#","unwritten":false"#, r#","unwritten":true"#)), LIMIT)
+            .0
+            .expect("the archive reads");
+        let wrote: Vec<Wrote> = marked.iter().map(|item| item.wrote).collect();
+        assert_eq!(wrote, [Wrote::ThisRun, Wrote::Earlier], "false is written by the run, true is not");
+    }
+
+    #[test]
+    fn an_unwritten_value_that_is_not_a_boolean_is_refused() {
+        for value in ["1", r#""true""#, "null", "[]"] {
+            let list = list_of_a_and_b("", &format!(r#","unwritten":{value}"#));
+            let error = extracted(&listed_as(&list), LIMIT).0.expect_err(value);
+            assert_members(&error, "the outputs archive's list is not a list of paths, sizes and SHA-256s");
+        }
     }
 
     /// The refusal [`extract`] gives for `archive`.
@@ -827,6 +897,7 @@ pub(crate) mod tests {
         Item {
             entry: entry(path, data),
             copy: None,
+            wrote: Wrote::ThisRun,
         }
     }
 
@@ -838,6 +909,7 @@ pub(crate) mod tests {
         Item {
             entry: entry(path, data),
             copy: Some(COPY_WRITTEN),
+            wrote: Wrote::ThisRun,
         }
     }
 
@@ -848,6 +920,7 @@ pub(crate) mod tests {
             .map(|entry| Item {
                 entry: entry.clone(),
                 copy: None,
+                wrote: Wrote::ThisRun,
             })
             .collect();
         raw_items(members, &items)
@@ -1152,7 +1225,7 @@ pub(crate) mod tests {
     #[test]
     fn a_window_27_archive_is_read_and_a_window_28_one_is_refused() {
         let (result, memory) = extracted(&windowed(27), LIMIT);
-        assert_eq!(result.expect("a 128 MiB window is taken"), [entry("a", b"a")]);
+        assert_eq!(result.expect("a 128 MiB window is taken"), [member("a", b"a")]);
         assert_eq!(memory.members, [("a".to_owned(), b"a".to_vec())]);
         let error = refusal_before_any_member(&windowed(28));
         assert!(!error.members(), "a window past the reader's is a fault of the stream: {error}");
@@ -1269,6 +1342,7 @@ pub(crate) mod tests {
         );
         let mut memory = Memory::default();
         let entries = extract(&archive[..], within(LIMIT), &manifest.by_hash(&[]), &|| true, &mut memory).expect("the archive is read");
+        let entries: Vec<Entry> = entries.into_iter().map(|item| item.entry).collect();
         assert_eq!(entries, [entry("bin/a.dll", b"other"), entry("bin/new.dll", data)]);
         assert_eq!(memory.copies, [("bin/new.dll".to_owned(), "the PC".to_owned())]);
     }

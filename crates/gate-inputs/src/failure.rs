@@ -160,7 +160,7 @@ mod tests {
 
     use super::{Capped, Capping, Caps, GIB, MIB, capped, failed_run_globs};
     use crate::glob::Globs;
-    use crate::manifest::{Chosen, Stamp};
+    use crate::manifest::{Chosen, Stamp, Wrote};
     use crate::walk::Found;
 
     /// A walked file at `path` of `size` bytes.
@@ -178,7 +178,11 @@ mod tests {
             let owned: Vec<String> = globs.iter().map(|glob| (*glob).to_owned()).collect();
             Globs::new(&owned).expect("the globs can be matched")
         });
-        let Capped { kept, left } = capped(files.iter().map(Chosen::from).collect(), reports.as_ref(), caps);
+        let Capped { kept, left } = capped(
+            files.iter().map(|file| Chosen::new(file, Wrote::ThisRun)).collect(),
+            reports.as_ref(),
+            caps,
+        );
         (kept.iter().map(|item| item.file.path.clone()).collect(), left)
     }
 

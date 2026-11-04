@@ -10,6 +10,7 @@ use tar::{EntryType, Header};
 
 use crate::archive::{Entry, Item, LIST_NAME, WINDOW_LOG_MAX, check_name, list_json, refused};
 use crate::hash::Hashing;
+use crate::manifest::Wrote;
 
 /// The zstd level the archive is compressed at: zstd's default, which keeps pace with a gigabit link. The writer adds
 /// long-distance matching over a window sized to the archive's files ([`window_log`]), which finds a repeat that far
@@ -75,8 +76,9 @@ impl<W: Write> Packer<W> {
     }
 
     /// Packs the `size` bytes of `data` as the file `path`, last written `modified` (seconds since 1970), hashing them
-    /// as they pass. Data that ends before `size` bytes fails the pack; bytes past it are left unread.
-    pub fn add(&mut self, path: &str, size: u64, modified: u64, data: impl Read) -> io::Result<()> {
+    /// as they pass, and lists it as written when `wrote` says. Data that ends before `size` bytes fails the pack; bytes
+    /// past it are left unread.
+    pub fn add(&mut self, path: &str, size: u64, modified: u64, data: impl Read, wrote: Wrote) -> io::Result<()> {
         check_name(path)?;
         let mut hashing = Hashing::new(data.take(size));
         self.tar.append_data(&mut file_header(size, modified), path, &mut hashing)?;
@@ -90,13 +92,15 @@ impl<W: Write> Packer<W> {
         self.entries.push(Item {
             entry: Entry { path, size, sha256 },
             copy: None,
+            wrote,
         });
         Ok(())
     }
 
     /// Lists the file `path`, last written `modified` (seconds since 1970), as a copy of the `size` bytes with SHA-256
-    /// `sha256` that an earlier member or a file the PC holds has, none of its bytes packed.
-    pub fn copy(&mut self, path: &str, size: u64, modified: u64, sha256: &str) -> io::Result<()> {
+    /// `sha256` that an earlier member or a file the PC holds has, none of its bytes packed, written when `wrote`
+    /// says.
+    pub fn copy(&mut self, path: &str, size: u64, modified: u64, sha256: &str, wrote: Wrote) -> io::Result<()> {
         check_name(path)?;
         self.entries.push(Item {
             entry: Entry {
@@ -105,6 +109,7 @@ impl<W: Write> Packer<W> {
                 sha256: sha256.to_owned(),
             },
             copy: Some(modified),
+            wrote,
         });
         Ok(())
     }
@@ -146,7 +151,7 @@ mod tests {
     use super::Packer;
     use crate::archive::tests::{LIMIT, Memory, entry, within};
     use crate::archive::{Entry, Item, LIST_NAME, MEMBER_LIMIT, UnpackError, WINDOW_LOG_MAX, extract, list_json, read_members};
-    use crate::manifest::HeldBy;
+    use crate::manifest::{HeldBy, Wrote};
 
     /// The last write the round trip packs its members at, in seconds since 1970.
     const PACKED_AT: u64 = 1_600_000_000;
@@ -160,9 +165,11 @@ mod tests {
         };
         let mut archive = Vec::new();
         let mut packer = Packer::new(&mut archive, WINDOW_LOG_MAX).expect("a packer");
-        packer.add(&a.path, 3, PACKED_AT, &b"abc"[..]).expect("a packs");
-        packer.add(&b.path, 5, PACKED_AT, &b"hello"[..]).expect("b packs");
-        packer.copy(&copy.path, a.size, 1_700_000_000, &a.sha256).expect("the copy is listed");
+        packer.add(&a.path, 3, PACKED_AT, &b"abc"[..], Wrote::ThisRun).expect("a packs");
+        packer.add(&b.path, 5, PACKED_AT, &b"hello"[..], Wrote::ThisRun).expect("b packs");
+        packer
+            .copy(&copy.path, a.size, 1_700_000_000, &a.sha256, Wrote::ThisRun)
+            .expect("the copy is listed");
         let packed = packer.finish().expect("the archive ends");
         let listed = [a.clone(), b.clone(), copy.clone()];
         assert_eq!(packed.entries, listed);
@@ -170,6 +177,7 @@ mod tests {
 
         let mut memory = Memory::default();
         let read = extract(&archive[..], within(LIMIT), &HeldBy::new(), &|| true, &mut memory).expect("the archive reads back");
+        let read: Vec<Entry> = read.into_iter().map(|item| item.entry).collect();
         assert_eq!(read, listed, "every path, size and SHA-256 listed");
         assert_eq!(
             memory.members,
@@ -198,11 +206,20 @@ mod tests {
         assert_eq!(last, LIST_NAME, "the list is the last member");
         assert_eq!(read_back.len(), 2, "the copy is not packed as a member");
         let items = [
-            Item { entry: a, copy: None },
-            Item { entry: b, copy: None },
+            Item {
+                entry: a,
+                copy: None,
+                wrote: Wrote::ThisRun,
+            },
+            Item {
+                entry: b,
+                copy: None,
+                wrote: Wrote::ThisRun,
+            },
             Item {
                 entry: copy,
                 copy: Some(1_700_000_000),
+                wrote: Wrote::ThisRun,
             },
         ];
         assert_eq!(list, list_json(&items), "the list names each member and the copy with its last write");
@@ -211,15 +228,22 @@ mod tests {
     #[test]
     fn a_file_named_as_the_list_is_not_packed() {
         let mut packer = Packer::new(io::sink(), WINDOW_LOG_MAX).expect("a packer");
-        let error = packer.add(".GATE-outputs.json", 1, 0, &b"x"[..]).expect_err("the list's name is refused");
+        let error = packer
+            .add(".GATE-outputs.json", 1, 0, &b"x"[..], Wrote::ThisRun)
+            .expect_err("the list's name is refused");
         assert_eq!(error.to_string(), "the output .GATE-outputs.json has the name of the archive's own list");
-        assert!(packer.add("bin/.gate-outputs.json", 1, 0, &b"x"[..]).is_ok(), "only at the root");
+        assert!(
+            packer.add("bin/.gate-outputs.json", 1, 0, &b"x"[..], Wrote::ThisRun).is_ok(),
+            "only at the root"
+        );
     }
 
     #[test]
     fn a_file_that_ends_before_its_size_fails_the_pack() {
         let mut packer = Packer::new(io::sink(), WINDOW_LOG_MAX).expect("a packer");
-        let error = packer.add("bin/a.dll", 5, 0, &b"abc"[..]).expect_err("a short file is refused");
+        let error = packer
+            .add("bin/a.dll", 5, 0, &b"abc"[..], Wrote::ThisRun)
+            .expect_err("a short file is refused");
         assert_eq!(error.to_string(), "bin/a.dll changed while it was packed: 3 of its 5 bytes were read");
     }
 
@@ -235,7 +259,7 @@ mod tests {
             deep.as_str(),
         ] {
             let mut packer = Packer::new(io::sink(), WINDOW_LOG_MAX).expect("a packer");
-            let error = packer.add(name, 1, 0, &b"x"[..]).expect_err(name);
+            let error = packer.add(name, 1, 0, &b"x"[..], Wrote::ThisRun).expect_err(name);
             assert_eq!(
                 error.to_string(),
                 format!("the output '{}' has a name the outputs archive's reader refuses", escaped(name))
@@ -327,7 +351,7 @@ mod tests {
         };
         let mut packer = Packer::new(sink, WINDOW_LOG_MAX).expect("a packer");
         packer
-            .add("bin/large.bin", LARGE, 0, Generated::new(LARGE, Rc::clone(&given)))
+            .add("bin/large.bin", LARGE, 0, Generated::new(LARGE, Rc::clone(&given)), Wrote::ThisRun)
             .expect("the file packs");
         let packed = packer.finish().expect("the archive ends");
         assert_eq!(given.get(), LARGE);
@@ -341,7 +365,7 @@ mod tests {
         let (pipe_reader, pipe_writer) = io::pipe().expect("a pipe");
         let writer = std::thread::spawn(move || {
             let mut packer = Packer::new(pipe_writer, WINDOW_LOG_MAX)?;
-            packer.add("bin/large.bin", LARGE, 0, Generated::new(LARGE, Rc::new(Cell::new(0))))?;
+            packer.add("bin/large.bin", LARGE, 0, Generated::new(LARGE, Rc::new(Cell::new(0))), Wrote::ThisRun)?;
             packer.finish()
         });
         let taken = Rc::new(Cell::new(0));

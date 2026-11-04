@@ -28,7 +28,7 @@ use gate_inputs::archive::{Item, held_size, refused};
 use gate_inputs::failure::{self, Capping, Caps};
 use gate_inputs::glob::Globs;
 use gate_inputs::hash::sha256_of;
-use gate_inputs::manifest::{Chosen, HeldBy, Listing, MANIFEST_LIMIT, Manifest, Stamp, hash_possible_copies, select};
+use gate_inputs::manifest::{Chosen, HeldBy, Listing, MANIFEST_LIMIT, Manifest, Stamp, Wrote, hash_possible_copies, select};
 use gate_inputs::pack::{Packed, Packer, window_log};
 use gate_inputs::walk::{Found, Walked, relative_path};
 use gate_wire::{Payload, archive_file_name, archive_key, escaped};
@@ -136,16 +136,14 @@ impl<'a> Asked<'a> {
     }
 
     /// These outputs over the output globs and the failure output globs together: what the listing before the command
-    /// walks, so a failed command's outputs are judged by it as a passing one's are; under `OutputsFull` only those of
-    /// them that name a `.tmp` folder ([`Globs::tmp_only`]), the only files whose stamps then count. `None` when none is
-    /// left.
-    fn listed(&self) -> Option<Asked<'a>> {
+    /// walks, so a failed command's outputs are judged by it as a passing one's are, under `OutputsFull` too, where the
+    /// listing still tells each file the run wrote from one it did not ([`Listing::written`]).
+    fn listed(&self) -> Asked<'a> {
         let globs = self
             .failure
             .as_ref()
             .map_or_else(|| self.globs.clone(), |failure| self.globs.joined(failure));
-        let globs = if self.full { globs.tmp_only()? } else { globs };
-        Some(Asked {
+        Asked {
             globs,
             failure: None,
             full: self.full,
@@ -153,7 +151,7 @@ impl<'a> Asked<'a> {
             rid: self.rid.clone(),
             archive: self.archive.clone(),
             folder: self.folder,
-        })
+        }
     }
 }
 
@@ -553,17 +551,17 @@ fn flock(file: &File, operation: libc::c_int) -> io::Result<()> {
 /// outside a `.tmp` folder counts as changed and none below one comes back ([`select`]).
 #[must_use]
 pub fn listing(asked: &Asked<'_>, work: &Path) -> (Option<Listing>, Option<String>) {
-    let found = match asked.listed() {
-        Some(listed) if !listed.globs.is_empty() => {
-            let walked = tree_folder(&listed, work)
-                .map_err(|error| in_context(work, &error))
-                .and_then(|top| walk(&top, work, &listed, false));
-            match walked {
-                Ok(walked) => listed.deduped(walked.found),
-                Err(error) => return (None, Some(unlisted_line(&error.to_string()))),
-            }
+    let listed = asked.listed();
+    let found = if listed.globs.is_empty() {
+        Vec::new()
+    } else {
+        let walked = tree_folder(&listed, work)
+            .map_err(|error| in_context(work, &error))
+            .and_then(|top| walk(&top, work, &listed, false));
+        match walked {
+            Ok(walked) => listed.deduped(walked.found),
+            Err(error) => return (None, Some(unlisted_line(&error.to_string()))),
         }
-        _ => Vec::new(),
     };
     let listing = Listing::of(&found);
     (Some(if asked.full { listing.under_outputs_full() } else { listing }), None)
@@ -912,7 +910,7 @@ fn pack(sink: impl Write, tree: &Tree<'_>, files: &[Chosen<'_>], held: &HeldBy<'
     for chosen in files {
         let known = |sha256: &str| sent.get(sha256).copied().or_else(|| held_size(held, sha256));
         pack_one(&mut packer, tree, chosen, known).map_err(|error| in_context(&chosen.file.full, &error))?;
-        if let Some(Item { entry, copy: None }) = packer.items().last() {
+        if let Some(Item { entry, copy: None, .. }) = packer.items().last() {
             sent.entry(entry.sha256.clone()).or_insert(entry.size);
         }
     }
@@ -949,17 +947,17 @@ fn pack_one<W: Write>(packer: &mut Packer<W>, tree: &Tree<'_>, chosen: &Chosen<'
         .filter(|_| stamp_of(&opened.before) == file.stamp)
         .and_then(|sha256| Some((sha256, known(sha256)?)));
     match copied {
-        Some((sha256, size)) => packer.copy(&file.path, size, opened.modified, sha256),
-        None => pack_file(packer, file, &opened, &opened.file),
+        Some((sha256, size)) => packer.copy(&file.path, size, opened.modified, sha256, chosen.wrote),
+        None => pack_file(packer, file, &opened, &opened.file, chosen.wrote),
     }
 }
 
-/// Packs the open file `opened`, found as `file`, its bytes read from `data`: its header holds the size and last write
-/// `opened` had when it was opened, and a file whose size or last write differs after the read, looked at on the same
-/// descriptor, fails the pack.
-fn pack_file<W: Write>(packer: &mut Packer<W>, file: &Found, opened: &Opened, data: impl Read) -> io::Result<()> {
+/// Packs the open file `opened`, found as `file`, its bytes read from `data`, listed as written when `wrote` says: its
+/// header holds the size and last write `opened` had when it was opened, and a file whose size or last write differs
+/// after the read, looked at on the same descriptor, fails the pack.
+fn pack_file<W: Write>(packer: &mut Packer<W>, file: &Found, opened: &Opened, data: impl Read, wrote: Wrote) -> io::Result<()> {
     let before = &opened.before;
-    packer.add(&file.path, size_of(before), opened.modified, data)?;
+    packer.add(&file.path, size_of(before), opened.modified, data, wrote)?;
     let after = beneath::file_stat(&opened.file)?;
     if after.st_size == before.st_size && mtime_nanos(&after) == mtime_nanos(before) {
         Ok(())
@@ -1163,7 +1161,7 @@ pub(crate) mod tests {
     use gate_args::BoxSeams;
     use gate_inputs::archive::{Item, UnpackError, read_members};
     use gate_inputs::hash::sha256_of;
-    use gate_inputs::manifest::{Held, Listing, MANIFEST_LIMIT, Manifest, Stamp};
+    use gate_inputs::manifest::{Held, Listing, MANIFEST_LIMIT, Manifest, Stamp, Wrote};
     use gate_inputs::pack::Packer;
     use gate_inputs::walk::Found;
     use gate_wire::{PathForm, Payload};
@@ -2069,7 +2067,7 @@ pub(crate) mod tests {
             grown: false,
         };
 
-        let error = pack_file(&mut packer, &found, &opened, growing).expect_err("a file that grew is refused");
+        let error = pack_file(&mut packer, &found, &opened, growing, Wrote::ThisRun).expect_err("a file that grew is refused");
 
         assert_eq!(
             error.to_string(),

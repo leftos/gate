@@ -238,10 +238,17 @@ impl Listing {
         Listing { full: true, ..self }
     }
 
-    /// Whether the run created or changed `file`: this listing lacks it or holds another stamp, or, under
-    /// `OutputsFull`, it lies outside a `.tmp` folder (`below_tmp` false).
-    fn changed(&self, file: &Found, below_tmp: bool) -> bool {
-        (self.full && !below_tmp) || self.stamps.get(&ordinal_upper(&file.path)).copied() != Some(file.stamp)
+    /// Whether a file counts as created or changed by the run: it is one the run `written` ([`Listing::written`]), or,
+    /// under `OutputsFull`, it lies outside a `.tmp` folder (`below_tmp` false).
+    fn changed(&self, written: bool, below_tmp: bool) -> bool {
+        (self.full && !below_tmp) || written
+    }
+
+    /// Whether the run wrote `file`: this listing lacks it or holds another stamp. `OutputsFull` plays no part: it only
+    /// widens what is sent, and never makes a file one the run wrote.
+    #[must_use]
+    pub fn written(&self, file: &Found) -> bool {
+        self.stamps.get(&ordinal_upper(&file.path)).copied() != Some(file.stamp)
     }
 }
 
@@ -251,17 +258,30 @@ fn is_below_tmp(path: &str) -> bool {
         .is_some_and(|(folders, _)| folders.split('/').any(|folder| folder.eq_ignore_ascii_case(".tmp")))
 }
 
-/// A file [`select`] chose to pack, with its SHA-256 when it was hashed before the pack.
+/// When a packed file was last written, as the archive's list says it to the PC's install, which stamps by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wrote {
+    /// By this run: the install gives it the snapshot time.
+    ThisRun,
+    /// Before this run, by an earlier build on the box: the install keeps the box's own last write, never later than
+    /// the snapshot time.
+    Earlier,
+}
+
+/// A file [`select`] chose to pack, with its SHA-256 when it was hashed before the pack, and when it was written
+/// ([`Wrote`]), which decides the last write the PC's install gives it.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Chosen<'found> {
     pub file: &'found Found,
     pub sha256: Option<String>,
+    pub wrote: Wrote,
 }
 
-impl<'found> From<&'found Found> for Chosen<'found> {
-    /// The file `file`, not hashed.
-    fn from(file: &'found Found) -> Chosen<'found> {
-        Chosen { file, sha256: None }
+impl<'found> Chosen<'found> {
+    /// The file `file`, not hashed, written as `wrote` says.
+    #[must_use]
+    pub fn new(file: &'found Found, wrote: Wrote) -> Chosen<'found> {
+        Chosen { file, sha256: None, wrote }
     }
 }
 
@@ -276,6 +296,9 @@ impl<'found> From<&'found Found> for Chosen<'found> {
 /// `listing` `None` counts every file outside a `.tmp` folder as changed (`OutputsFull` without a listing), so each
 /// that differs from the PC's comes back, and chooses no file below one. Paths compare without regard to case. Else
 /// the error of the first hash that fails.
+///
+/// Each chosen file is marked [`Wrote::ThisRun`] when `listing` shows the run wrote it ([`Listing::written`],
+/// `OutputsFull` aside), else [`Wrote::Earlier`]; with no `listing`, every one is `Earlier`.
 pub fn select<'found>(
     found: &'found [Found],
     manifest: &Manifest,
@@ -290,10 +313,12 @@ pub fn select<'found>(
             continue;
         }
         let below_tmp = is_below_tmp(&file.path);
-        let changed = listing.map_or(!below_tmp, |listing| listing.changed(file, below_tmp));
+        let written = listing.is_some_and(|listing| listing.written(file));
+        let changed = listing.map_or(!below_tmp, |listing| listing.changed(written, below_tmp));
+        let wrote = if written { Wrote::ThisRun } else { Wrote::Earlier };
         let Some(held) = manifest.get(&file.path) else {
             if changed || !below_tmp {
-                chosen.push(Chosen::from(file));
+                chosen.push(Chosen::new(file, wrote));
             }
             continue;
         };
@@ -302,7 +327,11 @@ pub fn select<'found>(
         }
         let sha256 = hash(file)?;
         if sha256 != held.sha256 {
-            chosen.push(Chosen { file, sha256: Some(sha256) });
+            chosen.push(Chosen {
+                file,
+                sha256: Some(sha256),
+                wrote,
+            });
         }
     }
     Ok(chosen)
@@ -334,7 +363,7 @@ mod tests {
     use std::io;
     use std::path::PathBuf;
 
-    use super::{Held, Listing, Manifest, Stamp, hash_possible_copies, read_sent, select, tree_split};
+    use super::{Held, Listing, Manifest, Stamp, Wrote, hash_possible_copies, read_sent, select, tree_split};
     use crate::hash::sha256_of;
     use crate::walk::Found;
 
@@ -764,5 +793,80 @@ mod tests {
         let pc = manifest(&[("bin/a.dll", stamp(1, 1), 'a')]);
         let failed = select(&files, &pc, None, &[], |_| Err(io::Error::other("denied")));
         assert_eq!(failed.map_err(|error| error.to_string()), Err("denied".to_owned()));
+    }
+
+    /// What `select` chooses when every file hashes to `hashes`' entry for it: each chosen path and when it was written.
+    fn marked(files: &[Found], manifest: &Manifest, listing: Option<&Listing>, hashes: &[(&str, char)]) -> Vec<(String, Wrote)> {
+        let hashes: HashMap<&str, String> = hashes.iter().map(|(path, digit)| (*path, sha(*digit))).collect();
+        let picked = select(files, manifest, listing, &[], |file| {
+            Ok(hashes.get(file.path.as_str()).cloned().expect("every hashed file has a hash"))
+        })
+        .expect("every hash succeeds");
+        picked.iter().map(|chosen| (chosen.file.path.clone(), chosen.wrote)).collect()
+    }
+
+    #[test]
+    fn under_outputs_full_a_listing_of_every_output_marks_each_sent_file_by_its_stamp() {
+        // Taken as the box takes it under OutputsFull: over every output glob, files outside `.tmp` included.
+        let before = Listing::of(&[
+            found("bin/old.dll", stamp(1, 10)),
+            found("bin/changed.dll", stamp(1, 10)),
+            found("bin/same.dll", stamp(1, 10)),
+            found(".tmp/old.json", stamp(1, 10)),
+        ])
+        .under_outputs_full();
+        let files = [
+            found("BIN/old.dll", stamp(1, 10)),
+            found("bin/changed.dll", stamp(1, 11)),
+            found("bin/same.dll", stamp(1, 10)),
+            found(".tmp/old.json", stamp(1, 10)),
+            found(".tmp/new.json", stamp(1, 10)),
+        ];
+        let pc = manifest(&[
+            ("bin/old.dll", stamp(1, 1), 'p'),
+            ("bin/changed.dll", stamp(1, 1), 'p'),
+            ("bin/same.dll", stamp(1, 1), 's'),
+        ]);
+        let hashes = [("BIN/old.dll", 'o'), ("bin/changed.dll", 'c'), ("bin/same.dll", 's')];
+        assert_eq!(
+            marked(&files, &pc, Some(&before), &hashes),
+            [
+                ("BIN/old.dll".to_owned(), Wrote::Earlier),
+                ("bin/changed.dll".to_owned(), Wrote::ThisRun),
+                (".tmp/new.json".to_owned(), Wrote::ThisRun)
+            ],
+            "OutputsFull sends the untouched file the PC holds otherwise, marked as written before the run, and the one \
+             the run changed as written by it; the untouched one the PC holds as it is and the old .tmp file stay"
+        );
+    }
+
+    #[test]
+    fn select_marks_each_chosen_file_written_or_not() {
+        let before = Listing::of(&[found("bin/old.dll", stamp(1, 10)), found("bin/changed.dll", stamp(1, 10))]);
+        let files = [
+            found("bin/new.dll", stamp(1, 20)),
+            found("bin/changed.dll", stamp(1, 11)),
+            found("bin/old.dll", stamp(1, 10)),
+        ];
+        let pc = manifest(&[("bin/changed.dll", stamp(1, 1), 'p')]);
+        let hashes = [("bin/changed.dll", 'c')];
+        assert_eq!(
+            marked(&files, &pc, Some(&before), &hashes),
+            [
+                ("bin/new.dll".to_owned(), Wrote::ThisRun),
+                ("bin/changed.dll".to_owned(), Wrote::ThisRun),
+                ("bin/old.dll".to_owned(), Wrote::Earlier)
+            ],
+            "a file the run made and one it changed are written; one it left as it was, which the PC lacks, is not"
+        );
+        assert_eq!(
+            marked(&files, &pc, None, &hashes),
+            [
+                ("bin/new.dll".to_owned(), Wrote::Earlier),
+                ("bin/changed.dll".to_owned(), Wrote::Earlier),
+                ("bin/old.dll".to_owned(), Wrote::Earlier)
+            ],
+            "without a listing no file is written"
+        );
     }
 }

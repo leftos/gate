@@ -153,7 +153,7 @@ mod tests {
     use std::path::PathBuf;
 
     use gate_inputs::glob::Globs;
-    use gate_inputs::manifest::{Chosen, Stamp};
+    use gate_inputs::manifest::{Chosen, Stamp, Wrote};
     use gate_inputs::walk::Found;
 
     use super::{Portable, crossed, failed_line, is_mapped, is_native_binary, mapped_folder, mapped_path, passed_line, portable, refused_line};
@@ -301,7 +301,7 @@ mod tests {
     fn portable_of(files: &[(&str, &[u8])]) -> io::Result<Result<Vec<String>, String>> {
         let heads: HashMap<PathBuf, Vec<u8>> = files.iter().map(|(path, head)| (found(path).full, head.to_vec())).collect();
         let walked: Vec<Found> = files.iter().map(|(path, _)| found(path)).collect();
-        let chosen: Vec<Chosen<'_>> = walked.iter().map(Chosen::from).collect();
+        let chosen: Vec<Chosen<'_>> = walked.iter().map(|file| Chosen::new(file, Wrote::ThisRun)).collect();
         Ok(match portable(chosen, |file| Ok(heads[&file.full].clone()))? {
             Portable::Kept(kept) => Ok(kept.iter().map(|chosen| chosen.file.path.clone()).collect()),
             Portable::Refused(path) => Err(path),
@@ -342,7 +342,9 @@ mod tests {
     #[test]
     fn a_head_that_cannot_be_read_fails_the_portability_check() {
         let walked = [found("bin/Debug/net10.0/win-x64/A.exe")];
-        let failed = portable(walked.iter().map(Chosen::from).collect(), |_| Err(io::Error::other("denied")));
+        let failed = portable(walked.iter().map(|file| Chosen::new(file, Wrote::ThisRun)).collect(), |_| {
+            Err(io::Error::other("denied"))
+        });
         assert_eq!(failed.map(drop).map_err(|error| error.to_string()), Err("denied".to_owned()));
     }
 

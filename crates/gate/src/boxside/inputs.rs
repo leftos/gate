@@ -972,8 +972,8 @@ fn staged(asked: &Asked<'_>, sent: &Sent, seams: &BoxSeams, stage: &Stage, conso
         }
         Some(put) => channel::received(put, asked.nonce, seams, console, |source| unpack(source, &into, budget, &pc)).map_err(Unstaged::Channel)?,
     };
-    let entries = match unpacked {
-        Ok(entries) => entries,
+    let entries: Vec<_> = match unpacked {
+        Ok(items) => items.into_iter().map(|item| item.entry).collect(),
         Err(error) => return Ok(Err(error.to_string())),
     };
     let files = match staged_files(stage) {

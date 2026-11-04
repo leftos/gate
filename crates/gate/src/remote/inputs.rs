@@ -34,7 +34,7 @@ use crate::outputs::archive::{final_path, pack, pack_rooted};
 use crate::outputs::cache::{HashCache, file_time_now};
 use crate::outputs::glob::Globs;
 use crate::outputs::hash::sha256_of;
-use crate::outputs::manifest::{Chosen, HeldBy, MANIFEST_LIMIT, Manifest, build_manifest_with};
+use crate::outputs::manifest::{Chosen, HeldBy, MANIFEST_LIMIT, Manifest, Wrote, build_manifest_with};
 use crate::outputs::walk::{Found, in_context, walk};
 
 /// The most files one put carries: the archive's member limit.
@@ -1284,7 +1284,8 @@ fn packed(archive: &File, shown: &Path, packing: &Pack<'_>, go_on: &dyn Fn() -> 
     if !go_on() {
         return Err(Unsent::Ended(End::Interrupted));
     }
-    let chosen: Vec<Chosen<'_>> = packing.files.iter().map(|file| Chosen::from(*file)).collect();
+    // The box's own unpack stamps nothing by the mark, so every input is listed as the run's.
+    let chosen: Vec<Chosen<'_>> = packing.files.iter().map(|file| Chosen::new(file, Wrote::ThisRun)).collect();
     let sink = Asking {
         inner: archive,
         go_on,

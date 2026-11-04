@@ -28,7 +28,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 pub(crate) use gate_inputs::archive::{Entry, UnpackError, sent_limit};
 
 use crate::outputs::hash::Hashing;
-use crate::outputs::manifest::{Chosen, HeldBy, Manifest};
+use crate::outputs::manifest::{Chosen, HeldBy, Manifest, Wrote};
 use crate::outputs::walk::{Found, in_context, stamp_of};
 
 /// The PC's own files a copy may be made from: the worktree root, and the manifest of the files below it that the PC
@@ -86,7 +86,7 @@ fn packed_below<'r>(sink: impl Write, files: &[Chosen<'_>], root_of: impl Fn(usi
     for (at, chosen) in files.iter().enumerate() {
         let known = |sha256: &str| sent.get(sha256).copied().or_else(|| held_size(held, sha256));
         pack_one(&mut packer, root_of(at), chosen, known).map_err(|error| in_context(&chosen.file.full, &error))?;
-        if let Some(Item { entry, copy: None }) = packer.items().last() {
+        if let Some(Item { entry, copy: None, .. }) = packer.items().last() {
             sent.entry(entry.sha256.clone()).or_insert(entry.size);
         }
     }
@@ -108,8 +108,8 @@ fn pack_one<W: Write>(packer: &mut Packer<W>, root: &Path, chosen: &Chosen<'_>, 
         .filter(|_| stamp_of(&before) == file.stamp)
         .and_then(|sha256| Some((sha256, known(sha256)?)));
     match copied {
-        Some((sha256, size)) => packer.copy(&file.path, size, modified, sha256),
-        None => pack_file(packer, file, &opened, &opened),
+        Some((sha256, size)) => packer.copy(&file.path, size, modified, sha256, chosen.wrote),
+        None => pack_file(packer, file, &opened, &opened, chosen.wrote),
     }
 }
 
@@ -169,13 +169,14 @@ fn open_plain(path: &Path) -> io::Result<File> {
     }
 }
 
-/// Packs the open file `opened`, found as `file`, its bytes read from `data`: its header holds the size and last write
-/// `opened` has before the read, and a file whose size or last write differs after it fails the pack.
-fn pack_file<W: Write>(packer: &mut Packer<W>, file: &Found, opened: &File, data: impl Read) -> io::Result<()> {
+/// Packs the open file `opened`, found as `file`, its bytes read from `data`, listed as written when `wrote` says: its
+/// header holds the size and last write `opened` has before the read, and a file whose size or last write
+/// differs after it fails the pack.
+fn pack_file<W: Write>(packer: &mut Packer<W>, file: &Found, opened: &File, data: impl Read, wrote: Wrote) -> io::Result<()> {
     let before = opened.metadata()?;
     let written = before.modified()?;
     let modified = seconds_since_1970(file, written)?;
-    packer.add(&file.path, before.len(), modified, data)?;
+    packer.add(&file.path, before.len(), modified, data, wrote)?;
     let after = opened.metadata()?;
     if after.len() == before.len() && after.modified()? == written {
         Ok(())
@@ -188,8 +189,8 @@ fn pack_file<W: Write>(packer: &mut Packer<W>, file: &Found, opened: &File, data
 }
 
 /// Extracts the `.tar.zst` stream `source` into the folder `destination`, which it creates and which must not exist
-/// yet, and into the folders it makes below it, each file with the last write its header holds. Returns the entries;
-/// else why the archive was refused.
+/// yet, and into the folders it makes below it, each file with the last write its header holds. Returns the list's
+/// item of every path, which says when the file was written ([`Wrote`]); else why the archive was refused.
 ///
 /// A member whose path is not a plain relative path inside the destination (see
 /// [`gate_inputs::names::is_plain_path`]), that is not a plain file, that is larger than
@@ -212,7 +213,7 @@ fn pack_file<W: Write>(packer: &mut Packer<W>, file: &Found, opened: &File, data
 /// Nothing is written outside the destination, and on a refusal `unpack` removes the destination it made, and all it
 /// extracted there; when that removal fails too, the refusal says so. The error says whether a member of the archive is
 /// refused for what it is ([`UnpackError::Members`]) or the stream could not be read ([`UnpackError::Fault`]).
-pub(crate) fn unpack(source: impl Read, destination: &Path, limit: u64, pc: &PcFiles<'_>) -> Result<Vec<Entry>, UnpackError> {
+pub(crate) fn unpack(source: impl Read, destination: &Path, limit: u64, pc: &PcFiles<'_>) -> Result<Vec<Item>, UnpackError> {
     fs::create_dir(destination).map_err(|error| in_context(destination, &error))?;
     extract_into(source, destination, limit, MEMBER_LIMIT, pc).map_err(|error| match fs::remove_dir_all(destination) {
         Ok(()) => error,
@@ -221,8 +222,8 @@ pub(crate) fn unpack(source: impl Read, destination: &Path, limit: u64, pc: &PcF
 }
 
 /// Extracts `source` into the folder `destination`, which exists, as [`unpack`] does, making at most `folder_limit`
-/// folders.
-fn extract_into(source: impl Read, destination: &Path, limit: u64, folder_limit: usize, pc: &PcFiles<'_>) -> Result<Vec<Entry>, UnpackError> {
+/// folders; the list's items.
+fn extract_into(source: impl Read, destination: &Path, limit: u64, folder_limit: usize, pc: &PcFiles<'_>) -> Result<Vec<Item>, UnpackError> {
     let root = std::path::absolute(destination).map_err(|error| in_context(destination, &error))?;
     check_folder(&root)?;
     let held = pc.manifest.by_hash(&[]);
@@ -437,7 +438,7 @@ mod tests {
     use crate::boxside::outputs::OUTPUTS_BUDGET;
     use crate::outputs::glob::Globs;
     use crate::outputs::hash::sha256_of;
-    use crate::outputs::manifest::{Chosen, Held, HeldBy, Manifest};
+    use crate::outputs::manifest::{Chosen, Held, HeldBy, Manifest, Wrote};
     use crate::outputs::walk::{Found, Stamp, walk};
     use crate::test_support::junction;
 
@@ -457,6 +458,7 @@ mod tests {
                 go_on: &|| true,
             },
         )
+        .map(|items| items.into_iter().map(|item| item.entry).collect())
     }
 
     /// `extract_into` of `source` into `destination` under `limit`, making at most `folders` folders, with no file of
@@ -474,6 +476,7 @@ mod tests {
                 go_on: &|| true,
             },
         )
+        .map(|items| items.into_iter().map(|item| item.entry).collect())
     }
 
     /// A scratch folder for one test, emptied first.
@@ -509,6 +512,7 @@ mod tests {
         Item {
             entry: entry(path, data),
             copy: None,
+            wrote: Wrote::ThisRun,
         }
     }
 
@@ -520,6 +524,7 @@ mod tests {
         Item {
             entry: entry(path, data),
             copy: Some(COPY_WRITTEN),
+            wrote: Wrote::ThisRun,
         }
     }
 
@@ -530,6 +535,7 @@ mod tests {
             .map(|entry| Item {
                 entry: entry.clone(),
                 copy: None,
+                wrote: Wrote::ThisRun,
             })
             .collect();
         raw_items(members, &items)
@@ -603,7 +609,7 @@ mod tests {
                 .expect("the last write can be set");
         }
         let found = walk(&source, &Globs::new(&["**".to_owned()]).expect("a glob")).expect("the walk");
-        let chosen: Vec<Chosen<'_>> = found.iter().map(Chosen::from).collect();
+        let chosen: Vec<Chosen<'_>> = found.iter().map(|file| Chosen::new(file, Wrote::ThisRun)).collect();
         let mut archive = Vec::new();
         let packed = pack(&mut archive, &source, &chosen, &HeldBy::new()).expect("the files pack");
         assert_eq!(packed.compressed, archive.len() as u64);
@@ -955,7 +961,11 @@ mod tests {
             .iter()
             .map(|file| {
                 let (sha256, _) = sha256_of(fs::File::open(&file.full).expect("the file opens")).expect("the file hashes");
-                Chosen { file, sha256: Some(sha256) }
+                Chosen {
+                    file,
+                    sha256: Some(sha256),
+                    wrote: Wrote::ThisRun,
+                }
             })
             .collect()
     }
@@ -984,6 +994,7 @@ mod tests {
                 go_on: &|| true,
             },
         )
+        .map(|items| items.into_iter().map(|item| item.entry).collect())
     }
 
     /// Writes `data` to the file `name` in the folder `folder`, last written `seconds` after 1970.
@@ -1209,7 +1220,7 @@ mod tests {
         fs::create_dir_all(&source).expect("the folder can be made");
         fs::write(source.join("a.bin"), vec![7_u8; 1 << 20]).expect("the file can be written");
         let found = walked(&source);
-        let chosen: Vec<Chosen<'_>> = found.iter().map(Chosen::from).collect();
+        let chosen: Vec<Chosen<'_>> = found.iter().map(|file| Chosen::new(file, Wrote::ThisRun)).collect();
         let mut archive = Vec::new();
         pack(&mut archive, &source, &chosen, &HeldBy::new()).expect("the file packs");
 
@@ -1444,7 +1455,7 @@ mod tests {
             path: &found.full,
             grown: false,
         };
-        let error = pack_file(&mut packer, &found, &opened, growing).expect_err("a file that grew is refused");
+        let error = pack_file(&mut packer, &found, &opened, growing, Wrote::ThisRun).expect_err("a file that grew is refused");
         assert_eq!(
             error.to_string(),
             "a.dll changed while it was packed: its size or last write differs from when it was opened"
@@ -1460,7 +1471,7 @@ mod tests {
             .and_then(|file| file.set_modified(UNIX_EPOCH - Duration::from_hours(24)))
             .expect("the last write can be set");
         let root = found.full.parent().expect("the file has a folder");
-        let error = pack(io::sink(), root, &[Chosen::from(&found)], &HeldBy::new()).expect_err("a file from before 1970 is refused");
+        let error = pack(io::sink(), root, &[Chosen::new(&found, Wrote::ThisRun)], &HeldBy::new()).expect_err("a file from before 1970 is refused");
         assert!(error.to_string().ends_with("a.dll was last written before 1970"), "{error}");
     }
 
@@ -1471,7 +1482,7 @@ mod tests {
         std::os::windows::fs::symlink_file(&found.full, &link).expect("this machine lets a test make a symbolic link");
         found.full = link;
         let root = found.full.parent().expect("the link has a folder").to_owned();
-        let error = pack(io::sink(), &root, &[Chosen::from(&found)], &HeldBy::new()).expect_err("a link is refused");
+        let error = pack(io::sink(), &root, &[Chosen::new(&found, Wrote::ThisRun)], &HeldBy::new()).expect_err("a link is refused");
         assert!(error.to_string().ends_with("is a link or a junction, not a file"), "{error}");
     }
 
@@ -1487,7 +1498,7 @@ mod tests {
         fs::rename(root.join("bin"), root.join("moved")).expect("the walked folder can be moved away");
         junction(&root.join("bin"), &outside);
 
-        let chosen: Vec<Chosen<'_>> = found.iter().map(Chosen::from).collect();
+        let chosen: Vec<Chosen<'_>> = found.iter().map(|file| Chosen::new(file, Wrote::ThisRun)).collect();
         let error = pack(io::sink(), &root, &chosen, &HeldBy::new()).expect_err("a file outside the work folder is refused");
 
         assert!(error.to_string().ends_with("bin/a.dll resolves outside the work folder"), "{error}");
