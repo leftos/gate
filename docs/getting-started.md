@@ -298,6 +298,7 @@ A new worktree's first routed run meets a cold work folder, and gate raises its 
 | `gate: ignored <path>: <reason>; running locally` | `remote.json` cannot be used, so nothing routes. Fix what the reason names. |
 | `gate: remote <host> version; running here` | The builder runs another gate build. Run `gate push`. |
 | `gate: remote <host> unreachable; running here` | ssh to the builder failed. Check that `ssh {builder}` logs in without a prompt. |
+| `gate: the snapshot push to <host> failed; running here` | The builder answered but the push of the snapshot failed for a reason other than the connection; the push's own lines above say why. With `(a partial clone lacks objects the push needs; git backfill fetches them)`, run `git backfill` in the repo. |
 | `push: no installed gate at <path>; run tools/install.ps1` | Install gate on this PC before pushing it. |
 | `push: <host> failed: <reason>` | That builder was not updated; the reason says why. The builder's ssh session must be an administrator's. |
 | `check: not in a git repository` | `gate check` runs inside a repo. |

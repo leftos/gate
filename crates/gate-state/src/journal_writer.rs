@@ -350,6 +350,8 @@ pub enum FallbackReason {
     Lfs,
     /// The builder's work root is not locked down, or another process holds it open.
     Root,
+    /// The snapshot push to a builder that answered its preflight failed.
+    Push,
 }
 
 impl FallbackReason {
@@ -372,6 +374,7 @@ impl FallbackReason {
             FallbackReason::Install => "install",
             FallbackReason::Lfs => "lfs",
             FallbackReason::Root => "root",
+            FallbackReason::Push => "push",
         }
     }
 }

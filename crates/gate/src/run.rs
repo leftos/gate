@@ -5739,10 +5739,16 @@ fn fallback_line(host: &str, reason: FallbackReason, detail: Option<&str>, next:
 }
 
 /// Why the builder `host` did not run the command, as a fallback line says it before where the run goes
-/// ([`fallback_line`]): `gate: remote <host> <reason>`, or for a client that could not start, why, `detail`.
+/// ([`fallback_line`]): `gate: remote <host> <reason>`, or for a client that could not start, why, `detail`; a failed
+/// snapshot push, `gate: the snapshot push to <host> failed`, with the hint `detail` carries, a partial clone's, in
+/// parentheses.
 fn fallback_head(host: &str, reason: FallbackReason, detail: Option<&str>) -> String {
     match reason {
         FallbackReason::Client => format!("gate: remote {host} client could not start: {}", detail.unwrap_or("no reason given")),
+        FallbackReason::Push => {
+            let hint = detail.map(|hint| format!(" ({hint})")).unwrap_or_default();
+            format!("gate: the snapshot push to {host} failed{hint}")
+        }
         _ => format!("gate: remote {host} {}", reason.as_str()),
     }
 }
@@ -5828,8 +5834,8 @@ fn not_here_line(host: &str, reason: FallbackReason, outcome: &RemoteOutcome, no
 
 /// The fallback reasons worth another builder: a builder that is full, busy, cannot be reached, or lacks the version,
 /// parity, install or tools the run needs may be one another builder has. Every other reason runs here, and a desktop
-/// run ends instead: the PC's own failures (`client`, `inputs`, `lfs`) and those of the worktree, the desktop or a lost
-/// run.
+/// run ends instead: the PC's own failures (`client`, `inputs`, `lfs`, and `push`, a snapshot push that failed other
+/// than as a connection fails) and those of the worktree, the desktop or a lost run.
 const RETRIED: [FallbackReason; 7] = [
     FallbackReason::Full,
     FallbackReason::Busy,

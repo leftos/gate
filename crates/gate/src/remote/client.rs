@@ -657,6 +657,10 @@ pub(super) enum End {
     /// said it, `None` when it said none: ends as [`End::Refused`] for [`FallbackReason::Version`] does, carrying the
     /// builder's version into [`RemoteOutcome::other_build`].
     OtherBuild(Option<String>),
+    /// The snapshot push failed other than as a connection fails: ends as [`End::Refused`] for
+    /// [`FallbackReason::Push`] does, carrying whether git said `promisor remote`, so the fallback's line adds the
+    /// partial-clone hint ([`PROMISOR_HINT`]) through [`RemoteOutcome::detail`].
+    PushFailed { promisor: bool },
     /// The builder's work folder does not hold the PC's build the run's `SentDigest` names: the box's `sent` tag, which
     /// no fallback answers, as the client runs the call once more with `--no-build` dropped ([`Attempt::run_called`]).
     SentRefused,
@@ -1407,6 +1411,10 @@ enum Tagged {
     /// The box's `channel` refusal of an outputs or put call's data channel, which the pull or put over ssh answers.
     Channel,
 }
+
+/// What the fallback line of a snapshot push whose git said `promisor remote` adds, in parentheses: a partial clone
+/// lacked objects the push needs.
+const PROMISOR_HINT: &str = "a partial clone lacks objects the push needs; git backfill fetches them";
 
 /// What the box's line says after its `channel` refusal tag, before why ([`gate_wire::channel_not_completed_line`]).
 const NOT_COMPLETED: &str = "gate: data channel not completed: ";
@@ -2903,7 +2911,8 @@ impl Attempt<'_, '_> {
     /// and no submodules, then saves the local ref and says the push: `gate: pushed snapshot …` for a run of one
     /// repository, `gate: remote pushed snapshot {name} …` for each of a pair's. The run's first push says it as it
     /// starts, `gate: pushing snapshot {8} to {host}`, or `gate: pushing snapshots to {host}` for a pair's. A push that
-    /// fails is `unreachable`; a sibling's save that fails keeps the run here naming it, the main one's ends the run.
+    /// that fails as a connection fails, or that the client killed, is `unreachable`; one that fails otherwise is
+    /// [`End::PushFailed`], `push`; a sibling's save that fails keeps the run here naming it, the main one's ends the run.
     fn push(&mut self, push: &Push<'_>, watch: Watch) -> Result<(), End> {
         self.go_on()?;
         let Push { at, repo, snapshot, created } = *push;
@@ -2952,15 +2961,27 @@ impl Attempt<'_, '_> {
             attempt.git_started(git.command(root), &args, &set, Echo::Progress, watch)
         })?;
         let size = push_size(&called.lines);
+        // Read before the call's lines join the attempt's: a push that failed as a connection fails, by the rules a
+        // transfer or a call before the banner is retried on, is `unreachable`, worth another builder; any other
+        // failure is the push's own, carrying whether git said its promisor remote could not give an object.
+        let failed = (called.status != 0).then(|| {
+            if called.transfer_failed(GIT_SSH_FAILED) || called.before_the_banner(GIT_SSH_FAILED) {
+                End::Refused(FallbackReason::Unreachable)
+            } else {
+                End::PushFailed {
+                    promisor: called.said().any(|line| line.contains("promisor remote")),
+                }
+            }
+        });
         self.lines.append(&mut called.lines);
         self.not_started_if_killed("the push", &called)?;
-        if called.status != 0 {
+        if let Some(end) = failed {
             let of = if pair { format!(" of {}", repo.name) } else { String::new() };
             self.say(format!(
                 "gate: pushing the snapshot{of} to {} failed (status {})",
                 target.url, called.status
             ));
-            return Err(End::Refused(FallbackReason::Unreachable));
+            return Err(end);
         }
         // A commit stage's staged tree is never saved: no later run's bridge builds on it.
         if !matches!(self.sent(at), snapshot::Sent::Staged(_)) {
@@ -3971,6 +3992,10 @@ impl Attempt<'_, '_> {
             }
             End::Status(status) => (status, None),
             End::Refused(reason) => (REFUSED, Some(reason)),
+            End::PushFailed { promisor } => {
+                detail = promisor.then(|| PROMISOR_HINT.to_owned());
+                (REFUSED, Some(FallbackReason::Push))
+            }
             End::OtherBuild(theirs) => {
                 other_build = theirs;
                 (REFUSED, Some(FallbackReason::Version))
@@ -5755,7 +5780,7 @@ fn warm_end(hash: &str, started: bool, end: &End, last_error: Option<&str>) -> W
     let failure = match end {
         End::Interrupted => return WarmEnd::Deleted,
         End::Status(0) if started && last_error == Some(warm_line(Some(hash)).as_str()) => return WarmEnd::Warm,
-        End::Refused(_) | End::OtherBuild(_) | End::NotRouted(_) => WarmFailure::Refused,
+        End::Refused(_) | End::OtherBuild(_) | End::PushFailed { .. } | End::NotRouted(_) => WarmFailure::Refused,
         _ if started => WarmFailure::Commands,
         _ => WarmFailure::Refused,
     };
@@ -5774,6 +5799,7 @@ fn warm_reason(end: &End, started: bool) -> String {
         End::Status(status) => format!("the builder ended the warm-up before its commands with status {status}"),
         End::Refused(reason) => format!("the builder refused: {}", reason.as_str()),
         End::OtherBuild(_) => format!("the builder refused: {}", FallbackReason::Version.as_str()),
+        End::PushFailed { .. } => "the snapshot push failed".to_owned(),
         End::SentRefused => "the builder refused: sent".to_owned(),
         End::Draining(_) => "the builder refused: drain".to_owned(),
         End::Killed => "the warm-up was killed: it ran out of its budget or went silent".to_owned(),
@@ -7015,7 +7041,7 @@ mod tests {
         let ended = attempt.pushes(&repos, &snapshots, &[]);
 
         drop(attempt);
-        assert!(matches!(ended, Err(End::Refused(FallbackReason::Unreachable))), "{ended:?}");
+        assert!(matches!(ended, Err(End::PushFailed { promisor: false })), "{ended:?}");
         assert!(!marker.exists(), "the protocol helper ran");
     }
 

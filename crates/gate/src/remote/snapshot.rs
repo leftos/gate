@@ -263,8 +263,9 @@ fn take_one(calls: &Calls<'_>, key: &str, sent: Sent<'_>) -> Result<Snapshot, Gi
         Sent::Worktree(_) => worktree_tree(calls)?,
         Sent::Staged(_) => index_tree(calls)?,
     };
-    // A shallow clone sends no history: a receiver refuses a push from one.
-    let (head, base) = if paths.shallow {
+    // A shallow clone sends no history: a receiver refuses a push from one. Nor does a partial clone: its history lacks
+    // blobs its promisor remote holds, which packing it would fetch through a protocol the push does not allow.
+    let (head, base) = if paths.shallow || paths.partial {
         (None, None)
     } else {
         (paths.head, default_branch(&listing))
@@ -432,13 +433,46 @@ fn index_tree(calls: &Calls<'_>) -> Result<(String, GitPaths), GitError> {
 }
 
 /// The index, the index copy and the object store of the worktree's repository, and what the call that named them says
-/// of its history: whether it is a shallow clone, and the commit of its born `HEAD`, `None` for an unborn one.
+/// of its history: whether it is a shallow clone, whether it is a partial one ([`read_partial`]), and the commit of its
+/// born `HEAD`, `None` for an unborn one.
 struct GitPaths {
     index: PathBuf,
     copy: PathBuf,
     objects: PathBuf,
     shallow: bool,
+    partial: bool,
     head: Option<String>,
+}
+
+/// Whether the object store at `objects` is a partial clone's: its `pack` folder holds a file whose name ends
+/// `.promisor`, the marker git writes beside each pack fetched from a promisor remote. Read with no git process; a
+/// missing pack folder is not partial.
+///
+/// # Errors
+///
+/// Why the pack folder, or one of its entries, could not be read.
+fn is_partial(objects: &Path) -> io::Result<bool> {
+    let entries = match fs::read_dir(objects.join("pack")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        if entry?.file_name().to_string_lossy().ends_with(".promisor") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether the object store at `objects` is a partial clone's ([`is_partial`]), as a snapshot and a commit's stage
+/// both read it.
+///
+/// # Errors
+///
+/// `cannot read <pack folder>: <error>` when the pack folder, or one of its entries, could not be read.
+pub(crate) fn read_partial(objects: &Path) -> Result<bool, GitError> {
+    is_partial(objects).map_err(|error| GitError::Failed(format!("cannot read {}: {error}", objects.join("pack").display())))
 }
 
 /// The worktree's [`GitPaths`], as one `git rev-parse` call names them: three `--git-path` answers, then
@@ -482,10 +516,12 @@ fn paths(calls: &Calls<'_>, name: &str) -> Result<GitPaths, GitError> {
         }
     };
     let head = lines.next().map(str::to_owned).filter(|head| is_commit(head));
+    let objects = git_path(calls.root, objects);
     Ok(GitPaths {
         index: git_path(calls.root, index),
         copy: git_path(calls.root, copy),
-        objects: git_path(calls.root, objects),
+        partial: read_partial(&objects)?,
+        objects,
         shallow,
         head,
     })

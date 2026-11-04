@@ -5370,6 +5370,33 @@ fn every_other_reason_from_the_first_builder_runs_here_without_trying_host() {
     }
 }
 
+/// A first builder whose snapshot push failed falls back `push` and runs here: the second builder is never called, as
+/// the push failed for no reason another builder would not share. A push that failed as a connection fails is
+/// `unreachable`, which [`every_retried_reason_from_the_first_builder_tries_the_next`] covers.
+#[test]
+fn a_failed_push_is_not_tried_on_the_next_builder() {
+    let case = two_builder_case("routing-push-not-retried");
+    let call = case.folder().join("push.json");
+    let record = format!("record {}", shown(&call));
+    let steps = shown(&stub(&case, &["on mac-1", "refuse push", "on builder", &record, "status 0"]));
+    let running = case.start(&routed_words("push.log", &steps, &[], &[r".\tool.exe", "out", "ran here"]));
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert!(
+        has_line(&outcome.stderr, "gate: the snapshot push to mac-1 failed; running here"),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("trying"), "{outcome:?}");
+    assert!(!call.exists(), "host was never called");
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "take", "fallback", "take", "release"], "{own:#?}");
+    assert_eq!(hosts(&own), [Some(MAC), Some(MAC), Some(MAC), None, None], "{own:#?}");
+    assert_eq!(own[2]["reason"], "push", "{own:#?}");
+}
+
 #[test]
 fn a_held_work_folder_key_runs_here_without_trying_the_next_builder() {
     // The key is the worktree's on every builder: a key another run holds is busy on host too.

@@ -54,6 +54,7 @@ pub(crate) mod payload;
 mod retry;
 pub(crate) mod siblings;
 mod snapshot;
+pub(crate) use snapshot::read_partial;
 pub(crate) mod syncback;
 #[cfg(feature = "test-seams")]
 mod tamper;
@@ -312,7 +313,8 @@ pub(crate) struct RemoteOutcome {
     pub reason: Option<FallbackReason>,
     pub killed: bool,
     pub lines: Vec<String>,
-    /// Why the client could not start its run, or could not say its lines.
+    /// Why the client could not start its run, or could not say its lines; or a fallback's hint, which its line adds:
+    /// for `push`, that a partial clone lacks objects the push needs.
     pub detail: Option<String>,
     /// Whether the run's outputs were brought back: `Some(true)` only when the run's outputs step installed its archive
     /// whole, or the box packed nothing for a PC that held outputs, and in either case the box skipped no name this PC
@@ -722,7 +724,7 @@ mod scripted {
     /// How often `wait` looks for its path and the interrupt.
     const WAIT_STEP: Duration = Duration::from_millis(20);
     /// Every reason a `refuse` step may give.
-    const REASONS: [FallbackReason; 15] = [
+    const REASONS: [FallbackReason; 16] = [
         FallbackReason::Full,
         FallbackReason::Busy,
         FallbackReason::Unreachable,
@@ -738,6 +740,7 @@ mod scripted {
         FallbackReason::Install,
         FallbackReason::Lfs,
         FallbackReason::Root,
+        FallbackReason::Push,
     ];
 
     #[derive(Debug, Clone, PartialEq)]

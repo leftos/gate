@@ -40,6 +40,8 @@ pub(crate) enum Ineligible {
     UnbornHead,
     /// The repository is a shallow clone.
     Shallow,
+    /// The repository is a partial clone ([`crate::remote::read_partial`]).
+    Partial,
     /// The pre-commit hook is missing or is not prek's shim.
     NotPrekHook,
     /// A `pre-commit.legacy` hook sits beside prek's shim, which prek would run too.
@@ -65,6 +67,7 @@ impl fmt::Display for Ineligible {
             Ineligible::InProgress(name) => write!(f, "a merge, cherry-pick, revert or rebase is in progress ({name})"),
             Ineligible::UnbornHead => f.write_str("HEAD names no commit yet"),
             Ineligible::Shallow => f.write_str("the repository is shallow"),
+            Ineligible::Partial => f.write_str("the repository is a partial clone"),
             Ineligible::NotPrekHook => f.write_str("the pre-commit hook is not prek's"),
             Ineligible::LegacyHook => f.write_str("a pre-commit.legacy hook sits beside prek's"),
             Ineligible::PrekConfig(path) => write!(f, "{} has changes that are not staged", escaped(path)),
@@ -111,6 +114,9 @@ pub(crate) struct StageFacts {
     unborn: bool,
     /// Whether the repository is a shallow clone.
     shallow: bool,
+    /// Whether the repository is a partial clone: the pack folder of its object store, as `--git-path objects` names
+    /// it for a snapshot too, holds a `.promisor` file.
+    partial: bool,
     hook: Hook,
     /// The first prek config file with unstaged changes or untracked.
     prek_config: Option<String>,
@@ -213,6 +219,7 @@ fn judge_facts(facts: &StageFacts) -> Result<(), Ineligible> {
         facts.in_progress.map(Ineligible::InProgress),
         facts.unborn.then_some(Ineligible::UnbornHead),
         facts.shallow.then_some(Ineligible::Shallow),
+        facts.partial.then_some(Ineligible::Partial),
         (facts.hook == Hook::NotPrek).then_some(Ineligible::NotPrekHook),
         (facts.hook == Hook::Legacy).then_some(Ineligible::LegacyHook),
         facts.prek_config.clone().map(Ineligible::PrekConfig),
@@ -355,6 +362,7 @@ pub(crate) fn stage_facts(root: &Path, git: &Git, bounds: GitBounds) -> Result<S
         in_progress: places.in_progress,
         unborn: places.unborn,
         shallow: places.shallow,
+        partial: crate::remote::read_partial(&places.objects)?,
         hook,
         prek_config,
         staged_path,
@@ -368,25 +376,34 @@ type Filtered = (String, String);
 /// What one `git rev-parse` call says of the repository.
 struct Places {
     in_progress: Option<&'static str>,
+    /// The repository's object store, as `--git-path objects` names it.
+    objects: PathBuf,
     /// The repository's common git folder, which holds its own hooks folder.
     common: PathBuf,
     shallow: bool,
     unborn: bool,
 }
 
-/// The repository's [`Places`], from one `git rev-parse`: a `--git-path` answer for each of [`IN_PROGRESS`], then
-/// `--git-common-dir`'s, then `--is-shallow-repository`'s `true` or `false`, then the commit of a born `HEAD`, which
-/// git prints for no other.
+/// The repository's [`Places`], from one `git rev-parse`: a `--git-path` answer for each of [`IN_PROGRESS`] and then for
+/// `objects`, then `--git-common-dir`'s, then `--is-shallow-repository`'s `true` or `false`, then the commit of a born
+/// `HEAD`, which git prints for no other.
 fn git_places(asked: &Asked<'_>) -> Result<Places, GitError> {
     let mut args = vec!["rev-parse"];
     for name in IN_PROGRESS {
         args.extend(["--git-path", name]);
     }
-    args.extend(["--git-common-dir", "--is-shallow-repository", "--revs-only", "HEAD^{commit}"]);
+    args.extend([
+        "--git-path",
+        "objects",
+        "--git-common-dir",
+        "--is-shallow-repository",
+        "--revs-only",
+        "HEAD^{commit}",
+    ]);
     let printed = asked.output(&args, None)?;
     let lines: Vec<&str> = printed.lines().map(str::trim_end).collect();
     let unreadable = || GitError::Failed(format!("git rev-parse did not print every path it was asked: {}", printed.trim()));
-    let (Some(paths), Some(&shallow)) = (lines.get(..=IN_PROGRESS.len()), lines.get(IN_PROGRESS.len() + 1)) else {
+    let (Some(paths), Some(&shallow)) = (lines.get(..IN_PROGRESS.len() + 2), lines.get(IN_PROGRESS.len() + 2)) else {
         return Err(unreadable());
     };
     let shallow = match shallow {
@@ -394,14 +411,15 @@ fn git_places(asked: &Asked<'_>) -> Result<Places, GitError> {
         "false" => false,
         _ => return Err(unreadable()),
     };
-    let head = lines.get(IN_PROGRESS.len() + 2);
+    let head = lines.get(IN_PROGRESS.len() + 3);
     Ok(Places {
         in_progress: IN_PROGRESS
             .into_iter()
             .zip(paths)
             .find(|(_, path)| asked.root.join(path).exists())
             .map(|(name, _)| name),
-        common: asked.root.join(paths[IN_PROGRESS.len()]),
+        objects: asked.root.join(paths[IN_PROGRESS.len()]),
+        common: asked.root.join(paths[IN_PROGRESS.len() + 1]),
         shallow,
         unborn: !head.is_some_and(|head| gate_wire::is_lower_hex(head, 40) || gate_wire::is_lower_hex(head, 64)),
     })
@@ -559,6 +577,7 @@ mod tests {
             in_progress: None,
             unborn: false,
             shallow: false,
+            partial: false,
             hook: Hook::Prek,
             prek_config: None,
             staged_path: None,
@@ -760,6 +779,7 @@ mod tests {
             ),
             (Ineligible::UnbornHead, "HEAD names no commit yet"),
             (Ineligible::Shallow, "the repository is shallow"),
+            (Ineligible::Partial, "the repository is a partial clone"),
             (Ineligible::NotPrekHook, "the pre-commit hook is not prek's"),
             (Ineligible::LegacyHook, "a pre-commit.legacy hook sits beside prek's"),
             (
@@ -972,6 +992,19 @@ mod tests {
         assert_eq!(judged_in(&clone), Err(Ineligible::Shallow));
         removed(&clone);
         removed(&source);
+    }
+
+    /// A partial clone, whose pack folder holds a `.promisor` marker, cannot stage a commit: its snapshot sends no
+    /// history, so the stage would have no `HEAD` to stand on.
+    #[test]
+    fn a_partial_clone_cannot_stage_a_commit() {
+        let root = repository("partial");
+        stage(&root, "b.txt", "b\n");
+        let pack = root.join(".git").join("objects").join("pack");
+        fs::create_dir_all(&pack).expect("the pack folder can be made");
+        fs::write(pack.join("pack-0000000000000000000000000000000000000000.promisor"), "").expect("the marker can be written");
+        assert_eq!(judged_in(&root), Err(Ineligible::Partial));
+        removed(&root);
     }
 
     #[test]

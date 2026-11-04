@@ -1621,6 +1621,108 @@ fn a_shallow_repo_pushes_no_history_refs() {
     assert_eq!(pushed_head, "", "no head ref from a shallow clone");
 }
 
+/// A partial clone sends neither history ref, as a shallow clone does: its history lacks blobs its promisor remote
+/// holds, and packing that history for the push would fetch them through a protocol the push does not allow.
+#[test]
+fn a_partial_clone_pushes_no_history_refs() {
+    let case = client_case("client-history-partial");
+    write(&case, "a.txt", "a\n");
+    git(&case, &["add", "a.txt"]);
+    git(&case, &["commit", "--quiet", "-m", "start"]);
+    let dropped = git(&case, &["rev-parse", "HEAD:a.txt"]);
+    write(&case, "a.txt", "b\n");
+    git(&case, &["add", "a.txt"]);
+    git(&case, &["commit", "--quiet", "-m", "next"]);
+    let head = git(&case, &["rev-parse", "HEAD"]);
+    git(&case, &["update-ref", "refs/remotes/origin/main", &head]);
+    git(&case, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
+    // The promisor is one the push may not reach: https, where the test transport's push allows only `file`.
+    git(&case, &["remote", "add", "origin", "https://127.0.0.1:9/none.git"]);
+    git(&case, &["config", "remote.origin.promisor", "true"]);
+    git(&case, &["config", "remote.origin.partialclonefilter", "blob:none"]);
+    promisor_pack_without(&case, &dropped);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "a"]));
+    let key = key_of(&events(&case));
+    let pushed_base = builder_ref(&case, &format!("refs/gate-base/{key}"));
+    let pushed_head = builder_ref(&case, &format!("refs/gate-head/{key}"));
+    let snapshot = builder_ref(&case, &format!("refs/gate/{key}"));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback: {outcome:?}");
+    assert!(is_sha(&snapshot), "the snapshot is pushed all the same: {outcome:?}");
+    assert_eq!(pushed_base, "", "no base ref from a partial clone");
+    assert_eq!(pushed_head, "", "no head ref from a partial clone");
+}
+
+/// Packs every object of the case's repository but `dropped` into one promisor pack and removes the loose copies,
+/// `dropped`'s with them, so the repository lacks `dropped` as a `--filter=blob:none` clone lacks the blobs of history
+/// it never checked out.
+fn promisor_pack_without(case: &Case, dropped: &str) {
+    let listed = git(case, &["rev-list", "--objects", "--all"]);
+    let kept: String = listed
+        .lines()
+        .filter(|line| !line.starts_with(dropped))
+        .flat_map(|line| [line, "\n"])
+        .collect();
+    let mut command = Command::new("git");
+    for name in GIT_REDIRECTS {
+        command.env_remove(name);
+    }
+    crate::support::git_home_for(&mut command);
+    let mut packing = command
+        .args(["pack-objects", "-q", ".git/objects/pack/pack"])
+        .current_dir(case.folder())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("git starts");
+    packing
+        .stdin
+        .take()
+        .expect("git's stdin is piped")
+        .write_all(kept.as_bytes())
+        .expect("the object list is written");
+    let packed = packing.wait_with_output().expect("git ends");
+    assert!(packed.status.success(), "git pack-objects: {packed:?}");
+    let name = String::from_utf8(packed.stdout).expect("the pack's name is UTF-8");
+    let pack = case.folder().join(".git").join("objects").join("pack");
+    fs::write(pack.join(format!("pack-{}.promisor", name.trim())), "").expect("the promisor marker can be written");
+    git(case, &["prune-packed"]);
+    let loose = case.folder().join(".git").join("objects").join(&dropped[..2]).join(&dropped[2..]);
+    fs::remove_file(loose).expect("the dropped blob was loose");
+}
+
+/// A snapshot push that fails on a builder that answered its preflight, for a reason other than the connection (here
+/// the builder's `pre-receive` hook refuses it), falls back `push`, not `unreachable`, and its line names the failed
+/// push; a push that names no promisor remote gets no partial-clone hint.
+#[test]
+fn a_failed_push_falls_back_push_and_names_it() {
+    let case = client_case("client-push-refused");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 8]);
+    let first = finish(client_gate(&case, "first.log", &steps, &[r".\tool.exe", "out", "a"]));
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "the first run ran there: {first:?}");
+    let hooks = Path::new(&bare_of(&case)).join("hooks");
+    fs::create_dir_all(&hooks).expect("the hooks folder can be made");
+    fs::write(hooks.join("pre-receive"), "#!/bin/sh\necho 'refused by the test' >&2\nexit 1\n").expect("the hook can be written");
+    write(&case, "a.txt", "changed\n");
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "the command ran here: {outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), ["push"], "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains(&format!("gate: the snapshot push to {HOST} failed; running here")),
+        "the fallback line names the failed push: {outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("partial clone"), "no partial-clone hint: {outcome:?}");
+}
+
 /// A worktree whose runs alternate between `builder-a` and `host` bridges each push on the snapshot that builder last
 /// received, kept at a ref of its own: going back to `builder-a` after `host` sends only the difference, never host's
 /// snapshot and its whole tree.

@@ -29,7 +29,7 @@ Take the first row that holds, then record the decision with `watch_local.py mar
 |---|---|---|
 | 1 | `STILL-LOCAL-AFTER-FIX` | The fix did not take. Find why, book it, mark `booked`. |
 | 2 | `matched=since` | Covered now. Mark `routed`, note `pattern added since`. |
-| 3 | `fellBack=` | A route failed and fell back. Book it with the reason, mark `booked`. |
+| 3 | `fellBack=` | A route failed and fell back. Book it with the reason, mark `booked`. `fellBack=push` with `promisor remote` in the run's log is a partial clone missing objects, not a down builder: the run's repo can run `git backfill`, or the gate now routes it without history refs. |
 | 4 | `reason=declared local` | The repo keeps it here in `.gate/local.toml`. Mark `local`, its reason there as the note. |
 | 5 | `reason=--local: <text>` where the text names something no work can move off this PC | Mark `local`, the reason as the note. |
 | 4a | `reason=gitignored folder` | The run's folder is gitignored, so the snapshot cannot send it: scratch work. Mark `local`, note `gitignored folder`. |

@@ -50,7 +50,7 @@ A repo not listed keeps the rule above: declared siblings that are all absent ma
 
 A routed command sees the PC's `HEAD` commits and `origin/<default>` (by name) for each repo of the run. The builder's checkout holds the gate's snapshot of the PC worktree, a commit with no parent, and the push also carries the PC's `HEAD` and the commit at its origin default branch, which the builder fetches as `origin/<default>`. A revision on neither (another branch, a tag, a stash) still fails there with `bad revision` or `bad object`. Such a command resolves the revision on the PC first and passes what it selects as words (godot-mcp's itest passes `-Groups a,b,...` picked on the PC), or is declared local ([A repo with a command that stays on this PC](#a-repo-with-a-command-that-stays-on-this-pc)).
 
-A repo's first routed run to a builder pushes its reachable history in one pack, which for a large repo is big (yaat measured about 1.92 GiB), inside the push's 30-minute transfer ceiling. A shallow clone sends no history refs, and a repo with no origin default branch sends no base.
+A repo's first routed run to a builder pushes its reachable history in one pack, which for a large repo is big (yaat measured about 1.92 GiB), inside the push's 30-minute transfer ceiling. A shallow or partial clone sends no history refs, and a repo with no origin default branch sends no base.
 
 ## Adding a repo
 
