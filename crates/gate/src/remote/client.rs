@@ -6506,6 +6506,67 @@ mod tests {
         }
     }
 
+    /// A sibling pair's run decides its inputs by its builder before any tree is picked (`inputs::pair_inputs`): on a
+    /// macOS builder, declared globs refuse the route `inputs` with the macOS line rather than any tree's failure, and
+    /// with none declared, the pair inputs marker that makes a Windows builder's run sweep makes no manifest at all.
+    #[test]
+    fn a_macos_pair_run_decides_its_inputs_before_any_tree_is_picked() {
+        let pair = Pair::new("client-macos-pair-inputs", &["lib"]);
+        let run = pair.run(&pair.root, &["lib"]);
+        let log = pair.top.join("out.log");
+        let state = pair.top.join("state");
+        let mac = gate_router::Builder {
+            alias: "mac-1".to_owned(),
+            os: BuilderOs::Macos,
+            root: Some("/Users/b/gate-remote".to_owned()),
+            slots: 1,
+            id: None,
+            data: None,
+        };
+        let globs = ["secrets/**".to_owned()];
+        let siblings = || carried(&run.root, &run.siblings).expect("the run's siblings check");
+        let transport = nowhere();
+        let declared = RemoteCall {
+            builder: &mac,
+            inputs: &globs,
+            state_dir: &state,
+            ..pair_call(&run, siblings(), &log)
+        };
+        let mut on_mac = attempt(&declared, &transport);
+
+        let refused = super::super::inputs::sent(&mut on_mac);
+
+        assert!(
+            matches!(refused, Err(End::Refused(FallbackReason::Inputs))),
+            "the route is refused `inputs`"
+        );
+        assert_eq!(
+            on_mac.lines,
+            ["gate: remote inputs not sent: the macOS builder does not take a sibling pair's inputs yet"],
+            "for the macOS builder, before any tree is walked"
+        );
+        drop(on_mac);
+
+        let marker = v1::pair_inputs_path(&state, None, declared.key);
+        fs::create_dir_all(marker.parent().expect("the marker has a folder")).expect("the marker's folder can be made");
+        fs::write(&marker, "").expect("the marker can be written");
+        let none = RemoteCall {
+            builder: &mac,
+            state_dir: &state,
+            ..pair_call(&run, siblings(), &log)
+        };
+        let on_windows = RemoteCall {
+            builder: &crate::test_support::HOST,
+            state_dir: &state,
+            ..pair_call(&run, siblings(), &log)
+        };
+        let mac_sent = super::super::inputs::sent(&mut attempt(&none, &transport));
+        let windows_sent = super::super::inputs::sent(&mut attempt(&on_windows, &transport));
+
+        assert!(matches!(mac_sent, Ok(None)), "the macOS builder's run makes no inputs call");
+        assert!(matches!(windows_sent, Ok(Some(_))), "where a Windows builder's run sends the sweep");
+    }
+
     /// The outputs-pending marker says the PC's outputs may be wrong, whichever builder ran: one a `mac-1` run leaves
     /// makes the next run of the worktree on `host` ask for every output that differs (`OutputsFull`).
     #[test]

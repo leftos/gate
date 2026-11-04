@@ -34,8 +34,8 @@ use gate_win32::{
 };
 use gate_wire::stamp::Tag;
 use gate_wire::{
-    BACK_COMMIT_NONE, BACK_COMMITS_FAILED, LAYOUT_CHANGING, PairSibling, PathForm, Payload, bare_stem, checkout_done_line, checkout_start_line,
-    layout_text, names_another_layout, ordinal_upper, trees, warm_line,
+    BACK_COMMIT_NONE, BACK_COMMITS_FAILED, LAYOUT_CHANGING, PathForm, Payload, bare_stem, checkout_done_line, checkout_start_line, layout_text,
+    names_another_layout, ordinal_upper, trees, warm_line,
 };
 
 use crate::answer::USAGE_STATUS;
@@ -155,6 +155,9 @@ pub(super) struct Request<'a> {
     main: Repo<'a>,
     /// Each sibling of a pair run, in the payload's order, checked out in `{work}\{name}`; none on a run of one repo.
     siblings: Vec<Repo<'a>>,
+    /// The trees of a sibling pair's run below the work folder ([`gate_wire::Pair::trees`]), the main repo's folder
+    /// first, then each sibling's; empty for one repo, whose tree is the work folder itself.
+    trees: Vec<String>,
     pub(super) work: &'a str,
     lock: &'a str,
     index: &'a str,
@@ -267,11 +270,12 @@ impl Request<'_> {
         let sent_digest = payload.sent_digest()?;
         let lfs_digest = payload.lfs_digest()?;
         // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
-        let (main, siblings) = repos(payload, work, (bare, snapshot), lfs_digest)?;
+        let (main, siblings, trees) = repos(payload, work, (bare, snapshot), lfs_digest)?;
         Ok(Request {
             key,
             main,
             siblings,
+            trees,
             work,
             lock,
             index,
@@ -316,6 +320,12 @@ impl Request<'_> {
     /// Every repo of the run, the main one first.
     fn repos(&self) -> impl Iterator<Item = &Repo<'_>> {
         std::iter::once(&self.main).chain(&self.siblings)
+    }
+
+    /// The trees of a sibling pair's run below the work folder, the main repo's folder first, then each sibling's;
+    /// empty for one repo, whose tree is the work folder itself.
+    fn trees(&self) -> Vec<&str> {
+        self.trees.iter().map(String::as_str).collect()
     }
 
     /// The work folder and the repos the run lays out in it.
@@ -377,8 +387,12 @@ pub(super) fn lay_out_alone(asked: &inputs::WorkLock<'_>, console: &mut Console)
     let (main, siblings) = match asked.pair {
         None => (Repo::new(None, asked.work.to_owned(), asked.bare, ""), Vec::new()),
         Some(pair) => {
-            let names: Vec<&str> = pair.siblings().iter().map(PairSibling::name).collect();
-            let (main_tree, sibling_trees) = trees(asked.work, Some((pair.leaf(), &names)), PathForm::Windows);
+            let names = pair.trees();
+            let (main_tree, sibling_trees) = trees(
+                asked.work,
+                names.split_first().map(|(leaf, siblings)| (*leaf, siblings)),
+                PathForm::Windows,
+            );
             let siblings = pair
                 .siblings()
                 .iter()
@@ -495,11 +509,13 @@ fn inputs_matched(request: &Request<'_>, held: &File, beat: &Beat<'_>, console: 
     let Some(sent) = request.inputs_digest else {
         return Ok(());
     };
-    let why = match inputs::unmatched(inputs::Book::Inputs, request.work, request.main.name.as_deref(), held, sent) {
+    let why = match inputs::unmatched(inputs::Book::Inputs, request.work, &request.trees(), held, sent) {
         Ok(moved_aside) => {
-            if let Some(line) = moved_aside {
+            if !moved_aside.is_empty() {
                 let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
-                stamping::err(console, &line);
+                for line in moved_aside {
+                    stamping::err(console, &line);
+                }
             }
             return Ok(());
         }
@@ -519,20 +535,23 @@ fn inputs_matched(request: &Request<'_>, held: &File, beat: &Beat<'_>, console: 
 }
 
 /// Checks the run's `SentDigest`, when it has one, against the work folder `held`'s sent-build record and the copies
-/// it holds, and rewrites the tree's exclude file from both records ([`inputs::unmatched`]), once the work folder is
+/// it holds, and rewrites each tree's exclude file from both records ([`inputs::unmatched`]), once the work folder is
 /// laid out and cleared and its inputs checked: a record missing, unreadable or of another digest, a copy changed or
 /// gone, or an exclude file that cannot be written refuses the run `sent`, its tag and line said under the box's
-/// output lock, so the PC runs it again without its `--no-build`; 75. On a sibling pair's run the exclude file is the
-/// main repo's, in `{work}\{leaf}`. A folder moved aside from the exclude file's name is said, under the lock too.
+/// output lock, so the PC runs it again without its `--no-build`; 75. On a sibling pair's run every tree's exclude
+/// file is rewritten, each in its own `{work}\{tree}`. A folder moved aside from an exclude file's name is said, under
+/// the lock too.
 fn sent_matched(request: &Request<'_>, held: &File, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
     let Some(sent) = request.sent_digest else {
         return Ok(());
     };
-    let why = match inputs::unmatched(inputs::Book::SentBuild, request.work, request.main.name.as_deref(), held, sent) {
+    let why = match inputs::unmatched(inputs::Book::SentBuild, request.work, &request.trees(), held, sent) {
         Ok(moved_aside) => {
-            if let Some(line) = moved_aside {
+            if !moved_aside.is_empty() {
                 let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
-                stamping::err(console, &line);
+                for line in moved_aside {
+                    stamping::err(console, &line);
+                }
             }
             return Ok(());
         }
@@ -557,13 +576,8 @@ fn sent_matched(request: &Request<'_>, held: &File, beat: &Beat<'_>, console: &m
 /// or the sibling's from `SiblingBases`, and its LFS digest the main repo's `lfs_digest`, the payload's `LfsDigest`, or
 /// the sibling's from `SiblingLfsDigests`. Only the main repo is a commit stage's, with the PC's `HEAD` from the
 /// payload's `Head`, when its `CommitStage` says so. Else the usage line, a `SiblingLfsDigests` without a `Pair` among
-/// them.
-fn repos<'a>(
-    payload: &'a Payload,
-    work: &str,
-    (bare, snapshot): (&str, &'a str),
-    lfs_digest: Option<&'a str>,
-) -> Result<(Repo<'a>, Vec<Repo<'a>>), String> {
+/// them. The pair's trees ([`gate_wire::Pair::trees`]) come with them, none for one repo.
+fn repos<'a>(payload: &'a Payload, work: &str, (bare, snapshot): (&str, &'a str), lfs_digest: Option<&'a str>) -> Result<Repos<'a>, String> {
     let base = payload.base()?;
     let head = payload.commit_stage_head()?;
     let Some(pair) = payload.pair()? else {
@@ -572,13 +586,14 @@ fn repos<'a>(
         return Ok((
             Repo::new(None, tree, bare, snapshot).based(base).staged(head).digested(lfs_digest),
             Vec::new(),
+            Vec::new(),
         ));
     };
     let commits = payload.sibling_snapshots(&pair)?;
     let bases = payload.sibling_bases(&pair)?;
     let digests = payload.sibling_lfs_digests(Some(&pair))?;
-    let names: Vec<&str> = pair.siblings().iter().map(PairSibling::name).collect();
-    let (main_tree, sibling_trees) = trees(work, Some((pair.leaf(), &names)), PathForm::Windows);
+    let names = pair.trees();
+    let (main_tree, sibling_trees) = trees(work, names.split_first().map(|(leaf, siblings)| (*leaf, siblings)), PathForm::Windows);
     let main = Repo::new(Some(pair.leaf()), main_tree, bare, snapshot)
         .based(base)
         .staged(head)
@@ -592,8 +607,11 @@ fn repos<'a>(
         .zip(sibling_trees)
         .map(|((((sibling, commit), base), digest), tree)| Repo::new(Some(sibling.name()), tree, sibling.bare(), commit).based(base).digested(digest))
         .collect();
-    Ok((main, siblings))
+    Ok((main, siblings, names.into_iter().map(str::to_owned).collect()))
 }
+
+/// What [`repos`] reads of a run's payload: the main repo, the siblings of a pair, and the pair's trees.
+type Repos<'a> = (Repo<'a>, Vec<Repo<'a>>, Vec<String>);
 
 /// One repo of a run, made once as the payload is read: its name on a pair run, its tree, the bare repository its
 /// snapshot is fetched from and its back commit pushed to, the commit checked out, and the PC's default branch, whose

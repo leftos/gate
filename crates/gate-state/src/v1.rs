@@ -266,12 +266,58 @@ pub fn inputs_hashes_path(root: &Path, id: Option<&str>, key: &str) -> PathBuf {
     builder_cache_dir(root, id).join(format!("{key}.inputs-hashes"))
 }
 
+/// The inputs hash cache of the sibling `sibling` of a pair run from the work folder `key` on the builder whose id is
+/// `id`, `<folder>\<key>.<sibling>.inputs-hashes` in its folder ([`builder_cache_dir`]), beside the main tree's
+/// [`inputs_hashes_path`]: each entry keyed by its path relative to the sibling's own tree, so no key of it ever names
+/// a file of another tree.
+#[must_use]
+pub fn sibling_inputs_hashes_path(root: &Path, id: Option<&str>, key: &str, sibling: &str) -> PathBuf {
+    builder_cache_dir(root, id).join(format!("{key}.{sibling}.inputs-hashes"))
+}
+
+/// Every sibling inputs hash cache of the work folder `key` on the builder whose id is `id` ([`sibling_inputs_hashes_path`])
+/// its folder holds; none when there is no folder. A key holds no `.`, so `<key>.` names only its own files.
+///
+/// # Errors
+///
+/// Why the folder cannot be listed, when it is there (or cannot be told absent): a caller says it rather than skip the
+/// caches.
+pub fn sibling_inputs_hashes_paths(root: &Path, id: Option<&str>, key: &str) -> io::Result<Vec<PathBuf>> {
+    let folder = builder_cache_dir(root, id);
+    let entries = match fs::read_dir(&folder) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let (head, own) = (format!("{key}."), format!("{key}.inputs-hashes"));
+    let mut paths = Vec::new();
+    for entry in entries {
+        if let Some(name) = entry?.file_name().to_str()
+            && name.starts_with(&head)
+            && name.ends_with(".inputs-hashes")
+            && name != own
+        {
+            paths.push(folder.join(name));
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
 /// The carried marker of the work folder `key` on the builder whose id is `id`, `<folder>\<key>.inputs-carried` in its
 /// folder ([`builder_cache_dir`]), beside the inputs hash cache: an empty file, there once an inputs step that carried a
 /// path a command named landed, until a run with no inputs has removed the copies it put.
 #[must_use]
 pub fn inputs_carried_path(root: &Path, id: Option<&str>, key: &str) -> PathBuf {
     builder_cache_dir(root, id).join(format!("{key}.inputs-carried"))
+}
+
+/// The pair inputs marker of the work folder `key` on the builder whose id is `id`, `<folder>\<key>.pair-inputs` in its
+/// folder ([`builder_cache_dir`]), beside the carried marker ([`inputs_carried_path`]): an empty file, there once a
+/// sibling pair's inputs manifest naming a file landed, until a pair run with no inputs has swept the copies it put.
+#[must_use]
+pub fn pair_inputs_path(root: &Path, id: Option<&str>, key: &str) -> PathBuf {
+    builder_cache_dir(root, id).join(format!("{key}.pair-inputs"))
 }
 
 /// The sent-build hash cache of the work folder `key` on the builder whose id is `id`, `<folder>\<key>.sent-build-hashes`
@@ -1457,7 +1503,7 @@ mod tests {
 
     use super::{
         BuiltHereRecord, BuiltHereSettings, WorktreeRecord, built_here_path, built_here_record, mark_gone, needs_write, read_listed_ticket,
-        versioned_text, worktree_record, write_built_here,
+        sibling_inputs_hashes_paths, versioned_text, worktree_record, write_built_here,
     };
 
     /// A built-here record of the project `one` under `-c Release` and the project keyed `""` under
@@ -1475,6 +1521,27 @@ mod tests {
         BuiltHereRecord {
             projects: [("one".to_owned(), release), (String::new(), whole)].into_iter().collect(),
         }
+    }
+
+    #[test]
+    fn a_cache_folder_that_cannot_be_listed_is_an_error_and_an_absent_one_lists_none() {
+        let root = crate::test_support::temp_dir().join(format!("gate-state-sibling-caches-{}", std::process::id()));
+        // A folder left by an earlier run of the test may not be there.
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            sibling_inputs_hashes_paths(&root, None, "app-1a2b3c4d").map_err(|error| error.kind()),
+            Ok(Vec::new()),
+            "no folder, no caches"
+        );
+        let folder = super::builder_cache_dir(&root, None);
+        std::fs::create_dir_all(folder.parent().expect("the folder has a parent")).expect("the parent can be made");
+        std::fs::write(&folder, "a file, not a folder").expect("the file can be written");
+
+        let listed = sibling_inputs_hashes_paths(&root, None, "app-1a2b3c4d");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let error = listed.expect_err("a file where the folder belongs cannot be listed");
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
     }
 
     #[test]

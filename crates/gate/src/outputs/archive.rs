@@ -55,12 +55,37 @@ pub(crate) struct PcFiles<'a> {
 pub(crate) fn pack(sink: impl Write, root: &Path, files: &[Chosen<'_>], held: &HeldBy<'_>) -> io::Result<Packed> {
     // Resolved once, as each file's final path is: `canonicalize` is `GetFinalPathNameByHandleW` on the opened folder.
     let root = fs::canonicalize(root).map_err(|error| in_context(root, &error))?;
+    packed_below(sink, files, |_| &root, held)
+}
+
+/// [`pack`] of files found below roots of their own: `roots[i]` is the root `files[i]` was found below, whose final
+/// path its own must be inside, never a common parent of them. Each root is resolved once.
+pub(crate) fn pack_rooted(sink: impl Write, files: &[Chosen<'_>], roots: &[&Path], held: &HeldBy<'_>) -> io::Result<Packed> {
+    if roots.len() != files.len() {
+        return Err(io::Error::other(format!("{} files were given {} roots", files.len(), roots.len())));
+    }
+    let mut resolved: Vec<(&Path, PathBuf)> = Vec::new();
+    let mut indexes = Vec::with_capacity(roots.len());
+    for root in roots {
+        if let Some(at) = resolved.iter().position(|(known, _)| known == root) {
+            indexes.push(at);
+        } else {
+            resolved.push((root, fs::canonicalize(root).map_err(|error| in_context(root, &error))?));
+            indexes.push(resolved.len() - 1);
+        }
+    }
+    let finals: Vec<&Path> = indexes.iter().map(|at| resolved[*at].1.as_path()).collect();
+    packed_below(sink, files, |at| finals[at], held)
+}
+
+/// Packs `files`, each found below the final path `root_of` gives for its index, as [`pack`] describes.
+fn packed_below<'r>(sink: impl Write, files: &[Chosen<'_>], root_of: impl Fn(usize) -> &'r Path, held: &HeldBy<'_>) -> io::Result<Packed> {
     let total = files.iter().fold(0_u64, |total, chosen| total.saturating_add(chosen.file.stamp.size));
     let mut sent: HashMap<String, u64> = HashMap::new();
     let mut packer = Packer::new(sink, window_log(total))?;
-    for chosen in files {
+    for (at, chosen) in files.iter().enumerate() {
         let known = |sha256: &str| sent.get(sha256).copied().or_else(|| held_size(held, sha256));
-        pack_one(&mut packer, &root, chosen, known).map_err(|error| in_context(&chosen.file.full, &error))?;
+        pack_one(&mut packer, root_of(at), chosen, known).map_err(|error| in_context(&chosen.file.full, &error))?;
         if let Some(Item { entry, copy: None }) = packer.items().last() {
             sent.entry(entry.sha256.clone()).or_insert(entry.size);
         }

@@ -126,6 +126,18 @@ fn builders_removed(state: &Path, key: &str, builders: &[(Option<String>, Outcom
         for path in own_files(state, id.as_deref(), key) {
             removed &= file_removed(&path, console);
         }
+        match v1::sibling_inputs_hashes_paths(state, id.as_deref(), key) {
+            Ok(paths) => {
+                for path in paths {
+                    removed &= file_removed(&path, console);
+                }
+            }
+            Err(error) => {
+                let folder = v1::builder_cache_dir(state, id.as_deref());
+                console.err(&format!("gate: prune: could not list {}: {error}", folder.display()));
+                removed = false;
+            }
+        }
     }
     removed
 }
@@ -135,12 +147,14 @@ fn every_removed(builders: &[(Option<String>, Outcome)]) -> bool {
     !builders.is_empty() && builders.iter().all(|(_, outcome)| *outcome == Outcome::Removed)
 }
 
-/// The files of `key` the builder whose id is `id` has of its own under the state root `state`.
-fn own_files(state: &Path, id: Option<&str>, key: &str) -> [PathBuf; 5] {
-    [
+/// The files of `key` the builder whose id is `id` has of its own under the state root `state`, each sibling's inputs
+/// hash cache aside: [`builders_removed`] lists those ([`v1::sibling_inputs_hashes_paths`]).
+fn own_files(state: &Path, id: Option<&str>, key: &str) -> Vec<PathBuf> {
+    vec![
         v1::outputs_hashes_path(state, id, key),
         v1::inputs_hashes_path(state, id, key),
         v1::inputs_carried_path(state, id, key),
+        v1::pair_inputs_path(state, id, key),
         v1::sent_build_hashes_path(state, id, key),
         v1::outputs_capped_path(state, id, key),
     ]

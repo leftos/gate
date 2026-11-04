@@ -2822,6 +2822,8 @@ mod tests {
                     name: (*name).to_owned(),
                     root: (*root).to_owned(),
                     id,
+                    repo: (*name).to_owned(),
+                    inputs: Vec::new(),
                 })
                 .collect(),
             absent_siblings: Vec::new(),

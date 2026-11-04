@@ -4612,6 +4612,8 @@ mod tests {
                 name: "lib".to_owned(),
                 root: sibling_root(&root, "lib"),
                 id: FolderId { volume: 1, file: [2; 16] },
+                repo: "lib".to_owned(),
+                inputs: Vec::new(),
             }],
             absent_siblings: Vec::new(),
             repo: "app".to_owned(),

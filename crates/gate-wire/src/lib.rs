@@ -827,6 +827,14 @@ impl Pair {
     pub fn siblings(&self) -> &[PairSibling] {
         &self.siblings
     }
+
+    /// The trees of the pair's layout below the work folder, by folder name: the main checkout's, then each sibling's in
+    /// the payload's order. The one list every step of the box that lays out, holds or reads the pair's trees takes, so
+    /// a record's tree prefixes are compared against the same names everywhere.
+    #[must_use]
+    pub fn trees(&self) -> Vec<&str> {
+        std::iter::once(self.leaf()).chain(self.siblings.iter().map(PairSibling::name)).collect()
+    }
 }
 
 /// Why the box refuses a run's `Pair`: the usage line, and the sibling it names when one sibling alone is refused.

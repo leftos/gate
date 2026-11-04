@@ -11,9 +11,21 @@ pub(crate) struct Sibling<'a> {
     name: &'a str,
     root: &'a str,
     id: FolderId,
+    repo: &'a str,
+    inputs: &'a [String],
 }
 
 impl<'a> Sibling<'a> {
+    /// The sibling's repo name, its main checkout's folder name, which its `inputs` and log lines are named by.
+    pub(crate) fn repo(&self) -> &'a str {
+        self.repo
+    }
+
+    /// The `inputs` globs the routing file gives the sibling's repo, relative to the sibling's own tree.
+    pub(crate) fn inputs(&self) -> &'a [String] {
+        self.inputs
+    }
+
     /// The folder name as `.gate/siblings.toml` declares it.
     pub(crate) fn name(&self) -> &'a str {
         self.name
@@ -54,6 +66,8 @@ pub(crate) fn carried<'a>(root: &str, siblings: &'a [CarriedSibling]) -> Result<
                 name: &sibling.name,
                 root: &sibling.root,
                 id: sibling.id,
+                repo: &sibling.repo,
+                inputs: &sibling.inputs,
             })
         })
         .collect()
@@ -87,6 +101,8 @@ mod tests {
                     name: (*name).to_owned(),
                     root: (*root).to_owned(),
                     id: ID,
+                    repo: (*name).to_owned(),
+                    inputs: Vec::new(),
                 })
                 .collect(),
             absent_siblings: Vec::new(),

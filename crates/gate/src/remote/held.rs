@@ -413,6 +413,8 @@ pub(super) mod tests {
                         name: (*name).to_owned(),
                         root: sibling_root(root, name),
                         id: id_of(&self.folder(name)),
+                        repo: (*name).to_owned(),
+                        inputs: Vec::new(),
                     })
                     .collect(),
                 absent_siblings: Vec::new(),

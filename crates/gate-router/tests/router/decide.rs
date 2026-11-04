@@ -6473,7 +6473,7 @@ fn pair_probe() -> FakeFacts {
 }
 
 /// The reason a sibling pair's run naming the probe is kept here for.
-const PAIR_PROBE: &str = r".tmp\probe is gitignored, and a sibling pair does not send inputs yet";
+const PAIR_PROBE: &str = r".tmp\probe is gitignored, and a sibling pair does not send a command's gitignored files yet";
 
 #[test]
 fn a_sibling_pair_s_gitignored_input_keeps_the_command_here_saying_so() {

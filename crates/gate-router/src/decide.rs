@@ -472,7 +472,8 @@ pub trait Facts {
 
     /// The folder name of the main checkout of the worktree at `tree`, as [`Place::checkout`] names the run's own: the
     /// parent of its common git folder, read from its `.git` alone with no git started; `None` when it cannot be read.
-    /// Asked only of a tree [`Facts::worktree_of`] found that is not the run's own, matched or not.
+    /// Asked of a tree [`Facts::worktree_of`] found that is not the run's own, matched or not, and of each carried
+    /// sibling's root, whose repo's `inputs` it names.
     fn checkout_of(&self, tree: &Path) -> Option<String>;
 
     /// What the PC knows of each of `builders` for the command `words`, rewritten for Windows, of the worktree at
@@ -500,13 +501,17 @@ pub struct FolderId {
     pub file: [u8; 16],
 }
 
-/// A sibling a routed run carries: its folder name as declared, its root as [`sibling_root`] spells it, and the id
-/// [`Facts::sibling_folder`] gave its folder.
+/// A sibling a routed run carries: its folder name as declared, its root as [`sibling_root`] spells it, the id
+/// [`Facts::sibling_folder`] gave its folder, its repo's name (its main checkout's folder name, as [`Place::checkout`]
+/// names the run's own, read by [`Facts::checkout_of`]; its declared name when that cannot be read), and the `inputs`
+/// globs the same routing file gives that repo, which apply to the sibling's own tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CarriedSibling {
     pub name: String,
     pub root: String,
     pub id: FolderId,
+    pub repo: String,
+    pub inputs: Vec<String>,
 }
 
 /// A declared sibling's folder as [`Facts::sibling_folder`] found it.
@@ -748,7 +753,10 @@ impl LocalReason {
                 CARRIED_BYTES / MIB,
                 bytes.div_ceil(MIB)
             ),
-            Self::GitignoredPair { path } => format!("{} is gitignored, and a sibling pair does not send inputs yet", escaped(path)),
+            Self::GitignoredPair { path } => format!(
+                "{} is gitignored, and a sibling pair does not send a command's gitignored files yet",
+                escaped(path)
+            ),
             Self::GitignoredUnsent { path, why } => format!("{} is gitignored and its files cannot be sent: {why}", escaped(path)),
             Self::BuiltHere { project } => format!("the last build of {} ran here; --no-build kept", escaped(project)),
             Self::DesktopUnderParent { pattern } => format!(
@@ -3451,7 +3459,19 @@ fn settle(config: &Config, opened: Opened, builder: Builder, facts: &dyn Facts) 
                     ..
                 },
                 id,
-            )| CarriedSibling { name, root, id },
+            )| {
+                let repo = facts
+                    .checkout_of(Path::new(&root))
+                    .map_or_else(|| repo_name(&name), |checkout| repo_name(&checkout));
+                let inputs = config.inputs(&repo);
+                CarriedSibling {
+                    name,
+                    root,
+                    id,
+                    repo,
+                    inputs,
+                }
+            },
         )
         .collect();
     Ok(Target {

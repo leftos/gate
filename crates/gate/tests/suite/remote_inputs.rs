@@ -486,19 +486,404 @@ fn a_run_the_box_refuses_for_its_inputs_falls_back_inputs() {
     assert_fell_back(&case, &outcome, "out.log", "the builder's work folder does not hold the inputs sent");
 }
 
-#[test]
-fn a_pair_with_inputs_falls_back_before_any_inputs_call() {
-    let (case, _, name, sibling) = pair_case("client-inputs-pair", &[], sibling_repository);
+/// The sibling's one input, `/`-separated below its own tree, and the bytes it holds.
+const SIBLING_INPUT: (&str, &str) = ("secrets/lib.json", "lib input");
+
+/// Writes the routing file of a pair case: its repo's `*tool*` commands to the builder with the sibling `sibling_name`,
+/// the main repo's input globs `main` and the sibling repo's `sibling`, each list left out when empty.
+fn pair_inputs_routed(case: &Case, leaf: &str, sibling_name: &str, main: &[&str], sibling: &[&str]) {
+    let (repo, sibling_repo) = (repo_name(leaf), repo_name(sibling_name));
+    let mut inputs = serde_json::Map::new();
+    for (name, globs) in [(&repo, main), (&sibling_repo, sibling)] {
+        if !globs.is_empty() {
+            inputs.insert(name.clone(), json!(globs));
+        }
+    }
+    let routing = json!({
+        "host": HOST,
+        "slots": 2,
+        "repos": { &repo: ["*tool*"] },
+        "outputs": { &repo: [] },
+        "siblings": { &repo: [sibling_name] },
+        "inputs": inputs,
+    });
+    write_remote_json(case, &routing.to_string());
+}
+
+/// A pair case whose main repo holds the ignored input [`INPUT`] and whose sibling holds the ignored input
+/// [`SIBLING_INPUT`], its routing file giving the main repo the globs `main` and the sibling's `sibling`: the case, its
+/// folder name, the sibling's name and its folder.
+fn pair_inputs_case(name: &str, main: &[&str], sibling: &[&str]) -> (Case, String, String, PathBuf) {
+    let (case, leaf, sibling_name, sibling_path) = pair_case(name, &[], sibling_repository);
     with_input(&case);
-    routed(&case, Some(&name));
+    fs::write(sibling_path.join(".gitignore"), "secrets/\n.tmp/\n").expect("the sibling's .gitignore can be written");
+    fs::create_dir_all(sibling_path.join("secrets")).expect("the sibling's secrets folder can be made");
+    fs::write(sibling_path.join(SIBLING_INPUT.0.replace('/', "\\")), SIBLING_INPUT.1).expect("the sibling's input can be written");
+    pair_inputs_routed(&case, &leaf, &sibling_name, main, sibling);
+    (case, leaf, sibling_name, sibling_path)
+}
+
+/// The file at the `/`-separated `path` of the tree `tree` in the builder's work folder of a pair run, `None` when it
+/// holds none.
+fn in_tree(case: &Case, tree: &str, path: &str) -> Option<String> {
+    fs::read_to_string(work_folder(case).join(tree).join(path.replace('/', "\\"))).ok()
+}
+
+#[test]
+fn a_pair_sends_each_repo_s_inputs_into_its_own_tree() {
+    let (case, leaf, name, sibling) = pair_inputs_case("client-inputs-pair", &["secrets/**"], &["secrets/**"]);
     let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
 
     let outcome = finish(client_gate(&case, "out.log", &steps, &RAN));
     remove_sibling(&sibling);
 
-    let made = calls(&steps);
-    assert!(!made.iter().any(|verb| verb == "inputs" || verb == "run"), "{made:?}");
-    assert_fell_back(&case, &outcome, "out.log", "a sibling pair does not send inputs yet");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        calls(&steps),
+        ["preflight", "inputs", "inputs", "run"],
+        "one diff and one put for both trees"
+    );
+    assert_eq!(
+        in_tree(&case, &leaf, INPUT).as_deref(),
+        Some("one"),
+        "the main repo's input is in its tree"
+    );
+    assert_eq!(
+        in_tree(&case, &name, SIBLING_INPUT.0).as_deref(),
+        Some(SIBLING_INPUT.1),
+        "the sibling's in its own"
+    );
+    assert!(
+        !work_folder(&case).join(&leaf).join(&name).exists(),
+        "nothing of the sibling lands below the leaf"
+    );
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_pair_whose_sibling_alone_declares_inputs_sends_them() {
+    let (case, leaf, name, sibling) = pair_inputs_case("client-inputs-pair-sibling", &[], &["secrets/**"]);
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &RAN));
+    remove_sibling(&sibling);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "inputs", "inputs", "run"]);
+    assert_eq!(in_tree(&case, &name, SIBLING_INPUT.0).as_deref(), Some(SIBLING_INPUT.1));
+    assert_eq!(in_tree(&case, &leaf, INPUT), None, "the main repo declares none");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn an_unchanged_pair_input_is_not_sent_again() {
+    let (case, _, _, sibling) = pair_inputs_case("client-inputs-pair-unchanged", &["secrets/**"], &["secrets/**"]);
+    let first = ssh_steps(&case, "first", &["ok"; 4]);
+    let sent = finish(client_gate(&case, "first.log", &first, &RAN));
+    assert_eq!(sent.code, Some(0), "{sent:?}");
+
+    let second = ssh_steps(&case, "second", &["ok"; 4]);
+    let outcome = finish(client_gate(&case, "second.log", &second, &RAN));
+    remove_sibling(&sibling);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&second), ["preflight", "inputs", "run"], "the diff alone, no put");
+    let said = log_of(&case, "second.log");
+    assert!(has_line(&said, "gate: inputs: 2 file(s) unchanged"), "{said}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_sibling_s_own_gate_temp_files_are_not_sent() {
+    let (case, _, name, sibling) = pair_inputs_case("client-inputs-pair-own-tmp", &[], &[".tmp/**"]);
+    let sibling_key = gate_router::work_folder_key(&shown(&sibling).replace('\\', "/"));
+    let own = format!(".tmp/{sibling_key}-0a1b2c3d.outputs.tar.zst");
+    fs::create_dir_all(sibling.join(".tmp")).expect("the sibling's .tmp can be made");
+    fs::write(sibling.join(own.replace('/', "\\")), "the sibling's own archive").expect("the archive can be written");
+    fs::write(sibling.join(r".tmp\data.txt"), "data").expect("the data can be written");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &RAN));
+    remove_sibling(&sibling);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        in_tree(&case, &name, ".tmp/data.txt").as_deref(),
+        Some("data"),
+        "the sibling's input is sent"
+    );
+    assert_eq!(in_tree(&case, &name, &own), None, "its own gate archive is not: {outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_pair_whose_inputs_list_is_emptied_sweeps_its_old_copies() {
+    let (case, leaf, name, sibling) = pair_inputs_case("client-inputs-pair-emptied", &["secrets/**"], &["secrets/**"]);
+    let first = ssh_steps(&case, "first", &["ok"; 4]);
+    let sent = finish(client_gate(&case, "first.log", &first, &RAN));
+    assert_eq!(sent.code, Some(0), "{sent:?}");
+    assert_eq!(in_tree(&case, &name, SIBLING_INPUT.0).as_deref(), Some(SIBLING_INPUT.1));
+    pair_inputs_routed(&case, &leaf, &name, &[], &[]);
+
+    let second = ssh_steps(&case, "second", &["ok"; 4]);
+    let swept = finish(client_gate(&case, "second.log", &second, &RAN));
+    let third = ssh_steps(&case, "third", &["ok"; 4]);
+    let after = finish(client_gate(&case, "third.log", &third, &RAN));
+    remove_sibling(&sibling);
+
+    assert_eq!(swept.code, Some(0), "{swept:?}");
+    assert_eq!(calls(&second), ["preflight", "inputs", "run"], "the empty manifest's diff, no put");
+    assert_eq!(in_tree(&case, &leaf, INPUT), None, "the main repo's old copy is swept");
+    assert_eq!(in_tree(&case, &name, SIBLING_INPUT.0), None, "and the sibling's");
+    let said = log_of(&case, "second.log");
+    assert!(has_line(&said, "gate: inputs: removed the old copies of every tree"), "{said}");
+    assert!(!said.contains("0 file(s) unchanged"), "the sweep is not said unchanged: {said}");
+    assert_eq!(after.code, Some(0), "{after:?}");
+    assert_eq!(calls(&third), ["preflight", "run"], "once swept, no inputs call");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+/// Sets the file at `path` last written an hour from now, so no build's hash cache keeps its hash: it never settles.
+fn unsettled(path: &Path) {
+    let file = fs::File::options().write(true).open(path).expect("the file can be opened");
+    file.set_modified(std::time::SystemTime::now() + Duration::from_hours(1))
+        .expect("its last write can be set");
+}
+
+#[test]
+fn a_pair_whose_inputs_never_settled_still_sweeps_them_once_its_list_is_emptied() {
+    let (case, leaf, name, sibling) = pair_inputs_case("client-inputs-pair-unsettled", &["secrets/**"], &["secrets/**"]);
+    unsettled(&case.folder().join(INPUT_ON_DISK));
+    unsettled(&sibling.join(SIBLING_INPUT.0.replace('/', "\\")));
+    let first = ssh_steps(&case, "first", &["ok"; 4]);
+    let sent = finish(client_gate(&case, "first.log", &first, &RAN));
+    assert_eq!(sent.code, Some(0), "{sent:?}");
+    assert_eq!(in_tree(&case, &name, SIBLING_INPUT.0).as_deref(), Some(SIBLING_INPUT.1));
+    pair_inputs_routed(&case, &leaf, &name, &[], &[]);
+
+    let second = ssh_steps(&case, "second", &["ok"; 4]);
+    let swept = finish(client_gate(&case, "second.log", &second, &RAN));
+    remove_sibling(&sibling);
+
+    assert_eq!(swept.code, Some(0), "{swept:?}");
+    assert_eq!(calls(&second), ["preflight", "inputs", "run"], "the empty manifest's diff, no put");
+    let said = log_of(&case, "second.log");
+    assert!(has_line(&said, "gate: inputs: removed the old copies of every tree"), "{said}");
+    assert_eq!(in_tree(&case, &leaf, INPUT), None, "the main repo's copy is swept");
+    assert_eq!(in_tree(&case, &name, SIBLING_INPUT.0), None, "and the sibling's");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+/// The diff of the sweep is refused by the stand-in, as a box refusing the request would: the run goes on without it,
+/// and the next run sends the sweep again.
+#[test]
+fn a_pair_sweep_the_box_refuses_still_runs_the_command() {
+    let (case, leaf, name, sibling) = pair_inputs_case("client-inputs-pair-sweep-refused", &["secrets/**"], &["secrets/**"]);
+    let first = ssh_steps(&case, "first", &["ok"; 4]);
+    let sent = finish(client_gate(&case, "first.log", &first, &RAN));
+    assert_eq!(sent.code, Some(0), "{sent:?}");
+    pair_inputs_routed(&case, &leaf, &name, &[], &[]);
+
+    let second = run_kept(&case, "second", &["ok", "say-exit 2 gate: the inputs request is refused"]);
+    let refused = finish(client_gate(&case, "second.log", &second, &RAN));
+    let third = ssh_steps(&case, "third", &["ok"; 4]);
+    let again = finish(client_gate(&case, "third.log", &third, &RAN));
+    remove_sibling(&sibling);
+
+    assert_eq!(refused.code, Some(0), "{refused:?}");
+    assert_eq!(calls(&second), ["preflight", "inputs", "run"], "the refused sweep, then the run");
+    let said = log_of(&case, "second.log");
+    assert!(
+        has_line(&said, "gate: inputs: the old copies were not removed: the inputs request is refused"),
+        "{said}"
+    );
+    assert_eq!(kept_inputs_digest(&second), None, "the run call carries no inputs digest");
+    assert_eq!(again.code, Some(0), "{again:?}");
+    assert_eq!(calls(&third), ["preflight", "inputs", "run"], "the next run sends the sweep again");
+    assert!(
+        has_line(&log_of(&case, "third.log"), "gate: inputs: removed the old copies of every tree"),
+        "{again:?}"
+    );
+    assert_eq!(in_tree(&case, &leaf, INPUT), None, "the main repo's old copy is swept");
+    assert_eq!(in_tree(&case, &name, SIBLING_INPUT.0), None, "and the sibling's");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+/// Sets the file at `path` last written an hour ago, so a build's hash cache keeps its hash.
+fn settled(path: &Path) {
+    let file = fs::File::options().write(true).open(path).expect("the file can be opened");
+    let before = std::time::SystemTime::now()
+        .checked_sub(Duration::from_hours(1))
+        .expect("the clock is past an hour");
+    file.set_modified(before).expect("its last write can be set");
+}
+
+#[test]
+fn a_single_repo_cache_of_the_same_key_starts_no_pair_sweep() {
+    let (case, leaf, name, sibling) = pair_inputs_case("client-inputs-pair-single-cache", &["secrets/**"], &[]);
+    settled(&case.folder().join(INPUT_ON_DISK));
+    let declared = case.folder().join(r".gate\siblings.toml");
+    let siblings_file = fs::read_to_string(&declared).expect("the siblings file can be read");
+    fs::remove_file(&declared).expect("the siblings file can be removed");
+    let single = ssh_steps(&case, "single", &["ok"; 4]);
+    let alone = finish(client_gate(&case, "single.log", &single, &RAN));
+    assert_eq!(alone.code, Some(0), "{alone:?}");
+    assert_eq!(on_builder(&case).as_deref(), Some("one"), "one repo's input is in the work folder itself");
+
+    fs::write(&declared, &siblings_file).expect("the siblings file can be written");
+    pair_inputs_routed(&case, &leaf, &name, &[], &[]);
+    let paired = ssh_steps(&case, "paired", &["ok"; 4]);
+    let pair = finish(client_gate(&case, "paired.log", &paired, &RAN));
+    remove_sibling(&sibling);
+
+    assert_eq!(pair.code, Some(0), "{pair:?}");
+    assert_eq!(calls(&paired), ["preflight", "run"], "no inputs call: {pair:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+/// The put installs on the box, but the stand-in passes none of its output on and ends as a dropped connection does, so
+/// the PC never sees it land: the copies are on the box, and the next run with the pair's lists emptied still sweeps
+/// them.
+#[test]
+fn a_pair_put_whose_landing_is_lost_still_sweeps_once_its_list_is_emptied() {
+    let (case, leaf, name, sibling) = pair_inputs_case("client-inputs-pair-landing-lost", &["secrets/**"], &["secrets/**"]);
+    let first = ssh_steps(&case, "first", &["ok", "ok", "truncate 0", "exit 1", "exit 1", "exit 1"]);
+    let lost = finish(client_gate(&case, "first.log", &first, &RAN));
+    assert_eq!(fallbacks(&events(&case)), ["inputs"], "{lost:?}");
+    assert_eq!(
+        in_tree(&case, &name, SIBLING_INPUT.0).as_deref(),
+        Some(SIBLING_INPUT.1),
+        "the box installed the put the PC lost: {:?}",
+        calls(&first)
+    );
+    pair_inputs_routed(&case, &leaf, &name, &[], &[]);
+
+    let second = ssh_steps(&case, "second", &["ok"; 4]);
+    let swept = finish(client_gate(&case, "second.log", &second, &RAN));
+    remove_sibling(&sibling);
+
+    assert_eq!(swept.code, Some(0), "{swept:?}");
+    assert_eq!(calls(&second), ["preflight", "inputs", "run"], "the sweep's diff, then the run");
+    assert!(
+        has_line(&log_of(&case, "second.log"), "gate: inputs: removed the old copies of every tree"),
+        "{swept:?}"
+    );
+    assert_eq!(in_tree(&case, &leaf, INPUT), None, "the main repo's copy is swept");
+    assert_eq!(in_tree(&case, &name, SIBLING_INPUT.0), None, "and the sibling's");
+    assert_eq!(fallbacks(&events(&case)), ["inputs"], "the second run does not fall back");
+}
+
+#[test]
+fn a_pair_whose_globs_match_nothing_clears_its_marker() {
+    let (case, leaf, name, sibling) = pair_inputs_case("client-inputs-pair-matches-nothing", &["secrets/**"], &["secrets/**"]);
+    let first = ssh_steps(&case, "first", &["ok"; 4]);
+    let sent = finish(client_gate(&case, "first.log", &first, &RAN));
+    assert_eq!(sent.code, Some(0), "{sent:?}");
+    pair_inputs_routed(&case, &leaf, &name, &["nothing/**"], &["nothing/**"]);
+
+    let second = ssh_steps(&case, "second", &["ok"; 4]);
+    let empty = finish(client_gate(&case, "second.log", &second, &RAN));
+    pair_inputs_routed(&case, &leaf, &name, &[], &[]);
+    let third = ssh_steps(&case, "third", &["ok"; 4]);
+    let after = finish(client_gate(&case, "third.log", &third, &RAN));
+    remove_sibling(&sibling);
+
+    assert_eq!(empty.code, Some(0), "{empty:?}");
+    assert_eq!(calls(&second), ["preflight", "inputs", "run"], "the empty manifest's diff, no put");
+    assert_eq!(in_tree(&case, &leaf, INPUT), None, "the main repo's old copy is gone");
+    assert_eq!(in_tree(&case, &name, SIBLING_INPUT.0), None, "and the sibling's");
+    assert_eq!(after.code, Some(0), "{after:?}");
+    assert_eq!(calls(&third), ["preflight", "run"], "nothing is left to sweep: {after:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+/// The files below `folder`, at any depth, whose names end `.inputs-hashes`: the inputs hash caches.
+fn inputs_hash_caches(folder: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let path = entry.expect("an entry can be read").path();
+        if path.is_dir() {
+            found.extend(inputs_hash_caches(&path));
+        } else if path.extension().is_some_and(|extension| extension == "inputs-hashes") {
+            found.push(path);
+        }
+    }
+    found
+}
+
+#[test]
+fn a_landed_sweep_removes_the_cache_of_a_sibling_no_longer_in_the_pair() {
+    let (case, leaf, name, sibling) = pair_inputs_case("client-inputs-pair-gone-sibling", &["secrets/**"], &["secrets/**"]);
+    // Settled, so each tree's build keeps a hash in its cache and leaves the cache file.
+    settled(&case.folder().join(INPUT_ON_DISK));
+    settled(&sibling.join(SIBLING_INPUT.0.replace('/', "\\")));
+    let first = ssh_steps(&case, "first", &["ok"; 4]);
+    let sent = finish(client_gate(&case, "first.log", &first, &RAN));
+    assert_eq!(sent.code, Some(0), "{sent:?}");
+    let own = format!(".{name}.inputs-hashes");
+    let sibling_cache = inputs_hash_caches(&case.root()).into_iter().find_map(|path| {
+        let file = path.file_name()?.to_string_lossy().into_owned();
+        file.strip_suffix(&own)
+            .map(|key| path.with_file_name(format!("{key}.gone.inputs-hashes")))
+    });
+    let gone = sibling_cache.expect("the pair run left the sibling's cache");
+    fs::write(&gone, "").expect("a cache of a sibling no longer in the pair can be written");
+    pair_inputs_routed(&case, &leaf, &name, &[], &[]);
+
+    let second = ssh_steps(&case, "second", &["ok"; 4]);
+    let swept = finish(client_gate(&case, "second.log", &second, &RAN));
+    remove_sibling(&sibling);
+
+    assert_eq!(swept.code, Some(0), "{swept:?}");
+    assert!(
+        has_line(&log_of(&case, "second.log"), "gate: inputs: removed the old copies of every tree"),
+        "{swept:?}"
+    );
+    assert!(!gone.exists(), "the cache of the sibling no longer in the pair is removed");
+    assert_eq!(
+        inputs_hash_caches(&case.root()),
+        Vec::<PathBuf>::new(),
+        "no inputs hash cache of the key is left"
+    );
+}
+
+#[test]
+fn a_run_switching_between_one_repo_and_a_pair_ends_with_each_input_in_its_tree() {
+    let (case, leaf, name, sibling) = pair_inputs_case("client-inputs-pair-switch", &["secrets/**"], &["secrets/**"]);
+    let declared = case.folder().join(r".gate\siblings.toml");
+    let siblings_file = fs::read_to_string(&declared).expect("the siblings file can be read");
+    fs::remove_file(&declared).expect("the siblings file can be removed");
+    let single = ssh_steps(&case, "single", &["ok"; 4]);
+    let alone = finish(client_gate(&case, "single.log", &single, &RAN));
+    assert_eq!(alone.code, Some(0), "{alone:?}");
+    assert_eq!(on_builder(&case).as_deref(), Some("one"), "one repo's input is in the work folder itself");
+
+    fs::write(&declared, &siblings_file).expect("the siblings file can be written");
+    let paired = ssh_steps(&case, "paired", &["ok"; 6]);
+    let pair = finish(client_gate(&case, "paired.log", &paired, &RAN));
+    assert_eq!(pair.code, Some(0), "{pair:?}");
+    assert_eq!(
+        in_tree(&case, &leaf, INPUT).as_deref(),
+        Some("one"),
+        "the main repo's input is in its tree"
+    );
+    assert_eq!(in_tree(&case, &name, SIBLING_INPUT.0).as_deref(), Some(SIBLING_INPUT.1));
+
+    fs::remove_file(&declared).expect("the siblings file can be removed");
+    let back = ssh_steps(&case, "back", &["ok"; 6]);
+    let again = finish(client_gate(&case, "back.log", &back, &RAN));
+    remove_sibling(&sibling);
+
+    assert_eq!(again.code, Some(0), "{again:?}");
+    assert_eq!(
+        on_builder(&case).as_deref(),
+        Some("one"),
+        "back to one repo, its input is in the work folder itself"
+    );
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
 }
 
 /// Removes the pair case's sibling folder.

@@ -16,9 +16,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gate_router::{CARRIED_INPUT, escaped};
+use gate_inputs::manifest::tree_split;
+use gate_router::{BuilderOs, CARRIED_INPUT, escaped, work_folder_key};
 use gate_state::{FallbackReason, v1};
 use gate_win32::Interrupt;
+use gate_wire::layout_text;
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_DELETE_ON_CLOSE, FILE_SHARE_READ};
 
@@ -28,7 +30,7 @@ use super::git::{Call, Git, GitBounds, GitError, git_failure};
 use super::outputs::{Archive, DELETE, GENERIC_WRITE, Unbuilt, sha256_for};
 use super::payload::{self, InputsStep, Location};
 use super::watchdog::{self, Cut};
-use crate::outputs::archive::{final_path, pack};
+use crate::outputs::archive::{final_path, pack, pack_rooted};
 use crate::outputs::cache::{HashCache, file_time_now};
 use crate::outputs::glob::Globs;
 use crate::outputs::hash::sha256_of;
@@ -88,7 +90,35 @@ pub(super) struct Built {
     pub(super) found: Vec<Found>,
     pub(super) said: Vec<String>,
     pub(super) marking: Marking,
+    /// On a sibling pair's run, each tree its manifest's paths are prefixed with, the main repo's first; empty for one
+    /// repo, whose files all lie below the worktree root.
+    pub(super) trees: Vec<Tree>,
 }
+
+/// One tree of a sibling pair's inputs: the folder name its manifest paths are prefixed with, its root on the PC, which
+/// its files are packed from and must resolve inside, and its own inputs hash cache, keyed by paths relative to it.
+pub(super) struct Tree {
+    prefix: String,
+    root: PathBuf,
+    cache: PathBuf,
+}
+
+impl Tree {
+    /// The prefixes of `trees`, in order, for [`Tree::of`]: made once per pack, not once per file.
+    fn names(trees: &[Tree]) -> Vec<&str> {
+        trees.iter().map(|tree| tree.prefix.as_str()).collect()
+    }
+
+    /// The tree of `trees`, whose prefixes are `names` ([`Tree::names`]), the prefixed `path` lies in, and the path
+    /// relative to it; `None` for a path of no tree, and always for one repo, which has no trees.
+    fn of<'t, 'p>(trees: &'t [Tree], names: &[&str], path: &'p str) -> Option<(&'t Tree, &'p str)> {
+        let (at, rest) = tree_split(path, names)?;
+        Some((trees.get(at)?, rest))
+    }
+}
+
+/// What a pair's cap refusal adds to the cap's line: the caps apply to the pair's trees together.
+const PAIR_CAPS: &str = " (the pair's trees together)";
 
 /// What a landed inputs step does with its work folder's carried marker ([`v1::inputs_carried_path`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +129,10 @@ pub(super) enum Marking {
     Write,
     /// Removes the marker and the inputs hash cache: the step was the empty manifest that removed the carried copies.
     Clear,
+    /// Removes the pair inputs marker and every inputs hash cache of the work folder: the step was a sibling pair's
+    /// empty manifest, which removed the copies an earlier pair run's inputs put, so the next run with no inputs sends
+    /// none.
+    Swept,
 }
 
 /// The inputs manifest `asked` names: the matched files git reports ignored, outside any folder holding a `.git` of its
@@ -107,6 +141,55 @@ pub(super) enum Marking {
 /// one it read. A set past `asked`'s caps is refused. [`Unbuilt::Interrupted`] once `go_on` says no or git was
 /// interrupted; else why the globs, the walk, git or a file failed, or why the set is not sent.
 pub(super) fn built(asked: &Asked<'_>, go_on: impl Fn() -> bool) -> Result<Built, Unbuilt> {
+    let Picked { kept, said, marking } = picked(asked)?;
+    if kept.len() > asked.caps.members {
+        return Err(Unbuilt::Failed(past_members(kept.len(), asked.caps.members)));
+    }
+    let manifest = hashed(asked, &kept, go_on).map_err(Unmade::unbuilt)?;
+    let line = manifest.line();
+    if line.len() > asked.caps.manifest {
+        return Err(Unbuilt::Failed(PAST_THE_CAP.to_owned()));
+    }
+    let (digest, _) = sha256_of(line.trim_end_matches('\n').as_bytes()).map_err(|error| Unbuilt::Failed(error.to_string()))?;
+    Ok(Built {
+        line,
+        digest,
+        manifest,
+        found: kept,
+        said,
+        marking,
+        trees: Vec::new(),
+    })
+}
+
+/// The files `asked`'s globs choose before any is hashed: the matched files git reports ignored, outside any folder
+/// holding a `.git` of its own; the log-only lines the choice said; and what its landing does with the carried marker.
+struct Picked {
+    kept: Vec<Found>,
+    said: Vec<String>,
+    marking: Marking,
+}
+
+/// Why a manifest's files were not hashed: past a cap, its line kept apart from every other failure so a caller tells
+/// the caps' refusals by their kind, never by their wording; or the interrupt, or why a file failed.
+enum Unmade {
+    Capped(String),
+    Unbuilt(Unbuilt),
+}
+
+impl Unmade {
+    /// The failure as [`Unbuilt`] says it: a cap's line is one failure among others.
+    fn unbuilt(self) -> Unbuilt {
+        match self {
+            Unmade::Capped(why) => Unbuilt::Failed(why),
+            Unmade::Unbuilt(unbuilt) => unbuilt,
+        }
+    }
+}
+
+/// The files `asked` chooses ([`Picked`]): [`Unbuilt::Interrupted`] once git was interrupted; else why the globs, the
+/// walk or git failed, or the path a command named that could not be sent.
+fn picked(asked: &Asked<'_>) -> Result<Picked, Unbuilt> {
     let excluded = exclusions(asked.root, asked.key, asked.log);
     let own = regex::Regex::new(&excluded).map_err(|error| Unbuilt::Failed(error.to_string()))?;
     // A carried path the exclusions match, such as the run's own log, is neither sent nor reported missing.
@@ -142,44 +225,160 @@ pub(super) fn built(asked: &Asked<'_>, go_on: impl Fn() -> bool) -> Result<Built
             .iter()
             .map(|file| format!("gate: inputs: {} is in the snapshot; not sent as an input", escaped(&file.path))),
     );
-    if kept.len() > asked.caps.members {
-        return Err(Unbuilt::Failed(format!(
-            "{} files match the input globs, more than one put carries ({})",
-            kept.len(),
-            asked.caps.members
-        )));
-    }
-    let manifest = hashed(asked, &kept, go_on)?;
-    let line = manifest.line();
-    if line.len() > asked.caps.manifest {
-        return Err(Unbuilt::Failed(PAST_THE_CAP.to_owned()));
-    }
-    let (digest, _) = sha256_of(line.trim_end_matches('\n').as_bytes()).map_err(|error| Unbuilt::Failed(error.to_string()))?;
     let marking = if asked_globs.iter().any(|glob| glob.starts_with(CARRIED_INPUT)) {
         Marking::Write
     } else {
         Marking::Leave
     };
-    Ok(Built {
-        line,
-        digest,
-        manifest,
-        found: kept,
-        said,
-        marking,
-    })
+    Ok(Picked { kept, said, marking })
 }
 
 /// Why an inputs manifest past its cap is not sent.
 const PAST_THE_CAP: &str = "the inputs manifest is larger than the box takes (64 MiB)";
 
+/// The line saying `members` files match, more than the `cap` one put carries.
+fn past_members(members: usize, cap: usize) -> String {
+    format!("{members} files match the input globs, more than one put carries ({cap})")
+}
+
+/// One tree of a sibling pair's run as its inputs are built: the folder name its paths are prefixed with, its repo's
+/// name, which its lines are named by, its root on the PC, its repo's input globs, the work folder key its own gate
+/// files under `.tmp` are named for, and its own inputs hash cache.
+pub(super) struct PairTree<'a> {
+    pub(super) prefix: &'a str,
+    pub(super) repo: &'a str,
+    pub(super) root: &'a Path,
+    pub(super) globs: &'a [String],
+    pub(super) key: String,
+    pub(super) cache: PathBuf,
+}
+
+/// What a sibling pair's inputs manifest is built from besides its trees: the pair's layout text, the run's log, the
+/// caps the whole manifest is held to, and the bounds of each tree's `git check-ignore` call, answering to `interrupt`.
+pub(super) struct PairAsked<'a> {
+    pub(super) layout: String,
+    pub(super) log: &'a Path,
+    pub(super) caps: Caps,
+    pub(super) bounds: GitBounds,
+    pub(super) interrupt: Option<Interrupt>,
+}
+
+/// Why a sibling pair sends no inputs for a tree whose list carries a path a command named: the router refuses such a
+/// pair first, so this only keeps a pair from ever dropping the carried marker.
+const PAIR_CARRIED: &str = "a sibling pair does not send a command's gitignored files yet";
+
+impl PairTree<'_> {
+    /// What this tree's files are chosen and hashed under, from the pair's `asked`.
+    fn asked<'t>(&'t self, asked: &'t PairAsked<'_>) -> Asked<'t> {
+        Asked {
+            root: self.root,
+            globs: self.globs,
+            key: &self.key,
+            log: asked.log,
+            cache: &self.cache,
+            caps: asked.caps,
+            bounds: asked.bounds,
+            interrupt: asked.interrupt,
+        }
+    }
+
+    /// The failure `why` of this tree, naming its repo.
+    fn failed(&self, why: &str) -> Unbuilt {
+        Unbuilt::Failed(format!("{}: {why}", escaped(self.repo)))
+    }
+}
+
+/// The inputs manifest of a sibling pair's `trees`: each tree with globs chosen on its own ([`picked`]), from its own
+/// root, with its own exclusions, nested-repo skip and `git check-ignore`, the pair refused as soon as the trees chosen
+/// so far pass the member cap together and before any file is hashed; then each tree hashed within its own read
+/// boundary and hash cache, each path prefixed with its tree's folder name, into one manifest naming the pair's layout,
+/// held to the caps as a whole, its lines naming the tree's repo. A tree past a cap on its own is refused naming its
+/// repo; only the trees together past one add [`PAIR_CAPS`]. A tree carrying a path a command named is refused
+/// ([`PAIR_CARRIED`]). [`Unbuilt::Interrupted`] once `go_on` says no; else why it is not sent.
+pub(super) fn built_pair(trees: &[PairTree<'_>], asked: &PairAsked<'_>, go_on: impl Fn() -> bool) -> Result<Built, Unbuilt> {
+    let mut chosen = Vec::new();
+    let mut members = 0_usize;
+    for tree in trees.iter().filter(|tree| !tree.globs.is_empty()) {
+        let picked = picked(&tree.asked(asked)).map_err(|unbuilt| match unbuilt {
+            Unbuilt::Failed(why) => tree.failed(&why),
+            Unbuilt::Interrupted => Unbuilt::Interrupted,
+        })?;
+        if picked.marking == Marking::Write {
+            return Err(Unbuilt::Failed(PAIR_CARRIED.to_owned()));
+        }
+        if picked.kept.len() > asked.caps.members {
+            return Err(tree.failed(&past_members(picked.kept.len(), asked.caps.members)));
+        }
+        members = members.saturating_add(picked.kept.len());
+        if members > asked.caps.members {
+            return Err(Unbuilt::Failed(format!("{}{PAIR_CAPS}", past_members(members, asked.caps.members))));
+        }
+        chosen.push((tree, picked));
+    }
+    let mut manifest = Manifest::default();
+    let mut found = Vec::new();
+    let mut said = Vec::new();
+    for (tree, picked) in chosen {
+        // A tree's own manifest past the cap is that tree's: only the combined check below names the pair.
+        let held = hashed(&tree.asked(asked), &picked.kept, &go_on).map_err(|unmade| match unmade {
+            Unmade::Capped(why) | Unmade::Unbuilt(Unbuilt::Failed(why)) => tree.failed(&why),
+            Unmade::Unbuilt(Unbuilt::Interrupted) => Unbuilt::Interrupted,
+        })?;
+        said.extend(picked.said.iter().map(|line| repo_line(tree.repo, line)));
+        for (path, held) in held.files() {
+            manifest.insert(format!("{}/{path}", tree.prefix), held.clone());
+        }
+        found.extend(picked.kept.into_iter().map(|file| Found {
+            path: format!("{}/{}", tree.prefix, file.path),
+            ..file
+        }));
+    }
+    let manifest = manifest.with_layout(asked.layout.clone());
+    let line = manifest.line();
+    if line.len() > asked.caps.manifest {
+        return Err(Unbuilt::Failed(format!("{PAST_THE_CAP}{PAIR_CAPS}")));
+    }
+    let (digest, _) = sha256_of(line.trim_end_matches('\n').as_bytes()).map_err(|error| Unbuilt::Failed(error.to_string()))?;
+    Ok(Built {
+        line,
+        digest,
+        manifest,
+        found,
+        said,
+        marking: Marking::Leave,
+        trees: pair_trees(trees),
+    })
+}
+
+/// The trees of a pair's built manifest, for its pack and its hash caches.
+fn pair_trees(trees: &[PairTree<'_>]) -> Vec<Tree> {
+    trees
+        .iter()
+        .map(|tree| Tree {
+            prefix: tree.prefix.to_owned(),
+            root: tree.root.to_owned(),
+            cache: tree.cache.clone(),
+        })
+        .collect()
+}
+
+/// The inputs log line `line` of a pair's tree, naming its repo `repo` as the LFS lines do: `gate: inputs: {repo}: …`.
+fn repo_line(repo: &str, line: &str) -> String {
+    match line.strip_prefix("gate: inputs: ") {
+        Some(rest) => format!("gate: inputs: {}: {rest}", escaped(repo)),
+        None => format!("{}: {line}", escaped(repo)),
+    }
+}
+
 /// The manifest of `files`, below `asked`'s root, each hashed as [`sha256_for`] hashes an output, the inputs hash cache
-/// read before and saved after when it changed; else the interrupt, or why a file failed.
-fn hashed(asked: &Asked<'_>, files: &[Found], go_on: impl Fn() -> bool) -> Result<Manifest, Unbuilt> {
+/// read before and saved after when it changed; else the interrupt, why a file failed, or the line past its cap
+/// ([`Unmade::Capped`]).
+fn hashed(asked: &Asked<'_>, files: &[Found], go_on: impl Fn() -> bool) -> Result<Manifest, Unmade> {
+    let failed = |why: String| Unmade::Unbuilt(Unbuilt::Failed(why));
     let previous = HashCache::load(asked.cache);
     let none = HashCache::default();
     let cache = previous.as_ref().unwrap_or(&none);
-    let inside = fs::canonicalize(asked.root).map_err(|error| Unbuilt::Failed(in_context(asked.root, &error).to_string()))?;
+    let inside = fs::canonicalize(asked.root).map_err(|error| failed(in_context(asked.root, &error).to_string()))?;
     let started = file_time_now();
     let stopped = Cell::new(false);
     let mut next = HashCache::default();
@@ -189,12 +388,12 @@ fn hashed(asked: &Asked<'_>, files: &[Found], go_on: impl Fn() -> bool) -> Resul
         Ok((sha256, stamp))
     });
     if stopped.get() {
-        return Err(Unbuilt::Interrupted);
+        return Err(Unmade::Unbuilt(Unbuilt::Interrupted));
     }
     let manifest = match built {
         Ok(manifest) => manifest,
-        Err(error) if error.kind() == io::ErrorKind::FileTooLarge => return Err(Unbuilt::Failed(PAST_THE_CAP.to_owned())),
-        Err(error) => return Err(Unbuilt::Failed(error.to_string())),
+        Err(error) if error.kind() == io::ErrorKind::FileTooLarge => return Err(Unmade::Capped(PAST_THE_CAP.to_owned())),
+        Err(error) => return Err(failed(error.to_string())),
     };
     if previous.as_ref() != Some(&next) {
         next.save(asked.cache);
@@ -321,8 +520,6 @@ fn ignored(asked: &Asked<'_>, found: &[Found]) -> Result<HashSet<String>, Unbuil
 pub(super) const INPUTS_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
 /// A megabyte, as the inputs line says sizes.
 pub(super) const MB: f64 = 1024.0 * 1024.0;
-/// Why a pair's run sends no inputs.
-const PAIR: &str = "a sibling pair does not send inputs yet";
 /// Why a run the box refused `inputs` falls back.
 const NOT_HELD: &str = "the builder's work folder does not hold the inputs sent";
 /// The box's diff and put lines.
@@ -347,16 +544,21 @@ pub(super) fn run_refused(attempt: &mut Attempt<'_, '_>) -> End {
 }
 
 /// The inputs manifest of `attempt`'s run, its lines logged. A run with no input globs sends the empty manifest when
-/// an earlier run's carried copies are to be removed ([`emptied`]), else none, as a pair's run with none does. A pair's
-/// run with input globs, and a manifest that cannot be built or is past a cap, refuse the route `inputs` before
-/// anything is sent.
+/// an earlier run's carried copies are to be removed ([`emptied`]), else none. A sibling pair's run sends each repo's
+/// inputs in its own tree ([`pair_sent`]), on a Windows builder only ([`pair_inputs`]). A manifest that cannot be built
+/// or is past a cap refuses the route `inputs` before anything is sent.
 pub(super) fn sent(attempt: &mut Attempt<'_, '_>) -> Result<Option<Built>, End> {
     let call = attempt.call;
-    if call.inputs.is_empty() {
-        return if call.siblings.is_empty() { emptied(attempt) } else { Ok(None) };
-    }
     if !call.siblings.is_empty() {
-        return Err(refused(attempt, PAIR));
+        let declared = !call.inputs.is_empty() || call.siblings.iter().any(|sibling| !sibling.inputs().is_empty());
+        return match pair_inputs(call.builder.os, declared) {
+            PairInputs::Sent => pair_sent(attempt),
+            PairInputs::None => Ok(None),
+            PairInputs::Refused(why) => Err(refused(attempt, why)),
+        };
+    }
+    if call.inputs.is_empty() {
+        return emptied(attempt);
     }
     let cache = v1::inputs_hashes_path(call.state_dir, call.builder.id.as_deref(), call.key);
     let asked = Asked {
@@ -369,7 +571,14 @@ pub(super) fn sent(attempt: &mut Attempt<'_, '_>) -> Result<Option<Built>, End> 
         bounds: attempt.git,
         interrupt: call.interrupt,
     };
-    match built(&asked, || attempt.go_on().is_ok()) {
+    let built = built(&asked, || attempt.go_on().is_ok());
+    logged_built(attempt, built)
+}
+
+/// The manifest `built` as a step sends it, its lines logged; the interrupt ends the run, and any other failure refuses
+/// the route `inputs`, its reason in the log.
+fn logged_built(attempt: &mut Attempt<'_, '_>, built: Result<Built, Unbuilt>) -> Result<Option<Built>, End> {
+    match built {
         Ok(built) => {
             for line in &built.said {
                 attempt.logged(line);
@@ -381,6 +590,95 @@ pub(super) fn sent(attempt: &mut Attempt<'_, '_>) -> Result<Option<Built>, End> 
     }
 }
 
+/// An empty inputs manifest, `manifest`, that removes copies the box holds, as `marking` says, on the `trees` of a
+/// sibling pair or none: its line and digest, naming no file and saying nothing; else why its digest cannot be made.
+fn empty_built(manifest: Manifest, marking: Marking, trees: Vec<Tree>) -> Result<Built, Unbuilt> {
+    let line = manifest.line();
+    let (digest, _) = sha256_of(line.trim_end_matches('\n').as_bytes()).map_err(|error| Unbuilt::Failed(error.to_string()))?;
+    Ok(Built {
+        line,
+        digest,
+        manifest,
+        found: Vec::new(),
+        said: Vec::new(),
+        marking,
+        trees,
+    })
+}
+
+/// Why a sibling pair's run on a macOS builder sends no inputs: its box refuses a pair's inputs request.
+const MACOS_PAIR: &str = "the macOS builder does not take a sibling pair's inputs yet";
+
+/// What a sibling pair's run does with its inputs.
+#[derive(Debug, PartialEq, Eq)]
+enum PairInputs {
+    /// Builds and sends them ([`pair_sent`]).
+    Sent,
+    /// Makes no inputs call: no sweep, its hash caches untouched.
+    None,
+    /// Refuses the route `inputs` before any inputs call, for the reason it holds.
+    Refused(&'static str),
+}
+
+/// What a sibling pair's run on a builder of `os` does with its inputs, `declared` when any of its trees declares
+/// some: a Windows builder takes them ([`PairInputs::Sent`]); any other, whose box refuses a pair's inputs request, makes
+/// no inputs call when none is declared, and refuses ([`MACOS_PAIR`]) when one is, decided before any tree is hashed.
+fn pair_inputs(os: BuilderOs, declared: bool) -> PairInputs {
+    if os == BuilderOs::Windows {
+        PairInputs::Sent
+    } else if declared {
+        PairInputs::Refused(MACOS_PAIR)
+    } else {
+        PairInputs::None
+    }
+}
+
+/// The inputs manifest of a sibling pair's run ([`built_pair`]): the main repo's tree, its paths prefixed with the leaf
+/// and cached in the work folder's own inputs hash cache, then each sibling's, prefixed with its folder name, its globs
+/// its own repo's, its gate files named for its own work folder key and its hashes in a cache of its own. Its lines are
+/// logged; one that cannot be built refuses the route `inputs`.
+///
+/// With no globs in any tree it is none, unless the pair inputs marker ([`v1::pair_inputs_path`]) shows an earlier pair
+/// run sent inputs: then the pair's empty manifest is sent, so the box sweeps the copies it holds, and once it landed
+/// the marker and every inputs hash cache of the work folder are removed ([`Marking::Swept`]).
+fn pair_sent(attempt: &mut Attempt<'_, '_>) -> Result<Option<Built>, End> {
+    let call = attempt.call;
+    let id = call.builder.id.as_deref();
+    let mut trees = vec![PairTree {
+        prefix: call.leaf,
+        repo: call.repo,
+        root: Path::new(call.root),
+        globs: call.inputs,
+        key: call.key.to_owned(),
+        cache: v1::inputs_hashes_path(call.state_dir, id, call.key),
+    }];
+    trees.extend(call.siblings.iter().map(|sibling| PairTree {
+        prefix: sibling.name(),
+        repo: sibling.repo(),
+        root: Path::new(sibling.root()),
+        globs: sibling.inputs(),
+        key: work_folder_key(sibling.root()),
+        cache: v1::sibling_inputs_hashes_path(call.state_dir, id, call.key, sibling.name()),
+    }));
+    let layout = layout_text(Some(call.leaf), call.siblings.iter().map(super::carried::Sibling::name).collect());
+    if trees.iter().all(|tree| tree.globs.is_empty()) {
+        if !v1::pair_inputs_path(call.state_dir, id, call.key).exists() {
+            return Ok(None);
+        }
+        let swept = empty_built(Manifest::default().with_layout(layout), Marking::Swept, pair_trees(&trees));
+        return logged_built(attempt, swept);
+    }
+    let asked = PairAsked {
+        layout,
+        log: call.log,
+        caps: Caps::FULL,
+        bounds: attempt.git,
+        interrupt: call.interrupt,
+    };
+    let built = built_pair(&trees, &asked, || attempt.go_on().is_ok());
+    logged_built(attempt, built)
+}
+
 /// The empty inputs manifest of a run with no inputs whose work folder holds copies a command's carried paths put, its
 /// carried marker there ([`v1::inputs_carried_path`]): the box's diff, needing nothing, deletes those copies, and
 /// [`send`] removes the marker once it landed. `None` when there is no marker. A digest that cannot be made refuses the
@@ -390,51 +688,112 @@ fn emptied(attempt: &mut Attempt<'_, '_>) -> Result<Option<Built>, End> {
     if !v1::inputs_carried_path(call.state_dir, call.builder.id.as_deref(), call.key).exists() {
         return Ok(None);
     }
-    let manifest = Manifest::default();
-    let line = manifest.line();
-    match sha256_of(line.trim_end_matches('\n').as_bytes()) {
-        Ok((digest, _)) => Ok(Some(Built {
-            line,
-            digest,
-            manifest,
-            found: Vec::new(),
-            said: Vec::new(),
-            marking: Marking::Clear,
-        })),
-        Err(error) => Err(refused(attempt, &error.to_string())),
-    }
+    let cleared = empty_built(Manifest::default(), Marking::Clear, Vec::new());
+    logged_built(attempt, cleared)
 }
 
 /// The log line of a run whose empty manifest removed the copies an earlier run carried.
 const REMOVED: &str = "gate: inputs: removed the carried copies of an earlier run";
+/// The log line of a sibling pair's run whose empty manifest removed the copies earlier runs' inputs put.
+const SWEPT: &str = "gate: inputs: removed the old copies of every tree";
 
-/// Does what the landed inputs step's `marking` says with `attempt`'s work folder's carried marker: writes it, empty,
-/// its folder made; or removes it and the inputs hash cache, so the next run with no inputs sends none, and says
-/// [`REMOVED`]. A marker that cannot be written, or a file that cannot be removed, is said in the log: a later run
-/// then sends the empty manifest once fewer, or once more.
-fn landed(attempt: &mut Attempt<'_, '_>, marking: Marking) {
+/// Does what the landed inputs step's `marking` says with `attempt`'s work folder's markers: a step that carried a path
+/// a command named writes the carried marker ([`marker_written`]); a sibling pair's manifest naming no file, whose diff
+/// removed every copy an earlier pair run put, removes the pair inputs marker, which a pair manifest naming a file wrote
+/// before it was sent ([`pair_marked`]); a pair's empty manifest sweeps ([`swept_landed`]); the empty manifest that
+/// removed carried copies clears ([`cleared`]). A marker that cannot be written, or a file that cannot be removed, is
+/// said in the log: a later run then sends the empty manifest once fewer, or once more.
+fn landed(attempt: &mut Attempt<'_, '_>, built: &Built) {
     let call = attempt.call;
-    let marker = v1::inputs_carried_path(call.state_dir, call.builder.id.as_deref(), call.key);
-    match marking {
+    let id = call.builder.id.as_deref();
+    match built.marking {
+        Marking::Swept => swept_landed(attempt),
+        Marking::Leave if !built.trees.is_empty() && built.manifest.files().next().is_none() => {
+            removed(attempt, &v1::pair_inputs_path(call.state_dir, id, call.key));
+        }
         Marking::Leave => {}
-        Marking::Write => {
-            let written = marker.parent().map_or(Ok(()), fs::create_dir_all).and_then(|()| fs::write(&marker, ""));
-            if let Err(error) = written {
-                attempt.logged(&format!("gate: inputs: cannot write the carried marker {}: {error}", marker.display()));
-            }
+        Marking::Write => marker_written(attempt, &v1::inputs_carried_path(call.state_dir, id, call.key), "carried marker"),
+        Marking::Clear => cleared(attempt),
+    }
+}
+
+/// Writes the empty marker at `marker`, its folder made; else why not.
+fn marker_made(marker: &Path) -> io::Result<()> {
+    marker.parent().map_or(Ok(()), fs::create_dir_all).and_then(|()| fs::write(marker, ""))
+}
+
+/// Writes the empty marker at `marker` ([`marker_made`]); one that cannot be written is said in the log, named `what`.
+fn marker_written(attempt: &mut Attempt<'_, '_>, marker: &Path, what: &str) {
+    if let Err(error) = marker_made(marker) {
+        attempt.logged(&format!("gate: inputs: cannot write the {what} {}: {error}", marker.display()));
+    }
+}
+
+/// Before a sibling pair's manifest `built` that names a file is sent: writes the pair inputs marker
+/// ([`v1::pair_inputs_path`]), so the copies its put installs are swept by a later pair run with no inputs even when
+/// this run never sees the put land. Nothing for any other manifest. Else why the marker cannot be written, which
+/// refuses the step, so no copy lands unmarked.
+fn pair_marked(attempt: &Attempt<'_, '_>, built: &Built) -> Result<(), String> {
+    if built.marking != Marking::Leave || built.trees.is_empty() || built.manifest.files().next().is_none() {
+        return Ok(());
+    }
+    let call = attempt.call;
+    let marker = v1::pair_inputs_path(call.state_dir, call.builder.id.as_deref(), call.key);
+    marker_made(&marker).map_err(|error| format!("cannot write the pair inputs marker {}: {error}", marker.display()))
+}
+
+/// After a sibling pair's empty manifest landed: removes the pair inputs marker and every inputs hash cache of the work
+/// folder ([`key_caches`]), a sibling's no longer in the pair among them, so the next pair run with no inputs sends
+/// none, and says [`SWEPT`].
+fn swept_landed(attempt: &mut Attempt<'_, '_>) {
+    let call = attempt.call;
+    let mut paths = key_caches(attempt);
+    paths.push(v1::pair_inputs_path(call.state_dir, call.builder.id.as_deref(), call.key));
+    for path in &paths {
+        removed(attempt, path);
+    }
+    attempt.logged(SWEPT);
+}
+
+/// After the empty manifest that removed an earlier run's carried copies landed: removes the carried marker, the pair
+/// inputs marker and every inputs hash cache of the work folder ([`key_caches`]), so the next run with no inputs sends
+/// none, and says [`REMOVED`].
+fn cleared(attempt: &mut Attempt<'_, '_>) {
+    let call = attempt.call;
+    let id = call.builder.id.as_deref();
+    let mut paths = key_caches(attempt);
+    paths.push(v1::inputs_carried_path(call.state_dir, id, call.key));
+    paths.push(v1::pair_inputs_path(call.state_dir, id, call.key));
+    for path in &paths {
+        removed(attempt, path);
+    }
+    attempt.logged(REMOVED);
+}
+
+/// Every inputs hash cache of `attempt`'s work folder: its own and each sibling's its cache folder holds, a sibling no
+/// longer in the pair included ([`v1::sibling_inputs_hashes_paths`]). A cache folder that cannot be listed is said in
+/// the log, and only the work folder's own cache is named.
+fn key_caches(attempt: &mut Attempt<'_, '_>) -> Vec<PathBuf> {
+    let call = attempt.call;
+    let id = call.builder.id.as_deref();
+    let mut paths = vec![v1::inputs_hashes_path(call.state_dir, id, call.key)];
+    match v1::sibling_inputs_hashes_paths(call.state_dir, id, call.key) {
+        Ok(siblings) => paths.extend(siblings),
+        Err(error) => {
+            let folder = v1::builder_cache_dir(call.state_dir, id);
+            attempt.logged(&format!("gate: inputs: cannot list {}: {error}", folder.display()));
         }
-        Marking::Clear => {
-            let cache = v1::inputs_hashes_path(call.state_dir, call.builder.id.as_deref(), call.key);
-            for path in [cache, marker] {
-                match fs::remove_file(&path) {
-                    Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                        attempt.logged(&format!("gate: inputs: cannot remove {}: {error}", path.display()));
-                    }
-                    _ => {}
-                }
-            }
-            attempt.logged(REMOVED);
+    }
+    paths
+}
+
+/// Removes the file at `path`; one that is there but cannot be removed is said in the log.
+fn removed(attempt: &mut Attempt<'_, '_>, path: &Path) {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            attempt.logged(&format!("gate: inputs: cannot remove {}: {error}", path.display()));
         }
+        _ => {}
     }
 }
 
@@ -448,12 +807,17 @@ fn unsent_why(unsent: &Unsent) -> String {
 }
 
 /// Sends `built` to the work folder at `location` for the run of `nonce`: the diff call, then, when the box needs any
-/// file, the put of an archive of exactly those, timed in the run's split; once it landed, the carried marker is kept
-/// as `built` says ([`landed`]). Whether it landed, so the run call carries its digest. A Ctrl+C ends the run. Any other
-/// failure of the empty manifest that removes carried copies ([`Marking::Clear`]) is said in the log and the run goes
-/// on without it, its marker kept for a later run; of any other manifest, it refuses the route `inputs`, its reason in
-/// the log. An end no inputs call returns fails the run.
+/// file, the put of an archive of exactly those, timed in the run's split; a sibling pair's manifest naming a file
+/// writes the pair inputs marker first, one that cannot be written refusing the route `inputs` before any call
+/// ([`pair_marked`]); once it landed, the carried marker is kept as `built` says ([`landed`]). Whether it landed, so the run call carries its digest. A Ctrl+C ends the run. Any other
+/// failure of an empty manifest that removes copies, carried ones ([`Marking::Clear`]) or a sibling pair's old ones
+/// ([`Marking::Swept`]), is said in the log and the run goes on without it, its marker kept so a later run sends it
+/// again; of any other manifest, it refuses the route `inputs`, its reason in the log. An end no inputs call returns
+/// fails the run.
 pub(super) fn send(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, built: &Built) -> Result<bool, End> {
+    if let Err(why) = pair_marked(attempt, built) {
+        return Err(refused(attempt, &why));
+    }
     let started = Instant::now();
     let request = Request {
         location,
@@ -464,13 +828,14 @@ pub(super) fn send(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &s
     attempt.split.inputs = Some(started.elapsed());
     match ended {
         Ok(()) => {
-            landed(attempt, built.marking);
+            landed(attempt, built);
             Ok(true)
         }
         Err(Unsent::Ended(End::Interrupted)) => Err(End::Interrupted),
-        Err(unsent) if built.marking == Marking::Clear => {
+        Err(unsent) if matches!(built.marking, Marking::Clear | Marking::Swept) => {
+            let copies = if built.marking == Marking::Clear { "carried" } else { "old" };
             let why = unsent_why(&unsent);
-            attempt.logged(&format!("gate: inputs: the carried copies were not removed: {}", escaped(&why)));
+            attempt.logged(&format!("gate: inputs: the {copies} copies were not removed: {}", escaped(&why)));
             Ok(false)
         }
         Err(Unsent::Ended(End::Failed(why)) | Unsent::Refused(why)) => Err(refused(attempt, &why)),
@@ -583,7 +948,7 @@ fn build_built(attempt: &mut Attempt<'_, '_>, bin: &str) -> Result<Built, Unbuil
         bounds: attempt.git,
         interrupt: call.interrupt,
     };
-    let manifest = hashed(&asked, &found, || attempt.go_on().is_ok())?;
+    let manifest = hashed(&asked, &found, || attempt.go_on().is_ok()).map_err(Unmade::unbuilt)?;
     let line = manifest.line();
     if line.len() > asked.caps.manifest {
         return Err(Unbuilt::Failed(PAST_THE_CAP.to_owned()));
@@ -596,6 +961,7 @@ fn build_built(attempt: &mut Attempt<'_, '_>, bin: &str) -> Result<Built, Unbuil
         found,
         said: Vec::new(),
         marking: Marking::Leave,
+        trees: Vec::new(),
     })
 }
 
@@ -734,7 +1100,7 @@ fn sent_to(attempt: &mut Attempt<'_, '_>, request: &Request<'_>, built: &Built) 
     let needed = diffed(attempt, request, built)?;
     if needed.is_empty() {
         // The empty manifest that removes carried copies says so once it landed ([`landed`]).
-        if built.marking != Marking::Clear {
+        if !matches!(built.marking, Marking::Clear | Marking::Swept) {
             attempt.logged(&format!("gate: {}: {} file(s) unchanged", kind.label(), built.manifest.files().count()));
         }
         return Ok(());
@@ -762,6 +1128,7 @@ fn sent_to(attempt: &mut Attempt<'_, '_>, request: &Request<'_>, built: &Built) 
         files: &needed,
         manifest: &built.manifest,
         cache: &cache,
+        trees: &built.trees,
     };
     // The archive's SHA-256 is read back only for a put that asks for the builder's data channel, which declares it.
     let hashed = matches!(channel::planned(attempt.call.builder), Ok(Some(_)));
@@ -909,6 +1276,9 @@ struct Pack<'p> {
     files: &'p [&'p Found],
     manifest: &'p Manifest,
     cache: &'p Path,
+    /// On a sibling pair's run, the trees the files' prefixed paths lie in: each file is packed from its own tree's
+    /// root and forgotten from its own tree's cache, and `root` and `cache` are not used; empty for one repo.
+    trees: &'p [Tree],
 }
 
 /// Packs `packing`'s files into the open `archive`, shown as `shown`, `go_on` asked before the pack and before each
@@ -927,7 +1297,18 @@ fn packed(archive: &File, shown: &Path, packing: &Pack<'_>, go_on: &dyn Fn() -> 
         go_on,
         stopped: &stopped,
     };
-    let result = pack(sink, packing.root, &chosen, &HeldBy::new());
+    let names = Tree::names(packing.trees);
+    let result = if packing.trees.is_empty() {
+        pack(sink, packing.root, &chosen, &HeldBy::new())
+    } else {
+        let roots: Option<Vec<&Path>> = packing
+            .files
+            .iter()
+            .map(|file| Tree::of(packing.trees, &names, &file.path).map(|(tree, _)| tree.root.as_path()))
+            .collect();
+        let roots = roots.ok_or_else(|| Unsent::Refused("an input names no tree of the pair".to_owned()))?;
+        pack_rooted(sink, &chosen, &roots, &HeldBy::new())
+    };
     if stopped.get() {
         return Err(Unsent::Ended(End::Interrupted));
     }
@@ -937,9 +1318,13 @@ fn packed(archive: &File, shown: &Path, packing: &Pack<'_>, go_on: &dyn Fn() -> 
         .iter()
         .find(|entry| packing.manifest.get(&entry.path).is_none_or(|held| held.sha256 != entry.sha256))
     {
-        if let Some(mut cache) = HashCache::load(packing.cache) {
-            cache.forget(&entry.path);
-            cache.save(packing.cache);
+        let (cache_path, key) = match Tree::of(packing.trees, &names, &entry.path) {
+            Some((tree, rest)) => (tree.cache.as_path(), rest),
+            None => (packing.cache, entry.path.as_str()),
+        };
+        if let Some(mut cache) = HashCache::load(cache_path) {
+            cache.forget(key);
+            cache.save(cache_path);
         }
         return Err(Unsent::Refused(format!("{} changed after it was hashed", escaped(&entry.path))));
     }
@@ -1036,16 +1421,20 @@ fn installed_all(lines: &[String], sent: usize) -> Result<(), String> {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test that cannot make its files must fail loudly")]
 mod tests {
+    use std::cell::Cell;
     use std::fs;
     use std::ops::Deref;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{Duration, SystemTime};
 
-    use gate_router::CARRIED_INPUT;
+    use gate_router::{BuilderOs, CARRIED_INPUT};
     use serde_json::Value;
 
-    use super::{Asked, Built, Caps, End, PAST_THE_CAP, Pack, Unsent, built, installed_all, made_in_tmp, needed, packed, relative};
+    use super::{
+        Asked, Built, Caps, End, PAST_THE_CAP, Pack, PairAsked, PairInputs, PairTree, Unsent, built, built_pair, installed_all, made_in_tmp, needed,
+        packed, pair_inputs, relative,
+    };
     use crate::outputs::hash::sha256_of;
     use crate::outputs::walk::Found;
     use crate::remote::git::GIT_BOUNDS;
@@ -1142,6 +1531,131 @@ mod tests {
         }
     }
 
+    /// The inputs of a sibling pair whose trees are `trees`, each its root and its repo's globs, each tree's folder
+    /// name its prefix and its repo's name, built under `caps`; each file the build asks about before its read counted
+    /// in `asked`.
+    fn build_pair(trees: &[(&Path, &[&str])], caps: Caps, asked: &Cell<usize>) -> Result<Built, Unbuilt> {
+        let globs: Vec<Vec<String>> = trees
+            .iter()
+            .map(|(_, globs)| globs.iter().map(|glob| (*glob).to_owned()).collect())
+            .collect();
+        let names: Vec<String> = trees
+            .iter()
+            .map(|(root, _)| root.file_name().expect("the tree has a name").to_string_lossy().into_owned())
+            .collect();
+        let pair: Vec<PairTree<'_>> = trees
+            .iter()
+            .zip(&globs)
+            .zip(&names)
+            .map(|(((root, _), globs), name)| PairTree {
+                prefix: name,
+                repo: name,
+                root,
+                globs,
+                key: KEY.to_owned(),
+                cache: cache_of(root),
+            })
+            .collect();
+        let log = trees[0].0.join("logs").join("run.log");
+        let pair_asked = PairAsked {
+            layout: names.join("|"),
+            log: &log,
+            caps,
+            bounds: GIT_BOUNDS,
+            interrupt: None,
+        };
+        built_pair(&pair, &pair_asked, || {
+            asked.set(asked.get() + 1);
+            true
+        })
+    }
+
+    #[test]
+    fn a_pair_past_the_member_cap_together_is_refused_before_any_file_is_hashed() {
+        let (app, lib) = (worktree("pair-cap-app", "secrets/\n"), worktree("pair-cap-lib", "secrets/\n"));
+        for root in [&app, &lib] {
+            put(root, "secrets/a", "a");
+            put(root, "secrets/b", "b");
+        }
+        let asked = Cell::new(0);
+
+        let refused = failure(build_pair(
+            &[(&app, &["secrets/**"]), (&lib, &["secrets/**"])],
+            Caps { members: 3, ..Caps::FULL },
+            &asked,
+        ));
+
+        assert_eq!(
+            refused, "4 files match the input globs, more than one put carries (3) (the pair's trees together)",
+            "each tree's two stay under the cap, their four do not"
+        );
+        assert_eq!(asked.get(), 0, "no file was hashed once the trees together passed the cap");
+    }
+
+    #[test]
+    fn a_tree_alone_past_a_cap_names_its_repo_and_not_the_pair() {
+        let (app, lib) = (worktree("pair-alone-app", "secrets/\n"), worktree("pair-alone-lib", "secrets/\n"));
+        put(&app, "secrets/a", "a");
+        for path in ["secrets/a", "secrets/b", "secrets/c"] {
+            put(&lib, path, "x");
+        }
+        let repo = lib.file_name().expect("the tree has a name").to_string_lossy().into_owned();
+        let trees: [(&Path, &[&str]); 2] = [(&app, &["secrets/**"]), (&lib, &["secrets/**"])];
+
+        let members = failure(build_pair(&trees, Caps { members: 2, ..Caps::FULL }, &Cell::new(0)));
+        let manifest = failure(build_pair(
+            &[(&app, &[]), (&lib, &["secrets/**"])],
+            Caps { manifest: 64, ..Caps::FULL },
+            &Cell::new(0),
+        ));
+
+        assert_eq!(
+            members,
+            format!("{repo}: 3 files match the input globs, more than one put carries (2)"),
+            "the sibling alone passes the member cap"
+        );
+        assert_eq!(manifest, format!("{repo}: {PAST_THE_CAP}"), "the sibling alone passes the manifest's cap");
+    }
+
+    #[test]
+    fn a_pair_with_inputs_on_a_macos_builder_falls_back_before_any_inputs_call() {
+        assert_eq!(
+            pair_inputs(BuilderOs::Macos, true),
+            PairInputs::Refused("the macOS builder does not take a sibling pair's inputs yet")
+        );
+        assert_eq!(pair_inputs(BuilderOs::Windows, true), PairInputs::Sent, "a Windows builder takes them");
+    }
+
+    #[test]
+    fn a_macos_pair_without_inputs_asks_for_no_inputs_call() {
+        assert_eq!(
+            pair_inputs(BuilderOs::Macos, false),
+            PairInputs::None,
+            "decided before any cache is looked at, so no sweep is sent"
+        );
+        assert_eq!(
+            pair_inputs(BuilderOs::Windows, false),
+            PairInputs::Sent,
+            "a Windows builder's caches decide the sweep"
+        );
+    }
+
+    #[test]
+    fn a_pair_tree_carrying_a_path_a_command_named_is_refused() {
+        let (app, lib) = (worktree("pair-carried-app", "probe/\n"), worktree("pair-carried-lib", "secrets/\n"));
+        put(&app, "probe/P.csproj", "x");
+        put(&lib, "secrets/a", "a");
+        let carried = format!("{CARRIED_INPUT}probe/P.csproj");
+
+        let refused = failure(build_pair(
+            &[(&app, &[carried.as_str()]), (&lib, &["secrets/**"])],
+            Caps::FULL,
+            &Cell::new(0),
+        ));
+
+        assert_eq!(refused, "a sibling pair does not send a command's gitignored files yet");
+    }
+
     #[test]
     fn a_carried_path_the_exclusions_match_is_neither_sent_nor_missing() {
         let root = worktree("carried-excluded", "*.log\n*.err\n.tmp/\nprobe/\n");
@@ -1174,6 +1688,7 @@ mod tests {
             files: &files,
             manifest: &built.manifest,
             cache: &cache,
+            trees: &[],
         };
         packed(&archive, &path, &packing, go_on, false)
     }
@@ -1436,6 +1951,7 @@ mod tests {
             files: &files,
             manifest: &built.manifest,
             cache: &cache,
+            trees: &[],
         };
 
         let (length, sha256) = packed(&archive, &path, &packing, &|| true, true).expect("the pack passes");

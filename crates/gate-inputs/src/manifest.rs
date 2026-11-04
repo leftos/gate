@@ -44,9 +44,29 @@ pub type HeldBy<'m> = HashMap<&'m str, Vec<(&'m str, &'m Held)>>;
 pub struct Manifest {
     /// Each file by its path's simple uppercase: its path as given, and what the PC holds there.
     files: BTreeMap<String, (String, Held)>,
+    /// On a sibling pair's inputs manifest, the layout text of the pair its paths are prefixed for
+    /// (`gate_wire::layout_text_for`), sent as the line's top-level `layout` key; `None` for one repo's, whose line
+    /// names none.
+    layout: Option<String>,
 }
 
 impl Manifest {
+    /// This manifest as a sibling pair's, its paths prefixed with the pair's tree names, for the pair whose layout text
+    /// is `layout`.
+    #[must_use]
+    pub fn with_layout(self, layout: String) -> Manifest {
+        Manifest {
+            layout: Some(layout),
+            ..self
+        }
+    }
+
+    /// The layout text a sibling pair's manifest names; `None` for one repo's.
+    #[must_use]
+    pub fn layout(&self) -> Option<&str> {
+        self.layout.as_deref()
+    }
+
     /// Holds `held` at `path`, in place of any file whose path differs from it only in case.
     pub fn insert(&mut self, path: String, held: Held) {
         self.files.insert(ordinal_upper(&path), (path, held));
@@ -93,7 +113,10 @@ impl Manifest {
                 (path.clone(), file)
             })
             .collect();
-        format!("{}\n", json!({ "files": files }))
+        match &self.layout {
+            None => format!("{}\n", json!({ "files": files })),
+            Some(layout) => format!("{}\n", json!({ "files": files, "layout": layout })),
+        }
     }
 
     /// The manifest `line` holds, its newline included or not; a blank line is an empty manifest. Else why it is not
@@ -107,7 +130,19 @@ impl Manifest {
             .get("files")
             .and_then(Value::as_object)
             .ok_or_else(|| "the outputs manifest holds no object of files".to_owned())?;
-        let mut manifest = Manifest::default();
+        let layout = match value.get("layout") {
+            None => None,
+            Some(layout) => Some(
+                layout
+                    .as_str()
+                    .ok_or_else(|| "the inputs manifest's layout is not text".to_owned())?
+                    .to_owned(),
+            ),
+        };
+        let mut manifest = Manifest {
+            layout,
+            ..Manifest::default()
+        };
         for (path, file) in files {
             manifest.insert(path.clone(), held(path, file)?);
         }
@@ -152,6 +187,19 @@ pub fn read_sent(mut line: Vec<u8>) -> Result<(Manifest, String), String> {
         return Err(format!("the inputs manifest names '{}', {why}", escaped(path)));
     }
     Ok((manifest, digest))
+}
+
+/// The tree a sibling pair's inputs path `path` lies in, as the index of its first part in `trees` (the pair's tree
+/// names, the box's own spelling), and the rest of the path below that tree: `path` must have at least two parts, the
+/// first byte-equal to one of `trees`, a case variant refused, not folded. `None` when it names no tree of the pair.
+#[must_use]
+pub fn tree_split<'p>(path: &'p str, trees: &[&str]) -> Option<(usize, &'p str)> {
+    let (first, rest) = path.split_once('/')?;
+    if rest.is_empty() {
+        return None;
+    }
+    let index = trees.iter().position(|tree| *tree == first)?;
+    Some((index, rest))
 }
 
 /// Why the box does not take the manifest's `path`: one that is not a plain relative path, or one the PC never sends
@@ -286,9 +334,61 @@ mod tests {
     use std::io;
     use std::path::PathBuf;
 
-    use super::{Held, Listing, Manifest, Stamp, hash_possible_copies, read_sent, select};
+    use super::{Held, Listing, Manifest, Stamp, hash_possible_copies, read_sent, select, tree_split};
     use crate::hash::sha256_of;
     use crate::walk::Found;
+
+    #[test]
+    fn a_pair_path_splits_into_its_tree_and_the_rest() {
+        let trees = ["app", "sib"];
+        assert_eq!(tree_split("app/lib/x", &trees), Some((0, "lib/x")));
+        assert_eq!(tree_split("sib/x", &trees), Some((1, "x")));
+    }
+
+    #[test]
+    fn a_pair_path_of_one_part_of_no_tree_or_of_another_case_is_refused() {
+        let trees = ["app", "sib"];
+        for path in ["x", "app", "app/", "other/x", "App/x", "SIB/x", "/app/x"] {
+            assert_eq!(tree_split(path, &trees), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_pair_manifest_line_carries_its_layout_and_comes_back_the_same() {
+        let sent = manifest(&[("app/a", stamp(1, 2), 'c')]).with_layout("pair app sib".to_owned());
+        let line = sent.line();
+        assert_eq!(
+            line,
+            format!(
+                "{{\"files\":{{\"app/a\":{{\"size\":1,\"modified\":2,\"sha256\":\"{}\"}}}},\"layout\":\"pair app sib\"}}\n",
+                sha('c')
+            )
+        );
+        let back = Manifest::parse(&line).expect("the line parses");
+        assert_eq!(back.layout(), Some("pair app sib"));
+        assert_eq!(back, sent);
+        let (read, _) = read_sent(line.into_bytes()).expect("the box reads it");
+        assert_eq!(read.layout(), Some("pair app sib"));
+    }
+
+    #[test]
+    fn a_single_repo_manifest_line_names_no_layout_and_is_unchanged() {
+        let single = manifest(&[("a", stamp(1, 2), 'c')]);
+        assert_eq!(single.layout(), None);
+        assert_eq!(
+            single.line(),
+            format!("{{\"files\":{{\"a\":{{\"size\":1,\"modified\":2,\"sha256\":\"{}\"}}}}}}\n", sha('c'))
+        );
+        assert_eq!(Manifest::parse(&single.line()).expect("the line parses").layout(), None);
+    }
+
+    #[test]
+    fn a_layout_that_is_not_text_is_refused() {
+        assert_eq!(
+            Manifest::parse("{\"files\":{},\"layout\":1}"),
+            Err("the inputs manifest's layout is not text".to_owned())
+        );
+    }
 
     /// A SHA-256 of `digit` repeated.
     fn sha(digit: char) -> String {

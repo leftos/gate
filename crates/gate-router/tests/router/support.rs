@@ -47,6 +47,8 @@ pub fn carried(name: &str) -> CarriedSibling {
         name: name.to_owned(),
         id: fake_id(&root),
         root,
+        repo: name.to_owned(),
+        inputs: Vec::new(),
     }
 }
 

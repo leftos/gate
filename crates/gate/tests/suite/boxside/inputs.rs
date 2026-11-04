@@ -20,7 +20,9 @@ use super::ReadBack;
 use super::channel_pc::{
     BOX_PROOF, PC_PROOF, assert_no_proof, channel_line, free_port, has_line, listening, not_completed, pc_connected, proved, with_windows,
 };
-use super::{box_call, field, gate_box, git, lines, pair_payload, pair_snapshot, passed, payload, refused_line, run_box, snapshot};
+use super::{
+    PAIR_KEY, box_call, field, gate_box, git, lines, pair_payload, pair_snapshot, passed, payload, refused_line, run_box, sibling_bare, snapshot,
+};
 use crate::support::{Case, FAKE_TOOL, Outcome, Running, box_payload, junction, shown};
 
 /// The lower-case hex SHA-256 of `bytes`.
@@ -399,19 +401,6 @@ fn a_run_with_its_record_s_inputs_digest_runs_and_another_or_none_is_refused() {
     let plain = run_box(&case, &payload);
     assert_eq!(plain.code, Some(0), "without the key nothing is checked: {plain:?}");
     assert_eq!(plain.stdout, "ran\n", "{plain:?}");
-}
-
-#[test]
-fn an_inputs_request_with_a_pair_is_refused() {
-    let case = Case::new("box_inputs_pair");
-    let mut payload = unreadied_payload(&case, "diff");
-    payload["Pair"] = json!({"Leaf": "app", "Siblings": ["lib"]});
-
-    let outcome = diff(&case, &payload, &[DATA]);
-
-    assert_eq!(outcome.code, Some(2), "{outcome:?}");
-    assert_eq!(outcome.stderr, "gate box: inputs for a sibling pair are not taken yet\n");
-    assert!(!work(&payload).exists(), "nothing is laid out");
 }
 
 /// `payload` carrying the digest of the manifest line `line` as its `InputsDigest`.
@@ -1284,16 +1273,162 @@ fn sent_build_of_a_pair_deletes_the_copy_that_left_the_pc_s_build_below_the_leaf
     assert_eq!(sent_record_paths(&payload), [in_leaf(BUILT_DLL.0)]);
 }
 
+/// The layout text of the pair [`pair_inputs_payload`] lays out.
+const PAIR_LAYOUT: &str = "pair app lib";
+/// A main repo's input of a pair's manifest, prefixed with the leaf.
+const LEAF_INPUT: Input = ("app/data/b.txt", b"main data\n");
+/// A sibling's input of a pair's manifest, prefixed with the sibling's name.
+const SIBLING_INPUT: Input = ("lib/x.txt", b"sibling input\n");
+
+/// The manifest line the PC sends for a pair's `files`, each path prefixed with its tree, naming `layout` when one is
+/// given, without its newline.
+fn pair_manifest_line(files: &[(&str, &[u8])], layout: Option<&str>) -> String {
+    let mut line: Value = serde_json::from_str(&manifest_line(files)).expect("the manifest line is JSON");
+    if let Some(layout) = layout {
+        line["layout"] = json!(layout);
+    }
+    line.to_string()
+}
+
+/// A pair's inputs call of `step` for `files`, its manifest naming `layout`, the archive holding every file.
+fn pair_call(case: &Case, payload: &Value, step: &str, files: &[(&str, &[u8])], layout: Option<&str>) -> Outcome {
+    let archive = if step == "put" { archive(files) } else { Vec::new() };
+    inputs_call(case, &stepped(payload, step), &[], &pair_manifest_line(files, layout), &archive)
+}
+
+/// The exclude file of the tree `name` of the pair payload `payload`'s work folder.
+fn tree_exclude_of(payload: &Value, name: &str) -> String {
+    fs::read_to_string(work(payload).join(name).join(r".git\info\exclude")).expect("the tree's exclude file can be read")
+}
+
+/// The paths the inputs record of `payload`'s work folder names.
+fn inputs_record_paths(payload: &Value) -> Vec<String> {
+    let text = fs::read_to_string(format!("{}.inputs", field(payload, "Work"))).expect("the inputs record can be read");
+    let record: Value = serde_json::from_str(&text).expect("the record is JSON");
+    record["files"].as_object().expect("the record has files").keys().cloned().collect()
+}
+
 #[test]
-fn a_pair_s_inputs_request_without_a_sent_bin_is_still_refused() {
-    let case = Case::new("box_inputs_pair_no_sent_bin");
+fn a_pair_inputs_request_lays_each_prefixed_path_into_its_tree() {
+    let case = Case::new("box_inputs_pair_trees");
+    let payload = pair_inputs_payload(&case, "diff");
+    let files = [LEAF_INPUT, SIBLING_INPUT];
+
+    let needed = pair_call(&case, &payload, "diff", &files, Some(PAIR_LAYOUT));
+    assert_eq!(needed.code, Some(0), "{needed:?}");
+    assert_eq!(
+        needed.stdout,
+        needs(&[LEAF_INPUT.0, SIBLING_INPUT.0]),
+        "the diff names the PC's prefixed paths"
+    );
+
+    let put = pair_call(&case, &payload, "put", &files, Some(PAIR_LAYOUT));
+    assert_eq!(put.code, Some(0), "{put:?}");
+    assert_eq!(put.stdout, "gate-remote-inputs: installed 2\n", "{put:?}");
+
+    let left = tree_files(work(&payload));
+    let paths: Vec<&str> = left.keys().map(String::as_str).collect();
+    assert_eq!(paths, [LEAF_INPUT.0, SIBLING_INPUT.0], "each input lands in its own tree");
+    assert_eq!(left.get(SIBLING_INPUT.0).map(Vec::as_slice), Some(SIBLING_INPUT.1));
+    assert!(
+        !work(&payload).join(LEAF).join("lib").exists(),
+        "nothing lands below the leaf for the sibling"
+    );
+    assert_eq!(
+        inputs_record_paths(&payload),
+        [LEAF_INPUT.0, SIBLING_INPUT.0],
+        "the record names prefixed paths"
+    );
+    let again = pair_call(&case, &payload, "diff", &files, Some(PAIR_LAYOUT));
+    assert_eq!(again.stdout, needs(&[]), "a second diff needs nothing: {again:?}");
+}
+
+#[test]
+fn a_pair_path_that_names_no_tree_is_refused_before_anything_is_written() {
+    let case = Case::new("box_inputs_pair_no_tree");
     let payload = pair_inputs_payload(&case, "put");
 
-    let outcome = put_with(&case, &payload, &[], &[DATA], &[DATA]);
+    for path in ["other/x.txt", "App/x.txt", "x.txt"] {
+        let outcome = pair_call(&case, &payload, "put", &[(path, b"x")], Some(PAIR_LAYOUT));
+
+        assert_eq!(outcome.code, Some(2), "{path}: {outcome:?}");
+        assert_eq!(
+            outcome.stderr,
+            format!("gate box: the inputs path {path} names no tree of the pair\n"),
+            "{path}"
+        );
+        assert!(!work(&payload).join(LEAF).exists(), "{path}: nothing is laid out");
+        assert!(stages_left(&payload).is_empty(), "{path}: no stage is made");
+    }
+}
+
+#[test]
+fn a_pair_manifest_without_its_layout_is_refused() {
+    let case = Case::new("box_inputs_pair_no_layout");
+    let payload = pair_inputs_payload(&case, "diff");
+
+    let outcome = pair_call(&case, &payload, "diff", &[SIBLING_INPUT], None);
 
     assert_eq!(outcome.code, Some(2), "{outcome:?}");
-    assert_eq!(outcome.stderr, "gate box: inputs for a sibling pair are not taken yet\n");
+    assert_eq!(outcome.stderr, "gate box: a pair's inputs manifest names no layout\n");
     assert!(!work(&payload).join(LEAF).exists(), "nothing is laid out");
+}
+
+#[test]
+fn a_pair_manifest_for_another_layout_is_refused() {
+    let case = Case::new("box_inputs_pair_other_layout");
+    let payload = pair_inputs_payload(&case, "put");
+
+    let outcome = pair_call(&case, &payload, "put", &[SIBLING_INPUT], Some("pair app other"));
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!("gate box: a pair's inputs manifest is for the layout pair app other, not {PAIR_LAYOUT}\n")
+    );
+    assert!(!work(&payload).join(LEAF).exists(), "nothing is laid out");
+}
+
+#[test]
+fn each_tree_s_exclude_lists_only_its_own_inputs() {
+    let case = Case::new("box_inputs_pair_excludes");
+    let payload = pair_inputs_payload(&case, "put");
+
+    let put = pair_call(&case, &payload, "put", &[LEAF_INPUT, SIBLING_INPUT], Some(PAIR_LAYOUT));
+
+    assert_eq!(put.code, Some(0), "{put:?}");
+    assert_eq!(tree_exclude_of(&payload, LEAF), "/data/b.txt\n", "the leaf's lists only its own");
+    assert_eq!(tree_exclude_of(&payload, "lib"), "/x.txt\n", "the sibling's lists only its own");
+}
+
+#[test]
+fn a_sibling_input_survives_its_tree_s_checkout_clean() {
+    let case = Case::new("box_inputs_pair_clean");
+    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "write", "../lib/made.txt", "made", "out", "ran"]);
+    pair_snapshot(&case, &mut payload, &[("tracked.txt", "tracked\n")], &[("lib", &[("lib.txt", "lib\n")])]);
+    let files = [LEAF_INPUT, SIBLING_INPUT];
+    let put = pair_call(&case, &payload, "put", &files, Some(PAIR_LAYOUT));
+    assert_eq!(put.code, Some(0), "{put:?}");
+
+    let run = run_box(&case, &digested(&payload, &pair_manifest_line(&files, Some(PAIR_LAYOUT))));
+
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert_eq!(run.stdout, "ran\n", "{run:?}");
+    let left = tree_files(work(&payload));
+    assert_eq!(
+        left.get(SIBLING_INPUT.0).map(Vec::as_slice),
+        Some(SIBLING_INPUT.1),
+        "the clean keeps the input"
+    );
+    assert_eq!(left.get(LEAF_INPUT.0).map(Vec::as_slice), Some(LEAF_INPUT.1), "and the leaf's");
+    let bare = format!("--git-dir={}", sibling_bare(&payload, "lib"));
+    let back = format!("refs/gate-back/{PAIR_KEY}");
+    let committed = git(&[&bare, "ls-tree", "-r", "--name-only", &back]);
+    assert!(
+        committed.lines().any(|path| path == "made.txt"),
+        "the sibling's back commit holds the run's change: {committed}"
+    );
+    assert!(!committed.lines().any(|path| path == "x.txt"), "and not its input: {committed}");
 }
 
 #[test]
