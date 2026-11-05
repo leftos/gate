@@ -4515,7 +4515,9 @@ Built verbs:
 
   A run, `inputs` and `lfs` set the lock file's last-write time to now when they take it and again when they let it go, so the prune reads the last take or release as use; a stamp that fails at the take prints `gate: remote could not stamp the work folder lock <path>: <error>` and the run goes on. The preflight takes the lock without stamping it.
 
-  `Work` must not end with a separator (`gate: box payload Work must not end with a separator: <work>`, exit 2). Every git call in a tree passes `-c core.hooksPath=<Lock>\hooks -c core.fsmonitor=false`, a hooks path that cannot exist while the box holds the lock, so a repository's own hooks (one a build installed) never run in the box's git; fetch and push name the repo's bare repository by its path, never `origin`.
+  `Work` must not end with a separator (`gate: box payload Work must not end with a separator: <work>`, exit 2). Every git call in a tree passes `-c core.hooksPath=<Lock>\hooks -c core.fsmonitor=false -c submodule.recurse=false`, a hooks path that cannot exist while the box holds the lock, so a repository's own hooks (one a build installed) never run in the box's git; fetch and push name the repo's bare repository by its path, never `origin`.
+
+  The fetch and the back push also pass `--no-recurse-submodules`, as the macOS box does. An initialized submodule's folder holds only the files the client sent as inputs, with no `.git`, and a fetch that recursed on demand into a submodule whose pin the snapshot moved would fail on it with `Could not access submodule '<path>'`.
 
   Every git call in a tree also passes `--git-dir=<tree>\.git --work-tree=<tree>`, so neither a `core.worktree` nor a repository above the tree is followed.
 

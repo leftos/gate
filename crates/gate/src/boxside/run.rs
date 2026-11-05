@@ -3316,10 +3316,11 @@ impl WorkGit {
             .map_err(|failure| failure.of_step(step))
     }
 
-    /// The safety options, no `core.attributesFile` among them ([`crate::remote::lfs::NO_ATTRIBUTES_FILE`]), so the
-    /// tree's attributes are read from its own `.gitattributes` files and from `<Work>\.git\info\attributes`, then `args`.
+    /// The safety options — no submodule recursed into, so a submodule's folder in the tree is only ever the client's
+    /// inputs — and no `core.attributesFile` among them ([`crate::remote::lfs::NO_ATTRIBUTES_FILE`]), so the tree's
+    /// attributes are read from its own `.gitattributes` files and from `<Work>\.git\info\attributes`, then `args`.
     pub(super) fn args<'a>(&'a self, args: &[&'a str]) -> Vec<&'a str> {
-        let mut all = vec!["-c", self.hooks.as_str(), "-c", "core.fsmonitor=false"];
+        let mut all = vec!["-c", self.hooks.as_str(), "-c", "core.fsmonitor=false", "-c", "submodule.recurse=false"];
         all.extend(crate::remote::lfs::NO_ATTRIBUTES_FILE);
         all.extend_from_slice(args);
         all
@@ -3813,7 +3814,7 @@ impl WorkGit {
         let head = repo
             .head
             .map(|_| format!("+refs/gate-head/{key}:refs/gate-head/{key}", key = request.key));
-        let mut args = vec!["fetch", "-q", &repo.bare, &refname];
+        let mut args = vec!["fetch", "-q", "--no-recurse-submodules", &repo.bare, &refname];
         args.extend(base.as_deref());
         args.extend(head.as_deref());
         self.step("fetch", GitClass::Long, repo, &args, console)?;
@@ -3986,7 +3987,12 @@ impl WorkGit {
             work: self,
         };
         let target = format!("{commit}:refs/gate-back/{}", request.key);
-        back.status(("push", GitClass::LongBare), &["push", "-q", &repo.bare, &target], false, console)
+        back.status(
+            ("push", GitClass::LongBare),
+            &["push", "-q", "--no-recurse-submodules", &repo.bare, &target],
+            false,
+            console,
+        )
     }
 
     /// The tree the command left in `repo`, committed on its back parent ([`Repo::back_parent`]), unpushed; nothing when

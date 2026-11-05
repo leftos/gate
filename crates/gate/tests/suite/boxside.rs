@@ -2425,6 +2425,44 @@ fn push_repo_snapshot(case: &Case, source: &str, bare: &str, key: &str, files: &
     git(&["-C", &source_text, "rev-parse", "HEAD"])
 }
 
+/// Commits in the case's source repository a tree whose `.gitmodules` names the submodule `tools/shared` and whose index
+/// holds the gitlink `tools/shared` at `pin`, making the source repository when it is missing, and pushes the commit to
+/// `refs/gate/<key>` in the payload's bare repository, as the client sends a snapshot; the commit. The gitlink's folder
+/// is absent from the source tree, which `add -A` would drop a gitlink over, so the index is written directly.
+fn push_gitlink_snapshot(case: &Case, payload: &Value, pin: &str) -> String {
+    let source = case.folder().join("source");
+    let source_text = source.to_str().expect("the case folder is Unicode").to_owned();
+    let bare = field(payload, "Bare");
+    let key = field(payload, "Key");
+    if !source.exists() {
+        git(&["init", "-q", &source_text]);
+        git(&["-C", &source_text, "config", "core.autocrlf", "false"]);
+    }
+    fs::write(
+        source.join(".gitmodules"),
+        "[submodule \"tools/shared\"]\n\tpath = tools/shared\n\turl = https://example.invalid/shared.git\n",
+    )
+    .expect("a snapshot file can be written");
+    git(&["-C", &source_text, "add", ".gitmodules"]);
+    let entry = format!("160000,{pin},tools/shared");
+    git(&["-C", &source_text, "update-index", "--add", "--cacheinfo", &entry]);
+    git(&[
+        "-C",
+        &source_text,
+        "-c",
+        "user.name=gate suite",
+        "-c",
+        "user.email=suite@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        "snapshot",
+    ]);
+    let target = format!("HEAD:refs/gate/{key}");
+    git(&["-C", &source_text, "push", "-q", "--force", "--no-verify", bare, &target]);
+    git(&["-C", &source_text, "rev-parse", "HEAD"])
+}
+
 /// The work-folder key of the leaf `app`, as the client makes it, which a pair payload's `Key` must be.
 const PAIR_KEY: &str = "app-1a2b3c4d";
 
@@ -4786,6 +4824,34 @@ fn box_run_a_failed_fetch_exits_with_gits_status() {
         outcome.stderr.lines().any(|line| line == "gate: remote fetch failed (status 128)"),
         "{outcome:?}"
     );
+}
+
+/// A run whose snapshot moves a submodule's gitlink is fetched over the input files the run before left in the
+/// submodule's folder: the box's fetch recurses into no submodule, so a folder that holds the client's inputs and has
+/// no `.git` is never read as a repository git must fetch.
+#[test]
+fn box_run_fetches_a_moved_submodule_pin_over_its_input_files() {
+    let case = Case::new("box_run_moved_submodule_pin");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    allow_breakaway();
+    passed(&gate_box(&case, "preflight", &self::payload(&payload), None));
+    let first = push_gitlink_snapshot(&case, &payload, "1111111111111111111111111111111111111111");
+    payload["Snapshot"] = json!(first);
+    let ran = run_box(&case, &payload);
+    assert_eq!(ran.code, Some(0), "{ran:?}");
+    assert_eq!(ran.stdout, "ran\n", "{ran:?}");
+    let work = field(&payload, "Work");
+    let shared = Path::new(&work).join("tools").join("shared");
+    fs::create_dir_all(&shared).expect("the submodule's folder can be made");
+    fs::write(shared.join("input.txt"), "x").expect("an input file can be written");
+    let moved = push_gitlink_snapshot(&case, &payload, "2222222222222222222222222222222222222222");
+    payload["Snapshot"] = json!(moved);
+
+    let again = run_box(&case, &payload);
+
+    assert_eq!(again.code, Some(0), "{again:?}");
+    assert_eq!(again.stdout, "ran\n", "{again:?}");
+    assert!(!again.stderr.lines().any(|line| line.contains("Could not access submodule")), "{again:?}");
 }
 
 #[test]
