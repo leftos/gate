@@ -276,8 +276,10 @@ pub(crate) fn location_word(location: &Location) -> String {
 
 /// The payload word of a preflight that asks the builder to probe tools: the location, the call's `Nonce`, which a
 /// refusal tag names, and `Needs`, an object of each tool's name and the minimum version the run needs of it (empty
-/// for any version), in the order of `needs`. With no needs there is no `Needs`.
-pub(crate) fn preflight_word(location: &Location, needs: &[(String, String)], nonce: &str) -> String {
+/// for any version), in the order of `needs`, and `UserTools`, the home-relative folders of the user tools whose
+/// builder copy's record the box reads, in the order of `user_tools`. With no needs there is no `Needs`, and with no
+/// user tools no `UserTools`.
+pub(crate) fn preflight_word(location: &Location, needs: &[(String, String)], user_tools: &[String], nonce: &str) -> String {
     let mut object = location.object();
     object.insert("Nonce".to_owned(), json!(nonce));
     if !needs.is_empty() {
@@ -286,6 +288,9 @@ pub(crate) fn preflight_word(location: &Location, needs: &[(String, String)], no
             .map(|(name, minimum)| (name.clone(), Value::String(minimum.clone())))
             .collect();
         object.insert("Needs".to_owned(), Value::Object(needs));
+    }
+    if !user_tools.is_empty() {
+        object.insert("UserTools".to_owned(), json!(user_tools));
     }
     word(&object)
 }
@@ -564,7 +569,7 @@ mod tests {
             hash: SHA,
         };
         let words = [
-            ("preflight", preflight_word(&routed, &[], NONCE)),
+            ("preflight", preflight_word(&routed, &[], &[], NONCE)),
             ("inputs", inputs_word(&routed, NONCE, InputsStep::Diff, None)),
             ("outputs", outputs_word(&routed, "app.zip", None)),
             ("run", run_word(&routed, &warm_run(&[], None))),
@@ -977,7 +982,7 @@ mod tests {
         let mut alone = decoded(&location_word(&location()));
         alone["Nonce"] = json!(NONCE);
         assert_eq!(
-            decoded(&preflight_word(&location(), &[], NONCE)),
+            decoded(&preflight_word(&location(), &[], &[], NONCE)),
             alone,
             "no needs: the location and the Nonce alone"
         );
@@ -986,12 +991,34 @@ mod tests {
             ("cargo-nextest".to_owned(), String::new()),
             ("ffmpeg".to_owned(), "7".to_owned()),
         ];
-        let with_needs = decoded(&preflight_word(&location(), &needs, NONCE));
+        let with_needs = decoded(&preflight_word(&location(), &needs, &[], NONCE));
         let mut expected = alone;
         expected["Needs"] = json!({"node": "24.0.0", "cargo-nextest": "", "ffmpeg": "7"});
         assert_eq!(with_needs, expected);
         let order: Vec<&String> = with_needs["Needs"].as_object().expect("Needs is an object").keys().collect();
         assert_eq!(order, ["node", "cargo-nextest", "ffmpeg"], "the needs keep their order");
+    }
+
+    #[test]
+    fn a_preflight_word_names_its_user_tools() {
+        let tools = ["~/.claude/tools/mock-three".to_owned(), "~/tools/other".to_owned()];
+
+        let sent = decoded(&preflight_word(&location(), &[], &tools, NONCE));
+
+        let mut expected = decoded(&location_word(&location()));
+        expected["Nonce"] = json!(NONCE);
+        expected["UserTools"] = json!(["~/.claude/tools/mock-three", "~/tools/other"]);
+        assert_eq!(sent, expected, "the paths in their order, beside the location and the Nonce");
+    }
+
+    #[test]
+    fn a_preflight_word_with_no_user_tools_has_no_user_tools_key() {
+        let needs = [("node".to_owned(), "24.0.0".to_owned())];
+
+        let sent = decoded(&preflight_word(&location(), &needs, &[], NONCE));
+
+        assert!(sent.get("UserTools").is_none(), "{sent}");
+        assert_eq!(sent["Needs"], json!({"node": "24.0.0"}), "{sent}");
     }
 
     #[test]

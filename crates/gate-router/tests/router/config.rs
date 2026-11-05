@@ -552,6 +552,183 @@ fn a_bad_carried_folders_value_carries_none_and_leaves_routing_alone() {
     }
 }
 
+/// A routing file whose `userTools` is `value`, routing every command of `g`.
+fn user_tools_file(value: &str) -> Config {
+    Config::parse(&format!(
+        r#"{{"host": "builder-1", "slots": 2, "repos": {{"g": ["x"]}}, "userTools": {value}}}"#
+    ))
+    .expect("routing reads the file whatever userTools holds")
+}
+
+/// Each of `repo`'s user tools as its path and its command patterns' texts.
+fn user_tool_texts(config: &Config, repo: &str) -> Result<Vec<(String, Vec<String>)>, String> {
+    config
+        .user_tools(repo)
+        .map(|tools| {
+            tools
+                .iter()
+                .map(|tool| {
+                    (
+                        tool.path.clone(),
+                        tool.commands.iter().map(|pattern| pattern.as_str().to_owned()).collect(),
+                    )
+                })
+                .collect()
+        })
+        .map_err(str::to_owned)
+}
+
+#[test]
+fn user_tools_reads_each_repo_s_paths_and_command_patterns() {
+    let config = user_tools_file(
+        r#"{"g": [{"path": "~/.claude/tools/mock-three", "commands": ["pwsh -NoProfile -File tools?mock-shoot.ps1 *", "node *"]},
+                  {"PATH": "~/tools/other", "Commands": ["x"]}],
+            "other": []}"#,
+    );
+    assert_eq!(
+        user_tool_texts(&config, "g"),
+        Ok(vec![
+            (
+                "~/.claude/tools/mock-three".to_owned(),
+                vec!["pwsh -NoProfile -File tools?mock-shoot.ps1 *".to_owned(), "node *".to_owned()]
+            ),
+            ("~/tools/other".to_owned(), vec!["x".to_owned()]),
+        ])
+    );
+    assert_eq!(user_tool_texts(&config, "other"), Ok(Vec::new()), "an empty list");
+    assert_eq!(user_tool_texts(&config, "missing"), Ok(Vec::new()), "a repo it does not name");
+    let tools = config.all_user_tools().expect("usable");
+    let repos: Vec<&str> = tools.iter().map(|(repo, _)| repo.as_str()).collect();
+    assert_eq!(repos, ["g", "other"], "every repo, in file order");
+    let pattern = &tools[0].1[0].commands[0];
+    assert!(pattern.is_match(r"pwsh -NoProfile -File tools\mock-shoot.ps1 -Page x"));
+    assert!(!pattern.is_match("pwsh -NoProfile -File tools/other.ps1 x"));
+}
+
+#[test]
+fn a_file_with_no_user_tools_has_none_for_any_repo() {
+    let none = Config::parse(r#"{"host": "builder-1", "repos": {"g": ["x"]}}"#).expect("usable");
+    assert_eq!(none.user_tools("g").map(<[_]>::len), Ok(0));
+    assert_eq!(none.all_user_tools().map(<[_]>::len), Ok(0));
+}
+
+#[test]
+fn user_tools_with_a_path_holding_another_is_unusable() {
+    let rows = [
+        (
+            r#"{"g": [{"path": "~/.claude", "commands": ["x"]}, {"path": "~/.claude/tools/x", "commands": ["x"]}]}"#,
+            r#"userTools."g"[0].path "~/.claude" holds or is held by userTools."g"[1].path "~/.claude/tools/x""#,
+        ),
+        (
+            r#"{"g": [{"path": "~/.claude/tools/x", "commands": ["x"]}], "h": [{"path": "~/.Claude/Tools", "commands": ["x"]}]}"#,
+            r#"userTools."g"[0].path "~/.claude/tools/x" holds or is held by userTools."h"[0].path "~/.Claude/Tools""#,
+        ),
+    ];
+    for (value, problem) in rows {
+        let config = user_tools_file(value);
+        assert_eq!(config.all_user_tools().map(<[_]>::len), Err(problem), "{value}");
+        assert_eq!(config.user_tools("g").map(<[_]>::len), Err(problem), "{value}");
+    }
+}
+
+#[test]
+fn user_tools_naming_one_path_in_two_repos_is_usable() {
+    let config = user_tools_file(
+        r#"{"g": [{"path": "~/tools/a", "commands": ["x"]}, {"path": "~/tools/a", "commands": ["y"]}],
+            "h": [{"path": "~/tools/a", "commands": ["x"]}, {"path": "~/tools/ab", "commands": ["x"]}]}"#,
+    );
+    assert_eq!(
+        config.all_user_tools().map(<[_]>::len),
+        Ok(2),
+        "a path that only starts with another's text holds nothing"
+    );
+}
+
+#[test]
+fn user_tools_names_a_repo_case_insensitively() {
+    let config = user_tools_file(r#"{"World-Of-Intrigue": [{"path": "~/a", "commands": ["x"]}]}"#);
+    let expected = Ok(vec![("~/a".to_owned(), vec!["x".to_owned()])]);
+    assert_eq!(user_tool_texts(&config, "world-of-intrigue"), expected);
+    assert_eq!(user_tool_texts(&config, "WORLD-OF-INTRIGUE"), expected);
+    let keyed = Config::parse(r#"{"host": "builder-1", "repos": {}, "USERTOOLS": {"g": [{"path": "~/a", "commands": ["x"]}]}}"#).expect("usable");
+    assert_eq!(user_tool_texts(&keyed, "g"), expected, "the key in any case");
+}
+
+#[test]
+fn user_tools_with_one_bad_entry_is_unusable_as_a_whole() {
+    let good = r#"{"path": "~/a", "commands": ["x"]}"#;
+    let mut cases: Vec<(String, String)> = [
+        (r#"["a"]"#.to_owned(), "userTools must be a JSON object".to_owned()),
+        ("null".to_owned(), "userTools must be a JSON object".to_owned()),
+        (r#"{"g": {}}"#.to_owned(), r#"userTools."g" is not an array"#.to_owned()),
+        (r#"{"g": "a"}"#.to_owned(), r#"userTools."g" is not an array"#.to_owned()),
+        (
+            format!(r#"{{"g": [{good}, "a"]}}"#),
+            r#"userTools."g"[1] is not an object with a path and commands"#.to_owned(),
+        ),
+        (
+            r#"{"g": [{"path": "~/a"}]}"#.to_owned(),
+            r#"userTools."g"[0] is not an object with a path and commands"#.to_owned(),
+        ),
+        (
+            r#"{"g": [{"commands": ["x"]}]}"#.to_owned(),
+            r#"userTools."g"[0] is not an object with a path and commands"#.to_owned(),
+        ),
+        (
+            r#"{"g": [{"path": "~/a", "commands": ["x"], "name": "a"}]}"#.to_owned(),
+            r#"userTools."g"[0] is not an object with a path and commands"#.to_owned(),
+        ),
+        (
+            r#"{"g": [{"path": "~/a", "commands": []}]}"#.to_owned(),
+            r#"userTools."g"[0].commands is not a non-empty array"#.to_owned(),
+        ),
+        (
+            r#"{"g": [{"path": "~/a", "commands": "x"}]}"#.to_owned(),
+            r#"userTools."g"[0].commands is not a non-empty array"#.to_owned(),
+        ),
+        (
+            r#"{"g": [{"path": "~/a", "commands": ["x", ""]}]}"#.to_owned(),
+            r#"userTools."g"[0].commands[1] is not a non-empty string"#.to_owned(),
+        ),
+        (
+            r#"{"g": [{"path": "~/a", "commands": ["x", 3]}]}"#.to_owned(),
+            r#"userTools."g"[0].commands[1] is not a non-empty string"#.to_owned(),
+        ),
+        (
+            format!(r#"{{"other": [{good}], "g": [{{"path": "~/a", "commands": [null]}}]}}"#),
+            r#"userTools."g"[0].commands[0] is not a non-empty string"#.to_owned(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    for path in [
+        ".claude/x",
+        "~/",
+        "~/a//b",
+        "~/a/./b",
+        "~/a/../b",
+        r"~\\a",
+        r"~/a\\b",
+        "~/C:/a",
+        r"~/a\nb",
+        r"~/a\u0001b",
+    ] {
+        let written = path.replace(r"\\", r"\").replace(r"\n", "\n").replace(r"\u0001", "\u{1}");
+        cases.push((
+            format!(r#"{{"g": [{good}, {{"path": "{path}", "commands": ["x"]}}]}}"#),
+            format!(r#"userTools."g"[1].path is not a home-relative folder (~/...): {written:?}"#),
+        ));
+    }
+    for (value, problem) in cases {
+        let config = user_tools_file(&value);
+        assert_eq!(user_tool_texts(&config, "g"), Err(problem.clone()), "{value}");
+        assert_eq!(user_tool_texts(&config, "other"), Err(problem.clone()), "the whole table: {value}");
+        assert_eq!(config.all_user_tools().map(<[_]>::len), Err(problem.as_str()), "{value}");
+        assert_eq!(config.host(), "builder-1", "{value}");
+        assert_eq!(pattern_texts(&config, "g"), ["x"], "{value}");
+    }
+}
+
 /// The routing file listing `g` with `warmup` holding `value`.
 fn warmup_file(value: &str) -> Config {
     Config::parse(&format!(

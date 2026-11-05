@@ -328,6 +328,21 @@ impl Payload {
         list.iter().map(|word| word.as_str().map(str::to_owned).ok_or_else(not_words)).collect()
     }
 
+    /// The texts of `key`, a list of them, none when the key is absent or null; else the usage line saying it is not a
+    /// list of texts.
+    pub fn texts(&self, key: &str) -> Result<Vec<String>, String> {
+        let not_texts = || format!("gate: box payload {key} is not a list of texts");
+        match self.object.get(key) {
+            None | Some(Value::Null) => Ok(Vec::new()),
+            Some(value) => value
+                .as_array()
+                .ok_or_else(not_texts)?
+                .iter()
+                .map(|text| text.as_str().map(str::to_owned).ok_or_else(not_texts))
+                .collect(),
+        }
+    }
+
     /// The text of `key`, empty when the key is absent or null; else the usage line saying it is not a text.
     pub fn optional_text(&self, key: &str) -> Result<&str, String> {
         match self.object.get(key) {
@@ -1959,6 +1974,17 @@ pub fn tool_line(name: &str, probed: &Probed) -> String {
         Probed::Missing => format!("gate: remote tool {name} missing"),
         Probed::Skipped(why) => format!("gate: remote tool {name} skipped: {}", escaped(why)),
     }
+}
+
+/// The start of the line the preflight says for each user tool its payload's `UserTools` names ([`user_tool_line`]).
+pub const USER_TOOL_PREFIX: &str = "gate: remote user tool ";
+
+/// The line the preflight says for the user tool at the home-relative `path`, as the record of the builder's copy
+/// gives its fingerprint: `gate: remote user tool <path> <fingerprint>`, or `missing` when there is none it can read,
+/// the path escaped, as it comes from outside.
+#[must_use]
+pub fn user_tool_line(path: &str, recorded: Option<&str>) -> String {
+    format!("{USER_TOOL_PREFIX}{} {}", escaped(path), recorded.unwrap_or("missing"))
 }
 
 /// The program and arguments a probe of the tool `name` runs to read its version; `None` for every other name, which each
@@ -4415,6 +4441,29 @@ mod tests {
             tool_line("a\nb", &Probed::Skipped("why\r".to_owned())),
             r"gate: remote tool a\nb skipped: why\r",
             "a name and a reason from outside are escaped"
+        );
+    }
+
+    #[test]
+    fn a_user_tool_line_says_the_recorded_fingerprint_or_missing() {
+        let fingerprint = "0123456789abcdef".repeat(4);
+        assert_eq!(
+            super::user_tool_line("~/.claude/tools/mock-three", Some(&fingerprint)),
+            format!("gate: remote user tool ~/.claude/tools/mock-three {fingerprint}")
+        );
+        assert_eq!(
+            super::user_tool_line("~/.claude/tools/mock-three", None),
+            "gate: remote user tool ~/.claude/tools/mock-three missing"
+        );
+        assert!(super::user_tool_line("~/t", None).starts_with(super::USER_TOOL_PREFIX));
+    }
+
+    #[test]
+    fn a_user_tool_line_escapes_its_path() {
+        assert_eq!(
+            super::user_tool_line("~/a b\u{1b}c", None),
+            r"gate: remote user tool ~/a b\u{1b}c missing",
+            "a path from outside is escaped"
         );
     }
 

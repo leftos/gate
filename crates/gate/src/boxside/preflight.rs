@@ -1,7 +1,7 @@
 //! `gate box preflight`, the first call of every routed run: readies the work folder and its bare repository as the
 //! PowerShell wrapper's `Initialize-WorkFolder` does, then says the version and warm lines, the new work tree line when
 //! it laid the work folder's tree out now, the boot and SDK lines, a line for each tool the payload's `Needs` names,
-//! and the path line when no trusted Git `bin` was found for the command's `PATH`.
+//! a line for each user tool its `UserTools` names, and the path line when no trusted Git `bin` was found for the command's `PATH`.
 
 use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
@@ -46,6 +46,7 @@ use crate::console::Console;
 use crate::environment::Variables;
 use crate::remote::{INSTALL_STATUS, git, install_untrusted_line, launch};
 use crate::run::{ERROR_FILE_NOT_FOUND, Written, find_program};
+use crate::user_tool;
 
 /// The Windows installer step that locks the builder's work root down, as the work-root refusal names it
 /// ([`gate_wire::root_unsafe_line`]).
@@ -201,6 +202,7 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
         stamping::out(console, msys::NO_GIT_BIN);
     }
     say_sdks_and_tools(payload, work, seams, console);
+    say_user_tools(payload, console);
     slots::look_said(slots_look, console);
     if let Some(slot) = slot {
         slot.kept();
@@ -295,6 +297,43 @@ fn say_sdks_and_tools(payload: &Payload, work: &str, seams: &BoxSeams, console: 
             stamping::out(console, &gate_wire::tool_line(&name, &probed));
         }
     });
+}
+
+/// The most of a user tool's record the preflight reads.
+const RECORD_BYTES: u64 = 4096;
+
+/// Says one line on stdout for each home-relative folder the payload's `UserTools` names, in its order: the
+/// fingerprint the record of this builder's copy holds, or `missing` ([`recorded_in`]). A `UserTools` that is not a
+/// list of texts is said on stderr and answers nothing.
+fn say_user_tools(payload: &Payload, console: &mut Console) {
+    let paths = match payload.texts("UserTools") {
+        Ok(paths) => paths,
+        Err(line) => {
+            stamping::err(console, &format!("{line}; checking no user tool"));
+            return;
+        }
+    };
+    if paths.is_empty() {
+        return;
+    }
+    let home = user_tool::home().ok();
+    for path in paths {
+        let recorded = home.as_deref().and_then(|home| recorded_in(home, &path));
+        stamping::out(console, &gate_wire::user_tool_line(&path, recorded.as_deref()));
+    }
+}
+
+/// The fingerprint the record of the user tool at `path` under `home` holds, read from its first [`RECORD_BYTES`]
+/// bytes ([`user_tool::recorded`]); `None` for a path that is not home-relative, which is never read, a record that is
+/// absent or cannot be read, or one that holds no fingerprint.
+fn recorded_in(home: &Path, path: &str) -> Option<String> {
+    if !gate_router::is_home_folder(path) {
+        return None;
+    }
+    let file = File::open(user_tool::folder(home, path).join(user_tool::RECORD)).ok()?;
+    let mut text = Vec::new();
+    file.take(RECORD_BYTES).read_to_end(&mut text).ok()?;
+    user_tool::recorded(&String::from_utf8_lossy(&text)).map(str::to_owned)
 }
 
 /// The folders of the payload's run that no tool probe runs a program from: the folder above `work`, `work` itself,

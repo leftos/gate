@@ -899,6 +899,12 @@ pub struct RemoteRun {
     /// Why the routing file's `carriedFolders` cannot be used, which carries no folder ([`carried_folders_line`]);
     /// `None` when it can.
     pub carried_folders_problem: Option<String>,
+    /// The home-relative folders of the routing file's `userTools` entries for the repo one of whose `commands` patterns
+    /// matches the command, each once, in file order ([`Config::user_tools`]); none when `userTools` cannot be used.
+    pub user_tools: Vec<String>,
+    /// Why the routing file's `userTools` cannot be used, which checks no user tool ([`user_tools_line`]); `None` when it
+    /// can.
+    pub user_tools_problem: Option<String>,
     /// The repo name the routing file listed.
     pub repo: String,
     /// The builder's work folder ([`work_folder_key`]).
@@ -1111,6 +1117,9 @@ impl RemoteRun {
         if let Some(problem) = &self.carried_folders_problem {
             lines.push(carried_folders_line(problem));
         }
+        if let Some(problem) = &self.user_tools_problem {
+            lines.push(user_tools_line(problem));
+        }
         if let Some(blocked) = &self.cross_build_blocked {
             lines.push(blocked.line());
         }
@@ -1310,6 +1319,8 @@ fn stage_run(config: &Config, place: Place, builder: Builder, facts: &dyn Facts)
         siblings: target.siblings,
         absent_siblings: target.absent_siblings,
         carried_folders_problem: None,
+        user_tools: Vec::new(),
+        user_tools_problem: None,
         repo: target.repo,
         subfolder: String::new(),
         pattern: String::new(),
@@ -1410,6 +1421,9 @@ struct Matched {
     target: Target,
     pattern: String,
     words: Vec<String>,
+    /// The words the routing pattern matched, joined by spaces: the Windows rewrite's, even for a macOS pick whose
+    /// `words` are in their Unix form ([`Facts::matched_against`]).
+    sent: String,
     outside: Option<String>,
     /// The path the outside word names ([`Rewritten::outside_path`]).
     outside_path: Option<PathBuf>,
@@ -2095,9 +2109,11 @@ fn built(config: &Config, mut opened: Opened, sent: Rewritten, kept: Kept, facts
     let built_here = std::mem::take(&mut opened.built_here);
     let target = settle(config, opened, kept.builder, facts)?;
     let desktop = check_desktop(config, &target, (kept.found, kept.hidden), &sent.words, facts)?;
+    let joined = sent.words.join(" ");
     Ok(Matched {
         target,
         pattern: kept.pattern,
+        sent: joined,
         words: kept.unix.unwrap_or(sent.words),
         outside: sent.outside,
         outside_path: sent.outside_path,
@@ -2116,7 +2132,8 @@ fn built(config: &Config, mut opened: Opened, sent: Rewritten, kept: Kept, facts
 /// it carries, then a `<folder>/**` entry for each of the repo's `carriedFolders` folders a word names a path in
 /// ([`carried_folder_inputs`]), whose paths are no exact candidate; or here when its last build ran here and its send
 /// cannot be made ([`planned_send`]). A `carriedFolders` that cannot be used carries no folder, and the run says why
-/// ([`RemoteRun::carried_folders_problem`]). What [`route`] and [`later_run`] both end with.
+/// ([`RemoteRun::carried_folders_problem`]). The run names the repo's `userTools` folders whose commands match
+/// ([`used_user_tools`]). What [`route`] and [`later_run`] both end with.
 fn ended(config: &Config, matched: Matched, given: &[String], facts: &dyn Facts) -> Result<RemoteRun, Here> {
     if let Some(word) = matched.outside.clone() {
         return Err(Some(outside_reason(config, word, &matched, facts)));
@@ -2143,6 +2160,7 @@ fn ended(config: &Config, matched: Matched, given: &[String], facts: &dyn Facts)
     } else {
         carried_folder_inputs(globs, &named_tree_paths(&matched.words, &place.prefix, &sibling_names(&matched)))
     };
+    let (user_tools, user_tools_problem) = used_user_tools(config, &matched);
     let carried = carried_inputs(&matched, globs, facts).map_err(Some)?;
     let marks = Marks {
         prefix: place.prefix.clone(),
@@ -2164,7 +2182,26 @@ fn ended(config: &Config, matched: Matched, given: &[String], facts: &dyn Facts)
     }
     run.inputs.extend(folders);
     run.carried_folders_problem = carried_folders_problem;
+    run.user_tools = user_tools;
+    run.user_tools_problem = user_tools_problem;
     Ok(run)
+}
+
+/// The folders of the repo's `userTools` entries one of whose `commands` patterns matches the words the routing pattern
+/// matched ([`Matched::sent`]), each once, in file order, with no problem; or no folder and why `userTools` cannot be
+/// used.
+fn used_user_tools(config: &Config, matched: &Matched) -> (Vec<String>, Option<String>) {
+    let tools = match config.user_tools(&matched.target.repo) {
+        Ok(tools) => tools,
+        Err(problem) => return (Vec::new(), Some(problem.to_owned())),
+    };
+    let mut paths: Vec<String> = Vec::new();
+    for tool in tools {
+        if tool.commands.iter().any(|pattern| pattern.is_match(&matched.sent)) && !paths.contains(&tool.path) {
+            paths.push(tool.path.clone());
+        }
+    }
+    (paths, None)
 }
 
 /// The input entry, `[carried]<folder>/**` ([`CARRIED_INPUT`]), of each folder of the worktree a path of `named` lies in
@@ -2199,6 +2236,12 @@ fn carried_folder<'p>(globs: &[FolderGlob], path: &'p str) -> Option<&'p str> {
 #[must_use]
 pub fn carried_folders_line(problem: &str) -> String {
     format!("gate: remote.json carriedFolders cannot be used: {problem}; no folder carried")
+}
+
+/// The line a routed run whose repo's `userTools` cannot be used says, for `problem`.
+#[must_use]
+pub fn user_tools_line(problem: &str) -> String {
+    format!("gate: remote.json userTools cannot be used: {problem}; no user tool checked")
 }
 
 /// What [`mark_carried_properties`] reads a word's paths by: the gate's folder below the root (`sub/dir/`, empty at
@@ -4278,21 +4321,14 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
     let fallback = without_no_build(given.to_vec());
     let own_outputs = config.own_outputs_on(&target.builder, &target.repo);
     let derives = target.builder.os == BuilderOs::Windows && own_outputs.as_ref().is_some_and(|globs| !globs.is_empty());
-    let derived: Vec<String> = if derives {
-        derived_outputs(&sent, &subfolder)
-            .into_iter()
-            .chain(switch_outputs(&sent, &subfolder))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let derived = derives.then(|| derived_outputs(&sent, &subfolder).into_iter().chain(switch_outputs(&sent, &subfolder)));
     let mut outputs = match own_outputs {
         Some(globs) => globs,
         None if target.builder.os == BuilderOs::Macos => Vec::new(),
         None if cargo => CARGO_OUTPUTS.iter().map(|glob| (*glob).to_owned()).collect(),
         None => DEFAULT_OUTPUTS.iter().map(|glob| (*glob).to_owned()).collect(),
     };
-    for glob in derived {
+    for glob in derived.into_iter().flatten() {
         if !outputs.contains(&glob) {
             outputs.push(glob);
         }
@@ -4337,6 +4373,8 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         siblings: target.siblings,
         absent_siblings: target.absent_siblings,
         carried_folders_problem: None,
+        user_tools: Vec::new(),
+        user_tools_problem: None,
         repo: target.repo,
         subfolder,
         pattern,

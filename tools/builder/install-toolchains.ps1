@@ -704,7 +704,7 @@ Invoke-Step 'Playwright 1.63.0 browsers' {
     }
     Add-BuilderWriteDeny $playwrightDir
 }
-# claude-config's mock-three pins playwright 1.64.1; its Chromium joins the same machine-wide folder.
+# A user tool gate push syncs from claude-config pins playwright 1.64.1; its Chromium joins the same machine-wide folder.
 Invoke-Step 'Playwright 1.64.1 browsers' {
     Sync-SessionPath
     Remove-BuilderWriteDeny $playwrightDir
@@ -723,33 +723,6 @@ Invoke-Step 'Playwright 1.64.1 browsers' {
         Write-InstallLog "Playwright 1.64.1 browsers found at $($locations -join ', '); install skipped"
     }
     Add-BuilderWriteDeny $playwrightDir
-}
-# claude-config's user-level mock-three tool, at the same home-relative path the PC runs it from. The orchestrator
-# stages its tracked files under the gate root; the mirror keeps the target's node_modules, and pnpm installs from the
-# lock. The tool stays writable by the builder user: it lives in its own profile, so no write-deny.
-Invoke-Step 'mock-three (claude-config tool)' {
-    Sync-SessionPath
-    $source = Join-Path $GateRoot 'stage\mock-three'
-    $target = Join-Path $HOME '.claude\tools\mock-three'
-    $sourcePackage = Join-Path $source 'package.json'
-    if (-not (Test-Path -LiteralPath $sourcePackage)) {
-        throw "mock-three: no staged copy at $source; stage claude-config's tools/mock-three there (tracked files only) and rerun -Only mock-three"
-    }
-    # robocopy's exit codes 0-7 report what it copied; 8 and up are failures.
-    & robocopy.exe $source $target /MIR /XD node_modules /NFL /NDL /NJH /NJS /NP
-    if ($LASTEXITCODE -ge 8) { throw "robocopy $source $target /MIR exited $LASTEXITCODE" }
-    Push-Location -LiteralPath $target
-    try {
-        & pnpm.cmd install --frozen-lockfile
-        if ($LASTEXITCODE) { throw "pnpm install --frozen-lockfile in $target exited $LASTEXITCODE" }
-    }
-    finally {
-        Pop-Location
-    }
-    $lockHash = (Get-FileHash -LiteralPath (Join-Path $source 'pnpm-lock.yaml') -Algorithm SHA256).Hash.ToLowerInvariant()
-    $packageHash = (Get-FileHash -LiteralPath $sourcePackage -Algorithm SHA256).Hash.ToLowerInvariant()
-    Set-Content -LiteralPath (Join-Path $target '.installed-from') -Value "$lockHash $packageHash" -Encoding ASCII
-    Write-InstallLog "mock-three installed at $target (lock $($lockHash.Substring(0, 12)))"
 }
 
 $gitSystemConfig = [ordered]@{ 'core.autocrlf' = 'false'; 'core.longpaths' = 'true'; 'gc.pruneExpire' = 'never' }

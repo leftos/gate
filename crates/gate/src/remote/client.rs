@@ -44,10 +44,10 @@ use gate_wire::stamp::{self, Tag};
 use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
-use gate_router::{Config, DROPPED_NO_BUILD_LINE, SendPlan, build_settings, escaped, repo_name};
+use gate_router::{BuilderOs, Config, DROPPED_NO_BUILD_LINE, SendPlan, build_settings, escaped, repo_name};
 use gate_wire::{
-    BACK_COMMIT_NONE, CREATED_PREFIX, NEW_WORK_TREE, PairRefused, Payload, SDKS_PREFIX, SHA256_DIGITS, VERSION_PREFIX, WARM_PREFIX, channel_prefix,
-    checkout_prefix, is_cross_not_brought_back, is_lower_hex, warm_line,
+    BACK_COMMIT_NONE, CREATED_PREFIX, NEW_WORK_TREE, PairRefused, Payload, SDKS_PREFIX, SHA256_DIGITS, USER_TOOL_PREFIX, VERSION_PREFIX, WARM_PREFIX,
+    channel_prefix, checkout_prefix, is_cross_not_brought_back, is_lower_hex, warm_line,
 };
 
 use super::channel;
@@ -86,6 +86,7 @@ use crate::route::{self, open_followed};
 #[cfg(feature = "test-seams")]
 use crate::run::find_program;
 use crate::run::{CONTROL_C_EXIT, is_within, resolved};
+use crate::user_tool;
 
 /// The statuses of a preflight whose builder has no `gate box` that takes the run: cmd's for a program it cannot find,
 /// a gate's usage error for a payload it does not read, and a Unix shell's for a program it found but could not run and
@@ -689,7 +690,9 @@ pub(super) enum End {
 /// What the preflight found: the bare repositories it created just now, as its `gate: remote created {bare}` lines name
 /// them, the builder's boot time, `None` when it said none, the SDKs it lists, `None` when it said no SDK line, the
 /// tools its `Needs` named, and what the builder said of each of them, in that order, a tool it said nothing of left
-/// out, and whether it said the work folder's tree is new ([`new_work_tree`]).
+/// out, and whether it said the work folder's tree is new ([`new_work_tree`]); then each user tool path it was sent,
+/// with the fingerprint the builder's copy records, `None` for one it said is missing or said nothing of
+/// ([`user_tools_of`]).
 struct Prepared {
     created: Vec<String>,
     new_tree: bool,
@@ -697,6 +700,7 @@ struct Prepared {
     sdks: Option<Vec<String>>,
     sent: Vec<String>,
     tools: Vec<(String, Reported)>,
+    user_tools: Vec<(String, Option<String>)>,
 }
 
 /// The versions, `major.minor.patch`, of the builder's installs a routed run uses, as the parity step chose them after
@@ -1646,7 +1650,7 @@ impl Attempt<'_, '_> {
     /// the work tree new and the bares created, which the box makes only for a poll it admits.
     fn drain_polled(&mut self) -> (End, Option<Prepared>) {
         let mut repos = self.repos();
-        let polled = self.location(&mut repos).and_then(|location| self.preflight(&location, &[]));
+        let polled = self.location(&mut repos).and_then(|location| self.preflight(&location, &[], &[]));
         match polled {
             Ok(prepared) => (End::Status(0), Some(prepared)),
             Err(end) => (end, None),
@@ -1677,8 +1681,7 @@ impl Attempt<'_, '_> {
             .map(|tree| tree.needs(godot_command))
             .unwrap_or_default();
         let git_lfs = self.git_lfs_needed(!lfs.is_empty(), &repos, &trees, &mut needs)?;
-        let prepared = self.preflight(&location, &needs)?;
-        self.carried.add(self.call.host(), prepared.new_tree, &prepared.created);
+        let prepared = self.preflighted(&location, &needs)?;
         let chosen = self.parity(&repos, &snapshots, &trees, &prepared, git_lfs)?;
         let raised = self.cold_ceiling(self.carried.new_tree);
         let created = self.carried.created.clone();
@@ -2411,7 +2414,7 @@ impl Attempt<'_, '_> {
     /// what it said of each tool sent. A builder with no `gate box` that takes the run is not routed, as one of another
     /// version is not. Says its start, and once it passed how long it took across every attempt; a refused one says its
     /// refusal alone, and no end line. A log-only call, the drain's and the slot wait's poll, says neither line.
-    fn preflight(&mut self, location: &Location, needs: &[(String, String)]) -> Result<Prepared, End> {
+    fn preflight(&mut self, location: &Location, needs: &[(String, String)], user_tools: &[String]) -> Result<Prepared, End> {
         self.go_on()?;
         let said = !self.log_only;
         if said {
@@ -2419,7 +2422,7 @@ impl Attempt<'_, '_> {
         }
         let started = Instant::now();
         let nonce: Arc<str> = Arc::from(payload::run_nonce());
-        let input = payload::input(&payload::preflight_word(location, needs, &nonce), None);
+        let input = payload::input(&payload::preflight_word(location, needs, user_tools, &nonce), None);
         let sent: Vec<String> = needs.iter().map(|(name, _)| name.clone()).collect();
         let watch = Watch::Setup(self.limits_for("preflight"));
         let raise = self.raises_at("preflight");
@@ -2436,6 +2439,7 @@ impl Attempt<'_, '_> {
         let boot = boot_time(&called.lines).map(str::to_owned);
         let sdks = sdks_of(&called.lines);
         let tools = toolchain::reported(&called.lines, &sent);
+        let user_tools = user_tools_of(&called.lines, user_tools);
         let ended = preflight_ended(self.call.host(), self.profile().root(), &called);
         let cache = v1::box_slots_path(self.call.state_dir, self.call.builder.id.as_deref());
         let unkept = box_slots_kept(&called.lines, &ended, &cache, at);
@@ -2465,7 +2469,75 @@ impl Attempt<'_, '_> {
             sdks,
             sent,
             tools,
+            user_tools,
         })
+    }
+
+    /// The run's preflight ([`Attempt::preflight`]), sent the user tools the route matched, the bare repositories it
+    /// created kept; before it, this PC's fingerprint of each of those tools ([`Attempt::user_tool_prints`]), and after
+    /// it the check that the builder's copy of each is this PC's ([`Attempt::user_tools_current`]).
+    fn preflighted(&mut self, location: &Location, needs: &[(String, String)]) -> Result<Prepared, End> {
+        let prints = self.user_tool_prints()?;
+        let prepared = self.preflight(location, needs, self.call.user_tools)?;
+        self.carried.add(self.call.host(), prepared.new_tree, &prepared.created);
+        self.user_tools_current(&prints, &prepared)?;
+        Ok(prepared)
+    }
+
+    /// This PC's fingerprint of each user tool the route matched for the command, with its path, in the route's order
+    /// ([`user_tool::print`]); none when it matched none. A copy that cannot be read keeps the run here, saying why.
+    fn user_tool_prints(&mut self) -> Result<Vec<(String, String)>, End> {
+        let paths: &[String] = self.call.user_tools;
+        let mut prints = Vec::with_capacity(paths.len());
+        for path in paths {
+            match self.user_tool_print(path) {
+                Ok(fingerprint) => prints.push((path.clone(), fingerprint)),
+                Err(why) => {
+                    // A copy this PC cannot read is the PC's own failure, which no other builder helps with.
+                    self.say(format!("gate: not routed: cannot read this PC's {}: {why}", escaped(path)));
+                    return Err(End::Refused(FallbackReason::Client));
+                }
+            }
+        }
+        Ok(prints)
+    }
+
+    /// The fingerprint of this PC's copy of the user tool at the home-relative `path`: its tracked files, as `git
+    /// ls-files -z` run in its folder lists them, asked with no worktree's variables; else why it cannot be read.
+    fn user_tool_print(&self, path: &str) -> Result<String, String> {
+        let listed = user_tool::read(path, |folder| {
+            Git::find(folder)?
+                .output_bytes_within(&self.git_call(folder, &["ls-files", "-z"], &[], None), git::OUTPUT_CAP)
+                .map_err(String::from)
+        });
+        listed.map(|print| print.fingerprint)
+    }
+
+    /// Keeps the run here when the builder's copy of a user tool of `prints`, this PC's fingerprints, is not this
+    /// PC's: the first one it has no copy of, or whose copy records another fingerprint, says so. Nothing for copies
+    /// that match.
+    fn user_tools_current(&mut self, prints: &[(String, String)], prepared: &Prepared) -> Result<(), End> {
+        let host = self.call.host();
+        for (path, ours) in prints {
+            let theirs = prepared
+                .user_tools
+                .iter()
+                .find(|(sent, _)| sent == path)
+                .and_then(|(_, recorded)| recorded.as_deref());
+            let line = match theirs {
+                None => missing_copy_line(host, path, self.call.builder.os),
+                Some(theirs) if theirs != ours => {
+                    format!(
+                        "gate: not routed: {host}'s copy of {} differs from this PC's; run gate push",
+                        escaped(path)
+                    )
+                }
+                Some(_) => continue,
+            };
+            self.say(line);
+            return Err(End::Refused(FallbackReason::Tools));
+        }
+        Ok(())
     }
 
     /// The snapshot's tree as the parity check reads it, listed before the preflight by one recursive listing that
@@ -5859,6 +5931,26 @@ fn box_slots_kept(lines: &[String], ended: &Result<(), (Option<String>, End)>, p
     box_slots_cached(lines, path, at).1
 }
 
+/// What the preflight `lines` say of each user tool path of `sent`, in its order: the fingerprint of the last user tool
+/// line naming it, its path escaped as the box says it ([`gate_wire::user_tool_line`]); `None` when that line says
+/// `missing` or no line names it.
+fn user_tools_of(lines: &[String], sent: &[String]) -> Vec<(String, Option<String>)> {
+    sent.iter()
+        .map(|path| {
+            let shown = escaped(path);
+            let said = lines.iter().rev().find_map(|line| {
+                let rest = line
+                    .strip_prefix(USER_TOOL_PREFIX)?
+                    .strip_prefix(shown.as_str())?
+                    .strip_prefix(' ')?
+                    .trim();
+                (!rest.contains(' ')).then_some(rest)
+            });
+            (path.clone(), said.filter(|said| *said != "missing").map(str::to_owned))
+        })
+        .collect()
+}
+
 /// The builder's version, from the last `gate: remote version <v>` line of its preflight; `None` when it said none.
 pub(crate) fn their_version(lines: &[String]) -> Option<&str> {
     lines.iter().rev().find_map(|line| line.strip_prefix(VERSION_PREFIX)).map(str::trim)
@@ -5960,6 +6052,15 @@ fn after_loss<'n>(before: Option<&str>, now: Option<&'n str>) -> Loss<'n> {
             (Ok(_), Ok(_)) => Loss::Lost,
             _ => Loss::Unreachable,
         },
+    }
+}
+
+/// The line refusing the builder `host`, of the system `os`, that has no copy of the user tool at `path`: a macOS
+/// builder, which `gate push` gives no user tools, is told so; a Windows builder is told to run `gate push`.
+fn missing_copy_line(host: &str, path: &str, os: BuilderOs) -> String {
+    match os {
+        BuilderOs::Macos => format!("gate: not routed: {host} is a macOS builder, which gets no user tools from gate push"),
+        BuilderOs::Windows => format!("gate: not routed: {host} has no copy of {}; run gate push", escaped(path)),
     }
 }
 
@@ -6446,6 +6547,7 @@ mod tests {
             send: None,
             desktop: None,
             inputs: &[],
+            user_tools: &[],
             log,
             timeout: 60,
             usual: None,
@@ -6558,6 +6660,7 @@ mod tests {
             let call = RemoteCall {
                 builder: &mac,
                 inputs: if in_sibling { &[] } else { &main },
+                user_tools: &[],
                 state_dir: &state,
                 ..pair_call(&run, siblings, &log)
             };
@@ -6600,6 +6703,7 @@ mod tests {
         let declared = RemoteCall {
             builder: &mac,
             inputs: &globs,
+            user_tools: &[],
             state_dir: &state,
             ..pair_call(&run, siblings(), &log)
         };
@@ -9087,7 +9191,7 @@ mod tests {
             "0123456789ab",
         );
 
-        assert!(matches!(attempt.preflight(&location, &[]), Err(End::Interrupted)), "the preflight");
+        assert!(matches!(attempt.preflight(&location, &[], &[]), Err(End::Interrupted)), "the preflight");
         let repos = attempt.repos();
         let push = Push {
             at: 0,
@@ -9867,6 +9971,7 @@ mod tests {
             send: None,
             desktop: None,
             inputs: &[],
+            user_tools: &[],
             log,
             timeout: 60,
             usual: None,
@@ -10876,5 +10981,17 @@ mod tests {
             let heard = held(&shared.heard);
             assert_eq!(heard.first_error.as_deref(), Some("said there"), "no process line is kept");
         }
+    }
+
+    #[test]
+    fn a_routed_run_on_a_macos_builder_with_a_user_tool_says_it_gets_none() {
+        assert_eq!(
+            super::missing_copy_line("mac-1", "~/.claude/tools/t", BuilderOs::Macos),
+            "gate: not routed: mac-1 is a macOS builder, which gets no user tools from gate push"
+        );
+        assert_eq!(
+            super::missing_copy_line("win-1", "~/.claude/tools/t", BuilderOs::Windows),
+            "gate: not routed: win-1 has no copy of ~/.claude/tools/t; run gate push"
+        );
     }
 }

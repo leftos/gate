@@ -159,6 +159,8 @@ fn the_control_command_routes_from_the_root() {
             siblings: Vec::new(),
             absent_siblings: Vec::new(),
             carried_folders_problem: None,
+            user_tools: Vec::new(),
+            user_tools_problem: None,
             repo: "yaat".to_owned(),
             key: work_folder_key(ROOT),
             subfolder: String::new(),
@@ -7736,6 +7738,96 @@ fn an_unusable_carried_folders_table_carries_no_folder_and_still_routes() {
         &carrying_folders(Some(r#"{"yaat": [".tmp/mocks/*-src"]}"#)),
     ));
     assert!(!run.lines().iter().any(|said| said.contains("carriedFolders")), "{:?}", run.lines());
+}
+
+/// World-of-intrigue's mock-shoot command, as a test of `userTools` runs it.
+const MOCK_SHOOT_TOOL: [&str; 6] = ["pwsh", "-NoProfile", "-File", "tools/mock-shoot.ps1", "-Page", "x"];
+
+/// A gate at the root, under a routing file routing every command of `yaat` whose `userTools` is `table`, or that has
+/// none.
+fn using_user_tools(table: Option<&str>) -> FakeFacts {
+    let text = match table {
+        Some(table) => format!(r#"{{"host": "builder-1", "repos": {{"yaat": ["*"]}}, "userTools": {table}}}"#),
+        None => r#"{"host": "builder-1", "repos": {"yaat": ["*"]}}"#.to_owned(),
+    };
+    FakeFacts::with_config(Config::parse(&text).expect("usable"))
+}
+
+#[test]
+fn a_routed_command_a_user_tool_pattern_matches_carries_its_path() {
+    let facts = using_user_tools(Some(
+        r#"{"YAAT": [{"path": "~/.claude/tools/mock-three", "commands": ["pwsh -NoProfile -File tools?mock-shoot.ps1 *"]}]}"#,
+    ));
+    let run = routed(decide(&heavy(&words(&MOCK_SHOOT_TOOL)), &facts));
+    assert_eq!(run.user_tools, ["~/.claude/tools/mock-three"]);
+    assert_eq!(run.user_tools_problem, None);
+    assert!(!run.lines().iter().any(|said| said.contains("userTools")), "{:?}", run.lines());
+}
+
+#[test]
+fn a_macos_pick_matches_user_tools_on_the_words_the_routing_pattern_matched() {
+    let text = r#"{"host": "builder-1", "repos": {"yaat": ["cargo *"]},
+        "builders": [{"host": "mac-1", "os": "macos", "root": "/Users/me/gate", "repos": {"yaat": ["pwsh *"]}}],
+        "userTools": {"yaat": [{"path": "~/.claude/tools/mock-three", "commands": ["pwsh -NoProfile -File tools\\mock-shoot.ps1 *"]}]}}"#;
+    let facts = FakeFacts {
+        config: Ok(Some(Config::parse(text).expect("usable"))),
+        snapshot: words(&["tools/mock-shoot.ps1"]),
+        ..FakeFacts::at("")
+    };
+    let command = words(&["pwsh", "-NoProfile", "-File", r"tools\mock-shoot.ps1", "-Page", "x"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder, mac_builder());
+    assert_eq!(
+        run.user_tools,
+        ["~/.claude/tools/mock-three"],
+        "the text before the macOS rewrite: {:?}",
+        run.words
+    );
+}
+
+#[test]
+fn a_routed_command_no_user_tool_pattern_matches_carries_no_user_tool() {
+    let tool = r#"[{"path": "~/.claude/tools/mock-three", "commands": ["pwsh -NoProfile -File tools?mock-shoot.ps1 *"]}]"#;
+    let other = words(&["pwsh", "-NoProfile", "-File", "tools/other.ps1", "x"]);
+    let routed_one = routed(decide(&heavy(&other), &using_user_tools(Some(&format!(r#"{{"yaat": {tool}}}"#)))));
+    assert_eq!(routed_one.user_tools, Vec::<String>::new(), "a command no pattern matches");
+    for table in [None, Some(format!(r#"{{"other": {tool}}}"#)), Some(r#"{"yaat": []}"#.to_owned())] {
+        let run = routed(decide(&heavy(&words(&MOCK_SHOOT_TOOL)), &using_user_tools(table.as_deref())));
+        assert_eq!(run.user_tools, Vec::<String>::new(), "{table:?}");
+        assert_eq!(run.user_tools_problem, None, "{table:?}");
+    }
+}
+
+#[test]
+fn two_entries_naming_one_path_carry_it_once() {
+    let facts = using_user_tools(Some(
+        r#"{"yaat": [{"path": "~/b", "commands": ["pwsh *"]}, {"path": "~/a", "commands": ["node *", "pwsh *"]},
+                     {"path": "~/b", "commands": ["* -Page *"]}, {"path": "~/c", "commands": ["node *"]}]}"#,
+    ));
+    let run = routed(decide(&heavy(&words(&MOCK_SHOOT_TOOL)), &facts));
+    assert_eq!(run.user_tools, ["~/b", "~/a"], "each path once, in file order");
+}
+
+#[test]
+fn an_unusable_user_tools_table_checks_no_user_tool_and_still_routes() {
+    for (table, problem) in [
+        (
+            r#"{"yaat": [{"path": "~/a", "commands": ["pwsh *"]}, {"path": "a", "commands": ["pwsh *"]}]}"#,
+            r#"userTools."yaat"[1].path is not a home-relative folder (~/...): "a""#,
+        ),
+        (r#"[{"path": "~/a", "commands": ["pwsh *"]}]"#, "userTools must be a JSON object"),
+    ] {
+        let run = routed(decide(&heavy(&words(&MOCK_SHOOT_TOOL)), &using_user_tools(Some(table))));
+        assert_eq!(run.user_tools, Vec::<String>::new(), "{table}");
+        assert_eq!(run.user_tools_problem.as_deref(), Some(problem), "{table}");
+        let line = format!("gate: remote.json userTools cannot be used: {problem}; no user tool checked");
+        assert_eq!(
+            run.lines().iter().filter(|said| **said == line).count(),
+            1,
+            "said once: {:?}",
+            run.lines()
+        );
+    }
 }
 
 /// [`carrying_folders`] of `.tmp/mocks/*-src`, whose facts report the gitignored project input `path` carried by

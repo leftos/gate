@@ -13021,3 +13021,149 @@ fn a_non_desktop_run_refused_still_runs_here() {
     assert!(marker.exists(), "the command ran here: {outcome:?}");
     assert_eq!(fallbacks(&own(&case, pid)), ["busy"]);
 }
+
+/// The `userTools` path every user-tool case names.
+const USER_TOOL: &str = "~/tools/t";
+
+/// A [`client_case`] whose routing file gives its repo the user tool [`USER_TOOL`] for the commands `commands`, with
+/// its scratch home, `.tmp\home` in the case folder, which no snapshot sends: the PC and the builder share it, so the
+/// record planted there is the builder copy's.
+fn user_tool_case(name: &str, commands: &[&str]) -> (Case, PathBuf) {
+    let case = client_case(name);
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({
+        "host": HOST,
+        "slots": 2,
+        "repos": { &repo: ["*tool*"] },
+        "outputs": { &repo: [] },
+        "userTools": { &repo: [{ "path": USER_TOOL, "commands": commands }] },
+    });
+    write_remote_json(&case, &routing.to_string());
+    let home = case.folder().join(".tmp").join("home");
+    (case, home)
+}
+
+/// The tool folder of [`USER_TOOL`] under `home`, holding two files, made a real git repository's tracked files when
+/// `tracked`; the fingerprint of those files by the rule: SHA-256 over each path in byte order, a NUL, its length, a
+/// NUL and its bytes.
+fn user_tool_files(case: &Case, home: &Path, tracked: bool) -> String {
+    let tool = home.join("tools").join("t");
+    fs::create_dir_all(tool.join("src")).expect("the tool's folders can be made");
+    fs::write(tool.join("cli.ts"), "run\n").expect("a tool file can be written");
+    fs::write(tool.join("src").join("lib.ts"), "export {};\n").expect("a tool file can be written");
+    if tracked {
+        git(case, &["-C", &shown(home), "init", "--quiet"]);
+        git(case, &["-C", &shown(home), "add", "tools/t"]);
+    }
+    let mut hasher = Sha256::new();
+    for (path, bytes) in [("cli.ts", "run\n"), ("src/lib.ts", "export {};\n")] {
+        hasher.update(format!("{path}\0{}\0{bytes}", bytes.len()).as_bytes());
+    }
+    hasher.finalize().iter().fold(String::new(), |mut hex, byte| {
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    })
+}
+
+/// Writes `fingerprint` as the record of the builder's copy of [`USER_TOOL`] under `home`, as `gate push` writes it.
+fn plant_user_tool_record(home: &Path, fingerprint: &str) {
+    fs::write(home.join("tools").join("t").join(".installed-from"), format!("{fingerprint} -\n")).expect("the record can be written");
+}
+
+/// [`client_gate`] with `USERPROFILE` the scratch `home`, which the stand-in's box inherits.
+fn user_tool_gate(case: &Case, home: &Path, steps: &Path) -> Command {
+    let mut gate = client_gate(case, "out.log", steps, &[r".\tool.exe", "out", "ran"]);
+    gate.env("USERPROFILE", home);
+    gate
+}
+
+#[test]
+fn a_routed_run_whose_builder_copy_of_a_user_tool_matches_routes() {
+    let (case, home) = user_tool_case("client-user-tool-matches", &["*tool*"]);
+    let fingerprint = user_tool_files(&case, &home, true);
+    plant_user_tool_record(&home, &fingerprint);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let (pid, outcome) = finish_with_pid(user_tool_gate(&case, &home, &steps));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "{outcome:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), Vec::<&str>::new(), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: not routed:"), "{outcome:?}");
+}
+
+#[test]
+fn a_routed_run_whose_builder_copy_of_a_user_tool_differs_stays_here() {
+    let (case, home) = user_tool_case("client-user-tool-differs", &["*tool*"]);
+    user_tool_files(&case, &home, true);
+    plant_user_tool_record(&home, &"0".repeat(64));
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let (pid, outcome) = finish_with_pid(user_tool_gate(&case, &home, &steps));
+
+    assert_eq!(outcome.code, Some(0), "the run here passed: {outcome:?}");
+    let line = format!("gate: not routed: {HOST}'s copy of {USER_TOOL} differs from this PC's; run gate push");
+    assert!(outcome.stderr.lines().any(|said| said == line), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"], "{outcome:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), ["tools"], "{outcome:?}");
+}
+
+#[test]
+fn a_routed_run_whose_builder_has_no_copy_of_a_user_tool_stays_here() {
+    let (case, home) = user_tool_case("client-user-tool-missing", &["*tool*"]);
+    user_tool_files(&case, &home, true);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let (pid, outcome) = finish_with_pid(user_tool_gate(&case, &home, &steps));
+
+    assert_eq!(outcome.code, Some(0), "the run here passed: {outcome:?}");
+    let line = format!("gate: not routed: {HOST} has no copy of {USER_TOOL}; run gate push");
+    assert!(outcome.stderr.lines().any(|said| said == line), "{outcome:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), ["tools"], "{outcome:?}");
+}
+
+#[test]
+fn a_routed_run_whose_pc_copy_of_a_user_tool_cannot_be_read_stays_here() {
+    let (case, home) = user_tool_case("client-user-tool-unreadable", &["*tool*"]);
+    // A second builder that routes the repo too: a failure on this PC is not one another builder can help with.
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({
+        "host": HOST,
+        "slots": 2,
+        "repos": { &repo: ["*tool*"] },
+        "outputs": { &repo: [] },
+        "builders": [{ "host": "win-2", "os": "windows", "repos": { &repo: ["*tool*"] }, "outputs": { &repo: [] } }],
+        "userTools": { &repo: [{ "path": USER_TOOL, "commands": ["*tool*"] }] },
+    });
+    write_remote_json(&case, &routing.to_string());
+    let fingerprint = user_tool_files(&case, &home, false);
+    plant_user_tool_record(&home, &fingerprint);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let (pid, outcome) = finish_with_pid(user_tool_gate(&case, &home, &steps));
+
+    assert_eq!(outcome.code, Some(0), "the run here passed: {outcome:?}");
+    let prefix = format!("gate: not routed: cannot read this PC's {USER_TOOL}: ");
+    let said: Vec<&str> = outcome.stderr.lines().filter(|said| said.starts_with(&prefix)).collect();
+    assert_eq!(said.len(), 1, "said once, no second builder tried: {outcome:?}");
+    assert_eq!(calls(&steps), Vec::<String>::new(), "no preflight: {outcome:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), ["client"], "{outcome:?}");
+}
+
+#[test]
+fn a_routed_run_no_user_tool_pattern_matches_checks_no_user_tool() {
+    let (case, home) = user_tool_case("client-user-tool-unmatched", &["*nomatch*"]);
+    user_tool_files(&case, &home, true);
+    // The preflight keeps its request: it waits on the case folder, which is there already.
+    let fed = format!("fed-hold {}", shown(&case.folder()));
+    let steps = ssh_steps(&case, "ssh", &[&fed, "ok"]);
+
+    let outcome = finish(user_tool_gate(&case, &home, &steps));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "{outcome:?}");
+    let request = last_request(&steps);
+    assert!(request.get("UserTools").is_none(), "{request}");
+    let log = log_texts(&case.folder().join("out.log"));
+    assert!(!log.contains("gate: remote user tool"), "{log}");
+}

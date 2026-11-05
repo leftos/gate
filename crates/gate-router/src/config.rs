@@ -102,6 +102,9 @@ pub struct Config {
     /// Each repo name's folder globs whose folders a routed run carries whole when a word names a path in one, or why
     /// `carriedFolders` cannot be used, which carries none.
     carried_folders: Result<Vec<(String, Vec<FolderGlob>)>, String>,
+    /// Each repo name's user-level tools a routed run checks the builder's copy of, or why `userTools` cannot be used,
+    /// which checks none.
+    user_tools: Result<Vec<(String, Vec<UserTool>)>, String>,
     /// The repo names whose warm-up may run, or why `warmup` cannot be used, which consents to none.
     warmup: Result<Vec<String>, String>,
     /// Each repo name's allowed desktop patterns, or why `desktop` cannot be used, which allows none.
@@ -165,7 +168,8 @@ impl Config {
     /// the gate's own, since the PowerShell gate accepts it. A bad `hosts` leaves the file usable for routing, and
     /// [`Config::builders`] gives its reason. A bad `siblings` leaves it usable too, allowing no sibling, and
     /// [`Config::allowed_siblings`] gives its reason. So does a bad `carriedFolders`, carrying no folder, and
-    /// [`Config::carried_folders`] gives its reason, and a bad `warmup`, consenting to no warm-up, and
+    /// [`Config::carried_folders`] gives its reason, and a bad `userTools`, checking no user tool, and
+    /// [`Config::user_tools`] gives its reason, and a bad `warmup`, consenting to no warm-up, and
     /// [`Config::warmup_consented`] gives its reason, and a bad `desktop`, allowing no desktop pattern, and
     /// [`Config::allowed_desktop`] gives its reason, and a bad `desktopSession`, allowing no session pattern, and
     /// [`Config::allowed_desktop_session`] gives its reason, and a bad `hooks`, consenting to no hook routing, and
@@ -219,6 +223,7 @@ impl Config {
             inputs,
             siblings: read_siblings(&data),
             carried_folders: read_carried_folders(&data),
+            user_tools: read_user_tools(&data),
             warmup: read_warmup_consent(&data),
             desktop: read_desktop_consent(&data, "desktop"),
             desktop_session: read_desktop_consent(&data, "desktopSession"),
@@ -420,6 +425,31 @@ impl Config {
             Err(problem) => Err(problem),
             Ok(table) => Ok(find(table, repo).unwrap_or(&[])),
         }
+    }
+
+    /// The user-level tools `userTools` gives `repo`, in file order, its repo name matched in any letter case: none when
+    /// it does not name the repo. A routed run whose command one of a tool's `commands` patterns matches checks the
+    /// builder's copy of that tool.
+    ///
+    /// # Errors
+    ///
+    /// Why `userTools` cannot be used: not an object of arrays of `{"path", "commands"}` objects, each path
+    /// home-relative and each command a valid pattern. Such a value checks no tool for any repo, and the rest of the file
+    /// is read whatever it holds.
+    pub fn user_tools(&self, repo: &str) -> Result<&[UserTool], &str> {
+        match &self.user_tools {
+            Err(problem) => Err(problem),
+            Ok(table) => Ok(find(table, repo).unwrap_or(&[])),
+        }
+    }
+
+    /// Every repo name's user-level tools, in file order ([`Config::user_tools`]).
+    ///
+    /// # Errors
+    ///
+    /// Why `userTools` cannot be used, as [`Config::user_tools`] gives it.
+    pub fn all_user_tools(&self) -> Result<&[(String, Vec<UserTool>)], &str> {
+        self.user_tools.as_deref().map_err(String::as_str)
     }
 
     /// The builder's host alias, the one a routed run goes to.
@@ -1166,6 +1196,116 @@ fn is_folder_glob(glob: &str) -> bool {
         && glob
             .split('/')
             .all(|name| !name.is_empty() && name != "." && name != ".." && !name.contains("**"))
+}
+
+/// A `userTools` entry: a user-level tool's folder and the commands that use it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserTool {
+    /// The tool's folder, home-relative, as written: `~/` and then `/`-separated names ([`is_home_folder`]).
+    pub path: String,
+    /// The patterns of the commands that use the tool, matched as `repos` patterns are, in file order.
+    pub commands: Vec<Pattern>,
+}
+
+/// The `userTools` table: each repo name's tools, in file order, read once ([`UserTool`]); an empty table when the key
+/// is missing. A problem writes the repo name quoted and escaped, so no control character in it reaches the console;
+/// two paths where one holds the other make the table unusable ([`nested_tools`]).
+fn read_user_tools(data: &Map<String, Value>) -> Result<Vec<(String, Vec<UserTool>)>, String> {
+    let Some(value) = property(data, "userTools") else {
+        return Ok(Vec::new());
+    };
+    let Value::Object(table) = value else {
+        return Err("userTools must be a JSON object".to_owned());
+    };
+    let table = table
+        .iter()
+        .map(|(repo, list)| {
+            let Value::Array(items) = list else {
+                return Err(format!("userTools.{repo:?} is not an array"));
+            };
+            let tools = items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| read_user_tool(repo, index, item))
+                .collect::<Result<Vec<UserTool>, String>>()?;
+            Ok((repo.clone(), tools))
+        })
+        .collect::<Result<Vec<(String, Vec<UserTool>)>, String>>()?;
+    nested_tools(&table).map_or(Ok(table), Err)
+}
+
+/// The problem with `table` when two of its paths, across every repo's entries, name folders one of which holds the
+/// other, or the same folder written in another letter case: compared by their `/`-separated names, ignoring case. The
+/// same path written the same way twice, in one repo or two, is one tool and no problem.
+fn nested_tools(table: &[(String, Vec<UserTool>)]) -> Option<String> {
+    let entries: Vec<(&str, usize, &str)> = table
+        .iter()
+        .flat_map(|(repo, tools)| {
+            tools
+                .iter()
+                .enumerate()
+                .map(move |(index, tool)| (repo.as_str(), index, tool.path.as_str()))
+        })
+        .collect();
+    for (at, (repo, index, path)) in entries.iter().enumerate() {
+        for (other_repo, other_index, other) in entries.iter().skip(at + 1) {
+            if path != other && nests(path, other) {
+                return Some(format!(
+                    "userTools.{repo:?}[{index}].path {path:?} holds or is held by userTools.{other_repo:?}[{other_index}].path {other:?}"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Whether the folder `one` names holds the one `other` names, or `other` holds `one`, or both name the same: one's
+/// `/`-separated names start the other's, ignoring case.
+fn nests(one: &str, other: &str) -> bool {
+    one.split('/').zip(other.split('/')).all(|(name, other_name)| {
+        name.chars()
+            .flat_map(char::to_lowercase)
+            .eq(other_name.chars().flat_map(char::to_lowercase))
+    })
+}
+
+/// The `userTools` entry `item`, at `index` of `repo`'s list: an object of exactly a string `path` and a `commands`
+/// array, keys in any letter case, or what is wrong with it.
+fn read_user_tool(repo: &str, index: usize, item: &Value) -> Result<UserTool, String> {
+    let entry = item.as_object().filter(|entry| entry.len() == 2);
+    let fields = entry.and_then(|entry| Some((property(entry, "path")?.as_str()?, property(entry, "commands")?)));
+    let Some((path, commands)) = fields else {
+        return Err(format!("userTools.{repo:?}[{index}] is not an object with a path and commands"));
+    };
+    if !is_home_folder(path) {
+        return Err(format!(
+            "userTools.{repo:?}[{index}].path is not a home-relative folder (~/...): {path:?}"
+        ));
+    }
+    let items = commands.as_array().filter(|items| !items.is_empty());
+    let Some(items) = items else {
+        return Err(format!("userTools.{repo:?}[{index}].commands is not a non-empty array"));
+    };
+    let commands = items
+        .iter()
+        .enumerate()
+        .map(|(at, item)| read_pattern("commands", item).map_err(|why| format!("userTools.{repo:?}[{index}].commands[{at}] {why}")))
+        .collect::<Result<Vec<Pattern>, String>>()?;
+    Ok(UserTool {
+        path: path.to_owned(),
+        commands,
+    })
+}
+
+/// Whether `path` is a `userTools` path: `~/` and then `/`-separated names, none empty, `.` or `..`, and no `\`, `:`
+/// or control character below U+0020 anywhere. The builder checks a path with it before it reads below its home folder.
+#[must_use]
+pub fn is_home_folder(path: &str) -> bool {
+    !path.contains(['\\', ':'])
+        && !path.chars().any(|character| character < ' ')
+        && path
+            .strip_prefix("~/")
+            .is_some_and(|rest| rest.split('/').all(|name| !name.is_empty() && name != "." && name != ".."))
 }
 
 /// The `warmup` list: the repo names whose warm-up may run, in file order; none when the key is missing.

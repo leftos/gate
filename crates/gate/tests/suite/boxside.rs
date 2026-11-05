@@ -1619,6 +1619,103 @@ fn preflight_a_need_that_is_not_an_object_of_texts_is_said_and_the_preflight_pas
     }
 }
 
+/// `gate box preflight` of a payload whose `UserTools` is `tools`, its `USERPROFILE` the folder `home`, its `PATH` git's
+/// folder alone, so no dotnet is found and the sdks line says `none`.
+fn user_tools_preflight(case: &Case, home: &Path, tools: &Value) -> Outcome {
+    let folders = Folders::new(case);
+    let request = payload(&json!({
+        "Key": "k",
+        "Bare": folders.bare,
+        "Work": folders.work,
+        "Lock": format!("{}.lock", folders.work),
+        "Job": "unused",
+        "UserTools": tools,
+    }));
+    let stub = tool_stubs(case, &[]);
+    let mut command = box_call(case, &["box", "preflight"], &request);
+    command.env("PATH", path_with_git(&[stub])).env("USERPROFILE", home);
+    command.finish_read()
+}
+
+/// Writes `text` as the record of the user tool at `folder`, making the folder.
+fn plant_record(folder: &Path, text: &str) {
+    fs::create_dir_all(folder).expect("the tool's folder can be made");
+    fs::write(folder.join(".installed-from"), text).expect("the record can be written");
+}
+
+#[test]
+fn box_preflight_says_each_user_tool_s_recorded_fingerprint() {
+    let case = Case::new("preflight_user_tool_recorded");
+    let home = case.folder().join("home");
+    let first = "0123456789abcdef".repeat(4);
+    let second = "fedcba9876543210".repeat(4);
+    plant_record(&home.join(".claude").join("tools").join("mock-three"), &format!("{first} -\r\n"));
+    plant_record(&home.join("tools").join("other"), &format!("{second} {first}"));
+
+    let outcome = user_tools_preflight(&case, &home, &json!(["~/tools/other", "~/.claude/tools/mock-three"]));
+
+    assert_eq!(
+        after_sdks(&outcome),
+        [
+            format!("gate: remote user tool ~/tools/other {second}"),
+            format!("gate: remote user tool ~/.claude/tools/mock-three {first}"),
+        ],
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn box_preflight_says_a_user_tool_with_no_record_is_missing() {
+    let case = Case::new("preflight_user_tool_no_record");
+    let home = case.folder().join("home");
+    fs::create_dir_all(home.join("tools").join("bare")).expect("the tool's folder can be made");
+
+    let outcome = user_tools_preflight(&case, &home, &json!(["~/tools/bare", "~/tools/absent"]));
+
+    assert_eq!(
+        after_sdks(&outcome),
+        [
+            "gate: remote user tool ~/tools/bare missing",
+            "gate: remote user tool ~/tools/absent missing"
+        ],
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn box_preflight_says_a_user_tool_with_a_bad_record_is_missing() {
+    let case = Case::new("preflight_user_tool_bad_record");
+    let home = case.folder().join("home");
+    plant_record(&home.join("tools").join("upper"), &"0123456789ABCDEF".repeat(4));
+    plant_record(&home.join("tools").join("short"), &"a".repeat(63));
+    plant_record(&home.join("tools").join("empty"), "");
+
+    let outcome = user_tools_preflight(&case, &home, &json!(["~/tools/upper", "~/tools/short", "~/tools/empty"]));
+
+    assert_eq!(
+        after_sdks(&outcome),
+        [
+            "gate: remote user tool ~/tools/upper missing",
+            "gate: remote user tool ~/tools/short missing",
+            "gate: remote user tool ~/tools/empty missing",
+        ],
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn box_preflight_never_reads_a_user_tool_path_outside_home() {
+    let case = Case::new("preflight_user_tool_outside_home");
+    let home = case.folder().join("home");
+    fs::create_dir_all(&home).expect("the home folder can be made");
+    // A record the path would reach were `..` followed: beside the home folder, not in it.
+    plant_record(&case.folder().join("x"), &"0123456789abcdef".repeat(4));
+
+    let outcome = user_tools_preflight(&case, &home, &json!(["~/../x"]));
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote user tool ~/../x missing"], "{outcome:?}");
+}
+
 #[test]
 fn preflight_a_tool_name_it_does_not_know_is_skipped() {
     let case = Case::new("preflight_unknown_tool");

@@ -34,7 +34,7 @@ A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `
 | `gate run` | Run one command under a slot and the watchdog. |
 | `gate stop-tree` | Stop a process tree, reaching the gate jobs inside it. |
 | `gate cutover` | Switch this machine from the PowerShell gate to `gate.exe`, draining it first. |
-| `gate push` | Copy the installed `gate.exe` and desktop helper to every builder `remote.json` names and register the desktop task there. |
+| `gate push` | Copy the installed `gate.exe` and desktop helper to every builder `remote.json` names and register the desktop task there, and sync the user-level tools `remote.json` names to each Windows builder. |
 | `gate drain` | Raise a barrier on a builder and wait until no routed run is going there, so it can be redeployed; `--lift` lifts it, `--status` reports ([`gate drain`](#gate-drain)). |
 | `gate prune --builders` | Mark the worktree records whose worktree is gone, and prune the work folder of each one that has been gone an hour on every builder `remote.json` lists, then remove what this PC keeps of the key ([`gate prune`](#gate-prune)). |
 | `gate remote` | Add or remove entries (patterns, names or folder globs) in one list of `remote.json`, keeping the rest of the file as it is, or ask which pattern of a repo matches a text with `match` ([`gate remote`](#gate-remote)). |
@@ -221,6 +221,27 @@ With nothing to push or nowhere to push it, `gate push` tries no builder, prints
 4. Then, with gate.exe in place, `push: <host>: slot count <N>` on stdout: the builder's `slots.json` was written with `<N>`, the builder's `slots` of `remote.json` ([remote.json](#remotejson)), `host` and `hosts` taking the top-level one.
 
    The file is `{root}\slots.json`, `{root}` the builder's default remote root (`root` of `remote.json` when set), holding `{"v":1,"slots":<N>}` ([Builder-side slots](#builder-side-slots)); it is written to a temporary file and moved over the old one. A builder whose root is not there yet, a Windows builder's first push, says on stderr `push: <host>: no slot count written: <root> does not exist yet; the next push writes it`.
+5. Then, for each user tool the push synced (below), `push: <host>: user tool <path> <12 hex>`, the path as `remote.json` writes it and the first 12 hex digits of the tool's fingerprint, with ` packages installed` after them when the builder ran its package install.
+
+   A user tool is a tool of the PC user's home that a routed command runs from there (the `userTools` key of [remote.json](#remotejson)). Every Windows builder the push reaches gets every tool of the table, the distinct paths of all repos in table order, so a run pinned to any of them finds its copy. The tools travel as a fourth stdin line of the builder call, gzipped JSON holding each path with its files and the PC's fingerprint ([user tool fingerprint](GLOSSARY.md)).
+
+   The builder script checks every path and file name first (a path is `~/` and then names, none empty, `.` or `..`, no `\`, `:` or character below U+0020), so a refused tool writes nothing.
+
+   Per tool the script deletes only the files the copy's `.installed-files` manifest names that the new list drops (a plain file only, never a link, and the empty folders above it up to but never the copy itself or a `node_modules`), writes the files, writes the new manifest. No delete or write goes through a linked folder: a delete under one is skipped, and a write under one fails the sync.
+
+   Before its first write it writes the manifest as the old and new lists together, so a sync that fails partway leaves no file it wrote unlisted. Each file is deleted before it is written, so a rename that changes only letter case shows on the builder.
+
+   It then runs `pnpm.cmd install --frozen-lockfile` in the copy when the tool has a lock that differs from the one recorded or the copy has no `node_modules`, and writes `.installed-from` (`<fingerprint> <lock>`) last. A copy with no manifest, such as one the installer made, loses nothing.
+
+   A bad `userTools` table does not stop the gate push: it still pushes gate, says on stderr `push: remote.json userTools cannot be used: <problem>; no user tool synced`, and exits 1. A tool whose copy on this PC cannot be read says `push: cannot read this PC's <path>: <why>; not synced` on stderr, is left out of every builder's list, and makes the exit 1.
+
+   A macOS builder gets no user tools: when the table holds any, the push says on stderr, as a note that never fails it, `push: <host>: user tools are not synced to macOS builders: <paths, comma separated>`.
+
+   A sync that fails fails the builder (exit 1) after gate.exe is installed, as a helper failure does, and no later tool is synced; nothing of the install is undone.
+
+   The reason is `the user tools could not be read: <message>` for a line that does not decode, `<path> is not a home-relative folder`, `<path>: <file> is not a relative path`, `<path>: .installed-files names <line>, which is not a relative path`, `<path>: <file> is a folder on the builder`, `<path>: <parent> is a file on the builder`, `<path>: <folder> is a link` (the copy's own folder), `<path>: <folder> is a link on the builder` (a folder inside the copy) or `USERPROFILE is not set`.
+
+   A package install that fails says `<path>: pnpm install --frozen-lockfile` with its status and last non-blank line (`could not run pnpm: <message>` or `did not finish in 180 s`).
 
 The order on a builder is gate.exe, then the helper, then the registration; `tools/install.ps1` places the helper first, and the push places gate.exe first, so a helper that cannot be placed still leaves the builder's gate updated. The helper is installed only with a gate.exe in place, installed or identical.
 
@@ -264,7 +285,7 @@ Then comes what happened to gate.exe, which the push had already settled: `; gat
 
 Builder text is escaped as the remote client escapes it and cut to 4096 bytes. The script says every line with its line breaks made spaces, so builder text with line breaks arrives as one line and cannot say a second fact.
 
-Each builder is one ssh call, run in a kill-on-close job with stdin piped and bounded at 300 s.
+Each builder is one ssh call, run in a kill-on-close job with stdin piped and bounded at 300 s, plus 180 s for each user tool sent to that Windows builder whose lock is not `-` (the tool's `pnpm install` bound).
 
 A timeout stops only the local ssh, so the builder's install may still finish.
 
@@ -354,9 +375,11 @@ A `building` marker is written before the build and removed when cargo ends by i
 
 The built binary is copied to `<root>/bin/gate-box.<pid>.tmp`, made mode 700, and installed only when its `--version` is `gate <v>` (`the built gate-box says gate <new>, not gate <v>`; each version read is bounded at 30 s). It is renamed over `<root>/bin/gate-box` without following a link there, so a push never leaves a half-written box.
 
-`--test-push-bound-ms` replaces the 300 s bound and the Mac build's 2400 s bound alike.
+`--test-push-bound-ms` replaces the whole per-builder bound (the 300 s and any user-tool additions) and the Mac build's 2400 s bound alike.
 
-Test-seams builds accept hidden options on `push`: `--test-push-ssh <path>` (the program each builder's call runs in place of the ssh found along `PATH`), `--test-push-bound-ms <n>` (the 300 s bound, in milliseconds above 0) and `--test-push-register ok|fail` (each builder's registration runs the pushed gate's `box --test-box-register <ok|fail> register-desktop`, the box's seam, so no Task Scheduler is reached; any other value is `gate: --test-push-register must be ok or fail, got '<value>'`).
+Test-seams builds accept hidden options on `push`. `--test-push-ssh <path>` is the program each builder's call runs in place of the ssh found along `PATH`, and `--test-push-bound-ms <n>` is the per-builder bound, in milliseconds above 0.
+
+`--test-push-register ok|fail` makes each builder's registration run the pushed gate's `box --test-box-register <ok|fail> register-desktop`, the box's seam, so no Task Scheduler is reached; any other value is `gate: --test-push-register must be ok or fail, got '<value>'`.
 
 A push through `--test-push-ssh` installs into each fake builder's own `%LOCALAPPDATA%\gate\bin` with no Program Files pin and no ownership or access check.
 
@@ -438,7 +461,7 @@ Each sibling the repo declares is checked as routing checks it, and gets one lin
 
 When the repo declares siblings and `remote.json` lists the repo but its `siblings` value cannot be used, the line `check: here: remote.json: <problem>` (control characters escaped, counted missing) comes before the sibling lines, and every sibling is not allowed. A repo that declares none says nothing of it.
 
-A `carriedFolders` table that cannot be used is said the same way, `check: <where>: remote.json: <problem>` counted missing, whatever the repo (the problems are listed under `remote.json`).
+A `carriedFolders` table that cannot be used is said the same way, `check: <where>: remote.json: <problem>` counted missing, whatever the repo (the problems are listed under `remote.json`). So is a `userTools` table that cannot be used.
 
 A `desktopSession` value of `remote.json` that cannot be used is said the same way, `check: <where>: remote.json: <problem>` counted missing, whatever the repo. So is a `commits` value that cannot be used, right after the `hooks` one.
 
@@ -703,7 +726,9 @@ The list above follows it only when a barrier stands and the state is `waiting` 
 
 The exit is 0 for a drained builder, a lift, a lift of nothing and a status; 1 for a failure; 2 for usage; 0xC000013A on Ctrl+C.
 
-A drain that returns does not stop a `git push`: the push to the builder's bare repositories is not gated, only counted by the box's drained test (a `git-receive-pack` or `git-upload-pack` process of the root), so a PC whose session lapsed between its preflight and its push can still push after "drained". `gate push` and `install-toolchains.ps1` neither check nor raise a barrier.
+A drain that returns does not stop a `git push`: the push to the builder's bare repositories is not gated, only counted by the box's drained test (a `git-receive-pack` or `git-upload-pack` process of the root), so a PC whose session lapsed between its preflight and its push can still push after "drained".
+
+`gate push` and `install-toolchains.ps1` neither check nor raise a barrier; a push that rewrites a user tool's copy ([`gate push`](#gate-push)) while a routed run uses that tool is not barred either.
 
 Test-seams builds accept hidden options on `drain` and no `--test-print-request`: `--test-poll-ms` (the 2 s ask), `--test-heartbeat-ms` (the 30 s line), `--test-drain-raise-ms` (the 5 minute re-raise), the switch `--test-drain-interrupt-after-list` (raises the interrupt once the first list is said), the switch `--test-drain-interrupt-before-raise` (raises it before the first raise call, which is then not made), `--test-remote-transport` (a local folder in place of ssh, as `gate check --builder` takes it) and `--test-remote-ssh` (which also needs `--test-remote-transport`).
 
@@ -988,6 +1013,8 @@ The lines of a run that starts its command:
   The line names each carried sibling in declared order with its root as routing spells it. When declared siblings are absent (nothing at the name beside the worktree root) it then says `gate: routed without sibling <name>: not beside the worktree`, or `gate: routed without siblings <a>, <b>: not beside the worktree` for more, the names in declared order, right after the `routed with siblings` line when there is one.
 
   A routed run whose `remote.json` has a `carriedFolders` table that cannot be used says, once per routed run, `gate: remote.json carriedFolders cannot be used: <problem>; no folder carried` (the problems are listed under [remote.json](#remotejson)). The run still routes, carrying no folder.
+
+  A routed run whose repo's `userTools` table cannot be used says, once per routed run, `gate: remote.json userTools cannot be used: <problem>; no user tool checked` ([remote.json](#remotejson)). The run still routes, checking no user tool.
 
   While it waits for a remote slot: `gate: waiting for a remote slot on <host> (<n> busy)` and `gate: still waiting for a remote slot on <host> (<s> s)`, as a local wait says them, ETA included.
 
@@ -2954,6 +2981,16 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   `gate remote add` refuses a bad glob with `the result has a problem the file did not have: carriedFolders."<repo>"[<i>] …`.
 
+  `userTools` is an optional object mapping a repo name, matched in any letter case, to an array of `{"path": "~/...", "commands": ["<pattern>", ...]}` objects (exactly those two keys): the user-level tools, folders below the PC user's home, that the repo's commands run, and the command patterns (as `repos` patterns) that use each. Example: `{"userTools": {"world-of-intrigue": [{"path": "~/.claude/tools/mock-three", "commands": ["pwsh -NoProfile -File tools/mock-shoot.ps1*"]}]}}`.
+
+  A routed run whose command matches an entry's pattern checks the builder's copy of that tool, and `gate push` syncs every tool of the table to each Windows builder it reaches ([Routing](#routing), User tools; [`gate push`](#gate-push)). A `path` is `~/` and then `/`-separated names, none empty, `.` or `..`, and no `\` or `:`.
+
+  A `userTools` that cannot be used refuses nothing else: no tool is checked or synced for any repo, and routing uses the rest of the file. A routed run says `gate: remote.json userTools cannot be used: <problem>; no user tool checked`, `gate push` says `push: remote.json userTools cannot be used: <problem>; no user tool synced` and exits 1, and `gate check` lists the problem.
+
+  The reasons are `userTools must be a JSON object`, `userTools."<repo>" is not an array`, `userTools."<repo>"[<i>] is not an object with a path and commands`, `userTools."<repo>"[<i>].path is not a home-relative folder (~/...): "<path>"`, `userTools."<repo>"[<i>].commands is not a non-empty array`, `userTools."<repo>"[<i>].commands[<j>] …` for a pattern that is not valid.
+
+  Two paths where one is the other or holds the other make the table unusable, across every repo, compared by name ignoring letter case: `userTools."<repo>"[<i>].path "<path>" holds or is held by userTools."<other>"[<j>].path "<other>"` for two paths where one is the other or holds the other, compared by name ignoring letter case, across every repo (the same path written the same way twice is one tool).
+
   `desktop` is an optional object mapping a repo name, matched in any letter case, to an array of the `.gate/desktop.toml` patterns the machine lets that repo run on the builder's desktop (`Config::allowed_desktop`); a declared pattern is consented only when listed exactly, letter case included. A repo with no entry is allowed none.
 
   A `desktop` that is not an object, or holds a value that is not an array of non-empty strings, never refuses the file: it consents to none and the rest is read as usual. The reasons are `desktop must be a JSON object`, `desktop."<repo>" is not an array of strings` and `desktop."<repo>"[<i>] is not a non-empty string`, which the routed run's not-allowed line appends.
@@ -3252,6 +3289,14 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     A tool the builder did not probe, gave no answer for, or found at a version that cannot be read against a minimum gets `gate: <host> did not probe <name>: <why>; not checking it` and is not a need. The lines come in this order: the SDK step's own, then the manifest's problem lines, then the per-tool skip lines in the manifest's order, then the mismatch lines.
 
     A text from the manifest or the builder is escaped, and the builder's cut to 4096 bytes, so neither can forge a line.
+
+    **User tools.** A routed run whose command one of a `userTools` entry's `commands` patterns matches (matched against the words the routing pattern matched) checks the builder's copy of that tool, each path once.
+
+    Before the preflight the client computes this PC's fingerprint of each such tool ([user tool fingerprint](GLOSSARY.md)): `git ls-files -z` in the tool's folder under the PC user's home, then SHA-256 over each tracked file's path, a NUL, its length, a NUL and its bytes, sorted by path. The preflight's `UserTools` lists the paths.
+
+    The Windows box answers each with `gate: remote user tool <path> <fingerprint|missing>`, read from `<USERPROFILE>\<path>\.installed-from` (its first token), after the tool lines. A copy that is missing, or records another fingerprint, refuses the route for `tools`, so the next capable builder may take the run: `gate: not routed: <host> has no copy of <path>; run gate push` or `gate: not routed: <host>'s copy of <path> differs from this PC's; run gate push`.
+
+    A macOS builder keeps no user tools, so a run that needs one says `gate: not routed: <host> is a macOS builder, which gets no user tools from gate push`, also for `tools`. A copy on this PC that cannot be read (no home, no folder, `git ls-files` failing) says `gate: not routed: cannot read this PC's <path>: <why>` and falls back `client`: the run stays here at once, since no other builder helps.
 
     `toolchain::standing` judges a tool against a minimum from what its probe found (met, too old, missing, not readable, skipped) in one place, which `gate check`'s report shares and a routed run applies to every tool but a pinned `godot` or `unreal`, which both judge with `pinned`; `gate check` judges a manifest `godot` or `unreal` pin through `pinned` too, so its report and a routed run agree. `--test-remote-interrupt-at manifest` raises the interrupt just before the manifest is read.
 
@@ -4137,6 +4182,8 @@ A warm-up's `run` payload sets `WarmCommands` (1 to 8 commands, each a non-empty
 
 `preflight` also reads an optional `Needs`, an object of tool name to minimum version text (`""` for any version; the box ignores the text, and for `godot` the PC sends the manifest's own pin when the manifest names one, else the project files' distinct pins, joined by `,`), which the PC builds with `remote::payload::preflight_word` from the tools it wants probed; it is omitted when there are none, so a payload without needs is the same bytes as before.
 
+`preflight` reads an optional `UserTools` too, an array of the home-relative paths of the user tools the run's command uses, omitted when empty; the box answers each path with a `gate: remote user tool` line, and a `UserTools` that is not an array of strings is said on stderr and answers nothing.
+
 Unknown keys are ignored, and `Outputs`, `OutputsFull` and `OutputFolder`, which the outputs transport owns (GATE-44), are read only by `run` (the outputs) and `outputs` (`Name`, `OutputFolder`); `preflight`, `stop` and `boot` ignore them.
 
 `Timeout` is the run's ceiling in whole seconds, 1 to 2147483647, which the box counts in load-adjusted time; absent or null means no box ceiling and no adjusted line, and anything else is refused before the lock with `gate: box payload Timeout is not a whole number of seconds` and exit 2. `Host` is the PC's `remote.json` name for the builder, which the box's kill lines name, control characters escaped; absent leaves it out of them.
@@ -4336,6 +4383,10 @@ Built verbs:
   A `Build.version` that cannot be used gives `<file> gives no integer MajorVersion, MinorVersion and PatchVersion`, `<file> is over 64 KiB`, `<file> is not UTF-8` or `cannot read <file>: <why>`.
 
   Each program is found through `PATH` and `PATHEXT` as `dotnet` is (a `.cmd` shim runs through the system folder's cmd.exe; a `.ps1` is not run) and runs in the system folder on a hidden console, in the bounded runner of `remote/git.rs` (`program_output`).
+
+  User tools (`boxside/preflight.rs`, `say_user_tools`; the line is `gate_wire::user_tool_line`): for each string of the payload's `UserTools`, in order, the box says one stdout line after the tool lines, `gate: remote user tool <path> <fingerprint>` or `gate: remote user tool <path> missing`.
+
+  The fingerprint is the first token of `<USERPROFILE>\<path>\.installed-from`, 64 lower-case hex digits; a path that is not `~/` and then plain names, an absent folder or file, or a record that does not read so says `missing`. The box only reports; the PC compares.
 
   The probes run in parallel, started at the same time as `dotnet --list-sdks`, under one shared 10 s deadline (`--test-probe-limit-ms` lowers it), each given 2 s after the tool exits for its output readers to finish (`--test-probe-drain-ms` changes it, for `dotnet --list-sdks` too); one still running at the deadline is killed with its process tree, and one with no time left is skipped without being launched.
 

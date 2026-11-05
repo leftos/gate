@@ -4,6 +4,7 @@
 //! old gate a copy of the stand-in, which says its own version, [`OLD_VERSION`]. Each builder's registration of the
 //! desktop task runs the pushed gate's own seam, so no case touches this PC's Task Scheduler.
 
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::Read as _;
 use std::os::windows::fs::OpenOptionsExt as _;
@@ -17,6 +18,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use flate2::read::GzDecoder;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::install::unix;
 use crate::support::{
@@ -447,7 +449,11 @@ fn a_push_sends_the_exe_compressed_and_installs_it_whole() {
     );
     let text = String::from_utf8(sent).expect("the push fed text");
     let lines: Vec<&str> = text.trim_end().split('\n').collect();
-    assert_eq!(lines.len(), 3, "the push fed the script's line, then the exe's, then the helper's");
+    assert_eq!(
+        lines.len(),
+        4,
+        "the push fed the script's line, then the exe's, then the helper's, then the user tools'"
+    );
     let gzip = STANDARD.decode(lines[1]).expect("the push fed base64");
     let mut unpacked = Vec::new();
     GzDecoder::new(gzip.as_slice()).read_to_end(&mut unpacked).expect("the push fed gzip");
@@ -1740,4 +1746,122 @@ fn a_macos_build_meeting_a_broken_src_git_fails_and_leaves_it() {
     assert!(!bare.join("HEAD").exists(), "src.git was not made again");
     assert_holds(&existing, &before);
     assert_eq!(calls(&steps), host_and_mac_calls());
+}
+
+/// The user tool path the user tool cases name.
+const USER_TOOL: &str = "~/.claude/tools/t";
+
+/// A scratch home for `case` holding a git repo at `.claude` whose `tools/t` folder tracks `files`, each a path and
+/// its bytes; the home's path.
+fn tool_home(case: &Case, files: &[(&str, &[u8])]) -> PathBuf {
+    let home = case.folder().join("home");
+    let tool = home.join(".claude").join("tools").join("t");
+    for (path, bytes) in files {
+        let file = tool.join(path);
+        fs::create_dir_all(file.parent().expect("a file has a folder")).expect("the tool's folder can be made");
+        fs::write(file, bytes).expect("the tool's file can be written");
+    }
+    fs::create_dir_all(&tool).expect("the tool's folder can be made");
+    git(case, &["-C", "home/.claude", "init", "--quiet"]);
+    git(case, &["-C", "home/.claude", "add", "."]);
+    home
+}
+
+/// A routing file whose host routes `app`, with `user_tools` as its `userTools`.
+fn tool_routing(case: &Case, user_tools: &Value) {
+    route(case, &json!({ "host": HOST, "repos": { "app": ["x"] }, "userTools": user_tools }));
+}
+
+/// `gate push` for `case` through the stand-in acting on `steps`, `home` as its `USERPROFILE`, which the fake builder
+/// shares.
+fn push_home(case: &Case, steps: &Path, home: &Path) -> Outcome {
+    let mut command = push_command(case, steps, FAKE_SSH, &[]);
+    command.env("USERPROFILE", home);
+    finish(command)
+}
+
+/// The fingerprint of `files` by the user tool rule: SHA-256 over each file, sorted by path, of its path, a NUL, its
+/// length in decimal, a NUL, then its bytes; lower-case hex.
+fn fingerprint(files: &[(&str, &[u8])]) -> String {
+    let mut sorted = files.to_vec();
+    sorted.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    let mut hasher = Sha256::new();
+    for (path, bytes) in sorted {
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+        hasher.update(bytes.len().to_string().as_bytes());
+        hasher.update([0]);
+        hasher.update(bytes);
+    }
+    hasher.finalize().iter().fold(String::new(), |mut hex, byte| {
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    })
+}
+
+#[test]
+fn push_syncs_each_user_tool_to_the_builder_that_routes_its_repo() {
+    let case = push_case("push_syncs_each_user_tool_to_the_builder_that_routes_its_repo");
+    let files: [(&str, &[u8]); 2] = [("cli.ts", b"console.log(1)\n"), ("src/a.ts", b"export {}\n")];
+    let home = tool_home(&case, &files);
+    tool_routing(&case, &json!({ "app": [{ "path": USER_TOOL, "commands": ["x"] }] }));
+    let steps = steps(&case, &["ok"]);
+
+    let outcome = push_home(&case, &steps, &home);
+
+    let print = fingerprint(&files);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        unix(&outcome.stdout).ends_with(&format!("push: {HOST}: user tool {USER_TOOL} {}\n", &print[..12])),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    let copy = home.join(".claude").join("tools").join("t");
+    assert_eq!(
+        fs::read_to_string(copy.join(".installed-from")).expect("the record was written"),
+        format!("{print} -")
+    );
+    for (path, bytes) in files {
+        assert_holds(&copy.join(path), bytes);
+    }
+}
+
+#[test]
+fn push_with_an_unusable_user_tools_table_still_pushes_gate_and_exits_1() {
+    let case = push_case("push_with_an_unusable_user_tools_table_still_pushes_gate_and_exits_1");
+    let home = tool_home(&case, &[("cli.ts", b"x")]);
+    tool_routing(&case, &json!({ "app": "not a list" }));
+    let steps = steps(&case, &["ok"]);
+
+    let outcome = push_home(&case, &steps, &home);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(unix(&outcome.stdout), installed_lines(HOST), "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        "push: remote.json userTools cannot be used: userTools.\"app\" is not an array; no user tool synced\n",
+        "{outcome:?}"
+    );
+    assert!(!home.join(".claude").join("tools").join("t").join(".installed-from").exists());
+}
+
+#[test]
+fn push_says_a_pc_copy_it_cannot_read_and_exits_1() {
+    let case = push_case("push_says_a_pc_copy_it_cannot_read_and_exits_1");
+    let home = tool_home(&case, &[("cli.ts", b"x")]);
+    tool_routing(&case, &json!({ "app": [{ "path": "~/.claude/tools/missing", "commands": ["x"] }] }));
+    let steps = steps(&case, &["ok"]);
+
+    let outcome = push_home(&case, &steps, &home);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(unix(&outcome.stdout), installed_lines(HOST), "gate is still pushed: {outcome:?}");
+    let stderr = unix(&outcome.stderr);
+    assert!(
+        stderr.starts_with("push: cannot read this PC's ~/.claude/tools/missing: ")
+            && stderr.ends_with("; not synced\n")
+            && stderr.lines().count() == 1,
+        "{outcome:?}"
+    );
+    assert!(!home.join(".claude").join("tools").join("missing").exists(), "nothing was synced");
 }

@@ -192,7 +192,7 @@ fn asked(transport: &dyn Transport, builder: &Builder, place: &Place, bound: Dur
         no_ticket: true,
         ..Location::under(&profile, &repo, &key, &payload::job_nonce())
     };
-    let input = payload::input(&payload::preflight_word(&location, &needs, &payload::run_nonce()), None);
+    let input = payload::input(&payload::preflight_word(&location, &needs, &[], &payload::run_nonce()), None);
     let sent: Vec<String> = needs.into_iter().map(|(name, _)| name).collect();
     let program = transport.call(host, &profile.line(BoxVerb::Preflight), Wire::Plain);
     let heard = called(&program, bound, drain, input.as_bytes()).map_err(|failure| failure.line(host))?;
@@ -643,6 +643,7 @@ impl Answer<'_> {
             consent_problem: None,
             hooks_problem: None,
             carried_folders_problem: None,
+            user_tools_problem: None,
             commits_problem: None,
             require_siblings_problem: None,
             siblings_required: false,

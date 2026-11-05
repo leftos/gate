@@ -177,6 +177,8 @@ pub(crate) struct Checked {
     pub hooks_problem: Option<String>,
     /// Why this PC's routing file's `carriedFolders` value cannot be used, when it cannot; none for a builder.
     pub carried_folders_problem: Option<String>,
+    /// Why this PC's routing file's `userTools` value cannot be used, when it cannot; none for a builder.
+    pub user_tools_problem: Option<String>,
     /// Why this PC's routing file's `commits` value cannot be used, when it cannot.
     pub commits_problem: Option<String>,
     /// Why this PC's routing file's `requireSiblings` value cannot be used, when it cannot.
@@ -368,6 +370,9 @@ fn items(at: At<'_>, checked: &Checked) -> Vec<Item> {
         items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
     }
     if let Some(problem) = &checked.carried_folders_problem {
+        items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
+    }
+    if let Some(problem) = &checked.user_tools_problem {
         items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
     }
     if let Some(problem) = &checked.commits_problem {
@@ -782,6 +787,7 @@ mod tests {
             consent_problem: None,
             hooks_problem: None,
             carried_folders_problem: None,
+            user_tools_problem: None,
             commits_problem: None,
             require_siblings_problem: None,
             siblings_required: false,

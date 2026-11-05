@@ -31,7 +31,10 @@ pub mod warm;
 mod watch;
 pub mod windows;
 
-pub use config::{Builder, BuilderOs, CARGO_OUTPUTS, Config, ConfigProblem, DEFAULT_OUTPUTS, builder_id, ignored_line, is_unix_root, is_usable_host};
+pub use config::{
+    Builder, BuilderOs, CARGO_OUTPUTS, Config, ConfigProblem, DEFAULT_OUTPUTS, UserTool, builder_id, ignored_line, is_home_folder, is_unix_root,
+    is_usable_host,
+};
 pub use decide::{
     BuildSettings, BuildTarget, BuilderWords, CARRIED_INPUT, CONFIGURATION_ELEMENTS, CarriedSibling, CrossBlocked, CrossBuild, CrossTarget,
     DROPPED_NO_BUILD_LINE, DROPPED_UNSENT_LINE, DotnetTarget, ElsewhereRead, Facts, FolderId, FolderSends, GATE_FOLDER_MARK, GitignoredInput, Inputs,

@@ -3,9 +3,10 @@
 //! registers the desktop task there. Each builder gets one ssh call
 //! whose line is a short PowerShell bootstrap, [`BOOTSTRAP`], sent encoded; ssh's stdin carries the install script,
 //! [`SCRIPT`], as one line of base64, then the exe compressed with gzip, as one line of base64, then the helper the same
-//! way. The bootstrap reads the script's line and runs it in the bootstrap's scope; the script reads the rest,
-//! decompresses both, checks each copy's SHA-256 and installs each on the builder the way `tools/install.ps1` installs
-//! a file here, with the old file set aside. The order differs: `tools/install.ps1` places the helper first, while the
+//! way, then the user tools the builder syncs the same way. The bootstrap reads the script's line and runs it in the
+//! bootstrap's scope; the script reads the other three lines and decompresses all three, checks the SHA-256 of the exe
+//! and of the helper and installs each on the builder the way `tools/install.ps1` installs a file here, with the old
+//! file set aside. The order differs: `tools/install.ps1` places the helper first, while the
 //! builder places gate.exe first and the helper after it, so a helper that cannot be placed still leaves the builder's
 //! gate updated; the version skew a push leaves between the two shows as `desktop` refusals, which is accepted. Last
 //! it runs the installed gate's `box register-desktop`, and says what it did on `gate-push: ` lines, which this side
@@ -32,10 +33,10 @@ use base64::engine::general_purpose::STANDARD;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use gate_args::{PruneRequest, PruneSeams, PushRequest};
-use gate_router::{BuilderOs, Config, escaped, is_unix_root};
+use gate_router::{BuilderOs, Config, UserTool, escaped, is_unix_root};
 use gate_win32::{EnvironmentBlock, Job, LaunchError, PipedConsole, PipedFed, PipedLaunch, Running};
 use gate_wire::slots::{MOST_LINE_BYTES, MOST_SLOTS};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT};
 
@@ -48,6 +49,7 @@ use crate::remote::transport::ssh::{BUILDER_ROOT, Ssh, git_ssh_command};
 use crate::remote::transport::{Transport, Wire, ssh_words};
 use crate::resolve::Environment;
 use crate::route::read_remote_json;
+use crate::user_tool::{self, Print};
 
 /// How long one builder's call may take before it is killed.
 const BOUND: Duration = Duration::from_secs(300);
@@ -84,6 +86,14 @@ const PROGRAM_FILES_SLOT: &str = "@PF@";
 const ROOT_SLOT: &str = "@ROOT@";
 /// The stand-in for the builder's slot count in [`SCRIPT`].
 const COUNT_SLOT: &str = "@COUNT@";
+/// The stand-in for the program [`SCRIPT`] installs a user tool's packages with.
+const PNPM_SLOT: &str = "@PNPM@";
+/// What a builder installs a user tool's packages with, found along the `PATH` the script sets: pnpm's own shim.
+const PNPM: &str = "pnpm.cmd";
+/// How long a builder's install of one user tool's packages may take before it is killed with its process tree.
+const PNPM_BOUND: Duration = Duration::from_secs(180);
+/// The stand-in for [`PNPM_BOUND`] in whole seconds in [`SCRIPT`].
+const PNPM_SECONDS_SLOT: &str = "@PNPM_SECONDS@";
 /// Where a builder's push installs: its admin-owned `C:\Program Files\gate\bin`, on a builder whose Program Files folder
 /// is `C:\Program Files`; the slot count goes to each builder's own root.
 const PROGRAM_FILES: Place<'static> = Place {
@@ -107,7 +117,9 @@ const BOOTSTRAP: &str = "$l=[Console]::In.ReadLine();. ([ScriptBlock]::Create([T
 /// The builder script, run by [`BOOTSTRAP`], as `tools/install.ps1` installs: on a pwsh older than 7.2, whose .NET lacks
 /// what its file checks call, it says `failed` and touches nothing. It reads the next line of stdin, the exe as base64 of
 /// its gzip, decompresses it, and refuses bytes whose SHA-256 is not the one this side put in for [`SHA_SLOT`]; then the
-/// rest of stdin, the desktop helper the same way, checked against [`HELPER_SHA_SLOT`]. It then adds its file checks, a
+/// next line, the desktop helper the same way, checked against [`HELPER_SHA_SLOT`]; then the next, the user tools line
+/// [`tools_line`] makes, which fails the push as `the user tools could not be read` and why when it does not decode to a
+/// `tools` list. It then adds its file checks, a
 /// small C# type, and fails before anything is touched when that cannot be done. Every line it says has its line breaks
 /// made spaces, so no text can say a second fact. Its install folder is [`DIR_SLOT`]'s, `C:\Program Files\gate\bin` on a
 /// builder. Before reading stdin it refuses a builder whose Program Files known folder is not [`PROGRAM_FILES_SLOT`]'s,
@@ -162,6 +174,33 @@ const BOOTSTRAP: &str = "$l=[Console]::In.ReadLine();. ([ScriptBlock]::Create([T
 /// `failed` and why, and exits 1, a failed helper install included, which tries no registration. Each version read is
 /// bounded at 30 s, and a version read that is killed at its bound is waited for up to 10 s more; one that cannot be
 /// stopped says `note` and why.
+///
+/// After the registration it syncs each user tool the tools line lists, its home `USERPROFILE`, failing when that is
+/// empty and there is a tool. It first checks every tool: a path must be `~/` and then `/`-separated names, none empty,
+/// `.` or `..`, and none holding `\` or `:`, else the push fails with `<path> is not a home-relative folder`; each file's
+/// path must be such names alone, else `<path>: <file> is not a relative path`; so a refused tool writes nothing. Then,
+/// for each tool in turn, it makes the folder the path names under the home when it is missing and refuses it when it
+/// is a link. It reads the second token of the copy's `.installed-from`, the lock hash the last sync recorded, and the
+/// copy's `.installed-files`, the manifest of the files the last sync wrote, one `/`-separated path a line, failing
+/// with `<path>: .installed-files names <line>, which is not a relative path` for a line the file rule refuses; then it
+/// deletes the record, so a sync that stops halfway leaves none. It deletes each file the old manifest names and the
+/// new list does not, when it is a plain file and no link and no folder on its way down from the copy is a link, and
+/// each folder above it that this leaves empty, up to but never the copy itself, never a `node_modules` and never a
+/// link; it walks no folder, so a copy with no manifest loses nothing. It then writes the manifest of the old and the
+/// new names together, so a sync that fails partway still lists every file it wrote, and writes each file's bytes as
+/// they came, deleting a plain file there first so the name takes the listed case, making its folders, and failing for
+/// a file with a link on its way down (`<folder> is a link on the builder`), whose path is a folder there (`<file> is
+/// a folder on the builder`) or whose parent is a file (`<parent> is a file on the builder`); then it writes the new
+/// list as the manifest. Each manifest write goes through `.installed-files.<pid>.tmp` and a move. A name below U+0020
+/// in a path, a file path or a manifest line fails as one the file rule refuses. When the tool has a lock (not `-`) that differs
+/// from the recorded one, or the copy has no `node_modules`, it sets `PATH` to the machine's then the user's and runs
+/// [`PNPM_SLOT`]'s program, `pnpm.cmd`, as `install --frozen-lockfile` in the copy, killed with its process tree after
+/// [`PNPM_BOUND`] ([`PNPM_SECONDS_SLOT`]); each such tool adds that bound to the call's ([`builder_bound`]). Last it writes
+/// `<fingerprint> <lock>` as one ASCII line to `.installed-from.<pid>.tmp`, moves it over `.installed-from` by force,
+/// and says `user-tool`, the path and the fingerprint's first 12 hex digits, with `packages installed` after them when
+/// pnpm ran. A sync that fails says `failed`, the tool's path and why, a pnpm that exited non-zero with its status and
+/// its last line that is not blank, then that gate.exe is installed, as a helper failure does, and exits 1; nothing of
+/// the install is undone and no later tool is synced.
 const SCRIPT: &str = r#"$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
 function Say($k,$t){$t="$t" -replace '[\r\n]+',' ';[Console]::Out.WriteLine("gate-push: $k $t")}
 function Tally{try{$n=@(Get-ChildItem -LiteralPath $dir -File|?{$_.Name -like 'gate.exe.*.old'}).Count;if($n){Say kept $n}}
@@ -225,8 +264,10 @@ if(!$x.WaitForExit($n*1000)){try{$x.Kill($true)}catch{Say note "could not stop t
 $x.WaitForExit();@{c=$x.ExitCode;r=@("$($o.Result)`n$($e.Result)" -split '\r?\n')}}
 try{$b=Unzip ([Console]::In.ReadLine())}catch{Fail "the copy could not be read: $($_.Exception.Message)"}
 if((Sha $b) -ne '@SHA@'){Fail 'the copy arrived damaged'}
-try{$hb=Unzip ([Console]::In.ReadToEnd())}catch{Fail "the desktop helper's copy could not be read: $($_.Exception.Message)"}
+try{$hb=Unzip ([Console]::In.ReadLine())}catch{Fail "the desktop helper's copy could not be read: $($_.Exception.Message)"}
 if((Sha $hb) -ne '@HSHA@'){Fail "the desktop helper's copy arrived damaged"}
+try{$ut=([Text.Encoding]::UTF8.GetString((Unzip ([Console]::In.ReadLine())))|ConvertFrom-Json).tools
+if($ut -isnot [array]){throw 'it holds no tools list'}}catch{Fail "the user tools could not be read: $($_.Exception.Message)"}
 try{Add-Type -TypeDefinition 'using System;using System.ComponentModel;using System.IO;using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 public static class GateFile{const uint ReadWrite=0xC0000000,OpenAlways=4,NoFollow=0x200080,Folder=0x10,Link=0x400;
@@ -330,6 +371,52 @@ elseif($null -ne $rg.x){Say unregistered $rg.x}
 elseif($rg.c -eq 0 -and $f.Count -and $f[-1] -match '^gate-register: registered (.+)$'){Say registered $Matches[1]}
 elseif($f.Count -and $f[-1] -match '(?s)^gate-register: failed: (.*)$'){Say unregistered $Matches[1]}
 elseif($l.Count){Say unregistered $l[-1]}else{Say unregistered "exit $($rg.c)"}}
+function Seg($p){"$p" -ne '' -and !@("$p" -split '/'|?{!$_ -or $_ -in '.','..' -or $_ -match '[\\:\x00-\x1f]'}).Count}
+function Under($b,$p){foreach($n in $p -split '/'){$b=[IO.Path]::Combine($b,$n)};$b}
+function Lk($p){$i=Get-Item -LiteralPath $p -Force -EA Ignore;$i -and ($i.Attributes -band [IO.FileAttributes]::ReparsePoint)}
+function Hop($tg,$m){$s=@("$m" -split '/');$q=$tg
+for($j=0;$j -lt $s.Count-1;$j++){$q=[IO.Path]::Combine($q,$s[$j]);if(Lk $q){return ($s[0..$j] -join '/')}};''}
+function Mfw($mf,$l){$mt="$mf.$PID.tmp";[IO.File]::WriteAllText($mt,(@($l|%{"$_`n"}) -join ''),[Text.UTF8Encoding]::new($false))
+[IO.File]::Move($mt,$mf,$true)}
+function Gone($tg,$m){if(Hop $tg $m){return};$mp=Under $tg $m;$it=Get-Item -LiteralPath $mp -Force -EA Ignore
+if(!$it -or $it.PSIsContainer -or ($it.Attributes -band [IO.FileAttributes]::ReparsePoint)){return};Remove-Item -LiteralPath $mp -Force
+$q=[IO.Path]::GetDirectoryName($mp)
+while($q.Length -gt $tg.Length -and [IO.Path]::GetFileName($q) -ne 'node_modules' -and !(Lk $q) -and !@(Get-ChildItem -LiteralPath $q -Force).Count){
+Remove-Item -LiteralPath $q -Force;$q=[IO.Path]::GetDirectoryName($q)}}
+function Put($tg,$f){$fp=Under $tg $f.path;$s=@("$($f.path)" -split '/');$h=Hop $tg $f.path;if($h){throw "$h is a link on the builder"};$q=$tg
+for($j=0;$j -lt $s.Count-1;$j++){$q=[IO.Path]::Combine($q,$s[$j])
+if(Test-Path -LiteralPath $q -PathType Leaf){throw "$($s[0..$j] -join '/') is a file on the builder"}}
+if(Test-Path -LiteralPath $fp -PathType Container){throw "$($f.path) is a folder on the builder"}
+if(Test-Path -LiteralPath $fp -PathType Leaf){[IO.File]::Delete($fp)}
+[void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($fp));[IO.File]::WriteAllBytes($fp,[Convert]::FromBase64String($f.bytes))}
+function Pn($d){$w='pnpm install --frozen-lockfile'
+try{$x=[Diagnostics.Process]::Start([Diagnostics.ProcessStartInfo]@{FileName='@PNPM@';Arguments='install --frozen-lockfile'
+WorkingDirectory=$d;RedirectStandardOutput=1;RedirectStandardError=1;UseShellExecute=0})}catch{return "could not run pnpm: $($_.Exception.Message)"}
+$o=$x.StandardOutput.ReadToEndAsync();$e=$x.StandardError.ReadToEndAsync()
+if(!$x.WaitForExit(@PNPM_SECONDS@*1000)){try{$x.Kill($true)}catch{Say note "could not stop pnpm: $($_.Exception.Message)"}
+[void]$x.WaitForExit(10000);return "$w did not finish in @PNPM_SECONDS@ s"}
+$x.WaitForExit();if($x.ExitCode){$l=@("$($o.Result)`n$($e.Result)" -split '\r?\n'|?{"$_".Trim()});"$w exited $($x.ExitCode): $(if($l){$l[-1]})"}}
+function Sync($t){$p=$t.path;$tg=Under $hr $p.Substring(2)
+if(!(Test-Path -LiteralPath $tg)){[void][IO.Directory]::CreateDirectory($tg)}
+if((Get-Item -LiteralPath $tg -Force).Attributes -band [IO.FileAttributes]::ReparsePoint){throw "$tg is a link"}
+$rc=Join-Path $tg '.installed-from';$mf=Join-Path $tg '.installed-files';$ol='';$om=@()
+if(Test-Path -LiteralPath $rc -PathType Leaf){$ol="$(@(-split "$(Get-Content -LiteralPath $rc -Raw)")[1])"}
+if(Test-Path -LiteralPath $mf -PathType Leaf){$om=@([IO.File]::ReadAllLines($mf)|?{$_ -ne ''})}
+foreach($m in $om){if(!(Seg $m)){throw ".installed-files names $m, which is not a relative path"}}
+[IO.File]::Delete($rc);$nw=@{};foreach($f in @($t.files)){$nw["$($f.path)"]=1}
+foreach($m in $om){if(!$nw.ContainsKey($m)){Gone $tg $m}}
+$nl=@($t.files|%{"$($_.path)"});Mfw $mf @(@($om)+$nl|Sort-Object -Unique)
+foreach($f in @($t.files)){Put $tg $f}
+Mfw $mf $nl;$pi=''
+if($t.lock -ne '-' -and ($t.lock -ne $ol -or !(Test-Path -LiteralPath (Join-Path $tg 'node_modules')))){
+$env:Path=[Environment]::GetEnvironmentVariable('Path','Machine')+';'+[Environment]::GetEnvironmentVariable('Path','User')
+$r=Pn $tg;if($r){throw $r};$pi=' packages installed'}
+$tm="$rc.$PID.tmp";[IO.File]::WriteAllText($tm,"$($t.fingerprint) $($t.lock)",[Text.Encoding]::ASCII);[IO.File]::Move($tm,$rc,$true)
+Say user-tool "$p $("$($t.fingerprint)".Substring(0,12))$pi"}
+if($ut.Count){$hr=$env:USERPROFILE;if(!$hr){HFail 'USERPROFILE is not set'}}
+foreach($t in $ut){$p="$($t.path)";if(!($p -match '^~/' -and (Seg $p.Substring(2)))){HFail "$p is not a home-relative folder"}
+foreach($f in @($t.files)){if(!(Seg $f.path)){HFail "${p}: $($f.path) is not a relative path"}}}
+foreach($t in $ut){try{Sync $t}catch{HFail "$($t.path): $($_.Exception.Message)"}}
 exit 0
 "#;
 
@@ -601,30 +688,23 @@ pub(crate) fn push(request: &PushRequest, environment: &Environment, console: &m
         None => prepared.ssh.clone(),
     };
     let bound = request.seams.bound_ms.map_or(BOUND, Duration::from_millis);
-    let mut status = 0;
+    let tools = Tools::read(&prepared.config, console);
+    let mut status = if tools.failed { u32::from(FAILED_STATUS) } else { 0 };
+    let windows_bound = builder_bound(request.seams.bound_ms, &tools.prints);
     for builder in &prepared.builders {
-        let host = &builder.alias;
-        console.out(&format!("push: {host}: sending gate {}", prepared.version));
-        let heard = match &ssh {
-            Ok(program) => called(&Call {
-                program,
-                args: ssh_words(host, &prepared.line, Wire::Plain),
-                input: prepared.input_of(builder).as_bytes(),
-                variables: &variables,
-                bound,
-            }),
-            Err(why) => Heard::failed(why.clone()),
-        };
-        let said = said(host, &prepared.version, &heard, bound);
-        for line in &said.notes {
-            console.err(line);
-        }
-        for line in &said.out {
-            console.out(line);
-        }
-        if let Some(line) = &said.failure {
-            console.err(line);
+        let input = prepared.input_of(builder, &tools);
+        if windows_pushed(&prepared, builder, (&ssh, &variables, windows_bound), &input, console) {
             status = u32::from(FAILED_STATUS);
+        }
+    }
+    let paths = tools.paths();
+    if !paths.is_empty() {
+        for mac in &prepared.macs {
+            let host = &mac.alias;
+            console.err(&format!(
+                "push: {host}: user tools are not synced to macOS builders: {}",
+                paths.join(", ")
+            ));
         }
     }
     if let Some(source) = prepared.source {
@@ -647,6 +727,41 @@ pub(crate) fn push(request: &PushRequest, environment: &Environment, console: &m
     status
 }
 
+/// Pushes `prepared` to the Windows builder `builder` through `ssh`, each call with `variables` as its environment and
+/// bounded at `bound`, fed `input`, saying its lines; whether it failed.
+fn windows_pushed(
+    prepared: &Prepared,
+    builder: &Windows,
+    (ssh, variables, bound): (&Result<PathBuf, String>, &[(OsString, OsString)], Duration),
+    input: &str,
+    console: &mut Console,
+) -> bool {
+    let host = &builder.alias;
+    console.out(&format!("push: {host}: sending gate {}", prepared.version));
+    let heard = match ssh {
+        Ok(program) => called(&Call {
+            program,
+            args: ssh_words(host, &prepared.line, Wire::Plain),
+            input: input.as_bytes(),
+            variables,
+            bound,
+        }),
+        Err(why) => Heard::failed(why.clone()),
+    };
+    let said = said(host, &prepared.version, &heard, bound);
+    for line in &said.notes {
+        console.err(line);
+    }
+    for line in &said.out {
+        console.out(line);
+    }
+    if let Some(line) = &said.failure {
+        console.err(line);
+        return true;
+    }
+    false
+}
+
 /// The prune sweep after a push, quiet when there is no worktree record, through the ssh the push called its builders
 /// with; its status is dropped, as it never changes the push's.
 fn swept(ssh: &Result<PathBuf, String>, environment: &Environment, console: &mut Console) {
@@ -665,8 +780,8 @@ fn swept(ssh: &Result<PathBuf, String>, environment: &Environment, console: &mut
 /// What every builder is sent: the Windows builders, what [`SCRIPT`]'s slots hold but the root and the count, which are
 /// each builder's own, the exe and the helper as every call is fed them, the exe's version as shown and as read, and the
 /// ssh line; then the macOS builders and, when there are any, what `source.json` says the installed gate was built
-/// from, or why it cannot be used; and the ssh the routing file names ([`Config::ssh`]), else the one found along the
-/// gate's own `PATH`, or why it cannot be used or found.
+/// from, or why it cannot be used; the ssh the routing file names ([`Config::ssh`]), else the one found along the
+/// gate's own `PATH`, or why it cannot be used or found; and the routing file as read.
 struct Prepared {
     builders: Vec<Windows>,
     ssh: Result<PathBuf, String>,
@@ -680,11 +795,13 @@ struct Prepared {
     raw_version: String,
     macs: Vec<Mac>,
     source: Option<Result<Source, String>>,
+    config: Config,
 }
 
 impl Prepared {
-    /// What the Windows builder `builder`'s call is fed: [`pushed_input`] with its root and its count in the slots.
-    fn input_of(&self, builder: &Windows) -> String {
+    /// What the Windows builder `builder`'s call is fed: [`pushed_input`] with its root and its count in the slots, and
+    /// the user tools line of `tools` ([`Tools::line`]), the same for every builder.
+    fn input_of(&self, builder: &Windows, tools: &Tools<'_>) -> String {
         let root = root_expression(self.place, &builder.root);
         let slots = Slots {
             sha: &self.sha,
@@ -694,7 +811,7 @@ impl Prepared {
             root: &root,
             count: builder.count,
         };
-        pushed_input(&slots, &self.payload)
+        pushed_input(&slots, &self.payload, &tools.line())
     }
 }
 
@@ -705,11 +822,13 @@ fn root_expression(place: Place<'_>, root: &str) -> String {
 }
 
 /// The builders a push reaches: `host` and each `hosts` entry, Windows builders, then the macOS `builders` entries; and
-/// the ssh the routing file names, else the one found along the gate's own `PATH`, or why it cannot be used or found.
+/// the ssh the routing file names, else the one found along the gate's own `PATH`, or why it cannot be used or found;
+/// and the routing file itself.
 struct Listed {
     hosts: Vec<Windows>,
     macs: Vec<Mac>,
     ssh: Result<PathBuf, String>,
+    config: Config,
 }
 
 /// A Windows builder the push installs gate on: its alias, its remote root and its slot count.
@@ -762,7 +881,12 @@ fn prepared(
     let exe = installed_gate(environment).ok_or_else(no_folder)?;
     let bin = exe.parent().ok_or_else(no_folder)?;
     let gate = bin.parent().ok_or_else(no_folder)?;
-    let Listed { hosts: builders, macs, ssh } = builders(&gate.join("remote.json"))?;
+    let Listed {
+        hosts: builders,
+        macs,
+        ssh,
+        config,
+    } = builders(&gate.join("remote.json"))?;
     // The lock tools/install.ps1 holds while it replaces and checks the exe and the helper, held for their reads and the
     // version only; with no bin folder there is no exe, which the read says.
     let lock = if bin.is_dir() { Some(local_lock(bin)?) } else { None };
@@ -785,6 +909,7 @@ fn prepared(
         raw_version,
         macs,
         source,
+        config,
     })
 }
 
@@ -832,14 +957,120 @@ fn place(ssh_seam: bool) -> Place<'static> {
 }
 
 /// What a builder's call is fed for the exe and the helper of `payload`, whose SHA-256s `slots` holds: [`script_line`],
-/// then the gzipped exe, then the gzipped helper, each on a line of its own.
-fn pushed_input(slots: &Slots<'_>, payload: &Payload) -> String {
-    format!("{}\n{}\n{}", script_line(slots), payload.exe, payload.helper)
+/// then the gzipped exe, then the gzipped helper, then `tools`, the builder's user tools line ([`tools_line`]), each on
+/// a line of its own.
+fn pushed_input(slots: &Slots<'_>, payload: &Payload, tools: &str) -> String {
+    format!("{}\n{}\n{}\n{tools}", script_line(slots), payload.exe, payload.helper)
 }
 
-/// [`SCRIPT`] with `slots` put in.
+/// The user tools line a builder is fed for `tools`, each a home-relative path and this PC's print of it: the UTF-8 JSON
+/// `{"tools":[{"path","fingerprint","lock","files":[{"path","bytes"}]}]}`, each file's bytes as base64, [`gzipped`].
+/// It always holds `tools`, empty for a builder that syncs none.
+fn tools_line(tools: &[(&str, &Print)]) -> String {
+    let tools: Vec<Value> = tools
+        .iter()
+        .map(|(path, print)| {
+            let files: Vec<Value> = print
+                .files
+                .iter()
+                .map(|(file, bytes)| json!({ "path": file, "bytes": STANDARD.encode(bytes) }))
+                .collect();
+            json!({ "path": path, "fingerprint": print.fingerprint, "lock": print.lock, "files": files })
+        })
+        .collect();
+    gzipped(json!({ "tools": tools }).to_string().as_bytes())
+}
+
+/// How long one Windows builder's call may take when it syncs the user tools of `prints`: [`BOUND`], and
+/// [`PNPM_BOUND`] more for each tool with a lock, whose packages the call may install; `bound_ms`, the
+/// `--test-push-bound-ms` seam's, in place of the whole when it is given.
+fn builder_bound(bound_ms: Option<u64>, prints: &[(String, Print)]) -> Duration {
+    bound_ms.map_or_else(
+        || {
+            let locked = prints.iter().filter(|(_, print)| print.lock != "-").count();
+            BOUND + PNPM_BOUND * u32::try_from(locked).unwrap_or(u32::MAX)
+        },
+        Duration::from_millis,
+    )
+}
+
+/// The routing file's user tools as a push syncs them: its `userTools` table, empty when it cannot be used, this PC's
+/// print of each of its paths that could be read, and whether the table or a print failed, which fails the push.
+struct Tools<'a> {
+    table: &'a [(String, Vec<UserTool>)],
+    prints: Vec<(String, Print)>,
+    failed: bool,
+}
+
+impl<'a> Tools<'a> {
+    /// The user tools of `config`, each path printed once, saying on stderr a table that cannot be used and each copy on
+    /// this PC that cannot be read.
+    fn read(config: &'a Config, console: &mut Console) -> Tools<'a> {
+        let mut tools = Tools {
+            table: &[],
+            prints: Vec::new(),
+            failed: false,
+        };
+        match config.all_user_tools() {
+            Ok(table) => tools.table = table,
+            Err(problem) => {
+                console.err(&format!("push: remote.json userTools cannot be used: {problem}; no user tool synced"));
+                tools.failed = true;
+                return tools;
+            }
+        }
+        for path in tools.paths() {
+            match tool_print(path) {
+                Ok(print) => tools.prints.push((path.to_owned(), print)),
+                Err(why) => {
+                    console.err(&format!("push: cannot read this PC's {}: {why}; not synced", escaped(path)));
+                    tools.failed = true;
+                }
+            }
+        }
+        tools
+    }
+
+    /// Every distinct path of the table, in table order.
+    fn paths(&self) -> Vec<&'a str> {
+        let mut paths: Vec<&'a str> = Vec::new();
+        for tool in self.table.iter().flat_map(|(_, tools)| tools) {
+            if !paths.contains(&tool.path.as_str()) {
+                paths.push(&tool.path);
+            }
+        }
+        paths
+    }
+
+    /// The user tools line every Windows builder is fed ([`tools_line`]): each tool of the table this PC's copy of
+    /// could be printed, in table order. A run pinned to any Windows builder checks its copies, so each gets them all.
+    fn line(&self) -> String {
+        let chosen: Vec<(&str, &Print)> = self.prints.iter().map(|(path, print)| (path.as_str(), print)).collect();
+        tools_line(&chosen)
+    }
+}
+
+/// This PC's print of the user tool at the home-relative `path` ([`user_tool::read`]): its tracked files as `git
+/// ls-files -z` run in its folder lists them, git found from that folder and bounded at [`VERSION_BOUND`]; else why it
+/// cannot be read.
+fn tool_print(path: &str) -> Result<Print, String> {
+    user_tool::read(path, |folder| {
+        git::Git::find(folder)?
+            .output_bytes_within(&git::Call::plain(folder, &["ls-files", "-z"], VERSION_BOUND), git::OUTPUT_CAP)
+            .map_err(String::from)
+    })
+}
+
+/// [`SCRIPT`] with `slots` put in, and [`PNPM`] for [`PNPM_SLOT`].
 fn filled(slots: &Slots<'_>) -> String {
+    filled_with(slots, PNPM)
+}
+
+/// [`SCRIPT`] with `slots` put in, and `pnpm` for [`PNPM_SLOT`]: only a unit test gives another program.
+fn filled_with(slots: &Slots<'_>, pnpm: &str) -> String {
     SCRIPT
+        .replace(PNPM_SECONDS_SLOT, &PNPM_BOUND.as_secs().to_string())
+        .replace(PNPM_SLOT, pnpm)
         .replace(SHA_SLOT, slots.sha)
         .replace(HELPER_SHA_SLOT, slots.helper_sha)
         .replace(REGISTER_SLOT, slots.register)
@@ -885,7 +1116,7 @@ fn builders(path: &Path) -> Result<Listed, String> {
             let macs = macs_of(&config, &hosts);
             let hosts = hosts.into_iter().map(|alias| windows_of(&config, alias)).collect();
             let ssh = Ssh::find(config.ssh()).map(|ssh| ssh.program);
-            Ok(Listed { hosts, macs, ssh })
+            Ok(Listed { hosts, macs, ssh, config })
         }
     }
 }
@@ -1588,6 +1819,8 @@ enum Fact {
     Unregistered(String),
     /// The builder's slot count was written: this count.
     Slots(String),
+    /// A user tool was synced: its path, its fingerprint's first 12 hex digits, and whether its packages were installed.
+    UserTool(String),
     Failed(String),
     /// A macOS builder's installed box says this version, empty for none.
     Version(String),
@@ -1610,6 +1843,7 @@ fn fact(line: &str) -> Option<Fact> {
         "registered" => Some(Fact::Registered),
         "unregistered" => Some(Fact::Unregistered(text)),
         "slots" => Some(Fact::Slots(text)),
+        "user-tool" => Some(Fact::UserTool(text)),
         "failed" => Some(Fact::Failed(text)),
         "version" => Some(Fact::Version(text)),
         "ready" => Some(Fact::Ready),
@@ -1642,11 +1876,11 @@ fn said(host: &str, version: &str, heard: &Heard, bound: Duration) -> Said {
         Fact::Kept(count) => Some(format!("push: {host}: kept {} aside copies: gate.exe is not verified", shown(count))),
         _ => None,
     });
-    // A push that failed after it wrote the count still says the count it left there.
+    // A push that failed after it wrote the count or synced a user tool still says what it left there.
     let (mut out, failure) = match ended(host, version, heard, &facts, bound) {
         Ok(out) => (out, None),
         Err(reason) => (
-            slot_line(host, &facts).into_iter().collect(),
+            slot_line(host, &facts).into_iter().chain(tool_lines(host, &facts)).collect(),
             Some(format!("push: {host} failed: {reason}")),
         ),
     };
@@ -1665,13 +1899,22 @@ fn ended(host: &str, version: &str, heard: &Heard, facts: &[Fact], bound: Durati
 }
 
 /// The lines of a push whose builder said it holds `version` already, or installed it, then what it did with the
-/// desktop helper and task ([`desktop`]), then the slot count it wrote ([`slot_line`]): `None` when it said neither. A
-/// version the builder could not read is said as `version`, this PC's.
+/// desktop helper and task ([`desktop`]), then the slot count it wrote ([`slot_line`]), then each user tool it synced
+/// ([`tool_lines`]): `None` when it said neither. A version the builder could not read is said as `version`, this PC's.
 fn succeeded(host: &str, version: &str, facts: &[Fact]) -> Option<Vec<String>> {
     let mut out = gate_lines(host, version, facts)?;
     out.extend(desktop(host, facts));
     out.extend(slot_line(host, facts));
+    out.extend(tool_lines(host, facts));
     Some(out)
+}
+
+/// The lines saying each user tool a push to `host` synced, in the order the builder said them.
+fn tool_lines<'a>(host: &'a str, facts: &'a [Fact]) -> impl Iterator<Item = String> + 'a {
+    facts.iter().filter_map(move |fact| match fact {
+        Fact::UserTool(text) => Some(format!("push: {host}: user tool {}", shown(text))),
+        _ => None,
+    })
 }
 
 /// The lines saying the desktop helper was installed and whether the desktop task was registered, in the order the
@@ -1721,13 +1964,17 @@ mod tests {
     use flate2::read::GzDecoder;
 
     use super::{
-        BOOTSTRAP, BUILD_BOUND, CARGO_BOUND, Call, End, Fact, Heard, LINE_CAP, MAC_SCRIPT, MARKED_CAP, MOST_SLOTS, PWSH, Payload, Place, REGISTER,
-        Said, Slots, called, encoded_line, fact, filled, gzipped, installed_lines, kept, mac_build_line, mac_ended, mac_prepare_line, place,
-        push_line, pushed_input, register_command, root_expression, said, sha256_hex, slot_line, succeeded,
+        BOOTSTRAP, BUILD_BOUND, CARGO_BOUND, Call, End, Fact, Heard, LINE_CAP, MAC_SCRIPT, MARKED_CAP, MOST_SLOTS, PNPM_BOUND, PWSH, Payload, Place,
+        Prepared, REGISTER, Said, Slots, Tools, Windows, builder_bound, called, encoded_line, fact, filled, filled_with, gzipped, installed_lines,
+        kept, mac_build_line, mac_ended, mac_prepare_line, place, push_line, pushed_input, register_command, root_expression, said, sha256_hex,
+        slot_line, succeeded, tools_line,
     };
+    use gate_router::Config;
+
     use crate::environment::Variables;
     use crate::installed::version_of;
     use crate::run::find_program;
+    use crate::user_tool::Print;
 
     const SHA: &str = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
     const HELPER_SHA: &str = "FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210";
@@ -1770,7 +2017,156 @@ mod tests {
             root: SEAM_ROOT,
             count: 1,
         };
-        pushed_input(&slots, &Payload::of(exe, helper))
+        pushed_input(&slots, &Payload::of(exe, helper), &tools_line(&[]))
+    }
+
+    /// A routing file whose host `wa` routes `app` and `lib`, whose Windows entry `wb` routes `app` alone, and whose
+    /// `userTools` is `tools`.
+    fn tool_routing(tools: &str) -> Config {
+        Config::parse(&format!(
+            r#"{{"host": "wa", "repos": {{"app": ["x"], "lib": ["x"]}},
+                "builders": [{{"host": "wb", "os": "windows", "repos": {{"app": ["x"]}}}}],
+                "userTools": {tools}}}"#
+        ))
+        .expect("the routing file reads")
+    }
+
+    /// A `userTools` entry for `path`, used by every command.
+    fn tool_entry(path: &str) -> String {
+        format!(r#"{{"path": "{path}", "commands": ["x"]}}"#)
+    }
+
+    #[test]
+    fn every_windows_builder_gets_every_user_tool() {
+        let (one, two, three) = ("~/.claude/tools/one", "~/.claude/tools/two", "~/.claude/tools/three");
+        let config = tool_routing(&format!(
+            r#"{{"lib": [{}, {}], "other": [{}, {}]}}"#,
+            tool_entry(one),
+            tool_entry(two),
+            tool_entry(one),
+            tool_entry(three)
+        ));
+        let table = config.all_user_tools().expect("the table is usable");
+        let print = |lock: &str| Print {
+            fingerprint: "ab".repeat(32),
+            lock: lock.to_owned(),
+            files: vec![("a.txt".to_owned(), b"one".to_vec())],
+        };
+        let tools = Tools {
+            table,
+            prints: vec![(one.to_owned(), print("-")), (two.to_owned(), print("-")), (three.to_owned(), print("-"))],
+            failed: false,
+        };
+        let windows = |alias: &str| Windows {
+            alias: alias.to_owned(),
+            root: r"D:\gate-remote".to_owned(),
+            count: 2,
+        };
+        let prepared = Prepared {
+            builders: vec![windows("wa"), windows("wb")],
+            ssh: Err("no ssh in a unit test".to_owned()),
+            sha: SHA.to_owned(),
+            helper_sha: HELPER_SHA.to_owned(),
+            register: REGISTER.to_owned(),
+            place: place(false),
+            payload: Payload::of(b"an exe", b"a helper"),
+            version: "0.2.0".to_owned(),
+            line: push_line(),
+            raw_version: "0.2.0".to_owned(),
+            macs: Vec::new(),
+            source: None,
+            config: tool_routing("{}"),
+        };
+
+        // wa routes lib; wb, a `builders` entry, routes app alone, which names no tool: each gets all three.
+        let sent: Vec<serde_json::Value> = prepared
+            .builders
+            .iter()
+            .map(|builder| tools_json(prepared.input_of(builder, &tools).split('\n').nth(3).expect("a fourth line")))
+            .collect();
+        let paths: Vec<&str> = sent[0]["tools"]
+            .as_array()
+            .expect("a tools list")
+            .iter()
+            .map(|tool| tool["path"].as_str().expect("a path"))
+            .collect();
+        assert_eq!(paths, [one, two, three], "every distinct path, in table order");
+        assert_eq!(sent[1], sent[0], "the builder that routes no repo with tools gets the same tools");
+        assert_eq!(tools.paths(), [one, two, three]);
+    }
+
+    #[test]
+    fn a_builder_call_s_bound_grows_by_the_package_install_bound_for_each_tool_with_a_lock() {
+        let print = |lock: &str| Print {
+            fingerprint: "ab".repeat(32),
+            lock: lock.to_owned(),
+            files: Vec::new(),
+        };
+        let none: Vec<(String, Print)> = Vec::new();
+        let locked = vec![
+            ("~/a".to_owned(), print(&"cd".repeat(32))),
+            ("~/b".to_owned(), print("-")),
+            ("~/c".to_owned(), print(&"ef".repeat(32))),
+        ];
+
+        assert_eq!(builder_bound(None, &none), super::BOUND);
+        assert_eq!(builder_bound(None, &locked), super::BOUND + 2 * PNPM_BOUND, "two tools with a lock");
+        assert_eq!(
+            builder_bound(Some(5), &locked),
+            Duration::from_millis(5),
+            "the seam replaces the whole bound"
+        );
+    }
+
+    /// The JSON a pushed input's user tools line holds.
+    fn tools_json(line: &str) -> serde_json::Value {
+        let mut json = Vec::new();
+        GzDecoder::new(STANDARD.decode(line).expect("the line is base64").as_slice())
+            .read_to_end(&mut json)
+            .expect("the line is gzip");
+        serde_json::from_slice(&json).expect("the line is JSON")
+    }
+
+    #[test]
+    fn the_pushed_input_carries_the_user_tools_as_its_fourth_line() {
+        let slots = Slots {
+            sha: SHA,
+            helper_sha: HELPER_SHA,
+            register: REGISTER,
+            place: place(false),
+            root: r"'D:\gate-remote'",
+            count: 2,
+        };
+        let print = Print {
+            fingerprint: "ab".repeat(32),
+            lock: "-".to_owned(),
+            files: vec![("a.txt".to_owned(), b"one".to_vec()), ("sub/b.bin".to_owned(), vec![0, 255])],
+        };
+        let input = pushed_input(
+            &slots,
+            &Payload::of(b"an exe", b"a helper"),
+            &tools_line(&[("~/.claude/tools/t", &print)]),
+        );
+
+        let lines: Vec<&str> = input.split('\n').collect();
+        assert_eq!(lines.len(), 4, "{input}");
+        assert_eq!(
+            tools_json(lines[3]),
+            serde_json::json!({"tools": [{
+                "path": "~/.claude/tools/t",
+                "fingerprint": "ab".repeat(32),
+                "lock": "-",
+                "files": [
+                    {"path": "a.txt", "bytes": STANDARD.encode(b"one")},
+                    {"path": "sub/b.bin", "bytes": STANDARD.encode([0u8, 255])}
+                ]
+            }]})
+        );
+        assert_eq!(
+            tools_json(&tools_line(&[])),
+            serde_json::json!({"tools": []}),
+            "no tools is an empty list"
+        );
     }
 
     #[test]
@@ -1803,9 +2199,13 @@ mod tests {
             root: r"'D:\gate-remote'",
             count: 2,
         };
-        let input = pushed_input(&slots, &Payload::of(b"an exe", b"a helper"));
+        let input = pushed_input(&slots, &Payload::of(b"an exe", b"a helper"), &tools_line(&[]));
         let lines: Vec<&str> = input.split('\n').collect();
-        assert_eq!(lines.len(), 3, "the script, the exe and the helper, each on a line: {input}");
+        assert_eq!(
+            lines.len(),
+            4,
+            "the script, the exe, the helper and the user tools, each on a line: {input}"
+        );
         assert_eq!(lines[1], gzipped(b"an exe"), "the exe follows the script's line");
         assert_eq!(lines[2], gzipped(b"a helper"), "the helper follows the exe's line");
         let script = String::from_utf8(STANDARD.decode(lines[0]).expect("the script's line is base64")).expect("the script is UTF-8");
@@ -2478,14 +2878,21 @@ mod tests {
     /// The push line run here through local pwsh, fed `input`, `LOCALAPPDATA` set to `local_app_data`: the
     /// `gate-push: ` lines it said and its end.
     fn run_script_fed(input: &str, local_app_data: &Path) -> Heard {
+        run_fed_home(input, local_app_data, None)
+    }
+
+    /// [`run_script_fed`] with `USERPROFILE` set to `home` too, when there is one.
+    fn run_fed_home(input: &str, local_app_data: &Path, home: Option<&Path>) -> Heard {
         let folder = std::env::current_dir().expect("the working folder is read");
         let pwsh = find_program("pwsh", &Variables::from_process(), &folder).expect("pwsh is on PATH");
         let line = push_line();
         let args: Vec<OsString> = line.split(' ').skip(1).map(OsString::from).collect();
-        let mut variables: Vec<(OsString, OsString)> = std::env::vars_os()
-            .filter(|(name, _)| !name.eq_ignore_ascii_case("LOCALAPPDATA"))
-            .collect();
+        let replaced = |name: &OsString| name.eq_ignore_ascii_case("LOCALAPPDATA") || (home.is_some() && name.eq_ignore_ascii_case("USERPROFILE"));
+        let mut variables: Vec<(OsString, OsString)> = std::env::vars_os().filter(|(name, _)| !replaced(name)).collect();
         variables.push(("LOCALAPPDATA".into(), local_app_data.into()));
+        if let Some(home) = home {
+            variables.push(("USERPROFILE".into(), home.into()));
+        }
         called(&Call {
             program: &pwsh,
             args,
@@ -2794,6 +3201,508 @@ mod tests {
         let _ = fs::remove_dir_all(&local_app_data);
     }
 
+    /// The user tool path every sync case pushes.
+    const TOOL: &str = "~/.claude/tools/t";
+    /// The fingerprint every sync case's print holds.
+    const PRINT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    /// A lock hash a sync case's print holds, and another.
+    const LOCK: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+    const OTHER_LOCK: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
+
+    /// A sync case's folders: the builder's `LOCALAPPDATA`, its home, and the folder its pnpm stand-in lives in.
+    struct ToolCase {
+        folder: PathBuf,
+        local_app_data: PathBuf,
+        home: PathBuf,
+    }
+
+    impl ToolCase {
+        fn new(test: &str) -> ToolCase {
+            let folder = scratch(test);
+            let local_app_data = folder.join("appdata");
+            let home = folder.join("home");
+            fs::create_dir_all(&local_app_data).expect("the LOCALAPPDATA folder is made");
+            fs::create_dir_all(&home).expect("the home folder is made");
+            ToolCase {
+                folder,
+                local_app_data,
+                home,
+            }
+        }
+
+        /// The builder's copy of [`TOOL`].
+        fn target(&self) -> PathBuf {
+            self.home.join(r".claude\tools\t")
+        }
+
+        /// Writes `bytes` at `path` under the builder's copy, making its folders.
+        fn seed(&self, path: &str, bytes: &[u8]) {
+            let file = self.target().join(path);
+            fs::create_dir_all(file.parent().expect("a file has a folder")).expect("the folder is made");
+            fs::write(file, bytes).expect("the file is written");
+        }
+
+        /// The pushed script run with the user tools `tools` fed, its pnpm a stand-in that logs each call to a marker
+        /// file, says `stub said no` and exits `pnpm_exit`.
+        fn run(&self, tools: &[(&str, &Print)], pnpm_exit: u32) -> Heard {
+            let stub = self.folder.join("pnpm-stub.cmd");
+            let marker = self.folder.join("pnpm-calls.txt");
+            fs::write(
+                &stub,
+                format!(
+                    "@echo off\r\necho %*>>\"{}\"\r\necho stub said no\r\nexit /b {pnpm_exit}\r\n",
+                    marker.display()
+                ),
+            )
+            .expect("the stand-in is written");
+            let exe = stand_in();
+            let slots = Slots {
+                sha: &sha256_hex(&exe),
+                helper_sha: &sha256_hex(HELPER),
+                register: REGISTERS,
+                place: place(true),
+                root: SEAM_ROOT,
+                count: 1,
+            };
+            let script = answered(&filled_with(&slots, &stub.display().to_string()), &exe);
+            let input = format!(
+                "{}\n{}\n{}\n{}",
+                STANDARD.encode(script),
+                gzipped(&exe),
+                gzipped(HELPER),
+                tools_line(tools)
+            );
+            run_fed_home(&input, &self.local_app_data, Some(&self.home))
+        }
+
+        /// How many times the pnpm stand-in ran.
+        fn pnpm_calls(&self) -> usize {
+            fs::read_to_string(self.folder.join("pnpm-calls.txt")).map_or(0, |text| text.lines().count())
+        }
+
+        /// The builder copy's record, `None` when there is none.
+        fn record(&self) -> Option<String> {
+            fs::read_to_string(self.target().join(".installed-from")).ok()
+        }
+    }
+
+    impl Drop for ToolCase {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.folder);
+        }
+    }
+
+    /// A print of `files` whose fingerprint is [`PRINT`] and whose lock hash is `lock`.
+    fn print_of(files: &[(&str, &[u8])], lock: &str) -> Print {
+        Print {
+            fingerprint: PRINT.to_owned(),
+            lock: lock.to_owned(),
+            files: files.iter().map(|(path, bytes)| ((*path).to_owned(), bytes.to_vec())).collect(),
+        }
+    }
+
+    /// The `user-tool` fact the script says of [`TOOL`], `packages installed` after it when `installed`.
+    fn synced_line(installed: bool) -> String {
+        format!(
+            "gate-push: user-tool {TOOL} {}{}",
+            &PRINT[..12],
+            if installed { " packages installed" } else { "" }
+        )
+    }
+
+    #[test]
+    fn the_script_syncs_a_user_tool_and_writes_its_record() {
+        let case = ToolCase::new("user-tool-sync");
+        let print = print_of(&[("a.txt", b"one"), ("sub/b.bin", &[0, 1, 255])], "-");
+
+        let heard = case.run(&[(TOOL, &print)], 0);
+
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        assert_eq!(heard.marked.last(), Some(&synced_line(false)), "{heard:?}");
+        assert_eq!(fs::read(case.target().join("a.txt")).expect("a.txt was written"), b"one");
+        assert_eq!(fs::read(case.target().join(r"sub\b.bin")).expect("b.bin was written"), [0, 1, 255]);
+        assert_eq!(case.record(), Some(format!("{PRINT} -")), "the record is the fingerprint and the lock");
+        assert_eq!(
+            listed(&case.target()),
+            [".installed-files", ".installed-from", "a.txt", "sub"],
+            "no temporary record or manifest is left"
+        );
+    }
+
+    #[test]
+    fn the_script_deletes_only_files_its_last_push_wrote() {
+        let case = ToolCase::new("user-tool-manifest-deletes");
+        case.seed("a.txt", b"old");
+        case.seed(r"gone\deep\x.txt", b"dropped");
+        case.seed("mine.txt", b"planted");
+        case.seed(".installed-files", b"a.txt\ngone/deep/x.txt\n");
+        let print = print_of(&[("a.txt", b"one")], "-");
+
+        let heard = case.run(&[(TOOL, &print)], 0);
+
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        assert_eq!(
+            listed(&case.target()),
+            [".installed-files", ".installed-from", "a.txt", "mine.txt"],
+            "the dropped file and its emptied folders went; the planted file stays: {heard:?}"
+        );
+        assert_eq!(fs::read(case.target().join("a.txt")).expect("a.txt was written"), b"one");
+    }
+
+    #[test]
+    fn the_script_deletes_nothing_when_there_is_no_manifest() {
+        let case = ToolCase::new("user-tool-no-manifest");
+        case.seed("old.txt", b"kept");
+        case.seed(r"gone\x.txt", b"kept");
+        let print = print_of(&[("a.txt", b"one")], "-");
+
+        let heard = case.run(&[(TOOL, &print)], 0);
+
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        assert_eq!(
+            listed(&case.target()),
+            [".installed-files", ".installed-from", "a.txt", "gone", "old.txt"],
+            "{heard:?}"
+        );
+        assert_eq!(listed(&case.target().join("gone")), ["x.txt"]);
+    }
+
+    #[test]
+    fn the_script_never_deletes_inside_a_nested_node_modules() {
+        let case = ToolCase::new("user-tool-nested-node-modules");
+        case.seed(r"packages\x\index.ts", b"old");
+        case.seed(r"packages\x\node_modules\dep\index.js", b"kept");
+        case.seed(".installed-files", b"packages/x/index.ts\n");
+        let print = print_of(&[("cli.ts", b"x")], "-");
+
+        let heard = case.run(&[(TOOL, &print)], 0);
+
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        assert_eq!(listed(&case.target().join(r"packages\x")), ["node_modules"], "{heard:?}");
+        assert_eq!(
+            fs::read(case.target().join(r"packages\x\node_modules\dep\index.js")).expect("the dependency stays"),
+            b"kept"
+        );
+    }
+
+    #[test]
+    fn the_script_turns_a_file_into_a_folder_and_back() {
+        let case = ToolCase::new("user-tool-kind-change");
+        let first = print_of(&[("lib.ts", b"1"), ("util/a.ts", b"2")], "-");
+        let second = print_of(&[("lib/index.ts", b"3"), ("util", b"4")], "-");
+
+        for (print, names) in [
+            (&first, [".installed-files", ".installed-from", "lib.ts", "util"]),
+            (&second, [".installed-files", ".installed-from", "lib", "util"]),
+            (&first, [".installed-files", ".installed-from", "lib.ts", "util"]),
+        ] {
+            let heard = case.run(&[(TOOL, print)], 0);
+            assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+            assert_eq!(listed(&case.target()), names, "{heard:?}");
+            for (path, bytes) in &print.files {
+                assert_eq!(&fs::read(case.target().join(path)).expect("the file was written"), bytes, "{path}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_script_refuses_a_manifest_line_outside_the_tool() {
+        let case = ToolCase::new("user-tool-manifest-outside");
+        case.seed("a.txt", b"kept");
+        case.seed(".installed-files", b"a.txt\n../x\n");
+        case.seed(".installed-from", format!("{PRINT} -").as_bytes());
+        let outside = case.home.join(r".claude\tools\x");
+        fs::write(&outside, b"kept").expect("the outside file is written");
+        let print = print_of(&[("b.txt", b"two")], "-");
+
+        let heard = case.run(&[(TOOL, &print)], 0);
+
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked.last(),
+            Some(&format!(
+                "gate-push: failed {TOOL}: .installed-files names ../x, which is not a relative path; gate {ANSWERED} is installed"
+            )),
+            "{heard:?}"
+        );
+        assert_eq!(fs::read(&outside).expect("the outside file stays"), b"kept");
+        assert_eq!(fs::read(case.target().join("a.txt")).expect("a.txt stays"), b"kept");
+        assert!(!case.target().join("b.txt").exists(), "nothing was written");
+    }
+
+    #[test]
+    fn the_script_writes_the_manifest_of_the_files_it_wrote() {
+        let case = ToolCase::new("user-tool-manifest-written");
+        let print = print_of(&[("a.txt", b"one"), ("sub/b.bin", &[0, 255])], "-");
+
+        let heard = case.run(&[(TOOL, &print)], 0);
+
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        assert_eq!(
+            fs::read_to_string(case.target().join(".installed-files")).expect("the manifest was written"),
+            "a.txt\nsub/b.bin\n"
+        );
+    }
+
+    #[test]
+    fn the_script_installs_packages_when_the_lock_changed() {
+        let case = ToolCase::new("user-tool-lock-changed");
+        case.seed(".installed-from", format!("{PRINT} {OTHER_LOCK}").as_bytes());
+        case.seed(r"node_modules\x", b"");
+        let print = print_of(&[("pnpm-lock.yaml", b"lock")], LOCK);
+
+        let heard = case.run(&[(TOOL, &print)], 0);
+
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        assert_eq!(case.pnpm_calls(), 1, "{heard:?}");
+        assert_eq!(heard.marked.last(), Some(&synced_line(true)), "{heard:?}");
+        assert_eq!(case.record(), Some(format!("{PRINT} {LOCK}")));
+    }
+
+    #[test]
+    fn the_script_installs_packages_when_node_modules_is_missing() {
+        let case = ToolCase::new("user-tool-no-node-modules");
+        case.seed(".installed-from", format!("{PRINT} {LOCK}").as_bytes());
+        let print = print_of(&[("pnpm-lock.yaml", b"lock")], LOCK);
+
+        let heard = case.run(&[(TOOL, &print)], 0);
+
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        assert_eq!(case.pnpm_calls(), 1, "{heard:?}");
+        assert_eq!(heard.marked.last(), Some(&synced_line(true)), "{heard:?}");
+    }
+
+    #[test]
+    fn the_script_skips_the_package_install_when_the_lock_is_the_same() {
+        let case = ToolCase::new("user-tool-same-lock");
+        case.seed(".installed-from", format!("{PRINT} {LOCK}").as_bytes());
+        case.seed(r"node_modules\x", b"");
+        let print = print_of(&[("pnpm-lock.yaml", b"lock")], LOCK);
+
+        let heard = case.run(&[(TOOL, &print)], 0);
+
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        assert_eq!(case.pnpm_calls(), 0, "{heard:?}");
+        assert_eq!(heard.marked.last(), Some(&synced_line(false)), "{heard:?}");
+        assert_eq!(case.record(), Some(format!("{PRINT} {LOCK}")));
+    }
+
+    #[test]
+    fn a_tool_with_no_lock_runs_no_package_install() {
+        let case = ToolCase::new("user-tool-no-lock");
+        let print = print_of(&[("cli.ts", b"x")], "-");
+
+        let heard = case.run(&[(TOOL, &print)], 0);
+
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        assert_eq!(case.pnpm_calls(), 0, "{heard:?}");
+        assert!(!case.target().join("node_modules").exists());
+    }
+
+    #[test]
+    fn a_failed_package_install_fails_the_push_and_leaves_no_record() {
+        let case = ToolCase::new("user-tool-pnpm-fails");
+        case.seed(".installed-from", format!("{PRINT} {OTHER_LOCK}").as_bytes());
+        let print = print_of(&[("pnpm-lock.yaml", b"lock")], LOCK);
+
+        let heard = case.run(&[(TOOL, &print)], 3);
+
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(case.pnpm_calls(), 1, "{heard:?}");
+        assert_eq!(
+            heard.marked.last(),
+            Some(&format!(
+                "gate-push: failed {TOOL}: pnpm install --frozen-lockfile exited 3: stub said no; gate {ANSWERED} is installed"
+            )),
+            "{heard:?}"
+        );
+        assert_eq!(case.record(), None, "the old record was deleted and no new one written");
+        assert_eq!(
+            fs::read(case.local_app_data.join(r"gate\bin\gate.exe")).expect("gate.exe stays installed"),
+            stand_in()
+        );
+    }
+
+    #[test]
+    fn the_script_refuses_a_user_tool_path_outside_home_and_writes_nothing() {
+        let case = ToolCase::new("user-tool-outside-home");
+        let print = print_of(&[("a.txt", b"one")], "-");
+        let heard = case.run(&[("~/../x", &print)], 0);
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked.last(),
+            Some(&format!(
+                "gate-push: failed ~/../x is not a home-relative folder; gate {ANSWERED} is installed"
+            )),
+            "{heard:?}"
+        );
+        assert!(!case.home.join(".claude").exists(), "nothing was written under home");
+        assert!(!case.folder.join("x").exists(), "nothing was written beside home");
+
+        let escaping = print_of(&[("a.txt", b"one"), ("../y", b"two")], "-");
+        let heard = case.run(&[(TOOL, &escaping)], 0);
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked.last(),
+            Some(&format!(
+                "gate-push: failed {TOOL}: ../y is not a relative path; gate {ANSWERED} was already installed"
+            )),
+            "{heard:?}"
+        );
+        assert!(!case.home.join(".claude").exists(), "nothing was written under home");
+        assert!(!case.folder.join("y").exists());
+    }
+
+    /// Makes `link` a junction to the folder `target`, through pwsh, which needs no privilege for one.
+    fn junction(link: &Path, target: &Path) {
+        let folder = std::env::current_dir().expect("the working folder is read");
+        let pwsh = find_program("pwsh", &Variables::from_process(), &folder).expect("pwsh is on PATH");
+        let command = format!(
+            "New-Item -ItemType Junction -Path '{}' -Target '{}' | Out-Null",
+            link.display(),
+            target.display()
+        );
+        let variables: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        let heard = called(&Call {
+            program: &pwsh,
+            args: vec!["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), command.into()],
+            input: b"",
+            variables: &variables,
+            bound: BOUND,
+        });
+        assert_eq!(heard.end, End::Exited(0), "the junction is made: {heard:?}");
+        assert!(link.is_dir(), "the junction leads to a folder");
+    }
+
+    /// A folder outside the case's home holding `x.js`, and the builder copy's `lib` made a junction to it.
+    fn linked_lib(case: &ToolCase) -> PathBuf {
+        let outside = case.folder.join("outside");
+        fs::create_dir_all(&outside).expect("the outside folder is made");
+        fs::write(outside.join("x.js"), b"outside").expect("the outside file is written");
+        fs::create_dir_all(case.target()).expect("the copy is made");
+        junction(&case.target().join("lib"), &outside);
+        outside
+    }
+
+    #[test]
+    fn the_script_never_deletes_through_a_linked_folder() {
+        let case = ToolCase::new("user-tool-linked-delete");
+        let outside = linked_lib(&case);
+        case.seed(".installed-files", b"lib/x.js\n");
+        let print = print_of(&[("a.txt", b"one")], "-");
+
+        let heard = case.run(&[(TOOL, &print)], 0);
+
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        assert_eq!(fs::read(outside.join("x.js")).expect("the file behind the link stays"), b"outside");
+        assert!(case.target().join("lib").is_dir(), "the link stays");
+    }
+
+    #[test]
+    fn the_script_refuses_to_write_through_a_linked_folder() {
+        let case = ToolCase::new("user-tool-linked-write");
+        let outside = linked_lib(&case);
+        let print = print_of(&[("lib/y.js", b"one")], "-");
+
+        let heard = case.run(&[(TOOL, &print)], 0);
+
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked.last(),
+            Some(&format!(
+                "gate-push: failed {TOOL}: lib is a link on the builder; gate {ANSWERED} is installed"
+            )),
+            "{heard:?}"
+        );
+        assert!(!outside.join("y.js").exists(), "nothing was written behind the link");
+    }
+
+    #[test]
+    fn a_sync_that_fails_after_a_write_lists_what_it_wrote() {
+        let case = ToolCase::new("user-tool-fails-after-a-write");
+        case.seed("old.txt", b"old");
+        case.seed(r"dir\keep.txt", b"kept");
+        case.seed(".installed-files", b"old.txt\n");
+        let print = print_of(&[("a.txt", b"one"), ("dir", b"a file where a folder is")], "-");
+
+        let heard = case.run(&[(TOOL, &print)], 0);
+
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked.last(),
+            Some(&format!(
+                "gate-push: failed {TOOL}: dir is a folder on the builder; gate {ANSWERED} is installed"
+            )),
+            "{heard:?}"
+        );
+        assert_eq!(fs::read(case.target().join("a.txt")).expect("a.txt was written"), b"one");
+        assert_eq!(
+            fs::read_to_string(case.target().join(".installed-files")).expect("the manifest is there"),
+            "a.txt\ndir\nold.txt\n",
+            "the old and the new names"
+        );
+    }
+
+    #[test]
+    fn the_script_mirrors_a_rename_that_changes_only_case() {
+        let case = ToolCase::new("user-tool-case-rename");
+        case.seed("Readme.md", b"old");
+        case.seed(".installed-files", b"Readme.md\n");
+        let print = print_of(&[("README.md", b"new")], "-");
+
+        let heard = case.run(&[(TOOL, &print)], 0);
+
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        // The names as the folder holds them, in their own case.
+        assert_eq!(listed(&case.target()), [".installed-files", ".installed-from", "README.md"], "{heard:?}");
+        assert_eq!(fs::read(case.target().join("README.md")).expect("the file was written"), b"new");
+    }
+
+    #[test]
+    fn the_script_refuses_a_file_path_with_a_control_character() {
+        let case = ToolCase::new("user-tool-control-character");
+        let print = print_of(&[("a.txt", b"one"), ("b\nc.txt", b"two")], "-");
+
+        let heard = case.run(&[(TOOL, &print)], 0);
+
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked.last(),
+            Some(&format!(
+                "gate-push: failed {TOOL}: b c.txt is not a relative path; gate {ANSWERED} is installed"
+            )),
+            "{heard:?}"
+        );
+        assert!(!case.home.join(".claude").exists(), "nothing was written under home");
+    }
+
+    #[test]
+    fn a_push_with_no_user_tools_touches_no_home_folder() {
+        let case = ToolCase::new("user-tool-none");
+
+        let heard = case.run(&[], 0);
+
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        // pwsh keeps its own files under the home it is given; the script makes no tool folder there.
+        assert!(!case.home.join(".claude").exists(), "{heard:?}");
+        assert!(!heard.marked.iter().any(|line| line.starts_with("gate-push: user-tool ")), "{heard:?}");
+    }
+
+    #[test]
+    fn a_user_tool_line_maps_to_the_owners_line() {
+        let text = format!("{TOOL} {} packages installed", &PRINT[..12]);
+        assert_eq!(fact(&format!("gate-push: user-tool {text}")), Some(Fact::UserTool(text.clone())));
+        assert_eq!(
+            said(
+                "b1",
+                "0.2.0",
+                &heard(0, &["gate-push: installed 0.2.0", &format!("gate-push: user-tool {text}")], None),
+                BOUND
+            ),
+            out(&["push: b1: installed gate 0.2.0", &format!("push: b1: user tool {text}")])
+        );
+    }
+
     #[test]
     fn a_helper_that_does_not_match_after_its_move_puts_the_old_one_back() {
         let local_app_data = builder_with("helper-post-move", &[(HELPER_NAME, OLDER_HELPER)]);
@@ -2843,11 +3752,12 @@ mod tests {
         run_lines(prelude, &answering(&sha256_hex(exe), answers), exe, local_app_data)
     }
 
-    /// `script` after `prelude` on the script's line, run as the push line runs it, fed `exe` and [`HELPER`].
+    /// `script` after `prelude` on the script's line, run as the push line runs it, fed `exe`, [`HELPER`] and no user
+    /// tool.
     fn run_lines(prelude: &str, script: &str, exe: &[u8], local_app_data: &Path) -> Heard {
         let script = format!("{prelude}\n{script}");
         run_script_fed(
-            &format!("{}\n{}\n{}", STANDARD.encode(script), gzipped(exe), gzipped(HELPER)),
+            &format!("{}\n{}\n{}\n{}", STANDARD.encode(script), gzipped(exe), gzipped(HELPER), tools_line(&[])),
             local_app_data,
         )
     }
@@ -2879,6 +3789,11 @@ mod tests {
             root: SEAM_ROOT,
             count: 1,
         });
+        answered(&script, answers)
+    }
+
+    /// `script` with its version read standing in for a gate's, as [`answering`]'s does for `answers`.
+    fn answered(script: &str, answers: &[u8]) -> String {
         assert!(script.contains(VER), "the script reads versions with Ver");
         let stand_in = format!(
             "{VER}$h=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($p)))\n\

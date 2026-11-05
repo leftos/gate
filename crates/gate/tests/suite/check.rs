@@ -1273,6 +1273,31 @@ fn check_says_an_unusable_commits_value() {
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
 }
 
+/// A routing file whose `userTools` entry names a folder that is not home-relative.
+const BAD_USER_TOOLS_ROUTING: &str =
+    r#"{"host": "builder-1", "repos": {"app": ["*"]}, "userTools": {"app": [{"path": "tools/x", "commands": ["*"]}]}}"#;
+
+/// A `userTools` value that cannot be used fails the check once, saying why.
+#[test]
+fn check_says_an_unusable_user_tools_value() {
+    let case = repo_case("check_bad_user_tools_value");
+    write_remote_json(&case, BAD_USER_TOOLS_ROUTING);
+
+    let outcome = check(&case, &[], &[]);
+
+    assert_eq!(
+        lines(&outcome.stdout),
+        [
+            format!("check: here: app at {}", root(&case)).as_str(),
+            "check: here: app declares no toolchain",
+            r#"check: here: remote.json: userTools."app"[0].path is not a home-relative folder (~/...): "tools/x""#,
+            "check: here: 1 missing, 0 too old",
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
 /// A routing file whose `ssh` is no absolute path.
 const RELATIVE_SSH_ROUTING: &str = r#"{"host": "builder-1", "repos": {"app": ["*"]}, "ssh": "git\\usr\\bin\\ssh.exe"}"#;
 

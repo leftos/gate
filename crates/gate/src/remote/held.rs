@@ -419,6 +419,8 @@ pub(super) mod tests {
                     .collect(),
                 absent_siblings: Vec::new(),
                 carried_folders_problem: None,
+                user_tools: Vec::new(),
+                user_tools_problem: None,
                 repo: "app".to_owned(),
                 key: "app-1a2b3c4d".to_owned(),
                 subfolder: String::new(),

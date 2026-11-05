@@ -62,6 +62,7 @@ mod tailscale;
 #[cfg(test)]
 mod test_support;
 mod trace;
+mod user_tool;
 mod wait;
 mod warm;
 mod watch;

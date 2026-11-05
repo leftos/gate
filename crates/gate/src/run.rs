@@ -1685,6 +1685,7 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         send: remote.send.as_ref(),
         cross_build: remote.cross_build.as_ref(),
         inputs: &remote.inputs,
+        user_tools: &remote.user_tools,
         desktop: remote.desktop,
         log: log.path(),
         timeout: ceiling,
@@ -5843,8 +5844,9 @@ fn not_here_line(host: &str, reason: FallbackReason, outcome: &RemoteOutcome, no
 
 /// The fallback reasons worth another builder: a builder that is full, busy, cannot be reached, or lacks the version,
 /// parity, install or tools the run needs may be one another builder has. Every other reason runs here, and a desktop
-/// run ends instead: the PC's own failures (`client`, `inputs`, `lfs`, and `push`, a snapshot push that failed other
-/// than as a connection fails) and those of the worktree, the desktop or a lost run.
+/// run ends instead: the PC's own failures (`client`, a copy of a user tool this PC cannot read among them, `inputs`,
+/// `lfs`, and `push`, a snapshot push that failed other than as a connection fails) and those of the worktree, the
+/// desktop or a lost run.
 const RETRIED: [FallbackReason; 7] = [
     FallbackReason::Full,
     FallbackReason::Busy,
@@ -6455,6 +6457,7 @@ mod tests {
                 send: None,
                 desktop: None,
                 inputs: &[],
+                user_tools: &[],
                 log,
                 timeout: 3600,
                 usual: None,

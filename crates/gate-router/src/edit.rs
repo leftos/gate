@@ -297,6 +297,7 @@ fn soft_problems(config: &Config) -> Vec<String> {
         config.builders().err(),
         config.allowed_siblings("").err(),
         config.carried_folders("").err(),
+        config.user_tools("").err(),
         config.warmup_consented("").err(),
         config.allowed_desktop("").err(),
         config.allowed_desktop_session("").err(),
@@ -371,4 +372,23 @@ fn open_item(index: usize, layout: &Layout<'_>, depth: usize, out: &mut String) 
 fn close(layout: &Layout<'_>, depth: usize, out: &mut String) {
     out.push_str(layout.eol);
     out.push_str(&layout.indent.repeat(depth));
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "a fixture that does not read must fail loudly")]
+mod tests {
+    use super::soft_problems;
+    use crate::config::Config;
+
+    #[test]
+    fn soft_problems_lists_an_unusable_user_tools_table() {
+        let config = Config::parse(r#"{"host": "builder-1", "repos": {"g": ["x"]}, "userTools": {"g": [{"path": "a", "commands": ["x"]}]}}"#)
+            .expect("routing reads the file whatever userTools holds");
+        let problem = r#"userTools."g"[0].path is not a home-relative folder (~/...): "a""#;
+        assert!(
+            soft_problems(&config).iter().any(|listed| listed == problem),
+            "{:?}",
+            soft_problems(&config)
+        );
+    }
 }

@@ -2383,6 +2383,7 @@ mod tests {
                 cross_build: None,
                 desktop: None,
                 inputs: &[],
+                user_tools: &[],
                 log,
                 timeout: 60,
                 usual: None,

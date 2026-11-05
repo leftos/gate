@@ -240,6 +240,8 @@ pub(crate) struct RemoteCall<'a> {
     pub cross_build: Option<&'a CrossBuild>,
     /// The input globs the run sends: the repo's `inputs` list, none when it has no entry.
     pub inputs: &'a [String],
+    /// The paths of the user tools the route matched for the command ([`gate_router::RemoteRun::user_tools`]).
+    pub user_tools: &'a [String],
     /// How the run uses the builder's desktop, `None` for not at all, as the route's decision judged it; a warm-up
     /// never does.
     pub desktop: Option<DesktopMode>,
@@ -616,6 +618,7 @@ mod snapshot_only {
                 send: None,
                 desktop: None,
                 inputs: &[],
+                user_tools: &[],
                 log,
                 timeout: 3600,
                 usual: None,

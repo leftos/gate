@@ -729,6 +729,7 @@ fn call_of<'a>(
         send: None,
         desktop: None,
         inputs: &target.inputs,
+        user_tools: &[],
         bring_tracked: &[],
         env: &[],
         log,
