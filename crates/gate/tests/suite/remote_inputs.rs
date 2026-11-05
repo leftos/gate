@@ -18,7 +18,7 @@ use crate::remote_client::{
     CLIENT_IGNORED, HOST, SENT_TEST, Tuned, client_case, client_gate, client_gate_tuned, dotnet_gate, fallbacks, pair_case, sent_build_case,
     sibling_repository, work_folder, write,
 };
-use crate::support::{Case, Go, Outcome, assert_in_order, beside, calls, events, finish, log_texts, shown, ssh_steps, start, write_remote_json};
+use crate::support::{Case, Go, Outcome, assert_in_order, beside, calls, events, finish, git, log_texts, shown, ssh_steps, start, write_remote_json};
 
 /// The case's one input, `/`-separated as its glob matches it, and as the builder's work folder holds it.
 const INPUT: &str = "secrets/keys.json";
@@ -379,6 +379,79 @@ fn a_run_with_no_inputs_after_a_carried_run_deletes_the_carried_copies() {
     );
     assert!(has_line(&log_of(&case, "second.log"), REMOVED), "{plain:?}");
     assert_eq!(carried_markers(&case.root()), Vec::<PathBuf>::new(), "the marker is removed");
+}
+
+/// The file of the submodule case's initialized submodule, `/`-separated below the worktree, and as the builder's work
+/// folder holds it.
+const SHARED: &str = "tools/shared/shared.txt";
+const SHARED_ON_DISK: &str = r"tools\shared\shared.txt";
+
+/// A client case, its repo given no input globs, whose `tools/shared` is an initialized submodule: a repository of its
+/// own holding a committed [`SHARED`], declared in the case's `.gitmodules` and added to it as a gitlink.
+fn submodule_case(name: &str) -> Case {
+    let case = client_case(name);
+    write(&case, SHARED, "shared");
+    git(&case, &["-C", "tools/shared", "init", "--quiet"]);
+    git(&case, &["-C", "tools/shared", "add", "shared.txt"]);
+    git(&case, &["-C", "tools/shared", "commit", "--quiet", "-m", "shared"]);
+    write(
+        &case,
+        ".gitmodules",
+        "[submodule \"tools/shared\"]\n\tpath = tools/shared\n\turl = ./shared\n",
+    );
+    git(&case, &["add", "tools/shared", ".gitmodules"]);
+    case
+}
+
+#[test]
+fn a_routed_run_carries_an_initialized_submodule_s_files() {
+    let case = submodule_case("client-inputs-submodule");
+    let first = ssh_steps(&case, "first", &["ok"; 4]);
+
+    let carried = finish(client_gate(&case, "first.log", &first, &RAN));
+
+    assert_eq!(carried.code, Some(0), "{carried:?}");
+    assert_eq!(
+        calls(&first),
+        ["preflight", "inputs", "inputs", "run"],
+        "the diff, then the put: {carried:?}"
+    );
+    assert!(carried.stdout.contains("ran"), "{carried:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+    let on_box = work_folder(&case).join(SHARED_ON_DISK);
+    assert_eq!(fs::read_to_string(&on_box).ok().as_deref(), Some("shared"), "{carried:?}");
+    let said = log_of(&case, "first.log");
+    assert!(has_line(&said, "gate: inputs: submodule tools/shared: 1 file sent as inputs"), "{said}");
+
+    fs::remove_file(case.folder().join(SHARED_ON_DISK)).expect("the submodule's file can be deleted");
+    let second = run_kept(&case, "second", &["ok", "ok"]);
+
+    let emptied = finish(client_gate(&case, "second.log", &second, &RAN));
+
+    assert_eq!(emptied.code, Some(0), "{emptied:?}");
+    assert_eq!(
+        calls(&second),
+        ["preflight", "inputs", "run"],
+        "the diff of an empty manifest alone: {emptied:?}"
+    );
+    assert!(!on_box.exists(), "the deleted file is gone on the box: {emptied:?}");
+    assert!(has_line(&log_of(&case, "second.log"), REMOVED), "{emptied:?}");
+}
+
+#[test]
+fn a_routed_run_whose_submodule_files_pass_the_inputs_budget_falls_back_after_the_diff() {
+    let case = submodule_case("client-inputs-submodule-budget");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+    let tuned = Tuned {
+        extra: &["--test-remote-inputs-budget-bytes", "1"],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &RAN));
+
+    assert_eq!(calls(&steps), ["preflight", "inputs"], "the diff alone");
+    let why = "the inputs the builder needs hold 6 bytes, more than one put carries (1 bytes)";
+    assert_fell_back(&case, &outcome, "out.log", why);
 }
 
 #[test]

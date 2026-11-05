@@ -4,29 +4,32 @@
 //! case, as output globs are, with the inputs' own exclusions: any `.git*` path, a `.lfsconfig`, a `.env`, `*.env`,
 //! `.env.<name>` or `.envrc` file, the gate's own archives and stages under `.tmp` (named for the work folder's key) and
 //! the run's own log and `.err` file are never sent. A match git does not report ignored is in the snapshot, and one
-//! inside a folder holding a `.git` of its own is another repository's; each is skipped with a line.
+//! inside a folder holding a `.git` of its own is another repository's; each is skipped with a line. A single repo's
+//! run also carries the files of each initialized submodule its `.gitmodules` lists, as git lists them there, at their
+//! paths below the worktree root.
 
-use std::cell::Cell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::cell::{Cell, OnceCell};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
-use std::os::windows::fs::{FileExt, OpenOptionsExt};
+use std::os::windows::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gate_inputs::manifest::tree_split;
+use gate_inputs::manifest::{refused_path, tree_split};
+use gate_inputs::names::{is_git_s, is_plain_path};
 use gate_router::{BuilderOs, CARRIED_INPUT, PAIR_CAPS, escaped, work_folder_key};
 use gate_state::{FallbackReason, v1};
 use gate_win32::Interrupt;
 use gate_wire::layout_text;
 use sha2::{Digest, Sha256};
-use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_DELETE_ON_CLOSE, FILE_SHARE_READ};
+use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_DELETE_ON_CLOSE, FILE_SHARE_READ};
 
 use super::channel;
 use super::client::{Attempt, Called, End, RawSink, Sent, Watch};
-use super::git::{Call, Git, GitBounds, GitError, git_failure};
+use super::git::{Call, Git, GitBounds, GitError, OUTPUT_CAP, git_failure};
 use super::outputs::{Archive, DELETE, GENERIC_WRITE, Unbuilt, sha256_for};
 use super::payload::{self, InputsStep, Location};
 use super::watchdog::{self, Cut};
@@ -35,7 +38,7 @@ use crate::outputs::cache::{HashCache, file_time_now};
 use crate::outputs::glob::Globs;
 use crate::outputs::hash::sha256_of;
 use crate::outputs::manifest::{Chosen, HeldBy, MANIFEST_LIMIT, Manifest, Wrote, build_manifest_with};
-use crate::outputs::walk::{Found, in_context, walk};
+use crate::outputs::walk::{Found, in_context, stamp_of, walk};
 
 /// The most files one put carries: the archive's member limit.
 pub(super) const MEMBERS: usize = 50_000;
@@ -123,7 +126,7 @@ pub(super) enum Marking {
     /// Nothing: the step carried no path a command named, or it is a sibling pair's, whose pair inputs marker sweeps
     /// the paths it carried ([`pair_marked`]).
     Leave,
-    /// Writes the marker: a single repo's step carried a path a command named.
+    /// Writes the marker: a single repo's step carried a path a command named, or an initialized submodule's files.
     Write,
     /// Removes the marker and the inputs hash cache: the step was the empty manifest that removed the carried copies.
     Clear,
@@ -133,21 +136,64 @@ pub(super) enum Marking {
     Swept,
 }
 
+/// What a single repo's run sends for its inputs ([`single`]): the manifest built, or none, with the lines its build
+/// said.
+enum Single {
+    Built(Built),
+    None(Vec<String>),
+}
+
+/// The inputs of a single repo's run `asked` names: its initialized submodules' files ([`submodules`]) beside its globs'
+/// files ([`built`]), git found once for both; none, with the lines said, when it has no globs and no submodule file is
+/// carried. [`Unbuilt::Interrupted`] once `go_on` says no or git was interrupted; else why the manifest is not sent,
+/// a set with the submodule files past a cap among them.
+fn single(asked: &Asked<'_>, go_on: impl Fn() -> bool) -> Result<Single, Unbuilt> {
+    let finder = Finder::new(asked.root);
+    let carried = submodules(asked, &finder, &go_on)?;
+    if asked.globs.is_empty() && carried.sent.is_empty() {
+        return Ok(Single::None(carried.said));
+    }
+    built(asked, &finder, &carried, &go_on).map(Single::Built)
+}
+
+/// git found for one build at most once, when a step first asks for it.
+struct Finder<'a> {
+    root: &'a Path,
+    git: OnceCell<Result<Git, String>>,
+}
+
+impl<'a> Finder<'a> {
+    fn new(root: &'a Path) -> Finder<'a> {
+        Finder { root, git: OnceCell::new() }
+    }
+
+    /// git, found along the gate's own `PATH` read against the root the first time; else why it cannot be found.
+    fn git(&self) -> Result<&Git, String> {
+        self.git.get_or_init(|| Git::find(self.root)).as_ref().map_err(Clone::clone)
+    }
+}
+
 /// The inputs manifest `asked` names: the matched files git reports ignored, outside any folder holding a `.git` of its
-/// own, each hashed once its stamp is read through its handle, or taking the hash the inputs hash cache holds at that
-/// stamp; `go_on` is asked before each file and each read. The cache the build leaves is saved, unless it equals the
-/// one it read. A set past `asked`'s caps is refused. [`Unbuilt::Interrupted`] once `go_on` says no or git was
-/// interrupted; else why the globs, the walk, git or a file failed, or why the set is not sent.
-pub(super) fn built(asked: &Asked<'_>, go_on: impl Fn() -> bool) -> Result<Built, Unbuilt> {
-    let Picked { kept, said, marking } = picked(asked)?;
-    if kept.len() > asked.caps.members {
-        return Err(Unbuilt::Failed(past_members(kept.len(), asked.caps.members)));
-    }
-    let manifest = hashed(asked, &kept, go_on).map_err(Unmade::unbuilt)?;
-    let line = manifest.line();
-    if line.len() > asked.caps.manifest {
-        return Err(Unbuilt::Failed(PAST_THE_CAP.to_owned()));
-    }
+/// own, with the `carried` files of the worktree's initialized submodules ([`with_submodules`]), each hashed once its
+/// stamp is read through its handle, or taking the hash the inputs hash cache holds at that stamp; `go_on` is asked
+/// before each file and each read. The cache the build leaves is saved, unless it equals the one it read. A set past
+/// `asked`'s caps is refused: the globbed files alone as they always were, and the set with the submodule files only
+/// when the globbed ones alone fit. [`Unbuilt::Interrupted`] once `go_on` says no or git was interrupted; else why the
+/// globs, the walk, git or a file failed, or why the set is not sent.
+fn built(asked: &Asked<'_>, finder: &Finder<'_>, carried: &Carried, go_on: &impl Fn() -> bool) -> Result<Built, Unbuilt> {
+    let mut picked = if asked.globs.is_empty() {
+        Picked::none()
+    } else {
+        picked(asked, finder)?
+    };
+    let merged = with_submodules(asked, &mut picked, carried, go_on)?;
+    let Picked { kept, said, marking, .. } = picked;
+    let (manifest, line, kept, marking) = if let Some((manifest, line, files)) = merged {
+        (manifest, line, files, Marking::Write)
+    } else {
+        let (manifest, line) = globbed_manifest(asked, &kept, go_on)?;
+        (manifest, line, kept, marking)
+    };
     let (digest, _) = sha256_of(line.trim_end_matches('\n').as_bytes()).map_err(|error| Unbuilt::Failed(error.to_string()))?;
     Ok(Built {
         line,
@@ -160,12 +206,120 @@ pub(super) fn built(asked: &Asked<'_>, go_on: impl Fn() -> bool) -> Result<Built
     })
 }
 
+/// The manifest of the globbed files `kept` alone ([`hashed`]) and its line, refused past `asked`'s member cap or its
+/// manifest's cap.
+fn globbed_manifest(asked: &Asked<'_>, kept: &[Found], go_on: &impl Fn() -> bool) -> Result<(Manifest, String), Unbuilt> {
+    if kept.len() > asked.caps.members {
+        return Err(Unbuilt::Failed(past_members(kept.len(), asked.caps.members)));
+    }
+    let manifest = hashed(asked, kept, go_on).map_err(Unmade::unbuilt)?;
+    let line = manifest.line();
+    if line.len() > asked.caps.manifest {
+        return Err(Unbuilt::Failed(PAST_THE_CAP.to_owned()));
+    }
+    Ok((manifest, line))
+}
+
+/// Why a set with submodule files whose manifest would pass the box's cap is not sent.
+const SUBMODULES_PAST_THE_MANIFEST: &str = "the submodules' files would make the inputs manifest larger than the box takes (64 MiB)";
+
+/// The manifest of the globbed files `picked` chose with the `carried` submodule files, its line, and those files,
+/// ordered by path, the submodules' lines said into `picked`'s ([`said_carried`]); `None` when none is carried. A set
+/// past a cap is refused, so the run stays here rather than run on the builder without the submodules: the members
+/// before any file is hashed, then the manifest's line as built, each blamed on the globbed files when they alone pass
+/// it ([`past_members`], [`PAST_THE_CAP`]) and on the submodules' files only when the globbed ones alone fit.
+/// [`Unbuilt::Interrupted`] once `go_on` says no; else why a file could not be hashed.
+fn with_submodules(
+    asked: &Asked<'_>,
+    picked: &mut Picked,
+    carried: &Carried,
+    go_on: &impl Fn() -> bool,
+) -> Result<Option<(Manifest, String, Vec<Found>)>, Unbuilt> {
+    picked.said.extend(carried.said.iter().cloned());
+    if carried.sent.is_empty() {
+        return Ok(None);
+    }
+    let cap = asked.caps.members;
+    if picked.kept.len() > cap {
+        return Err(Unbuilt::Failed(past_members(picked.kept.len(), cap)));
+    }
+    // `outside_nested` drops every globbed file inside a folder holding a `.git`, so the two sets share no path.
+    let mut files = std::mem::take(&mut picked.kept);
+    files.extend(carried.found.iter().cloned());
+    files.sort_by(|first, second| first.path.cmp(&second.path));
+    if files.len() > cap {
+        return Err(Unbuilt::Failed(format!(
+            "{} files with the submodules' files, more than one put carries ({cap})",
+            files.len()
+        )));
+    }
+    let line = match hashed(asked, &files, go_on) {
+        Ok(manifest) => Some((manifest.line(), manifest)),
+        Err(Unmade::Capped(_)) => None,
+        Err(Unmade::Unbuilt(unbuilt)) => return Err(unbuilt),
+    };
+    let Some((line, manifest)) = line.filter(|(line, _)| line.len() <= asked.caps.manifest) else {
+        return Err(past_the_manifest(asked, &files, carried, go_on));
+    };
+    said_carried(&mut picked.said, carried, &picked.nested);
+    Ok(Some((manifest, line, files)))
+}
+
+/// Why the set `files` with the `carried` submodule files, whose manifest passes `asked`'s cap, is not sent: the
+/// globbed files' own refusal when they alone pass it ([`globbed_manifest`]), else [`SUBMODULES_PAST_THE_MANIFEST`];
+/// the interrupt, or why a globbed file could not be hashed, as it is.
+fn past_the_manifest(asked: &Asked<'_>, files: &[Found], carried: &Carried, go_on: &impl Fn() -> bool) -> Unbuilt {
+    let submodule: HashSet<&str> = carried.found.iter().map(|file| file.path.as_str()).collect();
+    let globbed: Vec<Found> = files.iter().filter(|file| !submodule.contains(file.path.as_str())).cloned().collect();
+    match globbed_manifest(asked, &globbed, go_on) {
+        Ok(_) => Unbuilt::Failed(SUBMODULES_PAST_THE_MANIFEST.to_owned()),
+        Err(unbuilt) => unbuilt,
+    }
+}
+
+/// Says into `said` each submodule `carried` sends, with its count of files; and drops the line saying a folder is
+/// another repository, the folder `nested` names spelled as the disk does and matched to the submodule's path without
+/// regard to ASCII case, when every globbed file `nested` says was dropped there is among the carried files, so the
+/// line stays while a globbed file there is still not sent.
+fn said_carried(said: &mut Vec<String>, carried: &Carried, nested: &BTreeMap<String, Vec<String>>) {
+    let sent: HashSet<String> = carried.found.iter().map(|file| file.path.to_ascii_lowercase()).collect();
+    for (folder, files) in &carried.sent {
+        let covered = nested
+            .iter()
+            .filter(|(spelled, _)| spelled.eq_ignore_ascii_case(folder))
+            .filter(|(_, dropped)| dropped.iter().all(|path| sent.contains(&path.to_ascii_lowercase())));
+        for (spelled, _) in covered {
+            let line = another_repository(spelled);
+            said.retain(|said| *said != line);
+        }
+        let plural = if *files == 1 { "" } else { "s" };
+        said.push(format!(
+            "gate: inputs: submodule {}: {files} file{plural} sent as inputs",
+            escaped(folder)
+        ));
+    }
+}
+
 /// The files `asked`'s globs choose before any is hashed: the matched files git reports ignored, outside any folder
 /// holding a `.git` of its own; the log-only lines the choice said; and what its landing does with the carried marker.
 struct Picked {
     kept: Vec<Found>,
     said: Vec<String>,
     marking: Marking,
+    /// Each folder holding a `.git` of its own that a glob matched into, with the matched files it holds, none sent.
+    nested: BTreeMap<String, Vec<String>>,
+}
+
+impl Picked {
+    /// What a run with no globs chooses: nothing.
+    fn none() -> Picked {
+        Picked {
+            kept: Vec::new(),
+            said: Vec::new(),
+            marking: Marking::Leave,
+            nested: BTreeMap::new(),
+        }
+    }
 }
 
 /// Why a manifest's files were not hashed: past a cap, its line kept apart from every other failure so a caller tells
@@ -187,7 +341,7 @@ impl Unmade {
 
 /// The files `asked` chooses ([`Picked`]): [`Unbuilt::Interrupted`] once git was interrupted; else why the globs, the
 /// walk or git failed, or the path a command named that could not be sent.
-fn picked(asked: &Asked<'_>) -> Result<Picked, Unbuilt> {
+fn picked(asked: &Asked<'_>, finder: &Finder<'_>) -> Result<Picked, Unbuilt> {
     let excluded = exclusions(asked.root, asked.key, asked.log);
     let own = regex::Regex::new(&excluded).map_err(|error| Unbuilt::Failed(error.to_string()))?;
     // A carried path the exclusions match, such as the run's own log, is neither sent nor reported missing.
@@ -211,12 +365,8 @@ fn picked(asked: &Asked<'_>) -> Result<Picked, Unbuilt> {
     }
     let mut said = unmatched(&asked_globs, &globs, &found);
     let (found, nested) = outside_nested(asked.root, found);
-    said.extend(
-        nested
-            .iter()
-            .map(|folder| format!("gate: inputs: {} is another repository; not sent as an input", escaped(folder))),
-    );
-    let ignored = ignored(asked, &found)?;
+    said.extend(nested.keys().map(|folder| another_repository(folder)));
+    let ignored = ignored(asked, finder, &found)?;
     let (kept, tracked): (Vec<Found>, Vec<Found>) = found.into_iter().partition(|file| ignored.contains(&file.path));
     said.extend(
         tracked
@@ -228,7 +378,300 @@ fn picked(asked: &Asked<'_>) -> Result<Picked, Unbuilt> {
     } else {
         Marking::Leave
     };
-    Ok(Picked { kept, said, marking })
+    Ok(Picked { kept, said, marking, nested })
+}
+
+/// The line saying the files of `folder`, which holds a `.git` of its own, are not sent.
+fn another_repository(folder: &str) -> String {
+    format!("gate: inputs: {} is another repository; not sent as an input", escaped(folder))
+}
+
+/// The files a run carries from its worktree's initialized submodules ([`submodules`]): each file, its path below the
+/// worktree root; the log-only lines the look said; and each submodule carried, its path and its count of files.
+#[derive(Default)]
+struct Carried {
+    found: Vec<Found>,
+    said: Vec<String>,
+    sent: Vec<(String, usize)>,
+}
+
+/// The files of the initialized submodules of `asked`'s worktree ([`Carried`]), git found through `finder`. None, and no
+/// git process started, when its `.gitmodules` is not a regular file; else each path `git config` lists there, of a
+/// form the gate carries ([`carried_form`]) and a gitlink in the index at that very spelling ([`gitlinks`]), whose
+/// folder is a real one holding a `.git` entry: its files ([`submodule_files`]). A path of another form, or one through
+/// a link, is said and passed over. [`Unbuilt::Interrupted`] once `go_on` says no or git was interrupted; else why git
+/// cannot be found, or the `.gitmodules`, the index or a submodule cannot be read, which keeps the run here.
+fn submodules(asked: &Asked<'_>, finder: &Finder<'_>, go_on: &impl Fn() -> bool) -> Result<Carried, Unbuilt> {
+    let mut carried = Carried::default();
+    let unread = |why: String| Unbuilt::Failed(format!(".gitmodules cannot be read: {why}"));
+    if !gitmodules_at(asked.root).map_err(unread)? {
+        return Ok(carried);
+    }
+    let git = finder.git().map_err(|why| Unbuilt::Failed(format!("git cannot be found: {why}")))?;
+    let paths = submodule_paths(git, asked).map_err(|unbuilt| unbuilt.failed_as(unread))?;
+    let (paths, refused): (Vec<String>, Vec<String>) = paths.into_iter().partition(|path| carried_form(path));
+    carried.said.extend(refused.iter().map(|path| not_carried(path)));
+    let linked = gitlinks(git, asked, &paths)
+        .map_err(|unbuilt| unbuilt.failed_as(|why| Unbuilt::Failed(format!("the index's submodules cannot be read: {why}"))))?;
+    let excluded = regex::Regex::new(&exclusions(asked.root, asked.key, asked.log)).map_err(|error| Unbuilt::Failed(error.to_string()))?;
+    let look = Look {
+        git,
+        asked,
+        excluded: &excluded,
+        go_on,
+    };
+    for path in paths.iter().filter(|path| linked.contains(*path)) {
+        carry(&look, path, &mut carried)?;
+    }
+    Ok(carried)
+}
+
+/// Whether `root` holds a `.gitmodules` that is a regular file, read without following a link: `false` when there is none,
+/// or it is anything else. Else why it cannot be read.
+fn gitmodules_at(root: &Path) -> Result<bool, String> {
+    Ok(entry_at(&root.join(".gitmodules"))?.is_some_and(|metadata| metadata.is_file()))
+}
+
+/// What each submodule is looked at with: git, the run's `asked`, the inputs' exclusions at the worktree root, and the
+/// run's `go_on`.
+struct Look<'a> {
+    git: &'a Git,
+    asked: &'a Asked<'a>,
+    excluded: &'a regex::Regex,
+    go_on: &'a dyn Fn() -> bool,
+}
+
+impl Unbuilt {
+    /// This failure with its reason made over by `as_failed`; the interrupt as it is.
+    fn failed_as(self, as_failed: impl FnOnce(String) -> Unbuilt) -> Unbuilt {
+        match self {
+            Unbuilt::Failed(why) => as_failed(why),
+            Unbuilt::Interrupted => Unbuilt::Interrupted,
+        }
+    }
+}
+
+/// The line of a `.gitmodules` path the gate does not carry.
+fn not_carried(path: &str) -> String {
+    format!("gate: inputs: submodule path {} is not one the gate carries; not sent", escaped(path))
+}
+
+/// Adds to `carried` the files of the submodule at the `.gitmodules` path `path`, when its folder is a real one holding
+/// a `.git` entry ([`submodule_folder`]): nothing for an uninitialized one, its line for one through a link, a junction
+/// or a file. [`Unbuilt::Interrupted`] once `look`'s `go_on` says no or git was interrupted; else why it cannot be
+/// listed.
+fn carry(look: &Look<'_>, path: &str, carried: &mut Carried) -> Result<(), Unbuilt> {
+    let unlisted = |why: String| Unbuilt::Failed(format!("submodule {} cannot be listed: {why}", escaped(path)));
+    let folder = match submodule_folder(look.asked.root, path).map_err(unlisted)? {
+        Placed::Absent => return Ok(()),
+        Placed::Refused => {
+            carried.said.push(not_carried(path));
+            return Ok(());
+        }
+        Placed::Ready(folder) => folder,
+    };
+    let files = submodule_files(look, &folder, path, &mut carried.said).map_err(|unbuilt| unbuilt.failed_as(unlisted))?;
+    if !files.is_empty() {
+        carried.sent.push((path.to_owned(), files.len()));
+        carried.found.extend(files);
+    }
+    Ok(())
+}
+
+/// What git wrote, as text; else that it is not UTF-8.
+fn utf8(output: Vec<u8>) -> Result<String, Unbuilt> {
+    String::from_utf8(output).map_err(|_| Unbuilt::Failed("git's output is not UTF-8".to_owned()))
+}
+
+/// Each path the `.gitmodules` at `asked`'s root gives a submodule, once each, sorted, read by one `git config` call
+/// bounded as the run's git calls are; none when git finds no such key (status 1); else the interrupt, or why git
+/// failed.
+fn submodule_paths(git: &Git, asked: &Asked<'_>) -> Result<BTreeSet<String>, Unbuilt> {
+    let args = ["config", "-z", "-f", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"];
+    let call = Call {
+        interrupt: asked.interrupt,
+        ..Call::bounded(asked.root, &args, asked.bounds)
+    };
+    let (status, output, errors) = git.status_within(&call, OUTPUT_CAP).map_err(super::lfs::unbuilt)?;
+    match status.code() {
+        Some(0) => {}
+        Some(1) => return Ok(BTreeSet::new()),
+        code => return Err(Unbuilt::Failed(git_failure(code, &errors))),
+    }
+    // `-z` writes each entry as its key, a line feed and its value, ended by a NUL; a key with no value has no line feed.
+    Ok(utf8(output)?
+        .split('\0')
+        .filter_map(|entry| entry.split_once('\n'))
+        .map(|(_, value)| value.to_owned())
+        .collect())
+}
+
+/// The mode git's index gives a submodule: a gitlink.
+const GITLINK: &str = "160000";
+
+/// Those of `paths` the index at `asked`'s root holds as a gitlink at that very spelling, read by one bounded
+/// `git ls-files --stage` call naming them as literal paths; none, and no git process started, when `paths` is empty.
+/// Else the interrupt, or why git failed.
+fn gitlinks(git: &Git, asked: &Asked<'_>, paths: &[String]) -> Result<HashSet<String>, Unbuilt> {
+    if paths.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut args = vec!["--literal-pathspecs", "-c", "core.quotepath=off", "ls-files", "-z", "--stage", "--"];
+    args.extend(paths.iter().map(String::as_str));
+    let call = Call {
+        interrupt: asked.interrupt,
+        ..Call::bounded(asked.root, &args, asked.bounds)
+    };
+    let listed = utf8(git.output_bytes(&call).map_err(super::lfs::unbuilt)?)?;
+    // Each entry is `<mode> <object> <stage>\t<path>`, ended by a NUL.
+    Ok(listed
+        .split('\0')
+        .filter_map(|entry| entry.split_once('\t'))
+        .filter(|(staged, _)| staged.split(' ').next() == Some(GITLINK))
+        .map(|(_, path)| path.to_owned())
+        .collect())
+}
+
+/// Where a submodule's `.gitmodules` path leads in the worktree.
+#[derive(Debug, PartialEq, Eq)]
+enum Placed {
+    /// No folder there, or one holding no `.git` entry: an uninitialized submodule.
+    Absent,
+    /// A path through a link, a junction or a file.
+    Refused,
+    /// A real folder holding a `.git` entry: an initialized submodule, its full path.
+    Ready(PathBuf),
+}
+
+/// Whether `metadata` is of a link or a junction, or of anything else Windows reparses.
+fn reparsed(metadata: &fs::Metadata) -> bool {
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// The metadata of `path`, read without following a link; `None` when nothing is there. Else why it cannot be read.
+fn entry_at(path: &Path) -> Result<Option<fs::Metadata>, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(in_context(path, &error).to_string()),
+    }
+}
+
+/// Where the submodule at the `.gitmodules` path `path` below `root` leads ([`Placed`]), each folder on the way read
+/// without following a link or a junction; else why a folder on the way, or its `.git` entry, cannot be read.
+fn submodule_folder(root: &Path, path: &str) -> Result<Placed, String> {
+    let mut folder = root.to_path_buf();
+    for part in path.split('/') {
+        folder.push(part);
+        let Some(metadata) = entry_at(&folder)? else {
+            return Ok(Placed::Absent);
+        };
+        if reparsed(&metadata) || !metadata.is_dir() {
+            return Ok(Placed::Refused);
+        }
+    }
+    Ok(match entry_at(&folder.join(".git"))? {
+        Some(_) => Placed::Ready(folder),
+        None => Placed::Absent,
+    })
+}
+
+/// Whether the `.gitmodules` path `path` is one the gate carries, by the rules the box reads a manifest's paths with:
+/// plain ([`is_plain_path`]: relative, within the depth limit, each part a name Windows keeps as it is) and with no
+/// `.git*` part, 8.3 aliases included ([`is_git_s`]).
+fn carried_form(path: &str) -> bool {
+    is_plain_path(path) && !is_git_s(path)
+}
+
+/// The files of the initialized submodule at `folder`, its `.gitmodules` path `path`, that git lists there, tracked and
+/// untracked but not ignored, each looked at in turn ([`looked_at`]), `look`'s `go_on` asked before each, its path
+/// below the worktree root spelled as git lists it; each nested submodule's line said into `said`. [`Unbuilt::Interrupted`]
+/// once `go_on` says no or git was interrupted; else why git failed, or a file or a folder cannot be read.
+fn submodule_files(look: &Look<'_>, folder: &Path, path: &str, said: &mut Vec<String>) -> Result<Vec<Found>, Unbuilt> {
+    let args = ["-c", "core.quotepath=off", "ls-files", "-z", "--cached", "--others", "--exclude-standard"];
+    let call = Call {
+        interrupt: look.asked.interrupt,
+        ..Call::bounded(folder, &args, look.asked.bounds)
+    };
+    let listed = utf8(look.git.output_bytes(&call).map_err(super::lfs::unbuilt)?)?;
+    // A file in conflict is listed once per stage.
+    let listed: BTreeSet<&str> = listed.split('\0').filter(|file| !file.is_empty()).collect();
+    let mut plain = HashMap::new();
+    let mut found = Vec::new();
+    for file in listed {
+        if !(look.go_on)() {
+            return Err(Unbuilt::Interrupted);
+        }
+        let below = format!("{path}/{file}");
+        if !sendable(&below, look.excluded) {
+            continue;
+        }
+        match looked_at(folder, below, file, &mut plain).map_err(Unbuilt::Failed)? {
+            Looked::File(file) => found.push(file),
+            Looked::Nested(below) => said.push(format!("gate: inputs: submodule {} is inside a submodule; not carried", escaped(&below))),
+            Looked::Passed => {}
+        }
+    }
+    Ok(found)
+}
+
+/// What an entry git lists in a submodule is ([`looked_at`]).
+enum Looked {
+    /// A regular file, as an input.
+    File(Found),
+    /// A folder holding a `.git` entry, a submodule of the submodule, at its path below the worktree.
+    Nested(String),
+    /// Gone, below a folder that is not a plain one, a link, or anything else: passed over.
+    Passed,
+}
+
+/// What the entry git lists at `file` in the submodule at `folder`, at `below` the worktree, is ([`Looked`]), each
+/// folder on its way judged once, kept in `plain`, and every entry read without following a link. Else why it, its
+/// `.git` entry or a folder on its way cannot be read.
+fn looked_at(folder: &Path, below: String, file: &str, plain: &mut HashMap<String, bool>) -> Result<Looked, String> {
+    if !plain_folders(folder, file, plain)? {
+        return Ok(Looked::Passed);
+    }
+    let full = file.split('/').fold(folder.to_path_buf(), |full, part| full.join(part));
+    let Some(metadata) = entry_at(&full)?.filter(|metadata| !reparsed(metadata)) else {
+        return Ok(Looked::Passed);
+    };
+    if metadata.is_file() {
+        return Ok(Looked::File(Found {
+            path: below,
+            full,
+            stamp: stamp_of(&metadata),
+        }));
+    }
+    let nested = metadata.is_dir() && entry_at(&full.join(".git"))?.is_some();
+    Ok(if nested { Looked::Nested(below) } else { Looked::Passed })
+}
+
+/// Whether the path `below` the worktree is one the box takes in a manifest and the inputs' exclusions `excluded` do not
+/// match.
+fn sendable(below: &str, excluded: &regex::Regex) -> bool {
+    refused_path(below).is_none() && !excluded.is_match(below)
+}
+
+/// Whether each folder from the submodule at `folder` down to the parent of its file `file` is a plain folder, not a
+/// link, a junction or gone; each folder judged once, its answer kept in `plain` by its path below `folder`. Else why a
+/// folder on the way cannot be read.
+fn plain_folders(folder: &Path, file: &str, plain: &mut HashMap<String, bool>) -> Result<bool, String> {
+    for (end, _) in file.match_indices('/') {
+        let below = file.get(..end).unwrap_or(file);
+        let is_plain = if let Some(known) = plain.get(below) {
+            *known
+        } else {
+            let full = below.split('/').fold(folder.to_path_buf(), |full, part| full.join(part));
+            let judged = entry_at(&full)?.is_some_and(|metadata| metadata.is_dir() && !reparsed(&metadata));
+            plain.insert(below.to_owned(), judged);
+            judged
+        };
+        if !is_plain {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Why an inputs manifest past its cap is not sent.
@@ -295,7 +738,7 @@ pub(super) fn built_pair(trees: &[PairTree<'_>], asked: &PairAsked<'_>, go_on: i
     let mut chosen = Vec::new();
     let mut members = 0_usize;
     for tree in trees.iter().filter(|tree| !tree.globs.is_empty()) {
-        let picked = picked(&tree.asked(asked)).map_err(|unbuilt| match unbuilt {
+        let picked = picked(&tree.asked(asked), &Finder::new(tree.root)).map_err(|unbuilt| match unbuilt {
             Unbuilt::Failed(why) => tree.failed(&why),
             Unbuilt::Interrupted => Unbuilt::Interrupted,
         })?;
@@ -442,20 +885,19 @@ fn unmatched(asked: &[String], globs: &Globs, found: &[Found]) -> Vec<String> {
 }
 
 /// `found` without each file inside a folder below `root` that holds a `.git` of its own, a submodule or a nested
-/// repository, which git cannot be asked about; and those folders, each the outermost such one, once each, in order.
-fn outside_nested(root: &Path, found: Vec<Found>) -> (Vec<Found>, Vec<String>) {
+/// repository, which git cannot be asked about; and those folders, each the outermost such one, in order, with the paths
+/// of the files dropped inside it.
+fn outside_nested(root: &Path, found: Vec<Found>) -> (Vec<Found>, BTreeMap<String, Vec<String>>) {
     let mut known = HashMap::new();
-    let mut nested = BTreeSet::new();
+    let mut nested: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut kept = Vec::new();
     for file in found {
         match nested_folder(root, &file.path, &mut known) {
-            Some(folder) => {
-                nested.insert(folder);
-            }
+            Some(folder) => nested.entry(folder).or_default().push(file.path),
             None => kept.push(file),
         }
     }
-    (kept, nested.into_iter().collect())
+    (kept, nested)
 }
 
 /// The outermost folder of the `/`-separated `path` below `root` that holds a `.git` entry, each folder looked at once
@@ -477,11 +919,11 @@ pub(crate) fn nested_folder(root: &Path, path: &str, known: &mut HashMap<String,
 /// The paths of `found` that `git check-ignore` reports ignored in `asked`'s worktree, the global excludes and
 /// `.git/info/exclude` included and a tracked file never; else the interrupt, or why git failed, its status and the
 /// last lines it wrote on standard error.
-fn ignored(asked: &Asked<'_>, found: &[Found]) -> Result<HashSet<String>, Unbuilt> {
+fn ignored(asked: &Asked<'_>, finder: &Finder<'_>, found: &[Found]) -> Result<HashSet<String>, Unbuilt> {
     if found.is_empty() {
         return Ok(HashSet::new());
     }
-    let git = Git::find(asked.root).map_err(Unbuilt::Failed)?;
+    let git = finder.git().map_err(Unbuilt::Failed)?;
     let input: Vec<u8> = found.iter().flat_map(|file| file.path.bytes().chain([0])).collect();
     let args = ["check-ignore", "-z", "--stdin"];
     let call = Call {
@@ -536,8 +978,9 @@ pub(super) fn run_refused(attempt: &mut Attempt<'_, '_>) -> End {
     refused(attempt, NOT_HELD)
 }
 
-/// The inputs manifest of `attempt`'s run, its lines logged. A run with no input globs sends the empty manifest when
-/// an earlier run's carried copies are to be removed ([`emptied`]), else none. A sibling pair's run sends each repo's
+/// The inputs manifest of `attempt`'s run, its lines logged: its globs' files and its initialized submodules' files
+/// ([`single`]). A run with no input globs and no submodule file carried sends the empty manifest when an earlier run's
+/// carried copies are to be removed ([`emptied`]), else none. A sibling pair's run sends each repo's
 /// inputs in its own tree ([`pair_sent`]), on a Windows builder only ([`pair_inputs`]). A manifest that cannot be built
 /// or is past a cap refuses the route `inputs` before anything is sent.
 pub(super) fn sent(attempt: &mut Attempt<'_, '_>) -> Result<Option<Built>, End> {
@@ -550,9 +993,6 @@ pub(super) fn sent(attempt: &mut Attempt<'_, '_>) -> Result<Option<Built>, End> 
             PairInputs::Refused(why) => Err(refused(attempt, why)),
         };
     }
-    if call.inputs.is_empty() {
-        return emptied(attempt);
-    }
     let cache = v1::inputs_hashes_path(call.state_dir, call.builder.id.as_deref(), call.key);
     let asked = Asked {
         root: Path::new(call.root),
@@ -564,8 +1004,16 @@ pub(super) fn sent(attempt: &mut Attempt<'_, '_>) -> Result<Option<Built>, End> 
         bounds: attempt.git,
         interrupt: call.interrupt,
     };
-    let built = built(&asked, || attempt.go_on().is_ok());
-    logged_built(attempt, built)
+    match single(&asked, || attempt.go_on().is_ok()) {
+        Ok(Single::Built(built)) => logged_built(attempt, Ok(built)),
+        Ok(Single::None(said)) => {
+            for line in &said {
+                attempt.logged(line);
+            }
+            emptied(attempt)
+        }
+        Err(unbuilt) => logged_built(attempt, Err(unbuilt)),
+    }
 }
 
 /// The manifest `built` as a step sends it, its lines logged; the interrupt ends the run, and any other failure refuses
@@ -1427,8 +1875,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        Asked, Built, Caps, End, Marking, PAST_THE_CAP, Pack, PairAsked, PairInputs, PairTree, Unsent, built, built_pair, installed_all, made_in_tmp,
-        needed, packed, pair_inputs, relative,
+        Asked, Built, Caps, End, Marking, PAST_THE_CAP, Pack, PairAsked, PairInputs, PairTree, Single, Unsent, built_pair, carried_form,
+        gitmodules_at, installed_all, made_in_tmp, needed, packed, pair_inputs, relative, single,
     };
     use crate::outputs::hash::sha256_of;
     use crate::outputs::walk::Found;
@@ -1489,8 +1937,13 @@ mod tests {
             .expect("its last write can be set");
     }
 
-    /// The inputs of `globs` in `root`, its log at `log`, built under `caps`.
-    fn build_as(root: &Path, globs: &[&str], log: &Path, caps: Caps) -> Result<Built, Unbuilt> {
+    /// What a single repo's run of `globs` in `root` sends, its log at `log`, built under `caps`.
+    fn single_as(root: &Path, globs: &[&str], log: &Path, caps: Caps) -> Result<Single, Unbuilt> {
+        single_under(root, globs, log, caps, &|| true)
+    }
+
+    /// [`single_as`] with `go_on` asked as the run asks it.
+    fn single_under(root: &Path, globs: &[&str], log: &Path, caps: Caps, go_on: &dyn Fn() -> bool) -> Result<Single, Unbuilt> {
         let globs: Vec<String> = globs.iter().map(|glob| (*glob).to_owned()).collect();
         let asked = Asked {
             root,
@@ -1502,7 +1955,24 @@ mod tests {
             bounds: GIT_BOUNDS,
             interrupt: None,
         };
-        built(&asked, || true)
+        single(&asked, go_on)
+    }
+
+    /// The inputs of `globs` in `root`, its log at `log`, built under `caps`; a run that sends none is a failure.
+    fn build_as(root: &Path, globs: &[&str], log: &Path, caps: Caps) -> Result<Built, Unbuilt> {
+        single_as(root, globs, log, caps).and_then(|single| match single {
+            Single::Built(built) => Ok(built),
+            Single::None(said) => Err(Unbuilt::Failed(format!("the run sends no inputs: {said:?}"))),
+        })
+    }
+
+    /// The lines of a single repo's run of `globs` in `root` that sends no inputs; else what it sent, or why it failed.
+    fn none_said(root: &Path, globs: &[&str]) -> Result<Vec<String>, String> {
+        match single_as(root, globs, &root.join("logs").join("run.log"), Caps::FULL) {
+            Ok(Single::None(said)) => Ok(said),
+            Ok(Single::Built(built)) => Err(format!("the run sends inputs: {:?} {:?}", paths(&built), built.said)),
+            Err(unbuilt) => Err(failure(Err(unbuilt))),
+        }
     }
 
     fn build(root: &Path, globs: &[&str]) -> Result<Built, Unbuilt> {
@@ -1797,6 +2267,429 @@ mod tests {
                 "gate: inputs: vendor/mod is another repository; not sent as an input",
             ]
         );
+    }
+
+    /// Runs git with `args` in `folder` as a committer of the test's own, with no hook and no signing.
+    fn commit_git(folder: &Path, args: &[&str]) {
+        let mut all = vec![
+            "-c",
+            "user.name=gate test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=.no-hooks",
+        ];
+        all.extend_from_slice(args);
+        git(folder, &all);
+    }
+
+    /// The `.gitmodules` text declaring a submodule at each of `paths`.
+    fn gitmodules(paths: &[&str]) -> String {
+        paths
+            .iter()
+            .map(|path| format!("[submodule \"{path}\"]\n\tpath = {path}\n\turl = ./shared\n"))
+            .collect::<Vec<_>>()
+            .concat()
+    }
+
+    /// Makes `tools/shared` in `root` an initialized submodule: a repository of its own holding a committed
+    /// `tracked.txt`, declared in the root's `.gitmodules` and added to the root as a gitlink.
+    fn with_submodule(root: &Path) {
+        let shared = root.join("tools").join("shared");
+        put(root, "tools/shared/tracked.txt", "tracked");
+        git(&shared, &["init", "--quiet"]);
+        git(&shared, &["add", "tracked.txt"]);
+        commit_git(&shared, &["commit", "--quiet", "-m", "one"]);
+        put(root, ".gitmodules", &gitmodules(&["tools/shared"]));
+        commit_git(root, &["add", "tools/shared", ".gitmodules"]);
+    }
+
+    #[test]
+    fn an_initialized_submodule_s_tracked_and_untracked_files_are_kept_and_its_ignored_ones_not() {
+        let root = worktree("submodule", "logs/\nstate/\n");
+        with_submodule(&root);
+        put(&root, "tools/shared/.gitignore", "ignored.txt\n");
+        put(&root, "tools/shared/untracked.txt", "untracked");
+        put(&root, "tools/shared/ignored.txt", "ignored");
+
+        let built = build(&root, &["**"]).expect("the inputs are built");
+
+        assert_eq!(paths(&built), ["tools/shared/tracked.txt", "tools/shared/untracked.txt"]);
+        // The `**` glob matched `ignored.txt` there too, which is not sent, so the folder's line stays.
+        assert_eq!(
+            built.said,
+            [
+                "gate: inputs: tools/shared is another repository; not sent as an input",
+                "gate: inputs: submodule tools/shared: 2 files sent as inputs",
+            ]
+        );
+        assert_eq!(built.marking, Marking::Write, "a later run with none removes the copies");
+    }
+
+    #[test]
+    fn an_uninitialized_submodule_is_passed_over_saying_nothing() {
+        let root = worktree("submodule-uninitialized", "logs/\nstate/\n");
+        put(&root, ".gitmodules", &gitmodules(&["tools/shared"]));
+        put(&root, "tools/shared/a.txt", "a folder with no .git");
+
+        assert_eq!(none_said(&root, &[]).expect("the run sends no inputs"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_worktree_with_no_gitmodules_asks_git_nothing_about_submodules() {
+        // Any git call fails in this folder, whose `.git` names no repository: a call would refuse the run.
+        let root = scratch("submodule-no-gitmodules");
+        put(&root, ".git", "gitdir: nowhere");
+        put(&root, "tools/shared/.git", "gitdir: nowhere");
+        put(&root, "tools/shared/a.txt", "a");
+
+        assert_eq!(none_said(&root, &[]).expect("the run sends no inputs"), Vec::<String>::new());
+
+        put(&root, ".gitmodules", &gitmodules(&["tools/shared"]));
+        let why = none_said(&root, &[]).expect_err("a .gitmodules git cannot read keeps the run here");
+        assert!(why.starts_with(".gitmodules cannot be read: "), "{why}");
+    }
+
+    #[test]
+    fn a_gitmodules_git_cannot_read_keeps_the_run_here() {
+        let root = worktree("submodule-unreadable", "logs/\nstate/\n");
+        with_submodule(&root);
+        put(&root, ".gitmodules", "[broken\n");
+
+        let why = failure(build(&root, &["**"]));
+
+        assert!(why.starts_with(".gitmodules cannot be read: status 128: "), "{why}");
+    }
+
+    #[test]
+    fn a_submodule_git_cannot_list_keeps_the_run_here() {
+        let root = worktree("submodule-unlisted", "logs/\nstate/\n");
+        with_submodule(&root);
+        fs::remove_dir_all(root.join("tools").join("shared").join(".git")).expect("the submodule's git folder can be removed");
+        put(&root, "tools/shared/.git", "gitdir: nowhere");
+
+        let why = none_said(&root, &[]).expect_err("a submodule git cannot list keeps the run here");
+
+        assert!(why.starts_with("submodule tools/shared cannot be listed: "), "{why}");
+    }
+
+    #[test]
+    fn a_gitmodules_listing_no_path_carries_nothing_and_says_nothing() {
+        let root = worktree("submodule-no-paths", "logs/\nstate/\n");
+        put(&root, ".gitmodules", "[core]\n\tbare = false\n");
+
+        assert_eq!(none_said(&root, &[]).expect("the run sends no inputs"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_submodule_path_of_a_form_the_gate_does_not_carry_is_refused_with_its_line() {
+        let root = worktree("submodule-refused", "logs/\nstate/\n");
+        with_submodule(&root);
+        put(
+            &root,
+            ".gitmodules",
+            &gitmodules(&["../x", "a/.GitHub/b", "/abs", "vendor./lib", "TOOLS~1/x"]),
+        );
+
+        let said = none_said(&root, &[]).expect("the run sends no inputs");
+
+        assert_eq!(
+            said,
+            [
+                "gate: inputs: submodule path ../x is not one the gate carries; not sent",
+                "gate: inputs: submodule path /abs is not one the gate carries; not sent",
+                "gate: inputs: submodule path TOOLS~1/x is not one the gate carries; not sent",
+                "gate: inputs: submodule path a/.GitHub/b is not one the gate carries; not sent",
+                "gate: inputs: submodule path vendor./lib is not one the gate carries; not sent",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_submodule_path_is_carried_only_in_a_form_the_box_takes() {
+        for path in ["tools/shared", "a/b/c", "a b/c"] {
+            assert!(carried_form(path), "{path} is carried");
+        }
+        for path in [
+            "../x",
+            "a/../b",
+            "./a",
+            "a//b",
+            ".git/x",
+            "a/.GitHub/b",
+            "/abs",
+            "C:/x",
+            r"a\b",
+            "",
+            "a/",
+            "vendor./lib",
+            "TOOLS~1/x",
+        ] {
+            assert!(!carried_form(path), "{path:?} is refused");
+        }
+    }
+
+    #[test]
+    fn a_gitmodules_path_with_no_gitlink_in_the_index_sends_nothing() {
+        let root = worktree("submodule-no-gitlink", "logs/\nstate/\n");
+        with_submodule(&root);
+        commit_git(&root, &["rm", "--cached", "--quiet", "-f", "tools/shared"]);
+
+        assert_eq!(none_said(&root, &[]).expect("the run sends no inputs"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_gitmodules_path_spelled_otherwise_than_the_index_s_gitlink_sends_nothing() {
+        let root = worktree("submodule-spelled", "logs/\nstate/\n");
+        with_submodule(&root);
+        put(&root, ".gitmodules", &gitmodules(&["Tools/Shared"]));
+
+        assert_eq!(none_said(&root, &[]).expect("the run sends no inputs"), Vec::<String>::new());
+    }
+
+    /// Makes `link` a junction to the folder `target`.
+    #[expect(clippy::disallowed_methods, reason = "a test's junction setup takes no spawn lock")]
+    fn junction(link: &Path, target: &Path) {
+        let made = Command::new("cmd")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("cmd.exe runs");
+        assert!(made.status.success(), "a junction needs no privilege: {made:?}");
+    }
+
+    #[test]
+    fn a_listed_submodule_file_under_a_junction_or_deleted_is_skipped() {
+        let root = worktree("submodule-junction", "logs/\nstate/\n");
+        with_submodule(&root);
+        let shared = root.join("tools").join("shared");
+        put(&root, "tools/shared/sub/x.txt", "x");
+        git(&shared, &["add", "sub/x.txt"]);
+        commit_git(&shared, &["commit", "--quiet", "-m", "two"]);
+        fs::remove_dir_all(shared.join("sub")).expect("the folder can be removed");
+        let elsewhere = scratch("submodule-junction-target");
+        put(&elsewhere, "x.txt", "outside");
+        junction(&shared.join("sub"), &elsewhere);
+        put(&root, "tools/shared/untracked.txt", "untracked");
+        fs::remove_file(shared.join("tracked.txt")).expect("the tracked file can be deleted");
+
+        let built = build_as(&root, &[], &root.join("logs").join("run.log"), Caps::FULL).expect("the submodule's files are built");
+
+        assert_eq!(paths(&built), ["tools/shared/untracked.txt"]);
+        fs::remove_dir(shared.join("sub")).expect("the junction can be removed");
+    }
+
+    #[test]
+    fn a_submodule_look_ends_interrupted_once_the_run_is() {
+        let root = worktree("submodule-interrupted", "logs/\nstate/\n");
+        with_submodule(&root);
+
+        let interrupted = single_under(&root, &[], &root.join("logs").join("run.log"), Caps::FULL, &|| false);
+
+        assert!(matches!(interrupted, Err(Unbuilt::Interrupted)));
+    }
+
+    #[test]
+    fn a_folder_s_line_stays_while_a_globbed_file_there_is_not_sent_and_goes_once_every_one_is() {
+        let root = worktree("submodule-nested-line", "logs/\nstate/\n");
+        with_submodule(&root);
+        put(&root, "tools/shared/.gitignore", "bin/\n");
+        put(&root, "tools/shared/bin/out.dll", "built");
+
+        let build_file = build(&root, &["tools/shared/bin/**"]).expect("the inputs are built");
+        let carried_file = build(&root, &["tools/shared/tracked.txt"]).expect("the inputs are built");
+
+        assert_eq!(
+            build_file.said,
+            [
+                "gate: inputs: tools/shared is another repository; not sent as an input",
+                "gate: inputs: submodule tools/shared: 1 file sent as inputs",
+            ]
+        );
+        assert_eq!(carried_file.said, ["gate: inputs: submodule tools/shared: 1 file sent as inputs"]);
+    }
+
+    /// A worktree whose submodule holds a tracked and an untracked file, beside two ignored files `.tmp/**` matches.
+    fn capped_worktree(name: &str) -> Scratch {
+        let root = worktree(name, "logs/\nstate/\n.tmp/\n");
+        with_submodule(&root);
+        put(&root, "tools/shared/untracked.txt", "untracked");
+        put(&root, ".tmp/a.txt", "a");
+        put(&root, ".tmp/b.txt", "b");
+        root
+    }
+
+    #[test]
+    fn a_set_past_the_member_cap_is_blamed_on_the_globs_when_they_alone_pass_it_else_on_the_submodules() {
+        let root = capped_worktree("submodule-caps");
+        let log = root.join("logs").join("run.log");
+
+        let globs = failure(build_as(&root, &[".tmp/**"], &log, Caps { members: 1, ..Caps::FULL }));
+        let submodules = failure(build_as(&root, &[".tmp/**"], &log, Caps { members: 3, ..Caps::FULL }));
+        let whole = build_as(&root, &[".tmp/**"], &log, Caps { members: 4, ..Caps::FULL }).expect("the inputs are built");
+
+        assert_eq!(globs, "2 files match the input globs, more than one put carries (1)");
+        assert_eq!(submodules, "4 files with the submodules' files, more than one put carries (3)");
+        assert_eq!(
+            paths(&whole),
+            [".tmp/a.txt", ".tmp/b.txt", "tools/shared/tracked.txt", "tools/shared/untracked.txt"]
+        );
+    }
+
+    #[test]
+    fn a_set_past_the_manifest_cap_is_blamed_on_the_globs_when_they_alone_pass_it_else_on_the_submodules() {
+        let root = capped_worktree("submodule-manifest-cap");
+        let log = root.join("logs").join("run.log");
+        let whole = build_as(&root, &[".tmp/**"], &log, Caps::FULL).expect("the inputs are built");
+        let manifest = whole.line.len() - 1;
+
+        let submodules = failure(build_as(&root, &[".tmp/**"], &log, Caps { manifest, ..Caps::FULL }));
+        let globs = failure(build_as(&root, &[".tmp/**"], &log, Caps { manifest: 10, ..Caps::FULL }));
+
+        assert_eq!(
+            submodules,
+            "the submodules' files would make the inputs manifest larger than the box takes (64 MiB)"
+        );
+        assert_eq!(globs, PAST_THE_CAP);
+    }
+
+    #[test]
+    fn a_set_past_both_the_member_and_the_manifest_cap_is_refused_for_its_members() {
+        let root = capped_worktree("submodule-both-caps");
+        let log = root.join("logs").join("run.log");
+
+        let refused = failure(build_as(&root, &[".tmp/**"], &log, Caps { members: 3, manifest: 10 }));
+
+        assert_eq!(refused, "4 files with the submodules' files, more than one put carries (3)");
+    }
+
+    /// Why a single repo's run of `globs` in `root` under `caps`, `go_on` asked as the run asks it, is refused; a run
+    /// that is not refused says so instead.
+    fn refused_under(root: &Path, globs: &[&str], caps: Caps, go_on: &dyn Fn() -> bool) -> String {
+        match single_under(root, globs, &root.join("logs").join("run.log"), caps, go_on) {
+            Err(unbuilt) => failure(Err(unbuilt)),
+            Ok(Single::Built(built)) => format!("the run sends inputs: {:?}", paths(&built)),
+            Ok(Single::None(said)) => format!("the run sends no inputs: {said:?}"),
+        }
+    }
+
+    #[test]
+    fn a_run_with_no_globs_whose_submodule_files_pass_a_cap_is_refused_and_touches_no_hash_cache() {
+        let root = capped_worktree("submodule-capped-alone");
+        let caps = Caps { members: 1, ..Caps::FULL };
+
+        let refused = refused_under(&root, &[], caps, &|| true);
+
+        assert_eq!(refused, "2 files with the submodules' files, more than one put carries (1)");
+        assert!(!cache_of(&root).exists(), "no hash cache is made");
+        let held = b"a cache as an earlier run left it\n";
+        fs::create_dir_all(cache_of(&root).parent().expect("the cache has a folder")).expect("the folder can be made");
+        fs::write(cache_of(&root), held).expect("the cache can be written");
+        assert_eq!(refused_under(&root, &[], caps, &|| true), refused);
+        assert_eq!(
+            fs::read(cache_of(&root)).expect("the cache is there"),
+            held,
+            "the cache is left as it was"
+        );
+    }
+
+    #[test]
+    fn a_submodule_inside_a_submodule_is_said_and_not_carried() {
+        let root = worktree("submodule-nested", "logs/\nstate/\n");
+        with_submodule(&root);
+        let shared = root.join("tools").join("shared");
+        let inner = shared.join("inner");
+        put(&root, "tools/shared/inner/x.txt", "inner");
+        git(&inner, &["init", "--quiet"]);
+        git(&inner, &["add", "x.txt"]);
+        commit_git(&inner, &["commit", "--quiet", "-m", "inner"]);
+        commit_git(&shared, &["add", "inner"]);
+
+        let built = build_as(&root, &[], &root.join("logs").join("run.log"), Caps::FULL).expect("the submodule's files are built");
+
+        assert_eq!(paths(&built), ["tools/shared/tracked.txt"]);
+        assert_eq!(
+            built.said,
+            [
+                "gate: inputs: submodule tools/shared/inner is inside a submodule; not carried",
+                "gate: inputs: submodule tools/shared: 1 file sent as inputs",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_gitmodules_that_cannot_be_read_is_told_from_one_that_is_not_there() {
+        let root = scratch("gitmodules-unreadable");
+        put(&root, ".gitmodules/held.txt", "a folder, not a file");
+
+        assert_eq!(gitmodules_at(&root), Ok(false), "a folder is no .gitmodules");
+        assert_eq!(gitmodules_at(&root.join("missing")), Ok(false), "nothing is there");
+        // A name Windows refuses to open fails the read, but not as missing.
+        let unreadable = gitmodules_at(&root.join("held<name"));
+        assert!(unreadable.is_err(), "{unreadable:?}");
+    }
+
+    /// A name longer than any a Windows folder may have: reading what it names fails, but not as missing.
+    fn unreadable_name() -> String {
+        "l".repeat(300)
+    }
+
+    #[test]
+    fn a_submodule_folder_that_cannot_be_read_keeps_the_run_here() {
+        let root = worktree("submodule-folder-unreadable", "logs/\nstate/\n");
+        put(&root, "tools/kept.txt", "kept");
+        let path = format!("tools/{}", unreadable_name());
+        put(&root, ".gitmodules", &gitmodules(&[&path]));
+        let gitlink = format!("160000,{},{path}", "1".repeat(40));
+        commit_git(&root, &["update-index", "--add", "--cacheinfo", &gitlink]);
+
+        let why = none_said(&root, &[]).expect_err("a folder that cannot be read keeps the run here");
+
+        assert!(why.starts_with(&format!("submodule {path} cannot be listed: ")), "{why}");
+    }
+
+    #[test]
+    fn a_folder_above_a_listed_submodule_file_that_cannot_be_read_keeps_the_run_here() {
+        let root = worktree("submodule-file-folder-unreadable", "logs/\nstate/\n");
+        with_submodule(&root);
+        let shared = root.join("tools").join("shared");
+        put(&root, "tools/shared/empty.txt", "");
+        git(&shared, &["add", "empty.txt"]);
+        let listed = format!("100644,e69de29bb2d1d6434b8b29ae775ad8c2e48c5391,{}/x.txt", unreadable_name());
+        git(&shared, &["update-index", "--add", "--cacheinfo", &listed]);
+
+        let why = none_said(&root, &[]).expect_err("a folder that cannot be read keeps the run here");
+
+        assert!(why.starts_with("submodule tools/shared cannot be listed: "), "{why}");
+    }
+
+    #[test]
+    fn a_folder_s_line_spelled_in_another_case_than_the_submodule_s_path_still_goes() {
+        let root = worktree("submodule-nested-case", "logs/\nstate/\n");
+        with_submodule(&root);
+        let tools = root.join("tools");
+        fs::rename(tools.join("shared"), tools.join("moved")).expect("the folder can be moved");
+        fs::rename(tools.join("moved"), tools.join("Shared")).expect("the folder can be renamed");
+
+        let built = build(&root, &["tools/**"]).expect("the inputs are built");
+
+        assert_eq!(paths(&built), ["tools/shared/tracked.txt"]);
+        assert_eq!(built.said, ["gate: inputs: submodule tools/shared: 1 file sent as inputs"]);
+    }
+
+    #[test]
+    fn a_run_with_no_globs_and_a_carried_submodule_builds_a_manifest_of_its_files() {
+        let root = worktree("submodule-no-globs", "logs/\nstate/\n");
+        with_submodule(&root);
+
+        let built = build_as(&root, &[], &root.join("logs").join("run.log"), Caps::FULL).expect("the submodule's files are built");
+
+        assert_eq!(paths(&built), ["tools/shared/tracked.txt"]);
+        assert_eq!(built.said, ["gate: inputs: submodule tools/shared: 1 file sent as inputs"]);
+        assert_eq!(built.marking, Marking::Write);
     }
 
     #[test]

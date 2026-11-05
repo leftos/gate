@@ -1004,7 +1004,9 @@ The lines of a run that starts its command:
   A routed run whose snapshot holds Git LFS pointers says `gate: sending lfs objects to <builder>: <n> object(s)` after the diff and before the pack, only when the diff named an object, and `gate: lfs: <n> object(s), <X.X> MB in <Z.Z> s` once a put has sent objects, and `gate: lfs: <n> object(s) present` in the log only when the builder's store held them all; a sibling pair says these once per repo that sends, and the `lfs` time of the passed line adds up every repo's send.
   The reason of an `lfs` fallback is the log line `gate: remote lfs not sent: <reason>`, naming the repo in a pair (`gate: remote lfs not sent: {repo}: {why}`) ([Routing](#routing), Git LFS).
 
-  Four lines go to the log only: `gate: inputs: <n> file(s) unchanged` (the manifest's entries, said when the builder needed none), `gate: inputs: <glob> matched nothing`, `gate: inputs: <path> is in the snapshot; not sent as an input` and `gate: inputs: <folder> is another repository; not sent as an input`. The reason of an `inputs` fallback is the log line `gate: remote inputs not sent: <reason>` ([Routing](#routing), Inputs).
+  Four lines go to the log only: `gate: inputs: <n> file(s) unchanged` (the manifest's entries, said when the builder needed none), `gate: inputs: <glob> matched nothing`, `gate: inputs: <path> is in the snapshot; not sent as an input` and `gate: inputs: <folder> is another repository; not sent as an input`.
+
+  A carried submodule adds `gate: inputs: submodule <path>: <n> file(s) sent as inputs` ([Routing](#routing), Inputs). The reason of an `inputs` fallback is the log line `gate: remote inputs not sent: <reason>` ([Routing](#routing), Inputs).
 
   A remote part the gate cannot start says the second line before it takes a remote slot when ssh is missing, else after it ([Routing](#routing), The remote client's run).
 
@@ -3269,17 +3271,39 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     A sweep the box fails or refuses does not fall back: it logs `gate: inputs: the old copies were not removed: <why>`, the run goes on and the marker stays so the next run tries again. The clear lists the sibling cache folder first; one it cannot list logs `gate: inputs: cannot list <folder>: <error>`.
 
-    A glob that matches nothing, a match git does not report ignored (it is in the snapshot) and a file inside a folder holding a `.git` of its own (another repository, which git cannot be asked about) are each said in the log and skipped.
+    A glob that matches nothing, a match git does not report ignored (it is in the snapshot) and a file inside a folder holding a `.git` of its own (another repository, which git cannot be asked about) are each said in the log and skipped. The last is not said for a carried submodule's folder (matched ignoring ASCII case) when every globbed file dropped under it is carried (below).
+
+    A single-root run also carries the files of each initialized git submodule as inputs members at `<path>/<file>`, through the same manifest, diff and put, with no `inputs` glob needed; a sibling pair's run does not. Nothing is looked for unless the worktree root holds a regular-file `.gitmodules`, else no git process starts.
+
+    The paths come from `git config -z -f .gitmodules --get-regexp`.
+
+    A path is carried when it passes the box's manifest path rules (a plain path, no `.git*`, `.lfsconfig` or `.env` name, within the depth limit).
+
+    The index must hold a mode-160000 gitlink at exactly that spelling (`git --literal-pathspecs ls-files -z --stage`), and the path must be a real folder (no link or junction) holding a `.git` entry. An uninitialized submodule (no `.git`) or one with no gitlink is skipped silently; any other path logs `gate: inputs: submodule path <path> is not one the gate carries; not sent`.
+
+    The files are `git ls-files -z --cached --others --exclude-standard` run inside the submodule (tracked and untracked, not ignored), spelled as the index spells them.
+
+    Each is looked at once: the box's path rules and the run's inputs exclusions, no link or junction on its way, a regular file; a file gone by then is skipped. A submodule inside a carried one is not carried: `gate: inputs: submodule <path>/<entry> is inside a submodule; not carried`. Each carried submodule says `gate: inputs: submodule <path>: <n> file(s) sent as inputs` in the log.
+
+    The step is refused `inputs` (the run stays here) when the submodule files cannot be read or counted.
+
+    The reasons, after `gate: remote inputs not sent: `, are `.gitmodules cannot be read: <why>`, `the index's submodules cannot be read: <why>`, `git cannot be found: <why>`, `submodule <path> cannot be listed: <why>` (an unreadable submodule folder, `.git` entry, folder on a file's way or file), `<n> files with the submodules' files, more than one put carries (<cap>)` and `the submodules' files would make the inputs manifest larger than the box takes (64 MiB)`.
+
+    A globbed set that alone passes a cap keeps its own reason. A refused run touches no hash cache.
+
+    On the builder a gitlink folder holds no `.git`, so git sees none of the files under it: `git status` and `git add -A` ignore them and `git clean -fdq` and `checkout --force` leave them. The back commit therefore never holds a change a routed run makes inside a submodule, and an outputs archive member under a gitlink stays tracked and skipped.
 
     Never sent, whatever the globs: any `.git` path, `.lfsconfig`, `.env`, `*.env`, `.env.<name>` and `.envrc` at any depth, matched without regard to case, the gate's own archives and stages under `.tmp` (named for the work folder's key) and the run's own log and `.err` file, found by canonical path. `.tmp` is otherwise reachable.
 
-    Caps: 50,000 members and a 64 MiB manifest, counted on what the globs match, and 4 GiB per put, counted on the files the diff named (`--test-remote-inputs-budget-bytes` replaces the 4 GiB). A set past a cap is not sent. A file that changes between its hashing and its packing is not sent either, and its entry is dropped from the hash cache.
+    Caps: 50,000 members and a 64 MiB manifest, counted on what the globs match, and 4 GiB per put, counted on the files the diff named, submodule files included (`--test-remote-inputs-budget-bytes` replaces the 4 GiB). A set past a cap is not sent. The router's caps on command-named gitignored files (64 MiB, 2000 files) are separate from these. A file that changes between its hashing and its packing is not sent either, and its entry is dropped from the hash cache.
 
     The hash cache is `remote\<key>.inputs-hashes` in the state root (a pair keeps one more for each sibling, `remote\<key>.<sibling>.inputs-hashes`), beside the outputs one and apart from it, since the outputs saves drop every file the outputs walk no longer finds. It holds the manifest line of the last built manifest's files last written well before that build, is saved when a build changes it, and is the same shape and rules as the outputs cache ([Manifest time](#routing)). There is no PC record of what the builder holds: the diff call is the truth.
 
     The worktree's `.tmp` is held through the step. The diff's answer (`<key>-<nonce>.inputs-diff`) and the archive (`<key>-<nonce>.inputs.tar.zst`) are made new there, opened by handle with delete-on-close, so a gate killed outright leaves none, and each put attempt reads the archive at a position of its own.
 
     The diff is watched as a fetch is, by the stall window on its output and its own transfer ceiling (1800 s) counted from its own start. The put is watched while the archive is being fed by the later of the last byte fed and the last byte of output, and once it is fully fed by the transfer ceiling alone, since the builder installs without a word. Either call is made once more when it failed before the banner.
+
+    Carrying submodule files writes the carried marker too, and a later run with none sends the empty manifest that removes the copies.
 
     A carried path the run's inputs exclusions match (the list above, the run's own log and `.err` among them) is dropped from the manifest, neither sent nor said missing. The router leaves the run's own log and `.err` out of the files it sweeps from a carried folder (they reach the sweep only for a pinned `--builder` or `--alone` run, since an ordinary run removes its log before routing), and makes no `git check-ignore` call when no candidate swept a file.
 

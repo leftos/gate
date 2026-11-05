@@ -36,6 +36,8 @@ A property value (`-p:`, `/p:`, `-property:`, `/property:`, `--property:`, or th
 
 A command whose gitignored inputs hold more than 64 MiB or 2000 files (a sibling pair's two trees counted together), or whose files cannot be sent (a file the inputs never send, such as a `.env`, among them) stays local, saying `gate: not routed: <path> is gitignored ...` with the reason, and is journalled `notRouted: gitignored input` ([design.md, Routing](design.md#routing)).
 
+A repo whose scripts live in an initialized git submodule needs nothing declared: a single-root routed run carries the submodule's files (tracked and untracked, not ignored) to the builder. A change a routed run makes inside the submodule is not brought back, and a submodule too large for one put keeps the run here ([design.md, Routing](design.md#routing), Inputs).
+
 A sibling pair (a run carrying siblings; declared siblings that are all absent make a single repo) routes to a Windows builder and sends the `inputs` globs of both its repos, each applying to its own tree, and carries a gitignored file the command names in either tree, a sibling's included (`..\<sibling>\x`). A carried file's build that reads a gitignored file in the other tree stays local unless that file is sent there too.
 
 A builder that is not Windows, the macOS builder, does not take a pair's `inputs` yet: a pair whose repos declare any, or that carries a file, runs here, saying `gate: remote inputs not sent: the macOS builder does not take a sibling pair's inputs yet`.
