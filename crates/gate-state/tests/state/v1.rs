@@ -61,6 +61,7 @@ fn ticket(pid: u32, arrived: u64) -> Ticket {
         start_ms: 1_759_439_760_571,
         holds: false,
         lends_closed: false,
+        heavies_held: false,
         alone: false,
         remote: None,
         pool: None,
@@ -135,31 +136,35 @@ fn the_beside_allowance_is_two_light_gates_or_the_whole_pool() {
         kind: TicketKind::Critical,
         ..ticket(60080, 1)
     };
-    assert_eq!(beside_allowance(1, []), 1);
-    assert_eq!(beside_allowance(2, []), 2);
-    assert_eq!(beside_allowance(5, [&plain]), 2);
+    assert_eq!(beside_allowance(1, &plain), 1);
+    assert_eq!(beside_allowance(2, &plain), 2);
+    assert_eq!(beside_allowance(5, &plain), 2);
 }
 
 #[test]
-fn the_beside_allowance_is_none_while_a_request_to_hold_the_machine_alone_is_live() {
+fn the_beside_allowance_is_none_beside_a_request_to_hold_the_machine_alone_and_two_beside_a_plain_one_whatever_is_queued() {
     let alone = Ticket {
         kind: TicketKind::Critical,
         alone: true,
         ..ticket(60081, 2)
     };
-    let light = ticket(60080, 1);
+    let plain = Ticket {
+        kind: TicketKind::Critical,
+        ..ticket(60080, 1)
+    };
     let not_critical = Ticket {
         alone: true,
         ..ticket(60082, 3)
     };
 
-    assert_eq!(beside_allowance(5, [&light, &alone]), 0);
-    assert_eq!(beside_allowance(1, [&alone]), 0);
+    assert_eq!(beside_allowance(5, &alone), 0);
+    assert_eq!(beside_allowance(1, &alone), 0);
     assert_eq!(
-        beside_allowance(5, [&light, &not_critical]),
+        beside_allowance(5, &plain),
         2,
-        "only a critical ticket holds the machine alone"
+        "a plain request keeps its two, a request to hold the machine alone queued behind it or not"
     );
+    assert_eq!(beside_allowance(5, &not_critical), 2, "only a critical ticket holds the machine alone");
 }
 
 #[test]

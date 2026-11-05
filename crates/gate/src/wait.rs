@@ -232,8 +232,13 @@ pub(crate) struct Wait<'a> {
     /// The parent gate whose slot this gate runs under, which lends it while a critical request drains and whose pause
     /// marker it keeps; `None` for a gate under no such parent, and for a remote wait.
     under: Option<UnderParent>,
-    /// The critical request that held the gate back on the last pass; `None` when none did.
+    /// The critical request that held the gate back on the last pass; `None` when none did. For a light gate capped
+    /// beside a request ([`Wait::capped`]), the request that caps it ([`beside_cap`]).
     barrier: Option<Barrier>,
+    /// Whether the last pass found a critical request ahead of this light gate whose heavies are held, so that it
+    /// started only while a place beside that request was left ([`beside_cap`]); its lines then name that request.
+    /// While none ahead says so, the gate waits as any light gate does, and says so.
+    capped: bool,
     /// The slots the last pass tried, which the still-waiting line probes; none before the first pass.
     range: Range<u32>,
     /// The pause marker this gate keeps while it waits behind a critical request; no marker for a gate under no parent.
@@ -257,8 +262,9 @@ pub(crate) struct Wait<'a> {
     taken: usize,
 }
 
-/// The earliest critical request ahead of a waiting gate, which holds it back: its gate's pid, and whether it holds the
-/// machine alone ([`Ticket::holds_alone`]).
+/// The critical request ahead of a waiting gate that holds it back: the earliest one ahead, or, for a light gate capped
+/// beside a request whose heavies are held, the request that caps it ([`capping`]). Its gate's pid, and whether it holds
+/// the machine alone ([`Ticket::holds_alone`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Barrier {
     pid: u32,
@@ -352,6 +358,7 @@ impl<'a> Wait<'a> {
             start_ms: gate.start_ms,
             holds: false,
             lends_closed: false,
+            heavies_held: false,
             alone: false,
             remote: pool.is_remote().then_some(true),
             pool: pool.remote_id().map(|id| id.to_string()),
@@ -383,6 +390,7 @@ impl<'a> Wait<'a> {
             place,
             under,
             barrier: None,
+            capped: false,
             range: 0..0,
             pause,
             waiter,
@@ -452,7 +460,11 @@ impl<'a> Wait<'a> {
         self.barrier = self.barrier_in(&others);
         self.pause.refresh(self.barrier.is_some(), console);
         let beside = self.beside(&others, survey, console);
-        let (range, room) = self.range(count, &others, &beside, survey, console);
+        let (range, room, cap) = self.range(count, &others, &beside, survey, console);
+        self.capped = cap.is_some();
+        if cap.is_some() {
+            self.barrier = cap;
+        }
         self.range = range.clone();
         if let Some(pid) = held_back(self.pool, self.barrier, room, matches!(beside, Beside::Busy), self.may_route) {
             drop(beside);
@@ -695,26 +707,74 @@ impl<'a> Wait<'a> {
     }
 
     /// The slots of a count of `count` the gate tries on this pass, every one unless a critical request ahead holds it
-    /// back ([`slot_range`]), and the room left it, `None` for no cap but the free slots. A light gate held back counts
-    /// the light gates beside the request, the other gates' live light claims whatever their slots, holding the beside
-    /// mutex `beside`, and has the room the allowance leaves while the other gates' live tickets `others` wait or hold
+    /// back ([`slot_range`]), the room left it, `None` for no cap but the free slots, and the request that caps a light
+    /// gate ([`beside_cap`]). A heavy gate behind a critical request tries none.
+    ///
+    /// A light gate behind one is capped only once a critical request ahead of it says its heavies held, by the
+    /// tickets of the other gates `others` as the pass read them, or, when one ahead did not say so, as read again
+    /// holding the beside mutex `beside` ([`Wait::read_again`]); until then it tries every slot with no cap, as any
+    /// light gate does. Capped, it counts the light gates beside the request, the other gates' live light claims
+    /// whatever their slots, holding that mutex, and has the room the allowance of the request that caps it leaves
     /// ([`beside_allowance`]); it has none when it cannot list the claims, said once. A light gate that found the
-    /// beside mutex held by another gate has no room this pass.
-    fn range(&self, count: u32, others: &[Ticket], beside: &Beside, survey: &mut Survey, console: &mut Console) -> (Range<u32>, Option<usize>) {
+    /// beside mutex held by another gate has no room this pass, and is capped as the pass read the tickets.
+    fn range(
+        &self,
+        count: u32,
+        others: &[Ticket],
+        beside: &Beside,
+        survey: &mut Survey,
+        console: &mut Console,
+    ) -> (Range<u32>, Option<usize>, Option<Barrier>) {
         let busy = matches!(beside, Beside::Busy).then_some(0);
         let (Pool::Local(kind), Some(_)) = (self.pool, self.barrier) else {
-            return (0..count, busy);
+            return (0..count, busy, None);
         };
-        if kind == SlotKind::Heavy || busy.is_some() {
-            return (slot_range(kind, count, 0), busy);
+        if kind == SlotKind::Heavy {
+            return (slot_range(kind, count, 0), busy, None);
+        }
+        let cap = if busy.is_none()
+            && others
+                .iter()
+                .any(|ticket| is_critical_ahead(ticket, self.order) && !ticket.heavies_drained())
+        {
+            beside_cap(&self.read_again(others), self.order, count)
+        } else {
+            beside_cap(others, self.order, count)
+        };
+        let Some((barrier, allowance)) = cap else {
+            return (0..count, busy, None);
+        };
+        if busy.is_some() {
+            return (slot_range(kind, count, 0), busy, Some(barrier));
         }
         match survey.light_claims(&self.root.path, console) {
             Ok(claims) => {
-                let room = beside_room(beside_allowance(count, others), claims.len());
-                (slot_range(kind, count, room), Some(room))
+                let room = beside_room(allowance, claims.len());
+                (slot_range(kind, count, room), Some(room), Some(barrier))
             }
-            Err(_) => (slot_range(kind, count, 0), Some(0)),
+            Err(_) => (slot_range(kind, count, 0), Some(0), Some(barrier)),
         }
+    }
+
+    /// The other gates' live critical tickets `others` ahead of the gate, each that did not say its heavies held read
+    /// again from its file, as a pass reads them holding the beside mutex, so a request that said so since the pass
+    /// read the tickets caps it: a ticket whose file is gone is left out, and one that cannot be read again is kept as
+    /// the pass read it.
+    fn read_again(&self, others: &[Ticket]) -> Vec<Ticket> {
+        others
+            .iter()
+            .filter(|ticket| is_critical_ahead(ticket, self.order))
+            .filter_map(|ticket| {
+                if ticket.heavies_drained() {
+                    return Some(ticket.clone());
+                }
+                match v1::read_ticket(&v1::ticket_path(&self.root.path, ticket.pid, ticket.start_ms)) {
+                    Ok(again) => Some(again),
+                    Err(v1::FormatError::Io(error)) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(_) => Some(ticket.clone()),
+                }
+            })
+            .collect()
     }
 
     /// Whether the gate may try the slots `range` with the room `room` left it: some are left it, and fewer live
@@ -791,11 +851,13 @@ impl<'a> Wait<'a> {
         pool_eta(&claims, self.pool, &busy, Which::First, Timestamp::now())
     }
 
-    /// The first line of a gate the critical request of the last pass holds back; `None` when none did.
+    /// The first line of a gate the critical request of the last pass holds back; `None` when none did, and for a
+    /// light gate no request caps ([`Wait::capped`]), which says the line of any light gate.
     fn barrier_line(&self) -> Option<String> {
         let barrier = self.barrier?;
         let line = match self.pool {
-            Pool::Local(SlotKind::Light) => format!("gate: waiting for a {}", beside_place(barrier)),
+            Pool::Local(SlotKind::Light) if self.capped => format!("gate: waiting for a {}", beside_place(barrier)),
+            Pool::Local(SlotKind::Light) => return None,
             _ => format!("gate: waiting for a {} behind the critical request of gate {}", self.place, barrier.pid),
         };
         Some(line)
@@ -813,8 +875,8 @@ impl<'a> Wait<'a> {
         probe_pool(&self.root.root, self.pool, indices, survey, console)
     }
 
-    /// Says the still-waiting line when it is due, with the whole seconds since the gate queued; a light gate held
-    /// back by a critical request names it. A gate no critical request holds back probes the slots of the last pass,
+    /// Says the still-waiting line when it is due, with the whole seconds since the gate queued; a light gate capped
+    /// beside a critical request ([`Wait::capped`]) names it. A gate no critical request holds back probes the slots of the last pass,
     /// and when every one is busy says how many and when the first of their holders frees its slot ([`Wait::eta`]).
     pub(crate) fn say_heartbeat(&mut self, survey: &mut Survey, console: &mut Console) {
         let Some(waited) = self.waiter.heartbeat_due() else {
@@ -822,9 +884,11 @@ impl<'a> Wait<'a> {
         };
         let seconds = format!("{} s", waited.as_secs());
         let line = match (self.pool, self.barrier) {
-            (Pool::Local(SlotKind::Light), Some(barrier)) => format!("gate: still waiting for a {} ({seconds})", beside_place(barrier)),
-            (_, Some(_)) => format!("gate: still waiting for a {} ({seconds})", self.place),
-            (_, None) => format!(
+            (Pool::Local(SlotKind::Light), Some(barrier)) if self.capped => {
+                format!("gate: still waiting for a {} ({seconds})", beside_place(barrier))
+            }
+            (Pool::Local(SlotKind::Heavy), Some(_)) => format!("gate: still waiting for a {} ({seconds})", self.place),
+            _ => format!(
                 "gate: still waiting for a {} ({})",
                 self.place,
                 self.heartbeat_figures(seconds, survey, console)
@@ -1209,30 +1273,47 @@ fn lends(others: &[Ticket], unreadable: bool, facts: &mut impl LendFacts) -> boo
 fn barrier(others: &[Ticket], order: (u64, u32)) -> Option<Barrier> {
     others
         .iter()
-        .filter(|ticket| ticket.kind == TicketKind::Critical && ticket.queue_order() < order)
+        .filter(|ticket| is_critical_ahead(ticket, order))
         .min_by_key(|ticket| ticket.queue_order())
-        .map(|earliest| Barrier {
-            pid: earliest.pid,
-            alone: earliest.holds_alone(),
-        })
+        .map(barrier_of)
 }
 
-/// The barrier of a light gate at the place `order` ([`barrier`]), named by the request that leaves it no room: once a
-/// barrier holds it back, the earliest of `others`' requests to hold the machine alone, ahead of it or not, since any
-/// of them leaves no light gate room beside a critical request ([`beside_allowance`]); else the barrier itself.
-fn light_barrier(others: &[Ticket], order: (u64, u32)) -> Option<Barrier> {
-    let ahead = barrier(others, order)?;
-    if ahead.alone {
-        return Some(ahead);
-    }
-    let alone = others
-        .iter()
-        .filter(|ticket| ticket.holds_alone())
-        .min_by_key(|ticket| ticket.queue_order());
-    Some(alone.map_or(ahead, |ticket| Barrier {
+/// Whether `ticket` is a critical request ahead of the place `order`, by arrival and then pid.
+fn is_critical_ahead(ticket: &Ticket, order: (u64, u32)) -> bool {
+    ticket.kind == TicketKind::Critical && ticket.queue_order() < order
+}
+
+/// The barrier the critical request `ticket` makes.
+fn barrier_of(ticket: &Ticket) -> Barrier {
+    Barrier {
         pid: ticket.pid,
-        alone: true,
-    }))
+        alone: ticket.holds_alone(),
+    }
+}
+
+/// The barrier of a light gate at the place `order` ([`barrier`]), named by the request that caps it ([`capping`]),
+/// else the barrier itself. A request that is not ahead of it never names it.
+fn light_barrier(others: &[Ticket], order: (u64, u32)) -> Option<Barrier> {
+    capping(others, order).map(barrier_of).or_else(|| barrier(others, order))
+}
+
+/// The critical request of `others` that caps a light gate at the place `order`: of those ahead of it whose heavies
+/// are held ([`Ticket::heavies_drained`]), the one that leaves fewest light gates beside it, a request to hold the
+/// machine alone before a plain one ([`beside_allowance`]), the earliest on ties; `None` while none ahead says its
+/// heavies are held.
+fn capping(others: &[Ticket], order: (u64, u32)) -> Option<&Ticket> {
+    others
+        .iter()
+        .filter(|ticket| is_critical_ahead(ticket, order) && ticket.heavies_drained())
+        .min_by_key(|ticket| (!ticket.holds_alone(), ticket.queue_order()))
+}
+
+/// The cap on a light gate at the place `order` with a light count of `count`, by the other gates' live tickets
+/// `others`: the request that caps it ([`capping`]) and the allowance of light gates beside that request
+/// ([`beside_allowance`]); `None` while no request ahead says its heavies are held, and the gate tries any free light
+/// slot.
+fn beside_cap(others: &[Ticket], order: (u64, u32), count: u32) -> Option<(Barrier, u32)> {
+    capping(others, order).map(|ticket| (barrier_of(ticket), beside_allowance(count, ticket)))
 }
 
 /// The slots of a local pool of `kind` and `count` a gate behind a critical request tries: none for a heavy gate; for a
@@ -1495,7 +1576,7 @@ mod tests {
     use super::PoolNow;
     use super::scratch::{Holder, Scratch, holding, request};
     use super::{
-        Arrival, Barrier, Beside, Host, LendFacts, Wait, Waited, Which, barrier, beside_of, beside_place, beside_room, first_frees_in,
+        Arrival, Barrier, Beside, Host, LendFacts, Wait, Waited, Which, barrier, beside_cap, beside_of, beside_place, beside_room, first_frees_in,
         first_heartbeat, held_back, holder_eta, lends, light_barrier, may_take, pool_eta, probe_pool, queue_wait, queued_ahead, slot_range,
         spare_left, took_line,
     };
@@ -1752,6 +1833,18 @@ mod tests {
         );
         let held_again = Holder::take(scratch.name(KernelObject::LightSlot(0)));
         wait.barrier = Some(Barrier { pid: 9, alone: false });
+        wait.say_waiting(None, 0..1, &mut survey, &mut console);
+        assert_eq!(
+            console.take_notes(),
+            ["gate: waiting for a light slot (1 busy)"],
+            "behind a request whose heavies still run, the pool full: the first line of any light gate"
+        );
+        assert_eq!(
+            heartbeat(&mut wait, &mut survey, &mut console),
+            ["gate: still waiting for a light slot (N s; 1 busy)"],
+            "behind a request whose heavies still run, the line of any light gate"
+        );
+        wait.capped = true;
         assert_eq!(
             heartbeat(&mut wait, &mut survey, &mut console),
             ["gate: still waiting for a light slot beside the critical request of gate 9 (N s)"],
@@ -1813,6 +1906,7 @@ mod tests {
             start_ms: u64::from(pid) * 10,
             holds: false,
             lends_closed: false,
+            heavies_held: false,
             alone: false,
             remote: None,
             pool: None,
@@ -2054,40 +2148,165 @@ mod tests {
     }
 
     #[test]
-    fn a_light_gate_behind_a_plain_critical_request_is_named_behind_a_later_request_to_hold_the_machine_alone() {
+    fn a_light_gate_is_named_by_the_request_ahead_whose_heavies_are_held_with_the_least_allowance_never_by_a_later_one() {
         let own = ticket(TicketKind::Light, 100, 7);
         let order = own.queue_order();
-        let mut later_alone = ticket(TicketKind::Critical, 150, 21);
-        later_alone.alone = true;
-        let mut latest_alone = ticket(TicketKind::Critical, 300, 22);
-        latest_alone.alone = true;
-        let plain = ticket(TicketKind::Critical, 50, 12);
+        let critical = |arrived: u64, pid: u32, alone: bool, heavies_held: bool| Ticket {
+            alone,
+            heavies_held,
+            ..ticket(TicketKind::Critical, arrived, pid)
+        };
+        let plain = critical(50, 12, false, false);
+        let later_alone = critical(150, 21, true, true);
 
-        let behind = light_barrier(&[plain.clone(), latest_alone, later_alone], order);
-
+        assert_eq!(
+            light_barrier(&[plain.clone(), later_alone.clone(), critical(300, 22, true, false)], order),
+            Some(Barrier { pid: 12, alone: false }),
+            "a later request to hold the machine alone, its heavies held or not, leaves the plain request ahead named"
+        );
+        let held_alone = critical(60, 21, true, true);
+        let behind = light_barrier(&[critical(40, 11, false, true), held_alone, plain.clone()], order);
         assert_eq!(
             behind,
             Some(Barrier { pid: 21, alone: true }),
-            "the earliest alone request leaves it no room"
+            "of the requests ahead whose heavies are held, the one that leaves fewest light gates beside it"
         );
-        let line = behind.map(beside_place);
         assert_eq!(
-            line.as_deref(),
+            behind.map(beside_place).as_deref(),
             Some("light slot behind the request of gate 21 that holds the machine alone")
         );
         assert_eq!(
-            light_barrier(std::slice::from_ref(&plain), order),
-            Some(Barrier { pid: 12, alone: false }),
-            "with no alone request, the plain request ahead"
+            light_barrier(&[critical(45, 13, false, true), critical(40, 11, false, true)], order),
+            Some(Barrier { pid: 11, alone: false }),
+            "two plain requests whose heavies are held: the earlier"
         );
-        let mut alone_only = ticket(TicketKind::Critical, 150, 21);
-        alone_only.alone = true;
-        assert_eq!(light_barrier(&[alone_only], order), None, "a later request alone is no barrier by itself");
+        assert_eq!(
+            light_barrier(&[critical(40, 21, true, false), critical(45, 13, false, true)], order),
+            Some(Barrier { pid: 13, alone: false }),
+            "an alone request ahead whose heavies run caps nothing; the plain one whose heavies are held does"
+        );
+        assert_eq!(
+            light_barrier(&[later_alone], order),
+            None,
+            "a later request alone is no barrier by itself"
+        );
+    }
+
+    #[test]
+    fn a_light_gate_reads_again_the_critical_tickets_ahead_that_did_not_say_their_heavies_held() {
+        let scratch = Scratch::new("read-again");
+        let request = request(Slot::Light);
+        let gate = ThisGate::read(&request).expect("this process's start can be read");
+        let mut survey = Survey::new(&gate);
+        let mut console = Console::new();
+        let arrival = Arrival {
+            gate: &gate,
+            request: &request,
+            queued: Instant::now(),
+            arrived: gate.start_ms,
+            builder: None,
+            after_fallback: false,
+            under: None,
+            expected: None,
+        };
+        let host = Host {
+            processors: 4,
+            interrupt: None,
+        };
+        let mut wait = Wait::queue(&scratch.root, Pool::Local(SlotKind::Light), arrival, host, &mut console);
+        // As the pass read it, the request ahead had not said its heavies held; it says so before the re-read.
+        let ahead = ticket(TicketKind::Critical, 0, 4242);
+        let others = [ahead.clone()];
+        let path = v1::ticket_path(&scratch.root.path, ahead.pid, ahead.start_ms);
+        let said = Ticket {
+            heavies_held: true,
+            ..ahead.clone()
+        };
+        v1::write_ticket(&path, &said).expect("the ticket can be written");
+        wait.barrier = barrier(&others, wait.order);
+
+        let (range, room, cap) = wait.range(5, &others, &Beside::Untaken, &mut survey, &mut console);
+
+        assert_eq!(
+            (range, room, cap),
+            (0..5, Some(2), Some(Barrier { pid: 4242, alone: false })),
+            "the re-read caps the gate beside the request, two places left"
+        );
+        assert_eq!(wait.read_again(&others), [said], "the request as read again");
+        fs::remove_file(&path).expect("the ticket can be deleted");
+        assert_eq!(wait.read_again(&others), Vec::<Ticket>::new(), "a ticket now gone counts as no critical");
+        fs::write(&path, "not a ticket").expect("the file can be written");
+        assert_eq!(
+            wait.read_again(&others),
+            [ahead],
+            "a ticket that cannot be read again is kept as the pass read it"
+        );
+        wait.end(&mut console);
+    }
+
+    /// One row of the cap table: the other gates' tickets, the cap on a light gate at arrival 100, pid 7, with five
+    /// light slots, and why.
+    type CapRow<'t> = (&'t [Ticket], Option<(Barrier, u32)>, &'t str);
+
+    #[test]
+    fn a_light_gate_is_capped_only_by_a_critical_request_ahead_whose_heavies_are_held() {
+        let order = ticket(TicketKind::Light, 100, 7).queue_order();
+        let critical = |arrived: u64, pid: u32, alone: bool| Ticket {
+            alone,
+            ..ticket(TicketKind::Critical, arrived, pid)
+        };
+        let held = |ticket: Ticket| Ticket {
+            heavies_held: true,
+            ..ticket
+        };
+        let heavies_held = [held(critical(50, 12, false))];
+        let holds = [Ticket {
+            holds: true,
+            ..critical(50, 12, false)
+        }];
+        let closes = [Ticket {
+            lends_closed: true,
+            ..critical(50, 12, false)
+        }];
+        let running = [critical(50, 12, false)];
+        let later = [held(critical(150, 12, false))];
+        let alone_held = [held(critical(50, 21, true))];
+        let alone_running = [critical(50, 21, true)];
+        // Row 16: the earliest request waits for the critical mutex; a later one ahead of the gate holds it.
+        let holder_ahead = [critical(40, 11, false), held(critical(60, 13, false))];
+        // Row 17: the holder whose heavies are held arrived after the gate.
+        let holder_after = [critical(40, 11, false), held(critical(150, 13, false))];
+        let plain = |pid: u32| Some((Barrier { pid, alone: false }, 2));
+        let table: [CapRow<'_>; 10] = [
+            (&heavies_held, plain(12), "a request ahead that says its heavies held"),
+            (&holds, plain(12), "a request ahead that holds the machine"),
+            (&closes, plain(12), "a request ahead that closes its lends"),
+            (&running, None, "a request ahead whose heavies still run: no cap"),
+            (&later, None, "a request whose heavies are held, after the gate"),
+            (
+                &alone_held,
+                Some((Barrier { pid: 21, alone: true }, 0)),
+                "an alone request ahead whose heavies are held: none beside it",
+            ),
+            (&alone_running, None, "an alone request ahead whose heavies still run: no cap"),
+            (&holder_ahead, plain(13), "two requests ahead, the later one's heavies held"),
+            (&holder_after, None, "two requests, the one whose heavies are held after the gate"),
+            (&[], None, "no request at all"),
+        ];
+        for (others, expected, why) in table {
+            assert_eq!(beside_cap(others, order, 5), expected, "{why}");
+        }
+        assert_eq!(
+            beside_cap(&heavies_held, order, 1),
+            Some((Barrier { pid: 12, alone: false }, 1)),
+            "a count of 1 allows one light gate"
+        );
     }
 
     #[test]
     fn behind_a_barrier_a_heavy_gate_tries_no_slot_and_a_light_one_any_slot_while_fewer_than_the_allowance_run_beside_it() {
-        let tried = |kind: SlotKind, count: u32, beside: usize| slot_range(kind, count, beside_room(beside_allowance(count, []), beside));
+        let plain = ticket(TicketKind::Critical, 50, 12);
+        let tried = |kind: SlotKind, count: u32, beside: usize| slot_range(kind, count, beside_room(beside_allowance(count, &plain), beside));
         assert_eq!(tried(SlotKind::Heavy, 3, 0), 3..3, "a heavy gate tries none");
         assert_eq!(tried(SlotKind::Light, 5, 0), 0..5, "any light slot, the lowest included");
         assert_eq!(tried(SlotKind::Light, 5, 1), 0..5);
@@ -2099,7 +2318,8 @@ mod tests {
 
     #[test]
     fn of_two_light_gates_held_back_with_one_place_left_beside_the_request_the_later_one_leaves_it_to_the_earlier() {
-        let room = |count: u32, beside: usize| beside_room(beside_allowance(count, []), beside);
+        let plain = ticket(TicketKind::Critical, 50, 12);
+        let room = |count: u32, beside: usize| beside_room(beside_allowance(count, &plain), beside);
         assert_eq!(room(5, 1), 1, "one light gate beside it, one place left");
         assert_eq!(room(5, 3), 0, "past the allowance, no place");
         assert_eq!(room(1, 0), 1);
@@ -2168,8 +2388,18 @@ mod tests {
         let mut closed = ticket(TicketKind::Critical, 50, 9);
         closed.lends_closed = true;
         let closing = [closed];
+        let mut heavies = ticket(TicketKind::Critical, 50, 9);
+        heavies.heavies_held = true;
+        let heavies_held = [heavies];
         let heavy = [ticket(TicketKind::Heavy, 50, 10)];
-        let table: [Row<'_>; 8] = [
+        let table: [Row<'_>; 9] = [
+            (
+                &heavies_held,
+                true,
+                false,
+                true,
+                "a request whose heavies are held but that does not hold the machine",
+            ),
             (&waiting, false, false, true, "a waiting request"),
             (&waiting, false, true, true, "a waiting request, though another ticket cannot be read"),
             (&heavy, true, false, true, "the critical mutex open with no critical ticket"),

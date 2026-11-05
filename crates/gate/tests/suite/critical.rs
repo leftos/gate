@@ -97,14 +97,30 @@ fn own_start() -> Timestamp {
 
 /// Writes a ticket of `kind` naming the gate `pid` started at `start`, arrived at `arrived` ms, in the case's root.
 fn write_ticket(case: &Case, kind: TicketKind, (pid, start): (u32, Timestamp), arrived: u64, remote: bool) {
-    let start_ms = start.as_millisecond().unsigned_abs();
+    plant(case, &planted(kind, (pid, start), arrived, remote));
+}
+
+/// Writes the ticket of a critical request of the gate `pid` started at `start`, arrived at 0 ms, whose heavies are
+/// held (`heaviesHeld`), so a light gate after it starts only while a place beside it is left.
+fn write_heavies_held_ticket(case: &Case, (pid, start): (u32, Timestamp)) {
     let ticket = Ticket {
+        heavies_held: true,
+        ..planted(TicketKind::Critical, (pid, start), 0, false)
+    };
+    plant(case, &ticket);
+}
+
+/// A ticket of `kind` naming the gate `pid` started at `start`, arrived at `arrived` ms, neither holding nor closing its
+/// lends nor saying its heavies are held.
+fn planted(kind: TicketKind, (pid, start): (u32, Timestamp), arrived: u64, remote: bool) -> Ticket {
+    Ticket {
         kind,
         arrived,
         pid,
-        start_ms,
+        start_ms: start.as_millisecond().unsigned_abs(),
         holds: false,
         lends_closed: false,
+        heavies_held: false,
         alone: false,
         remote: remote.then_some(true),
         pool: None,
@@ -112,8 +128,13 @@ fn write_ticket(case: &Case, kind: TicketKind, (pid, start): (u32, Timestamp), a
         pinned: None,
         reason: None,
         expected: None,
-    };
-    v1::write_ticket(&v1::ticket_path(&case.root(), pid, start_ms), &ticket).expect("the ticket can be written");
+    }
+}
+
+/// Writes `ticket` in the case's root, at the path its gate's ticket has.
+fn plant(case: &Case, ticket: &Ticket) {
+    let path = v1::ticket_path(&case.root(), ticket.pid, ticket.start_ms);
+    v1::write_ticket(&path, ticket).expect("the ticket can be written");
 }
 
 /// Whether the case's root holds a ticket of the gate `pid`.
@@ -987,7 +1008,7 @@ fn a_light_gate_held_back_whose_heavy_re_ask_is_refused_ends_saying_so() {
     name_declarations(&case, &folder);
     let read = format!("gate: .gate/desktop.toml read from {}", folder.join("desktop.toml").display());
     let planted = (process::id(), own_start());
-    write_ticket(&case, TicketKind::Critical, planted, 0, false);
+    write_heavies_held_ticket(&case, planted);
     let refusal = format!("gate: not routed: {FAKE_TOOL} is outside the worktree; a desktop run never runs here\n");
     light.wait_for_stderr_where("the refusal, or the wait going on beside the critical request", |text| {
         text.contains(&refusal) || text.contains(&still_beside(planted.0))
@@ -1025,9 +1046,9 @@ fn a_light_gate_held_back_after_a_wait_counts_its_remote_take_from_its_queue_lin
         text.matches("gate: still waiting for a light slot (").count() >= 20
     });
 
-    // A critical request ahead of it, naming this live process, leaves it no place beside it.
+    // A critical request ahead of it, naming this live process, its heavies held, leaves it no place beside it.
     let planted = (process::id(), own_start());
-    write_ticket(&case, TicketKind::Critical, planted, 0, false);
+    write_heavies_held_ticket(&case, planted);
     let outcome = light.finish();
 
     assert_passed(&outcome);
@@ -1637,9 +1658,26 @@ fn a_light_gate_between_its_take_and_its_claim_lets_no_third_light_gate_beside_t
     assert_passed(&critical.finish());
 }
 
+/// The prefix of a plain critical gate's still-waiting line.
+const STILL_WAITING: &str = "gate: still waiting for the machine (critical): ";
+
+/// Waits until the critical gate `critical` says two more still-waiting lines starting with `prefix` after the lines it
+/// said so far: each follows a pass, so the second follows a whole pass begun after this call.
+fn two_more_passes(critical: &Running, prefix: &str) {
+    let before = critical.wait_for_stderr_where("its lines so far", |_| true).matches(prefix).count();
+    critical.wait_for_stderr_where("two more still-waiting lines, each after a pass", |stderr| {
+        stderr.matches(prefix).count() >= before + 2
+    });
+}
+
+/// Whether the ticket of the gate `pid` says its heavies are held (`heaviesHeld`).
+fn heavies_held(case: &Case, pid: u32) -> bool {
+    ticket_json(case, pid)["heaviesHeld"] == json!(true)
+}
+
 #[test]
-fn a_light_gate_no_request_holds_back_is_counted_between_its_take_and_its_claim() {
-    let case = Case::new("a_light_gate_no_request_holds_back_is_counted_between_its_take_and_its_claim");
+fn a_critical_gate_does_not_say_its_heavies_held_while_a_light_gate_is_between_its_take_and_its_claim() {
+    let case = Case::new("a_critical_gate_does_not_say_its_heavies_held_while_a_light_gate_is_between_its_take_and_its_claim");
     write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":4}"#);
     let go = case.folder().join("go");
     let go_word = shown(&go);
@@ -1647,7 +1685,6 @@ fn a_light_gate_no_request_holds_back_is_counted_between_its_take_and_its_claim(
     let light_go_word = shown(&light_go);
     let claim_go = case.folder().join("claim-go");
     let claim_go_word = shown(&claim_go);
-    let held = holder(&case, &heavy_words("holder.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
     let early = case.start(&run_words(
         "early.log",
         &slow_claim(&claim_go_word),
@@ -1657,54 +1694,285 @@ fn a_light_gate_no_request_holds_back_is_counted_between_its_take_and_its_claim(
     wait_for_file(&reached(&claim_go));
     assert!(!early_claim.exists(), "the early gate has taken its slot and not yet claimed it");
 
-    let critical = case.start(&critical_words("critical.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
+    let critical = case.start(&critical_words(
+        "critical.log",
+        &with_heartbeat(),
+        &[FAKE_TOOL, "wait", &go_word, "exit", "0"],
+    ));
     let critical_pid = critical.id();
     critical.wait_for_stderr(WAITING);
-    let later = [
-        case.start(&run_words(
-            "second.log",
-            &with_heartbeat(),
-            &[FAKE_TOOL, "wait", &light_go_word, "exit", "0"],
-        )),
-        case.start(&run_words(
-            "third.log",
-            &with_heartbeat(),
-            &[FAKE_TOOL, "wait", &light_go_word, "exit", "0"],
-        )),
-    ];
-    for gate in &later {
-        gate.wait_for_stderr(&beside(critical_pid));
-    }
+    two_more_passes(&critical, STILL_WAITING);
     assert!(
-        !later.iter().any(|gate| took(&case, gate)),
-        "no gate held back took a slot while the early gate, held back by no request, had not claimed its slot"
+        !heavies_held(&case, critical_pid),
+        "no heavies held while the early gate holds the beside mutex: {}",
+        ticket_json(&case, critical_pid)
     );
+    assert_eq!(events_of(&case, critical_pid), ["queue"]);
 
     let_go(&claim_go);
     wait_until("the early gate's claim", || early_claim.exists());
-    wait_until("one later gate taking a slot beside the early one", || {
-        later.iter().any(|gate| took(&case, gate))
-    });
-    let waiting = later.iter().find(|gate| !took(&case, gate)).expect("one later gate still waits");
-    let heartbeat = format!("gate: still waiting for a light slot beside the critical request of gate {critical_pid} (");
-    let before = waiting.wait_for_stderr_where("its lines so far", |_| true).matches(&heartbeat).count();
-    waiting.wait_for_stderr_where("two more still-waiting lines after the other's take", |stderr| {
-        stderr.matches(&heartbeat).count() >= before + 2
-    });
+    critical.wait_for_stderr(HOLDS);
+    let ticket = ticket_json(&case, critical_pid);
+    assert_eq!(ticket["holds"], true, "{ticket}");
     assert_eq!(
-        events_of(&case, waiting.id()),
-        ["queue"],
-        "two light gates run beside the critical request already"
+        ticket["heaviesHeld"], true,
+        "the gate said its heavies held once it had the mutex: {ticket}"
     );
 
     let_go(&light_go);
     assert_passed(&early.finish());
-    for gate in later {
-        assert_passed(&gate.finish());
-    }
     let_go(&go);
-    assert_passed(&held.finish());
     assert_passed(&critical.finish());
+}
+
+#[test]
+fn a_light_gate_starts_beside_a_waiting_critical_while_a_heavy_it_waits_on_runs() {
+    let case = Case::new("a_light_gate_starts_beside_a_waiting_critical_while_a_heavy_it_waits_on_runs");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+    let (heavy_go, first_go, light_go) = (
+        case.folder().join("heavy-go"),
+        case.folder().join("first-go"),
+        case.folder().join("light-go"),
+    );
+    let (heavy_word, first_word, light_word) = (shown(&heavy_go), shown(&first_go), shown(&light_go));
+    let heavy = holder(&case, &heavy_words("heavy.log", &POLL, &[FAKE_TOOL, "wait", &heavy_word, "exit", "0"]));
+    let heavy_pid = heavy.id();
+    let critical = case.start(&critical_words("critical.log", &with_heartbeat(), &[FAKE_TOOL, "exit", "0"]));
+    let critical_pid = critical.id();
+    critical.wait_for_stderr(WAITING);
+
+    let first = holder(&case, &run_words("first.log", &POLL, &[FAKE_TOOL, "wait", &first_word, "exit", "0"]));
+    let second = holder(&case, &run_words("second.log", &POLL, &[FAKE_TOOL, "wait", &light_word, "exit", "0"]));
+    let third = case.start(&run_words("third.log", &POLL, &[FAKE_TOOL, "wait", &light_word, "exit", "0"]));
+    third.wait_for_stderr_where("the third light gate's take, or its waiting line", |stderr| {
+        took(&case, &third) || stderr.contains("gate: waiting for")
+    });
+    assert!(
+        took(&case, &third),
+        "a third light gate starts beside the critical request while the heavy it waits on runs"
+    );
+    assert_eq!(events_of(&case, critical_pid), ["queue"], "no take while the heavy gate runs");
+
+    let_go(&heavy_go);
+    assert_passed(&heavy.finish());
+    critical.wait_until("the critical gate saying its heavies held", || heavies_held(&case, critical_pid));
+    assert_eq!(
+        events_of(&case, critical_pid),
+        ["queue"],
+        "three light gates run, one more than may run beside it"
+    );
+
+    let first_slot = take_of(&case, first.id())["slots"].clone();
+    let_go(&first_go);
+    let first_pid = first.id();
+    assert_passed(&first.finish());
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{critical_pid},"#));
+    assert!(at(&case, "release", heavy_pid) < at(&case, "take", critical_pid));
+    assert!(at(&case, "release", first_pid) < at(&case, "take", critical_pid));
+    let mut names = vec![json!(name(&case, KernelObject::HeavySlot(0)))];
+    names.extend(first_slot.as_array().expect("slots is a list").iter().cloned());
+    assert_eq!(
+        sorted(&take_of(&case, critical_pid)["slots"]),
+        sorted(&json!(names)),
+        "the heavy slot and the light slot the first light gate freed"
+    );
+    for light in [&second, &third] {
+        assert_eq!(events_of(&case, light.id()), ["queue", "take"], "two light gates run on beside it");
+    }
+
+    assert_passed(&critical.finish());
+    let_go(&light_go);
+    assert_passed(&second.finish());
+    assert_passed(&third.finish());
+}
+
+#[test]
+fn a_light_gate_starts_beside_a_waiting_alone_request_while_a_heavy_it_waits_on_runs() {
+    let case = Case::new("a_light_gate_starts_beside_a_waiting_alone_request_while_a_heavy_it_waits_on_runs");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+    let (heavy_go, light_go) = (case.folder().join("heavy-go"), case.folder().join("light-go"));
+    let (heavy_word, light_word) = (shown(&heavy_go), shown(&light_go));
+    let heavy = holder(&case, &heavy_words("heavy.log", &POLL, &[FAKE_TOOL, "wait", &heavy_word, "exit", "0"]));
+    let heavy_pid = heavy.id();
+    let alone = case.start(&alone_words("alone.log", &with_heartbeat(), &[FAKE_TOOL, "exit", "0"]));
+    let alone_pid = alone.id();
+    alone.wait_for_stderr(ALONE_WAITING);
+
+    let light = case.start(&run_words("light.log", &POLL, &[FAKE_TOOL, "wait", &light_word, "exit", "0"]));
+    let light_pid = light.id();
+    light.wait_for_stderr_where("the light gate's take, or its waiting line", |stderr| {
+        took(&case, &light) || stderr.contains("gate: waiting for")
+    });
+    assert!(
+        took(&case, &light),
+        "a light gate starts beside the alone request while the heavy it waits on runs"
+    );
+
+    let_go(&heavy_go);
+    assert_passed(&heavy.finish());
+    alone.wait_until("the alone gate saying its heavies held", || heavies_held(&case, alone_pid));
+    assert_eq!(events_of(&case, alone_pid), ["queue"], "no take while a light gate runs");
+
+    let_go(&light_go);
+    assert_passed(&light.finish());
+    assert_passed(&alone.finish());
+    assert!(at(&case, "release", heavy_pid) < at(&case, "take", alone_pid));
+    assert!(
+        at(&case, "release", light_pid) < at(&case, "take", alone_pid),
+        "the alone gate waits for the light gate that started while the heavy ran"
+    );
+    assert_eq!(sorted(&take_of(&case, alone_pid)["slots"]), every_slot(&case, 3));
+}
+
+#[test]
+fn a_waiting_critical_holds_no_light_slot_while_a_heavy_it_waits_on_runs() {
+    let case = Case::new("a_waiting_critical_holds_no_light_slot_while_a_heavy_it_waits_on_runs");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let heavy = holder(&case, &heavy_words("heavy.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    let critical = case.start(&critical_words("critical.log", &with_heartbeat(), &[FAKE_TOOL, "exit", "0"]));
+    let critical_pid = critical.id();
+    critical.wait_for_stderr(WAITING);
+    two_more_passes(&critical, STILL_WAITING);
+
+    for index in 0..3 {
+        let slot = name(&case, KernelObject::LightSlot(index));
+        assert!(
+            !gate_win32::mutex_exists(&slot).expect("the slot can be probed"),
+            "light slot {index} is free while the heavy gate runs"
+        );
+    }
+    assert!(!heavies_held(&case, critical_pid), "{}", ticket_json(&case, critical_pid));
+
+    let_go(&go);
+    assert_passed(&heavy.finish());
+    assert_passed(&critical.finish());
+}
+
+#[test]
+fn a_critical_ticket_says_heavies_held_once_it_holds_every_heavy_slot() {
+    let case = Case::new("a_critical_ticket_says_heavies_held_once_it_holds_every_heavy_slot");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+    let (heavy_go, first_go, light_go, go) = (
+        case.folder().join("heavy-go"),
+        case.folder().join("first-go"),
+        case.folder().join("light-go"),
+        case.folder().join("go"),
+    );
+    let (heavy_word, first_word, light_word, go_word) = (shown(&heavy_go), shown(&first_go), shown(&light_go), shown(&go));
+    let first = holder(&case, &run_words("first.log", &POLL, &[FAKE_TOOL, "wait", &first_word, "exit", "0"]));
+    let others = [
+        holder(&case, &run_words("second.log", &POLL, &[FAKE_TOOL, "wait", &light_word, "exit", "0"])),
+        holder(&case, &run_words("third.log", &POLL, &[FAKE_TOOL, "wait", &light_word, "exit", "0"])),
+    ];
+    let heavy = holder(&case, &heavy_words("heavy.log", &POLL, &[FAKE_TOOL, "wait", &heavy_word, "exit", "0"]));
+    let critical = case.start(&critical_words(
+        "critical.log",
+        &with_heartbeat(),
+        &[FAKE_TOOL, "wait", &go_word, "exit", "0"],
+    ));
+    let critical_pid = critical.id();
+    critical.wait_for_stderr(WAITING);
+    assert!(
+        !heavies_held(&case, critical_pid),
+        "the heavy gate runs: {}",
+        ticket_json(&case, critical_pid)
+    );
+
+    let_go(&heavy_go);
+    assert_passed(&heavy.finish());
+    critical.wait_until("the critical gate saying its heavies held", || heavies_held(&case, critical_pid));
+    let ticket = ticket_json(&case, critical_pid);
+    assert_eq!(ticket["holds"], false, "three light gates run, one more than may beside it: {ticket}");
+
+    let_go(&first_go);
+    assert_passed(&first.finish());
+    critical.wait_for_stderr(HOLDS);
+    let ticket = ticket_json(&case, critical_pid);
+    assert_eq!(ticket["holds"], true, "{ticket}");
+    assert_eq!(ticket["heaviesHeld"], true, "the holding rewrite keeps it: {ticket}");
+
+    let_go(&go);
+    assert_passed(&critical.finish());
+    let_go(&light_go);
+    for light in others {
+        assert_passed(&light.finish());
+    }
+}
+
+#[test]
+fn a_light_gate_after_the_heavies_are_held_waits_beside_the_critical() {
+    let case = Case::new("a_light_gate_after_the_heavies_are_held_waits_beside_the_critical");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":4}"#);
+    let light_go = case.folder().join("light-go");
+    let light_word = shown(&light_go);
+    let lights: Vec<Running> = ["first.log", "second.log", "third.log"]
+        .into_iter()
+        .map(|log| holder(&case, &run_words(log, &POLL, &[FAKE_TOOL, "wait", &light_word, "exit", "0"])))
+        .collect();
+    let critical = case.start(&critical_words("critical.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
+    let critical_pid = critical.id();
+    critical.wait_for_stderr(WAITING);
+    // No heavy gate runs, so it says its heavies held once it has the beside mutex, which the last light gate may
+    // still hold at its first pass.
+    critical.wait_until("the critical gate saying its heavies held", || heavies_held(&case, critical_pid));
+
+    let later = case.start(&run_words("later.log", &with_heartbeat(), &[FAKE_TOOL, "exit", "0"]));
+    let later_pid = later.id();
+    later.wait_for_stderr(&beside(critical_pid));
+    later.wait_for_stderr(&still_beside(critical_pid));
+    assert_eq!(
+        events_of(&case, later_pid),
+        ["queue"],
+        "a light slot is free, but three light gates run beside the critical request already"
+    );
+
+    let_go(&light_go);
+    assert_passed(&critical.finish());
+    assert_passed(&later.finish());
+    for light in lights {
+        assert_passed(&light.finish());
+    }
+}
+
+#[test]
+fn a_plain_critical_keeps_two_lights_beside_it_with_an_alone_request_queued_behind() {
+    let case = Case::new("a_plain_critical_keeps_two_lights_beside_it_with_an_alone_request_queued_behind");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+    let (go, light_go) = (case.folder().join("go"), case.folder().join("light-go"));
+    let (go_word, light_word) = (shown(&go), shown(&light_go));
+    let critical = holder(&case, &critical_words("critical.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    let critical_pid = critical.id();
+    critical.wait_for_stderr(HOLDS);
+    let alone = case.start(&alone_words("alone.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
+    let alone_pid = alone.id();
+    alone.wait_for_stderr(ALONE_WAITING);
+
+    // Two light gates run beside the plain critical gate, an alone request queued behind it or not. Each waits on its
+    // take alone: a pass that finds the beside mutex still held by the gate before it says a waiting line and takes
+    // on a later pass.
+    let lights: Vec<Running> = ["first.log", "second.log"]
+        .into_iter()
+        .map(|log| holder(&case, &run_words(log, &POLL, &[FAKE_TOOL, "wait", &light_word, "exit", "0"])))
+        .collect();
+    assert_eq!(events_of(&case, critical_pid), ["queue", "take"], "the critical gate holds on");
+    assert_eq!(events_of(&case, alone_pid), ["queue"], "the alone request waits behind it");
+
+    let_go(&go);
+    assert_passed(&critical.finish());
+    let_go(&light_go);
+    let light_pids: Vec<u32> = lights.iter().map(Running::id).collect();
+    for light in lights {
+        assert_passed(&light.finish());
+    }
+    assert_passed(&alone.finish());
+    for pid in light_pids {
+        assert!(
+            at(&case, "release", pid) < at(&case, "take", alone_pid),
+            "the alone gate waits for the light gates beside the plain one"
+        );
+    }
 }
 
 #[test]
@@ -2335,6 +2603,9 @@ fn a_light_gate_queued_after_an_alone_request_waits_until_it_ends() {
     let alone = case.start(&alone_words("alone.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
     let alone_pid = alone.id();
     alone.wait_for_stderr(ALONE_WAITING);
+    // No heavy gate runs, so it says its heavies held once it has the beside mutex, which the first light gate may
+    // still hold at its first pass.
+    alone.wait_until("the alone gate saying its heavies held", || heavies_held(&case, alone_pid));
 
     let later = case.start(&run_words("later.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
     let later_pid = later.id();

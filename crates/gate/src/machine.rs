@@ -126,7 +126,8 @@ pub(crate) struct MachineWait<'a> {
     others: Vec<Ticket>,
     /// The gates that held a slot by a live claim as the last pass read them, whose tickets wait for nothing.
     holders: Holders,
-    /// Whether no earlier heavy or light gate was left waiting, as last found.
+    /// Whether no earlier heavy or light gate was left waiting, as last found. Not the ticket's heavies held
+    /// ([`Ticket::heavies_held`]), which also needs every heavy slot of the count held.
     drained: bool,
     /// The counts file's ignored lines said already this wait.
     said: HashSet<String>,
@@ -144,6 +145,7 @@ impl<'a> MachineWait<'a> {
             start_ms: arrival.gate.start_ms,
             holds: false,
             lends_closed: false,
+            heavies_held: false,
             alone: arrival.request.alone,
             remote: None,
             pool: None,
@@ -202,10 +204,10 @@ impl<'a> MachineWait<'a> {
     /// One pass; whether the gate now holds the machine. It takes the critical mutex once no critical request that
     /// arrived before it is live, so critical requests run in arrival order; then, until it holds its first slot,
     /// waits until no earlier heavy gate, nor light one while it has a light slot to take, still waits, a remote one or
-    /// one whose gate already holds a slot left out; then takes every heavy slot of the counts as they stand and, on
-    /// every pass, its light slots ([`MachineWait::take_light`]); once it holds them all, holds the machine when no gate
-    /// runs lent its light parent's slot ([`MachineWait::hold`]). A pass that deleted a dead gate's ticket wakes the
-    /// other waiters.
+    /// one whose gate already holds a slot left out; then takes every heavy slot of the counts as they stand and, once
+    /// it holds them all, says its heavies held and takes its light slots ([`MachineWait::take_light`]); once it holds
+    /// them all, holds the machine when no gate runs lent its light parent's slot ([`MachineWait::hold`]). A pass that
+    /// deleted a dead gate's ticket wakes the other waiters.
     fn pass(&mut self, survey: &mut Survey, console: &mut Console) -> bool {
         self.counts = self.read_counts(console);
         let (others, deleted) = survey.others(&self.root.path, console);
@@ -236,10 +238,10 @@ impl<'a> MachineWait<'a> {
         true
     }
 
-    /// How many light gates may run beside this gate on this pass, by the light count and the live tickets the pass
-    /// read, its own included ([`beside_allowance`]): none while a request that holds the machine alone waits or holds.
+    /// How many light gates may run beside this gate on this pass, by the light count and its own ticket alone
+    /// ([`beside_allowance`]): none when it holds the machine alone, whatever other requests are queued.
     fn allowance(&self) -> u32 {
-        beside_allowance(self.counts.light, self.others.iter().chain([&self.ticket]))
+        beside_allowance(self.counts.light, &self.ticket)
     }
 
     /// Holds the machine once it holds every slot it takes: holding the beside mutex, counts the gates that run lent
@@ -254,10 +256,22 @@ impl<'a> MachineWait<'a> {
             return false;
         };
         match survey.lent_children(&self.root.path, console) {
-            Ok(0) => self.rewrite(true, false, survey, console),
+            Ok(0) => {
+                let holding = Ticket {
+                    holds: true,
+                    lends_closed: false,
+                    ..self.ticket.clone()
+                };
+                self.rewrite(holding, survey, console)
+            }
             Ok(_) => {
                 if !self.ticket.lends_closed {
-                    self.rewrite(false, true, survey, console);
+                    let closing = Ticket {
+                        holds: false,
+                        lends_closed: true,
+                        ..self.ticket.clone()
+                    };
+                    self.rewrite(closing, survey, console);
                 }
                 false
             }
@@ -265,15 +279,10 @@ impl<'a> MachineWait<'a> {
         }
     }
 
-    /// Rewrites the gate's ticket as holding the machine or not (`holds`) and as closing its lends or not
-    /// (`lends_closed`), keeping it as written; whether it was written. A ticket that cannot be written is said once a
-    /// wait and keeps what it said before, so the next pass tries again.
-    fn rewrite(&mut self, holds: bool, lends_closed: bool, survey: &mut Survey, console: &mut Console) -> bool {
-        let ticket = Ticket {
-            holds,
-            lends_closed,
-            ..self.ticket.clone()
-        };
+    /// Rewrites the gate's ticket as `ticket`, its own ticket with what changed (`holds`, `lends_closed` or
+    /// `heavies_held`), so every rewrite keeps the rest as written, its heavies held included; whether it was written. A
+    /// ticket that cannot be written is said once a wait and keeps what it said before, so the next pass tries again.
+    fn rewrite(&mut self, ticket: Ticket, survey: &mut Survey, console: &mut Console) -> bool {
         if let Err(error) = self.waiter.rewrite(&ticket) {
             survey.say_once("cannot write the ticket", &self.waiter.ticket().display().to_string(), error, console);
             return false;
@@ -306,15 +315,16 @@ impl<'a> MachineWait<'a> {
         true
     }
 
-    /// Takes every heavy slot of the counts it does not hold yet, then its light slots ([`MachineWait::take_light`]);
-    /// whether it holds them all.
+    /// Takes every heavy slot of the counts it does not hold yet, then, only once it holds them all, its light slots
+    /// ([`MachineWait::take_light`]), so it takes no light slot while a heavy gate it waits for runs; whether it holds
+    /// them all.
     fn take_slots(&mut self, survey: &mut Survey, console: &mut Console) -> bool {
         let mut all = true;
         for index in 0..self.counts.heavy {
             let object = KernelObject::HeavySlot(index);
             all &= self.machine.holds(&self.root.root.object_name(object)) || self.take(object, index, survey, console);
         }
-        self.take_light(survey, console) && all
+        all && self.take_light(survey, console)
     }
 
     /// Takes the slot `index` of `object`; whether it took it. A slot taken from a gate that died holding it has that
@@ -337,37 +347,51 @@ impl<'a> MachineWait<'a> {
     /// hold ([`MachineWait::running_light`]); whether it holds that many. It counts and takes holding the beside mutex
     /// ([`slots::try_beside`]), as every local light gate counts, takes and claims, so a light gate between its take
     /// and its claim is counted, and the slots left free are the beside slots of this drain. The mutex held by another
-    /// gate, or the claims folder that cannot be listed, takes nothing this pass. A pass that took a slot wakes the
-    /// waiters once it lets the mutex go.
+    /// gate, or the claims folder that cannot be listed, takes nothing this pass.
+    ///
+    /// Called once it holds every heavy slot, it first says its heavies held ([`MachineWait::say_heavies_held`]) in
+    /// that same hold of the mutex, so no light gate starts between that rewrite and its count; a rewrite that fails
+    /// is tried again on the next pass. A pass that said its heavies held or took a slot wakes the waiters once it
+    /// lets the mutex go.
     fn take_light(&mut self, survey: &mut Survey, console: &mut Console) -> bool {
         let allowance = self.allowance();
         let target = light_target(self.counts.light, allowance);
         let mut held = self.machine.light_held(self.root);
-        if held >= target {
+        if held >= target && self.ticket.heavies_held {
             return true;
         }
         let Some(beside) = self.try_beside(survey, console) else {
             return false;
         };
-        let allowance = usize::try_from(allowance).unwrap_or(usize::MAX);
-        if !self.running_light(survey, console).is_ok_and(|running| running <= allowance) {
-            return false;
-        }
+        let said = !self.ticket.heavies_held && self.say_heavies_held(survey, console);
         let before = held;
-        for index in 0..self.counts.light {
-            if held >= target {
-                break;
-            }
-            let object = KernelObject::LightSlot(index);
-            if !self.machine.holds(&self.root.root.object_name(object)) && self.take(object, index, survey, console) {
-                held += 1;
+        let allowance = usize::try_from(allowance).unwrap_or(usize::MAX);
+        if held < target && self.running_light(survey, console).is_ok_and(|running| running <= allowance) {
+            for index in 0..self.counts.light {
+                if held >= target {
+                    break;
+                }
+                let object = KernelObject::LightSlot(index);
+                if !self.machine.holds(&self.root.root.object_name(object)) && self.take(object, index, survey, console) {
+                    held += 1;
+                }
             }
         }
         drop(beside);
-        if held > before {
+        if said || held > before {
             slots::wake_waiters(self.root, survey, console);
         }
         held >= target
+    }
+
+    /// Rewrites the gate's ticket as having its heavies held (`heaviesHeld`), which it never unsays, so a light gate
+    /// after it starts only while a place beside it is left; whether it was written ([`MachineWait::rewrite`]).
+    fn say_heavies_held(&mut self, survey: &mut Survey, console: &mut Console) -> bool {
+        let ticket = Ticket {
+            heavies_held: true,
+            ..self.ticket.clone()
+        };
+        self.rewrite(ticket, survey, console)
     }
 
     /// How many other light gates run: the light slots of the count some gate has open that this gate does not hold, so
@@ -842,6 +866,7 @@ mod tests {
             start_ms: u64::from(pid) * 10,
             holds: false,
             lends_closed: false,
+            heavies_held: false,
             alone: false,
             remote: None,
             pool: None,
@@ -854,13 +879,14 @@ mod tests {
 
     /// The light slots a critical gate takes for a light count of `light` with no request to hold the machine alone.
     fn target(light: u32) -> u32 {
-        light_target(light, beside_allowance(light, []))
+        light_target(light, beside_allowance(light, &ticket(TicketKind::Critical, 100, 7)))
     }
 
     #[test]
     fn the_critical_status_says_one_light_slot_or_n_light_slots() {
         let held = HeavyLight { heavy: 2, light: 1 };
-        let status = |light: u32, earlier: usize| status_text(held, beside_allowance(light, []), earlier);
+        let plain = ticket(TicketKind::Critical, 100, 7);
+        let status = |light: u32, earlier: usize| status_text(held, beside_allowance(light, &plain), earlier);
         assert_eq!(status(1, 3), "2 heavy and 1 light slots held (1 light slot beside it), 3 earlier waiters");
         assert_eq!(
             status(2, 0),

@@ -38,7 +38,7 @@ The claims and tickets other than `v1-claim.json` and `v1-ticket.json` name proc
 | `v1-ticket.json` | The arrival ticket of a light gate waiting in the local queue, `holds` false. | `<state root>\waiting\<pid>-<start>.json`, here `60080-1759439760571.json` |
 | `v1-slot-counts.json` | A counts file setting three heavy and six light slots. | `<state root>\slot-counts.json` |
 | `v1-critical-claim.json` | The claim of critical gate 52000 holding the machine, `kind` `critical` and `index` 0. | `<state root>\slots\gate-critical.json` |
-| `v1-critical-ticket.json` | The ticket critical gate 52000 keeps to its end, `holds` true. | `<state root>\waiting\52000-1790852400500.json` |
+| `v1-critical-ticket.json` | The ticket critical gate 52000 keeps to its end, `holds` true and carrying `heaviesHeld`. | `<state root>\waiting\52000-1790852400500.json` |
 | `v1-remote-claim.json` | The claim of heavy gate 53000 holding remote slot 1: `kind` `remote`, then `remote`, `host` and `key`. | `<state root>\slots\gate-remote-slot-1.json` |
 | `v1-remote-ticket.json` | The ticket of heavy gate 53100 queued for the remote pool, `remote` true. | `<state root>\waiting\53100-1790852400500.json` |
 | `v1-claim-expected.json` | The claim of heavy gate 57000 holding slot 0, run with history: a claim's required keys, then `expected`, `{p50, p90, n, key}` with the seconds to three decimals. | `<state root>\slots\gate-slot-0.json` |

@@ -972,6 +972,10 @@ impl TicketKind {
 /// The arrival ticket a waiting gate writes at `waiting\<pid>-<start>.json`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is a key of the ticket format, written and read on its own"
+)]
 pub struct Ticket {
     pub kind: TicketKind,
     /// The gate's first arrival, Unix epoch milliseconds.
@@ -987,7 +991,14 @@ pub struct Ticket {
     /// to end: no light parent lends its slot while it says so. Written only when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lends_closed: bool,
-    /// True only for a critical gate asked for `--alone`: while it waits or holds, no light gate runs beside it, and it
+    /// True only for a critical gate whose heavies are held: it held every heavy slot of the count on one pass, with no
+    /// earlier waiter left for its drain, and from then on a light gate after it starts only while fewer light gates
+    /// than the beside allowance run beside it. Once true it stays true until the ticket is deleted. Written only when
+    /// true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub heavies_held: bool,
+    /// True only for a critical gate asked for `--alone`: once its heavies are held and while it holds, no light gate
+    /// after it starts beside it, and it waits for the light gates running to end before it holds; and it
     /// lends no slot. Written only when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub alone: bool,
@@ -1044,6 +1055,13 @@ impl Ticket {
     #[must_use]
     pub fn holds_alone(&self) -> bool {
         self.kind == TicketKind::Critical && self.alone
+    }
+
+    /// Whether the ticket's heavies are held: it says so (`heaviesHeld`), or it holds the machine or closes its lends,
+    /// which a critical gate says only once it holds every heavy slot, so a ticket an older build wrote reads so too.
+    #[must_use]
+    pub fn heavies_drained(&self) -> bool {
+        self.heavies_held || self.holds || self.lends_closed
     }
 }
 
