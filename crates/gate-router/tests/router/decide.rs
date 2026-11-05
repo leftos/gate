@@ -158,6 +158,7 @@ fn the_control_command_routes_from_the_root() {
             leaf: "a".to_owned(),
             siblings: Vec::new(),
             absent_siblings: Vec::new(),
+            carried_folders_problem: None,
             repo: "yaat".to_owned(),
             key: work_folder_key(ROOT),
             subfolder: String::new(),
@@ -7648,4 +7649,135 @@ fn named_tree_paths_says_a_duplicate_once() {
 #[test]
 fn named_tree_paths_joins_a_path_below_the_gate_folder() {
     assert_eq!(worktree_paths(&words(&["tool.exe", "a.txt", "../b.txt"]), "sub/"), ["sub/a.txt", "b.txt"]);
+}
+
+/// The world-of-intrigue mock shot: a page in a gitignored mock folder, and an output beside it.
+const MOCK_SHOT: [&str; 8] = [
+    "pwsh",
+    "-NoProfile",
+    "-File",
+    "tools/mock-shoot.ps1",
+    "-Page",
+    ".tmp/mocks/a-src/index.html",
+    "-Out",
+    ".tmp/mock-out/a.png",
+];
+
+/// A gate at the root, under a routing file routing every command of `yaat` whose `carriedFolders` is `table`, or that
+/// has none.
+fn carrying_folders(table: Option<&str>) -> FakeFacts {
+    let text = match table {
+        Some(table) => format!(r#"{{"host": "builder-1", "repos": {{"yaat": ["*"]}}, "carriedFolders": {table}}}"#),
+        None => r#"{"host": "builder-1", "repos": {"yaat": ["*"]}}"#.to_owned(),
+    };
+    FakeFacts {
+        config: Ok(Some(Config::parse(&text).expect("usable"))),
+        ..FakeFacts::at("")
+    }
+}
+
+#[test]
+fn a_word_naming_a_file_in_a_carried_folder_carries_the_folder_in_the_run_s_inputs() {
+    let facts = carrying_folders(Some(r#"{"YAAT": [".tmp/mocks/*-src"]}"#));
+    let run = routed(decide(&heavy(&words(&MOCK_SHOT)), &facts));
+    assert_eq!(
+        run.inputs,
+        marked(&[".tmp/mocks/a-src/**"]),
+        "the folder alone, nothing for .tmp/mock-out"
+    );
+}
+
+#[test]
+fn each_spelling_of_a_carried_folder_s_path_carries_it_once() {
+    let facts = carrying_folders(Some(r#"{"yaat": [".tmp/mocks/*-src"]}"#));
+    let command = words(&[
+        "pwsh",
+        "-File",
+        "tools/mock-shoot.ps1",
+        r"-Page:.tmp\mocks\a-src\index.html",
+        "./.tmp/mocks/a-src/models/m.glb",
+        ".tmp/mocks/b-src/",
+        ".tmp/mocks/a-src",
+    ]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.inputs, marked(&[".tmp/mocks/a-src/**", ".tmp/mocks/b-src/**"]));
+}
+
+#[test]
+fn a_repo_with_no_carried_folders_carries_no_folder() {
+    for table in [None, Some(r#"{"other": [".tmp/mocks/*-src"]}"#), Some(r#"{"yaat": []}"#)] {
+        let run = routed(decide(&heavy(&words(&MOCK_SHOT)), &carrying_folders(table)));
+        assert_eq!(run.inputs, Vec::<String>::new(), "{table:?}");
+    }
+}
+
+#[test]
+fn an_unusable_carried_folders_table_carries_no_folder_and_still_routes() {
+    let rules = "names separated by /, * and ? within a name, no . or .. name and no **";
+    for (table, problem) in [
+        (
+            r#"{"yaat": [".tmp/mocks/*-src", "../x"]}"#,
+            format!(r#"carriedFolders."yaat"[1] is not a folder glob below the worktree root: {rules}"#),
+        ),
+        (r#"[".tmp/mocks/*-src"]"#, "carriedFolders must be a JSON object".to_owned()),
+    ] {
+        let run = routed(decide(&heavy(&words(&MOCK_SHOT)), &carrying_folders(Some(table))));
+        assert_eq!(run.inputs, Vec::<String>::new(), "{table}");
+        let line = format!("gate: remote.json carriedFolders cannot be used: {problem}; no folder carried");
+        assert_eq!(
+            run.lines().iter().filter(|said| **said == line).count(),
+            1,
+            "said once: {:?}",
+            run.lines()
+        );
+    }
+    let run = routed(decide(
+        &heavy(&words(&MOCK_SHOT)),
+        &carrying_folders(Some(r#"{"yaat": [".tmp/mocks/*-src"]}"#)),
+    ));
+    assert!(!run.lines().iter().any(|said| said.contains("carriedFolders")), "{:?}", run.lines());
+}
+
+/// [`carrying_folders`] of `.tmp/mocks/*-src`, whose facts report the gitignored project input `path` carried by
+/// `files` files of one byte each.
+fn carrying_folders_ignoring(path: &str, files: usize) -> FakeFacts {
+    FakeFacts {
+        gitignored: vec![GitignoredInput {
+            path: path.to_owned(),
+            files: Ok((0..files).map(|index| (format!("{path}.{index}"), 1)).collect()),
+            elsewhere: Vec::new(),
+        }],
+        ..carrying_folders(Some(r#"{"yaat": [".tmp/mocks/*-src"]}"#))
+    }
+}
+
+#[test]
+fn a_project_input_inside_a_carried_folder_is_carried_by_the_folder_alone_past_the_caps() {
+    let path = ".tmp/mocks/a-src/A.csproj";
+    let facts = carrying_folders_ignoring(path, 2001);
+    let run = routed(decide(&heavy(&words(&["dotnet", "build", path])), &facts));
+    assert_eq!(
+        run.inputs,
+        marked(&[".tmp/mocks/a-src/**"]),
+        "no exact entry, and no cap counts its files"
+    );
+    assert_eq!(*facts.gitignored_asked.borrow(), Vec::<String>::new(), "it is no candidate");
+}
+
+#[test]
+fn a_project_input_outside_any_carried_folder_keeps_its_exact_entry_and_caps() {
+    let path = ".tmp/probe/P.csproj";
+    let run = routed(decide(&heavy(&words(&["dotnet", "build", path])), &carrying_folders_ignoring(path, 1)));
+    assert_eq!(run.inputs, marked(&[".tmp/probe/P.csproj.0"]));
+    let route = decide(&heavy(&words(&["dotnet", "build", path])), &carrying_folders_ignoring(path, 2001));
+    assert!(
+        matches!(
+            &route,
+            Route::Local {
+                reason: Some(LocalReason::GitignoredPastCap { .. })
+            }
+        ),
+        "{:?}",
+        local_line(&route)
+    );
 }

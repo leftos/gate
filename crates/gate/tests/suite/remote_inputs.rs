@@ -381,6 +381,72 @@ fn a_run_with_no_inputs_after_a_carried_run_deletes_the_carried_copies() {
     assert_eq!(carried_markers(&case.root()), Vec::<PathBuf>::new(), "the marker is removed");
 }
 
+/// A client case whose repo declares no input glob and carries the folders `.tmp/mocks/*-src`, holding the gitignored
+/// mock folders `a-src` and `b-src`, each a page and a model below it.
+fn mocks_case(name: &str) -> Case {
+    let case = client_case(name);
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({
+        "host": "builder",
+        "slots": 2,
+        "repos": { &repo: ["*tool*"] },
+        "outputs": { &repo: [] },
+        "carriedFolders": { &repo: [".tmp/mocks/*-src"] },
+    });
+    write_remote_json(&case, &routing.to_string());
+    for folder in ["a-src", "b-src"] {
+        write(&case, &format!(".tmp/mocks/{folder}/index.html"), folder);
+        write(&case, &format!(".tmp/mocks/{folder}/models/m.glb"), "model");
+    }
+    case
+}
+
+#[test]
+fn a_word_naming_a_file_in_a_carried_folder_sends_the_whole_folder_and_a_later_folder_replaces_it() {
+    let case = mocks_case("client-inputs-carried-folder");
+    let first = ssh_steps(&case, "first", &["ok"; 4]);
+
+    let sent = finish(client_gate(
+        &case,
+        "first.log",
+        &first,
+        &[r".\tool.exe", "out", ".tmp/mocks/a-src/index.html"],
+    ));
+
+    assert_eq!(sent.code, Some(0), "{sent:?}");
+    assert_eq!(
+        calls(&first),
+        ["preflight", "inputs", "inputs", "run"],
+        "the diff, then the put: {sent:?}"
+    );
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+    let mocks = work_folder(&case).join(".tmp").join("mocks");
+    assert_eq!(recorded(&case), [".tmp/mocks/a-src/index.html", ".tmp/mocks/a-src/models/m.glb"]);
+    assert!(
+        mocks.join("a-src").join("models").join("m.glb").exists(),
+        "the folder's other file is sent: {sent:?}"
+    );
+    assert!(!mocks.join("b-src").exists(), "a folder no word names is not sent");
+    let second = ssh_steps(&case, "second", &["ok"; 4]);
+
+    let replaced = finish(client_gate(
+        &case,
+        "second.log",
+        &second,
+        &[r".\tool.exe", "out", ".tmp/mocks/b-src/models/m.glb"],
+    ));
+
+    assert_eq!(replaced.code, Some(0), "{replaced:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+    assert_eq!(recorded(&case), [".tmp/mocks/b-src/index.html", ".tmp/mocks/b-src/models/m.glb"]);
+    assert!(mocks.join("b-src").join("index.html").exists(), "{replaced:?}");
+    assert!(!mocks.join("a-src").join("index.html").exists(), "the first folder's copies are removed");
+    assert!(
+        !mocks.join("a-src").join("models").join("m.glb").exists(),
+        "the first folder's copies are removed"
+    );
+}
+
 /// The file of the submodule case's initialized submodule, `/`-separated below the worktree, and as the builder's work
 /// folder holds it.
 const SHARED: &str = "tools/shared/shared.txt";

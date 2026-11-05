@@ -34,7 +34,17 @@ A gitignored `.targets` or `.props` file a word names also carries each file its
 
 A property value (`-p:`, `/p:`, `-property:`, `/property:`, `--property:`, or the switch and its value as two words) that names a carried file reaches the builder as `{gate-folder}/<path>`, and the box replaces the mark with the folder the command runs in, since MSBuild reads such a value from the project's folder.
 
-A command whose gitignored inputs hold more than 64 MiB or 2000 files (a sibling pair's two trees counted together), or whose files cannot be sent (a file the inputs never send, such as a `.env`, among them) stays local, saying `gate: not routed: <path> is gitignored ...` with the reason, and is journalled `notRouted: gitignored input` ([design.md, Routing](design.md#routing)).
+A gitignored folder that a command names only by one file inside it (a page's `index.html` and its assets, say) is carried whole when the PC's `remote.json` lists a matching glob in `carriedFolders`: `"carriedFolders": {"<repo>": [".tmp/mocks/*-src"]}`, each entry a `/`-separated folder below the worktree root where `*` is any run of characters within one name and `?` one character, matched ignoring letter case as PowerShell `-like` does.
+
+A mock capture such as `pwsh -NoProfile -File tools/mock-shoot.ps1 -Page .tmp/mocks/<name>-src/index.html -Out .tmp/mock-out/<name>.png`, with that glob and an `outputs` entry `.tmp/mock-out/**`, sends only the named page's folder, where an `inputs` glob would send every mock folder on every routed run.
+
+The outermost matching folder is carried, gitignored files included; its files count under the `inputs` caps (not the 64 MiB and 2000 files below), and a folder past a cap keeps the run here. Only the main tree's folders are carried.
+
+A file inside a carried folder travels only with its folder and counts toward neither of those caps.
+
+A bad entry turns the feature off for every repo; a routed run says `gate: remote.json carriedFolders cannot be used: <problem>; no folder carried` and still routes, and `gate check` says so too ([design.md, remote.json](design.md#remotejson)).
+
+A command whose gitignored files that its words name hold more than 64 MiB or 2000 files (a sibling pair's two trees counted together), or whose files cannot be sent (a file the inputs never send, such as a `.env`, among them) stays local, saying `gate: not routed: <path> is gitignored ...` with the reason, and is journalled `notRouted: gitignored input` ([design.md, Routing](design.md#routing)).
 
 A repo whose scripts live in an initialized git submodule needs nothing declared: a single-root routed run carries the submodule's files (tracked and untracked, not ignored) to the builder. A change a routed run makes inside the submodule is not brought back, and a submodule too large for one put keeps the run here ([design.md, Routing](design.md#routing), Inputs).
 
@@ -42,7 +52,7 @@ A sibling pair (a run carrying siblings; declared siblings that are all absent m
 
 A builder that is not Windows, the macOS builder, does not take a pair's `inputs` yet: a pair whose repos declare any, or that carries a file, runs here, saying `gate: remote inputs not sent: the macOS builder does not take a sibling pair's inputs yet`.
 
-A routed run that fails on its builder names, in a `gate: hint:` line before the failure line, each gitignored file (never a folder) its words name that no `inputs` glob covers and that was not carried; the fix is an `inputs` glob for it (in the sibling repo's `remote.json` for a file of a sibling, named `../<sibling>/<path>`), or `--local`.
+A routed run that fails on its builder names, in a `gate: hint:` line before the failure line, each gitignored file (never a folder) its words name that no `inputs` glob covers and that was not carried (a file in a carried folder included); the fix is an `inputs` glob for it (in the sibling repo's `remote.json` for a file of a sibling, named `../<sibling>/<path>`), or `--local`.
 
 A gitignored project, solution or dotnet folder also stays local when its build reads a gitignored file the run would not send. That is a build file such as `Directory.Build.props`, `Directory.Packages.props`, `nuget.config` or `global.json` in a folder above it (the worktree root included), or a relative path in one of its carried project, props, targets or solution files that points outside its own folder ([design.md, Routing](design.md#routing) lists both).
 

@@ -122,7 +122,7 @@ fn remote_unknown_verbs_sections_and_options_are_usage_errors() {
     );
     assert_eq!(
         problems(&["remote", "add", "warmup", "gate", "x"]),
-        ["gate: remote: unknown section warmup; one of repos, outputs, failureOutputs, inputs, desktop, desktopSession, siblings"]
+        ["gate: remote: unknown section warmup; one of repos, outputs, failureOutputs, inputs, desktop, desktopSession, siblings, carriedFolders"]
     );
     assert_eq!(
         problems(&["remote", "add", "repos", "gate", "x", "--force"]),

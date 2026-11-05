@@ -10,7 +10,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use crate::balance::{self, Balanced, BalancedEntry, BuilderFigures};
-use crate::config::{Builder, BuilderOs, CARGO_OUTPUTS, Config, ConfigProblem, DEFAULT_OUTPUTS, ignored_line};
+use crate::config::{Builder, BuilderOs, CARGO_OUTPUTS, Config, ConfigProblem, DEFAULT_OUTPUTS, FolderGlob, ignored_line};
 use crate::desktop::{DesktopDeclaration, DesktopMode};
 use crate::escape::escaped;
 use crate::key::{is_layout_name, repo_name, work_folder_key};
@@ -896,6 +896,9 @@ pub struct RemoteRun {
     /// The declared siblings that are absent (nothing at its name beside the root, dropped from the run), by name,
     /// in declared order.
     pub absent_siblings: Vec<String>,
+    /// Why the routing file's `carriedFolders` cannot be used, which carries no folder ([`carried_folders_line`]);
+    /// `None` when it can.
+    pub carried_folders_problem: Option<String>,
     /// The repo name the routing file listed.
     pub repo: String,
     /// The builder's work folder ([`work_folder_key`]).
@@ -924,8 +927,8 @@ pub struct RemoteRun {
     /// for the repo on the builder, none when it names none; kept for a dotnet `--no-build` command.
     pub failure_outputs: Vec<String>,
     /// The input globs the run sends: the repo's `inputs` list, none when it has no entry, then the exact path of each
-    /// gitignored file the command names, after [`CARRIED_INPUT`]; kept for a dotnet `--no-build` command, whose
-    /// outputs alone are withheld.
+    /// gitignored file the command names, then `<folder>/**` for each `carriedFolders` folder a word names a path in,
+    /// each after [`CARRIED_INPUT`]; kept for a dotnet `--no-build` command, whose outputs alone are withheld.
     pub inputs: Vec<String>,
     /// Whether `--no-build` was dropped from the builder's words.
     pub dropped_no_build: bool,
@@ -1079,7 +1082,8 @@ impl RemoteRun {
     /// The lines the gate says for this route, in order: [`RemoteRun::program_line`], [`DROPPED_NO_BUILD_LINE`] unless
     /// the run has a send, whose client says it only when the send does not land, [`NO_OUTPUTS_LINE`], then, for a run
     /// carrying siblings, `gate: routed with siblings: {name} ({root}), ...` naming each in declared order, then, for a
-    /// run with absent siblings, the line naming them ([`absent_line`]), then, for a command kept from its cross build
+    /// run with absent siblings, the line naming them ([`absent_line`]), then, for a `carriedFolders` that cannot be
+    /// used, why ([`carried_folders_line`]), then, for a command kept from its cross build
     /// ([`RemoteRun::cross_build_blocked`]), why ([`CrossBlocked::line`]).
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
@@ -1103,6 +1107,9 @@ impl RemoteRun {
         }
         if let Some(line) = absent_line(&self.absent_siblings) {
             lines.push(line);
+        }
+        if let Some(problem) = &self.carried_folders_problem {
+            lines.push(carried_folders_line(problem));
         }
         if let Some(blocked) = &self.cross_build_blocked {
             lines.push(blocked.line());
@@ -1302,6 +1309,7 @@ fn stage_run(config: &Config, place: Place, builder: Builder, facts: &dyn Facts)
         root: target.place.root,
         siblings: target.siblings,
         absent_siblings: target.absent_siblings,
+        carried_folders_problem: None,
         repo: target.repo,
         subfolder: String::new(),
         pattern: String::new(),
@@ -2105,8 +2113,10 @@ fn built(config: &Config, mut opened: Opened, sent: Rewritten, kept: Kept, facts
 /// the worktree ([`outside_reason`]), when the gate's folder below the root holds nothing the snapshot sends, or when a
 /// word names a gitignored project input the run cannot carry ([`carried_inputs`]); else the run on its builder
 /// ([`remote_run`]), for the command as `given`, its input globs followed by the exact paths of the gitignored files
-/// it carries, or here when its last build ran here and its send cannot be made ([`planned_send`]). What [`route`] and
-/// [`later_run`] both end with.
+/// it carries, then a `<folder>/**` entry for each of the repo's `carriedFolders` folders a word names a path in
+/// ([`carried_folder_inputs`]), whose paths are no exact candidate; or here when its last build ran here and its send
+/// cannot be made ([`planned_send`]). A `carriedFolders` that cannot be used carries no folder, and the run says why
+/// ([`RemoteRun::carried_folders_problem`]). What [`route`] and [`later_run`] both end with.
 fn ended(config: &Config, matched: Matched, given: &[String], facts: &dyn Facts) -> Result<RemoteRun, Here> {
     if let Some(word) = matched.outside.clone() {
         return Err(Some(outside_reason(config, word, &matched, facts)));
@@ -2124,7 +2134,16 @@ fn ended(config: &Config, matched: Matched, given: &[String], facts: &dyn Facts)
             }
         }
     }
-    let carried = carried_inputs(&matched, facts).map_err(Some)?;
+    let (globs, carried_folders_problem) = match config.carried_folders(&matched.target.repo) {
+        Ok(globs) => (globs, None),
+        Err(problem) => (&[][..], Some(problem.to_owned())),
+    };
+    let folders = if globs.is_empty() {
+        Vec::new()
+    } else {
+        carried_folder_inputs(globs, &named_tree_paths(&matched.words, &place.prefix, &sibling_names(&matched)))
+    };
+    let carried = carried_inputs(&matched, globs, facts).map_err(Some)?;
     let marks = Marks {
         prefix: place.prefix.clone(),
         siblings: sibling_names(&matched).into_iter().map(str::to_owned).collect(),
@@ -2143,7 +2162,43 @@ fn ended(config: &Config, matched: Matched, given: &[String], facts: &dyn Facts)
     for (sibling, files) in run.siblings.iter_mut().zip(siblings) {
         sibling.inputs.extend(files.into_iter().map(|file| format!("{CARRIED_INPUT}{file}")));
     }
+    run.inputs.extend(folders);
+    run.carried_folders_problem = carried_folders_problem;
     Ok(run)
+}
+
+/// The input entry, `[carried]<folder>/**` ([`CARRIED_INPUT`]), of each folder of the worktree a path of `named` lies in
+/// or names that one of the repo's `carriedFolders` `globs` matches ([`carried_folder`]), each folder once, compared
+/// without regard to ASCII letter case, in the order its first path comes. A path in a sibling is never one. Nothing
+/// checks the folder is there: one that is not gives an entry that matches no file. The entries count toward no cap of
+/// [`carried_inputs`]; the PC's inputs step builds them under the caps of the repo's own globs.
+fn carried_folder_inputs(globs: &[FolderGlob], named: &[TreePath]) -> Vec<String> {
+    let mut folders: Vec<&str> = Vec::new();
+    for (_, path) in named.iter().filter(|(tree, _)| tree.is_none()) {
+        if let Some(folder) = carried_folder(globs, path)
+            && !folders.iter().any(|known| known.eq_ignore_ascii_case(folder))
+        {
+            folders.push(folder);
+        }
+    }
+    folders.into_iter().map(|folder| format!("{CARRIED_INPUT}{folder}/**")).collect()
+}
+
+/// The shortest leading run of the `/`-separated `path`'s names, the whole path included, that one of `globs` matches
+/// name for name ([`FolderGlob::matches`]), as `path` spells it; `None` when none does.
+fn carried_folder<'p>(globs: &[FolderGlob], path: &'p str) -> Option<&'p str> {
+    let names: Vec<&str> = path.split('/').collect();
+    (1..=names.len()).find_map(|count| {
+        let leading = &names[..count];
+        let length = leading.iter().map(|name| name.len()).sum::<usize>() + count - 1;
+        globs.iter().any(|glob| glob.matches(leading)).then(|| &path[..length])
+    })
+}
+
+/// The line a routed run whose repo's `carriedFolders` cannot be used says, for `problem`.
+#[must_use]
+pub fn carried_folders_line(problem: &str) -> String {
+    format!("gate: remote.json carriedFolders cannot be used: {problem}; no folder carried")
 }
 
 /// What [`mark_carried_properties`] reads a word's paths by: the gate's folder below the root (`sub/dir/`, empty at
@@ -2276,10 +2331,15 @@ fn named_inputs(matched: &Matched) -> Vec<TreePath> {
 /// a candidate whose files cannot all be carried names it and why; one whose build reads a path in another tree of the
 /// pair that the run does not carry there ([`GitignoredInput::elsewhere`]) names it and that path; and the files
 /// carried, each tree's own input globs left out, hold at most [`CARRIED_BYTES`] by their sizes in at most
-/// [`CARRIED_FILES`] files, a sibling pair's trees counted together. Each is told before anything is sent.
-fn carried_inputs(matched: &Matched, facts: &dyn Facts) -> Result<Carried, LocalReason> {
+/// [`CARRIED_FILES`] files, a sibling pair's trees counted together. Each is told before anything is sent. A candidate
+/// in the worktree inside a folder one of the repo's `carriedFolders` `folders` matches ([`carried_folder`]) is none:
+/// its folder's entry carries it, and it counts toward no cap.
+fn carried_inputs(matched: &Matched, folders: &[FolderGlob], facts: &dyn Facts) -> Result<Carried, LocalReason> {
     let mut carried = Carried::none(matched.target.siblings.len());
-    let candidates = input_candidates(matched);
+    let candidates: Vec<(&str, TreePath)> = input_candidates(matched)
+        .into_iter()
+        .filter(|(_, (tree, path))| tree.is_some() || carried_folder(folders, path).is_none())
+        .collect();
     if candidates.is_empty() {
         return Ok(carried);
     }
@@ -2534,9 +2594,10 @@ fn sibling_names(matched: &Matched) -> Vec<&str> {
     matched.target.siblings.iter().map(|sibling| sibling.name.as_str()).collect()
 }
 
-/// The start of each entry of a routed run's input globs ([`RemoteRun::inputs`]) that is the exact path of a gitignored
-/// file the command names ([`carried_inputs`]), not one of the repo's globs: no input glob holds `[`, nor does a path a
-/// word names ([`tree_path`]).
+/// The start of each entry of a routed run's input globs ([`RemoteRun::inputs`]) that the command's words carry, not
+/// one of the repo's globs: the exact path of a gitignored file the command names ([`carried_inputs`]), which never
+/// holds a `*`, or a `<folder>/**` for a `carriedFolders` folder a word names a path in ([`carried_folder_inputs`]). No
+/// input glob holds `[`, nor does a path a word names ([`tree_path`]).
 pub const CARRIED_INPUT: &str = "[carried]";
 
 /// The bytes of a mebibyte.
@@ -4275,6 +4336,7 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         root: target.place.root,
         siblings: target.siblings,
         absent_siblings: target.absent_siblings,
+        carried_folders_problem: None,
         repo: target.repo,
         subfolder,
         pattern,
@@ -4808,7 +4870,85 @@ fn project_folder(project: &str, place: &Place) -> Option<String> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{PinRefusal, Place, TreePath, derived_outputs, input_values, names_bin_folder, send_bin, switch_outputs, tree_path};
+    use super::{
+        FolderGlob, PinRefusal, Place, TreePath, carried_folder_inputs, derived_outputs, input_values, names_bin_folder, send_bin, switch_outputs,
+        tree_path,
+    };
+
+    /// The `carriedFolders` entries the carried-folder cases match against.
+    fn mock_globs() -> Vec<&'static str> {
+        vec![".tmp/mocks/*-src"]
+    }
+
+    /// Each of `globs` read as a `carriedFolders` entry is.
+    fn parsed(globs: &[&str]) -> Vec<FolderGlob> {
+        // A glob it refuses is left out, which the case's expected entries then show.
+        globs.iter().filter_map(|glob| FolderGlob::parse(glob)).collect()
+    }
+
+    /// The input entries the worktree `paths` give under the folder `globs`.
+    fn folder_inputs(globs: &[&str], paths: &[&str]) -> Vec<String> {
+        let named: Vec<TreePath> = paths.iter().map(|path| (None, (*path).to_owned())).collect();
+        carried_folder_inputs(&parsed(globs), &named)
+    }
+
+    #[test]
+    fn a_carried_folder_glob_carries_the_folder_a_path_lies_in_or_names() {
+        for path in [".tmp/mocks/a-src/index.html", ".tmp/mocks/a-src", ".tmp/mocks/a-src/models/m.glb"] {
+            assert_eq!(folder_inputs(&mock_globs(), &[path]), ["[carried].tmp/mocks/a-src/**"], "{path}");
+        }
+        assert_eq!(
+            folder_inputs(&mock_globs(), &[".TMP/Mocks/A-src/x"]),
+            ["[carried].TMP/Mocks/A-src/**"],
+            "the names in any ASCII letter case, the folder as the word spells it"
+        );
+        assert_eq!(
+            folder_inputs(&["a?c/x*y*z"], &["abc/xyz/f", "abc/x1y2z/f"]),
+            ["[carried]abc/xyz/**", "[carried]abc/x1y2z/**"],
+            "? is one character and * any run, within one name"
+        );
+    }
+
+    #[test]
+    fn a_carried_folder_glob_carries_no_path_outside_a_matching_folder() {
+        for path in [
+            ".tmp/mocks/a-src2/x",
+            ".tmp/mocks/x",
+            ".tmp/other/a-src/x",
+            ".tmp/mocks",
+            ".tmp/mock-out/a.png",
+            "a-src/x",
+        ] {
+            assert_eq!(folder_inputs(&mock_globs(), &[path]), Vec::<String>::new(), "{path}");
+        }
+        assert_eq!(folder_inputs(&["a*"], &["b/a1/x"]), Vec::<String>::new(), "* never crosses a /");
+    }
+
+    #[test]
+    fn the_shortest_prefix_a_carried_folder_glob_matches_is_the_folder() {
+        assert_eq!(folder_inputs(&["*-src"], &["a-src/b-src/x"]), ["[carried]a-src/**"]);
+        assert_eq!(
+            folder_inputs(&[".tmp/mocks/*-src", ".tmp/*"], &[".tmp/mocks/a-src/x"]),
+            ["[carried].tmp/mocks/**"],
+            "the outermost folder of any glob"
+        );
+    }
+
+    #[test]
+    fn two_words_naming_one_carried_folder_give_one_entry() {
+        let named: Vec<TreePath> = vec![
+            (None, ".tmp/mocks/a-src/index.html".to_owned()),
+            (None, ".tmp/mocks/b-src/index.html".to_owned()),
+            (None, ".TMP/mocks/A-SRC/models/m.glb".to_owned()),
+            (None, ".tmp/mocks/a-src".to_owned()),
+            (Some(0), ".tmp/mocks/c-src/index.html".to_owned()),
+        ];
+        assert_eq!(
+            carried_folder_inputs(&parsed(&mock_globs()), &named),
+            ["[carried].tmp/mocks/a-src/**", "[carried].tmp/mocks/b-src/**"],
+            "each folder once, in first-seen order, and none in a sibling"
+        );
+    }
 
     /// The carried siblings of the matcher cases: `b` alone.
     const SIBLINGS: [&str; 1] = ["b"];

@@ -830,7 +830,16 @@ pub enum RemoteVerb {
 }
 
 /// The sections `gate remote` edits.
-pub const REMOTE_SECTIONS: [&str; 7] = ["repos", "outputs", "failureOutputs", "inputs", "desktop", "desktopSession", "siblings"];
+pub const REMOTE_SECTIONS: [&str; 8] = [
+    "repos",
+    "outputs",
+    "failureOutputs",
+    "inputs",
+    "desktop",
+    "desktopSession",
+    "siblings",
+    "carriedFolders",
+];
 
 /// The sections `gate remote --builder` edits, the ones a `builders` entry has.
 pub const REMOTE_BUILDER_SECTIONS: [&str; 3] = ["repos", "outputs", "failureOutputs"];

@@ -99,6 +99,9 @@ pub struct Config {
     inputs: Vec<(String, Vec<Pattern>)>,
     /// Each repo name's allowed sibling names, or why `siblings` cannot be used, which allows none.
     siblings: Result<Vec<(String, Vec<String>)>, String>,
+    /// Each repo name's folder globs whose folders a routed run carries whole when a word names a path in one, or why
+    /// `carriedFolders` cannot be used, which carries none.
+    carried_folders: Result<Vec<(String, Vec<FolderGlob>)>, String>,
     /// The repo names whose warm-up may run, or why `warmup` cannot be used, which consents to none.
     warmup: Result<Vec<String>, String>,
     /// Each repo name's allowed desktop patterns, or why `desktop` cannot be used, which allows none.
@@ -161,7 +164,8 @@ impl Config {
     /// A `host` that is not an ssh alias or `user@host` of letters, digits, `.`, `_` and `-` is refused with a reason of
     /// the gate's own, since the PowerShell gate accepts it. A bad `hosts` leaves the file usable for routing, and
     /// [`Config::builders`] gives its reason. A bad `siblings` leaves it usable too, allowing no sibling, and
-    /// [`Config::allowed_siblings`] gives its reason. So does a bad `warmup`, consenting to no warm-up, and
+    /// [`Config::allowed_siblings`] gives its reason. So does a bad `carriedFolders`, carrying no folder, and
+    /// [`Config::carried_folders`] gives its reason, and a bad `warmup`, consenting to no warm-up, and
     /// [`Config::warmup_consented`] gives its reason, and a bad `desktop`, allowing no desktop pattern, and
     /// [`Config::allowed_desktop`] gives its reason, and a bad `desktopSession`, allowing no session pattern, and
     /// [`Config::allowed_desktop_session`] gives its reason, and a bad `hooks`, consenting to no hook routing, and
@@ -214,6 +218,7 @@ impl Config {
             failure_outputs,
             inputs,
             siblings: read_siblings(&data),
+            carried_folders: read_carried_folders(&data),
             warmup: read_warmup_consent(&data),
             desktop: read_desktop_consent(&data, "desktop"),
             desktop_session: read_desktop_consent(&data, "desktopSession"),
@@ -396,6 +401,22 @@ impl Config {
     /// ([`is_layout_name`]). Such a value allows no sibling, and the rest of the file is read whatever it holds.
     pub fn allowed_siblings(&self, repo: &str) -> Result<&[String], &str> {
         match &self.siblings {
+            Err(problem) => Err(problem),
+            Ok(table) => Ok(find(table, repo).unwrap_or(&[])),
+        }
+    }
+
+    /// The folder globs `carriedFolders` gives `repo`, as written, its repo name matched in any letter case: none when
+    /// it does not name the repo. A routed run whose word names a path inside a folder one of them matches carries that
+    /// folder whole.
+    ///
+    /// # Errors
+    ///
+    /// Why `carriedFolders` cannot be used: not an object of arrays of folder globs below the worktree root
+    /// ([`is_folder_glob`]). Such a value carries no folder for any repo, and the rest of the file is read whatever it
+    /// holds.
+    pub fn carried_folders(&self, repo: &str) -> Result<&[FolderGlob], &str> {
+        match &self.carried_folders {
             Err(problem) => Err(problem),
             Ok(table) => Ok(find(table, repo).unwrap_or(&[])),
         }
@@ -1064,6 +1085,87 @@ fn read_siblings(data: &Map<String, Value>) -> Result<Vec<(String, Vec<String>)>
             Ok((repo.clone(), names))
         })
         .collect()
+}
+
+/// One `carriedFolders` entry: its text as written and each of its `/`-separated names read as a `-like` pattern
+/// ([`Pattern`]), so a `*` matches any run of characters within one name and a `?` one, ignoring letter case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderGlob {
+    text: String,
+    names: Vec<Pattern>,
+}
+
+impl FolderGlob {
+    /// The entry `text`, read once: `None` when [`is_folder_glob`] refuses it.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        if !is_folder_glob(text) {
+            return None;
+        }
+        let names = text.split('/').map(Pattern::parse).collect::<Result<Vec<Pattern>, _>>().ok()?;
+        Some(Self {
+            text: text.to_owned(),
+            names,
+        })
+    }
+
+    /// The entry as written.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// Whether `names`, a leading run of a path's names, is a folder this entry matches: as many names as it has, each
+    /// matching its own.
+    #[must_use]
+    pub fn matches(&self, names: &[&str]) -> bool {
+        names.len() == self.names.len() && self.names.iter().zip(names).all(|(pattern, name)| pattern.is_match(name))
+    }
+}
+
+/// The `carriedFolders` table: each repo name's folder globs, in file order, each one [`is_folder_glob`] accepts, read
+/// once ([`FolderGlob`]); an empty table when the key is missing. A problem writes the repo name quoted and escaped, so
+/// no control character in it reaches the console.
+fn read_carried_folders(data: &Map<String, Value>) -> Result<Vec<(String, Vec<FolderGlob>)>, String> {
+    let Some(value) = property(data, "carriedFolders") else {
+        return Ok(Vec::new());
+    };
+    let Value::Object(table) = value else {
+        return Err("carriedFolders must be a JSON object".to_owned());
+    };
+    table
+        .iter()
+        .map(|(repo, list)| {
+            let Value::Array(items) = list else {
+                return Err(format!("carriedFolders.{repo:?} is not an array of strings"));
+            };
+            let globs = items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| match item {
+                    Value::String(glob) if !glob.is_empty() => FolderGlob::parse(glob).ok_or_else(|| {
+                        format!(
+                            "carriedFolders.{repo:?}[{index}] is not a folder glob below the worktree root: names separated by /, * and ? \
+                             within a name, no . or .. name and no **"
+                        )
+                    }),
+                    _ => Err(format!("carriedFolders.{repo:?}[{index}] is not a non-empty string")),
+                })
+                .collect::<Result<Vec<FolderGlob>, String>>()?;
+            Ok((repo.clone(), globs))
+        })
+        .collect()
+}
+
+/// Whether `glob` is a `carriedFolders` entry: a folder below the worktree root written as `/`-separated names, none
+/// empty, `.` or `..`, none holding `**`, and no `\`, nor a `:`, `[`, `]`, `"`, `<`, `>` or `|`, which no path a word
+/// names holds, nor the backtick a `-like` pattern escapes with; a `*` matches any run of characters within one name, a
+/// `?` one character.
+fn is_folder_glob(glob: &str) -> bool {
+    !glob.contains(['\\', ':', '[', ']', '"', '<', '>', '|', '`'])
+        && glob
+            .split('/')
+            .all(|name| !name.is_empty() && name != "." && name != ".." && !name.contains("**"))
 }
 
 /// The `warmup` list: the repo names whose warm-up may run, in file order; none when the key is missing.

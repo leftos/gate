@@ -140,7 +140,29 @@ fn an_unknown_section_is_refused() {
     let refusal = add(BASE, "nonsense", "gate", &["x"]).expect_err("refused");
     assert_eq!(
         refusal.to_string(),
-        "unknown section nonsense; one of repos, outputs, failureOutputs, inputs, desktop, desktopSession, siblings"
+        "unknown section nonsense; one of repos, outputs, failureOutputs, inputs, desktop, desktopSession, siblings, carriedFolders"
+    );
+}
+
+#[test]
+fn a_carried_folder_glob_is_added_and_a_bad_one_refused() {
+    let edited = add(BASE, "carriedFolders", "gate", &[".tmp/mocks/*-src"]).expect("the edit is made");
+    assert_eq!(edited.lines, ["remote: carriedFolders.gate: + .tmp/mocks/*-src"]);
+    assert_eq!(value(&edited.text)["carriedFolders"]["gate"], serde_json::json!([".tmp/mocks/*-src"]));
+    let removed = remove(&edited.text, "carriedFolders", "gate", &[".tmp/mocks/*-src"]).expect("the edit is made");
+    assert_eq!(removed.lines, ["remote: carriedFolders.gate: - .tmp/mocks/*-src"]);
+
+    for bad in ["/abs", r".tmp\mocks", "../x", "./x", "a//b", "**/x", "a/**"] {
+        let refusal = add(BASE, "carriedFolders", "gate", &[bad]).expect_err(bad).to_string();
+        assert!(
+            refusal.starts_with(r#"the result has a problem the file did not have: carriedFolders."gate"[0] is not a folder glob"#),
+            "{bad}: {refusal}"
+        );
+    }
+    let refusal = add(BASE, "carriedFolders", "gate", &[""]).expect_err("an empty glob").to_string();
+    assert_eq!(
+        refusal,
+        r#"the result has a problem the file did not have: carriedFolders."gate"[0] is not a non-empty string"#
     );
 }
 

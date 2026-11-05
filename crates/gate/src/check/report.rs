@@ -175,6 +175,8 @@ pub(crate) struct Checked {
     pub consent_problem: Option<String>,
     /// Why this PC's routing file's `hooks` value cannot be used, when it cannot.
     pub hooks_problem: Option<String>,
+    /// Why this PC's routing file's `carriedFolders` value cannot be used, when it cannot; none for a builder.
+    pub carried_folders_problem: Option<String>,
     /// Why this PC's routing file's `commits` value cannot be used, when it cannot.
     pub commits_problem: Option<String>,
     /// Why this PC's routing file's `requireSiblings` value cannot be used, when it cannot.
@@ -363,6 +365,9 @@ fn items(at: At<'_>, checked: &Checked) -> Vec<Item> {
         items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
     }
     if let Some(problem) = &checked.hooks_problem {
+        items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
+    }
+    if let Some(problem) = &checked.carried_folders_problem {
         items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
     }
     if let Some(problem) = &checked.commits_problem {
@@ -776,6 +781,7 @@ mod tests {
             workloads: Vec::new(),
             consent_problem: None,
             hooks_problem: None,
+            carried_folders_problem: None,
             commits_problem: None,
             require_siblings_problem: None,
             siblings_required: false,
@@ -1625,6 +1631,24 @@ mod tests {
             Said {
                 lines: one_item(
                     r"check: here: remote.json: hooks[0] is not a non-empty string\u{202e}",
+                    "check: here: 1 missing, 0 too old"
+                ),
+                status: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_carried_folders_value_that_cannot_be_used_is_an_escaped_missing_line() {
+        let checked = Checked {
+            carried_folders_problem: Some("carriedFolders must be a JSON object\u{202e}".to_owned()),
+            ..checked(Vec::new())
+        };
+        assert_eq!(
+            said(HERE, &checked),
+            Said {
+                lines: one_item(
+                    r"check: here: remote.json: carriedFolders must be a JSON object\u{202e}",
                     "check: here: 1 missing, 0 too old"
                 ),
                 status: 1,

@@ -467,6 +467,91 @@ fn a_bad_siblings_value_allows_none_and_leaves_routing_alone() {
     }
 }
 
+/// A routing file whose `carriedFolders` is `value`, routing every command of `g`.
+fn carried_folders_file(value: &str) -> Config {
+    Config::parse(&format!(
+        r#"{{"host": "builder-1", "slots": 2, "repos": {{"g": ["x"]}}, "carriedFolders": {value}}}"#
+    ))
+    .expect("routing reads the file whatever carriedFolders holds")
+}
+
+#[test]
+fn carried_folders_gives_each_repo_s_folder_globs_as_written() {
+    let config = carried_folders_file(r#"{"G": [".tmp/mocks/*-src", "fixtures/big?", "data"], "other": []}"#);
+    let globs = |repo: &str| {
+        config
+            .carried_folders(repo)
+            .map(|globs| globs.iter().map(|glob| glob.as_str().to_owned()).collect::<Vec<String>>())
+    };
+    assert_eq!(
+        globs("g"),
+        Ok(vec![".tmp/mocks/*-src".to_owned(), "fixtures/big?".to_owned(), "data".to_owned()]),
+        "the repo name in any case"
+    );
+    assert_eq!(globs("other"), Ok(Vec::new()), "an empty list");
+    assert_eq!(globs("missing"), Ok(Vec::new()), "a repo it does not name");
+    let none = Config::parse(r#"{"host": "builder-1", "repos": {}}"#).expect("usable");
+    assert_eq!(none.carried_folders("g"), Ok(&[][..]), "no carriedFolders key carries none");
+    let keyed = Config::parse(r#"{"host": "builder-1", "repos": {}, "CARRIEDFOLDERS": {"g": ["a"]}}"#).expect("usable");
+    assert_eq!(
+        keyed
+            .carried_folders("g")
+            .map(|globs| globs.iter().map(|glob| glob.as_str().to_owned()).collect::<Vec<String>>()),
+        Ok(vec!["a".to_owned()]),
+        "the key in any case"
+    );
+}
+
+#[test]
+fn a_bad_carried_folders_value_carries_none_and_leaves_routing_alone() {
+    let not_a_glob = |index: usize| {
+        let rules = "names separated by /, * and ? within a name, no . or .. name and no **";
+        format!(r#"carriedFolders."g"[{index}] is not a folder glob below the worktree root: {rules}"#)
+    };
+    let mut cases: Vec<(String, String)> = [
+        (r#"["a"]"#, "carriedFolders must be a JSON object"),
+        ("null", "carriedFolders must be a JSON object"),
+        (r#"{"g": "a"}"#, r#"carriedFolders."g" is not an array of strings"#),
+        (r#"{"g": {}}"#, r#"carriedFolders."g" is not an array of strings"#),
+        (r#"{"g": ["a", ""]}"#, r#"carriedFolders."g"[1] is not a non-empty string"#),
+        (r#"{"g": [3]}"#, r#"carriedFolders."g"[0] is not a non-empty string"#),
+        (
+            r#"{"other": [null], "g": ["a"]}"#,
+            r#"carriedFolders."other"[0] is not a non-empty string"#,
+        ),
+    ]
+    .into_iter()
+    .map(|(value, problem)| (value.to_owned(), problem.to_owned()))
+    .collect();
+    for glob in [
+        "/abs",
+        r"C:/dev/x",
+        r".tmp\\mocks",
+        "../x",
+        "a/../b",
+        "./x",
+        "a/.",
+        "a//b",
+        "a/",
+        "**",
+        "**/x",
+        "a/**",
+        "a/b**c",
+        "a|b",
+        "a`*b",
+    ] {
+        cases.push((format!(r#"{{"g": ["ok", "{glob}"]}}"#), not_a_glob(1)));
+    }
+    for (value, problem) in cases {
+        let config = carried_folders_file(&value);
+        assert_eq!(config.carried_folders("g"), Err(problem.as_str()), "{value}");
+        assert_eq!(config.carried_folders("other"), Err(problem.as_str()), "the whole table: {value}");
+        assert_eq!(config.host(), "builder-1", "{value}");
+        assert_eq!(config.slots(), 2, "{value}");
+        assert_eq!(pattern_texts(&config, "g"), ["x"], "{value}");
+    }
+}
+
 /// The routing file listing `g` with `warmup` holding `value`.
 fn warmup_file(value: &str) -> Config {
     Config::parse(&format!(

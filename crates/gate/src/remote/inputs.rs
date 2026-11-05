@@ -864,11 +864,13 @@ pub(crate) fn relative(root: &Path, path: &Path) -> Option<String> {
 }
 
 /// The first exact path of `asked` that a command carries ([`CARRIED_INPUT`]) that the walk's `found` does not hold,
-/// compared without regard to ASCII letter case: one gone since the decision, or one the exclusions drop.
+/// compared without regard to ASCII letter case: one gone since the decision, or one the exclusions drop. A carried
+/// folder (`<folder>/**`, the only carried entry holding a `*`) is never one: it may hold no file at all.
 fn unsent_carried<'a>(asked: &'a [String], found: &[Found]) -> Option<&'a str> {
     asked
         .iter()
         .filter_map(|glob| glob.strip_prefix(CARRIED_INPUT))
+        .filter(|path| !path.contains('*'))
         .find(|path| !found.iter().any(|file| file.path.eq_ignore_ascii_case(path)))
 }
 
@@ -2150,6 +2152,38 @@ mod tests {
             built.as_ref().map(paths),
             Ok::<_, &String>(vec!["probe/P.csproj"]),
             "neither the log, its .err nor a stage is sent, and none is missing"
+        );
+    }
+
+    #[test]
+    fn a_carried_folder_sends_its_gitignored_files_and_is_never_missing() {
+        let root = worktree("carried-folder", ".tmp/\n");
+        for path in [
+            ".tmp/mocks/a-src/index.html",
+            ".tmp/mocks/a-src/models/m.glb",
+            ".tmp/mocks/b-src/index.html",
+        ] {
+            put(&root, path, "x");
+        }
+        let folder = format!("{CARRIED_INPUT}.tmp/mocks/a-src/**");
+        let missing = format!("{CARRIED_INPUT}.tmp/mocks/gone-src/**");
+
+        let built = build(&root, &[folder.as_str(), missing.as_str()]).map_err(|unbuilt| failure(Err(unbuilt)));
+
+        assert_eq!(
+            built.as_ref().map(paths),
+            Ok::<_, &String>(vec![".tmp/mocks/a-src/index.html", ".tmp/mocks/a-src/models/m.glb"]),
+            "the folder's files alone, and a folder that is not there is no failure"
+        );
+        let built = built.expect("built");
+        assert_eq!(built.marking, Marking::Write, "a carried folder writes the carried marker");
+        assert!(
+            !built
+                .said
+                .iter()
+                .any(|line| line.contains("could not be sent") || line.contains("matched nothing")),
+            "{:?}",
+            built.said
         );
     }
 

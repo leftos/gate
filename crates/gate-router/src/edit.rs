@@ -11,7 +11,16 @@ use crate::config::Config;
 use crate::escape::escaped;
 
 /// The sections `gate remote` edits: each an object of repo names to lists of strings.
-pub const EDIT_SECTIONS: [&str; 7] = ["repos", "outputs", "failureOutputs", "inputs", "desktop", "desktopSession", "siblings"];
+pub const EDIT_SECTIONS: [&str; 8] = [
+    "repos",
+    "outputs",
+    "failureOutputs",
+    "inputs",
+    "desktop",
+    "desktopSession",
+    "siblings",
+    "carriedFolders",
+];
 
 /// The sections a `builders` entry has, which `gate remote --builder` edits.
 pub const BUILDER_SECTIONS: [&str; 3] = ["repos", "outputs", "failureOutputs"];
@@ -287,6 +296,7 @@ fn soft_problems(config: &Config) -> Vec<String> {
     let mut problems: Vec<String> = [
         config.builders().err(),
         config.allowed_siblings("").err(),
+        config.carried_folders("").err(),
         config.warmup_consented("").err(),
         config.allowed_desktop("").err(),
         config.allowed_desktop_session("").err(),

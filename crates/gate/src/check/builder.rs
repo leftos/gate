@@ -642,6 +642,7 @@ impl Answer<'_> {
             workloads: declared.manifest.workloads,
             consent_problem: None,
             hooks_problem: None,
+            carried_folders_problem: None,
             commits_problem: None,
             require_siblings_problem: None,
             siblings_required: false,

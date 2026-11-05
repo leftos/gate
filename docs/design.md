@@ -37,7 +37,7 @@ A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `
 | `gate push` | Copy the installed `gate.exe` and desktop helper to every builder `remote.json` names and register the desktop task there. |
 | `gate drain` | Raise a barrier on a builder and wait until no routed run is going there, so it can be redeployed; `--lift` lifts it, `--status` reports ([`gate drain`](#gate-drain)). |
 | `gate prune --builders` | Mark the worktree records whose worktree is gone, and prune the work folder of each one that has been gone an hour on every builder `remote.json` lists, then remove what this PC keeps of the key ([`gate prune`](#gate-prune)). |
-| `gate remote` | Add or remove patterns in one list of `remote.json`, keeping the rest of the file as it is, or ask which pattern of a repo matches a text with `match` ([`gate remote`](#gate-remote)). |
+| `gate remote` | Add or remove entries (patterns, names or folder globs) in one list of `remote.json`, keeping the rest of the file as it is, or ask which pattern of a repo matches a text with `match` ([`gate remote`](#gate-remote)). |
 | `gate check` | Say what this PC lacks for the repo in the current folder, and how to install it. |
 | `gate burn` | Spin the CPU for a set time, for the load-burn tool. |
 | `gate expect` | Print the expected time of a command here and on each builder, from the durations store. |
@@ -438,6 +438,8 @@ Each sibling the repo declares is checked as routing checks it, and gets one lin
 
 When the repo declares siblings and `remote.json` lists the repo but its `siblings` value cannot be used, the line `check: here: remote.json: <problem>` (control characters escaped, counted missing) comes before the sibling lines, and every sibling is not allowed. A repo that declares none says nothing of it.
 
+A `carriedFolders` table that cannot be used is said the same way, `check: <where>: remote.json: <problem>` counted missing, whatever the repo (the problems are listed under `remote.json`).
+
 A `desktopSession` value of `remote.json` that cannot be used is said the same way, `check: <where>: remote.json: <problem>` counted missing, whatever the repo. So is a `commits` value that cannot be used, right after the `hooks` one.
 
 An `ssh` value that cannot be used is said as `check: here: remote.json: <problem>`, and a named ssh that does not exist as `check: here: remote.json: ssh <path> does not exist`, both counted missing.
@@ -771,7 +773,11 @@ Test-seams builds accept hidden options on `prune` and no `--test-print-request`
 
 A missing or unusable `remote.json` prints one `remote: ` line on stderr (the refusal texts below for the file) and exits 1. It takes no `--builder`, `--tag` or `--dry-run`. The local-run watcher asks it in place of a matcher of its own.
 
-`<section>` is one of `repos`, `outputs`, `failureOutputs`, `inputs`, `desktop`, `desktopSession` or `siblings`, and `<repo>` a key of that section. With `--builder <host>` (a `builders` entry matched by host in ASCII case) the list is the entry's own, and only `repos`, `outputs` and `failureOutputs` exist there. The flat lists (`warmup`, `hooks`, `commits`, `sendBuild`) are not edited by it. A repo key matches in ASCII case and keeps its spelling; a missing repo or section is appended at the end. Removing the last pattern leaves `[]` and never deletes the key (an empty `outputs` list brings nothing back).
+`<section>` is one of `repos`, `outputs`, `failureOutputs`, `inputs`, `desktop`, `desktopSession`, `siblings` or `carriedFolders`, and `<repo>` a key of that section.
+
+A section's entries are the patterns of a command-matching list, the folder names of `siblings` or the folder globs of `carriedFolders`; the word `<pattern>` stands for any of them.
+
+With `--builder <host>` (a `builders` entry matched by host in ASCII case) the list is the entry's own, and only `repos`, `outputs` and `failureOutputs` exist there. The flat lists (`warmup`, `hooks`, `commits`, `sendBuild`) are not edited by it. A repo key matches in ASCII case and keeps its spelling; a missing repo or section is appended at the end. Removing the last pattern leaves `[]` and never deletes the key (an empty `outputs` list brings nothing back).
 
 The file is rewritten as it stood: key order, indent (spaces or tabs), line ending, byte order mark and final newline are kept, and a file holding comments or trailing commas is refused, since a rewrite would drop them. Before it writes, the command checks that the result passes the router's parse, changes nothing outside the one list and adds no problem the file did not have, then re-reads the file and compares its bytes with what it edited. The write is `gate_state::write_text_replacing`, an atomic replace.
 
@@ -779,7 +785,13 @@ A write that changes the file first makes a backup beside it, `remote.json.bak-[
 
 Output on stdout, one line per pattern: `remote: <section>.<repo>: + <pattern>`, `remote: <section>.<repo>: - <pattern>`, `remote: <section>.<repo>: unchanged (already has <pattern>)` or `remote: <section>.<repo>: absent (no <pattern>)`, with `builders[<n>].<section>.<repo>` for a builder's list. Then `remote: backup <path>` and `remote: wrote <path>`, or `remote: dry run; nothing written`. Adding a present pattern or removing an absent one is not an error (exit 0).
 
-Exit 0 on success, 1 on a refusal and 2 on usage. Usage errors print their `gate: ` line before the usage: `gate: remote: missing the verb add, remove or match` (likewise a missing section, repo, pattern or, for `match`, `the text`), `unknown verb <v>; add, remove or match`, `<option> is for add and remove only; match changes nothing`, `match takes a repo and one text, and not <word>`, `unknown section <s>; one of repos, outputs, failureOutputs, inputs, desktop, desktopSession, siblings`, `a builder has no section <s>; with --builder, one of repos, outputs, failureOutputs`, `--tag is for add only; remove makes no backup to name` and `--tag must be 1 to 40 ASCII letters, digits, '_' and '-', got '<v>'`, plus the shared `--<opt> is given twice`, `unknown option <w>` and `--<opt> needs a value` (an option word or `--` after `--tag` or `--builder` is never its value).
+Exit 0 on success, 1 on a refusal and 2 on usage.
+
+Usage errors print their `gate: ` line before the usage: `gate: remote: missing the verb add, remove or match` (likewise a missing section, repo, pattern or, for `match`, `the text`), `unknown verb <v>; add, remove or match`, `<option> is for add and remove only; match changes nothing`, `match takes a repo and one text, and not <word>`.
+
+Others are `unknown section <s>; one of repos, outputs, failureOutputs, inputs, desktop, desktopSession, siblings, carriedFolders`, `a builder has no section <s>; with --builder, one of repos, outputs, failureOutputs`, `--tag is for add only; remove makes no backup to name` and `--tag must be 1 to 40 ASCII letters, digits, '_' and '-', got '<v>'`.
+
+The shared `--<opt> is given twice`, `unknown option <w>` and `--<opt> needs a value` are also said (an option word or `--` after `--tag` or `--builder` is never its value).
 
 A refusal prints one `remote: ` line on stderr and leaves the file as it was:
 
@@ -975,6 +987,8 @@ The lines of a run that starts its command:
 
   The line names each carried sibling in declared order with its root as routing spells it. When declared siblings are absent (nothing at the name beside the worktree root) it then says `gate: routed without sibling <name>: not beside the worktree`, or `gate: routed without siblings <a>, <b>: not beside the worktree` for more, the names in declared order, right after the `routed with siblings` line when there is one.
 
+  A routed run whose `remote.json` has a `carriedFolders` table that cannot be used says, once per routed run, `gate: remote.json carriedFolders cannot be used: <problem>; no folder carried` (the problems are listed under [remote.json](#remotejson)). The run still routes, carrying no folder.
+
   While it waits for a remote slot: `gate: waiting for a remote slot on <host> (<n> busy)` and `gate: still waiting for a remote slot on <host> (<s> s)`, as a local wait says them, ETA included.
 
   A run that waits on several builders' pools at once names them all, `gate: waiting for a remote slot on <alias> or <alias> (<n> busy)` and `gate: still waiting for a remote slot on <alias> or <alias> (<s> s)`, and says `gate: took a remote slot on <alias> after <s> s` for the builder whose slot it took, after that builder's route lines when it is not the pick ([Slots](#slots), Taking a slot).
@@ -1048,7 +1062,9 @@ The lines of a run that starts its command:
 
   A gitignored file of a sibling is named `../<sibling>/<path>` and the advice names that sibling's repo: `add it to <sibling-repo>'s inputs in remote.json`.
 
-  A path qualifies when a word of the run names it (any value of any word after the program word, words after `--` included, script text excluded, and before a dotnet command's own `--` no output option's value), it is a file in the worktree (a folder never is), git reports it ignored, no `inputs` glob covers it and it was not carried. The check runs after the remote slot is released, so the slot's release lines come before the hint and the `gate: FAILED` line, as for a restoring build.
+  A path qualifies when a word of the run names it (any value of any word after the program word, words after `--` included, script text excluded, and before a dotnet command's own `--` no output option's value), it is a file in the worktree (a folder never is), git reports it ignored, no `inputs` glob covers it, it was not carried and it lies in no carried folder (a folder a `carriedFolders` glob made the run carry whole).
+
+  The check runs after the remote slot is released, so the slot's release lines come before the hint and the `gate: FAILED` line, as for a restoring build.
 
   It names at most 5 paths, in word order, then `gate: hint: and <n> more gitignored path(s)`. The words come from `gate_router::named_tree_paths` and the ignore check is the one `git check-ignore -z --stdin` call that `Machine::check_ignore` also uses. When git or the `inputs` globs cannot be read for the check, the log alone says `gate: cannot tell which words are gitignored: <why>`.
 - The restore lines, on stderr and in the log, after a routed dotnet build that passed and brought everything back restores its target here ([Routing](#routing), The restore here), after the command's tail and before the stale, cores, route and passed lines, which stay the run's last. Each line that is not a success ends `; a --no-build run here builds first`, and the target and the side file's path are escaped.
@@ -2788,7 +2804,15 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A matched command that would otherwise route and names a gitignored project input carries the files to the builder as inputs (`carried_inputs`, after the nothing-sent check). Each file is an exact path in the run's inputs after the `[carried]` mark (`CARRIED_INPUT`), which no repo glob can equal, and a repo with no `inputs` entry gets an inputs step for such a run.
 
-  The command stays local, journalling `notRouted: "gitignored input"`, when the files cannot go. The caps, checked in the router before any push, are 64 MiB of raw bytes and 2,000 files across all carried candidates, saying `gate: not routed: <path> is gitignored and a command's inputs carry at most 64 MiB in 2000 files; its files hold <n> MiB in <k> files`.
+  The command stays local, journalling `notRouted: "gitignored input"`, when the files cannot go. The caps on the files a command's words name, checked in the router before any push, are 64 MiB of raw bytes and 2,000 files across all carried candidates (a carried folder's files do not count here, see below), saying `gate: not routed: <path> is gitignored and a command's inputs carry at most 64 MiB in 2000 files; its files hold <n> MiB in <k> files`.
+
+  A repo's `carriedFolders` globs ([remote.json](#remotejson)) carry a whole folder, gitignored files included, when a routed run's word names a path inside a matching folder or the folder itself (`carried_folder_inputs` in `decide.rs`, over the paths `named_tree_paths` reads). The outermost (shortest) matching folder wins and each folder is carried once, with no existence check.
+
+  A gitignored file a dotnet word names inside a carried folder travels only as part of its folder: it gets no exact carried entry and counts toward neither the 64 MiB nor the 2,000-file cap.
+
+  The folder's files travel as the repo's globbed inputs do, so the members, manifest line and put caps of the inputs step apply, not the 64 MiB and 2,000-file caps above; a folder past a cap keeps the run here with the globbed-inputs refusal.
+
+  A later run that carries no such folder removes the builder's copies, as for other carried copies. Only the main tree's folders are carried, never a sibling's.
 
   A run carrying siblings (a pair) carries a command-named gitignored file in the main tree or in a sibling on a Windows builder. A sibling file is recognised where the rewrite lands it (`..\<sibling>\x`, the sibling name in any letter case), checked with `git check-ignore` in the sibling repo (`Facts::gitignored_inputs` is asked once per tree, the other trees passed as `OtherTree`s) and listed in the pair manifest under that sibling's tree prefix as `[carried]`.
 
@@ -2919,6 +2943,16 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   `siblings` is an optional object of the same shape as `outputs`, but each value an array of folder names the builder can lay out (`is_layout_name`): the sibling worktrees the machine lets that repo carry, its repo name matched in any letter case and each sibling name exactly. A repo with no entry is allowed none.
 
   A `siblings` that is not an object, or holds a value that is not an array of such names, never refuses the file: it allows no sibling, and the rest of the file is read as usual ([Sibling worktrees](#routing)).
+
+  `carriedFolders` is an optional object of the same shape as `outputs`, each value an array of folder globs: `/`-separated folders below the worktree root, `*` any run of characters within one name, `?` one character, matched ignoring letter case as PowerShell `-like` does (simple Unicode case folding), the repo key in any case.
+
+  Example: `{"carriedFolders": {"world-of-intrigue": [".tmp/mocks/*-src"]}}` with `outputs` `.tmp/mock-out/**` lets `pwsh -NoProfile -File tools/mock-shoot.ps1 -Page .tmp/mocks/<name>-src/index.html -Out .tmp/mock-out/<name>.png` send only that page's folder, where a repo-wide `inputs` glob would send every mock folder on every routed run. Only the main tree uses it ([Routing](#routing), the carried folders paragraph).
+
+  A `carriedFolders` that cannot be used refuses nothing else: the feature is off for every repo and routing uses the rest of the file. A routed run says so with `gate: remote.json carriedFolders cannot be used: <problem>; no folder carried` ([Routing](#routing), the route-time lines).
+
+  The reasons are `carriedFolders must be a JSON object`, `carriedFolders."<repo>" is not an array of strings`, `carriedFolders."<repo>"[<i>] is not a non-empty string` and `carriedFolders."<repo>"[<i>] is not a folder glob below the worktree root: names separated by /, * and ? within a name, no . or .. name and no **` (an entry that is empty, absolute, holds `\`, `:`, `[`, `]`, `"`, `<`, `>`, `|` or a backtick, has an empty name, or has a `.`, `..` or `**` name).
+
+  `gate remote add` refuses a bad glob with `the result has a problem the file did not have: carriedFolders."<repo>"[<i>] …`.
 
   `desktop` is an optional object mapping a repo name, matched in any letter case, to an array of the `.gate/desktop.toml` patterns the machine lets that repo run on the builder's desktop (`Config::allowed_desktop`); a declared pattern is consented only when listed exactly, letter case included. A repo with no entry is allowed none.
 
@@ -3295,7 +3329,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     Never sent, whatever the globs: any `.git` path, `.lfsconfig`, `.env`, `*.env`, `.env.<name>` and `.envrc` at any depth, matched without regard to case, the gate's own archives and stages under `.tmp` (named for the work folder's key) and the run's own log and `.err` file, found by canonical path. `.tmp` is otherwise reachable.
 
-    Caps: 50,000 members and a 64 MiB manifest, counted on what the globs match, and 4 GiB per put, counted on the files the diff named, submodule files included (`--test-remote-inputs-budget-bytes` replaces the 4 GiB). A set past a cap is not sent. The router's caps on command-named gitignored files (64 MiB, 2000 files) are separate from these. A file that changes between its hashing and its packing is not sent either, and its entry is dropped from the hash cache.
+    Caps: 50,000 members and a 64 MiB manifest, counted on what the globs match, and 4 GiB per put, counted on the files the diff named, submodule files included (`--test-remote-inputs-budget-bytes` replaces the 4 GiB). A set past a cap is not sent.
+
+    The router's caps on command-named gitignored files (64 MiB, 2000 files) are separate from these, and a carried folder's files fall under these caps, not those. A file that changes between its hashing and its packing is not sent either, and its entry is dropped from the hash cache.
 
     The hash cache is `remote\<key>.inputs-hashes` in the state root (a pair keeps one more for each sibling, `remote\<key>.<sibling>.inputs-hashes`), beside the outputs one and apart from it, since the outputs saves drop every file the outputs walk no longer finds. It holds the manifest line of the last built manifest's files last written well before that build, is saved when a build changes it, and is the same shape and rules as the outputs cache ([Manifest time](#routing)). There is no PC record of what the builder holds: the diff call is the truth.
 

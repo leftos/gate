@@ -5993,11 +5993,12 @@ struct HintTree {
 }
 
 impl HintTree {
-    /// The tree at `root` whose run's input globs are `inputs`: the paths after [`CARRIED_INPUT`] carried, the rest
-    /// the repo's globs.
+    /// The tree at `root` whose run's input globs are `inputs`: the exact paths after [`CARRIED_INPUT`] carried, the
+    /// rest globs, the repo's own and each carried folder's (`<folder>/**`, the only carried entry holding a `*`).
     fn of(root: &str, inputs: &[String]) -> HintTree {
         let (carried, globs) = inputs.iter().fold((Vec::new(), Vec::new()), |(mut carried, mut globs), input| {
             match input.strip_prefix(CARRIED_INPUT) {
+                Some(folder) if folder.contains('*') => globs.push(folder.to_owned()),
                 Some(file) => carried.push(file.to_owned()),
                 None => globs.push(input.clone()),
             }
@@ -6182,6 +6183,22 @@ mod tests {
     use gate_state::v1::{Claim, ClaimKind};
     use jiff::Timestamp;
     use serde_json::{Map, Value};
+
+    #[test]
+    fn a_hint_tree_reads_a_carried_folder_as_a_glob() {
+        let inputs = [
+            "secrets/**".to_owned(),
+            format!("{}.tmp/a.targets", gate_router::CARRIED_INPUT),
+            format!("{}.tmp/mocks/a-src/**", gate_router::CARRIED_INPUT),
+        ];
+        let tree = super::HintTree::of("X:/dev/r", &inputs);
+        assert_eq!(tree.carried, [".tmp/a.targets"], "an exact path is carried");
+        assert_eq!(
+            tree.globs,
+            ["secrets/**", ".tmp/mocks/a-src/**"],
+            "a carried folder covers its files as the repo's globs do"
+        );
+    }
 
     #[test]
     fn a_desktop_or_pinned_run_lost_mid_run_says_it_may_have_run_there() {

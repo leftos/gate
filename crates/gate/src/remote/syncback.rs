@@ -4616,6 +4616,7 @@ mod tests {
                 inputs: Vec::new(),
             }],
             absent_siblings: Vec::new(),
+            carried_folders_problem: None,
             repo: "app".to_owned(),
             key: KEY.to_owned(),
             subfolder: String::new(),
