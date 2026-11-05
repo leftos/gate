@@ -19,7 +19,7 @@ use crate::stall_capture;
 /// The failure markers (kept, V2), as the PowerShell gate and design.md write them.
 const MARKERS: &str = concat!(
     r"^Build FAILED\.|error CS\d+|: error |Test run summary: Failed!|No test projects were found|^\s*failed: [1-9]|",
-    r"gate: (TIMED OUT|STALLED|BACKSTOP|TRANSFER TIMED OUT|TRANSFER FAILED)"
+    r"^\s*gate: (TIMED OUT|STALLED|BACKSTOP|TRANSFER TIMED OUT|TRANSFER FAILED)"
 );
 
 /// The start of the line the gate says before it makes a transfer after a routed command again, which carries the
@@ -421,7 +421,7 @@ mod tests {
             "failed: 1",
             "gate: TIMED OUT after 900 s",
             "gate: STALLED: no output",
-            "inner gate: BACKSTOP: 5 times the ceiling",
+            "  gate: BACKSTOP: 30 s of wall time",
             "gate: TRANSFER TIMED OUT after 1800 s fetching the outputs",
         ];
         for line in lines {
@@ -457,6 +457,35 @@ mod tests {
         assert!(!matched("    failed: 0"));
         assert!(matched("    failed: 3"), "leading spaces before failed");
         assert!(!matched("Build FAILED"), "the period is part of the marker");
+    }
+
+    #[test]
+    fn a_gate_kill_line_is_a_marker_only_at_the_start_of_its_text() {
+        assert!(
+            !matched("gate/tests/test_gate_call.py::test_gate_kill_reads_each_kind[STALLED-gate: STALLED after 40 s with no output and no CPU]"),
+            "a test id that holds a kill line is no kill line"
+        );
+        assert!(
+            !matched(
+                "worktree/tests/test_warm.py::test_a_gate_kill_exits_124_with_its_reading[gate: TIMED OUT after 300 s (load-adjusted 310 s)-reading1]"
+            ),
+            "a test id that holds a timeout line is no timeout line"
+        );
+        assert!(
+            !matched("x[BACKSTOP-gate: BACKSTOP at 900 s, machine free 12%]"),
+            "a backstop line mid-line"
+        );
+        assert!(
+            !matched("x[TRANSFER TIMED OUT-gate: TRANSFER TIMED OUT after 1800 s fetching the outputs]"),
+            "a transfer timeout line mid-line"
+        );
+        assert!(matched("gate: STALLED: no output"));
+        assert!(matched("  gate: TIMED OUT after 900 s"), "leading spaces before a kill line");
+        assert_eq!(
+            markers(&format!("ok\n{STAMP} gat gate: STALLED: no output for 600 s\n")),
+            numbered(&[(2, "gate: STALLED: no output for 600 s")]),
+            "a stamped gate line's text starts with its kill line"
+        );
     }
 
     #[test]

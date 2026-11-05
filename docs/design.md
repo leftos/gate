@@ -2424,7 +2424,7 @@ A period with no beat due flushes instead, and the box's flush probes stderr for
 - Lines end at CR LF, LF or a lone CR, as .NET's `ReadLine` ends them, for the marker scan and the tail. Both decode the log as UTF-8 lossily: an invalid byte reads as U+FFFD. The scan, the tail and the last-line read behind the verdict read the text after the tag, a line with no stamp whole, so a pattern anchored with `^` anchors at the text.
 
   Marker line numbers are numbers of the raw log's lines, process lines included. The gate writes the tail to stdout as UTF-8 (through the wide console API when stdout is a console), as text with no stamp or tag.
-- The failure-marker regex is built in (kept, V2): `^Build FAILED\.|error CS\d+|: error |Test run summary: Failed!|No test projects were found|^\s*failed: [1-9]|gate: (TIMED OUT|STALLED|BACKSTOP|TRANSFER TIMED OUT|TRANSFER FAILED)`.
+- The failure-marker regex is built in (kept, V2): `^Build FAILED\.|error CS\d+|: error |Test run summary: Failed!|No test projects were found|^\s*failed: [1-9]|^\s*gate: (TIMED OUT|STALLED|BACKSTOP|TRANSFER TIMED OUT|TRANSFER FAILED)`. The gate's kill lines count only at the start of a line's text (after any stamp and tag), so a command's output that quotes one mid-line, such as a test id whose parameter holds it, is no failure.
 
   `No test projects were found` makes a `dotnet test` that found nothing to run (a Windows-only test project on a macOS builder) a failure even when the command exits 0; a Microsoft.Testing.Platform run of zero tests needs no marker, since it exits 8 unless the repo asks otherwise.
 
