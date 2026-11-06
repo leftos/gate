@@ -752,6 +752,9 @@ pub enum LocalReason {
     /// Windows builder left once a macOS pick is steered off. `project` names what the run builds: its project's key,
     /// or its solution as named.
     BuiltHere { project: String },
+    /// A sibling pair's run that carries inputs ([`carries_pair_inputs`]) whose every routable candidate is no Windows
+    /// one: its inputs go only to a Windows builder, and none routes the command.
+    PairInputsMacOnly,
     /// A gate a parent gate's slot covers runs here with its parent, though its command matches `pattern`, the first
     /// declared desktop pattern it matches that `remote.json` allows the repo ([`desktop_under_parent`]).
     DesktopUnderParent { pattern: String },
@@ -810,6 +813,7 @@ impl LocalReason {
             ),
             Self::GitignoredUnsent { path, why } => format!("{} is gitignored and its files cannot be sent: {why}", escaped(path)),
             Self::BuiltHere { project } => format!("the last build of {} ran here; --no-build kept", escaped(project)),
+            Self::PairInputsMacOnly => "a sibling pair's inputs go only to a Windows builder, and no Windows builder routes this command".to_owned(),
             Self::DesktopUnderParent { pattern } => format!(
                 "a desktop command runs on this PC because its parent gate runs here (desktop pattern '{}')",
                 escaped(pattern)
@@ -1168,11 +1172,15 @@ fn absent_line(names: &[String]) -> Option<String> {
 /// here under its own settings ([`Facts::built_here`]) and whose send of the PC's build cannot be made runs here
 /// keeping its word, saying why ([`LocalReason::BuiltHere`]). A light gate's matched command its `.gate/local.toml`
 /// does not keep here runs here, saying why, when its learned local p50 proves it faster here than the builder the
-/// macOS and backslash steer-offs leave it ([`LocalReason::FasterHere`]).
+/// macOS, backslash and sibling pair's steer-offs leave it ([`LocalReason::FasterHere`]).
 ///
 /// A desktop run, a command its `.gate/desktop.toml` (read right after `.gate/local.toml`) gives a pattern the routing
 /// file consents, never runs here: it skips the light-run speed check, and every later reason that would keep it here,
 /// a silent one included, refuses it instead ([`PinRefusal::DesktopNotHere`]).
+///
+/// A sibling pair's run that carries inputs ([`carries_pair_inputs`]) never goes to a builder that is no Windows one:
+/// a pick of one goes on to the pick's first Windows builder ([`steer_off_pair_inputs`]), or runs here saying why
+/// ([`LocalReason::PairInputsMacOnly`]) when none is left; a run pinned to one is refused, and a later one is skipped.
 ///
 /// A run pinned to one builder ([`Inputs::pin`]) goes to that builder alone, with no later candidates, or is refused
 /// ([`pinned`]).
@@ -1449,11 +1457,17 @@ fn route(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Decided, Unrouted> {
         return Ok(Decided::Stage(run));
     }
     let config = routable(config, inputs)?;
-    let matched = matched(&config, inputs, facts)?;
-    let desktop_run = matched.desktop.is_some();
-    ended(&config, matched, inputs.words, facts)
-        .map(Decided::Routed)
-        .map_err(|here| Unrouted::kept(desktop_run, here))
+    let (picked, repick) = matched(&config, inputs, facts)?;
+    let desktop_run = picked.desktop.is_some();
+    let run = ended(&config, picked, inputs.words, facts).map_err(|here| Unrouted::kept(desktop_run, here))?;
+    match repick {
+        // A sibling pair's run that carries inputs goes on to the pick's first Windows builder, as the client refuses a
+        // pair's inputs on every other builder ([`carries_pair_inputs`]).
+        Some(repick) if carries_pair_inputs(&run) => steer_off_pair_inputs(&config, repick, inputs.words, facts)
+            .map(Decided::Routed)
+            .map_err(|here| Unrouted::kept(desktop_run, here)),
+        _ => Ok(Decided::Routed(run)),
+    }
 }
 
 /// Why the `matched` command whose `word` names a path outside the worktree runs here: the git worktree its outside
@@ -2032,7 +2046,11 @@ fn file_stem(path: &str) -> &str {
 /// A macOS pick runs the words rewritten with `/` ([`Separators::Slash`]) and its relative `\` paths the snapshot carries
 /// written with `/` ([`unix_form`]); a pick whose words still hold a `\` goes on, silently, to the next builder that is
 /// no macOS one ([`steer_off_backslashes`]).
-fn matched(config: &Config, inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Matched, Unrouted> {
+///
+/// Returns the matched command and, for a sibling pair's pick that is no Windows builder, what [`route`] hands to the
+/// pair's steer-off ([`steer_off_pair_inputs`]) so it opens no worktree and asks no fact again ([`Repick`]); `None` for
+/// every other pick, which can never be steered so.
+fn matched(config: &Config, inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<(Matched, Option<Repick>), Unrouted> {
     let (git_hook, words) = (inputs.git_hook, inputs.words);
     let hidden = inputs.desktop_hidden;
     let (opened, drives, sent) =
@@ -2058,7 +2076,7 @@ fn matched(config: &Config, inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Ma
     let desktop_run = found
         .as_ref()
         .is_some_and(|(pattern, mode)| desktop_consent(config, &opened.repo, pattern, *mode).is_ok());
-    let picked = || -> Result<Matched, Here> {
+    let picked = || -> Result<(Matched, Option<Repick>), Here> {
         // A desktop run always routes, so it asks no local p50 that only the speed check would use.
         let local_p50 = (inputs.slot == Slot::Light && !desktop_run)
             .then(|| facts.local_p50(&opened.place, &sent.words))
@@ -2068,12 +2086,17 @@ fn matched(config: &Config, inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Ma
         let (builder, pattern) = steer_off_macos((config, &order), &opened, &sent.words, facts, (first, &found))?;
         let unix = slashed(&builder, &opened, words, &drives, facts);
         let (builder, pattern, unix) = steer_off_backslashes(&order, (builder, pattern, unix))?;
-        // Compared only now, so a builder the steer-offs turned away never sets the finish a light run must beat.
-        if let Some(reason) = proven_faster_here(local_p50, scores.as_ref(), &builder) {
-            return Err(Some(reason));
-        }
-        let later = later_candidates(&order, &builder);
-        let balanced = balanced.map(|balanced| picked_first(balanced, &builder));
+        // Only a sibling pair's pick that is no Windows builder can be steered once its run is ended.
+        let steerable = !opened.siblings.is_empty() && builder.os != BuilderOs::Windows;
+        let unpicked = if steerable { balanced.clone() } else { None };
+        let (later, balanced) = finish_pick(&order, scores.as_ref(), balanced, local_p50, &builder)?;
+        let repick = steerable.then(|| Repick {
+            order,
+            scores,
+            balanced: unpicked,
+            local_p50,
+            sent: (opened.clone(), drives.clone(), sent.clone()),
+        });
         let kept = Kept {
             builder,
             pattern,
@@ -2084,9 +2107,43 @@ fn matched(config: &Config, inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Ma
         let mut matched = built(config, opened, sent, kept, facts)?;
         matched.later = later;
         matched.balanced = balanced;
-        Ok(matched)
+        Ok((matched, repick))
     };
     picked().map_err(|here| Unrouted::kept(desktop_run, here))
+}
+
+/// What a sibling pair's steer-off ([`steer_off_pair_inputs`]) re-applies the pick's own steps over, as [`matched`]
+/// had them, so it asks no fact of the pick again.
+struct Repick {
+    /// The scored builders, best first, each with its pattern that matched ([`Scored::order`]).
+    order: Vec<(Builder, String)>,
+    /// Every builder's score ([`Scored::scores`]).
+    scores: Option<Scores>,
+    /// The scored builders in score order, no pick first yet ([`Scored::balanced`]).
+    balanced: Option<Balanced>,
+    /// The light run's learned local p50, which the speed check compares ([`proven_faster_here`]).
+    local_p50: Option<f64>,
+    /// The worktree the pick opened, its subst table and the words it rewrote ([`opened_and_sent`]).
+    sent: OpenedAndSent,
+}
+
+/// The steps every pick ends with once its builder is final, the plain pick's ([`matched`]) and a sibling pair's
+/// steered one's ([`steer_off_pair_inputs`]): a light run proven faster here than on `builder` stays here saying so
+/// ([`proven_faster_here`]), compared only now so a builder a steer-off turned away never sets the finish a light run
+/// must beat; else the builders after it in the score `order` ([`later_candidates`]) and the scored builders with it
+/// first ([`picked_first`]).
+fn finish_pick(
+    order: &[(Builder, String)],
+    scores: Option<&Scores>,
+    balanced: Option<Balanced>,
+    local_p50: Option<f64>,
+    builder: &Builder,
+) -> Result<(Vec<LaterCandidate>, Option<Balanced>), Here> {
+    if let Some(reason) = proven_faster_here(local_p50, scores, builder) {
+        return Err(Some(reason));
+    }
+    let later = later_candidates(order, builder);
+    Ok((later, balanced.map(|balanced| picked_first(balanced, builder))))
 }
 
 /// A builder the pipeline kept for the command, once its steer-off rules let it run it.
@@ -2185,6 +2242,54 @@ fn ended(config: &Config, matched: Matched, given: &[String], facts: &dyn Facts)
     run.user_tools = user_tools;
     run.user_tools_problem = user_tools_problem;
     Ok(run)
+}
+
+/// Whether `run` is a sibling pair's run that carries inputs: it carries siblings, and its `inputs` or any sibling's is
+/// non-empty. The rule it mirrors is the PC client's `pair_inputs` (`crates/gate/src/remote/inputs.rs`, `MACOS_PAIR`),
+/// which refuses a pair's inputs on every builder that is no Windows one and stays as the backstop: the two must agree
+/// field for field.
+fn carries_pair_inputs(run: &RemoteRun) -> bool {
+    !run.siblings.is_empty() && (!run.inputs.is_empty() || run.siblings.iter().any(|sibling| !sibling.inputs.is_empty()))
+}
+
+/// The run of the sibling pair's command that carries inputs ([`carries_pair_inputs`]), on the first Windows builder of
+/// the pick's score order that [`kept_run`] keeps, each finished as the pick is ([`finish_pick`]); every other builder
+/// is left out, as the client's `pair_inputs` refuses a pair's inputs on every builder that is no Windows one. The run
+/// keeps the pick's scored builders with its own first, and only the Windows ones as later candidates. `repick` is what
+/// the pick had ([`Repick`]), so the walk asks no fact of the pick again.
+///
+/// # Errors
+///
+/// The run stays here: proven faster here than a Windows builder it tries, and so than every one after it
+/// ([`proven_faster_here`]); with no Windows builder in the order, saying only a Windows one takes the inputs
+/// ([`LocalReason::PairInputsMacOnly`]); else as the first one tried stays here ([`Unkept::Here`]), silently when it
+/// does.
+fn steer_off_pair_inputs(config: &Config, repick: Repick, given: &[String], facts: &dyn Facts) -> Result<RemoteRun, Here> {
+    let Repick {
+        order,
+        scores,
+        balanced,
+        local_p50,
+        sent,
+    } = repick;
+    let windows = |builder: &Builder| builder.os == BuilderOs::Windows;
+    let is_windows = |alias: &str| order.iter().any(|(builder, _)| windows(builder) && builder.alias == alias);
+    let mut first: Option<Here> = None;
+    for (builder, pattern) in order.iter().filter(|(builder, _)| windows(builder)) {
+        let (later, balanced) = finish_pick(&order, scores.as_ref(), balanced.clone(), local_p50, builder)?;
+        match kept_run(config, sent.clone(), (builder.clone(), pattern.clone()), (given, None), facts) {
+            Ok(mut run) => {
+                run.later = later.into_iter().filter(|candidate| is_windows(&candidate.alias)).collect();
+                run.balanced = balanced;
+                return Ok(run);
+            }
+            Err(Unkept::Here(here)) => {
+                first.get_or_insert(here);
+            }
+            Err(_) => {}
+        }
+    }
+    Err(first.unwrap_or(Some(LocalReason::PairInputsMacOnly)))
 }
 
 /// The folders of the repo's `userTools` entries one of whose `commands` patterns matches the words the routing pattern
@@ -2907,7 +3012,7 @@ pub fn later_run(inputs: &Inputs<'_>, facts: &dyn Facts, candidate: &LaterCandid
     }
     kept_run(&config, (opened, drives, sent), (builder, pattern), (inputs.words, proven), facts).map_err(|unkept| match unkept {
         Unkept::Here(here) => Some(kept_here(here)),
-        Unkept::Desktop | Unkept::WindowsOnly | Unkept::WindowsChange(_) | Unkept::BuiltHere(_) | Unkept::Backslash => None,
+        Unkept::Desktop | Unkept::WindowsOnly | Unkept::WindowsChange(_) | Unkept::BuiltHere(_) | Unkept::Backslash | Unkept::PairInputs => None,
     })
 }
 
@@ -2927,6 +3032,8 @@ enum Unkept {
     BuiltHere(String),
     /// A macOS builder, and a word of the command's Unix form still holds a `\` ([`Slashed::Backslash`]).
     Backslash,
+    /// A builder that is no Windows one, and the run is a sibling pair's that carries inputs ([`carries_pair_inputs`]).
+    PairInputs,
 }
 
 /// The routed run of the opened worktree's command, its subst table and its words `sent` ([`opened_and_sent`]), on the
@@ -2938,7 +3045,8 @@ enum Unkept {
 ///
 /// # Errors
 ///
-/// Why the builder is not kept ([`Unkept`]); each caller says it its own way.
+/// Why the builder is not kept ([`Unkept`]); each caller says it its own way. A macOS builder is never kept for a
+/// pair's run that carries inputs ([`Unkept::PairInputs`]).
 fn kept_run(
     config: &Config,
     sent: OpenedAndSent,
@@ -2978,7 +3086,13 @@ fn kept_run(
         unix,
     };
     let matched = built(config, opened, sent, kept, facts).map_err(Unkept::Here)?;
-    ended(config, matched, given, facts).map_err(Unkept::Here)
+    let run = ended(config, matched, given, facts).map_err(Unkept::Here)?;
+    // A pair's run that carries inputs is never taken on a builder that is no Windows one, whatever the run's own
+    // rules said.
+    if run.builder.os != BuilderOs::Windows && carries_pair_inputs(&run) {
+        return Err(Unkept::PairInputs);
+    }
+    Ok(run)
 }
 
 /// Why a pinned run whose command is `git`, `prek` or empty cannot route.
@@ -3035,6 +3149,7 @@ fn pinned(inputs: &Inputs<'_>, host: &str, facts: &dyn Facts) -> Result<RemoteRu
         Unkept::WindowsChange(reason) => cannot(&reason),
         Unkept::BuiltHere(_) => unreachable!("a pinned run never asks the built-here record"),
         Unkept::Backslash => cannot(r"a word still holds a \, which a macOS builder reads another way"),
+        Unkept::PairInputs => cannot("it sends a sibling pair's inputs, which a macOS builder does not take"),
     })
 }
 
@@ -3387,6 +3502,9 @@ fn hidden_refusal(config: &Config, repo: &str, found: Option<&(String, DesktopMo
 /// decision's score `order` that is no macOS one. `found` is the first declared desktop pattern the command matches,
 /// already read. `Err(None)` when no other builder's pattern matches, but for a run whose last build ran here, which
 /// runs here keeping its word ([`LocalReason::BuiltHere`]).
+///
+/// A pair's run that carries inputs is not steered here, as only the finished run knows whether it does: [`route`]
+/// walks the pick's Windows builders once [`ended`] has built it ([`steer_off_pair_inputs`]).
 fn steer_off_macos(
     (config, order): (&Config, &[(Builder, String)]),
     opened: &Opened,
@@ -3590,6 +3708,7 @@ fn listed_in(consent: Result<&[String], &str>, pattern: &str) -> Result<(), Opti
 }
 
 /// A worktree whose repo the routing file lists, with the siblings its siblings file declares, not yet checked.
+#[derive(Clone)]
 struct Opened {
     place: Place,
     repo: String,
@@ -3611,7 +3730,7 @@ struct Opened {
 
 /// What the worktree's built-here record says of a dotnet `test` or `run --no-build` command ([`Facts::built_here`]):
 /// asked at most once, and only when a rule needs it. The default asks nothing and finds no build here.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct BuiltHere {
     /// The command's words as given; `None` for a command the record is never asked of.
     words: Option<Vec<String>>,
@@ -3642,6 +3761,7 @@ impl BuiltHere {
 type FolderAnswer = Option<Result<SiblingFolder, String>>;
 
 /// A declared sibling that is not absent, as the worktree was opened ([`presence`]).
+#[derive(Clone)]
 struct OpenedSibling {
     /// Its declared name and root.
     root: SiblingRoot,

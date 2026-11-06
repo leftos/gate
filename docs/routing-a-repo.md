@@ -50,7 +50,9 @@ A repo whose scripts live in an initialized git submodule needs nothing declared
 
 A sibling pair (a run carrying siblings; declared siblings that are all absent make a single repo) routes to a Windows builder and sends the `inputs` globs of both its repos, each applying to its own tree, and carries a gitignored file the command names in either tree, a sibling's included (`..\<sibling>\x`). A carried file's build that reads a gitignored file in the other tree stays local unless that file is sent there too.
 
-A builder that is not Windows, the macOS builder, does not take a pair's `inputs` yet: a pair whose repos declare any, or that carries a file, runs here, saying `gate: remote inputs not sent: the macOS builder does not take a sibling pair's inputs yet`.
+A builder that is not Windows, the macOS builder, does not take a pair's `inputs` yet: the router sends a pair whose repos declare any, or that carries a file, to a Windows builder instead.
+With no Windows builder that routes the command it runs here, saying `gate: not routed: a sibling pair's inputs go only to a Windows builder, and no Windows builder routes this command`, and `--builder` naming the macOS builder for it is refused.
+A pair that carries no inputs, and a single repo's run, still go to the Mac.
 
 A routed run that fails on its builder names, in a `gate: hint:` line before the failure line, each gitignored file (never a folder) its words name that no `inputs` glob covers and that was not carried (a file in a carried folder included); the fix is an `inputs` glob for it (in the sibling repo's `remote.json` for a file of a sibling, named `../<sibling>/<path>`), or `--local`.
 
