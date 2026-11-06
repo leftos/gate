@@ -266,9 +266,11 @@ The PC consents with an exact entry in `desktop.<repo>` or `desktopSession.<repo
 
 To prove a command there before moving it, run `gate run --desktop hidden -- <command>`: a command matching a declared and consented pattern of any mode runs as a hidden run, this run only, and `--builder <host>` may pin it. The log's hand-off line (`gate: the desktop helper pid=<h> started the command pid=<c> on the hidden desktop gate-<32 hex>`) shows it ran there; a locked or session run says `on the visible desktop`.
 
-It is refused, exit 2, when the command matches no pattern of `.gate/desktop.toml` (`gate: --desktop hidden needs a command matching a pattern of .gate/desktop.toml`), when the pattern is not allowed (`gate: --desktop hidden needs the desktop pattern '<pattern>' allowed in remote.json`), under a parent gate, with `--local` or a `critical` or `none` slot, or for any reason that keeps a routed command here;
+It is refused, exit 2, when the command matches no pattern of `.gate/desktop.toml` (`gate: --desktop hidden needs a command matching a pattern of .gate/desktop.toml`), when the pattern is not allowed (`gate: --desktop hidden needs the desktop pattern '<pattern>' allowed in remote.json`), under a parent gate (`gate: --desktop hidden cannot route under a parent gate`), or with `--local`, a `critical` or `none` slot, or any other reason that keeps a routed command here (`gate: --desktop hidden cannot route this run: <reason>`, or `nothing routes it` where the gate gives no reason);
 
 the run never goes on without the desktop, so a builder that no longer proves it is skipped.
+
+A command matching a `hidden` pattern that `remote.json` does not allow, run without `--desktop hidden`, is no desktop run: it runs here with the `not allowed` line above, never the `a desktop run never runs here` refusal of a consented desktop run.
 
 Once the proof run passes, move the pattern from `patterns` or `session` to `hidden` in `.gate/desktop.toml`; the `remote.json` entry stays as it is. A repo that has not moved keeps its locked runs unchanged.
 
