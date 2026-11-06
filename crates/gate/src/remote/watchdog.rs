@@ -25,7 +25,7 @@ pub(super) const LOG_CAP: u64 = 256 << 20;
 
 /// Why the watchdog killed a call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Kill {
+pub(crate) enum Kill {
     /// Nothing came from the call for the stall window.
     Stalled,
     /// The call ran to the limit its clock is cut at: the run call's backstop, a setup call's transfer ceiling.

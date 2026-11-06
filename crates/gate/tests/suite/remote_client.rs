@@ -8724,6 +8724,319 @@ fn a_killed_run_whose_pull_fails_every_retry_says_transfer_failed_and_stays_time
     assert!(!case.folder().join("dumps").join("a.dmp").exists(), "nothing is installed: {outcome:?}");
 }
 
+/// The stall window, in milliseconds, of a run call the PC cuts once its command is quiet after its dump.
+const CUT_STALL_MS: &str = "2000";
+
+/// The box seams of a run the PC cuts: a heartbeat period longer than any case, so the run call says nothing once its
+/// command is quiet, the box does not find its client gone, and the waiting outputs call says nothing either.
+const SILENT_BOX: &str = "--test-heartbeat-ms 600000";
+
+/// How the command of a run the PC cuts goes on after its dump.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Held {
+    /// It sleeps until the PC's stop, which reaches the real box, ends it; the outputs call follows.
+    Sleeping,
+    /// As [`Held::Sleeping`], but the first outputs call, whose box sends the whole archive and then removes it,
+    /// ends as a connection dropped before the banner, so its retry finds nothing packed.
+    SleepingRefetched,
+    /// The PC's stop fails, its one retry too, and the command waits until the case creates [`let_go_path`], so the
+    /// box's run is still going when the outputs call, which then waits for it, comes.
+    Waiting,
+}
+
+/// The path the command of a [`Held::Waiting`] run waits for, which the case creates once it has asserted the run's
+/// outcome.
+fn let_go_path(case: &Case) -> PathBuf {
+    case.folder().join("ssh").join("let-go")
+}
+
+/// Creates the let-go path of its case ([`let_go_path`]) when dropped, so the command of a [`Held::Waiting`] run, and
+/// the box's run with it, ends whether the case's assertions passed or not.
+struct LetGo<'c>(&'c Case);
+
+impl Drop for LetGo<'_> {
+    #[expect(clippy::print_stderr, reason = "a let-go path that cannot be written says so in the case's output")]
+    fn drop(&mut self) {
+        // A path that cannot be written leaves the command to its own wait limit, said so the case's output shows it.
+        if let Err(error) = fs::write(let_go_path(self.0), "") {
+            eprintln!("cannot write the let-go path {}: {error}", let_go_path(self.0).display());
+        }
+    }
+}
+
+/// A [`failure_case`] routed run with the failure output globs `failure`, whose command builds `bin\built.txt`, writes
+/// the dump `dumps\a.dmp` on the real box and goes on as `held` says until the PC cuts its run call as `tuned` says. The
+/// box runs outside the stand-in's job (`away`) with [`SILENT_BOX`]. Its case, steps file and outcome, from the first
+/// run whose command wrote its dump before the cut; a command held until let go is let go before a run is made again.
+fn pc_cut_after_its_dump(name: &str, failure: &[&str], tuned: &Tuned<'_>, held: Held) -> (Case, PathBuf, Outcome) {
+    let guard = Instant::now() + MARKED_BEFORE_THE_KILL_GUARD;
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let case = failure_case(name, &BIN, failure);
+        let (after, hold) = match held {
+            Held::Sleeping => (&["ok", "ok"][..], ["sleep".to_owned(), "600000".to_owned()]),
+            Held::SleepingRefetched => (&["ok", "truncate 10", "ok"][..], ["sleep".to_owned(), "600000".to_owned()]),
+            Held::Waiting => (&["drop", "drop", "ok"][..], ["wait".to_owned(), shown(&let_go_path(&case))]),
+        };
+        let mut all = vec!["ok", "away"];
+        all.extend_from_slice(after);
+        let steps = ssh_steps(&case, "ssh", &all);
+        let mut command = vec![r".\tool.exe", "write", r"bin\built.txt", "box", "write", r"dumps\a.dmp", "dump"];
+        command.extend(hold.iter().map(String::as_str));
+        let mut gate = client_gate_tuned(&case, "out.log", &steps, tuned, &command);
+        gate.env(BOX_SEAMS_VARIABLE, SILENT_BOX);
+        let outcome = finish(gate);
+        let queued = work_folder_if_queued(&case);
+        let dumped = queued.as_ref().is_some_and(|work| work.join("dumps").join("a.dmp").exists());
+        if outcome.code != Some(124) || queued.is_none() || dumped {
+            return (case, steps, outcome);
+        }
+        if held == Held::Waiting {
+            drop(LetGo(&case));
+        }
+        assert!(
+            Instant::now() < guard,
+            "every one of {attempts} commands was cut before its dump was in its work folder, until the hang guard; last \
+             outcome: {outcome:?}"
+        );
+    }
+}
+
+/// The PC's watchdog cuts the silent run call of a command that wrote its dump: the PC stops the command, then fetches
+/// the killed run's narrowed set by name with no count, installs the dump and the run stays stalled, the marker kept.
+#[test]
+fn a_run_the_pc_stalls_brings_its_failure_set_back_and_stays_stalled() {
+    let tuned = Tuned {
+        extra: &["--test-remote-watch-call", "run", "--test-stall-ms", CUT_STALL_MS],
+        ..Tuned::default()
+    };
+    let (case, steps, outcome) = pc_cut_after_its_dump("client-pc-stalled-dump", &["dumps/*.dmp"], &tuned, Held::Sleeping);
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert_eq!(verdict(&case), "stalled", "{outcome:?}");
+    let made = calls(&steps);
+    assert!(
+        made.ends_with(&["stop".to_owned(), "outputs".to_owned()]),
+        "a stop, then the fetch: {made:?}"
+    );
+    assert_eq!(worktree_text(&case, r"dumps\a.dmp"), "dump", "the dump is installed: {outcome:?}");
+    assert!(
+        !case.folder().join("bin").join("built.txt").exists(),
+        "nothing under bin is installed: {outcome:?}"
+    );
+    let pulling = "gate: pulling the killed run's outputs from ";
+    let line = outcome
+        .stderr
+        .lines()
+        .find(|line| line.starts_with(pulling))
+        .expect("the pull line is said");
+    assert!(!line.contains("file(s)"), "the pull names no count: {line}");
+    assert!(pending_marker(&case).exists(), "a cut run leaves the marker: {outcome:?}");
+}
+
+/// The PC's backstop cuts the run call of a command that wrote its dump: the killed run's narrowed set comes back and
+/// the run stays backstop.
+#[test]
+fn a_run_past_the_pc_backstop_brings_its_failure_set_back_and_stays_backstop() {
+    let tuned = Tuned {
+        extra: &["--test-remote-backstop-ms", "4000"],
+        ..Tuned::default()
+    };
+    let (case, steps, outcome) = pc_cut_after_its_dump("client-pc-backstop-dump", &["dumps/*.dmp"], &tuned, Held::Sleeping);
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert_eq!(verdict(&case), "backstop", "{outcome:?}");
+    let made = calls(&steps);
+    assert!(
+        made.ends_with(&["stop".to_owned(), "outputs".to_owned()]),
+        "a stop, then the fetch: {made:?}"
+    );
+    assert_eq!(worktree_text(&case, r"dumps\a.dmp"), "dump", "the dump is installed: {outcome:?}");
+    let pulling = "gate: pulling the killed run's outputs from ";
+    let line = outcome
+        .stderr
+        .lines()
+        .find(|line| line.starts_with(pulling))
+        .expect("the pull line is said");
+    assert!(!line.contains("file(s)"), "the pull names no count: {line}");
+    assert!(pending_marker(&case).exists(), "a cut run leaves the marker: {outcome:?}");
+}
+
+/// The PC stalls a run whose failure output glob matches nothing the command wrote: the box packs nothing, which the
+/// log alone says once, and the run stays stalled.
+#[test]
+fn a_pc_cut_run_whose_box_packed_nothing_says_one_log_note() {
+    let tuned = Tuned {
+        extra: &["--test-remote-watch-call", "run", "--test-stall-ms", CUT_STALL_MS],
+        ..Tuned::default()
+    };
+    let (case, _steps, outcome) = pc_cut_after_its_dump("client-pc-stalled-none", &["dumps/*.none"], &tuned, Held::Sleeping);
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert_eq!(verdict(&case), "stalled", "{outcome:?}");
+    let note = "gate: the builder packed none of the killed run's outputs";
+    let log = out_log(&case);
+    assert_eq!(log.matches(note).count(), 1, "said once in the log: {log}");
+    assert!(!outcome.stderr.contains(note), "not on the console: {outcome:?}");
+}
+
+/// The PC stalls a run whose stop then fails, and the fetch after the cut waits on the box's run, still going, until the
+/// watchdog stops it at its transfer ceiling: the fetch's own TRANSFER TIMED OUT is the log's last kill line, yet the
+/// run stays stalled.
+#[test]
+fn a_pc_cut_fetch_the_watchdog_stops_keeps_the_stall_verdict() {
+    let tuned = Tuned {
+        stall: "15",
+        extra: &["--test-remote-watch-call", "outputs", "--test-remote-timeout-ms", "1000"],
+        ..Tuned::default()
+    };
+    let (case, steps, outcome) = pc_cut_after_its_dump("client-pc-stalled-fetch-stopped", &["dumps/*.dmp"], &tuned, Held::Waiting);
+    let _let_go = LetGo(&case);
+
+    let made = calls(&steps);
+    assert!(
+        made.ends_with(&["outputs".to_owned()]),
+        "the stop failed, and the fetch is made: {made:?}"
+    );
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert_eq!(verdict(&case), "stalled", "{outcome:?}");
+    let log = out_log(&case);
+    let kills: Vec<&str> = log
+        .lines()
+        .filter(|line| {
+            ["gate: STALLED", "gate: BACKSTOP", "gate: TIMED OUT", "gate: TRANSFER TIMED OUT"]
+                .iter()
+                .any(|kill| line.starts_with(kill))
+        })
+        .collect();
+    assert!(
+        kills.first().is_some_and(|line| line.starts_with("gate: STALLED")),
+        "the run call's stall first: {log}"
+    );
+    assert!(
+        kills.last().is_some_and(|line| line.starts_with("gate: TRANSFER TIMED OUT")),
+        "the fetch's own kill line last: {log}"
+    );
+}
+
+/// The PC stalls a run whose stop then fails, and the box's run outlasts the short wait the fetch asks for: the box
+/// says the archive is not finished, which the TRANSFER FAILED line naming the PC's stop says, and the run stays
+/// stalled.
+#[test]
+fn a_pc_cut_run_whose_pack_outlasts_the_cut_wait_says_transfer_failed_and_stays_stalled() {
+    let tuned = Tuned {
+        extra: &[
+            "--test-remote-watch-call",
+            "run",
+            "--test-stall-ms",
+            CUT_STALL_MS,
+            "--test-remote-cut-wait-ms",
+            "500",
+        ],
+        ..Tuned::default()
+    };
+    let (case, _steps, outcome) = pc_cut_after_its_dump("client-pc-stalled-unfinished", &["dumps/*.dmp"], &tuned, Held::Waiting);
+    let _let_go = LetGo(&case);
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    let start = "gate: TRANSFER FAILED: the PC stopped the command on ";
+    assert!(
+        outcome
+            .stderr
+            .lines()
+            .any(|line| line.starts_with(start) && line.contains("the killed run's outputs not brought back: ")),
+        "the line names the PC's stop and the killed run's outputs: {outcome:?}"
+    );
+    assert_eq!(verdict(&case), "stalled", "{outcome:?}");
+    assert!(!case.folder().join("dumps").join("a.dmp").exists(), "nothing is installed: {outcome:?}");
+}
+
+/// The PC stalls a run, and the first fetch after the cut gets the whole archive, which the box then removes, but ends
+/// as a connection dropped before the banner: the retry finds nothing packed, which is the TRANSFER FAILED line naming
+/// the PC's stop, never a quiet note, and the run stays stalled.
+#[test]
+fn a_pc_cut_fetch_whose_retry_finds_nothing_says_transfer_failed_and_stays_stalled() {
+    let tuned = Tuned {
+        extra: &["--test-remote-watch-call", "run", "--test-stall-ms", CUT_STALL_MS],
+        ..Tuned::default()
+    };
+    let (case, steps, outcome) = pc_cut_after_its_dump("client-pc-stalled-refetched", &["dumps/*.dmp"], &tuned, Held::SleepingRefetched);
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    let made = calls(&steps);
+    assert!(
+        made.ends_with(&["stop".to_owned(), "outputs".to_owned(), "outputs".to_owned()]),
+        "a stop, then the fetch and its retry: {made:?}"
+    );
+    let start = "gate: TRANSFER FAILED: the PC stopped the command on ";
+    assert!(
+        outcome
+            .stderr
+            .lines()
+            .any(|line| line.starts_with(start) && line.contains("the killed run's outputs not brought back: ")),
+        "the line names the PC's stop and the killed run's outputs: {outcome:?}"
+    );
+    let log = out_log(&case);
+    assert!(!log.contains("gate: the builder packed none of"), "no quiet note: {log}");
+    assert_eq!(verdict(&case), "stalled", "{outcome:?}");
+    assert!(!case.folder().join("dumps").join("a.dmp").exists(), "nothing is installed: {outcome:?}");
+}
+
+/// The PC stalls a run call that never said the box's start marker, a call cut during the box's setup: the command never
+/// started, so nothing is fetched and nothing is said of the killed run's set, and the run stays stalled.
+#[test]
+fn a_pc_cut_before_the_command_starts_pulls_nothing() {
+    let case = failure_case("client-pc-stalled-unstarted", &BIN, &["dumps/*.dmp"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", never(&case)), "ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-remote-watch-call", "run", "--test-stall-ms", WATCHED_MS],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &FAILING_WITH_A_DUMP));
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert!(outcome.stderr.contains(STALLED_LINE), "the run call was cut: {outcome:?}");
+    let made = calls(&steps);
+    assert!(
+        made_but_maybe(&made, &["preflight", "run", "stop"], "run"),
+        "a stop, and no fetch: {made:?}"
+    );
+    assert!(
+        !says_a_line_starting(&outcome, "gate: pulling the killed run's"),
+        "nothing is pulled: {outcome:?}"
+    );
+    assert_eq!(verdict(&case), "stalled", "{outcome:?}");
+}
+
+/// The PC stalls a run whose command wrote its dump, and a Ctrl+C comes once the run call, its stop included, has
+/// returned: nothing is fetched, and the run stays stalled.
+#[test]
+fn a_ctrl_c_after_a_pc_cut_pulls_nothing() {
+    let tuned = Tuned {
+        extra: &[
+            "--test-remote-watch-call",
+            "run",
+            "--test-stall-ms",
+            CUT_STALL_MS,
+            "--test-remote-interrupt-at",
+            "after-run",
+        ],
+        ..Tuned::default()
+    };
+    let (case, steps, outcome) = pc_cut_after_its_dump("client-pc-stalled-ctrl-c", &["dumps/*.dmp"], &tuned, Held::Sleeping);
+
+    assert!(outcome.stderr.contains("gate: STALLED: "), "the run call was cut: {outcome:?}");
+    let made = calls(&steps);
+    assert!(made.ends_with(&["stop".to_owned()]), "a stop, and no fetch: {made:?}");
+    assert!(
+        !says_a_line_starting(&outcome, "gate: pulling the killed run's"),
+        "nothing is pulled: {outcome:?}"
+    );
+    assert_eq!(verdict(&case), "stalled", "{outcome:?}");
+}
+
 /// The box kills a command at its 1 s ceiling after it wrote its dump, and a Ctrl+C comes once the run call has
 /// returned: the client pulls nothing of the killed run's set, stops nothing, and the run stays timed out.
 #[test]

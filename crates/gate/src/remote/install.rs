@@ -84,8 +84,9 @@ pub(super) struct Fetched<'f> {
     pub(super) marker: Option<&'f Path>,
     pub(super) manifest: &'f Manifest,
     pub(super) globs: &'f [String],
-    /// The files the pull's start line said the archive brings, which the install's start line says again.
-    pub(super) count: u64,
+    /// The files the pull's start line said the archive brings, which the install's start line says again; `None` for a
+    /// fetch after the PC's own cut of the run call, whose box said nothing of what it packed.
+    pub(super) count: Option<u64>,
     /// The main repo's tree on the box, which stands for the worktree: the work folder for a run of one repo,
     /// `{work}\{leaf}` for a pair.
     pub(super) main_tree: String,
@@ -303,7 +304,10 @@ pub(super) fn pc_spelling(root: &str) -> io::Result<PathBuf> {
 pub(super) fn installed(attempt: &mut Attempt<'_, '_>, fetched: &Fetched<'_>) -> (End, bool) {
     let staged = Cell::new(false);
     let bringing = fetched.bringing();
-    attempt.say(install_start_line(bringing, fetched.count));
+    attempt.say(match fetched.count {
+        Some(count) => install_start_line(bringing, count),
+        None => uncounted_start_line(bringing),
+    });
     let (end, lines, complete, clear) = match install(attempt, fetched, &staged) {
         Ok((done, started)) => {
             cached(
@@ -660,6 +664,12 @@ fn reasons(entries: &[impl Member], tracked: &HashSet<&str>, in_use: &HashSet<&s
 /// The line an install of what `bringing` names says as it starts, for the `count` files its pull said it was bringing.
 fn install_start_line(bringing: Bringing, count: u64) -> String {
     format!("gate: installing {}: {count} file(s)", bringing.pulled())
+}
+
+/// The line an install of what `bringing` names says as it starts when its pull said no count: a fetch after the PC's
+/// own cut of the run call, whose box said nothing of what it packed.
+fn uncounted_start_line(bringing: Bringing) -> String {
+    format!("gate: installing {}", bringing.pulled())
 }
 
 /// The lines an install of what `bringing` names that put `installed` into the worktree says, `seconds` after its fetch
@@ -2438,7 +2448,7 @@ mod tests {
                 marker: Some(marker.as_path()),
                 manifest: &manifest,
                 globs: &globs,
-                count: 1,
+                count: Some(1),
                 main_tree: r"D:\gate-remote\work\app-1a2b3c4d".to_owned(),
                 sibling_trees: Vec::new(),
                 started: Instant::now(),
@@ -2507,7 +2517,7 @@ mod tests {
                 marker: Some(marker.as_path()),
                 manifest: &manifest,
                 globs: &globs,
-                count: 1,
+                count: Some(1),
                 main_tree: r"D:\gate-remote\work\app-1a2b3c4d".to_owned(),
                 sibling_trees: Vec::new(),
                 started: Instant::now(),
@@ -2562,7 +2572,7 @@ mod tests {
                 marker: Some(marker.as_path()),
                 manifest: &manifest,
                 globs: &globs,
-                count: 1,
+                count: Some(1),
                 main_tree: r"D:\gate-remote\work\app-1a2b3c4d".to_owned(),
                 sibling_trees: Vec::new(),
                 started: Instant::now(),
@@ -2617,7 +2627,7 @@ mod tests {
                 marker: Some(marker.as_path()),
                 manifest: &manifest,
                 globs: &globs,
-                count: 1,
+                count: Some(1),
                 main_tree: r"D:\gate-remote\work\app-1a2b3c4d".to_owned(),
                 sibling_trees: Vec::new(),
                 started: Instant::now(),

@@ -142,6 +142,14 @@ pub(crate) fn box_kill_verdict(kill: BoxKill) -> Verdict {
     }
 }
 
+/// The verdict a run whose run call the PC's own watchdog cut for `kill` is journalled with.
+pub(crate) fn pc_cut_verdict(kill: watchdog::Kill) -> Verdict {
+    match kill {
+        watchdog::Kill::Stalled => Verdict::Stalled,
+        watchdog::Kill::Backstop => Verdict::Backstop,
+    }
+}
+
 /// What runs a routed command on the builder.
 pub(crate) trait RemoteClient {
     /// Takes the lock of the call's work-folder key, which the run holds from before it takes a remote slot until its
@@ -334,6 +342,10 @@ pub(crate) struct RemoteOutcome {
     /// The kill the box's kill tag named, when the box killed the command itself; the run's verdict comes from it,
     /// never from the log. `None` for any other end, a kill of the client's own included.
     pub box_killed: Option<BoxKill>,
+    /// The PC's own watchdog cut of the run call, its stall or its backstop; the run's verdict comes from it, read before
+    /// a transfer's failure and the log's last kill line, so a fetch after the cut never replaces it. `None` for any
+    /// other end, a box kill included.
+    pub pc_cut: Option<watchdog::Kill>,
     /// Whether the command exited 0 but a transfer after it failed every attempt, as the TRANSFER FAILED line says: the
     /// run's verdict is `transfer-failed`.
     pub transfer_failed: bool,
@@ -1285,8 +1297,19 @@ mod scripted {
 mod tests {
     use gate_wire::{ROOT_BUSY, ROOT_STATUS, ROOT_UNSAFE, root_busy_line, root_unsafe_line};
 
-    use super::{COLD_NOTE_PREFIX, INSTALL_UNTRUSTED, client, git, root_busy_why, root_why};
+    use gate_state::Verdict;
+
+    use super::watchdog::Kill;
+    use super::{COLD_NOTE_PREFIX, INSTALL_UNTRUSTED, client, git, pc_cut_verdict, root_busy_why, root_why};
     use crate::boxside::WORK_ROOT_STEP;
+
+    /// The PC's own cut of the run call is the run's verdict: its stall is `stalled` and its backstop `backstop`, which
+    /// a post-cut fetch's own kill line in the log never replaces.
+    #[test]
+    fn a_pc_cut_s_verdict_is_its_own_kill() {
+        assert_eq!(pc_cut_verdict(Kill::Stalled), Verdict::Stalled);
+        assert_eq!(pc_cut_verdict(Kill::Backstop), Verdict::Backstop);
+    }
 
     #[test]
     fn the_client_s_cold_note_starts_with_the_prefix_the_fallback_filter_drops() {

@@ -146,6 +146,9 @@ const RAW_CHUNK: usize = 64 * 1024;
 /// How often an outputs pull says its progress while it runs, counted from the pull's start, before its first call,
 /// across all its calls.
 const OUTPUTS_PROGRESS: Duration = Duration::from_secs(30);
+/// How long the outputs call after the PC's own cut of the run call asks the box to wait for the run's pack
+/// (`CutWaitMs`): 120 s, the most the box waits ([`gate_wire::CUT_WAIT_CAP_MS`]).
+const CUT_WAIT: Duration = Duration::from_millis(gate_wire::CUT_WAIT_CAP_MS);
 
 /// The Rust client: over ssh, or over the local transport of `--test-remote-transport`.
 pub(crate) struct RustClient {
@@ -168,6 +171,9 @@ pub(crate) struct RustClient {
     timeout_ms: Option<u64>,
     /// `--test-remote-backstop-ms`: the run call's backstop, in milliseconds, in place of five ceilings and 60 s.
     backstop_ms: Option<u64>,
+    /// How long the outputs call after the PC's own cut of the run call asks the box to wait for the run's pack:
+    /// `--test-remote-cut-wait-ms`, else [`CUT_WAIT`].
+    cut_wait: Duration,
     /// How far before the moment it is taken each attempt's snapshot time is put: `--test-remote-snapshot-age-ms`, else
     /// none.
     snapshot_age: Duration,
@@ -274,6 +280,7 @@ impl RustClient {
             stall_ms: seams.stall_ms,
             timeout_ms: seams.remote_timeout_ms,
             backstop_ms: seams.remote_backstop_ms,
+            cut_wait: seams.remote_cut_wait_ms.map_or(CUT_WAIT, Duration::from_millis),
             snapshot_age: seams.remote_snapshot_age_ms.map_or(Duration::ZERO, Duration::from_millis),
             watch_call: seams.remote_watch_call.clone(),
             interrupt_at: seams.remote_interrupt_at.clone(),
@@ -483,6 +490,7 @@ impl RustClient {
             adjusted: None,
             box_killed: None,
             box_kill_pulls: false,
+            pc_cut: None,
             run_kill_heard: None,
             held_run: None,
             ceiling: None,
@@ -496,6 +504,7 @@ impl RustClient {
             checked: None,
             raised: None,
             backstop_seam: self.backstop_ms.map(Duration::from_millis),
+            cut_wait: self.cut_wait,
             carried: match phases {
                 Phases::All => std::mem::take(&mut self.carried).taken_for(call.host()),
                 Phases::DrainPoll => Carried::default(),
@@ -1260,7 +1269,7 @@ pub(super) struct Called {
     pub(super) lines: Vec<String>,
     /// Its last standard error line that is the box's outputs line, however many lines came after it, and the size
     /// line heard just before it.
-    outputs: Option<outputs::OutputsLines>,
+    pub(super) outputs: Option<outputs::OutputsLines>,
     /// Its last standard error line that is the box's back commits line, however many lines came after it.
     back_commits: Option<String>,
     /// Whether it said on standard error, stamped as the box's own line, that the run's command left its tree as the
@@ -1546,6 +1555,9 @@ pub(super) struct Attempt<'c, 'a> {
     /// Whether the killed run's narrowed set is pulled after the box's kill: only after a run call that exited 124 of
     /// its own, with no cut and no Ctrl+C raised by then ([`Attempt::box_kill_heard`]).
     box_kill_pulls: bool,
+    /// The PC's own watchdog cut of the run call, its stall or its backstop, set as it cuts the call; `None` for any other
+    /// end, a box kill included. The run's verdict comes from it, never from a later kill line of a fetch after the cut.
+    pc_cut: Option<Kill>,
     /// The kill the box's kill tag named on the last run call made, as its readers heard it whatever the call's end, a
     /// call a Ctrl+C cut or the client failed included; `None` before a run call, and after one that heard no kill tag.
     run_kill_heard: Option<BoxKill>,
@@ -1581,6 +1593,9 @@ pub(super) struct Attempt<'c, 'a> {
     /// `--test-remote-backstop-ms`: the run call's backstop, which a raised ceiling leaves as it is; `None` without the
     /// seam.
     backstop_seam: Option<Duration>,
+    /// How long the outputs call after the PC's own cut of the run call asks the box to wait for the run's pack
+    /// (`CutWaitMs`): [`CUT_WAIT`], or `--test-remote-cut-wait-ms`.
+    pub(super) cut_wait: Duration,
     /// What the drain polls and drained attempts before this attempt learned of the work folder, with what this
     /// attempt's own preflight found taken in ([`Carried`]).
     carried: Carried,
@@ -1755,7 +1770,8 @@ impl Attempt<'_, '_> {
         // The sync-back runs after a run call that ended with the command's own status; a refusal, an interrupt, a
         // kill, a lost connection or a failed call ended the attempt before it, so a box refusal's 75 never syncs back.
         // A command the box's ceiling killed, said so, has its narrowed set brought back when its run call exited 124 of
-        // its own, with no sync-back, and stays killed however the call ended. The pending marker stays on every end
+        // its own, with no sync-back, and stays killed however the call ended; one the PC's own watchdog cut has it
+        // fetched by name after the stop, with no sync-back, and stays killed too. The pending marker stays on every end
         // but a passing run whose box packed nothing.
         match called.end {
             End::Status(status) => {
@@ -1771,6 +1787,7 @@ impl Attempt<'_, '_> {
                 self.transferred(status, end)
             }
             End::Killed if self.box_killed.is_some() => Ok(self.box_killed_end(&location, &nonce, &sent, &called)),
+            End::Killed if self.pc_cut.is_some() => Ok(self.pc_cut_end(&location, &nonce, &sent, &called)),
             End::Lost(output) => Ok(self.connection_lost(&location, prepared.boot.as_deref(), output)),
             end => Ok(self.refused_end(end, called.last_error.as_deref())),
         }
@@ -1790,6 +1807,23 @@ impl Attempt<'_, '_> {
         }
         let (ran, brought) = self.outputs_ran(location, nonce, i64::from(KILLED), called);
         let end = outputs::killed_end(self, sent, &ran, brought.as_ref());
+        self.refused_end(end, called.last_error.as_deref())
+    }
+
+    /// The end of a run call `called` to `location` that the PC's own watchdog cut for a stall or its backstop
+    /// ([`Attempt::pc_cut`]), the command stopped already: the killed run's narrowed set the box packed for the outputs
+    /// `nonce` after the cut, fetched by name once the box's run ended and installed ([`outputs::cut_end`], a transfer
+    /// that failed said naming the PC's stop), then [`End::Killed`] whatever that gave, through
+    /// [`Attempt::refused_end`] as any other kill. What the cut call said of the outputs is never read. A call cut before
+    /// the box said the command's start marker, during its checkout or its LFS fetch, and a Ctrl+C, fetch nothing and
+    /// say nothing; a stop that failed fetches all the same, as the box's outputs call waits for the run.
+    fn pc_cut_end(&mut self, location: &Location, nonce: &str, sent: &outputs::Sent<'_>, called: &RunEnd) -> End {
+        if !called.started || self.go_on().is_err() {
+            return self.refused_end(End::Killed, called.last_error.as_deref());
+        }
+        // The box's outputs line of a cut call is never read: the fetch goes by the archive's name alone.
+        let (ran, _) = self.outputs_ran(location, nonce, i64::from(KILLED), called);
+        let end = outputs::cut_end(self, sent, &ran);
         self.refused_end(end, called.last_error.as_deref())
     }
 
@@ -1821,7 +1855,7 @@ impl Attempt<'_, '_> {
     }
 
     /// Says the TRANSFER FAILED line of a transfer after a command that ended as `ended` says (`the command exited <n>`,
-    /// or [`outputs::KILLED_AT_ITS_CEILING`]) on the builder, which failed every attempt for `why`.
+    /// [`outputs::KILLED_AT_ITS_CEILING`] or [`outputs::PC_STOPPED`]) on the builder, which failed every attempt for `why`.
     pub(super) fn say_transfer_failed(&mut self, ended: &str, why: &str) {
         let host = self.call.host();
         self.say(format!("gate: TRANSFER FAILED: {ended} on {host}; {why}"));
@@ -3243,9 +3277,10 @@ impl Attempt<'_, '_> {
 
     /// The run call as `make` makes it, watched by `limits`, as [`Attempt::run_call`] says. Once the call heard the
     /// box's kill tag, the box's kill is the run's end however the call then ended, and nothing is stopped
-    /// ([`Attempt::box_kill_heard`]). Else the command is stopped only when it may have started: after a kill, after a
-    /// Ctrl+C that ended a call still running, and after one raised by the time a call ended with a status; never after
-    /// a Ctrl+C in the retry pause or after a call that failed before the banner.
+    /// ([`Attempt::box_kill_heard`]). A cut of the PC's own watchdog is kept as [`Attempt::pc_cut`], which the run's
+    /// verdict and its fetch after the stop read. Else the command is stopped only when it may have started: after a
+    /// kill, after a Ctrl+C that ended a call still running, and after one raised by the time a call ended with a
+    /// status; never after a Ctrl+C in the retry pause or after a call that failed before the banner.
     fn run_call_made(&mut self, location: &Location, limits: Limits, mut make: impl FnMut(&mut Self) -> Result<Called, End>) -> Result<End, End> {
         let mut running = false;
         let mut made = self.with_retry(SSH_FAILED, |attempt| {
@@ -3273,6 +3308,7 @@ impl Attempt<'_, '_> {
         self.lines.append(&mut called.lines);
         let output = kept..self.lines.len();
         if let Some(Cut::Watchdog(kill)) = called.cut {
+            self.pc_cut = Some(kill);
             self.say(watchdog::kill_line(
                 kill,
                 limits.stall,
@@ -3575,11 +3611,12 @@ impl Attempt<'_, '_> {
         self.pulled_bytes = 0;
         self.pulled_last = None;
         self.go_on()?;
-        let input = payload::input(&payload::outputs_word(location, name, None), None);
+        let input = payload::input(&payload::outputs_word(location, name, None, pull.cut_wait), None);
         let raise = self.raises_at("outputs");
         self.pull_periods_said.set(0);
         self.pulling = Some(pull);
-        let towards = self.channel_towards();
+        // A fetch after the PC's cut knows no size to dial with, so it takes the plain call.
+        let towards = if pull.cut_wait.is_some() { None } else { self.channel_towards() };
         // Why the proofs could not be drawn, said once for the call when its last attempt could not draw them either.
         let mut undrawn = None;
         let retried = self.with_retry(SSH_FAILED, |attempt| {
@@ -3590,7 +3627,7 @@ impl Attempt<'_, '_> {
                     undrawn = None;
                     // A nonce of the attempt's own, so only this attempt's reader takes its box's port line.
                     let nonce = payload::run_nonce();
-                    let word = payload::outputs_word(location, name, Some((&asked, &nonce)));
+                    let word = payload::outputs_word(location, name, Some((&asked, &nonce)), None);
                     CallOnly {
                         input: Input::Text(payload::input(&word, None)),
                         nonce: None,
@@ -4184,6 +4221,7 @@ impl Attempt<'_, '_> {
             split: self.split,
             adjusted: self.adjusted,
             box_killed: self.box_killed,
+            pc_cut: self.pc_cut,
             transfer_failed,
             warm,
             raised: self.raised,
@@ -4253,6 +4291,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             adjusted: None,
             box_killed: None,
             box_kill_pulls: false,
+            pc_cut: None,
             run_kill_heard: None,
             held_run: None,
             ceiling: None,
@@ -4266,6 +4305,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             checked: None,
             raised: None,
             backstop_seam: None,
+            cut_wait: crate::remote::client::CUT_WAIT,
             carried: Carried::default(),
             log_only: false,
         }
@@ -4432,6 +4472,9 @@ pub(super) struct Pull {
     pub(super) total: Option<u64>,
     pub(super) started: Instant,
     pub(super) bringing: outputs::Bringing,
+    /// For a fetch after the PC's own cut of the run call, how long its outputs call asks the box to wait for the run's
+    /// pack (`CutWaitMs`); such a call never asks for a data channel. `None` for every other pull.
+    pub(super) cut_wait: Option<Duration>,
 }
 
 /// The progress an outputs call's watch says of its pull, whose size, start and what it brings it carries ([`Pull`]):
@@ -6696,6 +6739,7 @@ mod tests {
             adjusted: None,
             box_killed: None,
             box_kill_pulls: false,
+            pc_cut: None,
             run_kill_heard: None,
             held_run: None,
             ceiling: None,
@@ -6709,6 +6753,7 @@ mod tests {
             checked: None,
             raised: None,
             backstop_seam: None,
+            cut_wait: crate::remote::client::CUT_WAIT,
             carried: Carried::default(),
             log_only: false,
         }
@@ -7696,6 +7741,7 @@ mod tests {
             PathBuf::from(r"C:\gate-client-tests-no-such-folder\app.tar.zst"),
         );
         let pull = super::Pull {
+            cut_wait: None,
             bringing: outputs::Bringing::Outputs,
             total: None,
             started: Instant::now(),
@@ -7777,6 +7823,7 @@ mod tests {
         let mut attempt = attempt(&given, &transport);
         attempt.outputs_progress = Duration::from_secs(1);
         attempt.pulling = Some(super::Pull {
+            cut_wait: None,
             bringing: outputs::Bringing::Outputs,
             total: None,
             started: Instant::now(),
@@ -9976,6 +10023,7 @@ mod tests {
         let pull_started = Instant::now();
         attempt.command_started = Some(marker);
         attempt.pulling = Some(super::Pull {
+            cut_wait: None,
             bringing: outputs::Bringing::Outputs,
             total: None,
             started: pull_started,
@@ -10011,6 +10059,7 @@ mod tests {
             .expect("this PC's clock reads at least 8 s, so the pull can start 8 s back");
         attempt.command_started = Some(pull_started);
         attempt.pulling = Some(super::Pull {
+            cut_wait: None,
             bringing: outputs::Bringing::Outputs,
             total: None,
             started: pull_started,
@@ -10044,6 +10093,7 @@ mod tests {
         let started = Instant::now();
         attempt.command_started = Some(started);
         attempt.pulling = Some(super::Pull {
+            cut_wait: None,
             bringing: outputs::Bringing::Reports(outputs::Narrowed::TestReports, outputs::Cause::Failed),
             total: None,
             started,

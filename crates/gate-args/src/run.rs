@@ -102,6 +102,8 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     RemoteBackstopMs,
     #[cfg(feature = "test-seams")]
+    RemoteCutWaitMs,
+    #[cfg(feature = "test-seams")]
     RemoteSnapshotAgeMs,
     #[cfg(feature = "test-seams")]
     OutputsProgressMs,
@@ -406,6 +408,7 @@ impl RunBuilder {
             | ValueOption::RemoteWatchCall
             | ValueOption::RemoteTimeoutMs
             | ValueOption::RemoteBackstopMs
+            | ValueOption::RemoteCutWaitMs
             | ValueOption::RemoteSnapshotAgeMs
             | ValueOption::OutputsProgressMs
             | ValueOption::LocalSdks
@@ -473,6 +476,7 @@ impl RunBuilder {
             ValueOption::RemoteWatchCall => seams.remote_watch_call = Some(values::remote_call(spelled, value, values::WATCHED_CALLS)?),
             ValueOption::RemoteTimeoutMs => seams.remote_timeout_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::RemoteBackstopMs => seams.remote_backstop_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::RemoteCutWaitMs => seams.remote_cut_wait_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::RemoteSnapshotAgeMs => seams.remote_snapshot_age_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::OutputsProgressMs => seams.outputs_progress_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::LocalSdks => seams.local_sdks = Some(value.to_owned()),
@@ -710,7 +714,7 @@ impl RunBuilder {
 
     /// Refuses the remote client's seams that cannot work together: `--test-remote-ssh`,
     /// `--test-remote-retry-pause-ms`, `--test-remote-bound-ms`, `--test-remote-interrupt-at`,
-    /// `--test-remote-watch-call`, `--test-remote-timeout-ms`, `--test-remote-backstop-ms`,
+    /// `--test-remote-watch-call`, `--test-remote-timeout-ms`, `--test-remote-backstop-ms`, `--test-remote-cut-wait-ms`,
     /// `--test-remote-snapshot-age-ms`, `--test-outputs-progress-ms`, `--test-remote-hint-from-pull`,
     /// `--test-local-sdks`,
     /// `--test-remote-fetch-cap-bytes`,
@@ -733,6 +737,7 @@ impl RunBuilder {
             (self.test_seams.remote_watch_call.is_some(), "--test-remote-watch-call"),
             (self.test_seams.remote_timeout_ms.is_some(), "--test-remote-timeout-ms"),
             (self.test_seams.remote_backstop_ms.is_some(), "--test-remote-backstop-ms"),
+            (self.test_seams.remote_cut_wait_ms.is_some(), "--test-remote-cut-wait-ms"),
             (self.test_seams.remote_snapshot_age_ms.is_some(), "--test-remote-snapshot-age-ms"),
             (self.test_seams.outputs_progress_ms.is_some(), "--test-outputs-progress-ms"),
             (self.test_seams.remote_hint_from_pull, "--test-remote-hint-from-pull"),

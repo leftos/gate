@@ -4434,8 +4434,10 @@ impl Run<'_> {
     /// Ends a run the client ran to its end: the verdict with the passed line on the run's host and, when the verdict
     /// passes, the lines naming the folders the run left stale ([`stale_lines`]); its markers not scanned when the
     /// client killed the run or the console was interrupted, and the facts its release carries, with the adjusted
-    /// seconds the box said. It is a kill only when the box's kill tag named one, whose kind is the verdict, or when the
-    /// client killed it, by the kill line in the log.
+    /// seconds the box said. Its verdict is the PC's own cut of the run call first, a stall or the backstop
+    /// ([`RemoteOutcome::pc_cut`]), which a later kill line of a fetch after the cut never replaces; then the kill the
+    /// box's kill tag named; then a transfer that failed; else the client's kill, by the kill line in the log, or the
+    /// status.
     fn remote_ended(&mut self, outcome: &RemoteOutcome, passing: Passing<'_>, wall: Duration, console: &mut Console) -> Ended {
         self.trace.phases = phases(&outcome.split);
         let interrupted = self.host.interrupt.is_some_and(Interrupt::is_raised);
@@ -4446,7 +4448,9 @@ impl Run<'_> {
         }
         match self.verdict(outcome.status, Some(passing), outcome.killed || interrupted, &[], console) {
             Ok(status) => {
-                let verdict = if let Some(kill) = outcome.box_killed {
+                let verdict = if let Some(kill) = outcome.pc_cut {
+                    crate::remote::pc_cut_verdict(kill)
+                } else if let Some(kill) = outcome.box_killed {
                     crate::remote::box_kill_verdict(kill)
                 } else if outcome.transfer_failed {
                     Verdict::TransferFailed

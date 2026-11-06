@@ -4019,7 +4019,13 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A pull that fails every retry says `gate: TRANSFER FAILED: the box killed the command at its ceiling on <builder>; the killed run's outputs not brought back: <why>`. A Ctrl+C raised before the pull starts skips it; one during it ends the pull.
 
-  Only the narrowed set comes back, never the full `outputs`. Whatever the pull gives, the run still ends 124 with the box kill's verdict, the cap record is untouched and the outputs are never marked brought back. A cut by the PC (a stall, the PC backstop, a lost connection, Ctrl+C) brings nothing back.
+  Only the narrowed set comes back, never the full `outputs`. Whatever the pull gives, the run still ends 124 with the box kill's verdict, the cap record is untouched and the outputs are never marked brought back. A lost connection and Ctrl+C bring nothing back.
+
+  After the PC's own cut of a routed run (a stall or the PC backstop), when the box's start marker was seen for that run call, the run asked for a narrowed set and no Ctrl+C was raised, the client makes an `outputs` call after the `stop`, by the archive's name, carrying `CutWaitMs` (120 s) so the box waits for the run's pack, and dials no data channel. A cut before the start marker makes no call.
+
+  Its lines are `gate: pulling the killed run's outputs from <builder>` (or `test reports`) and `gate: installing the killed run's outputs`, with no count or size, since the client does not know them. A box that packed nothing leaves only the log line `gate: the builder packed none of the killed run's outputs`.
+
+  A box that says the run is not finished, a pull that fails every retry or a retry that finds nothing says `gate: TRANSFER FAILED: the PC stopped the command on <builder>; the killed run's outputs not brought back: <why>`. The run's verdict is the cut's own (`stalled` or `backstop`), whatever the fetch says, and the status stays 124; the pending marker and the cap record are untouched.
 
   A killed preflight or push never started the command, so an early stall says `gate: remote <host> unreachable: <the call> stalled` (or `outlived its transfer ceiling of 1800 s`) and falls back `unreachable`, with no kill line and no exit 124.
 
@@ -5034,7 +5040,7 @@ Built verbs:
 
   A cut run ends as one: 255 for a gone client, or a failure for a stopped passing command. A stopped run makes no back commit and says no `gate: remote sync-back failed` before its pack. A command that never started packs nothing, and neither does a warm-up. The box's own ceiling kill keeps the rules above.
 
-  Only the box packs: the PC still fetches nothing after its own cut, so the archive waits on the builder for a call of the `outputs` verb with `CutWaitMs`. The Unix box does the same, with a cut being a gone client alone ([The Unix box](#the-unix-box), `run` and `outputs`).
+  The PC fetches the set after its own stall or backstop cut (a lost connection and Ctrl+C fetch nothing) by a call of the `outputs` verb with `CutWaitMs`, which waits for the pack. The Unix box does the same, with a cut being a gone client alone ([The Unix box](#the-unix-box), `run` and `outputs`).
 - **`stop`** sets the job's stop event, then terminates the payload's job, taking no lock. It terminates the job again on every 100 ms poll of the job's process ids, until the job is empty or 10 s pass, so a process that joins late is ended; its processes end with 124.
 
   A terminate after the first that fails is not a failure of the stop: it is said once, `gate: remote could not terminate job <name> again: <error>`, after the other lines. An event that cannot be set prints `gate: remote could not signal the stop of job <name>: <error>` on stderr, and the job is terminated all the same. A stopped job prints `gate: remote stopped job <name>` on stdout and exits 0; no such job exits 0 with no output.
@@ -6272,6 +6278,8 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   `--test-remote-interrupt-at <preflight|inputs|lfs|run|outputs|install|sdks|stop|manifest|apply>` makes the client raise the console interrupt itself after that call's first output byte (for `inputs` or `lfs`, the first of either call); `install` raises it before the second file's move, so an install of one file is never interrupted, and `sdks` just before the parity check reads this PC's SDK list with `dotnet --list-sdks`; `manifest` just before it reads the snapshot's `.gate/toolchain.toml`; `apply` once a pair's sync-back has checked every patch and before it applies the first (no output byte is waited for); `stop` raises it at the run call's first byte and again while the stop call runs.
 
   `--test-remote-backstop-ms <n>` (whole milliseconds above 0) replaces the run call's backstop of 5 x `--timeout` + 60 s for the client, counted from the run call's start.
+
+  `--test-remote-cut-wait-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 120 s `CutWaitMs` of the outputs call after the PC's own cut of a run call. It is refused without the transport with `gate: --test-remote-cut-wait-ms needs --test-remote-transport`.
 
   `--test-remote-snapshot-age-ms <n>` (whole milliseconds above 0, on `gate run` and `gate warm`) puts each attempt's [snapshot time](GLOSSARY.md#snapshot-time) `n` ms before the moment the snapshot begins, so a case can have the install stamp its files well before the moves and keep their hashes.
 

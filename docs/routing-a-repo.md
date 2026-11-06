@@ -86,7 +86,7 @@ A repo's first routed run to a builder pushes its reachable history in one pack,
 
    An `outputs` or `failureOutputs` glob brings back a file below a `.tmp` folder only when its folder segment is exactly `.tmp` (`.tmp/dumps/**`, `**/.tmp/x.json`; `**` and `.t*p/x` do not reach), and only a file this run created or changed. The gate's own `.tmp` files never come back.
 
-  A failure output over 256 MiB, or past 1 GiB in all, stays on the builder and the box says so (`gate: remote failure output left on the builder: ...`). A run whose command the builder kills at its ceiling brings back the same set as a failed command (its `TestResults` globs' files and the `failureOutputs` files, never the full `outputs`) and still ends 124. A builder backstop kill, and a run the PC cuts (a stall, the PC backstop, a lost connection, Ctrl+C), bring nothing back.
+  A failure output over 256 MiB, or past 1 GiB in all, stays on the builder and the box says so (`gate: remote failure output left on the builder: ...`). A run whose command the builder kills at its ceiling brings back the same set as a failed command (its `TestResults` globs' files and the `failureOutputs` files, never the full `outputs`) and still ends 124. A run the PC cuts by a stall or the PC backstop brings the same set back after its stop and still ends as the cut's verdict. A builder backstop kill, a lost connection and Ctrl+C bring nothing back.
 
   The gate cannot tell a whole file from one half-written at the kill, so a command whose outputs are worth bringing back after a kill writes each one to a temporary name and renames it into place when it is whole.
 4. Run one routing trial (below). The repo counts as routed once its trial passes.

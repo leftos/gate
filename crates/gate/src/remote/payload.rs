@@ -4,7 +4,7 @@
 
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -313,10 +313,16 @@ pub(crate) fn preflight_word(location: &Location, needs: &[(String, String)], us
 
 /// The payload word of the outputs call: the location and the outputs archive's `Name`, `name`; with `channel`, the
 /// call's `Nonce` its lines carry and the data channel it asks for, `Channel`: the builder's `Address`, the PC's own
-/// `Peer` and the two proofs as lower-case hex, which this word alone carries, on the call's standard input.
-pub(crate) fn outputs_word(location: &Location, name: &str, channel: Option<(&Asked, &str)>) -> String {
+/// `Peer` and the two proofs as lower-case hex, which this word alone carries, on the call's standard input; with
+/// `cut_wait`, for a fetch after the PC's own cut of the run call, how long the box waits for the run's pack, in whole
+/// milliseconds ([`gate_wire::CUT_WAIT_KEY`]).
+pub(crate) fn outputs_word(location: &Location, name: &str, channel: Option<(&Asked, &str)>, cut_wait: Option<Duration>) -> String {
     let mut object = location.object();
     object.insert("Name".to_owned(), Value::String(name.to_owned()));
+    if let Some(wait) = cut_wait {
+        let millis = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+        object.insert(gate_wire::CUT_WAIT_KEY.to_owned(), json!(millis));
+    }
     if let Some((asked, nonce)) = channel {
         object.insert("Nonce".to_owned(), json!(nonce));
         object.insert("Channel".to_owned(), Value::Object(channel_object(asked)));
@@ -587,7 +593,7 @@ mod tests {
         let words = [
             ("preflight", preflight_word(&routed, &[], &[], NONCE)),
             ("inputs", inputs_word(&routed, NONCE, InputsStep::Diff, None)),
-            ("outputs", outputs_word(&routed, "app.zip", None)),
+            ("outputs", outputs_word(&routed, "app.zip", None, None)),
             ("run", run_word(&routed, &warm_run(&[], None))),
         ];
         for (verb, word) in words {

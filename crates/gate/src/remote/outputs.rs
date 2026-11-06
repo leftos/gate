@@ -443,8 +443,7 @@ fn step_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synce
                 globs: sent.globs,
                 files,
                 marker,
-                count: *count,
-                size: *size,
+                packed: Packed::Archive { count: *count, size: *size },
                 reports: None,
             };
             return fetched(attempt, &kept, ran, synced);
@@ -500,7 +499,7 @@ fn reports_end(
     (marker, now): (Option<&Path>, i64),
     brought: Option<&Brought>,
 ) -> (End, bool) {
-    let end = match narrowed_fetched(attempt, (sent, ran), (marker, now, Cause::Failed), brought) {
+    let end = match narrowed_fetched(attempt, (sent, ran), (marker, now, Cause::Failed), archive_of(brought)) {
         None | Some(End::Status(_) | End::Failed(_)) => End::Status(now),
         Some(end) => end,
     };
@@ -523,26 +522,93 @@ pub(super) fn killed_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &R
     if sent.stepped() {
         let marker = sent.marker.as_deref();
         // The run ends killed whatever the fetch gave; only a transfer that failed every attempt is said here.
-        if let Some(End::TransferFailed(why)) = narrowed_fetched(attempt, (sent, ran), (marker, ran.status, Cause::Killed), brought) {
+        if let Some(End::TransferFailed(why)) = narrowed_fetched(attempt, (sent, ran), (marker, ran.status, Cause::Killed), archive_of(brought)) {
             attempt.say_transfer_failed(KILLED_AT_ITS_CEILING, &why);
         }
     }
     End::Killed
 }
 
+/// How the TRANSFER FAILED line of a fetch after the PC's own cut of the run call says its command ended ([`cut_end`]).
+pub(super) const PC_STOPPED: &str = "the PC stopped the command";
+
+/// The end of the outputs step of a run whose run call the PC's own watchdog cut, for a stall or its backstop, and
+/// whose command it stopped, its run `ran` ending with the kill's status: for a run with an outputs step
+/// ([`Sent::stepped`]) whose narrowed set holds globs, that set fetched by its name alone, with no count, no size and
+/// no data channel, the outputs call asking the box to wait for the run's pack ([`Attempt::cut_wait`]), and installed
+/// as [`killed_end`] installs a box-killed run's, its lines naming the killed run's outputs or test reports. A box that
+/// packed nothing says so in the log alone. A pull that failed every attempt, or one the box could not wait for, says
+/// the TRANSFER FAILED line naming the PC's stop ([`PC_STOPPED`]). Always [`End::Killed`], whatever the fetch, the
+/// install, the watchdog's stop or a Ctrl+C during them gives. It never clears the pending marker, never touches the
+/// outputs cap record, makes no sync-back and never marks the outputs brought back.
+pub(super) fn cut_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>) -> End {
+    if sent.stepped() {
+        let marker = sent.marker.as_deref();
+        let packed = Packed::Cut(attempt.cut_wait);
+        if let Some(End::TransferFailed(why)) = narrowed_fetched(attempt, (sent, ran), (marker, ran.status, Cause::Killed), Some(packed)) {
+            attempt.say_transfer_failed(PC_STOPPED, &why);
+        }
+    }
+    End::Killed
+}
+
+/// What an outputs pull knows of the archive it fetches ([`Kept`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Packed {
+    /// The archive the box said it packed: its file count and, when it said one, its size in bytes.
+    Archive { count: u64, size: Option<u64> },
+    /// A fetch after the PC's own cut of the run call, whose box said nothing of what it packed: its count and size are
+    /// unknown, and its outputs call asks the box to wait this long for the run's pack, with no data channel.
+    Cut(Duration),
+}
+
+impl Packed {
+    /// The files the box said the archive holds; `None` for a fetch after the PC's own cut.
+    fn count(self) -> Option<u64> {
+        match self {
+            Packed::Archive { count, .. } => Some(count),
+            Packed::Cut(_) => None,
+        }
+    }
+
+    /// The archive's size in bytes, when the box said it; `None` for a fetch after the PC's own cut.
+    fn size(self) -> Option<u64> {
+        match self {
+            Packed::Archive { size, .. } => size,
+            Packed::Cut(_) => None,
+        }
+    }
+
+    /// How long the outputs call asks the box to wait for the run's pack: only for a fetch after the PC's own cut.
+    fn cut_wait(self) -> Option<Duration> {
+        match self {
+            Packed::Archive { .. } => None,
+            Packed::Cut(wait) => Some(wait),
+        }
+    }
+}
+
+/// The archive the box said it `brought`, as [`narrowed_fetched`] takes it; `None` unless it packed one.
+fn archive_of(brought: Option<&Brought>) -> Option<Packed> {
+    match brought {
+        Some(Brought::Archive { count, size, .. }) => Some(Packed::Archive { count: *count, size: *size }),
+        _ => None,
+    }
+}
+
 /// The end [`fetched`] gives for the narrowed set of a run that ended at `now` as `cause` says, with the pending marker
-/// `marker`, whose box said it `brought` its outputs or not: `None`, nothing fetched and nothing said, unless the box
-/// packed an archive, the PC's manifest was built and one of the run's output globs names a `TestResults` folder or
-/// the run has failure output globs; else the narrowed set ([`failure::failed_run_set`]) fetched and installed as
-/// [`fetched`] says for [`Bringing::Reports`], its lines naming the run's outputs when the set holds a failure output
-/// glob, else its test reports.
+/// `marker`, for the archive `packed` says: `None`, nothing fetched and nothing said, unless there is an archive to
+/// fetch, the PC's manifest was built and one of the run's output globs names a `TestResults` folder or the run has
+/// failure output globs; else the narrowed set ([`failure::failed_run_set`]) fetched and installed as [`fetched`] says
+/// for [`Bringing::Reports`], its lines naming the run's outputs when the set holds a failure output glob, else its
+/// test reports. A fetch after the PC's own cut ([`Packed::Cut`]) asks the box to wait for the run's pack.
 fn narrowed_fetched(
     attempt: &mut Attempt<'_, '_>,
     (sent, ran): (&Sent<'_>, &Ran<'_>),
     (marker, now, cause): (Option<&Path>, i64, Cause),
-    brought: Option<&Brought>,
+    packed: Option<Packed>,
 ) -> Option<End> {
-    let (Ok(files), Some(Brought::Archive { count, size, .. })) = (&sent.built, brought) else {
+    let (Ok(files), Some(packed)) = (&sent.built, packed) else {
         return None;
     };
     // Output globs that cannot be matched name no `TestResults` folder, as an empty list names none.
@@ -561,8 +627,7 @@ fn narrowed_fetched(
         globs: sent.globs,
         files,
         marker,
-        count: *count,
-        size: *size,
+        packed,
         reports: Some((&narrowed, named, cause)),
     };
     Some(fetched(attempt, &kept, ran, End::Status(now)).0)
@@ -594,7 +659,8 @@ pub(super) enum Narrowed {
 pub(super) enum Cause {
     /// Its command exited non-zero: the failed run's.
     Failed,
-    /// The box killed its command at its ceiling: the killed run's.
+    /// The box killed its command at its ceiling, or the PC's own watchdog cut its run call for a stall or its backstop
+    /// and stopped it: the killed run's.
     Killed,
 }
 
@@ -646,15 +712,15 @@ impl Bringing {
 
 /// What the outputs step of a run whose box packed an archive keeps for its pull and install: the run's output globs,
 /// the PC's manifest and the pending marker, `None` for a run whose outputs the route withheld, whose marker no end
-/// clears; the files
-/// the box said it packed, and the archive's size in bytes when it said one; and, for a failed or killed run, its
-/// narrowed set ([`narrowed_fetched`]), which the install is held to, what the set holds and how the run ended.
+/// clears; what it knows of the archive ([`Packed`]): the files the box said it packed and the archive's size in bytes
+/// when it said one, or, for a fetch after the PC's own cut, whose box said nothing, how long its outputs call asks the
+/// box to wait for the run's pack; and, for a failed or killed run, its narrowed set ([`narrowed_fetched`]), which the
+/// install is held to, what the set holds and how the run ended.
 struct Kept<'k> {
     globs: &'k [String],
     files: &'k Manifest,
     marker: Option<&'k Path>,
-    count: u64,
-    size: Option<u64>,
+    packed: Packed,
     reports: Option<(&'k Globs, Narrowed, Cause)>,
 }
 
@@ -728,6 +794,13 @@ pub(super) fn trees_of<'a>(
 /// end, a fetch past the cap only says so, and the install is held to the narrowed globs; the ends that fail a passing
 /// run are handed back as they are, and [`reports_end`] turns them to the command's status, while [`killed_end`] turns
 /// every one of them to [`End::Killed`].
+///
+/// The narrowed set of a run whose run call the PC's own watchdog cut (a `kept` with a cut wait, [`Packed::Cut`]) is
+/// fetched the same way, by the same name, with no count or size said, its outputs call asking the box to wait for the
+/// run's pack and dialling no data channel. A box that says it packed nothing on the call's first attempt installs
+/// nothing and is said in the log alone; one that says so on a retry, or that the run was still going when its wait ran
+/// out, fails the pull as a transfer that failed every attempt ([`retried_call`]), which [`cut_end`] says; every end of
+/// it is turned to [`End::Killed`].
 fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced: End) -> (End, bool) {
     // The install stamps each file the run wrote with the snapshot time; an attempt past its run without one is a bug of
     // the client's, which pulls nothing rather than stamp the outputs with another time.
@@ -738,15 +811,16 @@ fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced
     };
     let started = Instant::now();
     let bringing = kept.bringing();
-    attempt.say(pull_start_line(bringing, attempt.call.host(), kept.count, kept.size));
+    attempt.say(pull_start_line(bringing, attempt.call.host(), kept.packed.count(), kept.packed.size()));
     let name = archive_file_name(attempt.call.key, ran.nonce);
     let tmp = Path::new(attempt.call.root).join(TMP);
     let mut archive = Archive::new(Path::new(attempt.call.root), tmp.join(&name));
     let limits = attempt.limits_for("outputs");
     let pull = client::Pull {
-        total: kept.size,
+        total: kept.packed.size(),
         started,
         bringing,
+        cut_wait: kept.packed.cut_wait(),
     };
     let retried = retried_call(attempt, (ran.location, &name), &mut archive, (limits, pull), bringing);
     let (called, exhausted) = match retried {
@@ -769,6 +843,12 @@ fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced
         _ => attempt.say(pull_ended_line(bringing, pulled, attempt.pulled_bytes)),
     }
     match called {
+        // A fetch after the PC's cut, whose box said it packed nothing, installs nothing and says so in the log alone.
+        Ok(called) if matches!(kept.packed, Packed::Cut(_)) && pulled_whole(&called, interrupted) && packed_nothing(called.outputs.as_ref()) => {
+            attempt.logged(&format!("gate: the builder packed none of {}", bringing.pulled()));
+            removed(attempt, &archive, PARTIAL);
+            (synced, false)
+        }
         // `judged` hands back the run's end so far only when the archive was fetched whole, and `called` a cut when it
         // was not: an archive past the fetch cap installs nothing.
         Ok(called) => {
@@ -788,7 +868,7 @@ fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced
                         marker: kept.marker,
                         manifest: kept.files,
                         globs: kept.globs,
-                        count: kept.count,
+                        count: kept.packed.count(),
                         main_tree,
                         sibling_trees,
                         started,
@@ -815,8 +895,11 @@ fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced
 /// The outputs call to the builder at `location` for the archive `name`, made by [`Attempt::outputs_call`] into
 /// `archive`, watched by `limits` as the pull `pull` of what `bringing` names, and made again as
 /// [`Attempt::transfer_call`] makes a transfer after ssh's own failure status, each retry said with the line the
-/// failure gives. A retry the box answers that the archive does not exist, as it removes the archive once it sent it
-/// all, ends the pull as [`End::TransferFailed`] for the first call's failure. What the pull received is summed over
+/// failure gives. Three answers fail the pull as [`End::TransferFailed`]: a retry the box answers that the archive does
+/// not exist, as it removes the archive once it sent it all, for the first call's failure; for a fetch after the PC's
+/// own cut ([`client::Pull::cut_wait`]), a retry the box answers `gate-remote-outputs: 0`, the archive gone with the
+/// call before it, for the first call's failure too; and, for such a fetch, the box's answer that the archive is not
+/// finished, the run still going when its wait ran out, for that answer. What the pull received is summed over
 /// every call. The call that counts, and whether it failed as a connection fails with no retry left; else that end, why
 /// the file or the call could not be made, or the interrupt.
 fn retried_call(
@@ -842,8 +925,25 @@ fn retried_call(
         Transferred {
             called, first: Some(first), ..
         } if archive_gone(&called) => Err(End::TransferFailed(first)),
+        // A fetch after the PC's cut whose retry finds nothing packed lost the archive with the call before it.
+        Transferred {
+            called, first: Some(first), ..
+        } if pull.cut_wait.is_some() && packed_nothing(called.outputs.as_ref()) => Err(End::TransferFailed(first)),
+        // A fetch after the PC's cut whose box's wait ran out before the run's pack ended fails as a transfer does.
+        Transferred { called, .. } if pull.cut_wait.is_some() && not_finished(&called) => {
+            Err(End::TransferFailed(unbrought(bringing, &failure(&called))))
+        }
         Transferred { called, exhausted, .. } => Ok((called, exhausted)),
     }
+}
+
+/// Whether the outputs call that ended as `called` failed for the box's answer, on any line it said, that the archive
+/// is not finished: the run that packs it was still going when the call's wait ran out.
+fn not_finished(called: &Called) -> bool {
+    called.status != 0
+        && called
+            .said()
+            .any(|line| line.starts_with("gate: remote outputs archive ") && line.contains(" is not finished: "))
 }
 
 /// Whether the outputs call that ended as `called` failed for the box's answer, on any line it said, that the archive
@@ -1331,6 +1431,12 @@ pub(super) fn accepted(heard: Option<&OutputsLines>, key: &str, nonce: &str) -> 
     })
 }
 
+/// Whether `heard`, a call's last outputs line on standard error ([`keep_outputs_lines`]), is the box's
+/// `gate-remote-outputs: 0`: it packed nothing.
+pub(super) fn packed_nothing(heard: Option<&OutputsLines>) -> bool {
+    heard.is_some_and(|heard| heard.line.strip_prefix(OUTPUTS) == Some("0"))
+}
+
 /// `text` as a whole number when it is ASCII digits alone and fits a `u64`; else `None`.
 fn whole_number(text: &str) -> Option<u64> {
     let digits = !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
@@ -1353,13 +1459,15 @@ pub(super) fn mb_rate(bytes: u64, seconds: f64) -> String {
 }
 
 /// The line an outputs pull of what it brings (`bringing`) says as it starts, from the builder `builder` (its alias),
-/// for `count` files and, when the box said it, the archive's `size` in bytes.
+/// for `count` files and, when the box said it, the archive's `size` in bytes; with no count, a fetch after the PC's own
+/// cut whose box said nothing, neither is said.
 #[expect(clippy::cast_precision_loss, reason = "a size said to one decimal of a megabyte")]
-fn pull_start_line(bringing: Bringing, builder: &str, count: u64, size: Option<u64>) -> String {
+fn pull_start_line(bringing: Bringing, builder: &str, count: Option<u64>, size: Option<u64>) -> String {
     let what = bringing.pulled();
-    match size {
-        Some(size) => format!("gate: pulling {what} from {builder}: {count} file(s), {}", mb_size(size as f64)),
-        None => format!("gate: pulling {what} from {builder}: {count} file(s)"),
+    match (count, size) {
+        (Some(count), Some(size)) => format!("gate: pulling {what} from {builder}: {count} file(s), {}", mb_size(size as f64)),
+        (Some(count), None) => format!("gate: pulling {what} from {builder}: {count} file(s)"),
+        (None, _) => format!("gate: pulling {what} from {builder}"),
     }
 }
 

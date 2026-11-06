@@ -472,6 +472,9 @@ pub struct TestSeams {
     /// The remote client's backstop on the run call in milliseconds, counted from the run call's start, in place of
     /// five ceilings and 60 s.
     pub remote_backstop_ms: Option<u64>,
+    /// How long the remote client's outputs call after its own cut of the run call asks the box to wait for the run's
+    /// pack (`CutWaitMs`), in milliseconds, in place of 120 s.
+    pub remote_cut_wait_ms: Option<u64>,
     /// How far before the moment it is taken the remote client puts each attempt's snapshot time, in milliseconds, in
     /// place of none.
     pub remote_snapshot_age_ms: Option<u64>,
