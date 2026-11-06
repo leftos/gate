@@ -624,6 +624,91 @@ mod unix {
         assert!(case.lock_free(), "the work lock is free");
     }
 
+    /// How long a kill case runs its command again while each run is killed before its command marked, as the gate
+    /// suite's own guard of that name allows.
+    const MARKED_BEFORE_THE_KILL_GUARD: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// The run, under the box seams `seams`, of a command that writes `bin/x.txt` and the dump `.tmp/dumps/a.dmp`,
+    /// then marks `marked.txt` and sleeps past its 1 s ceiling: its case and how it ended, from the first run whose
+    /// command marked before the box killed it. A command starved past its ceiling before it marked wrote nothing to
+    /// pack, which proves nothing of the pack, so such a run is followed by a fresh one, up to the guard. A run that did
+    /// not end 124 is returned at once, so the caller's asserts fail with its own output.
+    fn killed_after_its_mark(name: &str, seams: &[&str]) -> (Case, Ended) {
+        let guard = std::time::Instant::now() + MARKED_BEFORE_THE_KILL_GUARD;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let case = Case::new(name);
+            let commit = case.snapshot_holding(&[(".gitignore", "bin/\n.tmp/\n")]);
+            let script = "mkdir -p bin .tmp/dumps && echo x > bin/x.txt && echo d > .tmp/dumps/a.dmp && touch marked.txt; sleep 600";
+            let keys = json!({
+                "Command": ["/bin/sh", "-c", script],
+                "Timeout": 1,
+                "Outputs": ["bin/**"],
+                "FailureOutputs": [".tmp/dumps/**"],
+            });
+            let request = case.outputs_request(&commit, &keys, &Manifest::default());
+            let ended = ran(seams, &request, Reading::All, &case.base.join("beaten"));
+            let marked = Path::new(&case.work()).join("marked.txt").exists();
+            if ended.status != Some(124) || marked {
+                return (case, ended);
+            }
+            assert!(
+                std::time::Instant::now() < guard,
+                "every one of {attempts} commands was killed before it marked, until the guard; last: {:?}",
+                ended.err
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_past_its_ceiling_packs_its_failure_outputs_after_the_tag() {
+        // The whole machine free, so the ceiling's clock runs with wall time however loaded the machine is.
+        // Its start shifted 10 minutes later, so no load can bring the kill too near the PC's backstop to pack.
+        let seams = ["--test-box-free-percent", "100", "--test-box-start-shift-ms", "-600000"];
+        let (case, ended) = killed_after_its_mark("ceiling-dump", &seams);
+
+        assert_eq!(ended.status, Some(124), "the kill's status: {:?}", ended.err);
+        let tag = killed_line(NONCE, BoxKill::TimedOut);
+        let packed = packed_line(1);
+        let tag_at = ended.err.iter().position(|line| *line == tag);
+        let packed_at = ended.err.iter().position(|line| *line == packed);
+        assert!(
+            tag_at.is_some() && packed_at.is_some(),
+            "the kill tag and the outputs line: {:?}",
+            ended.err
+        );
+        assert!(tag_at < packed_at, "the outputs line comes after the kill tag: {:?}", ended.err);
+        let archive = fs::read(case.archive()).expect("the archive is read");
+        assert_eq!(members_of(&archive), [".tmp/dumps/a.dmp"], "the dump comes back, the build does not");
+        assert!(case.lock_free(), "the work lock is free");
+    }
+
+    #[test]
+    fn a_ceiling_kill_too_near_the_backstop_packs_nothing() {
+        // The run verb takes itself to have started 10 s ago: under 60 s remains of the PC's backstop, 5 x 1 s + 60 s.
+        let seams = ["--test-box-free-percent", "100", "--test-box-start-shift-ms", "10000"];
+        let (case, ended) = killed_after_its_mark("ceiling-near-backstop", &seams);
+
+        assert_eq!(ended.status, Some(124), "the kill's status: {:?}", ended.err);
+        assert!(ended.err_has(&killed_line(NONCE, BoxKill::TimedOut)), "{:?}", ended.err);
+        assert!(outputs_said(&ended).is_empty(), "no outputs line: {:?}", ended.err);
+        assert!(!case.archive().exists(), "nothing is packed");
+        assert!(case.lock_free(), "the work lock is free");
+    }
+
+    #[test]
+    fn a_command_past_its_backstop_packs_nothing() {
+        // A sampler that fails leaves only the backstop, five ceilings of wall time, to fire.
+        let (case, ended) = killed_after_its_mark("backstop-dump", &["--test-box-sampler-fail", "true"]);
+
+        assert_eq!(ended.status, Some(124), "the kill's status: {:?}", ended.err);
+        assert!(ended.err_has(&killed_line(NONCE, BoxKill::Backstop)), "{:?}", ended.err);
+        assert!(outputs_said(&ended).is_empty(), "no outputs line: {:?}", ended.err);
+        assert!(!case.archive().exists(), "nothing is packed");
+        assert!(case.lock_free(), "the work lock is free");
+    }
+
     #[test]
     fn a_held_work_lock_refuses_busy_75() {
         let case = Case::new("busy");

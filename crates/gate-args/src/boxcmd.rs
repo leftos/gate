@@ -10,8 +10,8 @@
 //! `--test-box-sample-ms <n>`, `--test-box-sampler-fail true|false`, `--test-box-free-percent <1-100>`,
 //! `--test-box-drain-lease-ms <n>`, `--test-box-drain-lapse-ms <n>`, `--test-box-drain-lock-ms <n>`, `--test-box-now <unix s>`,
 //! `--test-box-drain-readable-only true|false`,
-//! `--test-box-kill-leaves <n>`, `--test-probe-limit-ms <n>`, `--test-probe-drain-ms <n>`, `--test-box-desktop <fault>`,
-//! `--test-box-desktop-session <state>`, `--test-box-desktop-mutex <name>`, `--test-box-desktop-ms <n>`,
+//! `--test-box-kill-leaves <n>`, `--test-box-start-shift-ms <i64>`, `--test-probe-limit-ms <n>`, `--test-probe-drain-ms <n>`,
+//! `--test-box-desktop <fault>`, `--test-box-desktop-session <state>`, `--test-box-desktop-mutex <name>`, `--test-box-desktop-ms <n>`,
 //! `--test-box-desktop-message-ms <n>` and `--test-box-register ok|fail`, `--test-box-root-walk-stop <folder>`,
 //! `--test-box-git-limit <step>:<ms>`, `--test-box-git-armed-by <path>`, `--test-box-git-long-ms <ms>`, `--test-box-gone-reached <path>`,
 //! `--test-box-channel-ports <first>-<last>`, `--test-box-channel-accept-ms <n>`, `--test-box-channel-proof-ms <n>`,
@@ -232,6 +232,8 @@ enum Seam {
     DrainReadableOnly,
     /// `--test-box-kill-leaves <n>`: how many processes the ending of a job the ceiling killed reports left.
     KillLeaves,
+    /// `--test-box-start-shift-ms <i64>`: how far `gate box run` shifts its recorded start, earlier when positive.
+    StartShiftMs,
     /// `--test-probe-limit-ms <n>`: how long the preflight's tool probes may take together.
     ProbeLimitMs,
     /// `--test-probe-drain-ms <n>`: how long the readers of each tool probe, and of dotnet's SDK list, get to end once the
@@ -301,6 +303,7 @@ impl Seam {
             "--test-box-now" => Some(Seam::Now),
             "--test-box-drain-readable-only" => Some(Seam::DrainReadableOnly),
             "--test-box-kill-leaves" => Some(Seam::KillLeaves),
+            "--test-box-start-shift-ms" => Some(Seam::StartShiftMs),
             "--test-probe-limit-ms" => Some(Seam::ProbeLimitMs),
             "--test-probe-drain-ms" => Some(Seam::ProbeDrainMs),
             "--test-netfx-key" => Some(Seam::NetfxKey),
@@ -346,6 +349,7 @@ impl Seam {
             Seam::Now => "--test-box-now",
             Seam::DrainReadableOnly => "--test-box-drain-readable-only",
             Seam::KillLeaves => "--test-box-kill-leaves",
+            Seam::StartShiftMs => "--test-box-start-shift-ms",
             Seam::ProbeLimitMs => "--test-probe-limit-ms",
             Seam::ProbeDrainMs => "--test-probe-drain-ms",
             Seam::NetfxKey => "--test-netfx-key",
@@ -408,10 +412,10 @@ fn seams(words: &mut Peekable<impl Iterator<Item = OsString>>, problems: &mut Ve
 /// whole milliseconds above 0 after its last `:` for the git limit, `fail-before` for the console, `refused` for the
 /// token, any path for the park, the git bound's arm and the gone mark, whole bytes above 0 for the outputs, the inputs
 /// and the LFS budgets, `true` or `false` for the sampler's failure, a whole percent from 1 to 100 for the free share, a
-/// whole count above 0 for the processes a kill leaves, one of the desktop faults for the desktop, one of the session
-/// states for the desktop session, 1 to 64 letters, digits and `-` for the
-/// desktop mutex, `ok` or `fail` for the registration, any key path for the netfx key and any path for the root walk's
-/// stop. An empty or missing value is no value.
+/// whole count above 0 for the processes a kill leaves, a signed whole number of milliseconds the clock can shift by for
+/// the run's start shift, one of the desktop faults for the desktop, one of the session states for the desktop session,
+/// 1 to 64 letters, digits and `-` for the desktop mutex, `ok` or `fail` for the registration, any key path for the netfx
+/// key and any path for the root walk's stop. An empty or missing value is no value.
 #[cfg(feature = "test-seams")]
 fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Problem>) -> Result<(), Problem> {
     let name = seam.name();
@@ -442,6 +446,7 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
             };
         }
         Seam::KillLeaves => seams.kill_leaves = Some(crate::values::above_zero(name, &value)?),
+        Seam::StartShiftMs => seams.start_shift_ms = Some(crate::values::start_shift_ms(name, &value)?),
         Seam::ProbeLimitMs => seams.probe_limit_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::ProbeDrainMs => seams.probe_drain_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::NetfxKey => seams.netfx_key = Some(value),

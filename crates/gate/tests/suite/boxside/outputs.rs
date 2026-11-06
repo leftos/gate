@@ -24,6 +24,7 @@ use super::{
     BoxCall, bare_box_call, box_call, ended_within, field, gate_box, git, git_folder, has_ref, path_for_run, payload, renamed, run_box,
     run_box_with_path, snapshot,
 };
+use crate::remote_client::MARKED_BEFORE_THE_KILL_GUARD;
 use crate::support::{Case, FAKE_TOOL, HANG_GUARD, Outcome, Running, box_payload, shown};
 
 /// The ignore file of an outputs case's snapshot: `bin/` is build output, so no back commit carries it.
@@ -776,6 +777,128 @@ fn box_run_of_a_failed_command_with_a_failure_output_glob_packs_its_file() {
         ["dumps/a.dmp"],
         "the dump comes back, the build does not"
     );
+}
+
+/// A `gate box run` of a command that writes `bin\a.txt` and the dump `dumps\a.dmp`, then marks `marked.txt` and sleeps
+/// past its 1 s ceiling, with the box seams `seams`: its case, payload and outcome, from the first run whose command
+/// marked before the box killed it. A command starved past its ceiling before it marked wrote nothing to pack, which
+/// proves nothing of the pack, so such a run is followed by a fresh one, up to the guard. A run that did not end 124
+/// is returned at once, so the caller's asserts fail with its own output.
+fn killed_after_its_mark(name: &str, seams: &[&str]) -> (Case, Value, Outcome) {
+    let guard = Instant::now() + MARKED_BEFORE_THE_KILL_GUARD;
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let case = Case::new(name);
+        let command = [
+            FAKE_TOOL,
+            "write",
+            r"bin\a.txt",
+            "a",
+            "write",
+            r"dumps\a.dmp",
+            "dmp",
+            "mark",
+            "marked.txt",
+            "sleep",
+            "600000",
+        ];
+        let mut payload = failure_payload(&case, &command, &["bin/**"], &["dumps/*.dmp"]);
+        payload["Timeout"] = json!(1);
+        payload["Host"] = json!("builder");
+        snapshot(&case, &mut payload, &[IGNORE_ALL]);
+        let mut args = vec!["box"];
+        args.extend_from_slice(seams);
+        args.push("run");
+        let outcome = finish_with_manifest(box_call(&case, &args, &self::payload(&payload)), &manifest(&[]));
+        let marked = Path::new(field(&payload, "Work")).join("marked.txt").exists();
+        if outcome.code != Some(124) || marked {
+            return (case, payload, outcome);
+        }
+        assert!(
+            Instant::now() < guard,
+            "every one of {attempts} commands was killed before it marked, until the guard; last outcome: {outcome:?}"
+        );
+    }
+}
+
+/// A command the box kills at its 1 s ceiling, after it wrote a build file and a dump, has its failure outputs packed
+/// as a failed command's are, after the kill line and tag, and still ends 124.
+#[test]
+fn box_run_killed_at_its_ceiling_packs_its_failure_outputs_after_the_kill_line() {
+    // The whole machine free, so the clock runs with wall time however loaded the machine running the case is.
+    // Its start shifted 10 minutes later, so no load can bring the kill too near the PC's backstop to pack.
+    let seams = [
+        "--test-box-sample-ms",
+        "20",
+        "--test-box-free-percent",
+        "100",
+        "--test-box-start-shift-ms",
+        "-600000",
+    ];
+    let (_case, payload, outcome) = killed_after_its_mark("box_outputs_killed_dump", &seams);
+
+    assert_eq!(outcome.code, Some(124), "the kill's status: {outcome:?}");
+    let said: Vec<&str> = outcome.stderr.lines().collect();
+    let kill = said.iter().position(|line| line.starts_with("gate: TIMED OUT on builder"));
+    let timed_out = format!("gate-remote-killed: {} timed-out", field(&payload, "Nonce"));
+    let tag = said.iter().position(|line| *line == timed_out);
+    let packed = packed_line(&payload, 1);
+    let outputs = said.iter().position(|line| *line == packed);
+    assert!(
+        kill.is_some() && tag.is_some() && outputs.is_some(),
+        "the kill line, tag and outputs line: {outcome:?}"
+    );
+    assert!(
+        kill < tag && tag < outputs,
+        "the kill line and tag come before the outputs line: {outcome:?}"
+    );
+    assert_eq!(
+        archive_members(&archive_path(&payload)),
+        ["dumps/a.dmp"],
+        "the dump comes back, the build does not"
+    );
+}
+
+/// A command the box kills at its backstop, its sampler failing so only five ceilings of wall time can fire, packs
+/// nothing and says no outputs line, though it wrote a dump its failure output glob names.
+#[test]
+fn box_run_past_its_backstop_packs_nothing() {
+    let seams = ["--test-box-sample-ms", "20", "--test-box-sampler-fail", "true"];
+    let (_case, payload, outcome) = killed_after_its_mark("box_outputs_backstop_dump", &seams);
+
+    assert_eq!(outcome.code, Some(124), "the kill's status: {outcome:?}");
+    let backstop = format!("gate-remote-killed: {} backstop", field(&payload, "Nonce"));
+    assert!(has_line(&outcome.stderr, &backstop), "the backstop's tag: {outcome:?}");
+    assert!(
+        !outcome.stderr.lines().any(|line| line.starts_with("gate-remote-outputs")),
+        "no outputs line: {outcome:?}"
+    );
+    assert!(!archive_path(&payload).exists(), "nothing is packed");
+}
+
+/// A ceiling kill of a run whose verb took itself to have started 10 s ago leaves less than 60 s before the box's
+/// estimate of the PC's backstop (5 x 1 s + 60 s): the box packs nothing and says no outputs line.
+#[test]
+fn box_run_killed_at_its_ceiling_too_near_the_backstop_packs_nothing() {
+    let seams = [
+        "--test-box-sample-ms",
+        "20",
+        "--test-box-free-percent",
+        "100",
+        "--test-box-start-shift-ms",
+        "10000",
+    ];
+    let (_case, payload, outcome) = killed_after_its_mark("box_outputs_killed_near_backstop", &seams);
+
+    assert_eq!(outcome.code, Some(124), "the kill's status: {outcome:?}");
+    let timed_out = format!("gate-remote-killed: {} timed-out", field(&payload, "Nonce"));
+    assert!(has_line(&outcome.stderr, &timed_out), "a ceiling kill: {outcome:?}");
+    assert!(
+        !outcome.stderr.lines().any(|line| line.starts_with("gate-remote-outputs")),
+        "no outputs line: {outcome:?}"
+    );
+    assert!(!archive_path(&payload).exists(), "nothing is packed");
 }
 
 #[test]

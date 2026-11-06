@@ -6085,7 +6085,7 @@ fn a_run_call_past_its_backstop_is_killed_with_the_backstop_line() {
 
 /// How long a box-kill case goes on with fresh runs while the box's ceiling kills each command before it marked its
 /// file: a hang guard a passing run never reaches.
-const MARKED_BEFORE_THE_KILL_GUARD: Duration = Duration::from_secs(300);
+pub(crate) const MARKED_BEFORE_THE_KILL_GUARD: Duration = Duration::from_secs(300);
 
 /// A routed run whose command marks `made-on-box.txt` on the builder, then sleeps past its 1 s ceiling, the box's `run`
 /// given `box_seams` when some: its case, steps file and outcome, from the first run whose command marked the file
@@ -6174,6 +6174,10 @@ pub(super) fn work_folder(case: &Case) -> PathBuf {
 /// The box seams a box-kill case gives the box's `run` through the stand-in: a sample every 20 ms of a machine all
 /// free, so the box's clock runs with wall time however loaded the machine running the case is.
 const FREE_BOX: &str = "--test-box-sample-ms 20 --test-box-free-percent 100";
+
+/// [`FREE_BOX`] with the box's recorded start shifted 10 minutes later, so no load can bring a ceiling kill too near
+/// the PC's backstop for the box to pack the killed run's failure outputs.
+const FREE_BOX_STARTED_LATER: &str = "--test-box-sample-ms 20 --test-box-free-percent 100 --test-box-start-shift-ms -600000";
 
 /// The variable whose words the stand-in gives the box's `run` before its verb.
 const BOX_SEAMS_VARIABLE: &str = "GATE_FAKE_SSH_BOX_SEAMS";
@@ -8628,6 +8632,133 @@ fn a_failing_run_with_a_failure_output_glob_brings_its_file_back_keeps_its_statu
     assert!(says_a_line_starting(&outcome, "gate: the failed run's outputs: 1 file(s)"), "{outcome:?}");
     assert!(!says_a_line_starting(&outcome, "gate: the failed run's test reports"), "{outcome:?}");
     assert!(pending_marker(&case).exists(), "a failed run leaves the marker: {outcome:?}");
+}
+
+/// A [`failure_case`] routed run whose command builds `bin\built.txt` and writes the dump `dumps\a.dmp` on the
+/// builder, then sleeps past its 1 s ceiling on a box whose machine reads all free and whose start is shifted later
+/// ([`FREE_BOX_STARTED_LATER`]): its case, steps file and outcome, from the first run whose command wrote the dump
+/// before the box killed it, as [`box_killed_after_its_mark`] retries. The stand-in passes the preflight and the run
+/// call, then takes `after` for the calls that follow; the client is also given the words `extra`.
+fn box_killed_after_its_dump(name: &str, after: &[&str], extra: &[&str]) -> (Case, PathBuf, Outcome) {
+    let guard = Instant::now() + MARKED_BEFORE_THE_KILL_GUARD;
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let case = failure_case(name, &BIN, &["dumps/*.dmp"]);
+        let mut all = vec!["ok", "ok"];
+        all.extend_from_slice(after);
+        let steps = ssh_steps(&case, "ssh", &all);
+        let tuned = Tuned {
+            timeout: "1",
+            extra,
+            ..Tuned::default()
+        };
+        let command = [
+            r".\tool.exe",
+            "write",
+            r"bin\built.txt",
+            "box",
+            "write",
+            r"dumps\a.dmp",
+            "dump",
+            "sleep",
+            "600000",
+        ];
+        let mut gate = client_gate_tuned(&case, "out.log", &steps, &tuned, &command);
+        gate.env(BOX_SEAMS_VARIABLE, FREE_BOX_STARTED_LATER);
+        let outcome = finish(gate);
+        let queued = work_folder_if_queued(&case);
+        let dumped = queued.as_ref().is_some_and(|work| work.join("dumps").join("a.dmp").exists());
+        if outcome.code != Some(124) || queued.is_none() || dumped {
+            return (case, steps, outcome);
+        }
+        assert!(
+            Instant::now() < guard,
+            "every one of {attempts} commands was killed before its dump was in its work folder, until the hang guard; \
+             last outcome: {outcome:?}"
+        );
+    }
+}
+
+/// The real box kills a command at its 1 s ceiling after it wrote a dump its failure output glob names: the box packs
+/// the killed run's narrowed set, and the client brings the dump back while the run stays killed, with no stop, no
+/// sync-back and the pending marker kept.
+#[test]
+fn a_command_the_box_kills_at_its_ceiling_brings_its_failure_outputs_back_and_stays_timed_out() {
+    let (case, steps, outcome) = box_killed_after_its_dump("client-box-killed-dump", &["ok", "ok"], &[]);
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert_eq!(verdict(&case), "timed-out", "{outcome:?}");
+    assert_eq!(worktree_text(&case, r"dumps\a.dmp"), "dump", "the dump is installed: {outcome:?}");
+    assert!(
+        !case.folder().join("bin").join("built.txt").exists(),
+        "nothing under bin is installed: {outcome:?}"
+    );
+    assert!(
+        says_a_line_starting(&outcome, "gate: pulling the killed run's outputs from"),
+        "{outcome:?}"
+    );
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs"], "no stop: {outcome:?}");
+    assert!(!outcome.stderr.contains("gate: synced back"), "{outcome:?}");
+    assert!(pending_marker(&case).exists(), "a killed run leaves the marker: {outcome:?}");
+}
+
+/// The box kills a command at its 1 s ceiling after it wrote its dump, and each attempt of the killed run's pull is
+/// dropped before the banner until its retries run out: the run says the TRANSFER FAILED line naming the kill and
+/// stays timed out.
+#[test]
+fn a_killed_run_whose_pull_fails_every_retry_says_transfer_failed_and_stays_timed_out() {
+    let (case, _steps, outcome) = box_killed_after_its_dump("client-box-killed-dump-banner", &["fail-banner"; 12], &[]);
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert_eq!(verdict(&case), "timed-out", "{outcome:?}");
+    let start = "gate: TRANSFER FAILED: the box killed the command at its ceiling on";
+    assert!(says_a_line_starting(&outcome, start), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .lines()
+            .any(|line| line.contains(start) && line.contains("the killed run's outputs not brought back: ")),
+        "the line names the killed run's outputs: {outcome:?}"
+    );
+    assert!(!case.folder().join("dumps").join("a.dmp").exists(), "nothing is installed: {outcome:?}");
+}
+
+/// The box kills a command at its 1 s ceiling after it wrote its dump, and a Ctrl+C comes once the run call has
+/// returned: the client pulls nothing of the killed run's set, stops nothing, and the run stays timed out.
+#[test]
+fn a_ctrl_c_raised_after_a_box_killed_run_call_pulls_nothing() {
+    let extra = ["--test-remote-interrupt-at", "after-run"];
+    let (case, steps, outcome) = box_killed_after_its_dump("client-box-killed-dump-ctrl-c", &["ok", "ok"], &extra);
+
+    assert!(
+        !says_a_line_starting(&outcome, "gate: pulling the killed run's"),
+        "nothing is pulled: {outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert_eq!(verdict(&case), "timed-out", "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "no pull and no stop: {outcome:?}");
+}
+
+/// The box kills a command at its 1 s ceiling after it wrote its dump, and a Ctrl+C comes as the client hears the box's
+/// kill tag, while the box packs the killed run's set: the box's kill stays the run's end, timed out, with no stop
+/// and nothing pulled.
+#[test]
+fn a_ctrl_c_during_the_box_s_pack_after_its_kill_ends_timed_out_with_no_stop() {
+    let extra = ["--test-remote-interrupt-at", "kill-tag"];
+    let (case, steps, outcome) = box_killed_after_its_dump("client-box-killed-dump-kill-tag", &["ok", "ok"], &extra);
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert_eq!(verdict(&case), "timed-out", "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "no stop and no pull: {outcome:?}");
+    assert!(
+        !says_a_line_starting(&outcome, "gate: pulling the killed run's"),
+        "nothing is pulled: {outcome:?}"
+    );
+    assert!(
+        !says_a_line_starting(&outcome, "gate: stopping the command on"),
+        "nothing is stopped: {outcome:?}"
+    );
 }
 
 #[test]

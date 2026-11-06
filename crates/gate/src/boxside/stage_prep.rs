@@ -107,7 +107,7 @@ impl CommandLines for PrepLines {
         let ending = match ran {
             Ran::Exited(status) => format!("exited {status}"),
             Ran::NotStarted(status) => format!("could not start (status {status})"),
-            Ran::Killed => format!("ran past its budget of {} s", self.budget),
+            Ran::Killed(_) => format!("ran past its budget of {} s", self.budget),
         };
         clean.then(|| format!("gate: remote stage prep failed: {} {ending}", spoken(at.words)))
     }

@@ -500,8 +500,50 @@ fn reports_end(
     (marker, now): (Option<&Path>, i64),
     brought: Option<&Brought>,
 ) -> (End, bool) {
+    let end = match narrowed_fetched(attempt, (sent, ran), (marker, now, Cause::Failed), brought) {
+        None | Some(End::Status(_) | End::Failed(_)) => End::Status(now),
+        Some(end) => end,
+    };
+    (end, false)
+}
+
+/// How the TRANSFER FAILED line of a killed run's pull says its command ended ([`killed_end`]).
+pub(super) const KILLED_AT_ITS_CEILING: &str = "the box killed the command at its ceiling";
+
+/// The end of the outputs step of a run whose command the box killed at its ceiling, its run `ran` ending with the
+/// kill's status, whose box said it `brought` its outputs or not: for a run with an outputs step ([`Sent::stepped`]),
+/// the killed run's narrowed set fetched and installed as [`reports_end`] fetches a failed run's, its lines naming the
+/// killed run's outputs or test reports ([`Cause::Killed`]), when the box packed one; nothing, and no line, otherwise
+/// (a box backstop kill, or a ceiling kill too near the PC's backstop, packs none). A pull that failed every attempt
+/// says the TRANSFER FAILED line naming the kill ([`KILLED_AT_ITS_CEILING`], [`Attempt::say_transfer_failed`]).
+/// Always [`End::Killed`], whatever the fetch, the install, the watchdog's stop or a Ctrl+C during them gives. It never
+/// clears the pending marker, never touches the outputs cap record, makes no sync-back and never marks the outputs
+/// brought back.
+pub(super) fn killed_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, brought: Option<&Brought>) -> End {
+    if sent.stepped() {
+        let marker = sent.marker.as_deref();
+        // The run ends killed whatever the fetch gave; only a transfer that failed every attempt is said here.
+        if let Some(End::TransferFailed(why)) = narrowed_fetched(attempt, (sent, ran), (marker, ran.status, Cause::Killed), brought) {
+            attempt.say_transfer_failed(KILLED_AT_ITS_CEILING, &why);
+        }
+    }
+    End::Killed
+}
+
+/// The end [`fetched`] gives for the narrowed set of a run that ended at `now` as `cause` says, with the pending marker
+/// `marker`, whose box said it `brought` its outputs or not: `None`, nothing fetched and nothing said, unless the box
+/// packed an archive, the PC's manifest was built and one of the run's output globs names a `TestResults` folder or
+/// the run has failure output globs; else the narrowed set ([`failure::failed_run_set`]) fetched and installed as
+/// [`fetched`] says for [`Bringing::Reports`], its lines naming the run's outputs when the set holds a failure output
+/// glob, else its test reports.
+fn narrowed_fetched(
+    attempt: &mut Attempt<'_, '_>,
+    (sent, ran): (&Sent<'_>, &Ran<'_>),
+    (marker, now, cause): (Option<&Path>, i64, Cause),
+    brought: Option<&Brought>,
+) -> Option<End> {
     let (Ok(files), Some(Brought::Archive { count, size, .. })) = (&sent.built, brought) else {
-        return (End::Status(now), false);
+        return None;
     };
     // Output globs that cannot be matched name no `TestResults` folder, as an empty list names none.
     let outputs = Globs::new(sent.globs).or_else(|_| Globs::new(&[]));
@@ -509,9 +551,7 @@ fn reports_end(
         .filter(|globs| !globs.is_empty())
         .and_then(|globs| Globs::new(globs).ok());
     let reports = outputs.ok().and_then(|outputs| outputs.test_results_only());
-    let Some(narrowed) = failure::failed_run_set(reports.as_ref(), failure_globs.as_ref()) else {
-        return (End::Status(now), false);
-    };
+    let narrowed = failure::failed_run_set(reports.as_ref(), failure_globs.as_ref())?;
     let named = if failure_globs.is_some() {
         Narrowed::Outputs
     } else {
@@ -523,13 +563,9 @@ fn reports_end(
         marker,
         count: *count,
         size: *size,
-        reports: Some((&narrowed, named)),
+        reports: Some((&narrowed, named, cause)),
     };
-    let end = match fetched(attempt, &kept, ran, End::Status(now)).0 {
-        End::Status(_) | End::Failed(_) => End::Status(now),
-        end => end,
-    };
-    (end, false)
+    Some(fetched(attempt, &kept, ran, End::Status(now)).0)
 }
 
 /// What an outputs pull brings back, which its lines, its install and the records it keeps follow.
@@ -537,64 +573,73 @@ fn reports_end(
 pub(super) enum Bringing {
     /// A passing run's outputs, under every output glob of the run.
     Outputs,
-    /// A failed run's narrowed set: its outputs under the globs that name a `TestResults` folder
-    /// ([`Globs::test_results_only`]) and under its failure output globs, which the lines name as [`Narrowed`] says.
-    /// Their pull and install keep the run's status, leave the outputs cap record and never clear the pending marker.
-    Reports(Narrowed),
+    /// A failed or killed run's narrowed set: its outputs under the globs that name a `TestResults` folder
+    /// ([`Globs::test_results_only`]) and under its failure output globs, which the lines name as [`Narrowed`] and
+    /// [`Cause`] say. Their pull and install keep the run's end, leave the outputs cap record and never clear the
+    /// pending marker.
+    Reports(Narrowed, Cause),
 }
 
-/// What a failed run's narrowed set holds, which the lines of its pull and install name.
+/// What a failed or box-killed run's narrowed set holds, which the lines of its pull and install name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Narrowed {
-    /// The globs that name a `TestResults` folder alone: the failed run's test reports.
+    /// The globs that name a `TestResults` folder alone: the run's test reports.
     TestReports,
-    /// A failure output glob among them: the failed run's outputs.
+    /// A failure output glob among them: the run's outputs.
     Outputs,
 }
 
+/// How the run whose narrowed set is brought back ended, which the lines of its pull and install name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Cause {
+    /// Its command exited non-zero: the failed run's.
+    Failed,
+    /// The box killed its command at its ceiling: the killed run's.
+    Killed,
+}
+
 impl Bringing {
-    /// What the pull's lines and the install's success line say they bring: `outputs`, or the failed run's
-    /// ([`Bringing::failed`]).
+    /// What the pull's lines and the install's success line say they bring: `outputs`, or the failed or killed run's
+    /// ([`Bringing::narrowed`]).
     pub(super) fn pulled(self) -> &'static str {
         match self {
             Bringing::Outputs => "outputs",
-            Bringing::Reports(narrowed) => Bringing::failed(narrowed),
+            Bringing::Reports(narrowed, cause) => Bringing::narrowed(narrowed, cause),
         }
     }
 
-    /// What the lines saying what was not brought back name: `remote outputs`, or the failed run's
-    /// ([`Bringing::failed`]).
+    /// What the lines saying what was not brought back name: `remote outputs`, or the failed or killed run's
+    /// ([`Bringing::narrowed`]).
     pub(super) fn unbrought(self) -> &'static str {
         match self {
             Bringing::Outputs => "remote outputs",
-            Bringing::Reports(narrowed) => Bringing::failed(narrowed),
+            Bringing::Reports(narrowed, cause) => Bringing::narrowed(narrowed, cause),
         }
     }
 
-    /// The words the pull's hang hint names its phase with, before the builder's alias.
-    pub(super) fn pulling_from(self) -> &'static str {
+    /// The words the pull's hang hint names its phase with, before the builder's alias: `pulling` what the pull brings
+    /// ([`Bringing::pulled`]) `from`.
+    pub(super) fn pulling_from(self) -> String {
+        format!("pulling {} from", self.pulled())
+    }
+
+    /// What the watchdog's line says a fetch it stopped was doing: fetching the outputs, or the failed or killed run's
+    /// ([`Bringing::narrowed`]).
+    fn fetching(self) -> String {
         match self {
-            Bringing::Outputs => "pulling outputs from",
-            Bringing::Reports(Narrowed::TestReports) => "pulling the failed run's test reports from",
-            Bringing::Reports(Narrowed::Outputs) => "pulling the failed run's outputs from",
+            Bringing::Outputs => "fetching the outputs".to_owned(),
+            Bringing::Reports(narrowed, cause) => format!("fetching {}", Bringing::narrowed(narrowed, cause)),
         }
     }
 
-    /// What the watchdog's line says a fetch it stopped was doing.
-    fn fetching(self) -> &'static str {
-        match self {
-            Bringing::Outputs => "fetching the outputs",
-            Bringing::Reports(Narrowed::TestReports) => "fetching the failed run's test reports",
-            Bringing::Reports(Narrowed::Outputs) => "fetching the failed run's outputs",
-        }
-    }
-
-    /// What the lines of a failed run's pull and install call what they bring back: its test reports, or its outputs
-    /// when its narrowed set holds a failure output glob.
-    fn failed(narrowed: Narrowed) -> &'static str {
-        match narrowed {
-            Narrowed::TestReports => "the failed run's test reports",
-            Narrowed::Outputs => "the failed run's outputs",
+    /// What the lines of a failed or killed run's pull and install call what they bring back: its test reports, or
+    /// its outputs when its narrowed set holds a failure output glob, named for how the run ended (`cause`).
+    fn narrowed(narrowed: Narrowed, cause: Cause) -> &'static str {
+        match (narrowed, cause) {
+            (Narrowed::TestReports, Cause::Failed) => "the failed run's test reports",
+            (Narrowed::Outputs, Cause::Failed) => "the failed run's outputs",
+            (Narrowed::TestReports, Cause::Killed) => "the killed run's test reports",
+            (Narrowed::Outputs, Cause::Killed) => "the killed run's outputs",
         }
     }
 }
@@ -602,21 +647,22 @@ impl Bringing {
 /// What the outputs step of a run whose box packed an archive keeps for its pull and install: the run's output globs,
 /// the PC's manifest and the pending marker, `None` for a run whose outputs the route withheld, whose marker no end
 /// clears; the files
-/// the box said it packed, and the archive's size in bytes when it said one; and, for a failed run, its narrowed set
-/// ([`reports_end`]), which the install is held to, and what the set holds.
+/// the box said it packed, and the archive's size in bytes when it said one; and, for a failed or killed run, its
+/// narrowed set ([`narrowed_fetched`]), which the install is held to, what the set holds and how the run ended.
 struct Kept<'k> {
     globs: &'k [String],
     files: &'k Manifest,
     marker: Option<&'k Path>,
     count: u64,
     size: Option<u64>,
-    reports: Option<(&'k Globs, Narrowed)>,
+    reports: Option<(&'k Globs, Narrowed, Cause)>,
 }
 
 impl Kept<'_> {
-    /// What the pull brings: a failed run's narrowed set when it carries one, else outputs.
+    /// What the pull brings: a failed or killed run's narrowed set when it carries one, else outputs.
     fn bringing(&self) -> Bringing {
-        self.reports.map_or(Bringing::Outputs, |(_, narrowed)| Bringing::Reports(narrowed))
+        self.reports
+            .map_or(Bringing::Outputs, |(_, narrowed, cause)| Bringing::Reports(narrowed, cause))
     }
 }
 
@@ -677,10 +723,11 @@ pub(super) fn trees_of<'a>(
 /// watch does; one that did not end whole says how long it ran and what it received ([`pull_ended_line`]) before any
 /// other line of its end.
 ///
-/// A failed run's test reports (a `kept` carrying their narrowed globs, [`Bringing::Reports`]) are pulled and installed
-/// the same way, each line naming them, but the outputs cap record is neither removed nor counted on any end, a fetch
-/// past the cap only says so, and the install is held to the narrowed globs; the ends that fail a passing run are
-/// handed back as they are, and [`reports_end`] turns them to the command's status.
+/// A failed or box-killed run's test reports (a `kept` carrying their narrowed globs, [`Bringing::Reports`]) are pulled
+/// and installed the same way, each line naming them, but the outputs cap record is neither removed nor counted on any
+/// end, a fetch past the cap only says so, and the install is held to the narrowed globs; the ends that fail a passing
+/// run are handed back as they are, and [`reports_end`] turns them to the command's status, while [`killed_end`] turns
+/// every one of them to [`End::Killed`].
 fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced: End) -> (End, bool) {
     // The install stamps each file the run wrote with the snapshot time; an attempt past its run without one is a bug of
     // the client's, which pulls nothing rather than stamp the outputs with another time.
@@ -881,14 +928,14 @@ pub(super) fn judged(
     }
     let fetch = (archive, bringing);
     if let Some(cut) = called.cut {
-        if let Some(line) = client::watchdog_line(cut, bringing.fetching()) {
+        if let Some(line) = client::watchdog_line(cut, &bringing.fetching()) {
             attempt.say(line);
             attempt.noted(called);
             return unfetched(attempt, fetch, &stopped_reason(called.received), End::Killed);
         }
         attempt.noted(called);
         if let Cut::ArchiveTooBig(_) = cut {
-            if matches!(bringing, Bringing::Reports(_)) {
+            if matches!(bringing, Bringing::Reports(..)) {
                 return unfetched(attempt, fetch, &cut.reason("the archive"), synced);
             }
             return capped(attempt, archive, &cut.reason("the archive"), synced);
@@ -1373,8 +1420,9 @@ mod tests {
     use gate_router::DEFAULT_OUTPUTS;
 
     use super::{
-        Archive, Brought, MANIFEST_LIMIT, Manifest, Manifested, NonZeroU64, PARTIAL, PAST_THE_CAP, Unbuilt, accepted, hashed, holds_outputs,
-        keep_outputs_lines, manifest_line, manifest_over, mb_size, pending, sha256_for, stopped_reason, turned_reason, within_cap,
+        Archive, Bringing, Brought, Cause, MANIFEST_LIMIT, Manifest, Manifested, Narrowed, NonZeroU64, PARTIAL, PAST_THE_CAP, Unbuilt, accepted,
+        hashed, holds_outputs, keep_outputs_lines, manifest_line, manifest_over, mb_size, not_brought_back, pending, sha256_for, stopped_reason,
+        turned_reason, within_cap,
     };
     use crate::outputs::cache::{HashCache, file_time_now};
     use crate::outputs::glob::Globs;
@@ -1386,6 +1434,55 @@ mod tests {
     const KEY: &str = "app-1a2b3c4d";
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
     const OTHER_NONCE: &str = "fedcba9876543210fedcba9876543210";
+
+    /// A box-killed run's narrowed set of test reports alone, and of outputs.
+    const KILLED_SETS: [(Bringing, &str); 2] = [
+        (Bringing::Reports(Narrowed::TestReports, Cause::Killed), "the killed run's test reports"),
+        (Bringing::Reports(Narrowed::Outputs, Cause::Killed), "the killed run's outputs"),
+    ];
+
+    /// Every phrase a box-killed run's pull names its set with names it the killed run's, never the failed run's.
+    #[test]
+    fn a_killed_run_s_pull_names_its_set_the_killed_run_s() {
+        for (bringing, set) in KILLED_SETS {
+            assert_eq!(bringing.pulled(), set);
+            assert_eq!(bringing.unbrought(), set);
+            assert_eq!(bringing.pulling_from(), format!("pulling {set} from"));
+            assert_eq!(bringing.fetching(), format!("fetching {set}"));
+        }
+        assert_eq!(
+            Bringing::Reports(Narrowed::Outputs, Cause::Killed).pulling_from(),
+            "pulling the killed run's outputs from"
+        );
+        assert_eq!(
+            Bringing::Reports(Narrowed::TestReports, Cause::Killed).fetching(),
+            "fetching the killed run's test reports"
+        );
+    }
+
+    /// A box-killed run's set not brought back is said as the killed run's.
+    #[test]
+    fn a_killed_run_s_set_not_brought_back_names_the_killed_run_s() {
+        assert_eq!(
+            not_brought_back(Bringing::Reports(Narrowed::Outputs, Cause::Killed), "the manifest could not be built"),
+            "gate: the killed run's outputs not brought back: the manifest could not be built"
+        );
+        assert_eq!(
+            not_brought_back(Bringing::Reports(Narrowed::TestReports, Cause::Killed), "why"),
+            "gate: the killed run's test reports not brought back: why"
+        );
+    }
+
+    /// The watchdog's line for a box-killed run's fetch it stopped at its ceiling names what the fetch was bringing.
+    #[test]
+    fn a_stopped_killed_run_s_fetch_says_transfer_timed_out_fetching_the_killed_run_s_set() {
+        for (bringing, set) in KILLED_SETS {
+            assert_eq!(
+                crate::remote::watchdog::transfer_line(Duration::from_mins(30), &bringing.fetching()),
+                format!("gate: TRANSFER TIMED OUT after 1800 s fetching {set}")
+            );
+        }
+    }
 
     #[test]
     fn a_stopped_fetch_says_the_bytes_it_had_fetched_in_whole_seconds_and_their_rate() {

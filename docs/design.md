@@ -3975,7 +3975,17 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A run call killed by the client says `gate: STALLED: no output or remote CPU for <n> s` or `gate: BACKSTOP on <host>: no end after <w> s of wall time (5 x the <n> s ceiling + 60 s, the raised ceiling for a cold run); killed the run call and stopped the command`, stops the command on the builder and ends the run with status 124, with no fallback.
 
-  A command the builder killed ends the run the same way as a client kill, with the verdict `timed-out` or `backstop` the kill tag names, but with no stop call (the box already ended the job), no sync-back fetch and no outputs fetch, the outputs pending marker kept; the kill line is the box's own, read from the log.
+  A command the builder killed ends the run the same way as a client kill, with the verdict `timed-out` or `backstop` the kill tag names, but with no stop call (the box already ended the job) and no sync-back fetch, the outputs pending marker kept; the kill line is the box's own, read from the log. The ssh calls are `preflight, run`, and `outputs` after them only when the box packed the killed run's set and the call exited 124.
+
+  Once the client has heard the box's kill tag, the box's kill is the run's end however the call then ends: a lost connection, a Ctrl+C or a watchdog cut during the box's pack ends the run 124 with the tag's verdict, with no stop call, no PC kill line, no boot check, no fallback and no pull.
+
+  When the box packed the failed run's set after its `timed-out` kill tag (an accepted outputs line naming an archive; a `backstop` kill packs nothing), the client fetches and installs it as a failed run's (Outputs fetch, Outputs install) with the lines `gate: pulling the killed run's outputs from <builder>: <n> file(s), <size>` (`the killed run's test reports` when no failure output glob is set).
+
+  Its other lines are `gate: installing the killed run's outputs: <n> file(s)`, `gate: the killed run's outputs: <n> file(s), ...` and `gate: the killed run's outputs not brought back: <why>`, the hang hint phase `pulling the killed run's outputs from` (or `test reports`) and, on a watchdog cut, `gate: TRANSFER TIMED OUT after <n> s fetching the killed run's outputs`.
+
+  A pull that fails every retry says `gate: TRANSFER FAILED: the box killed the command at its ceiling on <builder>; the killed run's outputs not brought back: <why>`. A Ctrl+C raised before the pull starts skips it; one during it ends the pull.
+
+  Only the narrowed set comes back, never the full `outputs`. Whatever the pull gives, the run still ends 124 with the box kill's verdict, the cap record is untouched and the outputs are never marked brought back. A cut by the PC (a stall, the PC backstop, a lost connection, Ctrl+C) brings nothing back.
 
   A killed preflight or push never started the command, so an early stall says `gate: remote <host> unreachable: <the call> stalled` (or `outlived its transfer ceiling of 1800 s`) and falls back `unreachable`, with no kill line and no exit 124.
 
@@ -4450,7 +4460,11 @@ Built verbs:
 
   At the load-adjusted ceiling it ends the job and says `gate: TIMED OUT on <host> after <n> s of load-adjusted time (wall <w> s, machine free <p>% on average); killed <command> and its children`; at 5 x the ceiling of wall time it says `gate: BACKSTOP on <host>: <w> s of wall time (5 x <n> s ceiling, load-adjusted <a> s, machine free <p>% on average); killed <command> and its children`, the clause reading `machine load unknown: the sampler failed` after a sampler failure.
 
-  At a kill the box ends the job and drains the command's output first, then says, in order, the kill line, `gate-remote-killed: <nonce> timed-out|backstop` and the adjusted line `gate-remote-adjusted: <nonce> <s.sss>`, and exits 124. It makes no back commit (`refs/gate-back/<key>`) and packs no outputs.
+  At a kill the box ends the job and drains the command's output first, then says, in order, the kill line, `gate-remote-killed: <nonce> timed-out|backstop` and the adjusted line `gate-remote-adjusted: <nonce> <s.sss>`, and exits 124. It makes no back commit (`refs/gate-back/<key>`).
+
+  After a ceiling kill (`timed-out`), while at least the larger of 60 s and the ceiling remains before the box's estimate of the client's backstop (its own `run` start plus 5 x the payload's `Timeout` plus 60 s), when outputs were asked and the failed run's set is not empty, it then packs that set as a failed command's ([Outputs](#the-box-side)) and says its `gate-remote-outputs-size:` and `gate-remote-outputs:` lines after the tag, even when the kill left a process running; the status stays 124 whatever the pack gives.
+
+  A backstop kill, or a ceiling kill past that margin, packs nothing and says no outputs line, so the client's own backstop never cuts a pack short.
 
   When ending the job fails or leaves processes, the box tries once more to end it. If the job is still not ended, it says first `gate: note: the box's ceiling|backstop kill left <n> process(es) running in job <job>` (or `gate: note: the box's ceiling|backstop kill could not end job <job>: <error>`), then the kill line, the tag and the adjusted line as on any kill, and exits 124: the run is still a kill.
 
@@ -4963,8 +4977,8 @@ Built verbs:
   - Right after a pack that wrote an archive, the box trims `OutputFolder` to at most 50 GiB of outputs archives (files named as in the first step; other files are neither counted nor removed). It removes the archives last written strictly before the run's own, oldest first (by path among equals), until the total fits; an archive written with the run's own or after it is never removed, so the folder may stay over the budget until the newer run's own trim.
   - The run's own archive is opened sharing reads only, so another run's trim cannot remove it mid-write; such a removal fails, is said as above (`gate: remote could not remove the old outputs archive <path>: <error>`) and that trim goes on to the next oldest. An entry whose metadata cannot be read is said (`gate: remote could not read the outputs archive <path>: <error>`, control characters escaped), left out of the total, and the trim goes on.
   - A run whose own archive alone is larger than the budget removes only its own archive, leaves the others, and says `gate: remote outputs not brought back: the archive is <X.X> GiB, more than the box keeps (50 GiB)`. A run whose own archive is gone before its trim says `gate: remote outputs not brought back: the archive was removed before it could be sent`. Either turns a passed 0 into 1.
-  - A pack that fails removes its half-written archive, says `gate: remote outputs not brought back: <reason>` and turns the passed 0 into 1 (a failed run ends on the command's own status, whatever the pack does). A killed command or a failed sync-back packs nothing.
-  - A failed command (exit other than 0; a killed one packs nothing) packs only the files matched by the failed run's set: the output globs that name a `TestResults` folder (`Globs::test_results_only` in `gate-inputs`: a folder segment, not the last, equal to `TestResults` in any letter case) followed by the `FailureOutputs` globs (`failure::failed_run_globs`).
+  - A pack that fails removes its half-written archive, says `gate: remote outputs not brought back: <reason>` and turns the passed 0 into 1 (a failed run ends on the command's own status, whatever the pack does). A failed sync-back packs nothing.
+  - A failed command (exit other than 0), or one the box killed at its ceiling (which makes no back commit, so none of its paths is left out), packs only the files matched by the failed run's set: the output globs that name a `TestResults` folder (`Globs::test_results_only` in `gate-inputs`: a folder segment, not the last, equal to `TestResults` in any letter case) followed by the `FailureOutputs` globs (`failure::failed_run_globs`).
 
     It says its usual `gate-remote-outputs-size:` and `gate-remote-outputs:` lines, or `gate-remote-outputs: 0` when nothing matched. With neither kind of glob a failed run packs nothing and says no outputs line.
 
@@ -5461,7 +5475,9 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
   A PC found gone before the pack or before the trim ends the run 255 with nothing more said and nothing packed or trimmed after it; an archive already packed stays in the output folder until the 24-hour prune. The `diff-tree` step's output is read whole, never cut at the 1 MiB cap the other git steps keep.
 
-  After those come the trim's lines; and last, on failure, `gate: remote outputs not brought back: <reason>`, which turns a passed run's 0 into 1. A failed command packs only the reports under its `TestResults` globs and the files under its `FailureOutputs` globs (held to the built-in caps, each file left said as the Windows box says it), never runs the cross build and skips the Mach-O/ELF refusal; a killed command or a failed sync-back packs nothing; a client gone keeps the command's status.
+  After those come the trim's lines; and last, on failure, `gate: remote outputs not brought back: <reason>`, which turns a passed run's 0 into 1.
+
+  A failed command packs only the reports under its `TestResults` globs and the files under its `FailureOutputs` globs (held to the built-in caps, each file left said as the Windows box says it), never runs the cross build and skips the Mach-O/ELF refusal; a failed sync-back packs nothing; a command the box killed at its ceiling packs the same set after its kill line and tag (one killed at its backstop packs nothing), with no back commit, and still ends 124; a client gone keeps the command's status.
 
   The not-brought-back reasons the Unix box adds are the bad manifest's own text, `diff-tree printed a path that is not UTF-8`, the lines of a failed `diff-tree` step in the Unix sync-back style, and the over-budget and gone-before-sent reasons. The `diff-tree` step (named `diff-tree <leaf>` on a pair run) runs through the run's killable git steps and is recorded in `<work>.pgid`, only when a back commit was pushed for a run with outputs.
 
@@ -5786,6 +5802,8 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
     The cores are `available_parallelism`, unweighted. The ceiling and the heartbeat share one CPU source: the pump's group CPU when the run has a pump, else the ceiling's own reading of the command group. The first read is at the watch's start.
 
     A command past its ceiling in load-adjusted time is ended through the runner. The run then says, in one write, an optional note (`gate: note: the box's {ceiling|backstop} kill could not end job <job>: <why>` when the group is still there, else `gate: note: after the box's {ceiling|backstop} kill: <why>`), the kill line, `gate-remote-killed: <nonce> timed-out|backstop` and `gate-remote-adjusted: <nonce> <s.sss>`, and exits 124 with the records kept.
+
+    After a ceiling kill inside the same margin as the Windows box's (`timed-out`, with at least the larger of 60 s and the ceiling left before the client's backstop), the failed run's set is then packed as for a failed command, its lines after the tag.
 
     The kill lines are the Windows box's: `gate: TIMED OUT[ on <host>] after <t> s of load-adjusted time (wall <w> s, machine free <p>% on average); killed <words> and its children`, and for a command past 5 x its ceiling of wall time `gate: BACKSTOP[ on <host>]: <w> s of wall time (5 x <t> s ceiling, load-adjusted <a> s, machine free <p>% on average); killed <words> and its children`.
 

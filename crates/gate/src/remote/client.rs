@@ -482,6 +482,8 @@ impl RustClient {
             pulled_last: None,
             adjusted: None,
             box_killed: None,
+            box_kill_pulls: false,
+            run_kill_heard: None,
             held_run: None,
             ceiling: None,
             places: Vec::new(),
@@ -1538,8 +1540,15 @@ pub(super) struct Attempt<'c, 'a> {
     /// The load-adjusted seconds the box said it counted for the command, `None` until the run call that counts said
     /// them.
     adjusted: Option<f64>,
-    /// The kill the box's kill tag named, set only when the run call ended as the box's own kill.
+    /// The kill the box's kill tag named, set once the run call that counts heard it, which then ends as the box's own
+    /// kill however the call ended.
     box_killed: Option<BoxKill>,
+    /// Whether the killed run's narrowed set is pulled after the box's kill: only after a run call that exited 124 of
+    /// its own, with no cut and no Ctrl+C raised by then ([`Attempt::box_kill_heard`]).
+    box_kill_pulls: bool,
+    /// The kill the box's kill tag named on the last run call made, as its readers heard it whatever the call's end, a
+    /// call a Ctrl+C cut or the client failed included; `None` before a run call, and after one that heard no kill tag.
+    run_kill_heard: Option<BoxKill>,
     /// The run's folders and locks, held from before its snapshots until its last save; `None` before and once let go.
     held_run: Option<RunHold>,
     /// The folder every git call about a pair's repository stops its search at, the pair's parent folder; `None` for a
@@ -1745,7 +1754,9 @@ impl Attempt<'_, '_> {
         }
         // The sync-back runs after a run call that ended with the command's own status; a refusal, an interrupt, a
         // kill, a lost connection or a failed call ended the attempt before it, so a box refusal's 75 never syncs back.
-        // The pending marker stays on every end but a passing run whose box packed nothing.
+        // A command the box's ceiling killed, said so, has its narrowed set brought back when its run call exited 124 of
+        // its own, with no sync-back, and stays killed however the call ended. The pending marker stays on every end
+        // but a passing run whose box packed nothing.
         match called.end {
             End::Status(status) => {
                 let back_commits = called.back_commits.as_deref().and_then(syncback::back_commits);
@@ -1754,21 +1765,46 @@ impl Attempt<'_, '_> {
                     None => Ok(syncback::unmatched(self, status)),
                 };
                 let end = synced.map(|synced| {
-                    let brought = outputs::accepted(called.outputs.as_ref(), self.call.key, &nonce);
-                    let ran = outputs::Ran {
-                        location: &location,
-                        nonce: &nonce,
-                        status,
-                        names_skipped: called.names_skipped,
-                        cross_not_brought_back: called.cross_not_brought_back,
-                    };
+                    let (ran, brought) = self.outputs_ran(&location, &nonce, status, &called);
                     outputs::ended(self, &sent, &ran, synced, brought.as_ref())
                 });
                 self.transferred(status, end)
             }
+            End::Killed if self.box_killed.is_some() => Ok(self.box_killed_end(&location, &nonce, &sent, &called)),
             End::Lost(output) => Ok(self.connection_lost(&location, prepared.boot.as_deref(), output)),
             end => Ok(self.refused_end(end, called.last_error.as_deref())),
         }
+    }
+
+    /// The end of a run call `called` to `location` whose command the box killed at its ceiling or backstop and said
+    /// so: the killed run's narrowed set the box packed for the outputs `nonce`, which only a ceiling kill packs,
+    /// fetched and installed ([`outputs::killed_end`], a transfer that failed every attempt said naming the
+    /// kill), then [`End::Killed`] whatever that gave, through [`Attempt::refused_end`] as any other kill. Only a run
+    /// call that exited 124 of its own pulls ([`Attempt::box_kill_heard`]); after any other end of it, and after a
+    /// Ctrl+C, nothing is fetched and nothing said.
+    fn box_killed_end(&mut self, location: &Location, nonce: &str, sent: &outputs::Sent<'_>, called: &RunEnd) -> End {
+        // A call that did not exit 124 of its own, or a Ctrl+C before the pull, brings nothing back and says nothing:
+        // the run still ends killed.
+        if !self.box_kill_pulls || self.go_on().is_err() {
+            return self.refused_end(End::Killed, called.last_error.as_deref());
+        }
+        let (ran, brought) = self.outputs_ran(location, nonce, i64::from(KILLED), called);
+        let end = outputs::killed_end(self, sent, &ran, brought.as_ref());
+        self.refused_end(end, called.last_error.as_deref())
+    }
+
+    /// The run the outputs step reads of the run call `called` to `location` for the outputs `nonce`, whose command
+    /// ended with `status`, and what the call's box said it packed ([`outputs::accepted`]).
+    fn outputs_ran<'r>(&self, location: &'r Location, nonce: &'r str, status: i64, called: &RunEnd) -> (outputs::Ran<'r>, Option<outputs::Brought>) {
+        let brought = outputs::accepted(called.outputs.as_ref(), self.call.key, nonce);
+        let ran = outputs::Ran {
+            location,
+            nonce,
+            status,
+            names_skipped: called.names_skipped,
+            cross_not_brought_back: called.cross_not_brought_back,
+        };
+        (ran, brought)
     }
 
     /// The end of a run whose command exited `status` once its transfers after it ended at `end`. A transfer that failed
@@ -1779,10 +1815,16 @@ impl Attempt<'_, '_> {
             Ok(End::TransferFailed(why)) | Err(End::TransferFailed(why)) => why,
             end => return end,
         };
-        let host = self.call.host();
-        self.say(format!("gate: TRANSFER FAILED: the command exited {status} on {host}; {why}"));
+        self.say_transfer_failed(&format!("the command exited {status}"), &why);
         self.transfer_failed = status == 0;
         Ok(End::Status(if status == 0 { super::TRANSFER_FAILED } else { status }))
+    }
+
+    /// Says the TRANSFER FAILED line of a transfer after a command that ended as `ended` says (`the command exited <n>`,
+    /// or [`outputs::KILLED_AT_ITS_CEILING`]) on the builder, which failed every attempt for `why`.
+    pub(super) fn say_transfer_failed(&mut self, ended: &str, why: &str) {
+        let host = self.call.host();
+        self.say(format!("gate: TRANSFER FAILED: {ended} on {host}; {why}"));
     }
 
     /// Whether the run needs git-lfs of the builder, its need then added to `needs` ([`toolchain::with_git_lfs`]): when
@@ -3137,7 +3179,8 @@ impl Attempt<'_, '_> {
     /// retries failed before the banner, as the command never started; a refusal when its 75 comes with the box's refusal
     /// tag for the run whose nonce is `nonce` and no start marker; a lost connection when it exited 255 otherwise. A
     /// watchdog kill says
-    /// its line, stops the command and ends the run killed; a Ctrl+C stops the command too. Each call made is fed
+    /// its line, stops the command and ends the run killed; a Ctrl+C stops the command too. A call that heard the box's
+    /// kill tag ends killed as the box's kill however it ended, with nothing stopped. Each call made is fed
     /// `input` on its standard input ([`payload::input`]). With the end, what the call that counts said of the outputs
     /// ([`RunEnd`]).
     fn run_call(&mut self, location: &Location, input: &Arc<str>, nonce: &str) -> Result<RunEnd, End> {
@@ -3181,6 +3224,10 @@ impl Attempt<'_, '_> {
         self.split.command = begun.map_or(Duration::ZERO, |begun| begun.elapsed());
         self.adjusted = adjusted;
         let end = made?;
+        // `--test-remote-interrupt-at after-run`: the console interrupt raised once the run call has returned.
+        if let Some(interrupt) = self.call.interrupt.filter(|_| self.raises_at("after-run")) {
+            interrupt.raise();
+        }
         Ok(RunEnd {
             end,
             outputs: heard,
@@ -3193,17 +3240,22 @@ impl Attempt<'_, '_> {
         })
     }
 
-    /// The run call as `make` makes it, watched by `limits`, as [`Attempt::run_call`] says. The command is stopped only
-    /// when it may have started: after a kill, after a Ctrl+C that ended a call still running, and after one raised by
-    /// the time a call ended with a status; never after a Ctrl+C in the retry pause or after a call that failed before
-    /// the banner.
+    /// The run call as `make` makes it, watched by `limits`, as [`Attempt::run_call`] says. Once the call heard the
+    /// box's kill tag, the box's kill is the run's end however the call then ended, and nothing is stopped
+    /// ([`Attempt::box_kill_heard`]). Else the command is stopped only when it may have started: after a kill, after a
+    /// Ctrl+C that ended a call still running, and after one raised by the time a call ended with a status; never after
+    /// a Ctrl+C in the retry pause or after a call that failed before the banner.
     fn run_call_made(&mut self, location: &Location, limits: Limits, mut make: impl FnMut(&mut Self) -> Result<Called, End>) -> Result<End, End> {
         let mut running = false;
-        let made = self.with_retry(SSH_FAILED, |attempt| {
+        let mut made = self.with_retry(SSH_FAILED, |attempt| {
+            attempt.run_kill_heard = None;
             let made = make(attempt);
             running = matches!(made, Err(End::Interrupted));
             made
         });
+        if let Some(killed) = self.box_kill_heard(&mut made, running) {
+            return Ok(killed);
+        }
         let (mut called, again) = match made {
             Ok(made) => made,
             Err(End::Interrupted) if running => {
@@ -3231,12 +3283,6 @@ impl Attempt<'_, '_> {
             self.stop(location);
             return Ok(End::Killed);
         }
-        // The box killed the command itself and said so: its job is already ended, so nothing is stopped.
-        if let Some(kill) = called.box_killed.filter(|_| called.status == KILLED) {
-            self.noted(&called);
-            self.box_killed = Some(kill);
-            return Ok(End::Killed);
-        }
         if again {
             return Ok(End::Refused(FallbackReason::Unreachable));
         }
@@ -3261,6 +3307,33 @@ impl Attempt<'_, '_> {
             self.say(line);
         }
         Ok(end)
+    }
+
+    /// The run's end once the run call that counts, `made`, heard the box's kill tag: the box killed the command itself
+    /// and said so, its job is already ended, and its kill is the run's end however the call then ended, a call a
+    /// Ctrl+C cut while it ran (`running`) and one the client failed included: [`End::Killed`], with nothing stopped
+    /// and no kill line of the PC's. A call that came back has its lines kept and its note said, and the killed run's
+    /// set is pulled after it only when it exited 124 of its own, with no cut and no Ctrl+C raised by then; a failed
+    /// call's reason is said as a killed call's note is. `None` when no kill tag was heard, and for a Ctrl+C that came
+    /// in the retry pause.
+    fn box_kill_heard(&mut self, made: &mut Result<(Called, bool), End>, running: bool) -> Option<End> {
+        let kill = match made {
+            Ok((called, _)) => called.box_killed,
+            Err(End::Interrupted) if running => self.run_kill_heard,
+            Err(End::Failed(_)) => self.run_kill_heard,
+            Err(_) => None,
+        }?;
+        self.box_killed = Some(kill);
+        match made {
+            Ok((called, _)) => {
+                self.box_kill_pulls = called.status == KILLED && called.cut.is_none() && self.go_on().is_ok();
+                self.lines.append(&mut called.lines);
+                self.noted(called);
+            }
+            Err(End::Failed(why)) => self.say(format!("gate: {why}")),
+            Err(_) => {}
+        }
+        Some(End::Killed)
     }
 
     /// Makes a call with `make` and, when it failed before the banner and its job did not write more than 1 MiB, says
@@ -3811,6 +3884,8 @@ impl Attempt<'_, '_> {
         let shared = Arc::new(Shared::new());
         // Only the run call carries the run's nonce.
         let run_call = starts.nonce.is_some();
+        // `--test-remote-interrupt-at kill-tag`: the console interrupt raised as the run call hears the box's kill tag.
+        held(&shared.heard).raise_at_kill = self.call.interrupt.filter(|_| run_call && self.raises_at("kill-tag"));
         let (done, readers) = mpsc::channel();
         let reading = Reading {
             echo,
@@ -3865,6 +3940,10 @@ impl Attempt<'_, '_> {
         let watched = self.watched_out(watching);
         // Kept whatever the call's end, so a warm-up that fails after the marker counts its commands as run.
         self.marker_seen |= held(&shared.heard).started;
+        // So is the run call's kill tag, so a call a Ctrl+C cut after it still ends as the box's kill.
+        if run_call {
+            self.run_kill_heard = held(&shared.heard).box_killed;
+        }
         let (ended, looks) = watched?;
         if let Some(line) = &looks.unread {
             self.logged(line);
@@ -4172,6 +4251,8 @@ impl<'c, 'a> Attempt<'c, 'a> {
             pulled_last: None,
             adjusted: None,
             box_killed: None,
+            box_kill_pulls: false,
+            run_kill_heard: None,
             held_run: None,
             ceiling: None,
             places: Vec::new(),
@@ -4321,11 +4402,11 @@ impl HangPhase {
     /// the watch reads: the run call's command and phase both since the box's start marker, `None` before it came; the
     /// outputs pull's run since `counted_from` and its phase since `pull_started`, both from one look at the clock, never
     /// since the call's own start.
-    fn times(self, progress: &Progress) -> Option<(Duration, &'static str, Duration)> {
+    fn times(self, progress: &Progress) -> Option<(Duration, String, Duration)> {
         match self {
             HangPhase::Running => {
                 let running = progress.since_started()?;
-                Some((running, "running on", running))
+                Some((running, "running on".to_owned(), running))
             }
             HangPhase::Pulling {
                 counted_from,
@@ -4918,6 +4999,9 @@ struct Heard {
     /// Its last standard error line saying what the box sent over a data channel.
     channel_sent: Option<String>,
     problem: Option<String>,
+    /// `--test-remote-interrupt-at kill-tag`: the console interrupt raised once, as the run call's first kill tag is
+    /// heard; `None` for every other call, and once raised.
+    raise_at_kill: Option<Interrupt>,
 }
 
 impl Heard {
@@ -4946,7 +5030,7 @@ impl Heard {
     }
 
     /// Marks what the box's line read as `protocol` says: the run started, its first refusal, its last kill tag, its last
-    /// load-adjusted seconds.
+    /// load-adjusted seconds. The first kill tag raises the interrupt [`Heard::raise_at_kill`] holds.
     fn marked(&mut self, protocol: Protocol) {
         match protocol {
             Protocol::Started => self.started = true,
@@ -4965,7 +5049,12 @@ impl Heard {
                     *drain = drain.with(line);
                 }
             }
-            Protocol::Killed(kill) => self.box_killed = Some(kill),
+            Protocol::Killed(kill) => {
+                self.box_killed = Some(kill);
+                if let Some(interrupt) = self.raise_at_kill.take() {
+                    interrupt.raise();
+                }
+            }
             Protocol::Adjusted(seconds) => self.adjusted = Some(seconds),
             Protocol::Channel(port) => {
                 self.channel_port.get_or_insert(port);
@@ -6397,9 +6486,9 @@ mod tests {
 
     use super::retry::PRE_BANNER_RETRIES;
     use super::{
-        Attempt, CallEnd, Called, Capped, Cut, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Loss, NonZeroU64, OUTPUTS_BUDGET, OneCall,
-        ProtocolLines, Push, Raised, Reader, Reading, RustClient, SSH_FAILED, Shared, Split, Ssh, Unfinished, Watch, Watching, after_loss, boot_time,
-        called_of, console_of, held, install_refusal, install_refused, install_tag_refusal, install_why, is_heartbeat, last_update,
+        Attempt, BoxKill, CallEnd, Called, Capped, Cut, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Loss, NonZeroU64, OUTPUTS_BUDGET,
+        OneCall, ProtocolLines, Push, Raised, Reader, Reading, RustClient, SSH_FAILED, Shared, Split, Ssh, Unfinished, Watch, Watching, after_loss,
+        boot_time, called_of, console_of, held, install_refusal, install_refused, install_tag_refusal, install_why, is_heartbeat, last_update,
         local_sdk_listing, path_outside, paused, preflight_refusal, push_size, relay, relay_raw, relayed_raw, root_refused, run_install_refused,
         sdks_of, seconds, their_version, version_refusal,
     };
@@ -6604,6 +6693,8 @@ mod tests {
             pulled_last: None,
             adjusted: None,
             box_killed: None,
+            box_kill_pulls: false,
+            run_kill_heard: None,
             held_run: None,
             ceiling: None,
             places: Vec::new(),
@@ -8306,6 +8397,188 @@ mod tests {
         assert!(stopped(&attempt), "the stop is made: {:?}", attempt.lines);
     }
 
+    /// A run call that said the start marker and the box's kill tag for `kill`, then ended with `status`.
+    fn box_killed_with(status: i32, kill: BoxKill) -> Called {
+        Called {
+            started: true,
+            output_seen: true,
+            box_killed: Some(kill),
+            ..ended_with(status, "the command's line")
+        }
+    }
+
+    /// What `attempt`'s run call came to, `ended`, once the box's kill tag was heard: whether it ended killed, the box's
+    /// kill it kept, whether the killed run's set is pulled, and whether the command was stopped.
+    fn box_kill_ended(attempt: &Attempt<'_, '_>, ended: &Result<End, End>) -> (bool, Option<BoxKill>, bool, bool) {
+        (
+            matches!(ended, Ok(End::Killed)),
+            attempt.box_killed,
+            attempt.box_kill_pulls,
+            stopped(attempt),
+        )
+    }
+
+    #[test]
+    fn a_run_call_that_exits_124_after_the_box_kill_tag_ends_killed_and_pulls_with_no_stop() {
+        let log = unwritten_log();
+        let call = RemoteCall {
+            interrupt: None,
+            ..call(&log)
+        };
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+
+        let ended = attempt.run_call_made(&location(), Limits::for_tests(), |_| Ok(box_killed_with(KILLED, BoxKill::TimedOut)));
+
+        let lines = &attempt.lines;
+        assert_eq!(
+            box_kill_ended(&attempt, &ended),
+            (true, Some(BoxKill::TimedOut), true, false),
+            "{ended:?}: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line == "the command's line"),
+            "the call's lines are kept: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_run_call_lost_after_the_box_kill_tag_ends_killed_with_no_stop_or_pull() {
+        let log = unwritten_log();
+        let call = RemoteCall {
+            interrupt: None,
+            ..call(&log)
+        };
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+
+        let ended = attempt.run_call_made(&location(), Limits::for_tests(), |_| Ok(box_killed_with(SSH_FAILED, BoxKill::TimedOut)));
+
+        let lines = &attempt.lines;
+        assert_eq!(
+            box_kill_ended(&attempt, &ended),
+            (true, Some(BoxKill::TimedOut), false, false),
+            "{ended:?}: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_ctrl_c_that_cuts_a_run_call_after_the_box_kill_tag_ends_killed_with_no_stop_or_pull() {
+        let log = unwritten_log();
+        let call = call(&log);
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+
+        let ended = attempt.run_call_made(&location(), Limits::for_tests(), |attempt| {
+            attempt.run_kill_heard = Some(BoxKill::TimedOut);
+            Err(End::Interrupted)
+        });
+
+        let lines = &attempt.lines;
+        assert_eq!(
+            box_kill_ended(&attempt, &ended),
+            (true, Some(BoxKill::TimedOut), false, false),
+            "{ended:?}: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_watchdog_cut_after_the_box_kill_tag_ends_killed_as_the_box_s_kill_with_no_kill_line_stop_or_pull() {
+        for kill in [Kill::Stalled, Kill::Backstop] {
+            let log = unwritten_log();
+            let call = RemoteCall {
+                interrupt: None,
+                ..call(&log)
+            };
+            let transport = nowhere();
+            let mut attempt = attempt(&call, &transport);
+            let limits = Limits::for_tests();
+            let kill_line = watchdog::kill_line(kill, limits.stall, limits.backstop, limits.command.as_secs(), call.host());
+
+            let ended = attempt.run_call_made(&location(), limits, |_| {
+                Ok(Called {
+                    cut: Some(Cut::Watchdog(kill)),
+                    ..box_killed_with(KILLED, BoxKill::Backstop)
+                })
+            });
+
+            let lines = &attempt.lines;
+            assert_eq!(
+                box_kill_ended(&attempt, &ended),
+                (true, Some(BoxKill::Backstop), false, false),
+                "{kill:?}: {ended:?}: {lines:?}"
+            );
+            assert!(!lines.contains(&kill_line), "no kill line of the PC's: {lines:?}");
+        }
+    }
+
+    #[test]
+    fn a_run_call_that_exits_another_status_after_the_box_kill_tag_ends_killed_with_no_stop_or_pull() {
+        for status in [0, 1, 75] {
+            let log = unwritten_log();
+            let call = RemoteCall {
+                interrupt: None,
+                ..call(&log)
+            };
+            let transport = nowhere();
+            let mut attempt = attempt(&call, &transport);
+
+            let ended = attempt.run_call_made(&location(), Limits::for_tests(), |_| Ok(box_killed_with(status, BoxKill::TimedOut)));
+
+            let lines = &attempt.lines;
+            assert_eq!(
+                box_kill_ended(&attempt, &ended),
+                (true, Some(BoxKill::TimedOut), false, false),
+                "{status}: {ended:?}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ctrl_c_raised_by_the_time_a_run_call_exited_124_after_the_box_kill_tag_ends_killed_with_no_stop_or_pull() {
+        let log = unwritten_log();
+        let call = call(&log);
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+
+        let ended = attempt.run_call_made(&location(), Limits::for_tests(), |_| Ok(box_killed_with(KILLED, BoxKill::TimedOut)));
+
+        let lines = &attempt.lines;
+        assert_eq!(
+            box_kill_ended(&attempt, &ended),
+            (true, Some(BoxKill::TimedOut), false, false),
+            "{ended:?}: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_call_after_the_box_kill_tag_still_ends_killed_with_no_stop() {
+        let log = unwritten_log();
+        let call = RemoteCall {
+            interrupt: None,
+            ..call(&log)
+        };
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+
+        let ended = attempt.run_call_made(&location(), Limits::for_tests(), |attempt| {
+            attempt.run_kill_heard = Some(BoxKill::Backstop);
+            Err(End::Failed("cannot wait for ssh.exe: access denied".to_owned()))
+        });
+
+        let lines = &attempt.lines;
+        assert_eq!(
+            box_kill_ended(&attempt, &ended),
+            (true, Some(BoxKill::Backstop), false, false),
+            "{ended:?}: {lines:?}"
+        );
+        assert_eq!(
+            *lines,
+            ["gate: cannot wait for ssh.exe: access denied"],
+            "the failure's reason, said once as a killed call's problem"
+        );
+    }
+
     #[test]
     fn the_outputs_line_survives_a_stdout_flood_after_it() {
         let mut heard = Heard::default();
@@ -9769,7 +10042,7 @@ mod tests {
         let started = Instant::now();
         attempt.command_started = Some(started);
         attempt.pulling = Some(super::Pull {
-            bringing: outputs::Bringing::Reports(outputs::Narrowed::TestReports),
+            bringing: outputs::Bringing::Reports(outputs::Narrowed::TestReports, outputs::Cause::Failed),
             total: None,
             started,
         });

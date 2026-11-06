@@ -39,7 +39,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use super::client::{Attempt, End};
 use super::git::{Git, GitError};
-use super::outputs::{self, Archive, Bringing, Narrowed, Polled};
+use super::outputs::{self, Archive, Bringing, Cause, Narrowed, Polled};
 use crate::outputs::archive::{Entry, PcFiles, UnpackError, below, check_folder, unpack};
 use crate::outputs::cache::{HashCache, file_time_now};
 use crate::outputs::glob::Globs;
@@ -98,16 +98,17 @@ pub(super) struct Fetched<'f> {
     pub(super) snapshot: SystemTime,
     /// How long the fetch alone took, from its start to the archive's last byte.
     pub(super) pulled: Duration,
-    /// For a failed run, its narrowed set, the output globs that name a `TestResults` folder joined with its failure
-    /// output globs, and what the set holds: the install is held to them in place of `globs`, never clears the pending
-    /// marker, and its lines name what the set holds.
-    pub(super) reports: Option<(&'f Globs, Narrowed)>,
+    /// For a failed or killed run, its narrowed set, the output globs that name a `TestResults` folder joined with its
+    /// failure output globs, what the set holds and how the run ended: the install is held to them in place of
+    /// `globs`, never clears the pending marker, and its lines name what the set holds and the run's end.
+    pub(super) reports: Option<(&'f Globs, Narrowed, Cause)>,
 }
 
 impl Fetched<'_> {
-    /// What the archive brings: a failed run's narrowed set when it carries one, else outputs.
+    /// What the archive brings: a failed or killed run's narrowed set when it carries one, else outputs.
     fn bringing(&self) -> Bringing {
-        self.reports.map_or(Bringing::Outputs, |(_, narrowed)| Bringing::Reports(narrowed))
+        self.reports
+            .map_or(Bringing::Outputs, |(_, narrowed, cause)| Bringing::Reports(narrowed, cause))
     }
 }
 
@@ -406,7 +407,7 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
         }
     })?;
     let all;
-    let globs = if let Some((reports, _)) = fetched.reports {
+    let globs = if let Some((reports, _, _)) = fetched.reports {
         reports
     } else {
         all = Globs::new(fetched.globs).map_err(transient)?;
@@ -1258,7 +1259,7 @@ mod tests {
     use gate_inputs::pack::Packer;
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
-    use super::outputs::Narrowed;
+    use super::outputs::{Cause, Narrowed};
     use super::{
         Bringing, Checked, Index, Installed, Kind as RefusalKind, Moved, Moves, Refused, Skip, Unmet, Unmoved, Unrewritable, cached, checked, ending,
         install_start_line, moved, own_logs, reasons, rewritten, said, stage_made, success_line, tracked, unmet_of, unpacked,
@@ -2353,7 +2354,7 @@ mod tests {
         use crate::outputs::manifest::{Chosen, HeldBy, Manifest, Wrote};
         use crate::outputs::walk::walk;
         use crate::remote::client::{Attempt, End};
-        use crate::remote::outputs::{Archive, Narrowed};
+        use crate::remote::outputs::{Archive, Cause, Narrowed};
         use crate::remote::transport::Local;
         use crate::remote::{RemoteCall, Warmth};
 
@@ -2566,7 +2567,7 @@ mod tests {
                 started: Instant::now(),
                 snapshot: SystemTime::now() - Duration::from_hours(1),
                 pulled: Duration::ZERO,
-                reports: Some((&narrowed, Narrowed::TestReports)),
+                reports: Some((&narrowed, Narrowed::TestReports, Cause::Failed)),
             };
 
             let (end, complete) = installed(&mut attempt, &fetched);
@@ -2955,8 +2956,21 @@ mod tests {
     fn the_install_s_start_line_says_what_the_pull_brings() {
         assert_eq!(install_start_line(Bringing::Outputs, 3), "gate: installing outputs: 3 file(s)");
         assert_eq!(
-            install_start_line(Bringing::Reports(Narrowed::TestReports), 2),
+            install_start_line(Bringing::Reports(Narrowed::TestReports, Cause::Failed), 2),
             "gate: installing the failed run's test reports: 2 file(s)"
+        );
+    }
+
+    /// A box-killed run's install start line names its set the killed run's.
+    #[test]
+    fn a_killed_run_s_install_start_line_names_the_killed_run_s_set() {
+        assert_eq!(
+            install_start_line(Bringing::Reports(Narrowed::TestReports, Cause::Killed), 2),
+            "gate: installing the killed run's test reports: 2 file(s)"
+        );
+        assert_eq!(
+            install_start_line(Bringing::Reports(Narrowed::Outputs, Cause::Killed), 1),
+            "gate: installing the killed run's outputs: 1 file(s)"
         );
     }
 
@@ -3088,12 +3102,25 @@ mod tests {
     fn a_failed_run_s_reports_refused_for_pc_changes_still_end_1() {
         let refused = Refused::changed(vec!["bin/a.dll changed during the run".to_owned()], RefusalKind::PcChanged);
 
-        let (end, lines) = ending(Bringing::Reports(Narrowed::TestReports), Unmet::Refused(refused));
+        let (end, lines) = ending(Bringing::Reports(Narrowed::TestReports, Cause::Failed), Unmet::Refused(refused));
 
         assert!(matches!(end, End::Status(1)), "{end:?}");
         assert_eq!(
             lines,
             ["gate: the failed run's test reports not brought back: bin/a.dll changed during the run"]
+        );
+    }
+
+    /// A box-killed run's set refused for the PC's changes is said not brought back as the killed run's.
+    #[test]
+    fn a_killed_run_s_set_refused_for_pc_changes_names_the_killed_run_s() {
+        let refused = Refused::changed(vec!["dumps/a.dmp changed during the run".to_owned()], RefusalKind::PcChanged);
+
+        let (_, lines) = ending(Bringing::Reports(Narrowed::Outputs, Cause::Killed), Unmet::Refused(refused));
+
+        assert_eq!(
+            lines,
+            ["gate: the killed run's outputs not brought back: dumps/a.dmp changed during the run"]
         );
     }
 

@@ -501,7 +501,10 @@ fn the_remote_client_seams_need_a_value_once() {
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-interrupt-at", "push", "--", "cmd"]
         ))),
-        ["gate: --test-remote-interrupt-at must be preflight, inputs, lfs, run, outputs, install, sdks, stop, manifest or apply, got 'push'"]
+        [
+            "gate: --test-remote-interrupt-at must be preflight, inputs, lfs, run, outputs, install, sdks, stop, manifest, apply, after-run or \
+             kill-tag, got 'push'"
+        ]
     );
 }
 
@@ -875,7 +878,7 @@ fn the_remote_snapshot_age_seam_takes_whole_milliseconds_above_0_with_the_transp
 #[cfg(feature = "test-seams")]
 #[test]
 fn box_seams_of_the_ceiling_refuse_a_bad_missing_or_repeated_value() {
-    let rows: [(&[&str], &[&str]); 14] = [
+    let rows: [(&[&str], &[&str]); 15] = [
         (
             &["box", "--test-box-kill-leaves", "0", "run", "--stdin"],
             &["gate: --test-box-kill-leaves must be a whole number above 0, got '0'"],
@@ -925,6 +928,13 @@ fn box_seams_of_the_ceiling_refuse_a_bad_missing_or_repeated_value() {
         (
             &["box", "--test-box-free-percent=", "run", "--stdin"],
             &["gate: --test-box-free-percent needs a value"],
+        ),
+        (
+            &["box", "--test-box-start-shift-ms", "soon", "run", "--stdin"],
+            &[
+                "gate: --test-box-start-shift-ms takes a signed whole number of milliseconds the clock can shift by (positive moves the \
+                 start earlier, negative later), got 'soon'",
+            ],
         ),
     ];
     for (words, want) in rows {

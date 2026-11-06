@@ -127,6 +127,8 @@ pub(crate) const INTERRUPTED_CALLS: &[&str] = &[
     "stop",
     "manifest",
     "apply",
+    "after-run",
+    "kill-tag",
 ];
 /// The calls `--test-remote-watch-call` may name.
 #[cfg(feature = "test-seams")]
@@ -168,6 +170,22 @@ pub(crate) fn git_limit(option: &str, value: &str) -> Result<(String, u64), Prob
             value: value.to_owned(),
         }),
     }
+}
+
+/// The signed whole number of milliseconds `--test-box-start-shift-ms` takes: one this machine's monotonic clock can
+/// move an instant taken now by, earlier for a positive shift and later for a negative one; else the problem naming the
+/// value as given.
+#[cfg(feature = "test-seams")]
+pub(crate) fn start_shift_ms(option: &str, value: &str) -> Result<i64, Problem> {
+    let bad = || Problem::BadStartShift {
+        option: option.to_owned(),
+        value: value.to_owned(),
+    };
+    let shift: i64 = value.parse().map_err(|_| bad())?;
+    let now = std::time::Instant::now();
+    let by = std::time::Duration::from_millis(shift.unsigned_abs());
+    let shifted = if shift >= 0 { now.checked_sub(by) } else { now.checked_add(by) };
+    shifted.map(|_| shift).ok_or_else(bad)
 }
 
 /// The first and last port `--test-box-channel-ports`'s `<first>-<last>` names: two whole numbers from 1 to 65535, the

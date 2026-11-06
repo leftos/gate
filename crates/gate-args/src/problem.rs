@@ -115,6 +115,13 @@ pub enum Problem {
     /// A `--test-box-git-armed-by` given without the `--test-box-git-limit` whose bound it arms.
     #[cfg(feature = "test-seams")]
     GitArmedByNeedsLimit,
+    /// A `--test-box-start-shift-ms` value that is not a signed whole number of milliseconds this machine's clock can
+    /// shift an instant taken now by.
+    #[cfg(feature = "test-seams")]
+    BadStartShift {
+        option: String,
+        value: String,
+    },
     /// A `--test-box-channel-ports` value that is not two ports from 1 to 65535 joined by `-`, the first not above the
     /// last.
     #[cfg(feature = "test-seams")]
@@ -253,6 +260,12 @@ impl fmt::Display for Problem {
             Problem::BadGitLimit { option, value } => write!(f, "gate: {option} must be <step>:<ms>, got '{value}'"),
             #[cfg(feature = "test-seams")]
             Problem::GitArmedByNeedsLimit => f.write_str("gate: --test-box-git-armed-by needs --test-box-git-limit"),
+            #[cfg(feature = "test-seams")]
+            Problem::BadStartShift { option, value } => write!(
+                f,
+                "gate: {option} takes a signed whole number of milliseconds the clock can shift by (positive moves the start \
+                 earlier, negative later), got '{value}'"
+            ),
             #[cfg(feature = "test-seams")]
             Problem::BadPortRange { option, value } => write!(
                 f,

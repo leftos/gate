@@ -693,6 +693,7 @@ impl<'a> Repo<'a> {
 /// Once the subfolder is checked, a heartbeat goes to stderr every period, 5 s unless `seams` set it, until the run
 /// ends; `seams` may also make the command's console fail, or park its launch.
 pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
+    let started = started_at(seams);
     let _stamps = stamping::Stamps::begin();
     stamping::err(console, &stamping::root_line());
     let request = match Request::read(payload) {
@@ -758,9 +759,36 @@ pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) ->
             return status;
         }
     };
-    match in_work_folder(&request, &stop, seams, console) {
+    match in_work_folder(&request, &stop, (seams, started), console) {
         Ok(status) | Err(status) => status,
     }
+}
+
+/// When the run verb started, taken as it starts: shifted by `--test-box-start-shift-ms` when `seams` give it, earlier
+/// for a positive shift and later for a negative one; a shift the clock cannot take, which the seam's parse refuses,
+/// leaves the start as taken.
+fn started_at(seams: &BoxSeams) -> Instant {
+    let now = Instant::now();
+    seams
+        .start_shift_ms
+        .and_then(|shift| {
+            let by = Duration::from_millis(shift.unsigned_abs());
+            if shift >= 0 { now.checked_sub(by) } else { now.checked_add(by) }
+        })
+        .unwrap_or(now)
+}
+
+/// Whether a command the box killed for `kill`, in a run whose verb started at `started` under the payload's ceiling
+/// of `ceiling` seconds, has its failure outputs packed: only for a ceiling kill (tagged `timed-out`), and only while at
+/// least the larger of 60 s and the ceiling remains before the box's estimate of the PC's backstop of the run call, five
+/// ceilings and 60 s from `started`, so the PC's backstop never cuts the call during the pack.
+fn pack_after_kill(kill: Kill, started: Instant, ceiling: Option<u64>) -> bool {
+    let Some(ceiling) = ceiling.map(Duration::from_secs) else {
+        return false;
+    };
+    let minute = Duration::from_secs(60);
+    let backstop = ceiling.saturating_mul(5).saturating_add(minute);
+    !kill.is_backstop() && started.elapsed().saturating_add(ceiling.max(minute)) <= backstop
 }
 
 /// What the run writes besides its console lines: the lock every line on the box's own output takes, and the
@@ -776,6 +804,9 @@ pub(super) struct Beat<'a> {
     /// The load-adjusted seconds the box's ceiling counted for the last command it watched, set as that ceiling ends;
     /// `None` before any, for a command under no ceiling, and once the sampler failed.
     adjusted: Cell<Option<f64>>,
+    /// When the run verb started ([`started_at`]), which the pack after a kill measures the PC's backstop from
+    /// ([`pack_after_kill`]).
+    started: Instant,
 }
 
 /// The run's stop signal as the box looks at it ([`look`]): set is a stop, unset none, and one that cannot be read is
@@ -946,9 +977,10 @@ impl<'a> RunOutputs<'a> {
     }
 }
 
-/// The run once the lock is held: `Ok` with the status after the back commit, or `Err` with the status of a run that
-/// ended before it, its lines said. The heartbeat starts once the subfolder is checked and stops on every way out.
-fn in_work_folder(request: &Request<'_>, stop: &Rc<NamedEvent>, seams: &BoxSeams, console: &mut Console) -> Result<u32, u32> {
+/// The run once the lock is held, its verb started at `started`: `Ok` with the status after the back commit, or `Err`
+/// with the status of a run that ended before it, its lines said. The heartbeat starts once the subfolder is checked
+/// and stops on every way out.
+fn in_work_folder(request: &Request<'_>, stop: &Rc<NamedEvent>, (seams, started): (&BoxSeams, Instant), console: &mut Console) -> Result<u32, u32> {
     // Before the run's first git call, so no lock an earlier run's ended git left fails it.
     if let Err(why) = swept(&request.laid()) {
         return Err(layout_refused_alone(request.nonce, request.repo_name(), &why, console));
@@ -997,6 +1029,7 @@ fn in_work_folder(request: &Request<'_>, stop: &Rc<NamedEvent>, seams: &BoxSeams
         seams,
         stop: StopSignal::sharing(stop, request.job, &unread_said),
         adjusted: Cell::new(None),
+        started,
     };
     // The MSYS keeper (`boxside::msys`): up once the heartbeat beats and before the checkout's first git call, held
     // until the run returns, so no MSYS start of the run can leave Git's shared section locked. A stop ends the wait
@@ -1037,7 +1070,9 @@ fn checked_out(
 }
 
 /// The run once its checkout is ready, as [`checked_out`] goes on with it, its LFS state `lfs` held throughout and
-/// giving the back commit its pins ([`RunLfs::pins`]).
+/// giving the back commit its pins ([`RunLfs::pins`]). A command the box killed makes no back commit and ends
+/// [`KILLED`]: one its ceiling killed early enough has its test reports and failure outputs packed first as a failed
+/// command's are ([`reports_brought_back`]), whatever the pack gives, and any other packs nothing ([`pack_after_kill`]).
 fn commanded(
     request: &Request<'_>,
     git: &WorkGit,
@@ -1066,9 +1101,15 @@ fn commanded(
         Ran::Exited(status) => (status, true),
         // A command that never started left the tree as it found it: it says nothing of a back commit it did not make.
         Ran::NotStarted(status) => (status, false),
-        // The PC applies nothing of a run the box killed, and a process its kill could not end may still be writing.
-        Ran::Killed => {
+        // The PC applies nothing of a run the box killed, so it makes no back commit. A ceiling kill's failure outputs
+        // are packed after its kill line and tag as a failed command's are, though a process its kill could not end
+        // may still be writing; a backstop kill, or a ceiling kill too near the PC's own backstop of the run call,
+        // packs nothing, as the pack could outlast that backstop. The run ends killed whatever the pack gives.
+        Ran::Killed(kill) => {
             back_commits_failed(request, beat, console);
+            if let Some(outputs) = outputs.as_deref().filter(|_| pack_after_kill(kill, beat.started, request.timeout)) {
+                reports_brought_back((request, git), (outputs, None), folders.work, beat, console);
+            }
             return Ok(KILLED);
         }
     };
@@ -1095,12 +1136,12 @@ fn commanded(
     }
 }
 
-/// Packs the test reports and failure outputs of a failed command of `request` run in `work`
-/// ([`outputs::Asked::failed_run`]), the failure outputs held to the box's caps ([`outputs::failure_caps`]), leaving
-/// out the paths of the back commit `commit`, read with `git`, as a passing command's outputs are packed; nothing, and
-/// no line, when no output glob names a `TestResults` folder and the run has no failure output globs. The failed
-/// command ends on its own status whatever the pack says, a client gone while the paths are read or during the pack
-/// included.
+/// Packs the test reports and failure outputs of a failed command of `request` run in `work`, or of one the box's
+/// ceiling killed ([`outputs::Asked::failed_run`]), the failure outputs held to the box's caps ([`outputs::failure_caps`]), leaving
+/// out the paths of the back commit `commit`, read with `git`, as a passing command's outputs are packed: none for a
+/// killed command, which makes no back commit; nothing, and no line, when no output glob names a `TestResults` folder
+/// and the run has no failure output globs. The command ends on its own status, or killed, whatever the pack says, a
+/// client gone while the paths are read or during the pack included.
 fn reports_brought_back(
     (request, git): (&Request<'_>, &WorkGit),
     (outputs, commit): (&RunOutputs<'_>, Option<&str>),
@@ -1253,7 +1294,7 @@ impl<L: CommandLines> ListRun<'_, '_, L> {
         let spent = command_spent(beat.adjusted.get(), began.elapsed());
         let status = match ran {
             Ran::Exited(status) | Ran::NotStarted(status) => status,
-            Ran::Killed => KILLED,
+            Ran::Killed(_) => KILLED,
         };
         let said = if status == 0 {
             self.lines.passed(at, began.elapsed())
@@ -2880,7 +2921,7 @@ fn watch_of(started: Started<'_, '_>, of: Of, console: &mut Console) -> Result<R
         WaitEnd::Killed((kill, ceiling)) => {
             let ceiling = ceiling.closed();
             beat.adjusted.set(ceiling.adjusted_seconds());
-            killed(watched, says_ceiling.then_some((kill, &ceiling)), beat.seams, console)
+            killed(watched, kill, says_ceiling.then_some(&ceiling), beat.seams, console)
         }
         WaitEnd::ClientGone => Err(watched.client_gone(console)),
         WaitEnd::Failed { status, .. } => Err(watched.wait_failed(status, console)),
@@ -2894,7 +2935,8 @@ pub(super) enum Ran {
     /// The command never started: its program was not found, no shell could run it, its variables could not be built,
     /// or the box could not create its process. `u32` is the start failure's status, as [`not_started`] gives it.
     NotStarted(u32),
-    Killed,
+    /// The box's ceiling or backstop killed the command, for the kill `Kill`: only a ceiling kill packs failure outputs.
+    Killed(Kill),
 }
 
 /// The box's ceiling found the command of `watched` past a limit for `kill`: its job is ended and the readers drain
@@ -2903,7 +2945,7 @@ pub(super) enum Ran {
 /// job was still not ended, and the run goes on as [`Ran::Killed`], a kill whatever the ending left. With no `told`,
 /// a stage preparation's kill, nothing is said here: [`ended_whole`] says what the ending left.
 /// `--test-box-kill-leaves` stands in for what that last ending leaves.
-fn killed(watched: Watched<'_>, told: Option<(Kill, &Ceiling<'_>)>, seams: &BoxSeams, console: &mut Console) -> Result<Ran, u32> {
+fn killed(watched: Watched<'_>, kill: Kill, told: Option<&Ceiling<'_>>, seams: &BoxSeams, console: &mut Console) -> Result<Ran, u32> {
     let job = watched.job;
     let ending = match watched.killed(console)? {
         Ok(ending) if ending.left == 0 && seams.kill_leaves.is_none() => Ok(ending),
@@ -2916,10 +2958,10 @@ fn killed(watched: Watched<'_>, told: Option<(Kill, &Ceiling<'_>)>, seams: &BoxS
         }),
         None => ending,
     };
-    if let Some((kill, ceiling)) = told {
+    if let Some(ceiling) = told {
         ceiling.killed(kill, &ending, console);
     }
-    Ok(Ran::Killed)
+    Ok(Ran::Killed(kill))
 }
 
 /// A command just started that [`watch`] sees to its end: its job, its main process and pipes, the processes of its

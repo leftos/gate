@@ -17,8 +17,9 @@ use gate_inputs::failure::Caps;
 use gate_inputs::manifest::{Listing, Manifest};
 use gate_wire::drain::refused_lines;
 use gate_wire::{
-    BACK_COMMIT_NONE, BACK_COMMITS_FAILED, CROSS_STEP_START, CrossBuild, LAYOUT_CHANGING, PairSibling, PathForm, Payload, Refusal, back_commits_line,
-    bare_stem, busy_line, checkout_done_line, checkout_start_line, escaped, layout_line, layout_text, names_another_layout, refused_line, trees,
+    BACK_COMMIT_NONE, BACK_COMMITS_FAILED, BoxKill, CROSS_STEP_START, CrossBuild, LAYOUT_CHANGING, PairSibling, PathForm, Payload, Refusal,
+    back_commits_line, bare_stem, busy_line, checkout_done_line, checkout_start_line, escaped, layout_line, layout_text, names_another_layout,
+    refused_line, trees,
 };
 
 use gate_watchdog::Pump;
@@ -700,6 +701,23 @@ pub struct Watches {
     pub budget: u64,
     /// The drain's clock the run is admitted by.
     pub drain: DrainSeams,
+    /// When the run verb started, taken as its watches are read ([`started_at`]). The pack after a kill measures the
+    /// PC's backstop from it ([`pack_after_kill`]).
+    pub started: Instant,
+}
+
+/// When the run verb started, taken as it starts: shifted by `--test-box-start-shift-ms` when `seams` give it, earlier
+/// for a positive shift and later for a negative one; a shift the clock cannot take, which the seam's parse refuses,
+/// leaves the start as taken.
+fn started_at(seams: &BoxSeams) -> Instant {
+    let now = Instant::now();
+    seams
+        .start_shift_ms
+        .and_then(|shift| {
+            let by = Duration::from_millis(shift.unsigned_abs());
+            if shift >= 0 { now.checked_sub(by) } else { now.checked_add(by) }
+        })
+        .unwrap_or(now)
 }
 
 /// What the drain's clock reads of the test seams: `--test-box-now`, `--test-box-drain-lease-ms`,
@@ -762,6 +780,7 @@ impl Watches {
             sampler,
             budget: outputs::budget(seams),
             drain: DrainSeams::of(seams),
+            started: started_at(seams),
         }
     }
 }
@@ -818,8 +837,11 @@ fn run_reading<S: LineSink + 'static>(
 
 /// The status of the run `ready` once its command has run, sampled from `watches`' sampler: the command's own
 /// ([`command_status`]), the back commit made only after an end of its own ([`of_its_own`]) and the outputs trimmed to
-/// `watches`' budget. A run with a chosen Godot version runs with the install of it under the login shell's
-/// `GATE_GODOT_ROOT` ([`probe::installed_godot`]), or with Godot missing when there is no root or no such install.
+/// `watches`' budget; a command the box killed at its ceiling early enough has its failure outputs packed after its
+/// kill line and tag ([`killed_brought_back`]) and still ends killed, and any other kill packs nothing
+/// ([`pack_after_kill`]). A run with a chosen
+/// Godot version runs with the install of it under the login shell's `GATE_GODOT_ROOT` ([`probe::installed_godot`]),
+/// or with Godot missing when there is no root or no such install.
 fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, watches: Watches) -> u8 {
     let request = &ready.request;
     let login_path = ready.login_path.as_deref();
@@ -855,15 +877,52 @@ fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, 
     let end = run_command(&launch, output);
     let status = command_status(end);
     if !of_its_own(end) {
-        return back_commits_failed(output, request, status);
+        let status = back_commits_failed(output, request, status);
+        // Only a ceiling kill early enough packs: a pack after the backstop, or too near the PC's own backstop of the
+        // run call, could outlast that backstop.
+        if let CommandEnd::Killed(kill) = end
+            && pack_after_kill(kill, watches.started, request.timeout)
+        {
+            killed_brought_back(ready, output, watches.budget);
+        }
+        return status;
     }
     synced_back(ready, output, status, watches.budget, &launch)
 }
 
+/// Whether a command the box killed for `kill`, in a run whose verb started at `started` under the payload's ceiling
+/// of `ceiling` seconds, has its failure outputs packed, as the Windows box's `pack_after_kill` rules: only for a
+/// ceiling kill (tagged `timed-out`), and only while at least the larger of 60 s and the ceiling remains before the
+/// box's estimate of the PC's backstop of the run call, five ceilings and 60 s from `started`, so the PC's backstop
+/// never cuts the call during the pack.
+fn pack_after_kill(kill: BoxKill, started: Instant, ceiling: Option<u64>) -> bool {
+    let Some(ceiling) = ceiling.map(Duration::from_secs) else {
+        return false;
+    };
+    let minute = Duration::from_secs(60);
+    let backstop = ceiling.saturating_mul(5).saturating_add(minute);
+    kill == BoxKill::TimedOut && started.elapsed().saturating_add(ceiling.max(minute)) <= backstop
+}
+
+/// Packs the test reports and failure outputs of the run `ready`, whose command the box killed at its ceiling, as a
+/// failed command's are ([`Asked::failed_run`] under [`Caps::BUILT_IN`], [`brought_back`]), with no back commit to
+/// leave out, the output folder trimmed to `budget` bytes; nothing, and no line, for a run that asks for no outputs or
+/// whose failed run set is empty. The run ends killed whatever the pack gives. Only a kill [`pack_after_kill`] allows
+/// comes here.
+fn killed_brought_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, budget: u64) {
+    if let (Some(asked), Some(read)) = (&ready.request.outputs, &ready.outputs)
+        && let Some(reports) = asked.failed_run(Caps::BUILT_IN)
+    {
+        // A killed command ends killed, so the pack's own status is only said.
+        let _ = brought_back(ready, (&reports, read), None, output, budget);
+    }
+}
+
 /// Whether the command that ended as `end` reached an end of its own, an exit or a signal the box did not send, which
 /// alone is followed by a back commit: one the box killed for its ceiling or backstop, whose client is gone, that never
-/// started or that the box could not see to its end makes none, as the PC applies nothing of it. A `box stop`'s
-/// `SIGTERM` reads as any other signal.
+/// started or that the box could not see to its end makes none, as the PC applies nothing of it; one the box killed at
+/// its ceiling early enough still has its failure outputs packed ([`killed_brought_back`], [`pack_after_kill`]). A
+/// `box stop`'s `SIGTERM` reads as any other signal.
 fn of_its_own(end: CommandEnd) -> bool {
     matches!(end, CommandEnd::Exited(_) | CommandEnd::Signalled(_))
 }
@@ -877,7 +936,8 @@ fn of_its_own(end: CommandEnd) -> bool {
 /// gives its status; a failed command has only its test reports and failure outputs brought back
 /// ([`Asked::failed_run`] under [`Caps::BUILT_IN`]), with no cross
 /// build, and ends on its own status whatever the pack gives, and one with no glob naming a `TestResults` folder, a
-/// failed sync-back or a cross build that did not pass packs nothing.
+/// failed sync-back or a cross build that did not pass packs nothing. A command the box killed never reaches here: its
+/// failure outputs are packed with no back commit ([`killed_brought_back`]).
 fn synced_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, status: u8, budget: u64, launch: &Launch<'_>) -> u8 {
     let request = &ready.request;
     let commits = match back::back_commit(request, &ready.lock, ready.login_path.as_deref(), output) {
@@ -2189,6 +2249,7 @@ mod tests {
             sampler: Sampler::FreePercent(100),
             budget: OUTPUTS_BUDGET,
             drain: DrainSeams::default(),
+            started: Instant::now(),
         }
     }
 
