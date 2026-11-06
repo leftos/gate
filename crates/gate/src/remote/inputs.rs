@@ -4,9 +4,9 @@
 //! case, as output globs are, with the inputs' own exclusions: any `.git*` path, a `.lfsconfig`, a `.env`, `*.env`,
 //! `.env.<name>` or `.envrc` file, the gate's own archives and stages under `.tmp` (named for the work folder's key) and
 //! the run's own log and `.err` file are never sent. A match git does not report ignored is in the snapshot, and one
-//! inside a folder holding a `.git` of its own is another repository's; each is skipped with a line. A single repo's
-//! run also carries the files of each initialized submodule its `.gitmodules` lists, as git lists them there, at their
-//! paths below the worktree root.
+//! inside a folder holding a `.git` of its own is another repository's; each is skipped with a line. A run also carries
+//! the files of each initialized submodule its `.gitmodules` lists, as git lists them there, at their paths below the
+//! worktree root; a sibling pair's run carries each tree's, at their paths below that tree.
 
 use std::cell::{Cell, OnceCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -248,10 +248,7 @@ fn with_submodules(
     files.extend(carried.found.iter().cloned());
     files.sort_by(|first, second| first.path.cmp(&second.path));
     if files.len() > cap {
-        return Err(Unbuilt::Failed(format!(
-            "{} files with the submodules' files, more than one put carries ({cap})",
-            files.len()
-        )));
+        return Err(Unbuilt::Failed(past_members_with_submodules(files.len(), cap)));
     }
     let line = match hashed(asked, &files, go_on) {
         Ok(manifest) => Some((manifest.line(), manifest)),
@@ -263,6 +260,11 @@ fn with_submodules(
     };
     said_carried(&mut picked.said, carried, &picked.nested);
     Ok(Some((manifest, line, files)))
+}
+
+/// Why a set of `count` files with the submodules' files, past the member cap `cap`, is not sent.
+fn past_members_with_submodules(count: usize, cap: usize) -> String {
+    format!("{count} files with the submodules' files, more than one put carries ({cap})")
 }
 
 /// Why the set `files` with the `carried` submodule files, whose manifest passes `asked`'s cap, is not sent: the
@@ -725,46 +727,47 @@ impl PairTree<'_> {
     }
 }
 
-/// The inputs manifest of a sibling pair's `trees`: each tree with globs chosen on its own ([`picked`]), from its own
-/// root, with its own exclusions, nested-repo skip and `git check-ignore`, the pair refused as soon as the trees chosen
-/// so far pass the member cap together and before any file is hashed; then each tree hashed within its own read
-/// boundary and hash cache, each path prefixed with its tree's folder name, into one manifest naming the pair's layout,
+/// The inputs manifest of a sibling pair's `trees`: each tree's globbed files chosen on its own ([`picked`]), from its
+/// own root, with its own exclusions, nested-repo skip and `git check-ignore`, beside the files of each initialized
+/// submodule of that tree ([`submodules`]); a tree with no globs whose submodules carry no file is not chosen, its lines
+/// still said. The pair is refused as soon as the trees chosen so far pass the member cap together and before any file
+/// is hashed; then each tree is hashed within its own read boundary and hash cache, with its submodules' files
+/// ([`with_submodules`]), each path prefixed with its tree's folder name, into one manifest naming the pair's layout,
 /// held to the caps as a whole, its lines naming the tree's repo. A tree past a cap on its own is refused naming its
 /// repo; only the trees together past one add [`PAIR_CAPS`]. A tree's paths a command named (its `[carried]` entries)
 /// are chosen as any single tree's are, and the pair's marking stays [`Marking::Leave`]: the pair inputs marker, not
 /// the carried one, sweeps them ([`pair_marked`]). [`Unbuilt::Interrupted`] once `go_on` says no; else why it is not
 /// sent.
 pub(super) fn built_pair(trees: &[PairTree<'_>], asked: &PairAsked<'_>, go_on: impl Fn() -> bool) -> Result<Built, Unbuilt> {
-    let mut chosen = Vec::new();
+    let cap = asked.caps.members;
+    let mut looked = Vec::new();
     let mut members = 0_usize;
-    for tree in trees.iter().filter(|tree| !tree.globs.is_empty()) {
-        let picked = picked(&tree.asked(asked), &Finder::new(tree.root)).map_err(|unbuilt| match unbuilt {
-            Unbuilt::Failed(why) => tree.failed(&why),
-            Unbuilt::Interrupted => Unbuilt::Interrupted,
-        })?;
-        if picked.kept.len() > asked.caps.members {
-            return Err(tree.failed(&past_members(picked.kept.len(), asked.caps.members)));
+    let mut carries = false;
+    for tree in trees {
+        let (chosen, picked, carried) = pair_tree_looked(tree, asked, &go_on)?;
+        if chosen {
+            members = members.saturating_add(picked.kept.len()).saturating_add(carried.found.len());
+            carries |= !carried.found.is_empty();
+            if members > cap {
+                return Err(pair_past_members(members, cap, carries));
+            }
         }
-        members = members.saturating_add(picked.kept.len());
-        if members > asked.caps.members {
-            return Err(Unbuilt::Failed(format!("{}{PAIR_CAPS}", past_members(members, asked.caps.members))));
-        }
-        chosen.push((tree, picked));
+        looked.push((tree, chosen, picked, carried));
     }
     let mut manifest = Manifest::default();
     let mut found = Vec::new();
     let mut said = Vec::new();
-    for (tree, picked) in chosen {
-        // A tree's own manifest past the cap is that tree's: only the combined check below names the pair.
-        let held = hashed(&tree.asked(asked), &picked.kept, &go_on).map_err(|unmade| match unmade {
-            Unmade::Capped(why) | Unmade::Unbuilt(Unbuilt::Failed(why)) => tree.failed(&why),
-            Unmade::Unbuilt(Unbuilt::Interrupted) => Unbuilt::Interrupted,
-        })?;
+    for (tree, chosen, mut picked, carried) in looked {
+        if !chosen {
+            said.extend(carried.said.iter().map(|line| repo_line(tree.repo, line)));
+            continue;
+        }
+        let (held, files) = tree_merged(tree, asked, &mut picked, &carried, &go_on)?;
         said.extend(picked.said.iter().map(|line| repo_line(tree.repo, line)));
         for (path, held) in held.files() {
             manifest.insert(format!("{}/{path}", tree.prefix), held.clone());
         }
-        found.extend(picked.kept.into_iter().map(|file| Found {
+        found.extend(files.into_iter().map(|file| Found {
             path: format!("{}/{}", tree.prefix, file.path),
             ..file
         }));
@@ -784,6 +787,63 @@ pub(super) fn built_pair(trees: &[PairTree<'_>], asked: &PairAsked<'_>, go_on: i
         marking: Marking::Leave,
         trees: pair_trees(trees),
     })
+}
+
+/// One tree of a pair as [`built_pair`] looks at it before any file is hashed: whether it is chosen, its globbed files
+/// ([`picked`], none without globs) and its submodules' files ([`submodules`]), git found once for both. A tree with no
+/// globs whose submodules carry no file is not chosen. Refused naming its repo when its globbed files alone, or with its
+/// submodules' files, pass the member cap. [`Unbuilt::Interrupted`] once `go_on` says no; else why it cannot be built.
+fn pair_tree_looked(tree: &PairTree<'_>, asked: &PairAsked<'_>, go_on: &impl Fn() -> bool) -> Result<(bool, Picked, Carried), Unbuilt> {
+    let cap = asked.caps.members;
+    let tree_asked = tree.asked(asked);
+    let finder = Finder::new(tree.root);
+    let failed = |unbuilt: Unbuilt| unbuilt.failed_as(|why| tree.failed(&why));
+    let picked = if tree.globs.is_empty() {
+        Picked::none()
+    } else {
+        picked(&tree_asked, &finder).map_err(failed)?
+    };
+    if picked.kept.len() > cap {
+        return Err(tree.failed(&past_members(picked.kept.len(), cap)));
+    }
+    let carried = submodules(&tree_asked, &finder, go_on).map_err(failed)?;
+    let chosen = !tree.globs.is_empty() || !carried.sent.is_empty();
+    let count = picked.kept.len().saturating_add(carried.found.len());
+    if chosen && count > cap {
+        return Err(tree.failed(&past_members_with_submodules(count, cap)));
+    }
+    Ok((chosen, picked, carried))
+}
+
+/// Why a pair whose chosen trees hold `members` files together, past the member cap `cap`, is not sent, naming the
+/// submodules' files when `carries` says any tree carried some, and [`PAIR_CAPS`].
+fn pair_past_members(members: usize, cap: usize, carries: bool) -> Unbuilt {
+    let why = if carries {
+        past_members_with_submodules(members, cap)
+    } else {
+        past_members(members, cap)
+    };
+    Unbuilt::Failed(format!("{why}{PAIR_CAPS}"))
+}
+
+/// The manifest of the chosen pair tree `tree` and its files, paths below the tree: its globbed files `picked` chose
+/// with its `carried` submodules' files ([`with_submodules`]), else the globbed files alone ([`hashed`]); the
+/// submodules' lines said into `picked`'s. A tree's own manifest past the cap is that tree's, refused naming its repo:
+/// only [`built_pair`]'s combined check names the pair. [`Unbuilt::Interrupted`] once `go_on` says no.
+fn tree_merged(
+    tree: &PairTree<'_>,
+    asked: &PairAsked<'_>,
+    picked: &mut Picked,
+    carried: &Carried,
+    go_on: &impl Fn() -> bool,
+) -> Result<(Manifest, Vec<Found>), Unbuilt> {
+    let tree_asked = tree.asked(asked);
+    let failed = |unbuilt: Unbuilt| unbuilt.failed_as(|why| tree.failed(&why));
+    if let Some((manifest, _, files)) = with_submodules(&tree_asked, picked, carried, go_on).map_err(failed)? {
+        return Ok((manifest, files));
+    }
+    let held = hashed(&tree_asked, &picked.kept, go_on).map_err(|unmade| failed(unmade.unbuilt()))?;
+    Ok((held, std::mem::take(&mut picked.kept)))
 }
 
 /// The trees of a pair's built manifest, for its pack and its hash caches.
@@ -982,14 +1042,16 @@ pub(super) fn run_refused(attempt: &mut Attempt<'_, '_>) -> End {
 
 /// The inputs manifest of `attempt`'s run, its lines logged: its globs' files and its initialized submodules' files
 /// ([`single`]). A run with no input globs and no submodule file carried sends the empty manifest when an earlier run's
-/// carried copies are to be removed ([`emptied`]), else none. A sibling pair's run sends each repo's
-/// inputs in its own tree ([`pair_sent`]), on a Windows builder only ([`pair_inputs`]). A manifest that cannot be built
-/// or is past a cap refuses the route `inputs` before anything is sent.
+/// carried copies are to be removed ([`emptied`]), else none. A sibling pair's run sends each repo's inputs and its
+/// initialized submodules' files in its own tree ([`pair_sent`]), on a Windows builder only ([`pair_inputs`]): a pair
+/// any of whose trees has globs or a `.gitmodules` ([`pair_declared`]) refuses another builder. A manifest that cannot
+/// be built or is past a cap refuses the route `inputs` before anything is sent.
 pub(super) fn sent(attempt: &mut Attempt<'_, '_>) -> Result<Option<Built>, End> {
     let call = attempt.call;
     if !call.siblings.is_empty() {
-        let declared = !call.inputs.is_empty() || call.siblings.iter().any(|sibling| !sibling.inputs().is_empty());
-        return match pair_inputs(call.builder.os, declared) {
+        let trees = std::iter::once((Path::new(call.root), call.inputs))
+            .chain(call.siblings.iter().map(|sibling| (Path::new(sibling.root()), sibling.inputs())));
+        return match pair_inputs(call.builder.os, pair_declared(trees)) {
             PairInputs::Sent => pair_sent(attempt),
             PairInputs::None => Ok(None),
             PairInputs::Refused(why) => Err(refused(attempt, why)),
@@ -1063,6 +1125,15 @@ enum PairInputs {
     Refused(&'static str),
 }
 
+/// Whether a sibling pair's `trees`, each its root and its repo's input globs, may send inputs: any tree has globs or
+/// holds a regular `.gitmodules` ([`gitmodules_at`]), one that cannot be read counting as held, so a builder that does
+/// not take a pair's inputs refuses rather than run without a submodule's files.
+fn pair_declared<'a>(trees: impl IntoIterator<Item = (&'a Path, &'a [String])>) -> bool {
+    trees
+        .into_iter()
+        .any(|(root, globs)| !globs.is_empty() || !matches!(gitmodules_at(root), Ok(false)))
+}
+
 /// What a sibling pair's run on a builder of `os` does with its inputs, `declared` when any of its trees declares
 /// some: a Windows builder takes them ([`PairInputs::Sent`]); any other, whose box refuses a pair's inputs request, makes
 /// no inputs call when none is declared, and refuses ([`MACOS_PAIR`]) when one is, decided before any tree is hashed.
@@ -1078,12 +1149,14 @@ fn pair_inputs(os: BuilderOs, declared: bool) -> PairInputs {
 
 /// The inputs manifest of a sibling pair's run ([`built_pair`]): the main repo's tree, its paths prefixed with the leaf
 /// and cached in the work folder's own inputs hash cache, then each sibling's, prefixed with its folder name, its globs
-/// its own repo's, its gate files named for its own work folder key and its hashes in a cache of its own. Its lines are
-/// logged; one that cannot be built refuses the route `inputs`.
+/// its own repo's, its gate files named for its own work folder key and its hashes in a cache of its own; each tree
+/// with its initialized submodules' files. Its lines are logged; one that cannot be built refuses the route `inputs`.
 ///
-/// With no globs in any tree it is none, unless the pair inputs marker ([`v1::pair_inputs_path`]) shows an earlier pair
-/// run sent inputs: then the pair's empty manifest is sent, so the box sweeps the copies it holds, and once it landed
-/// the marker and every inputs hash cache of the work folder are removed ([`Marking::Swept`]).
+/// With no globs in any tree and no submodule file carried in any, its lines logged, it is none, unless the pair
+/// inputs marker ([`v1::pair_inputs_path`]) shows an earlier pair run sent inputs: then the pair's empty manifest is
+/// sent, so the box sweeps the copies it holds, and once it landed the marker and every inputs hash cache of the work
+/// folder are removed ([`Marking::Swept`]) ([`pair_emptied`]). A tree's `.gitmodules` that cannot be read counts as
+/// one that may carry files, so the build says why.
 fn pair_sent(attempt: &mut Attempt<'_, '_>) -> Result<Option<Built>, End> {
     let call = attempt.call;
     let id = call.builder.id.as_deref();
@@ -1104,22 +1177,35 @@ fn pair_sent(attempt: &mut Attempt<'_, '_>) -> Result<Option<Built>, End> {
         cache: v1::sibling_inputs_hashes_path(call.state_dir, id, call.key, sibling.name()),
     }));
     let layout = layout_text(Some(call.leaf), call.siblings.iter().map(super::carried::Sibling::name).collect());
-    if trees.iter().all(|tree| tree.globs.is_empty()) {
-        if !v1::pair_inputs_path(call.state_dir, id, call.key).exists() {
-            return Ok(None);
-        }
-        let swept = empty_built(Manifest::default().with_layout(layout), Marking::Swept, pair_trees(&trees));
-        return logged_built(attempt, swept);
-    }
+    let globless = trees.iter().all(|tree| tree.globs.is_empty());
     let asked = PairAsked {
-        layout,
+        layout: layout.clone(),
         log: call.log,
         caps: Caps::FULL,
         bounds: attempt.git,
         interrupt: call.interrupt,
     };
     let built = built_pair(&trees, &asked, || attempt.go_on().is_ok());
-    logged_built(attempt, built)
+    match built {
+        Ok(built) if globless && built.found.is_empty() => {
+            for line in &built.said {
+                attempt.logged(line);
+            }
+            pair_emptied(attempt, layout, &trees)
+        }
+        built => logged_built(attempt, built),
+    }
+}
+
+/// What a sibling pair's run with no inputs to send, its layout `layout`, sends for its `trees`: none, unless the pair
+/// inputs marker shows an earlier pair run sent inputs; then the pair's empty manifest, which sweeps them.
+fn pair_emptied(attempt: &mut Attempt<'_, '_>, layout: String, trees: &[PairTree<'_>]) -> Result<Option<Built>, End> {
+    let call = attempt.call;
+    if !v1::pair_inputs_path(call.state_dir, call.builder.id.as_deref(), call.key).exists() {
+        return Ok(None);
+    }
+    let swept = empty_built(Manifest::default().with_layout(layout), Marking::Swept, pair_trees(trees));
+    logged_built(attempt, swept)
 }
 
 /// The empty inputs manifest of a run with no inputs whose work folder holds copies a command's carried paths put, its
@@ -1873,12 +1959,12 @@ mod tests {
     use std::process::Command;
     use std::time::{Duration, SystemTime};
 
-    use gate_router::{BuilderOs, CARRIED_INPUT};
+    use gate_router::{BuilderOs, CARRIED_INPUT, PAIR_CAPS};
     use serde_json::Value;
 
     use super::{
         Asked, Built, Caps, End, Marking, PAST_THE_CAP, Pack, PairAsked, PairInputs, PairTree, Single, Unsent, built_pair, carried_form,
-        gitmodules_at, installed_all, made_in_tmp, needed, packed, pair_inputs, relative, single,
+        gitmodules_at, installed_all, made_in_tmp, needed, packed, pair_declared, pair_inputs, relative, single,
     };
     use crate::outputs::hash::sha256_of;
     use crate::outputs::walk::Found;
@@ -2060,6 +2146,26 @@ mod tests {
     }
 
     #[test]
+    fn a_pair_past_the_member_cap_with_submodule_files_says_so() {
+        let (app, lib) = (worktree("pair-sub-cap-app", "secrets/\n"), worktree("pair-sub-cap-lib", "secrets/\n"));
+        put(&app, "secrets/a", "a");
+        with_submodule(&lib);
+        put(&lib, "tools/shared/untracked.txt", "untracked");
+
+        let refused = failure(build_pair(
+            &[(&app, &["secrets/**"]), (&lib, &[])],
+            Caps { members: 2, ..Caps::FULL },
+            &Cell::new(0),
+        ));
+
+        assert!(
+            refused.starts_with("3 files with the submodules' files, more than one put carries (2)"),
+            "{refused}"
+        );
+        assert!(refused.ends_with(PAIR_CAPS), "{refused}");
+    }
+
+    #[test]
     fn a_tree_alone_past_a_cap_names_its_repo_and_not_the_pair() {
         let (app, lib) = (worktree("pair-alone-app", "secrets/\n"), worktree("pair-alone-lib", "secrets/\n"));
         put(&app, "secrets/a", "a");
@@ -2091,6 +2197,16 @@ mod tests {
             PairInputs::Refused("the macOS builder does not take a sibling pair's inputs yet")
         );
         assert_eq!(pair_inputs(BuilderOs::Windows, true), PairInputs::Sent, "a Windows builder takes them");
+    }
+
+    #[test]
+    fn a_pair_tree_s_gitmodules_declares_inputs_as_its_globs_do() {
+        let root = scratch("pair-declared");
+        let globs = ["secrets/**".to_owned()];
+        assert!(!pair_declared([(&*root, &[][..])]), "no globs and no .gitmodules declare nothing");
+        assert!(pair_declared([(&*root, &globs[..])]), "globs declare inputs");
+        put(&root, ".gitmodules", &gitmodules(&["tools/shared"]));
+        assert!(pair_declared([(&*root, &[][..])]), "a .gitmodules may carry a submodule's files");
     }
 
     #[test]

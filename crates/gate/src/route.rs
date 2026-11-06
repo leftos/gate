@@ -678,14 +678,29 @@ pub(crate) fn not_routed(route: &Route, sent: Option<&Sent>) -> Option<String> {
 pub(crate) const NOTHING_EXCLUDED: &str = r"[^\s\S]";
 
 /// Which of `paths`, relative to `root`, one `git check-ignore -z --stdin` in the root, under `bounds`, reports
-/// ignored; a tracked file is never reported.
+/// ignored; a tracked file is never reported. A path, `/`-separated below the root, that lies inside a folder below
+/// the root holding a `.git` of its own, a submodule's or a nested repository's, is not asked itself: git is asked the
+/// outermost such folder ([`nested_folder`]) in its place, each folder once, and the path is reported ignored exactly
+/// when its folder is. git refuses to judge a path in a submodule, while a submodule's folder is tracked and a nested
+/// clone's folder below an ignored one is ignored.
 ///
 /// # Errors
 ///
 /// Why git cannot be started, failed, with its status and last error lines ([`git::git_failure`]), or wrote what
 /// cannot be read.
 pub(crate) fn ignored_paths(root: &Path, paths: &[String], bounds: git::GitBounds) -> Result<Vec<String>, String> {
-    let input: Vec<u8> = paths.iter().flat_map(|path| path.bytes().chain([0])).collect();
+    let mut known = HashMap::new();
+    // Each path with what git is asked of it: the path itself, or the outermost nested folder it lies in.
+    let asked: Vec<(&String, String)> = paths
+        .iter()
+        .map(|path| (path, nested_folder(root, path, &mut known).unwrap_or_else(|| path.clone())))
+        .collect();
+    let mut sent = HashSet::new();
+    let input: Vec<u8> = asked
+        .iter()
+        .filter(|(_, ask)| sent.insert(ask.as_str()))
+        .flat_map(|(_, ask)| ask.bytes().chain([0]))
+        .collect();
     let args = ["check-ignore", "-z", "--stdin"];
     let call = git::Call {
         stdin: Some(&input),
@@ -701,7 +716,12 @@ pub(crate) fn ignored_paths(root: &Path, paths: &[String], bounds: git::GitBound
         .read_to_end(&mut listing)
         .map_err(|error| format!("cannot read git check-ignore's output: {error}"))?;
     let listing = String::from_utf8(listing).map_err(|_| "git check-ignore's output is not valid UTF-8".to_owned())?;
-    Ok(listing.split('\0').filter(|file| !file.is_empty()).map(str::to_owned).collect())
+    let ignored: HashSet<&str> = listing.split('\0').filter(|file| !file.is_empty()).collect();
+    Ok(asked
+        .into_iter()
+        .filter(|(_, ask)| ignored.contains(ask.as_str()))
+        .map(|(path, _)| path.clone())
+        .collect())
 }
 
 /// The folders a sweep ([`swept_folder`]) never enters, at any depth below the swept folder, in any ASCII letter case.

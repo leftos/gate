@@ -2938,7 +2938,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   Candidates come from whole words, switch values after `=` or a colon, MSBuild lists split on `;` and `,`, and `@file`. Never read: script text, words after a bare `--`, and the values of the dotnet output options (`-o`, `--output`, `--results-directory`, `--diag`, `-d`, `--artifacts-path`, `-bl`, `--binaryLogger`, `-fl`, `-flp`, `--fileLoggerParameters`).
 
-  One `git check-ignore -z --stdin` call judges every candidate. When it fails, each candidate is asked alone; one git refuses (in a submodule, say) gets the log note `gate: cannot tell which words are gitignored: <why>`, and the run routes with the light-run hint withheld.
+  One `git check-ignore -z --stdin` call judges every candidate; a word inside a folder holding a `.git` of its own is asked as the outermost such folder (it is ignored exactly when its folder is), since git refuses a path inside a submodule. When it fails, each candidate is asked alone; one git refuses (in a submodule, say) gets the log note `gate: cannot tell which words are gitignored: <why>`, and the run routes with the light-run hint withheld.
 
   A command the repo keeps on this PC is declared in its `.gate/local.toml`, `patterns = [...]` of at most 32 `-like` patterns matched against the rewritten words joined by single spaces, like the `repos` and `desktop` patterns. The check runs right after the `repos` patterns match and before the siblings and desktop checks, on the file read as `desktop.toml` is (guarded, at most 64 KiB, else from the declarations folder), and needs no consent in `remote.json`, since it only narrows routing.
 
@@ -3393,13 +3393,13 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The diff call (`gate box inputs`, `Step` `diff`) is fed the request and the manifest line and answers the paths whose copy is missing or differs. The put call (`Step` `put`) is made only when the diff named a file, fed the request, the manifest line and then an archive of exactly those files, in the outputs archive's format. The put says `gate: sending inputs to <builder>: <n> file(s)` before it packs. A diff that names none says `gate: inputs: <n> file(s) unchanged` in the log.
 
-    A sibling pair on a Windows builder sends the inputs of both its repos in one step: each repo's own `inputs` list, looked up by its checkout's repo name, applies to its own tree and is built there with that repo's exclusions, nested-repo skip, `git check-ignore` and read boundary.
+    A sibling pair on a Windows builder (a macOS builder refuses a pair any of whose trees holds a regular-file `.gitmodules`, or one that cannot be read, as declaring inputs, saying `the macOS builder does not take a sibling pair's inputs yet`, and the run stays here; the router's steer does not look at submodules) sends the inputs of both its repos in one step: each repo's own `inputs` list, looked up by its checkout's repo name, applies to its own tree and is built there with that repo's exclusions, nested-repo skip, `git check-ignore` and read boundary.
 
     One manifest holds every path prefixed with its tree's folder name (`{leaf}/…`, `{sibling}/…`) and carries a top-level `layout` key, the pair's layout text, on pair manifest lines only (a single repo's line is unchanged); one diff, one put, one digest and one `{Work}.inputs` record serve the pair. A sibling that alone declares a list sends.
 
     A pair also carries command-named gitignored files of either tree as `[carried]` entries under that tree's prefix; its carried copies are swept by the pair inputs marker below, and a pair never writes `.inputs-carried`.
 
-    The caps below count the pair's trees together, and a refusal of the combined count ends ` (the pair's trees together)`, e.g. `4 files match the input globs, more than one put carries (3) (the pair's trees together)`; a single tree over a cap names its repo with no suffix (`<repo>: <n> files match the input globs, more than one put carries (<cap>)`, `<repo>: the inputs manifest is larger than the box takes (64 MiB)`); a pair's log and failure lines start `<repo>: `.
+    The caps below count the pair's trees together, and a refusal of the combined count ends ` (the pair's trees together)`, e.g. `4 files match the input globs, more than one put carries (3) (the pair's trees together)`; a single tree over a cap names its repo with no suffix (`<repo>: <n> files match the input globs, more than one put carries (<cap>)`, `<repo>: the inputs manifest is larger than the box takes (64 MiB)`); a pair's log and failure lines start `<repo>: `. When submodule files are counted, the combined refusal reads `<n> files with the submodules' files, more than one put carries (<cap>) (the pair's trees together)` in place of the `match the input globs` form.
 
     A pair whose lists were emptied sends one empty manifest, so the box removes the old copies of every tree (`gate: inputs: removed the old copies of every tree`), after which the pair inputs marker, the key's own hash cache and every `<key>.*.inputs-hashes` (siblings no longer in the pair included) are removed.
 
@@ -3409,7 +3409,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     A glob that matches nothing, a match git does not report ignored (it is in the snapshot) and a file inside a folder holding a `.git` of its own (another repository, which git cannot be asked about) are each said in the log and skipped. The last is not said for a carried submodule's folder (matched ignoring ASCII case) when every globbed file dropped under it is carried (below).
 
-    A single-root run also carries the files of each initialized git submodule as inputs members at `<path>/<file>`, through the same manifest, diff and put, with no `inputs` glob needed; a sibling pair's run does not. Nothing is looked for unless the worktree root holds a regular-file `.gitmodules`, else no git process starts.
+    A single-root run also carries the files of each initialized git submodule as inputs members at `<path>/<file>`, through the same manifest, diff and put, with no `inputs` glob needed. A sibling pair's run does the same in each of its trees, the files under that tree's prefix (`{leaf}/<path>/<file>`, `{sibling}/<path>/<file>`), a tree with no glob included; its log line is `gate: inputs: <repo>: submodule <path>: <n> file(s) sent as inputs`. Nothing is looked for unless the worktree root holds a regular-file `.gitmodules`, else no git process starts.
 
     The paths come from `git config -z -f .gitmodules --get-regexp`.
 
@@ -3423,11 +3423,11 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The step is refused `inputs` (the run stays here) when the submodule files cannot be read or counted.
 
-    The reasons, after `gate: remote inputs not sent: `, are `.gitmodules cannot be read: <why>`, `the index's submodules cannot be read: <why>`, `git cannot be found: <why>`, `submodule <path> cannot be listed: <why>` (an unreadable submodule folder, `.git` entry, folder on a file's way or file), `<n> files with the submodules' files, more than one put carries (<cap>)` and `the submodules' files would make the inputs manifest larger than the box takes (64 MiB)`.
+    The reasons, after `gate: remote inputs not sent: `, are `.gitmodules cannot be read: <why>`, `the index's submodules cannot be read: <why>`, `git cannot be found: <why>`, `submodule <path> cannot be listed: <why>` (an unreadable submodule folder, `.git` entry, folder on a file's way or file), `<n> files with the submodules' files, more than one put carries (<cap>)` (a pair's tree: `<repo>: <n> files with the submodules' files, more than one put carries (<cap>)`) and `the submodules' files would make the inputs manifest larger than the box takes (64 MiB)`.
 
     A globbed set that alone passes a cap keeps its own reason. A refused run touches no hash cache.
 
-    On the builder a gitlink folder holds no `.git`, so git sees none of the files under it: `git status` and `git add -A` ignore them and `git clean -fdq` and `checkout --force` leave them. The back commit therefore never holds a change a routed run makes inside a submodule, and an outputs archive member under a gitlink stays tracked and skipped.
+    On the builder a gitlink folder holds no `.git`, so git sees none of the files under it: `git status` and `git add -A` ignore them and `git clean -fdq` and `checkout --force` leave them. The back commit therefore never holds a change a routed run makes inside a submodule, and an outputs archive member under a gitlink stays tracked and skipped. In a pair this holds for each repo's own gitlink folders.
 
     Never sent, whatever the globs: any `.git` path, `.lfsconfig`, `.env`, `*.env`, `.env.<name>` and `.envrc` at any depth, matched without regard to case, the gate's own archives and stages under `.tmp` (named for the work folder's key) and the run's own log and `.err` file, found by canonical path. `.tmp` is otherwise reachable.
 
@@ -3441,7 +3441,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The diff is watched as a fetch is, by the stall window on its output and its own transfer ceiling (1800 s) counted from its own start. The put is watched while the archive is being fed by the later of the last byte fed and the last byte of output, and once it is fully fed by the transfer ceiling alone, since the builder installs without a word. Either call is made once more when it failed before the banner.
 
-    Carrying submodule files writes the carried marker too, and a later run with none sends the empty manifest that removes the copies.
+    Carrying submodule files in a single-root run writes the carried marker too, and a later run with none sends the empty manifest that removes the copies. A pair keeps the pair inputs marker instead, which sweeps its carried submodule files, and writes no carried marker.
 
     A carried path the run's inputs exclusions match (the list above, the run's own log and `.err` among them) is dropped from the manifest, neither sent nor said missing. The router leaves the run's own log and `.err` out of the files it sweeps from a carried folder (they reach the sweep only for a pinned `--builder` or `--alone` run, since an ordinary run removes its log before routing), and makes no `git check-ignore` call when no candidate swept a file.
 

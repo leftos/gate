@@ -2188,10 +2188,17 @@ pub(crate) fn with_submodule(case: &Case) {
     git(case, &["add", "sub"]);
 }
 
+/// Makes the case's folder `sub` a gitlink in the index whose folder holds no `.git`, which `git check-ignore` still
+/// refuses to judge a path in: the submodule [`with_submodule`] makes, its `.git` removed, `A.csproj` left.
+fn with_gitlink_only(case: &Case) {
+    with_submodule(case);
+    fs::remove_dir_all(case.folder().join("sub").join(".git")).expect("the submodule's .git can be removed");
+}
+
 #[test]
 fn a_command_whose_gitignored_check_fails_routes_and_says_why_in_the_log() {
     let case = routed_case("routing-gitignored-check-fails");
-    with_submodule(&case);
+    with_gitlink_only(&case);
 
     let (outcome, called) = run_routed_naming(&case, "sub/A.csproj");
 
@@ -2207,7 +2214,7 @@ fn a_command_whose_gitignored_check_fails_routes_and_says_why_in_the_log() {
 #[test]
 fn a_path_git_refuses_hides_no_gitignored_project_beside_it() {
     let case = routed_case("routing-gitignored-beside-submodule");
-    with_submodule(&case);
+    with_gitlink_only(&case);
     ignore_and_write(&case, ".tmp/\n", ".tmp/probe/Probe.csproj");
     let call = case.folder().join("call.json");
     let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
@@ -2224,6 +2231,19 @@ fn a_path_git_refuses_hides_no_gitignored_project_beside_it() {
         1,
         "one note, for sub/A.csproj alone: {log}"
     );
+}
+
+#[test]
+fn a_word_in_an_initialized_submodule_routes_with_no_gitignored_note() {
+    let case = routed_case("routing-gitignored-in-submodule");
+    with_submodule(&case);
+
+    let (outcome, called) = run_routed_naming(&case, "sub/A.csproj");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(called, "a word in a submodule routes: {outcome:?}");
+    let log = log_texts(&case.folder().join("out.log"));
+    assert!(!log.contains("gate: cannot tell which words are gitignored"), "{log}");
 }
 
 #[test]
@@ -2448,6 +2468,19 @@ fn a_failing_routed_run_names_the_gitignored_file_its_words_point_at() {
         let failed = text.find("gate: FAILED (status 1)").expect("the verdict is said");
         assert!(said < failed, "the hint comes before the verdict: {text}");
     }
+}
+
+#[test]
+fn a_failing_routed_run_naming_a_submodule_file_still_hints_the_gitignored_one() {
+    let case = routed_case("routing-hint-ignored-beside-submodule");
+    with_submodule(&case);
+    ignore_and_write(&case, ".tmp/\n", ".tmp/a.jsonl");
+
+    let (outcome, log) = run_routed_ending(&case, &["status 1"], &["--", "sub/A.csproj", ".tmp/a.jsonl"]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(hint_lines(&log), [ignored_hint(".tmp/a.jsonl")], "{log}");
+    assert!(!log.contains("gate: cannot tell which words are gitignored"), "{log}");
 }
 
 #[test]

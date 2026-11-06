@@ -456,17 +456,27 @@ const SHARED_ON_DISK: &str = r"tools\shared\shared.txt";
 /// own holding a committed [`SHARED`], declared in the case's `.gitmodules` and added to it as a gitlink.
 fn submodule_case(name: &str) -> Case {
     let case = client_case(name);
-    write(&case, SHARED, "shared");
-    git(&case, &["-C", "tools/shared", "init", "--quiet"]);
-    git(&case, &["-C", "tools/shared", "add", "shared.txt"]);
-    git(&case, &["-C", "tools/shared", "commit", "--quiet", "-m", "shared"]);
-    write(
-        &case,
-        ".gitmodules",
-        "[submodule \"tools/shared\"]\n\tpath = tools/shared\n\turl = ./shared\n",
-    );
-    git(&case, &["add", "tools/shared", ".gitmodules"]);
+    with_pair_submodule(&case, &case.folder());
     case
+}
+
+/// The `.gitmodules` text declaring the submodule at `tools/shared`.
+const GITMODULES: &str = "[submodule \"tools/shared\"]\n\tpath = tools/shared\n\turl = ./shared\n";
+
+/// Makes `tools/shared` in the repository at `folder`, the case's own or a sibling's, an initialized submodule: a
+/// repository of its own holding a committed [`SHARED`], declared in the folder's `.gitmodules` and added to its index
+/// as a gitlink, git run through `case`.
+fn with_pair_submodule(case: &Case, folder: &Path) {
+    let shared = folder.join("tools").join("shared");
+    fs::create_dir_all(&shared).expect("the submodule's folder can be made");
+    fs::write(shared.join("shared.txt"), "shared").expect("the submodule's file can be written");
+    let shared = shared.to_str().expect("the folder is Unicode");
+    git(case, &["-C", shared, "init", "--quiet"]);
+    git(case, &["-C", shared, "add", "shared.txt"]);
+    git(case, &["-C", shared, "commit", "--quiet", "-m", "shared"]);
+    fs::write(folder.join(".gitmodules"), GITMODULES).expect("the .gitmodules can be written");
+    let at = folder.to_str().expect("the folder is Unicode");
+    git(case, &["-C", at, "add", "tools/shared", ".gitmodules"]);
 }
 
 #[test]
@@ -695,6 +705,99 @@ fn a_pair_sends_each_repo_s_inputs_into_its_own_tree() {
     assert!(
         !work_folder(&case).join(&leaf).join(&name).exists(),
         "nothing of the sibling lands below the leaf"
+    );
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_pair_carries_each_tree_s_initialized_submodule_into_its_own_tree() {
+    let (case, leaf, name, sibling) = pair_inputs_case("client-pair-subs", &[], &[]);
+    with_pair_submodule(&case, &case.folder());
+    with_pair_submodule(&case, &sibling);
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &RAN));
+    remove_sibling(&sibling);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        calls(&steps),
+        ["preflight", "inputs", "inputs", "run"],
+        "one diff and one put for both trees: {outcome:?}"
+    );
+    assert_eq!(
+        in_tree(&case, &leaf, SHARED).as_deref(),
+        Some("shared"),
+        "the main repo's submodule is in its tree"
+    );
+    assert_eq!(in_tree(&case, &name, SHARED).as_deref(), Some("shared"), "the sibling's in its own");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+    let said = log_of(&case, "out.log");
+    for repo in [repo_name(&leaf), repo_name(&name)] {
+        let line = format!("gate: inputs: {repo}: submodule tools/shared: 1 file sent as inputs");
+        assert!(has_line(&said, &line), "{line}: {said}");
+    }
+}
+
+#[test]
+fn a_pair_carries_a_submodule_beside_the_sibling_s_globbed_inputs() {
+    let (case, leaf, name, sibling) = pair_inputs_case("client-pair-sub-globs", &[], &["secrets/**"]);
+    with_pair_submodule(&case, &case.folder());
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &RAN));
+    remove_sibling(&sibling);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        in_tree(&case, &leaf, SHARED).as_deref(),
+        Some("shared"),
+        "the main repo's submodule is in its tree"
+    );
+    assert_eq!(
+        in_tree(&case, &name, SIBLING_INPUT.0).as_deref(),
+        Some(SIBLING_INPUT.1),
+        "the sibling's input in its own"
+    );
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_pair_tree_with_globs_and_a_submodule_sends_both() {
+    let (case, leaf, _, sibling) = pair_inputs_case("client-pair-sub-both", &["secrets/**"], &[]);
+    with_pair_submodule(&case, &case.folder());
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &RAN));
+    remove_sibling(&sibling);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        in_tree(&case, &leaf, INPUT).as_deref(),
+        Some("one"),
+        "the main repo's globbed input is in its tree"
+    );
+    assert_eq!(in_tree(&case, &leaf, SHARED).as_deref(), Some("shared"), "its submodule's file beside it");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+    let said = log_of(&case, "out.log");
+    let line = format!("gate: inputs: {}: submodule tools/shared: 1 file sent as inputs", repo_name(&leaf));
+    assert!(has_line(&said, &line), "{line}: {said}");
+}
+
+#[test]
+fn a_pair_whose_submodule_is_not_initialized_sends_no_inputs() {
+    let (case, _, _, sibling) = pair_inputs_case("client-pair-sub-uninit", &[], &[]);
+    fs::write(case.folder().join(".gitmodules"), GITMODULES).expect("the .gitmodules can be written");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 2]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &RAN));
+    remove_sibling(&sibling);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        calls(&steps),
+        ["preflight", "run"],
+        "no inputs call, as a pair with no globs: {outcome:?}"
     );
     assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
 }
