@@ -2275,6 +2275,7 @@ impl Attempt<'_, '_> {
         let warm_up = matches!(self.call.warmth, Warmth::WarmUp { .. });
         let location =
             Location::under(&self.profile(), self.call.repo, self.call.key, &payload::job_nonce()).with_session(self.call.session, warm_up);
+        let location = location.with_spare(self.call.spare_folders);
         let Some((main, siblings)) = repos.split_first_mut() else {
             return Ok(location);
         };
@@ -6648,6 +6649,7 @@ mod tests {
             interrupt: Some(raised()),
             state: &STATE,
             state_dir: Path::new(r"C:\gate-client-tests-state"),
+            spare_folders: &[],
             warmth: Warmth::Unasked,
         }
     }
@@ -10141,6 +10143,7 @@ mod tests {
         let warm_up = [vec!["./tool.exe".to_owned()]];
         let warm_call = RemoteCall {
             commit_stage: false,
+            spare_folders: &[],
             warmth: Warmth::WarmUp {
                 commands: &warm_up,
                 hash: WARM_HASH,
@@ -10188,6 +10191,7 @@ mod tests {
         let warm_up = [vec!["./tool.exe".to_owned()]];
         let warm_call = RemoteCall {
             commit_stage: false,
+            spare_folders: &[],
             warmth: Warmth::WarmUp {
                 commands: &warm_up,
                 hash: WARM_HASH,
@@ -10256,6 +10260,7 @@ mod tests {
             interrupt,
             state,
             state_dir: Path::new(r"C:\gate-client-tests-state"),
+            spare_folders: &[],
             warmth: Warmth::Unasked,
         }
     }
@@ -10310,6 +10315,7 @@ mod tests {
             dropped_no_build: false,
             send: None,
             desktop: None,
+            spare_folders: &[],
             warmth: Warmth::WarmUp {
                 commands: &warm_up,
                 hash: WARM_HASH,
@@ -10342,6 +10348,7 @@ mod tests {
         let warm_up = [vec!["./tool.exe".to_owned()]];
         let warm_call = RemoteCall {
             commit_stage: false,
+            spare_folders: &[],
             warmth: Warmth::WarmUp {
                 commands: &warm_up,
                 hash: WARM_HASH,
@@ -10375,6 +10382,7 @@ mod tests {
         // The call's interrupt is raised, so the connection's loss ends on it.
         let warm_call = RemoteCall {
             commit_stage: false,
+            spare_folders: &[],
             warmth: Warmth::WarmUp {
                 commands: &warm_up,
                 hash: WARM_HASH,

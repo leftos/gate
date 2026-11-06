@@ -101,6 +101,9 @@ struct Asked<'a> {
     store: String,
     /// The data channel a put's archive comes over instead of stdin, `None` for stdin.
     channel: Option<PutChannel>,
+    /// The folders below the main repo's tree the layout's clear after an interrupted command spares, `SpareFolders`;
+    /// none when the payload gives none.
+    spare: Vec<String>,
 }
 
 impl Asked<'_> {
@@ -126,6 +129,7 @@ impl Asked<'_> {
             Step::Diff if payload.sets("Channel") => return Err(DIFF_CHANNEL.to_owned()),
             Step::Diff => None,
         };
+        let spare = payload.spare_folders()?;
         Ok(Asked {
             key,
             work,
@@ -137,6 +141,7 @@ impl Asked<'_> {
             pair,
             store,
             channel,
+            spare,
         })
     }
 
@@ -154,6 +159,8 @@ impl Asked<'_> {
             lock: self.lock,
             nonce: self.nonce,
             pair: self.pair.as_ref(),
+            // The lock lays the work folder out first, so its clear after an interrupted command spares these.
+            spare: &self.spare,
         }
     }
 }

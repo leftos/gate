@@ -274,6 +274,9 @@ struct Asked<'a> {
     trees: Vec<String>,
     /// The data channel a put's archive comes over instead of stdin, `None` for stdin.
     channel: Option<PutChannel>,
+    /// The folders below the main repo's tree the layout's clear after an interrupted command spares, `SpareFolders`;
+    /// none when the payload gives none.
+    spare: Vec<String>,
 }
 
 /// The path convention of a request's manifest, chosen from what the request carries, never from a pair alone: one
@@ -317,6 +320,7 @@ impl Asked<'_> {
         let trees = pair
             .as_ref()
             .map_or_else(Vec::new, |pair| pair.trees().into_iter().map(str::to_owned).collect());
+        let spare = payload.spare_folders()?;
         Ok(Asked {
             key,
             work,
@@ -330,6 +334,7 @@ impl Asked<'_> {
             convention,
             trees,
             channel,
+            spare,
         })
     }
 
@@ -452,12 +457,14 @@ impl Asked<'_> {
             lock: self.lock,
             nonce: self.nonce,
             pair: self.pair.as_ref(),
+            spare: &self.spare,
         }
     }
 }
 
 /// The work folder a box verb holds while it works, as [`locked`] takes it: its key, its path, the bare repository it
-/// shares, its lock file, the nonce a busy refusal names, and the sibling pair it is laid out for, `None` for one repo.
+/// shares, its lock file, the nonce a busy refusal names, the sibling pair it is laid out for, `None` for one repo, and
+/// the folders below the main repo's tree a layout's clear after an interrupted command spares.
 pub(super) struct WorkLock<'a> {
     pub(super) key: &'a str,
     pub(super) work: &'a str,
@@ -465,6 +472,7 @@ pub(super) struct WorkLock<'a> {
     pub(super) lock: &'a str,
     pub(super) nonce: &'a str,
     pub(super) pair: Option<&'a Pair>,
+    pub(super) spare: &'a [String],
 }
 
 /// Holds each of the work folder's `trees`, opened beneath the held work folder `work`, whose path is `work_path`, and
@@ -1933,6 +1941,7 @@ mod tests {
             convention: Convention::Single,
             trees: Vec::new(),
             channel: None,
+            spare: Vec::new(),
         }
     }
 

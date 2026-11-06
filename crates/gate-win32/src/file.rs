@@ -535,8 +535,9 @@ pub struct NotDeleted {
 /// opened and held without delete sharing while the walk is inside it, so it cannot be renamed out of `top`, listed,
 /// descended into, and stays, emptied or not; a folder that is a reparse point (a junction or a folder link) is neither
 /// descended into nor deleted; an entry named `.git` in any letter case, file or folder, is skipped at every depth with
-/// all it holds. A sharing violation on either open is tried again as `fresh` says; an entry gone between the listing
-/// and its open is skipped. How many files were deleted.
+/// all it holds. A folder `spared` says yes to, given its path below `top` as the listings name it, is skipped with all
+/// it holds too: no file below it is deleted or counted. A sharing violation on either open is tried again as `fresh`
+/// says; an entry gone between the listing and its open is skipped. How many files were deleted.
 ///
 /// The listing's times are never used: NTFS keeps a stale time in the listing for a name the file was not written
 /// through, such as a second hard link to it, so each file is opened with attribute access alone and judged by its
@@ -546,7 +547,7 @@ pub struct NotDeleted {
 ///
 /// The first entry that could not be listed, opened or deleted, with the system's error; what was deleted before it
 /// stays deleted.
-pub fn delete_fresh_beneath(top: &File, fresh: Fresh) -> Result<usize, NotDeleted> {
+pub fn delete_fresh_beneath(top: &File, fresh: Fresh, spared: &dyn Fn(&Path) -> bool) -> Result<usize, NotDeleted> {
     let stopped = |path: &Path| {
         let path = path.to_path_buf();
         move |error| NotDeleted { path, error }
@@ -566,6 +567,9 @@ pub fn delete_fresh_beneath(top: &File, fresh: Fresh) -> Result<usize, NotDelete
             continue;
         }
         let path = level.path.join(&entry.name);
+        if entry.attributes & FILE_ATTRIBUTE_DIRECTORY != 0 && spared(&path) {
+            continue;
+        }
         let parent = level.folder.as_ref().unwrap_or(top);
         match fresh_visit(parent, &entry, fresh).map_err(stopped(&path))? {
             Visit::Descend(folder, entries) => stack.push(FreshLevel {
@@ -1046,7 +1050,8 @@ mod tests {
             wait: std::time::Duration::ZERO,
         };
 
-        let deleted = delete_fresh_beneath(&held(&folder), fresh).expect("a file whose delete is pending does not refuse the walk");
+        let deleted =
+            delete_fresh_beneath(&held(&folder), fresh, &|_: &Path| false).expect("a file whose delete is pending does not refuse the walk");
 
         assert_eq!(deleted, 1, "the fresh file is the one deleted; the pending one counts as gone");
         assert!(!fresh_file.exists(), "the fresh file goes");
@@ -1195,7 +1200,7 @@ mod tests {
             wait: std::time::Duration::ZERO,
         };
 
-        let deleted = delete_fresh_beneath(&held(&work), fresh).expect("the fresh files are deleted");
+        let deleted = delete_fresh_beneath(&held(&work), fresh, &|_: &Path| false).expect("the fresh files are deleted");
 
         assert_eq!(deleted, 1, "the fresh link is the one file below the work folder");
         assert!(!work.join(r"bin\link.txt").exists(), "the work folder's name goes");
@@ -1238,7 +1243,7 @@ mod tests {
             wait: std::time::Duration::ZERO,
         };
 
-        let deleted = delete_fresh_beneath(&held(&folder), fresh).expect("the fresh files are deleted");
+        let deleted = delete_fresh_beneath(&held(&folder), fresh, &|_: &Path| false).expect("the fresh files are deleted");
 
         assert!(!written.exists(), "the name written through goes");
         assert!(
@@ -1247,6 +1252,91 @@ mod tests {
         );
         assert_eq!(deleted, 2, "both names are deleted");
         std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    /// Clears `work` with `since`, sparing the folder whose path below it is `spared` alone; how many files went.
+    fn cleared_sparing(work: &Path, since: Option<std::time::SystemTime>, spared: &Path) -> usize {
+        let fresh = Fresh {
+            since,
+            tries: 1,
+            wait: std::time::Duration::ZERO,
+        };
+        delete_fresh_beneath(&held(work), fresh, &|path: &Path| path == spared).expect("the fresh files are deleted")
+    }
+
+    /// A work folder below `name`'s test folder holding a fresh file at any depth below `.tmp\sweep-logs`, one beside it
+    /// in `.tmp` and one in `.tmp\sweep-logs-old`: the test folder and the work folder.
+    fn work_with_spared_logs(name: &str) -> (PathBuf, PathBuf) {
+        let folder = folder(name);
+        let work = folder.join("work");
+        std::fs::create_dir_all(work.join(r".tmp\sweep-logs\deep")).expect("the spared folder can be made");
+        std::fs::create_dir_all(work.join(r".tmp\sweep-logs-old")).expect("the other folder can be made");
+        std::fs::write(work.join(r".tmp\sweep-logs\run.log"), "log").expect("the spared file can be written");
+        std::fs::write(work.join(r".tmp\sweep-logs\deep\more.log"), "log").expect("the deep spared file can be written");
+        std::fs::write(work.join(r".tmp\beside.txt"), "beside").expect("the file beside can be written");
+        std::fs::write(work.join(r".tmp\sweep-logs-old\old.log"), "old").expect("the other folder's file can be written");
+        (folder, work)
+    }
+
+    #[test]
+    fn a_fresh_delete_spares_a_named_folder_s_subtree() {
+        let (folder, work) = work_with_spared_logs("fresh-spared");
+        let since = Some(std::time::SystemTime::now() - std::time::Duration::from_secs(60));
+
+        let deleted = cleared_sparing(&work, since, Path::new(r".tmp\sweep-logs"));
+
+        assert_eq!(deleted, 2, "the spared files are neither deleted nor counted");
+        assert!(work.join(r".tmp\sweep-logs\run.log").exists(), "the spared folder's file stays");
+        assert!(work.join(r".tmp\sweep-logs\deep\more.log").exists(), "the whole subtree below it stays");
+        assert!(!work.join(r".tmp\beside.txt").exists(), "the file beside it goes");
+        assert!(
+            !work.join(r".tmp\sweep-logs-old\old.log").exists(),
+            "a folder whose name only starts the same is cleared"
+        );
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_fresh_delete_with_no_start_spares_a_named_folder_s_subtree() {
+        let (folder, work) = work_with_spared_logs("fresh-spared-no-start");
+
+        let deleted = cleared_sparing(&work, None, Path::new(r".tmp\sweep-logs"));
+
+        assert_eq!(deleted, 2, "with every file fresh, the spared ones are still left and not counted");
+        assert!(work.join(r".tmp\sweep-logs\run.log").exists(), "the spared folder's file stays");
+        assert!(work.join(r".tmp\sweep-logs\deep\more.log").exists(), "the whole subtree below it stays");
+        assert!(!work.join(r".tmp\beside.txt").exists(), "the file beside it goes");
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    /// A folder whose name ends in a dot or a space, which a Win32 path trims, is judged by the name its listing gives
+    /// through the handle walk: never as the trimmed name. The walk opens each entry by handle beneath its folder, so no
+    /// 8.3 short name or `\\?\` form of a path ever reaches the spared test.
+    #[test]
+    fn a_fresh_delete_judges_a_spared_folder_by_its_on_disk_name() {
+        for (name, trimmed) in [("logs.", "logs"), ("logs ", "logs")] {
+            let folder = folder("fresh-spared-trailing");
+            let work = folder.join("work");
+            let long = |path: &Path| PathBuf::from(format!(r"\\?\{}", path.display()));
+            let file = long(&work.join(name).join("run.log"));
+            std::fs::create_dir_all(long(&work.join(name))).expect("the folder can be made by its verbatim name");
+            std::fs::write(&file, "log").expect("the file can be written");
+            let since = Some(std::time::SystemTime::now() - std::time::Duration::from_secs(60));
+
+            assert_eq!(
+                cleared_sparing(&work, since, Path::new(trimmed)),
+                1,
+                "{name:?} is not spared as {trimmed:?}"
+            );
+            assert!(!file.exists(), "{name:?}'s file goes");
+            std::fs::write(&file, "log").expect("the file can be written again");
+            assert_eq!(cleared_sparing(&work, since, Path::new(name)), 0, "{name:?} is spared by its own name");
+            assert!(file.exists(), "{name:?}'s file stays");
+
+            std::fs::remove_file(&file).expect("the file can be removed");
+            std::fs::remove_dir(long(&work.join(name))).expect("the folder can be removed");
+            std::fs::remove_dir_all(&folder).expect("the test folder can be removed");
+        }
     }
 
     /// The folder `path` held open, as a caller of [`open_beneath`] holds one.

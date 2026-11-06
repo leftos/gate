@@ -124,6 +124,7 @@ A repo describes itself to gate in a tracked `.gate` folder. Every file is optio
 | `desktop.toml` | The routed commands that need the builder's logged-on desktop (`patterns`), only its console session (`session`) or a desktop of their own that no one sees (`hidden`). |
 | `local.toml` | The commands that always run on this PC (`patterns`). |
 | `env.toml` | The prefixes of the repo's own environment variables (`prefixes`), so a routed run names the ones it does not send. |
+| `spare.toml` | The folders below the worktree root (`folders`) whose files the Windows builder's clear after an interrupted command keeps. |
 | `windows.toml` | The paths whose change keeps a run off a macOS builder (`paths`). |
 
 A repo that builds with Rust and tests with cargo-nextest might declare:

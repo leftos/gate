@@ -9,6 +9,7 @@ mod edit;
 mod key;
 mod like;
 mod rewrite;
+mod spare;
 mod support;
 mod warm;
 mod watch;

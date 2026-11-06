@@ -535,6 +535,25 @@ mod unix {
         case.ended_clean();
     }
 
+    /// This box's clear deletes no file, so it takes `SpareFolders` and does nothing with it: a run that carries it
+    /// ends as one without.
+    #[test]
+    fn a_request_with_spare_folders_runs_normally() {
+        let case = Case::new("spare-folders");
+        let commit = case.snapshot();
+        let run = |extra: &Value| ran(&[], &case.request(&commit, extra), Reading::All, &case.base.join("beaten"));
+        let command = json!(["/bin/sh", "-c", "echo ran"]);
+
+        let without = run(&json!({ "Command": command }));
+        let with = run(&json!({ "Command": command, "SpareFolders": [".tmp/sweep-logs", "logs"] }));
+
+        assert_eq!(without.status, Some(0), "{:?}", without.err);
+        assert_eq!(with.status, Some(0), "{:?}", with.err);
+        assert_eq!(texts(&with.out), texts(&without.out), "the same output");
+        assert!(with.err_has(&started_line(NONCE)), "the start marker on standard error: {:?}", with.err);
+        case.ended_clean();
+    }
+
     #[test]
     fn a_pair_run_runs_in_the_main_tree_and_reads_its_sibling_beside_it() {
         let case = Case::new("pair");
@@ -1026,7 +1045,12 @@ mod unix {
     /// Runs `gate-box box inputs --stdin` for `step` of the work folder of `case`, the request, the manifest of `files`
     /// and, for a put, their archive on its stdin; its status and its lines.
     fn inputs_answered(case: &Case, step: &str, files: &[(&str, &[u8])]) -> Ended {
-        let mut input = format!("{}\n{}", case.inputs_request(step), manifest_of(files).line()).into_bytes();
+        inputs_answered_with(case, step, files, &json!({}))
+    }
+
+    /// [`inputs_answered`], with `extra` keys set over the request.
+    fn inputs_answered_with(case: &Case, step: &str, files: &[(&str, &[u8])], extra: &Value) -> Ended {
+        let mut input = format!("{}\n{}", case.inputs_request_with(step, extra), manifest_of(files).line()).into_bytes();
         if step == "put" {
             input.extend(archive_of(files));
         }
@@ -1100,6 +1124,30 @@ mod unix {
         assert_eq!(texts(&ended.out), ["input", "cached"]);
         assert!(ended.err_has(&started_line(NONCE)), "the start marker on standard error: {:?}", ended.err);
         case.ended_clean();
+    }
+
+    /// The inputs verb takes `SpareFolders` too and does nothing with it: a diff and a put carrying it are answered as
+    /// ones without.
+    #[test]
+    fn an_inputs_request_with_spare_folders_is_accepted() {
+        let case = Case::new("inputs-spare-folders");
+        case.snapshot();
+        let spare = json!({ "SpareFolders": [".tmp/sweep-logs"] });
+
+        let diff = inputs_answered_with(&case, "diff", &INPUTS, &spare);
+        let put = inputs_answered_with(&case, "put", &INPUTS, &spare);
+
+        assert_eq!(diff.status, Some(0), "{:?}", diff.err);
+        assert_eq!(
+            diff.out,
+            [
+                "gate-remote-inputs: need 2",
+                "gate-remote-inputs: path cache/x.bin",
+                "gate-remote-inputs: path in.txt"
+            ]
+        );
+        assert_eq!(put.status, Some(0), "{:?}", put.err);
+        assert_eq!(put.out, ["gate-remote-inputs: installed 2"]);
     }
 
     #[test]

@@ -265,6 +265,10 @@ pub(crate) struct RemoteCall<'a> {
     pub state: &'a StateRoot,
     /// The state root's folder, which holds the work-folder key's outputs pending marker.
     pub state_dir: &'a Path,
+    /// The folders below the main repo's tree the box's clear after an interrupted command spares, as the repo's
+    /// `.gate/spare.toml` names them: sent as `SpareFolders` by every verb that lays the work folder out, only when
+    /// there is one.
+    pub spare_folders: &'a [String],
     /// What the call asks of the work folder's warm-up.
     pub warmth: Warmth<'a>,
     /// Whether the call is a commit's pre-commit stage: its main repository's snapshot is the staged index's tree,
@@ -630,6 +634,7 @@ mod snapshot_only {
                 interrupt,
                 state: &STATE,
                 state_dir: Path::new(r"C:\gate-snapshot-client-tests"),
+                spare_folders: &[],
                 warmth: crate::remote::Warmth::Unasked,
             }
         }
@@ -1122,6 +1127,7 @@ mod scripted {
             "tail": call.tail,
             "noMarkers": call.no_markers,
             "env": call.env,
+            "spareFolders": call.spare_folders,
             "warmth": recorded_warmth(call.warmth),
         });
         fs::write(path, recorded.to_string()).map_err(|error| format!("cannot record the call to {}: {error}", path.display()))?;

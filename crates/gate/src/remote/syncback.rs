@@ -2942,6 +2942,7 @@ mod tests {
             interrupt: Some(interrupt),
             state: &state,
             state_dir: Path::new(r"C:\gate-sync-back-tests"),
+            spare_folders: &[],
             warmth: crate::remote::Warmth::Unasked,
         };
         let transport = Local::new(r"local:C:\gate-sync-back-tests", None).expect("a local transport");
@@ -3763,6 +3764,7 @@ mod tests {
             interrupt: None,
             state,
             state_dir: Path::new(r"C:\gate-sync-back-tests"),
+            spare_folders: &[],
             warmth: crate::remote::Warmth::Unasked,
         }
     }

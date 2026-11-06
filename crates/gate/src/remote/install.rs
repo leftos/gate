@@ -2396,6 +2396,7 @@ mod tests {
                 interrupt: None,
                 state: &STATE,
                 state_dir: state,
+                spare_folders: &[],
                 warmth: Warmth::Unasked,
             }
         }

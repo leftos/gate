@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 
 use crate::nesting::{LOOK_OFTEN, end_parent, first_event, marked, orphaned_as, spawned, test_marker};
 
-use crate::remote_client::{Tuned, client_case, client_gate, client_gate_tuned, fallbacks};
+use crate::remote_client::{PREK_SHIM, STAGE_COMMIT, Tuned, client_case, client_gate, client_gate_tuned, fallbacks};
 use crate::support::{
     Case, DenyEntry, FAKE_TOOL, GATE, Go, Junction, LOCAL_REASON, Outcome, Running, UNTIL_KILLED, assert_in_order, beside, calls, copy_tool,
     critical_words, events, finish, git, git_init, heavy_words, log_texts, nothing_back, powershell_folder, record_path, release, run_words, shown,
@@ -893,6 +893,91 @@ fn an_env_file_in_the_declarations_folder_is_read_when_the_worktree_has_none() {
     );
     let log = log_texts(&case.folder().join("out.log"));
     let read = format!("gate: .gate/env.toml read from {}", folder.join("env.toml").display());
+    assert!(log.lines().any(|line| line == read), "{read}: {log}");
+}
+
+/// Runs the routed fake tool in `case`, recording the client's call; the outcome and the call recorded, `None` when the
+/// client never ran.
+fn run_recording_spare(case: &Case) -> (Outcome, Option<Value>) {
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[FAKE_TOOL, "out", "ran"])));
+    let recorded = call.exists().then(|| recorded(&call));
+    (outcome, recorded)
+}
+
+#[test]
+fn a_routed_run_sends_its_spare_folders_in_the_payload() {
+    let case = routed_case("routing-spare");
+    fs::create_dir_all(case.folder().join(".gate")).expect("the .gate folder can be made");
+    fs::write(case.folder().join(".gate").join("spare.toml"), "folders = ['.tmp/sweep-logs', 'logs']\n").expect("the declaration can be written");
+
+    let (outcome, call) = run_recording_spare(&case);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let call = call.expect("the run routed");
+    assert_eq!(call["spareFolders"], serde_json::json!([".tmp/sweep-logs", "logs"]), "{call}");
+    assert!(!outcome.stderr.contains("spare.toml"), "a good file says nothing: {outcome:?}");
+}
+
+/// A commit's pre-commit stage runs on the builder in the same work folder as the repo's routed runs, so its call
+/// sends the folders the repo's `.gate/spare.toml` names, as a routed run's does.
+#[test]
+fn a_commit_stage_sends_its_repo_s_spare_folders() {
+    let case = routed_case("routing-stage-spare");
+    let routing = json!({ "host": HOST, "repos": { repo(&case): ["*tool*"] }, "commits": [repo(&case)] });
+    write_remote_json(&case, &routing.to_string());
+    fs::write(case.folder().join(".gitignore"), "*.exe\n*.log\n").expect("the ignore file can be written");
+    fs::create_dir_all(case.folder().join(".gate")).expect("the .gate folder can be made");
+    fs::write(case.folder().join(".gate").join("spare.toml"), "folders = ['logs']\n").expect("the declaration can be written");
+    fs::write(case.folder().join("a.txt"), "a\n").expect("a.txt can be written");
+    git(&case, &["add", "-A"]);
+    git(&case, &["commit", "--quiet", "-m", "base"]);
+    fs::write(case.folder().join("a.txt"), "b\n").expect("a.txt can be changed");
+    git(&case, &["add", "a.txt"]);
+    let hooks = case.folder().join(".git").join("hooks");
+    fs::create_dir_all(&hooks).expect("the hooks folder can be made");
+    fs::write(hooks.join("pre-commit"), PREK_SHIM).expect("the hook shim can be written");
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 1"]));
+
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &STAGE_COMMIT)));
+
+    assert!(call.exists(), "the stage called the builder: {outcome:?}");
+    let call = recorded(&call);
+    assert_eq!(call["spareFolders"], json!(["logs"]), "{call}");
+    assert!(!outcome.stderr.contains("spare.toml"), "a good file says nothing: {outcome:?}");
+}
+
+#[test]
+fn a_spare_file_with_a_problem_says_so_and_still_routes() {
+    let case = routed_case("routing-spare-broken");
+    fs::create_dir_all(case.folder().join(".gate")).expect("the .gate folder can be made");
+    fs::write(case.folder().join(".gate").join("spare.toml"), "folders = '.tmp'\n").expect("the declaration can be written");
+
+    let (outcome, call) = run_recording_spare(&case);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let call = call.expect("a bad spare file never keeps the run here");
+    assert_eq!(call["spareFolders"], serde_json::json!([]), "the run routes with no list: {call}");
+    let line = "gate: .gate/spare.toml: folders is not an array (TOML string); the box's clear spares no folder";
+    assert!(outcome.stderr.contains(&format!("{line}\n")), "{outcome:?}");
+    let routed_line = format!("gate: routed {FAKE_TOOL} as {}", fake_tool_name());
+    assert_in_order(&outcome.stderr, &[routed_line.as_str(), line]);
+}
+
+#[test]
+fn a_spare_file_in_the_declarations_folder_is_read_from_there() {
+    let case = routed_case("routing-spare-folder");
+    let folder = declarations_holding(&case, &[("spare.toml", "folders = ['logs']\n")]);
+    name_declarations(&case, &folder);
+
+    let (outcome, call) = run_recording_spare(&case);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(call.expect("the run routed")["spareFolders"], serde_json::json!(["logs"]));
+    let log = log_texts(&case.folder().join("out.log"));
+    let read = format!("gate: .gate/spare.toml read from {}", folder.join("spare.toml").display());
     assert!(log.lines().any(|line| line == read), "{read}: {log}");
 }
 

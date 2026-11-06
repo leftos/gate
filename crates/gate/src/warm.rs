@@ -124,6 +124,11 @@ struct Prepared<'e> {
     first: Warmup,
     /// The warm-up's drain session, made once for every call it makes.
     session: String,
+    /// The folders the repo's `.gate/spare.toml` names ([`route::spare_folders`]), which the box's clear after an
+    /// interrupted command spares when the warm-up lays the work folder out; none when the file has a problem.
+    spare: Vec<String>,
+    /// The line saying the problem of the repo's `.gate/spare.toml`, `None` when it has none.
+    spare_problem: Option<String>,
 }
 
 /// A read of the warm-up file: what it declares, the hash of its bytes and its commands worded for the builder.
@@ -146,6 +151,7 @@ fn prepare<'e>(request: &WarmRequest, environment: &'e Environment) -> Result<Pr
     machine.hold_config(&config);
     let target = target(&config, place, &machine).map_err(|reason| End::Usage(reason.map_or_else(|| not_listed(&repo), |reason| reason.line())))?;
     let first = read_file(&target, &machine, &config)?;
+    let (spare, spare_problem) = route::spare_split(route::spare_folders(Path::new(&target.place.root), &target.repo, &machine));
     Ok(Prepared {
         root,
         environment,
@@ -153,6 +159,8 @@ fn prepare<'e>(request: &WarmRequest, environment: &'e Environment) -> Result<Pr
         target,
         first,
         session: remote::payload::run_nonce(),
+        spare,
+        spare_problem,
     })
 }
 
@@ -488,8 +496,16 @@ fn warm_up(prepared: &Prepared<'_>, request: &WarmRequest, started: Timestamp, c
         }
     };
     leave_worktree_record(prepared, console);
+    // The warm-up goes on with no folder spared, its line among the log's notes and, unless in the background, on stderr.
+    let mut notes = prepared.machine.unsaid_notes();
+    if let Some(line) = &prepared.spare_problem {
+        notes.push(line.clone());
+        if !request.background {
+            console.err(line);
+        }
+    }
     let log_path = v1::warm_log_path(state, key);
-    let _log = match fresh_log(&log_path).and_then(|log| noted(log, &log_path, &prepared.machine.unsaid_notes())) {
+    let _log = match fresh_log(&log_path).and_then(|log| noted(log, &log_path, &notes)) {
         Ok(log) => log,
         Err(line) => return End::Failed(line).say(request.background, console),
     };
@@ -741,6 +757,7 @@ fn call_of<'a>(
         interrupt,
         state: &prepared.root.root,
         state_dir: &prepared.root.path,
+        spare_folders: &prepared.spare,
         warmth,
     })
 }

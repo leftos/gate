@@ -224,6 +224,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, started
         routing: RoutingFacts::default(),
         sent: None,
         warm_hash: None,
+        spare_folders: Vec::new(),
         cold: false,
         tailscale_read: None,
         would: None,
@@ -946,6 +947,9 @@ struct Run<'a> {
     /// The hash of the warm-up file a routed run's work folder must be warm with, which its call asks the builder for;
     /// `None` when the route asks no warmth. Set once, by [`Run::route`].
     warm_hash: Option<String>,
+    /// The folders the box's clear after an interrupted command spares in the routed run's work folder, as its repo's
+    /// `.gate/spare.toml` names them; none for every other run. Set once, by [`Run::route`].
+    spare_folders: Vec<String>,
     /// Whether the routed run's call ran in a work tree the builder found new, its ceiling raised, which its `release`
     /// line says; false for every other run, one that fell back among them.
     cold: bool,
@@ -1220,6 +1224,8 @@ struct CallParts<'r> {
     root: &'r ResolvedRoot,
     /// What the call knows of the work folder's warm-up, or asks of it.
     warmth: remote::Warmth<'r>,
+    /// The folders the box's clear after an interrupted command spares ([`Run::route`]).
+    spare_folders: &'r [String],
     /// The variables the call sends the builder ([`routed_env`]).
     env: &'r [(String, String)],
     /// The run's drain session, made once before its first attempt.
@@ -1900,6 +1906,7 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         host,
         root,
         warmth,
+        spare_folders,
         env,
         session,
         commit_stage,
@@ -1937,6 +1944,7 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         interrupt: host.interrupt,
         state: &root.root,
         state_dir: &root.path,
+        spare_folders,
         warmth,
     })
 }
@@ -2351,11 +2359,13 @@ impl Run<'_> {
             mut route,
             placed: place,
             warm_hash,
+            spare_folders,
             decision,
             sent,
         } = route::route(self.request, environment, (parent, given), (self.root, &self.gate), console);
         self.sent = sent;
         self.warm_hash = warm_hash;
+        self.spare_folders = spare_folders;
         self.would = Some(decision);
         self.may_reroute = !matches!(route, Route::Routed(_));
         self.tag = match &route {
@@ -2879,8 +2889,8 @@ impl Run<'_> {
             Some(decision) => route::route_as_heavy(self.request, decision, by, console),
             None => route::AsHeavy::Here,
         };
-        let (remote, warm_hash) = match as_heavy {
-            route::AsHeavy::Routed(remote, warm_hash) => (remote, warm_hash),
+        let (remote, warm_hash, spare_folders) = match as_heavy {
+            route::AsHeavy::Routed(remote, warm_hash, spare_folders) => (remote, warm_hash, spare_folders),
             route::AsHeavy::Here => {
                 // It waits on, held back like any light gate, its log taking the notes the decision held.
                 if let Some(writer) = &self.writer {
@@ -2899,6 +2909,7 @@ impl Run<'_> {
         };
         self.close_log(console);
         self.warm_hash = warm_hash;
+        self.spare_folders = spare_folders;
         self.rerouted_for = Some(by);
         self.tag = Some(RemoteTag {
             host: remote.builder.alias.clone(),
@@ -3362,6 +3373,7 @@ impl Run<'_> {
             log: &self.log,
             host: &self.host,
             root: self.root,
+            spare_folders: &self.spare_folders,
             warmth: warmth_of(self.warm_hash.as_deref()),
             env: &env,
             session,
@@ -3682,6 +3694,7 @@ impl Run<'_> {
             log: &self.log,
             host: &self.host,
             root: self.root,
+            spare_folders: &self.spare_folders,
             warmth: warmth_of(self.warm_hash.as_deref()),
             env: &env,
             // The key lock sends nothing, so it names no session.
@@ -6721,6 +6734,7 @@ mod tests {
                 interrupt: Some(interrupt),
                 state: &scratch.root.root,
                 state_dir: scratch.path(),
+                spare_folders: &[],
                 warmth: crate::remote::Warmth::Unasked,
             }
         }

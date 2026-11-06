@@ -144,6 +144,18 @@ The same line then also names the caller's variables starting a declared prefix,
 
 A file with a problem does not keep the run here: it says `gate: .gate/env.toml: <problem>; only the build variables are watched` (a declarations-folder copy named by its full path) on stderr after the route lines and before the dropped-variable line, and the run routes watching the build variables alone. `gate check` does not report this file.
 
+A repo names folders the Windows box's interrupted-command clear ([The box side](#the-box-side)) spares in `.gate/spare.toml`: `folders = ["build/cache", ...]`, at most 32 entries, each a folder below the worktree root written as a `carriedFolders` entry is: `/`-separated names, none empty, `.` or `..`, none holding `**` or any of `\ : [ ] " < > |`, with `*` and `?` allowed within a name.
+
+An entry matches a folder with the same number of names, ignoring letter case, and spares every file below it. On a pair run the list is the main repo's, applied to the main repo's tree. It spares nothing in the layout-change clear, in the checkout's `git clean -fdq` (a spared folder must be gitignored, or `git clean` deletes it on every run), in `checkout --force` of tracked files or in a prune.
+
+The file is read for a routed run, after the decision, and by `gate warm`, from the worktree's `.gate` or else the repo's declarations folder, through the same guarded read as `.gate/env.toml`; it needs no `remote.json` consent, and a declarations-folder copy logs `gate: .gate/spare.toml read from <path>`.
+
+A file with a problem never keeps the run here: it says `gate: .gate/spare.toml: <problem>; the box's clear spares no folder` on stderr and the run routes with no list. Problems read like `folders is not an array (TOML string)` and `entry <n> '<e>' is not a folder path: <rule text>`, `<n>` counting from 0.
+
+The list travels in the payload key `SpareFolders`, sent only when non-empty, in every payload word (run, inputs, put, LFS and warm-up, and a commit's pre-commit stage), and every box verb that lays the work folder out reads it, so the clear spares the same folders whichever verb lays the folder out first.
+
+A warm-up writes the file's problem line into its warm log, and says it on stderr too unless it runs with `--background`. On a pair run the list applies to the main repo's tree (the work folder's main leaf), never to a sibling's tree.
+
 ### `gate stop-tree`
 
 `gate stop-tree <pid>` takes one process snapshot (pids, parents and start times, no command lines) and builds the tree: the pid plus its descendants, a child counting only when its creation time is readable and at or after its parent's, so a recycled pid adopts no one (a child whose creation time is unreadable is left out with its subtree).
@@ -1807,9 +1819,9 @@ It reads like `commits`: a value that is not an array (`requireSiblings must be 
 
 **Declarations folder.** `declarations` is an object mapping a repo name, matched in any letter case, to an absolute folder: `{"declarations": {"<repo>": "D:\\notes\\<repo>\\gate"}}`.
 
-For a repo that cannot commit its `.gate` files, the folder holds `toolchain.toml`, `siblings.toml`, `desktop.toml`, `local.toml`, `env.toml`, `warmup.toml` and `windows.toml`, each read only when the repo has no file of that name: the snapshot's tree for `toolchain.toml` in a routed run, the worktree on disk otherwise. A file is taken whole from one place, so a repo's own file wins even with problems, and a file the folder lacks is simply absent.
+For a repo that cannot commit its `.gate` files, the folder holds `toolchain.toml`, `siblings.toml`, `desktop.toml`, `local.toml`, `env.toml`, `spare.toml`, `warmup.toml` and `windows.toml`, each read only when the repo has no file of that name: the snapshot's tree for `toolchain.toml` in a routed run, the worktree on disk otherwise. A file is taken whole from one place, so a repo's own file wins even with problems, and a file the folder lacks is simply absent.
 
-The folder asks no new consent: `desktop` and `warmup` stay in `remote.json`, and `local.toml` and `env.toml` need none, and the warm-up hash stays the SHA-256 of the file's bytes wherever they came from.
+The folder asks no new consent: `desktop` and `warmup` stay in `remote.json`, and `local.toml`, `env.toml` and `spare.toml` need none, and the warm-up hash stays the SHA-256 of the file's bytes wherever they came from.
 
 The folder must be an absolute drive path (a letter, `:`, a separator and a name, with no share, device or `\\?\` path) on a fixed local drive, a real folder and no link or junction. No name of the path may end in `.` or a space or hold `:`, which also refuses `.` and `..`. A drive whose letter is a `subst` onto a share is not local; a letter whose device cannot be read counts as no `subst`.
 
@@ -3240,7 +3252,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     **Toolchain manifest** (GATE-206, GATE-209): a repo's `.gate/toolchain.toml` declares what a routed run's builder must have beyond the .NET SDK, and `remote/toolchain.rs` reads it as data from text the caller hands over.
 
-    [`gate check`](#gate-check) reads it from the worktree on disk and says what this PC lacks; a routed run with parity reads it from the snapshot's git tree (the only one of the repo's `.gate` files read there; `stage.toml` is read on the builder, from the stage's checkout, and `siblings.toml`, `desktop.toml`, `local.toml`, `env.toml`, `warmup.toml` and `windows.toml` are read from the worktree on disk) and refuses the route when the builder lacks a tool it declares (below).
+    [`gate check`](#gate-check) reads it from the worktree on disk and says what this PC lacks; a routed run with parity reads it from the snapshot's git tree (the only one of the repo's `.gate` files read there; `stage.toml` is read on the builder, from the stage's checkout, and `siblings.toml`, `desktop.toml`, `local.toml`, `env.toml`, `spare.toml`, `warmup.toml` and `windows.toml` are read from the worktree on disk) and refuses the route when the builder lacks a tool it declares (below).
 
     `toolchain::meets` compares a found version with a minimum. A repo's sibling worktrees are not declared here but in `.gate/siblings.toml` ([Sibling worktrees](#routing)), whose problems keep a run local.
 
@@ -4232,6 +4244,8 @@ Unknown keys are ignored, and `Outputs`, `OutputsFull` and `OutputFolder`, which
 
 A `run` payload may also hold `Desktop` (true or false, false when absent or null, else `gate: box payload Desktop is not true or false` and exit 2) and `DesktopWait` (whole seconds, 1 to 2147483647, else `gate: box payload DesktopWait is not a whole number of seconds` and exit 2), which together ask for a desktop run, the command on the builder's logged-on desktop (The desktop run, below).
 
+The optional `SpareFolders` (a list of folder globs, from the repo's `.gate/spare.toml`; absent or null is none) is read in the run, inputs, put, LFS and warm-up words; anything else is refused with `gate: box payload SpareFolders is not a list of texts` or `gate: box payload SpareFolders holds an empty glob` and exit 2.
+
 `DesktopSession` (true or false, false when absent or null, else `gate: box payload DesktopSession is not true or false`; true without `Desktop` true, `gate: box payload DesktopSession needs Desktop`, both exit 2) makes it a session run, which takes no desktop lock.
 
 `DesktopHidden` (true or false, false when absent or null, else `gate: box payload DesktopHidden is not true or false`; true without `DesktopSession` true, `gate: box payload DesktopHidden needs DesktopSession`, both exit 2) makes the session run's command run on a desktop of its own that no one sees (The hidden desktop, in The desktop run's design).
@@ -4594,6 +4608,10 @@ Built verbs:
   It then removes every file below `Work` written since the recorded start less 60 s of slack for a stepped clock and coarse file times, never inside a `.git` and never behind a junction. Last it says `gate: remote cleared <n> file(s) an interrupted command left in the work folder` and removes the record, so a clear cut short runs again.
 
   A file's freshness is read through its own handle, not the folder listing, and a file another process holds without delete sharing is tried 5 times, 500 ms apart.
+
+  A file below a folder the payload's `SpareFolders` ([Command environment](#command-environment), `.gate/spare.toml`) matches is kept, and is left out of `<n>`; this holds whichever verb lays the folder out (run, inputs, put, LFS, warm-up), with a dated record and with one that reads as `since: None`. The layout-change clear spares nothing.
+
+  The Unix box's clear removes only its `.warm`, `.tools` and `.packages` records and deletes no files, so it accepts `SpareFolders` and ignores it.
 
   The record is read as the tools record is. One that is not UTF-8 or of another form has no start and no job: the clear takes every file and ends no job. A job name must be the work folder's key in any letter case; one held by an object that is not a job counts as no job.
 

@@ -46,6 +46,10 @@ pub(crate) struct Location {
     pub repo: String,
     /// Whether the call takes no ticket in the drain's line (`NoTicket`): a warm-up's.
     pub no_ticket: bool,
+    /// The folders below the main repo's tree the box's clear after an interrupted command spares (`SpareFolders`),
+    /// which every word built on the location's keys ([`Location::object`]) sends only when there is one, as any of
+    /// their verbs may lay the work folder out.
+    pub spare: Vec<String>,
 }
 
 /// A sibling pair as the payload's `Pair` carries it: the main checkout's folder name and each sibling's, in order.
@@ -74,6 +78,15 @@ impl Location {
             pc: pc_name(),
             repo: repo.to_owned(),
             no_ticket: false,
+            spare: Vec::new(),
+        }
+    }
+
+    /// This location with the folders `spare` its clear after an interrupted command spares.
+    pub(crate) fn with_spare(self, spare: &[String]) -> Location {
+        Location {
+            spare: spare.to_vec(),
+            ..self
         }
     }
 
@@ -97,7 +110,7 @@ impl Location {
         }
     }
 
-    /// The payload keys every verb reads, `Pair`, `Session` and `Pc` only when there is one.
+    /// The payload keys every verb reads, `Pair`, `Session`, `Pc` and `SpareFolders` only when there is one.
     fn object(&self) -> Map<String, Value> {
         let mut object = Map::new();
         for (name, value) in [
@@ -120,6 +133,9 @@ impl Location {
         }
         if let Some(pc) = &self.pc {
             object.insert("Pc".to_owned(), json!(pc));
+        }
+        if !self.spare.is_empty() {
+            object.insert("SpareFolders".to_owned(), json!(self.spare));
         }
         object.insert("NoTicket".to_owned(), json!(self.no_ticket));
         object
@@ -626,6 +642,7 @@ mod tests {
                 pc: pc_name(),
                 repo: "duel".to_owned(),
                 no_ticket: false,
+                spare: Vec::new(),
             }
         );
         assert!(gate_wire::is_job_name(&location.job, "duel-0a1b2c3d", PathForm::Unix), "{}", location.job);
@@ -672,6 +689,7 @@ mod tests {
                 pc: pc_name(),
                 repo: "app".to_owned(),
                 no_ticket: false,
+                spare: Vec::new(),
             }
         );
     }
@@ -1164,6 +1182,42 @@ mod tests {
         let without = RunCall { failure_outputs: &[], ..run };
         let sent = decoded(&run_word(&location(), &without));
         assert!(sent.get("FailureOutputs").is_none(), "a run with none sends no FailureOutputs: {sent}");
+    }
+
+    /// Every word, each built on the location's keys, sends `SpareFolders` only when there are some: the run, inputs,
+    /// put, LFS and warm-up words alike, as each of their verbs may lay the work folder out.
+    #[test]
+    fn every_word_sends_spare_folders_only_when_there_are_some() {
+        let words = ["./tool.exe".to_owned()];
+        let run = RunCall {
+            words: &words,
+            ..warm_run(&[], None)
+        };
+        let commands = [vec!["./tool.exe".to_owned()]];
+        let warm = WarmCall {
+            commands: &commands,
+            hash: "h",
+        };
+        let spare = [".tmp/sweep-logs".to_owned(), "logs".to_owned()];
+        let worded = |location: &Location| {
+            [
+                ("run", run_word(location, &run)),
+                ("inputs diff", inputs_word(location, NONCE, InputsStep::Diff, None)),
+                ("inputs put", inputs_word(location, NONCE, InputsStep::Put, None)),
+                ("put", super::put_word(location, NONCE, None, None)),
+                ("lfs diff", lfs_word(location, NONCE, InputsStep::Diff, None, None)),
+                ("lfs put", lfs_word(location, NONCE, InputsStep::Put, None, None)),
+                ("warm-up", warm_word(location, &run, &warm)),
+            ]
+        };
+        for (verb, word) in worded(&location().with_spare(&spare)) {
+            assert_eq!(decoded(&word)["SpareFolders"], json!([".tmp/sweep-logs", "logs"]), "{verb}");
+            assert_eq!(on_the_box(&word).spare_folders(), Ok(spare.to_vec()), "{verb} reads back on the box");
+        }
+        for (verb, word) in worded(&location()) {
+            let sent = decoded(&word);
+            assert!(sent.get("SpareFolders").is_none(), "{verb} with none sends no SpareFolders: {sent}");
+        }
     }
 
     #[test]

@@ -205,6 +205,9 @@ pub(super) struct Request<'a> {
     /// The digest of the manifest of the PC's build the client sent the work folder, `SentDigest`, `None` when it sent
     /// none.
     sent_digest: Option<&'a str>,
+    /// The folders below the main repo's tree whose files the clear after an interrupted command leaves alone,
+    /// `SpareFolders`; none when the payload gives none.
+    spare: Vec<String>,
 }
 
 impl Request<'_> {
@@ -268,6 +271,7 @@ impl Request<'_> {
         let engine = resolved_engine(payload.unreal_version()?, &refused);
         let inputs_digest = payload.inputs_digest()?;
         let sent_digest = payload.sent_digest()?;
+        let spare = payload.spare_folders()?;
         let lfs_digest = payload.lfs_digest()?;
         // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
         let (main, siblings, trees) = repos(payload, work, (bare, snapshot), lfs_digest)?;
@@ -297,6 +301,7 @@ impl Request<'_> {
             host,
             inputs_digest,
             sent_digest,
+            spare,
         })
     }
 
@@ -335,6 +340,7 @@ impl Request<'_> {
             key: self.key,
             main: &self.main,
             siblings: &self.siblings,
+            spare: &self.spare,
         }
     }
 
@@ -351,8 +357,29 @@ fn repo_name_of(bare: &str) -> &str {
     bare_stem(bare, folder, PathForm::Windows).unwrap_or(file)
 }
 
+/// Whether the folder at `path` below the work folder is one `spared` names below the main repo's tree, whose names
+/// below the work folder are `base` (none for one repo, the leaf on a pair run): its first names those of `base`
+/// ignoring ASCII letter case, and
+/// its names below them, each valid Unicode, matched as [`Spared::spares`] matches them. A folder outside the main
+/// repo's tree, or with a name that is not valid Unicode, is never spared.
+///
+/// [`Spared::spares`]: gate_router::spare::Spared::spares
+fn spared_below(spared: &gate_router::spare::Spared, base: &[String], path: &Path) -> bool {
+    if spared.is_empty() {
+        return false;
+    }
+    let Some(names) = path.iter().map(OsStr::to_str).collect::<Option<Vec<&str>>>() else {
+        return false;
+    };
+    let Some((head, below)) = names.split_at_checked(base.len()) else {
+        return false;
+    };
+    head.iter().zip(base).all(|(name, base)| name.eq_ignore_ascii_case(base)) && !below.is_empty() && spared.spares(below)
+}
+
 /// What the layout step lays out ([`WorkGit::lay_out`]): the work folder, the main repo and the siblings of a pair,
-/// none for one repo. A run and the inputs verb each build one, so both lay the work folder out alike.
+/// none for one repo, and the folders below the main repo's tree its clear after an interrupted command spares. A run
+/// and the inputs verb each build one, so both lay the work folder out alike, each sparing what its payload names.
 pub(super) struct Laid<'r> {
     work: &'r str,
     /// The payload's key, which names the work folder's jobs ([`gate_wire::is_job_name`]); the work folder's last name
@@ -360,6 +387,8 @@ pub(super) struct Laid<'r> {
     key: &'r str,
     main: &'r Repo<'r>,
     siblings: &'r [Repo<'r>],
+    /// The run's `SpareFolders`, each a folder path below the main repo's tree ([`gate_router::spare::Spared`]).
+    spare: &'r [String],
 }
 
 impl Laid<'_> {
@@ -407,6 +436,7 @@ pub(super) fn lay_out_alone(asked: &inputs::WorkLock<'_>, console: &mut Console)
         key: asked.key,
         main: &main,
         siblings: &siblings,
+        spare: asked.spare,
     };
     let laid_out = swept(&laid)
         .map_err(NotLaidOut::Refused)
@@ -3421,7 +3451,7 @@ impl WorkGit {
             // Last, so a clear cut short still finds the record and clears again.
             removed(Path::new(&command))?;
         } else {
-            self.cleared_interrupted(laid.work, laid.key, &held, console)?;
+            self.cleared_interrupted(laid, &held, console)?;
         }
         // A tree readied here removes the warm record itself when its `.git` is made or repaired ([`WorkGit::ready_trees`]).
         if changed || !laid.siblings.is_empty() || !preflight::git_is_plain(Path::new(&laid.main.tree)) {
@@ -3437,10 +3467,12 @@ impl WorkGit {
     /// record ([`command_record`]) is there: the warm, packages and tools records removed first, so none of their
     /// skip rules trusts the folder; the recorded job ended until it holds no process, a job no longer there being
     /// fine; then every file below the work folder written since the recorded start ([`Interrupted::read`]) removed
-    /// by handle ([`gate_win32::delete_fresh_beneath`]), never inside a `.git` or behind a junction; the record
-    /// removed last, so a clear cut short runs again. Its two lines are said under the box's output lock. A file that
-    /// will not go, or a job that will not empty, refuses the run `layout` with the record kept ([`WorkGit::not_cleared`]).
-    fn cleared_interrupted(&self, work: &str, key: &str, held: &File, console: &mut Console) -> Result<(), NotLaidOut> {
+    /// by handle ([`gate_win32::delete_fresh_beneath`]), never inside a `.git` or behind a junction, nor below a folder
+    /// the run's spare list names ([`spared_below`]), whose files are left uncounted; the record removed last, so a
+    /// clear cut short runs again. Its two lines are said under the box's output lock. A file that will not go, or a
+    /// job that will not empty, refuses the run `layout` with the record kept ([`WorkGit::not_cleared`]).
+    fn cleared_interrupted(&self, laid: &Laid<'_>, held: &File, console: &mut Console) -> Result<(), NotLaidOut> {
+        let (work, key) = (laid.work, laid.key);
         let Some(interrupted) = interrupted(work, key)? else {
             return Ok(());
         };
@@ -3456,7 +3488,11 @@ impl WorkGit {
             tries: CLEAR_TRIES,
             wait: CLEAR_WAIT,
         };
-        let count = gate_win32::delete_fresh_beneath(held, fresh)
+        let spared = gate_router::spare::Spared::new(laid.spare);
+        // The main repo's tree is the work folder itself for one repo, `{work}\{leaf}` on a pair run ([`trees`]).
+        let base = laid.main.name.as_slice();
+        let spares = |path: &Path| spared_below(&spared, base, path);
+        let count = gate_win32::delete_fresh_beneath(held, fresh, &spares)
             .map_err(|not| self.not_cleared(&Path::new(work).join(&not.path).display().to_string(), &not.error, console))?;
         self.say(
             console,

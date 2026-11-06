@@ -9619,6 +9619,222 @@ fn box_run_after_a_stopped_run_clears_what_it_wrote() {
 }
 
 #[test]
+fn box_run_after_a_stopped_run_spares_the_folders_its_payload_names() {
+    const SPARED: &str = r".tmp\sweep-logs\run.log";
+    let case = Case::new("box_run_after_stop_spared");
+    let mut payload = box_payload(
+        &case,
+        "k",
+        &[
+            FAKE_TOOL,
+            "write",
+            SPARED,
+            "log",
+            "write",
+            HALF_WRITTEN,
+            "{",
+            "err",
+            "mid-write",
+            "sleep",
+            "600000",
+        ],
+    );
+    payload["SpareFolders"] = json!([".tmp/sweep-logs"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\n.tmp/\n"), ("a.txt", "a\n")]);
+    let running = start_box(&case, &payload);
+    running.wait_for_stderr("mid-write");
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    let outcome = running.finish_read();
+    assert_eq!(outcome.code, Some(124), "the stop ended the command: {outcome:?}");
+    let work = PathBuf::from(field(&payload, "Work"));
+    assert!(
+        work.join(SPARED).exists() && work.join(HALF_WRITTEN).exists(),
+        "the stopped command left both files"
+    );
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+
+    let next = run_box(&case, &ran_next(&payload));
+
+    assert_eq!(next.code, Some(0), "{next:?}");
+    assert!(work.join(SPARED).exists(), "the spared folder's file survives the clear: {next:?}");
+    assert!(!work.join(HALF_WRITTEN).exists(), "a file elsewhere is cleared: {next:?}");
+    assert!(lines(&next.stderr).contains(&CLEARING), "{next:?}");
+    assert!(
+        !command_record(&payload).exists(),
+        "the clear and the clean run remove the record: {next:?}"
+    );
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// A routed run that sends inputs calls the inputs verb before its run, so that verb's layout runs the clear after the
+/// stopped run, sparing what its own payload names; the run after it finds nothing left to clear.
+#[test]
+fn box_run_after_a_stopped_run_spares_the_folders_an_inputs_call_names() {
+    const SPARED: &str = r".tmp\sweep-logs\run.log";
+    let case = Case::new("box_run_after_stop_inputs_spared");
+    let mut payload = box_payload(
+        &case,
+        "k",
+        &[
+            FAKE_TOOL,
+            "write",
+            SPARED,
+            "log",
+            "write",
+            HALF_WRITTEN,
+            "{",
+            "err",
+            "mid-write",
+            "sleep",
+            "600000",
+        ],
+    );
+    payload["SpareFolders"] = json!([".tmp/sweep-logs"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\n.tmp/\n"), ("a.txt", "a\n")]);
+    let running = start_box(&case, &payload);
+    running.wait_for_stderr("mid-write");
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_eq!(running.finish_read().code, Some(124), "the stop ended the command");
+    let work = PathBuf::from(field(&payload, "Work"));
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+
+    let mut inputs = ran_next(&payload);
+    inputs["Step"] = json!("diff");
+    let (calling, mut stdin) = box_call(&case, &["box", "inputs"], &self::payload(&inputs)).start_with_stdin();
+    stdin.write_all(b"{\"files\":{}}\n").expect("the manifest can be sent");
+    drop(stdin);
+    let inputs_call = calling.finish_read();
+
+    assert_eq!(inputs_call.code, Some(0), "{inputs_call:?}");
+    assert!(
+        lines(&inputs_call.stderr).contains(&CLEARING),
+        "the inputs verb clears first: {inputs_call:?}"
+    );
+    assert!(
+        work.join(SPARED).exists(),
+        "the spared folder's file survives the inputs verb's clear: {inputs_call:?}"
+    );
+    assert!(!work.join(HALF_WRITTEN).exists(), "a file elsewhere is cleared: {inputs_call:?}");
+    assert!(!command_record(&payload).exists(), "the clear removes the record: {inputs_call:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+
+    let next = run_box(&case, &renamed(&ran_next(&payload), 3));
+
+    assert_eq!(next.code, Some(0), "{next:?}");
+    assert!(!lines(&next.stderr).contains(&CLEARING), "nothing is left to clear: {next:?}");
+    assert!(work.join(SPARED).exists(), "the spared file survives the run: {next:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// An LFS call lays the work folder out under its lock as the inputs verb does, so when it is the first verb after a
+/// stopped run, its layout runs the clear, sparing what its own payload names.
+#[test]
+fn box_lfs_after_a_stopped_run_spares_the_folders_its_payload_names() {
+    const SPARED: &str = r".tmp\sweep-logs\run.log";
+    let case = Case::new("box_lfs_after_stop_spared");
+    let mut payload = box_payload(
+        &case,
+        "k",
+        &[
+            FAKE_TOOL,
+            "write",
+            SPARED,
+            "log",
+            "write",
+            HALF_WRITTEN,
+            "{",
+            "err",
+            "mid-write",
+            "sleep",
+            "600000",
+        ],
+    );
+    payload["SpareFolders"] = json!([".tmp/sweep-logs"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\n.tmp/\n"), ("a.txt", "a\n")]);
+    let running = start_box(&case, &payload);
+    running.wait_for_stderr("mid-write");
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_eq!(running.finish_read().code, Some(124), "the stop ended the command");
+    let work = PathBuf::from(field(&payload, "Work"));
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+
+    let mut lfs = ran_next(&payload);
+    lfs["Step"] = json!("diff");
+    let (calling, mut stdin) = box_call(&case, &["box", "lfs"], &self::payload(&lfs)).start_with_stdin();
+    // An empty manifest: the diff needs no object, and its layout still runs first.
+    stdin.write_all(b"\n").expect("the manifest can be sent");
+    drop(stdin);
+    let lfs_call = calling.finish_read();
+
+    assert_eq!(lfs_call.code, Some(0), "{lfs_call:?}");
+    assert!(lines(&lfs_call.stderr).contains(&CLEARING), "the LFS verb clears first: {lfs_call:?}");
+    assert!(
+        work.join(SPARED).exists(),
+        "the spared folder's file survives the LFS verb's clear: {lfs_call:?}"
+    );
+    assert!(!work.join(HALF_WRITTEN).exists(), "a file elsewhere is cleared: {lfs_call:?}");
+    assert!(!command_record(&payload).exists(), "the clear removes the record: {lfs_call:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// On a pair run the spare list names folders below the main repo's tree alone: the same folder in a sibling's tree is
+/// cleared like any other file the stopped command wrote.
+#[test]
+fn box_run_of_a_pair_spares_only_the_main_tree_s_folder() {
+    const SPARED: &str = r".tmp\sweep-logs\run.log";
+    let case = Case::new("box_run_pair_spared");
+    let sibling_spared = format!(r"..\lib\{SPARED}");
+    let command = [
+        FAKE_TOOL,
+        "write",
+        SPARED,
+        "log",
+        "write",
+        &sibling_spared,
+        "log",
+        "write",
+        HALF_WRITTEN,
+        "{",
+        "err",
+        "mid-write",
+        "sleep",
+        "600000",
+    ];
+    let mut payload = pair_payload(&case, &["lib"], &command);
+    payload["SpareFolders"] = json!([".tmp/sweep-logs"]);
+    let ignored = ".gitignore";
+    pair_snapshot(
+        &case,
+        &mut payload,
+        &[(ignored, "bin/\n.tmp/\n"), ("a.txt", "a\n")],
+        &[("lib", &[(ignored, ".tmp/\n"), ("b.txt", "b\n")])],
+    );
+    let running = start_box(&case, &payload);
+    running.wait_for_stderr("mid-write");
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_eq!(running.finish_read().code, Some(124), "the stop ended the command");
+    let (main, lib) = (PathBuf::from(pair_tree(&payload, "app")), PathBuf::from(pair_tree(&payload, "lib")));
+    assert!(
+        main.join(SPARED).exists() && lib.join(SPARED).exists() && main.join(HALF_WRITTEN).exists(),
+        "the stopped command left every file"
+    );
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+
+    let next = run_box(&case, &ran_next(&payload));
+
+    assert_eq!(next.code, Some(0), "{next:?}");
+    assert!(lines(&next.stderr).contains(&CLEARING), "{next:?}");
+    assert!(main.join(SPARED).exists(), "the main tree's spared folder survives: {next:?}");
+    assert!(!lib.join(SPARED).exists(), "the sibling's folder of the same name is cleared: {next:?}");
+    assert!(!main.join(HALF_WRITTEN).exists(), "a file elsewhere is cleared: {next:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
 fn box_run_clear_never_enters_a_junction_or_git() {
     let case = Case::new("box_run_clear_junction_git");
     let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "laid"]);

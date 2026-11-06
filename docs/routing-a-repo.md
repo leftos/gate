@@ -336,6 +336,14 @@ The line `gate: a routed run does not send the caller's <names>; --env NAME send
 
 A file the gate cannot use says `gate: .gate/env.toml: <problem>; only the build variables are watched` and the run still routes. The file may also sit in the declarations folder; `gate check` does not report it ([design.md](design.md#command-environment)).
 
+## Keeping a killed run's finished work on the builder
+
+When a command is ended mid-run (killed at its ceiling, or its client lost), the Windows builder's next run clears every file that command wrote in the work folder. A repo whose builds keep a slow cache there names its folders in a tracked `.gate/spare.toml`, `folders = ["build/cache"]`, at most 32 entries, each a `/`-separated folder below the worktree root written as a `carriedFolders` entry is (`*` and `?` within a name, matched ignoring letter case, no `.`, `..` or `**` name). An entry spares everything below every folder it matches; on a pair run the list is the main repo's.
+
+The list spares files only in that clear. A spared folder must be gitignored, or the checkout's `git clean -fdq` deletes it on every run; the clear after a layout change, `checkout --force` of tracked files and a prune ignore the list. The macOS builder's clear deletes no files, so it needs none. It needs no `remote.json` consent.
+
+A file the gate cannot use says `gate: .gate/spare.toml: <problem>; the box's clear spares no folder` and the run still routes. The file may also sit in the declarations folder ([design.md](design.md#command-environment)).
+
 ## A repo whose git hooks run heavy checks
 
 A heavy gate started inside a git hook stays local silently unless `remote.json` names its repo in `hooks`, an array of repo names matched in any letter case: `"hooks": ["<repo>"]`. A value that is not an array of non-empty strings consents to no repo, and the rest of the file is still read ([design.md, remote.json](design.md#remotejson)).

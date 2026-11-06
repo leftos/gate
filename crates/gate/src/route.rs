@@ -85,6 +85,9 @@ const PAIR_INPUTS_MAC_ONLY: &str = "pair inputs mac only";
 const NO_PATTERN: &str = "no pattern";
 /// The declaration file of the prefixes of the caller's variables a repo's commands read.
 const ENV_NAME: &str = "env.toml";
+
+/// The repo's spare declaration's file name in `.gate` ([`spare_folders`]).
+const SPARE_NAME: &str = "spare.toml";
 /// The largest file of `.gate` the gate reads: 64 KiB.
 const GATE_FILE_MOST_BYTES: usize = 64 * 1024;
 /// The problem of a file of `.gate` that is a link, a junction or a folder.
@@ -156,6 +159,9 @@ pub(crate) struct Decided {
     pub route: Route,
     pub placed: Placed,
     pub warm_hash: Option<String>,
+    /// The folders the repo of a routed run or a commit's stage names in `.gate/spare.toml` ([`spare_folders`]); none
+    /// for every other route.
+    pub spare_folders: Vec<String>,
     pub decision: Decision,
     pub(crate) sent: Option<Sent>,
 }
@@ -269,10 +275,17 @@ pub(crate) fn route(
         },
         route => route,
     };
-    let (warm_hash, declared) = match &route {
-        Route::Routed(remote) => (consented_hash(remote, &machine), declared_prefixes(remote, &machine)),
-        Route::Local { .. } | Route::Refused(_) | Route::Stage(_) => (None, Ok(Vec::new())),
+    let (warm_hash, declared, spare) = match &route {
+        Route::Routed(remote) => (
+            consented_hash(remote, &machine),
+            declared_prefixes(remote, &machine),
+            spare_folders(Path::new(&remote.root), &remote.repo, &machine),
+        ),
+        // A commit's stage lays out the same work folder as the repo's routed runs, so its clear spares the same folders.
+        Route::Stage(stage) => (None, Ok(Vec::new()), spare_folders(Path::new(&stage.root), &stage.repo, &machine)),
+        Route::Local { .. } | Route::Refused(_) => (None, Ok(Vec::new()), Ok(Vec::new())),
     };
+    let (spare_folders, spare_problem) = spare_split(spare);
     // A refused pin never readies its log, so the notes it would have written there are said now.
     let refused = matches!(route, Route::Refused(_));
     // A gate under a parent says only its one line of the decision, never its notes.
@@ -286,14 +299,20 @@ pub(crate) fn route(
     }
     match &route {
         Route::Local { reason: Some(reason) } => console.err(&reason.line()),
-        Route::Local { reason: None } | Route::Stage(_) => {}
+        Route::Local { reason: None } => {}
+        Route::Stage(_) => {
+            if let Some(line) = &spare_problem {
+                console.err(line);
+            }
+        }
         Route::Refused(refusal) => console.err(&refusal.line()),
-        Route::Routed(run) => say_routed(request, run, declared, console),
+        Route::Routed(run) => say_routed(request, run, declared, spare_problem.as_deref(), console),
     }
     Decided {
         route,
         placed: machine.found.into_inner(),
         warm_hash,
+        spare_folders,
         decision,
         sent: machine.sent.into_inner(),
     }
@@ -355,8 +374,9 @@ fn folded(path: &Path) -> String {
 
 /// Says the lines of `request`'s routed `run`: the line of the builders its decision scored when it scored two or more
 /// ([`balanced_line`]), its route lines, the problem of its repo's `.gate/env.toml` when `declared` is one
-/// ([`declared_prefixes`]), and the line of the watched variables it does not send ([`dropped_line`]).
-fn say_routed(request: &RunRequest, run: &RemoteRun, declared: Result<Vec<String>, String>, console: &mut Console) {
+/// ([`declared_prefixes`]), the problem line of its `.gate/spare.toml` when it has one ([`spare_folders`]), and the line
+/// of the watched variables it does not send ([`dropped_line`]).
+fn say_routed(request: &RunRequest, run: &RemoteRun, declared: Result<Vec<String>, String>, spare: Option<&str>, console: &mut Console) {
     if let Some(line) = run.balanced.as_ref().and_then(balanced_line) {
         console.err(&line);
     }
@@ -365,6 +385,9 @@ fn say_routed(request: &RunRequest, run: &RemoteRun, declared: Result<Vec<String
         console.err(&line);
         Vec::new()
     });
+    if let Some(line) = spare {
+        console.err(line);
+    }
     if let Some(line) = dropped_line(request, &prefixes) {
         console.err(&line);
     }
@@ -402,8 +425,8 @@ fn balanced_figures(entry: &BalancedEntry, has_duration: bool) -> String {
 /// ([`route_as_heavy`]).
 pub(crate) enum AsHeavy {
     /// It runs on the builder: the routed run, with the hash of its repo's warm-up file when its warm-up is set up
-    /// ([`consented_hash`]).
-    Routed(Box<RemoteRun>, Option<String>),
+    /// ([`consented_hash`]), and the folders its repo's `.gate/spare.toml` names ([`spare_folders`]).
+    Routed(Box<RemoteRun>, Option<String>, Vec<String>),
     /// It goes back to its wait here.
     Here,
     /// It ends, refused; its lines are said.
@@ -453,6 +476,7 @@ pub(crate) fn route_as_heavy(request: &RunRequest, decision: &Decision, by: u32,
     };
     let warm_hash = consented_hash(&run, &machine);
     let declared = declared_prefixes(&run, &machine);
+    let (spare_folders, spare_problem) = spare_split(spare_folders(Path::new(&run.root), &run.repo, &machine));
     for line in machine.unsaid_notes() {
         console.note(&line);
     }
@@ -460,8 +484,8 @@ pub(crate) fn route_as_heavy(request: &RunRequest, decision: &Decision, by: u32,
         "gate: held back by the critical request of gate {by}; sending this light run to {}",
         run.builder.alias
     ));
-    say_routed(request, &run, declared, console);
-    AsHeavy::Routed(run, warm_hash)
+    say_routed(request, &run, declared, spare_problem.as_deref(), console);
+    AsHeavy::Routed(run, warm_hash, spare_folders)
 }
 
 /// The routed run of `request` on `candidate`, a later builder of the run its decision `decision` routed
@@ -534,6 +558,38 @@ fn declared_prefixes(remote: &RemoteRun, machine: &Machine<'_>) -> Result<Vec<St
         Err(problem) => problem,
     };
     Err(gate_router::env::problem_line(&source.said(ENV_NAME), &problem))
+}
+
+/// The folders the repo `repo` of the worktree at `root` names in `.gate/spare.toml` ([`gate_router::spare::read_spare`]),
+/// which the box's clear after an interrupted command leaves alone, read as [`declared_prefixes`] reads `.gate/env.toml`:
+/// through [`read_declaration`] with the declarations folder of the routing file `machine` holds, its log lines kept
+/// among `machine`'s notes; none when neither place has the file. A routed run reads it after the decision, which it
+/// never changes, and a warm-up before its call, as each lays the work folder out.
+///
+/// # Errors
+///
+/// The line to say when the file cannot be read or has a problem ([`gate_router::spare::problem_line`]), naming it as
+/// [`Source::said`] does; the call then goes with no folder spared.
+pub(crate) fn spare_folders(root: &Path, repo: &str, machine: &Machine<'_>) -> Result<Vec<String>, String> {
+    let (read, source) = read_declaration(root, repo, machine.config.borrow().as_ref(), SPARE_NAME);
+    machine.notes.borrow_mut().extend(source.log_lines(repo, SPARE_NAME));
+    let problem = match read {
+        Ok(None) => return Ok(Vec::new()),
+        Ok(Some(bytes)) => match gate_router::spare::read_spare(&bytes) {
+            Ok(folders) => return Ok(folders),
+            Err(problem) => problem,
+        },
+        Err(problem) => problem,
+    };
+    Err(gate_router::spare::problem_line(&source.said(SPARE_NAME), &problem))
+}
+
+/// The folders `spare` names and no problem line, or none and the line saying its problem ([`spare_folders`]).
+pub(crate) fn spare_split(spare: Result<Vec<String>, String>) -> (Vec<String>, Option<String>) {
+    match spare {
+        Ok(folders) => (folders, None),
+        Err(line) => (Vec::new(), Some(line)),
+    }
 }
 
 /// The hash of `remote`'s warm-up file when its repo has warm-up consent and the file parsed; else `None`. Consent is

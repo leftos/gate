@@ -401,6 +401,13 @@ impl Payload {
         self.globs_at("FailureOutputs")
     }
 
+    /// The folders below the main repo's tree whose files the clear after an interrupted command leaves alone,
+    /// `SpareFolders`, as the repo's `.gate/spare.toml` names them: read as [`Payload::output_globs`] reads `Outputs`;
+    /// none when the key is absent or null. Else the usage line.
+    pub fn spare_folders(&self) -> Result<Vec<String>, String> {
+        self.globs_at("SpareFolders")
+    }
+
     /// The globs at `key`: a list of non-empty texts holding no `[` or `]`; none when the key is absent or null. Else
     /// the usage line naming `key`, a glob shown with its control characters escaped.
     fn globs_at(&self, key: &str) -> Result<Vec<String>, String> {
@@ -3241,6 +3248,35 @@ mod tests {
         );
         assert_eq!(
             output_globs(&json!({ "FailureOutputs": ["d/*.dmp"] })),
+            Ok(vec![]),
+            "Outputs is not read from it"
+        );
+    }
+
+    #[test]
+    fn spare_folders_are_a_list_of_texts_none_when_absent() {
+        let spare = |json: serde_json::Value| decoded(&json.to_string()).and_then(|payload| payload.spare_folders());
+        assert_eq!(spare(json!({})), Ok(vec![]), "absent");
+        assert_eq!(spare(json!({ "SpareFolders": null })), Ok(vec![]), "null");
+        assert_eq!(
+            spare(json!({ "SpareFolders": [".tmp/sweep-logs", "logs"], "FailureOutputs": ["d/*.dmp"] })),
+            Ok(vec![".tmp/sweep-logs".to_owned(), "logs".to_owned()]),
+            "its own key"
+        );
+        assert_eq!(
+            spare(json!({ "SpareFolders": ".tmp/sweep-logs" })),
+            Err("gate: box payload SpareFolders is not a list of texts".to_owned())
+        );
+        assert_eq!(
+            spare(json!({ "SpareFolders": ["logs", 3] })),
+            Err("gate: box payload SpareFolders is not a list of texts".to_owned())
+        );
+        assert_eq!(
+            spare(json!({ "SpareFolders": [""] })),
+            Err("gate: box payload SpareFolders holds an empty glob".to_owned())
+        );
+        assert_eq!(
+            output_globs(&json!({ "SpareFolders": ["logs"] })),
             Ok(vec![]),
             "Outputs is not read from it"
         );

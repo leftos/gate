@@ -155,6 +155,87 @@ fn a_warm_up_from_a_subfolder_is_worded_and_sent_from_the_root() {
     assert_eq!(record(&case).expect("a record")["state"], "warm");
 }
 
+/// A warm-up lays the work folder out as a run does, so its call sends the folders the repo's `.gate/spare.toml`
+/// names, which the box's clear after an interrupted command spares.
+#[test]
+fn a_warm_up_sends_its_repo_s_spare_folders() {
+    let case = warm_case("warm-spare");
+    fs::write(case.folder().join(".gate").join("spare.toml"), "folders = ['.tmp/sweep-logs', 'logs']\n").expect("the declaration can be written");
+    let call = case.folder().join("call.json");
+    let steps = steps(&case, &[&format!("record {}", shown(&call)), "warmed"]);
+
+    let outcome = warm(&case, &steps, &[]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let call = recorded(&call);
+    assert_eq!(call["spareFolders"], json!([".tmp/sweep-logs", "logs"]), "{call}");
+    assert!(!outcome.stderr.contains("spare.toml"), "a good file says nothing: {outcome:?}");
+
+    // Through the real client, the warm-up's run call the builder is fed carries them as `SpareFolders`.
+    let case = warm_client_case("warm-real-spare");
+    fs::write(case.folder().join(".gate").join("spare.toml"), "folders = ['.tmp/sweep-logs', 'logs']\n").expect("the declaration can be written");
+    // The run call keeps its request: it waits on the case folder, which is there already.
+    let fed = format!("fed-hold {}", shown(&case.folder()));
+    let steps = ssh_steps(&case, "ssh", &["ok", &fed]);
+
+    let outcome = finish(warm_client(&case, &steps, &[]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "{outcome:?}");
+    let sent = fed_request(&steps);
+    assert!(sent.get("WarmCommands").is_some(), "the request is the warm-up's: {sent}");
+    assert_eq!(sent["SpareFolders"], json!([".tmp/sweep-logs", "logs"]), "{sent}");
+}
+
+/// The request the stand-in of the steps file `steps` was fed by its last call that kept it (`fed-hold`), decoded: its
+/// first line, base64 JSON.
+fn fed_request(steps: &Path) -> Value {
+    use base64::Engine;
+    let input = fs::read_to_string(crate::support::beside(steps, ".input")).expect("the stand-in kept the call's input");
+    let word = input.lines().next().expect("the input has a request line");
+    let json = base64::engine::general_purpose::STANDARD.decode(word).expect("the request is base64");
+    serde_json::from_slice(&json).expect("the request is JSON")
+}
+
+/// The line of the problem of `.gate/spare.toml` the case [`a_warm_up_with_a_spare_file_problem`] writes.
+const SPARE_PROBLEM: &str = "gate: .gate/spare.toml: folders is not an array (TOML string); the box's clear spares no folder";
+
+/// A warm-up of a case whose `.gate/spare.toml` has a problem, with `extra` words: its outcome, the call it recorded and
+/// its warm log's text.
+fn a_warm_up_with_a_spare_file_problem(name: &str, extra: &[&str]) -> (Outcome, Value, String) {
+    let case = warm_case(name);
+    fs::write(case.folder().join(".gate").join("spare.toml"), "folders = '.tmp'\n").expect("the declaration can be written");
+    let call = case.folder().join("call.json");
+    let steps = steps(&case, &[&format!("record {}", shown(&call)), "warmed"]);
+    let outcome = warm(&case, &steps, extra);
+    let log = fs::read_to_string(warm_entry(&case, "log").expect("the warm-up log is written")).expect("the log can be read");
+    (outcome, recorded(&call), log)
+}
+
+/// A spare file with a problem never stops a warm-up: it goes with no folder spared, its line in the warm log among the
+/// other notes and on stderr.
+#[test]
+fn a_warm_up_whose_spare_file_has_a_problem_says_so_and_still_warms() {
+    let (outcome, call, log) = a_warm_up_with_a_spare_file_problem("warm-spare-broken", &[]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(call["spareFolders"], json!([]), "{call}");
+    assert!(outcome.stderr.lines().any(|line| line == SPARE_PROBLEM), "{outcome:?}");
+    assert!(log.lines().any(|line| line == SPARE_PROBLEM), "{log}");
+}
+
+/// Under `--background` the spare file's problem line goes into the warm log alone, as the warm-up's other quiet lines
+/// keep off stderr.
+#[test]
+fn a_background_warm_up_logs_its_spare_file_problem_and_says_nothing() {
+    let (outcome, call, log) = a_warm_up_with_a_spare_file_problem("warm-spare-broken-bg", &["--background"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(call["spareFolders"], json!([]), "{call}");
+    assert!(!outcome.stderr.contains("spare.toml"), "nothing on stderr: {outcome:?}");
+    assert!(log.lines().any(|line| line == SPARE_PROBLEM), "{log}");
+}
+
 #[test]
 fn a_warm_up_whose_root_the_path_map_cannot_carry_logs_why_it_has_none() {
     let case = warm_case("warm path-map");
