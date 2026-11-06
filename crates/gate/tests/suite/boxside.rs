@@ -3270,8 +3270,8 @@ fn box_run_leaves_a_lock_another_handle_holds_open() {
     assert!(lock.is_file(), "the held lock stays: {outcome:?}");
 }
 
-/// A stop during the command keeps the back commit's git from starting: its first step, `add -A`, says the stop and
-/// never runs, so it leaves no `{Work}.index.lock` behind.
+/// A stop during the command keeps the back commit from starting: the stopped command makes none, so its first step,
+/// `add -A`, never runs, it leaves no `{Work}.index.lock` behind, and no sync-back failure is said.
 #[test]
 fn box_run_after_a_stop_during_the_command_starts_no_back_commit_step() {
     let case = Case::new("box_run_stop_no_back_commit");
@@ -3290,8 +3290,10 @@ fn box_run_after_a_stop_during_the_command_starts_no_back_commit_step() {
     let outcome = running.finish_read();
 
     assert_eq!(stopped.code, Some(0), "{stopped:?}");
-    let line = format!("failed: the job {} was stopped", field(&payload, "Job"));
-    assert!(outcome.stderr.contains(&line), "{line}: {outcome:?}");
+    assert!(
+        !outcome.stderr.contains("gate: remote sync-back failed"),
+        "a stopped run makes no back commit to fail: {outcome:?}"
+    );
     assert!(!added.exists(), "no add was started: {outcome:?}");
     let index_lock = PathBuf::from(format!("{}.index.lock", field(&payload, "Work")));
     assert!(!index_lock.exists(), "no index lock is left: {outcome:?}");
@@ -5386,6 +5388,33 @@ fn box_run_a_closed_stderr_pipe_stops_a_quiet_command_and_exits_255() {
     assert_eq!(stopped.stdout, "", "nothing is left to stop: {stopped:?}");
     assert!(!has_ref(&payload, "refs/gate-back/k"), "a lost client gets no back commit");
     wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// A warm-up whose client goes while its command runs ends 255 as any run does, and packs nothing: a warm-up asks for
+/// no outputs, and its command's gone end is no pack's.
+#[test]
+fn box_warm_up_whose_client_goes_packs_nothing() {
+    let case = Case::new("box_warm_up_gone");
+    let mut payload = box_payload(&case, "k", &[]);
+    payload.as_object_mut().expect("the payload is an object").remove("Command");
+    payload["WarmCommands"] = json!([[FAKE_TOOL, "write", r"dumps\a.dmp", "dmp", "out", "started", "sleep", "1200000"]]);
+    payload["WarmHash"] = json!("5f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0");
+    payload["Timeout"] = json!(600);
+    snapshot(&case, &mut payload, &[(".gitignore", "dumps/\n")]);
+
+    let (running, stderr) =
+        bare_box_call(&case, &["box", "--test-heartbeat-ms", "200", "run"], &self::payload(&payload)).start_with_closable_stderr();
+    running.wait_for_stdout("started");
+    stderr.close();
+    let outcome = ended_within(running, QUIET_CLIENT_GONE_GUARD);
+
+    assert_eq!(outcome.code, Some(255), "a closed connection exits 255: {outcome:?}");
+    let archive = Path::new(field(&payload, "OutputFolder")).join(format!("k-{}.tar.zst", field(&payload, "Nonce")));
+    assert!(!archive.exists(), "a warm-up packs nothing: {outcome:?}");
+    assert!(
+        !Path::new(&format!("{}.warm", field(&payload, "Work"))).exists(),
+        "no warm record: {outcome:?}"
+    );
 }
 
 #[test]

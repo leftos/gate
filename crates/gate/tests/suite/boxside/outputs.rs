@@ -3,6 +3,7 @@
 //! once and removes it.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -11,6 +12,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
+use gate_win32::NamedEvent;
 use gate_win32::socket::Stream;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -21,11 +23,11 @@ use super::channel_pc::{
     BOX_PROOF, PC_PROOF, assert_no_proof, channel_line, free_port, has_line, hex_bytes, listening, not_completed, pc_connected, proved, with_windows,
 };
 use super::{
-    BoxCall, bare_box_call, box_call, ended_within, field, gate_box, git, git_folder, has_ref, path_for_run, payload, renamed, run_box,
-    run_box_with_path, snapshot,
+    BoxCall, Does, PARKED_GIT_GUARD, QUIET_CLIENT_GONE_GUARD, bare_box_call, box_call, ended_within, field, gate_box, git, git_folder, has_ref,
+    parked_pid, path_for_run, payload, renamed, run_box, run_box_with_path, snapshot, stub_git_doing, wait_until_gone,
 };
 use crate::remote_client::MARKED_BEFORE_THE_KILL_GUARD;
-use crate::support::{Case, FAKE_TOOL, HANG_GUARD, Outcome, Running, box_payload, shown};
+use crate::support::{Case, FAKE_TOOL, HANG_GUARD, Outcome, Running, StderrCloser, box_payload, shown};
 
 /// The ignore file of an outputs case's snapshot: `bin/` is build output, so no back commit carries it.
 const IGNORE_BIN: (&str, &str) = (".gitignore", "bin/\n");
@@ -901,6 +903,412 @@ fn box_run_killed_at_its_ceiling_too_near_the_backstop_packs_nothing() {
     assert!(!archive_path(&payload).exists(), "nothing is packed");
 }
 
+/// The command of the client-gone and stop cases: it writes the build file `bin\a.txt`, which only an outputs glob
+/// names, and the dump `dumps\a.dmp`, which a failure output glob names, says `started` and sleeps until it is ended.
+const WRITES_THEN_SLEEPS: [&str; 11] = [
+    FAKE_TOOL,
+    "write",
+    r"bin\a.txt",
+    "a",
+    "write",
+    r"dumps\a.dmp",
+    "dmp",
+    "out",
+    "started",
+    "sleep",
+    "1200000",
+];
+
+/// The payload of a run of `command` asking for the outputs under `bin/**` and the failure outputs under `dumps/*.dmp`,
+/// its snapshot, which ignores both, pushed.
+fn dump_payload(case: &Case, command: &[&str]) -> Value {
+    let mut payload = failure_payload(case, command, &["bin/**"], &["dumps/*.dmp"]);
+    snapshot(case, &mut payload, &[IGNORE_ALL]);
+    payload
+}
+
+/// `gate box run` of `payload` with `seams` before the verb and a heartbeat every 200 ms, so the box finds a closed
+/// stderr within a period, and `PATH` set to `path` when given: its request line and the PC's empty manifest written,
+/// its stdin then closed, and its stderr closable by the case.
+fn run_to_be_cut(case: &Case, payload: &Value, seams: &[&str], path: Option<&OsString>) -> (Running, StderrCloser) {
+    let mut words = vec!["box", "--test-heartbeat-ms", "200"];
+    words.extend_from_slice(seams);
+    words.push("run");
+    let request = format!("{}\n{}", self::payload(payload), manifest(&[]).trim_end());
+    let mut call = bare_box_call(case, &words, &request);
+    if let Some(path) = path {
+        call.env("PATH", path);
+    }
+    call.start_with_closable_stderr()
+}
+
+/// A command whose client goes while it runs is stopped, and the failed run's set is packed, the dump alone, though
+/// the run ends 255 as any closed connection does.
+#[test]
+fn box_run_whose_client_goes_mid_command_packs_the_failed_run_set_and_exits_255() {
+    let case = Case::new("box_outputs_gone_mid_command");
+    let payload = dump_payload(&case, &WRITES_THEN_SLEEPS);
+
+    let (running, stderr) = run_to_be_cut(&case, &payload, &[], None);
+    running.wait_for_stdout("started");
+    stderr.close();
+    let outcome = ended_within(running, QUIET_CLIENT_GONE_GUARD);
+
+    assert_eq!(outcome.code, Some(255), "a closed connection exits 255: {outcome:?}");
+    assert_eq!(
+        archive_members(&archive_path(&payload)),
+        ["dumps/a.dmp"],
+        "the dump comes back, the build does not: {outcome:?}"
+    );
+    assert!(!has_ref(&payload, "refs/gate-back/k"), "a lost client gets no back commit");
+}
+
+/// A command the PC's stop ends packs the failed run's set and makes no back commit: the run ends on the stopped
+/// command's own 124, with no sync-back failure said.
+#[test]
+fn box_run_stopped_mid_command_packs_the_failed_run_set_and_makes_no_back_commit() {
+    let case = Case::new("box_outputs_stopped_mid_command");
+    let command = [&[FAKE_TOOL, "write", "new.txt", "x"][..], &WRITES_THEN_SLEEPS[1..]].concat();
+    let payload = dump_payload(&case, &command);
+
+    let (running, mut stdin) = box_call(&case, &["box", "run"], &self::payload(&payload)).start_with_stdin();
+    stdin.write_all(manifest(&[]).as_bytes()).expect("the manifest can be written");
+    running.wait_for_stdout("started");
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+    let outcome = running.finish_read();
+    drop(stdin);
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_eq!(outcome.code, Some(124), "the stopped command's own status: {outcome:?}");
+    assert!(has_line(&outcome.stderr, &packed_line(&payload, 1)), "{outcome:?}");
+    assert!(
+        !outcome.stderr.contains("gate: remote sync-back failed"),
+        "no back commit to fail: {outcome:?}"
+    );
+    assert!(!has_ref(&payload, "refs/gate-back/k"), "a stopped run gets no back commit: {outcome:?}");
+    assert_eq!(archive_members(&archive_path(&payload)), ["dumps/a.dmp"], "the dump alone");
+}
+
+/// A failed command whose client goes while its back commit's `add -A` runs still has the failed run's set packed,
+/// and the run ends 255.
+#[test]
+fn box_run_whose_client_goes_during_the_back_commit_still_packs_the_failed_run_set() {
+    let case = Case::new("box_outputs_gone_back_commit");
+    let command = [FAKE_TOOL, "write", r"bin\a.txt", "a", "write", r"dumps\a.dmp", "dmp", "exit", "3"];
+    let payload = dump_payload(&case, &command);
+    let stub = case.folder().join("stub");
+    let parked = case.folder().join("parked");
+    stub_git_doing(&stub, &[("-A", Does::Park(&parked))]);
+
+    let (running, stderr) = run_to_be_cut(&case, &payload, &[], Some(&path_for_run(std::slice::from_ref(&stub))));
+    let pid = parked_pid(&running, &stub, &parked);
+    stderr.close();
+    let outcome = ended_within(running, PARKED_GIT_GUARD);
+
+    assert_eq!(outcome.code, Some(255), "a closed connection exits 255: {outcome:?}");
+    assert_eq!(archive_members(&archive_path(&payload)), ["dumps/a.dmp"], "the dump alone: {outcome:?}");
+    wait_until_gone(pid);
+}
+
+/// A passing command whose client went after its back commit, before its pack, has only the failed run's set packed:
+/// the dump comes back, the build file only an outputs glob names does not, and the run ends as a closed connection.
+/// The run parks just before its pack until the box has seen its client gone.
+#[test]
+fn box_run_of_a_passing_command_whose_client_went_packs_only_its_failed_run_set() {
+    let case = Case::new("box_outputs_passed_gone");
+    let command = [FAKE_TOOL, "write", r"bin\a.txt", "a", "write", r"dumps\a.dmp", "dmp"];
+    let payload = dump_payload(&case, &command);
+    let gone = shown(&case.folder().join("gone"));
+    let seams = ["--test-box-gone-reached", gone.as_str(), "--test-box-park-outputs", gone.as_str()];
+
+    let (running, stderr) = run_to_be_cut(&case, &payload, &seams, None);
+    let parked = PathBuf::from(format!("{gone}.parked"));
+    running.wait_until("the run parked before its pack", || parked.exists());
+    stderr.close();
+    let outcome = ended_within(running, QUIET_CLIENT_GONE_GUARD);
+
+    assert_eq!(
+        outcome.code,
+        Some(255),
+        "a run whose client went ends as a closed connection, as every cut does: {outcome:?}"
+    );
+    assert_eq!(
+        archive_members(&archive_path(&payload)),
+        ["dumps/a.dmp"],
+        "the failed run's set alone: {outcome:?}"
+    );
+}
+
+/// A passing command that changed a tracked file, so its back commit is made and pushed, and whose client went before
+/// its pack still has its failed run's set packed: the PC syncs nothing back of a cut run, so the back commit's paths
+/// are not read to be left out, which a gone client would refuse.
+#[test]
+fn box_run_of_a_passing_command_that_changed_a_tracked_file_and_whose_client_went_still_packs_its_failed_run_set() {
+    let case = Case::new("box_outputs_passed_changed_gone");
+    let command = [
+        FAKE_TOOL,
+        "write",
+        "new.txt",
+        "x",
+        "write",
+        r"bin\a.txt",
+        "a",
+        "write",
+        r"dumps\a.dmp",
+        "dmp",
+    ];
+    let payload = dump_payload(&case, &command);
+    let gone = shown(&case.folder().join("gone"));
+    let seams = ["--test-box-gone-reached", gone.as_str(), "--test-box-park-outputs", gone.as_str()];
+
+    let (running, stderr) = run_to_be_cut(&case, &payload, &seams, None);
+    let parked = PathBuf::from(format!("{gone}.parked"));
+    running.wait_until("the run parked before its pack", || parked.exists());
+    stderr.close();
+    let outcome = ended_within(running, QUIET_CLIENT_GONE_GUARD);
+
+    assert_eq!(
+        outcome.code,
+        Some(255),
+        "a run whose client went ends as a closed connection, as every cut does: {outcome:?}"
+    );
+    assert!(has_ref(&payload, "refs/gate-back/k"), "the back commit was pushed: {outcome:?}");
+    assert_eq!(
+        archive_members(&archive_path(&payload)),
+        ["dumps/a.dmp"],
+        "the failed run's set alone: {outcome:?}"
+    );
+}
+
+/// A failing command that changed a tracked file, so its back commit is made and pushed, and whose client went before
+/// its pack has its failed run's set packed: the PC syncs nothing back of a cut run, so the back commit's paths are not
+/// read to be left out, which a gone client would refuse. The run ends on the command's own status.
+#[test]
+fn box_run_of_a_failing_command_that_changed_a_tracked_file_and_whose_client_went_after_its_back_commit_packs_its_failed_run_set() {
+    let case = Case::new("box_outputs_failed_changed_gone");
+    let command = [
+        FAKE_TOOL,
+        "write",
+        "new.txt",
+        "x",
+        "write",
+        r"bin\a.txt",
+        "a",
+        "write",
+        r"dumps\a.dmp",
+        "dmp",
+        "exit",
+        "3",
+    ];
+    let payload = dump_payload(&case, &command);
+    let gone = shown(&case.folder().join("gone"));
+    let seams = ["--test-box-gone-reached", gone.as_str(), "--test-box-park-outputs", gone.as_str()];
+
+    let (running, stderr) = run_to_be_cut(&case, &payload, &seams, None);
+    let parked = PathBuf::from(format!("{gone}.parked"));
+    running.wait_until("the run parked before its pack", || parked.exists());
+    stderr.close();
+    let outcome = ended_within(running, QUIET_CLIENT_GONE_GUARD);
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    assert!(has_ref(&payload, "refs/gate-back/k"), "the back commit was pushed: {outcome:?}");
+    assert_eq!(
+        archive_members(&archive_path(&payload)),
+        ["dumps/a.dmp"],
+        "the failed run's set alone: {outcome:?}"
+    );
+}
+
+/// A passing command whose run is stopped after its back commit, before its pack, ends as a cut run, not 0, and has
+/// its failed run's set packed: the dump comes back, the build file only an outputs glob names does not.
+#[test]
+fn box_run_of_a_passing_command_stopped_after_its_back_commit_ends_failed_and_packs_its_failed_run_set() {
+    let case = Case::new("box_outputs_passed_stopped");
+    let command = [FAKE_TOOL, "write", r"bin\a.txt", "a", "write", r"dumps\a.dmp", "dmp"];
+    let payload = dump_payload(&case, &command);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+
+    let call = box_call(
+        &case,
+        &["box", "--test-box-park-outputs", go_word.as_str(), "run"],
+        &self::payload(&payload),
+    );
+    let (running, mut stdin) = call.start_with_stdin();
+    stdin.write_all(manifest(&[]).as_bytes()).expect("the manifest can be written");
+    let parked = PathBuf::from(format!("{go_word}.parked"));
+    running.wait_until("the run parked before its pack", || parked.exists());
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+    fs::write(&go, "").expect("the parked run can be released");
+    let outcome = ended_within(running, HANG_GUARD);
+    drop(stdin);
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_ne!(outcome.code, Some(0), "a cut run does not pass: {outcome:?}");
+    assert_eq!(archive_members(&archive_path(&payload)), ["dumps/a.dmp"], "the dump alone: {outcome:?}");
+}
+
+/// A passing command whose payload asks for no outputs and whose run is stopped after its back commit ends as a cut
+/// run, not 0, as one that asked for outputs does.
+#[test]
+fn box_run_of_a_command_without_outputs_stopped_after_its_back_commit_ends_failed() {
+    let case = Case::new("box_outputs_none_stopped");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "write", "new.txt", "n"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+
+    let call = box_call(
+        &case,
+        &["box", "--test-box-park-outputs", go_word.as_str(), "run"],
+        &self::payload(&payload),
+    );
+    let (running, stdin) = call.start_with_stdin();
+    let parked = PathBuf::from(format!("{go_word}.parked"));
+    running.wait_until("the run parked after its back commit", || parked.exists());
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+    fs::write(&go, "").expect("the parked run can be released");
+    let outcome = ended_within(running, HANG_GUARD);
+    drop(stdin);
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_ne!(outcome.code, Some(0), "a cut run does not pass: {outcome:?}");
+}
+
+/// A failing command whose payload asks for no outputs and whose client went after its back commit ends on its own
+/// status, as one that asked for outputs does. The run parks just before its pack until the box has seen its client
+/// gone.
+#[test]
+fn box_run_of_a_failing_command_without_outputs_whose_client_went_after_its_back_commit_ends_on_its_own_status() {
+    let case = Case::new("box_outputs_none_failed_gone");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "write", "new.txt", "n", "exit", "3"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let gone = shown(&case.folder().join("gone"));
+    let seams = ["--test-box-gone-reached", gone.as_str(), "--test-box-park-outputs", gone.as_str()];
+
+    let (running, stderr) = run_to_be_cut(&case, &payload, &seams, None);
+    let parked = PathBuf::from(format!("{gone}.parked"));
+    running.wait_until("the run parked after its back commit", || parked.exists());
+    stderr.close();
+    let outcome = ended_within(running, QUIET_CLIENT_GONE_GUARD);
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+}
+
+/// The payload of a cut-during-the-path-read case: [`dump_payload`] of a command that also changes the tracked
+/// `new.txt`, so its back commit is made and its paths are read, then ends with `exit`, when given.
+fn back_paths_payload(case: &Case, exit: Option<&str>) -> Value {
+    let mut command = vec![
+        FAKE_TOOL,
+        "write",
+        "new.txt",
+        "x",
+        "write",
+        r"bin\a.txt",
+        "a",
+        "write",
+        r"dumps\a.dmp",
+        "dmp",
+    ];
+    if let Some(exit) = exit {
+        command.extend_from_slice(&["exit", exit]);
+    }
+    dump_payload(case, &command)
+}
+
+/// `gate box run` of `payload` parked just before it reads its back commit's paths, stopped while parked, then let go.
+fn stopped_while_back_paths_are_read(case: &Case, payload: &Value) -> Outcome {
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let call = box_call(
+        case,
+        &["box", "--test-box-park-back-paths", go_word.as_str(), "run"],
+        &self::payload(payload),
+    );
+    let (running, mut stdin) = call.start_with_stdin();
+    stdin.write_all(manifest(&[]).as_bytes()).expect("the manifest can be written");
+    let parked = PathBuf::from(format!("{go_word}.parked"));
+    running.wait_until("the run parked before its back commit's paths are read", || parked.exists());
+    let stopped = gate_box(case, "stop", &self::payload(payload), None);
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    fs::write(&go, "").expect("the parked run can be released");
+    let outcome = ended_within(running, HANG_GUARD);
+    drop(stdin);
+    outcome
+}
+
+/// A failing command whose run is stopped while its back commit's paths are read still has its failed run's set
+/// packed, none left out, whatever the read gave.
+#[test]
+fn box_run_of_a_failing_command_stopped_while_its_back_paths_are_read_packs_its_failed_run_set() {
+    let case = Case::new("box_outputs_failed_stopped_paths");
+    let payload = back_paths_payload(&case, Some("3"));
+
+    let outcome = stopped_while_back_paths_are_read(&case, &payload);
+
+    assert!(has_ref(&payload, "refs/gate-back/k"), "the back commit was pushed: {outcome:?}");
+    assert_eq!(archive_members(&archive_path(&payload)), ["dumps/a.dmp"], "the dump alone: {outcome:?}");
+}
+
+/// A passing command whose run is stopped while its back commit's paths are read has its failed run's set packed and
+/// ends as a cut run, not 0.
+#[test]
+fn box_run_of_a_passing_command_stopped_while_its_back_paths_are_read_packs_its_failed_run_set_and_ends_failed() {
+    let case = Case::new("box_outputs_passed_stopped_paths");
+    let payload = back_paths_payload(&case, None);
+
+    let outcome = stopped_while_back_paths_are_read(&case, &payload);
+
+    assert_ne!(outcome.code, Some(0), "a cut run does not pass: {outcome:?}");
+    assert!(has_ref(&payload, "refs/gate-back/k"), "the back commit was pushed: {outcome:?}");
+    assert_eq!(archive_members(&archive_path(&payload)), ["dumps/a.dmp"], "the dump alone: {outcome:?}");
+}
+
+/// A failed command whose run is stopped while its back commit's `add -A` runs still has the failed run's set packed.
+#[test]
+fn box_run_stopped_during_its_back_commit_packs_the_failed_run_set() {
+    let case = Case::new("box_outputs_stopped_back_commit");
+    let command = [FAKE_TOOL, "write", r"bin\a.txt", "a", "write", r"dumps\a.dmp", "dmp", "exit", "3"];
+    let payload = dump_payload(&case, &command);
+    let stub = case.folder().join("stub");
+    let parked = case.folder().join("parked");
+    stub_git_doing(&stub, &[("-A", Does::Park(&parked))]);
+
+    let mut call = box_call(&case, &["box", "run"], &self::payload(&payload));
+    call.env("PATH", path_for_run(std::slice::from_ref(&stub)));
+    let (running, mut stdin) = call.start_with_stdin();
+    stdin.write_all(manifest(&[]).as_bytes()).expect("the manifest can be written");
+    let pid = parked_pid(&running, &stub, &parked);
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+    fs::write(parked.with_extension("go"), "").expect("the parked git can be released");
+    let outcome = ended_within(running, PARKED_GIT_GUARD);
+    drop(stdin);
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_eq!(archive_members(&archive_path(&payload)), ["dumps/a.dmp"], "the dump alone: {outcome:?}");
+    wait_until_gone(pid);
+}
+
+/// A client gone before the command starts, while the checkout runs, packs nothing.
+#[test]
+fn box_run_whose_client_goes_before_its_command_packs_nothing() {
+    let case = Case::new("box_outputs_gone_before");
+    let payload = dump_payload(&case, &WRITES_THEN_SLEEPS);
+    let stub = case.folder().join("stub");
+    let parked = case.folder().join("parked");
+    stub_git_doing(&stub, &[("checkout", Does::Park(&parked))]);
+
+    let (running, stderr) = run_to_be_cut(&case, &payload, &[], Some(&path_for_run(std::slice::from_ref(&stub))));
+    let pid = parked_pid(&running, &stub, &parked);
+    stderr.close();
+    let outcome = ended_within(running, PARKED_GIT_GUARD);
+
+    assert_eq!(outcome.code, Some(255), "a closed connection exits 255: {outcome:?}");
+    assert!(!outcome.stdout.contains("started"), "the command never ran: {outcome:?}");
+    assert!(!archive_path(&payload).exists(), "nothing is packed: {outcome:?}");
+    wait_until_gone(pid);
+}
+
 #[test]
 fn box_run_of_a_failed_command_packs_a_tmp_failure_output() {
     let case = Case::new("box_outputs_failed_tmp_dump");
@@ -1552,6 +1960,173 @@ fn box_outputs_says_an_archive_that_does_not_exist() {
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
     assert_eq!(outcome.stdout, "");
     assert_eq!(outcome.stderr, format!("gate: remote outputs archive {name} does not exist\n"));
+}
+
+/// The `outputs` payload of the work folder `k`'s archive asking to wait up to `ms` for the run that packs it
+/// (`CutWaitMs`), and the archive's path, its folder made.
+fn cut_wait_payload(case: &Case, ms: u64) -> (Value, PathBuf) {
+    let mut payload = verb_payload(case, "");
+    payload["Name"] = json!(archive_name(&payload));
+    payload["CutWaitMs"] = json!(ms);
+    let archive = archive_path(&payload);
+    fs::create_dir_all(archive.parent().expect("the archive has a folder")).expect("the outputs folder can be made");
+    (payload, archive)
+}
+
+/// The stop event of the run of `payload`'s `Job`, made as the run makes it and held until dropped: the run is going.
+fn run_going(payload: &Value) -> NamedEvent {
+    NamedEvent::create_new_manual(&format!("{}-stopped", field(payload, "Job"))).expect("the run's stop event can be made")
+}
+
+/// `gate box outputs` of `payload` with a heartbeat every 50 ms, started.
+fn waiting_outputs(case: &Case, payload: &Value) -> Running {
+    bare_box_call(case, &["box", "--test-heartbeat-ms", "50", "outputs"], &self::payload(payload)).start()
+}
+
+/// The bytes of a test archive.
+fn some_bytes() -> Vec<u8> {
+    (0..=255_u8).cycle().take(70_001).collect()
+}
+
+/// Whether every line of `stderr` is an idle heartbeat.
+fn only_heartbeats(stderr: &str) -> bool {
+    stderr.lines().all(|line| line == "gate-remote-heartbeat: 0")
+}
+
+#[test]
+fn box_outputs_with_a_cut_wait_sends_the_archive_once_the_run_s_stop_event_is_gone() {
+    let case = Case::new("box_outputs_cut_wait_event");
+    let (payload, archive) = cut_wait_payload(&case, 120_000);
+    let bytes = some_bytes();
+    fs::write(&archive, &bytes).expect("the archive can be written");
+    let going = run_going(&payload);
+
+    let running = waiting_outputs(&case, &payload);
+    running.wait_for_stderr("gate-remote-heartbeat: 0");
+    drop(going);
+    let outcome = running.finish_read();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(only_heartbeats(&outcome.stderr), "{outcome:?}");
+    assert!(
+        outcome.raw_stdout == bytes,
+        "the archive's bytes, exactly: {} bytes came",
+        outcome.raw_stdout.len()
+    );
+    assert!(!archive.exists(), "a sent archive is removed");
+}
+
+#[test]
+fn box_outputs_with_a_cut_wait_waits_while_the_archive_is_still_open_for_writing() {
+    let case = Case::new("box_outputs_cut_wait_writer");
+    let (payload, archive) = cut_wait_payload(&case, 120_000);
+    let bytes = some_bytes();
+    let mut writer = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&archive)
+        .expect("the archive can be made as the pack makes it");
+    writer.write_all(&bytes).expect("the archive can be written");
+
+    let running = waiting_outputs(&case, &payload);
+    running.wait_for_stderr("gate-remote-heartbeat: 0");
+    drop(writer);
+    let outcome = running.finish_read();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(only_heartbeats(&outcome.stderr), "{outcome:?}");
+    assert!(
+        outcome.raw_stdout == bytes,
+        "the archive's bytes, exactly: {} bytes came",
+        outcome.raw_stdout.len()
+    );
+    assert!(!archive.exists(), "a sent archive is removed");
+}
+
+#[test]
+fn box_outputs_with_a_cut_wait_and_no_archive_says_nothing_was_packed() {
+    let case = Case::new("box_outputs_cut_wait_nothing");
+    let (payload, _archive) = cut_wait_payload(&case, 120_000);
+
+    let outcome = gate_box(&case, "outputs", &self::payload(&payload), None);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(outcome.stderr, "gate-remote-outputs: 0\n");
+}
+
+#[test]
+fn box_outputs_with_a_cut_wait_past_its_bound_says_the_run_is_still_going() {
+    let case = Case::new("box_outputs_cut_wait_bound");
+    let (payload, archive) = cut_wait_payload(&case, 200);
+    fs::write(&archive, some_bytes()).expect("the archive can be written");
+    let name = archive_name(&payload);
+    let going = run_going(&payload);
+
+    let outcome = gate_box(&case, "outputs", &self::payload(&payload), None);
+    drop(going);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(outcome.raw_stdout.is_empty(), "nothing is sent: {} bytes came", outcome.raw_stdout.len());
+    assert_eq!(
+        outcome.stderr,
+        format!("gate: remote outputs archive {name} is not finished: the run is still going after 1 s\n")
+    );
+    assert!(archive.exists(), "an archive not sent stays");
+}
+
+/// A call waiting for its run whose own caller goes stops waiting, though the run is still going: it sends nothing,
+/// says nothing and exits 255, and the archive stays for the prune.
+#[test]
+fn box_outputs_with_a_cut_wait_whose_caller_goes_stops_waiting() {
+    let case = Case::new("box_outputs_cut_wait_gone");
+    let (payload, archive) = cut_wait_payload(&case, 120_000);
+    fs::write(&archive, some_bytes()).expect("the archive can be written");
+    let going = run_going(&payload);
+
+    let (running, stderr) =
+        bare_box_call(&case, &["box", "--test-heartbeat-ms", "50", "outputs"], &self::payload(&payload)).start_with_closable_stderr();
+    running.wait_for_stderr("gate-remote-heartbeat: 0");
+    stderr.close();
+    let outcome = ended_within(running, HANG_GUARD);
+    drop(going);
+
+    assert_eq!(outcome.code, Some(255), "a gone caller ends the wait: {outcome:?}");
+    assert!(outcome.raw_stdout.is_empty(), "nothing is sent: {} bytes came", outcome.raw_stdout.len());
+    assert!(archive.exists(), "an archive not sent stays");
+}
+
+/// A call without `CutWaitMs` looks once, as it always has, though the run is still going.
+#[test]
+fn box_outputs_without_a_cut_wait_of_a_missing_archive_still_says_it_does_not_exist() {
+    let case = Case::new("box_outputs_no_cut_wait_missing");
+    let mut payload = verb_payload(&case, "");
+    let name = archive_name(&payload);
+    payload["Name"] = json!(name);
+    let going = run_going(&payload);
+
+    let outcome = gate_box(&case, "outputs", &self::payload(&payload), None);
+    drop(going);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(outcome.stderr, format!("gate: remote outputs archive {name} does not exist\n"));
+}
+
+/// A pack the seam slows after it made its archive still packs the failed run's set whole.
+#[test]
+fn box_run_with_a_pack_delay_still_packs_its_failed_run_set() {
+    let case = Case::new("box_outputs_pack_delay");
+    let command = [FAKE_TOOL, "write", r"bin\a.txt", "a", "write", r"dumps\a.dmp", "dmp", "exit", "3"];
+    let payload = dump_payload(&case, &command);
+
+    let call = box_call(&case, &["box", "--test-box-pack-delay-ms", "50", "run"], &self::payload(&payload));
+    let outcome = finish_with_manifest(call, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    assert!(has_line(&outcome.stderr, &packed_line(&payload, 1)), "{outcome:?}");
+    assert_eq!(archive_members(&archive_path(&payload)), ["dumps/a.dmp"], "the dump alone");
 }
 
 /// The `outputs` payload of the work folder `k`'s archive, asking for a data channel on loopback from loopback with the

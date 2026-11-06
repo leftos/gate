@@ -10,6 +10,7 @@
 )]
 
 use std::io;
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -506,6 +507,20 @@ impl Payload {
                 .filter(|seconds| (1..=MAX_WHOLE_NUMBER).contains(seconds))
                 .map(Some)
                 .ok_or_else(|| "gate: box payload Timeout is not a whole number of seconds".to_owned()),
+        }
+    }
+
+    /// How long an `outputs` call waits for the run that packs its archive to end, [`CUT_WAIT_KEY`]: whole milliseconds
+    /// from 1, held to [`CUT_WAIT_CAP_MS`]; `None` when the key is absent or null, a call that does not wait. Else the
+    /// usage line.
+    pub fn cut_wait(&self) -> Result<Option<Duration>, String> {
+        match self.object.get(CUT_WAIT_KEY) {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => value
+                .as_u64()
+                .filter(|ms| *ms >= 1)
+                .map(|ms| Some(Duration::from_millis(ms.min(CUT_WAIT_CAP_MS))))
+                .ok_or_else(|| format!("gate: box payload {CUT_WAIT_KEY} is not a whole number of milliseconds")),
         }
     }
 
@@ -1265,6 +1280,12 @@ impl Payload {
         }
     }
 }
+
+/// The payload key an `outputs` call after a cut run sets to ask the box to wait, in milliseconds, for the run that
+/// packs its archive to end before it answers ([`Payload::cut_wait`]).
+pub const CUT_WAIT_KEY: &str = "CutWaitMs";
+/// The most an `outputs` call's [`CUT_WAIT_KEY`] wait lasts on the box, in milliseconds: two minutes.
+pub const CUT_WAIT_CAP_MS: u64 = 120_000;
 
 /// The first port of the range a builder's data channel listens in.
 pub const CHANNEL_FIRST_PORT: u16 = 47100;
@@ -2149,6 +2170,48 @@ mod tests {
         assert_eq!(hex.len(), 512);
         assert!(super::is_lower_hex(&hex, 512));
         assert_eq!(&hex[2 * 0xab..2 * 0xab + 2], "ab");
+    }
+
+    #[expect(clippy::expect_used, reason = "a payload a case cannot build must fail the case loudly")]
+    mod cut_wait {
+        use std::time::Duration;
+
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+        use serde_json::{Value, json};
+
+        use crate::{CUT_WAIT_CAP_MS, CUT_WAIT_KEY, PathForm, Payload};
+
+        /// What the `CutWaitMs` reader makes of a payload whose `CutWaitMs` is `value`.
+        fn read(value: &Value) -> Result<Option<Duration>, String> {
+            let payload =
+                Payload::decode(&STANDARD.encode(json!({ CUT_WAIT_KEY: value }).to_string()), PathForm::Windows).expect("the payload decodes");
+            payload.cut_wait()
+        }
+
+        #[test]
+        fn cut_wait_is_none_when_absent_or_null() {
+            let payload = Payload::decode(&STANDARD.encode("{}"), PathForm::Windows).expect("the payload decodes");
+            assert_eq!(payload.cut_wait(), Ok(None), "an absent key asks for no wait");
+            assert_eq!(read(&Value::Null), Ok(None), "a null key asks for no wait");
+        }
+
+        #[test]
+        fn cut_wait_is_capped_at_two_minutes() {
+            assert_eq!(read(&json!(1)), Ok(Some(Duration::from_millis(1))));
+            assert_eq!(read(&json!(200)), Ok(Some(Duration::from_millis(200))));
+            assert_eq!(read(&json!(CUT_WAIT_CAP_MS)), Ok(Some(Duration::from_secs(120))));
+            assert_eq!(read(&json!(CUT_WAIT_CAP_MS + 1)), Ok(Some(Duration::from_secs(120))));
+            assert_eq!(read(&json!(u64::MAX)), Ok(Some(Duration::from_secs(120))));
+        }
+
+        #[test]
+        fn cut_wait_refuses_a_value_that_is_not_a_whole_number() {
+            let refused = Err("gate: box payload CutWaitMs is not a whole number of milliseconds".to_owned());
+            for value in [json!(0), json!(-1), json!(1.5), json!("200"), json!(true), json!([200]), json!({})] {
+                assert_eq!(read(&value), refused, "{value}");
+            }
+        }
     }
 
     #[expect(clippy::expect_used, reason = "a payload a case cannot build must fail the case loudly")]

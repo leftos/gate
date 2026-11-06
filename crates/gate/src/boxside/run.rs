@@ -17,6 +17,7 @@ use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::ops::ControlFlow;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -78,7 +79,7 @@ pub(super) const FAILED_STATUS: u32 = 1;
 /// The status of a command that could not be started.
 const NOT_STARTED: u32 = 127;
 /// The status of a run whose client closed the connection: the box stopped the job and exits as a lost connection does.
-const CLOSED_STATUS: u32 = 255;
+pub(super) const CLOSED_STATUS: u32 = 255;
 
 /// The git step that deletes a repo's back ref ([`WorkGit::clear_back_ref`]).
 const BACK_REF_RESET: &str = "back ref reset";
@@ -965,7 +966,8 @@ impl<'a> RunOutputs<'a> {
     /// out `skip`, the back commit's paths or why they could not be read, and says how it went: 0, or 1 when the
     /// outputs are not brought back, the run's own archive among them when it alone is over the box's outputs budget.
     fn bring_back(&self, asked: &Asked<'_>, work: &Path, skip: Result<Vec<String>, String>, beat: &Beat<'_>, console: &mut Console) -> u32 {
-        let brought = skip.and_then(|skip| outputs::bring_back(asked, &self.manifest, self.listing.as_ref(), work, &skip));
+        let delay = beat.seams.pack_delay_ms.map(Duration::from_millis);
+        let brought = skip.and_then(|skip| outputs::bring_back(asked, &self.manifest, self.listing.as_ref(), work, (&skip, delay)));
         match brought {
             Ok(brought) => {
                 if let Some(skipped) = &brought.skipped {
@@ -1118,6 +1120,7 @@ fn commanded(
     if let Some(outputs) = outputs.as_deref_mut() {
         outputs.list(folders.work, beat, console);
     }
+    let outputs = (outputs.as_deref(), folders.work);
     let one = One {
         words: request.commands.first().map_or(&[][..], Vec::as_slice),
         place: folders.place,
@@ -1128,63 +1131,173 @@ fn commanded(
     let record = command_record(request.work);
     let ran = ran_command(request, &one, beat, console)?;
     removed_if_clean(&record, &ran, beat, console);
-    let (status, started) = match ran {
-        Ran::Exited(status) => (status, true),
+    let (status, started) = match before_back_commit(&ran, (request, git), outputs, beat, console) {
+        ControlFlow::Continue(going) => going,
+        ControlFlow::Break(end) => return end,
+    };
+    let commit = match git.back_commit(request, lfs, started, console) {
+        Ok(commit) => commit,
+        Err(failed) => return back_commit_failed((failed, status), (request, git), outputs, beat, console),
+    };
+    if let Some(park) = beat.seams.park_outputs.as_deref() {
+        wait_for_path(park, console);
+    }
+    outputs_packed((status, commit.as_deref()), (request, git), outputs, beat, console)
+}
+
+/// How the command that `ran` leaves the run before its back commit: `Continue` with its status and whether it started,
+/// for a run that goes on to its back commit; else `Break` with how the run ends, its back commits said failed and the
+/// failed run's set of its `outputs`, if any, packed where it is due ([`reports_brought_back`]).
+fn before_back_commit(
+    ran: &Ran,
+    (request, git): (&Request<'_>, &WorkGit),
+    (outputs, work): (Option<&RunOutputs<'_>>, &Path),
+    beat: &Beat<'_>,
+    console: &mut Console,
+) -> ControlFlow<Result<u32, u32>, (u32, bool)> {
+    match *ran {
         // A command that never started left the tree as it found it: it says nothing of a back commit it did not make.
-        Ran::NotStarted(status) => (status, false),
+        Ran::NotStarted(status) => ControlFlow::Continue((status, false)),
+        Ran::Exited(status) if !cut(beat) => ControlFlow::Continue((status, true)),
+        // A command whose client went makes no back commit; its failed run's set is packed for a later `outputs` call,
+        // and the run ends as a closed connection.
+        Ran::Gone => {
+            back_commits_failed(request, beat, console);
+            reports_brought_back((request, git), (outputs, None), work, beat, console);
+            ControlFlow::Break(Err(CLOSED_STATUS))
+        }
+        // A command a stop ended, or whose client went before its back commit, makes none: the PC applies nothing of
+        // it. Its failed run's set is packed, and the run ends on its own status, a failure for one that passed.
+        Ran::Exited(status) => {
+            back_commits_failed(request, beat, console);
+            reports_brought_back((request, git), (outputs, None), work, beat, console);
+            ControlFlow::Break(Ok(cut_status(status, beat)))
+        }
         // The PC applies nothing of a run the box killed, so it makes no back commit. A ceiling kill's failure outputs
         // are packed after its kill line and tag as a failed command's are, though a process its kill could not end
         // may still be writing; a backstop kill, or a ceiling kill too near the PC's own backstop of the run call,
         // packs nothing, as the pack could outlast that backstop. The run ends killed whatever the pack gives.
         Ran::Killed(kill) => {
             back_commits_failed(request, beat, console);
-            if let Some(outputs) = outputs.as_deref().filter(|_| pack_after_kill(kill, beat.started, request.timeout)) {
-                reports_brought_back((request, git), (outputs, None), folders.work, beat, console);
-            }
-            return Ok(KILLED);
+            let kept = outputs.filter(|_| pack_after_kill(kill, beat.started, request.timeout));
+            reports_brought_back((request, git), (kept, None), work, beat, console);
+            ControlFlow::Break(Ok(KILLED))
         }
-    };
-    let commit = match git.back_commit(request, lfs, started, console) {
-        Ok(commit) => commit,
-        Err(failed) => {
-            back_commits_failed(request, beat, console);
-            let message = failed.or_end(console)?;
-            stamping::err(console, &format!("gate: remote sync-back failed: {message}"));
-            return Ok(if status == 0 { FAILED_STATUS } else { status });
-        }
-    };
+    }
+}
+
+/// The status a run cut after its command exited with `status` ends on, read once its failed run's set is packed:
+/// [`CLOSED_STATUS`] for a gone client, else the command's own, a failure for one that passed.
+fn cut_status(status: u32, beat: &Beat<'_>) -> u32 {
+    if beat.client_gone() {
+        CLOSED_STATUS
+    } else if status == 0 {
+        FAILED_STATUS
+    } else {
+        status
+    }
+}
+
+/// How the run ends once its back commit failed for `failed`, after a command that ended with `status`: its back
+/// commits said failed, then its sync-back failure said, then the failed run's set of its `outputs` packed when the
+/// run was cut meanwhile, its client gone or a stop set; the run ends on the command's status, a failure for one that
+/// passed, or `Err` for a client gone during the back commit, its line said.
+fn back_commit_failed(
+    (failed, status): (BackFailed, u32),
+    (request, git): (&Request<'_>, &WorkGit),
+    (outputs, work): (Option<&RunOutputs<'_>>, &Path),
+    beat: &Beat<'_>,
+    console: &mut Console,
+) -> Result<u32, u32> {
+    back_commits_failed(request, beat, console);
+    // The line first, then the pack, as the passing arm's failed read of the back commit's paths does.
+    let ended = failed.or_end(console).map(|message| {
+        stamping::err(console, &format!("gate: remote sync-back failed: {message}"));
+        if status == 0 { FAILED_STATUS } else { status }
+    });
+    if cut(beat) {
+        reports_brought_back((request, git), (outputs, None), work, beat, console);
+    }
+    ended
+}
+
+/// How the run ends once its back commit `commit` is pushed, after a command that ended with `status`, its `outputs`, if
+/// any, packed. A passing command packs its outputs, leaving out the back commit's paths; a failing one, or one whose
+/// run was cut, packs its failed run's set ([`reports_brought_back`]): nothing a cut run brings back is installed, so
+/// its outputs are not asked for, and a passing one cut ends as a cut run before its back commit does
+/// ([`cut_status`]). `Err` when the client went while the back commit's paths were read: its line said, then its
+/// failed run's set packed.
+fn outputs_packed(
+    (status, commit): (u32, Option<&str>),
+    (request, git): (&Request<'_>, &WorkGit),
+    (outputs, work): (Option<&RunOutputs<'_>>, &Path),
+    beat: &Beat<'_>,
+    console: &mut Console,
+) -> Result<u32, u32> {
     match outputs {
+        // Read after the push and only for outputs, so failing to read them fails the outputs, never the sync-back.
+        Some(outputs) if status == 0 && !cut(beat) => {
+            let read = back_skip(request, git, commit, beat, console);
+            // A run cut while the paths were read, whatever the read gave, packs its failed run's set, none left out,
+            // and ends as a cut run, or on the read's own end for a client gone meanwhile, its line said.
+            if cut(beat) {
+                reports_brought_back((request, git), (Some(outputs), None), work, beat, console);
+                return read.map(|_| cut_status(status, beat));
+            }
+            match read {
+                Ok(skip) => Ok(outputs.bring_back(outputs.asked, work, skip, beat, console)),
+                Err(code) => {
+                    reports_brought_back((request, git), (Some(outputs), None), work, beat, console);
+                    Err(code)
+                }
+            }
+        }
+        // A run cut after its back commit ends as one cut before it does.
         Some(outputs) if status == 0 => {
-            // Read after the push and only for outputs, so failing to read them fails the outputs, never the sync-back.
-            let skip = back_skip(request, git, commit.as_deref(), console)?;
-            Ok(outputs.bring_back(outputs.asked, folders.work, skip, beat, console))
+            reports_brought_back((request, git), (Some(outputs), None), work, beat, console);
+            Ok(cut_status(status, beat))
         }
         Some(outputs) => {
-            reports_brought_back((request, git), (outputs, commit.as_deref()), folders.work, beat, console);
+            reports_brought_back((request, git), (Some(outputs), commit), work, beat, console);
             Ok(status)
         }
-        None => Ok(status),
+        // A passing run cut after its back commit ends as a cut run whether it asked for outputs or not; a failing one
+        // ends on its own status either way.
+        None => Ok(if status == 0 && cut(beat) { cut_status(status, beat) } else { status }),
     }
 }
 
 /// Packs the test reports and failure outputs of a failed command of `request` run in `work`, or of one the box's
 /// ceiling killed ([`outputs::Asked::failed_run`]), the failure outputs held to the box's caps ([`outputs::failure_caps`]), leaving
 /// out the paths of the back commit `commit`, read with `git`, as a passing command's outputs are packed: none for a
-/// killed command, which makes no back commit; nothing, and no line, when no output glob names a `TestResults` folder
-/// and the run has no failure output globs. The command ends on its own status, or killed, whatever the pack says, a
-/// client gone while the paths are read or during the pack included.
+/// killed command, which makes no back commit, and none for a cut run ([`cut`]), whose paths are not read; nothing,
+/// and no line, for a run without `outputs`, or when no output glob names a `TestResults` folder and the run has no
+/// failure output globs. The command ends on its own status, or killed, whatever the pack says, a client gone while
+/// the paths are read or during the pack included.
 fn reports_brought_back(
     (request, git): (&Request<'_>, &WorkGit),
-    (outputs, commit): (&RunOutputs<'_>, Option<&str>),
+    (outputs, commit): (Option<&RunOutputs<'_>>, Option<&str>),
     work: &Path,
     beat: &Beat<'_>,
     console: &mut Console,
 ) {
+    let Some(outputs) = outputs else {
+        return;
+    };
     let Some(reports) = outputs.asked.failed_run(outputs::failure_caps(beat.seams)) else {
         return;
     };
-    let Ok(skip) = back_skip(request, git, commit, console) else {
-        return;
+    // The PC syncs nothing back of a cut run, so the back commit's paths are not left out, and not read; a run cut
+    // while they are read packs with none left out, whatever the read gave.
+    let skip = if cut(beat) {
+        Ok(Vec::new())
+    } else {
+        let read = back_skip(request, git, commit, beat, console);
+        match read {
+            _ if cut(beat) => Ok(Vec::new()),
+            Ok(skip) => skip,
+            Err(_) => return,
+        }
     };
     // A failed command ends on its own status, so the pack's own is only said.
     let _ = outputs.bring_back(&reports, work, skip, beat, console);
@@ -1326,6 +1439,8 @@ impl<L: CommandLines> ListRun<'_, '_, L> {
         let status = match ran {
             Ran::Exited(status) | Ran::NotStarted(status) => status,
             Ran::Killed(_) => KILLED,
+            // A list's command whose client went ends the list as a closed connection, and packs nothing.
+            Ran::Gone => return Err(CLOSED_STATUS),
         };
         let said = if status == 0 {
             self.lines.passed(at, began.elapsed())
@@ -1472,8 +1587,9 @@ fn retried<T>(mut step: impl FnMut() -> io::Result<T>, mut between: impl FnMut()
 }
 
 /// The interrupted-command record of the work folder `work`, `{work}.command`: `{UTC start} {job}`, written just before
-/// a command starts and removed only once it ended clean ([`ended_clean`]), so a record found by a later run is of a
-/// command that was ended mid-run, whose leftovers that run clears ([`WorkGit::cleared_interrupted`]).
+/// a command starts and removed only once it ended without its run being cut ([`removed_if_clean`]), so a record
+/// found by a later run is of a command that was ended mid-run, whose leftovers that run clears
+/// ([`WorkGit::cleared_interrupted`]).
 pub(super) fn command_record(work: &str) -> String {
     format!("{work}{COMMAND_SUFFIX}")
 }
@@ -1526,10 +1642,23 @@ pub(super) fn ended_clean(beat: &Beat<'_>) -> bool {
     !beat.client_gone() && matches!(beat.stop.event.is_set(), Ok(false))
 }
 
-/// Removes the interrupted-command record `record` once the command that `ran` ended clean ([`ended_clean`]); a removal
-/// that fails is said under the box's output lock and changes nothing else.
+/// Whether the run was cut ([`is_cut`]): its client went, or its stop signal reads as set now. Every failed-set pack
+/// after a cut reads it.
+fn cut(beat: &Beat<'_>) -> bool {
+    is_cut(beat.client_gone(), beat.stop.event.is_set())
+}
+
+/// Whether a run whose client went when `gone` and whose stop signal read `stop` was cut: a gone client or a stop read
+/// as set cuts it; a signal that cannot be read is no stop.
+fn is_cut(gone: bool, stop: io::Result<bool>) -> bool {
+    gone || stop.is_ok_and(|set| set)
+}
+
+/// Removes the interrupted-command record `record` once the command that `ran` ended without its run being cut
+/// ([`cut`]), so a signal that cannot be read counts here as it does for the packs; a removal that fails is said under
+/// the box's output lock and changes nothing else.
 fn removed_if_clean(record: &str, ran: &Ran, beat: &Beat<'_>, console: &mut Console) {
-    if matches!(ran, Ran::Exited(_) | Ran::NotStarted(_)) && ended_clean(beat) {
+    if matches!(ran, Ran::Exited(_) | Ran::NotStarted(_)) && !cut(beat) {
         // Said when it fails; the run's status stands.
         let _ = record_step(preflight::remove_entry(Path::new(record)), "remove", record, beat, console);
     }
@@ -1835,10 +1964,20 @@ fn ended_before(status: u32, request: &Request<'_>, beat: &Beat<'_>, console: &m
 
 /// The paths the back commit `commit` changes, which the outputs leave out, none without a commit, or why they could
 /// not be read; `Err` with the status the run ends on when the client closed the connection meanwhile, its line said.
-fn back_skip(request: &Request<'_>, git: &WorkGit, commit: Option<&str>, console: &mut Console) -> Result<Result<Vec<String>, String>, u32> {
+/// A run cut while they are read may end the read either way, so each caller reads the cut again after it.
+fn back_skip(
+    request: &Request<'_>,
+    git: &WorkGit,
+    commit: Option<&str>,
+    beat: &Beat<'_>,
+    console: &mut Console,
+) -> Result<Result<Vec<String>, String>, u32> {
     let Some(commit) = commit else {
         return Ok(Ok(Vec::new()));
     };
+    if let Some(park) = beat.seams.park_back_paths.as_deref() {
+        wait_for_path(park, console);
+    }
     match git.back_paths(request, commit, console) {
         Ok(paths) => Ok(Ok(paths)),
         Err(failed) => failed.or_end(console).map(Err),
@@ -2913,7 +3052,7 @@ struct Pipes {
 /// [`Forwarders::drain`] does — up to [`DRAIN`], and past it up to its hang guard for a reader that is only behind;
 /// the command's exit code. A failed write to the box's own output means the client closed the connection,
 /// whenever it is noticed: the command's job is stopped then, before the readers drain or after them, and
-/// [`CLOSED_STATUS`] answered for it instead. Should the box fail first, the job is terminated, so the command does
+/// [`Ran::Gone`] answered for it instead. Should the box fail first, the job is terminated, so the command does
 /// not outlive a run that no longer watches it. The heartbeat watches the job once the readers drain its pipes, so no
 /// CPU read runs while the command's output is left unread, and stops watching it once the wait ends, however it ends.
 /// Once the command has exited, what it left in its job but the processes of `keep` is ended ([`end_what_it_left`])
@@ -2977,7 +3116,10 @@ fn watch_of(started: Started<'_, '_>, of: Of, console: &mut Console) -> Result<R
             let ceiling = ceiling.map(Ceiling::closed);
             beat.adjusted.set(ceiling.as_ref().and_then(Ceiling::adjusted_seconds));
             end_what_it_left(job, keep, console);
-            watched.drained(console)?;
+            // A write that found the client gone while the readers drained: its line said, the command still started.
+            if watched.drained(console).is_err() {
+                return Ok(Ran::Gone);
+            }
             if let Some(ceiling) = ceiling.as_ref().filter(|_| says_ceiling) {
                 ceiling.ended(console);
             }
@@ -2986,15 +3128,22 @@ fn watch_of(started: Started<'_, '_>, of: Of, console: &mut Console) -> Result<R
         WaitEnd::Killed((kill, ceiling)) => {
             let ceiling = ceiling.closed();
             beat.adjusted.set(ceiling.adjusted_seconds());
-            killed(watched, kill, says_ceiling.then_some(&ceiling), beat.seams, console)
+            Ok(killed(watched, kill, says_ceiling.then_some(&ceiling), beat.seams, console))
         }
-        WaitEnd::ClientGone => Err(watched.client_gone(console)),
+        WaitEnd::ClientGone => {
+            watched.client_gone(console);
+            Ok(Ran::Gone)
+        }
         WaitEnd::Failed { status, .. } => Err(watched.wait_failed(status, console)),
     }
 }
 
-/// How a command came to its end: it exited with its status, the box's ceiling killed it, or it never started.
+/// How a command came to its end: it exited with its status, the box's ceiling killed it, its client went, or it never
+/// started.
 pub(super) enum Ran {
+    /// The command started and its client closed the connection before its end was told: its job is stopped and the
+    /// closed connection said, and the run ends with [`CLOSED_STATUS`] once its failed run's set is packed.
+    Gone,
     /// The command ran and exited with its status.
     Exited(u32),
     /// The command never started: its program was not found, no shell could run it, its variables could not be built,
@@ -3005,16 +3154,18 @@ pub(super) enum Ran {
 }
 
 /// The box's ceiling found the command of `watched` past a limit for `kill`: its job is ended and the readers drain
-/// ([`Watched::killed`]), a client gone meanwhile answered as such, with no back ref and no outputs; a job that still
+/// ([`Watched::killed`]), a client gone meanwhile answered as [`Ran::Gone`], with no kill said; a job that still
 /// holds processes, or could not be ended, is ended once more; then the ceiling says the kill, a note first when the
 /// job was still not ended, and the run goes on as [`Ran::Killed`], a kill whatever the ending left. With no `told`,
 /// a stage preparation's kill, nothing is said here: [`ended_whole`] says what the ending left.
 /// `--test-box-kill-leaves` stands in for what that last ending leaves.
-fn killed(watched: Watched<'_>, kill: Kill, told: Option<&Ceiling<'_>>, seams: &BoxSeams, console: &mut Console) -> Result<Ran, u32> {
+fn killed(watched: Watched<'_>, kill: Kill, told: Option<&Ceiling<'_>>, seams: &BoxSeams, console: &mut Console) -> Ran {
     let job = watched.job;
-    let ending = match watched.killed(console)? {
-        Ok(ending) if ending.left == 0 && seams.kill_leaves.is_none() => Ok(ending),
-        _ => terminate_and_wait(job),
+    let ending = match watched.killed(console) {
+        // The client went while the readers drained, before the kill was said: the closed connection is said instead.
+        Err(_) => return Ran::Gone,
+        Ok(Ok(ending)) if ending.left == 0 && seams.kill_leaves.is_none() => Ok(ending),
+        Ok(_) => terminate_and_wait(job),
     };
     let ending = match seams.kill_leaves {
         Some(left) => Ok(Ending {
@@ -3026,7 +3177,7 @@ fn killed(watched: Watched<'_>, kill: Kill, told: Option<&Ceiling<'_>>, seams: &
     if let Some(ceiling) = told {
         ceiling.killed(kill, &ending, console);
     }
-    Ok(Ran::Killed(kill))
+    Ran::Killed(kill)
 }
 
 /// A command just started that [`watch`] sees to its end: its job, its main process and pipes, the processes of its
@@ -4377,8 +4528,8 @@ mod tests {
 
     use super::{
         BackGit, CLOSED_STATUS, DesktopTake, GIT_CONFIG_COUNT, GODOT_PATH, Look, Of, One, PATH_VARIABLE, Payload, Request, SHARING_VIOLATION,
-        STARTING_COMMAND, StopSignal, UE_ROOT, WorkGit, before_the_job, client_gone, command_spent, command_variables, gap_spent, handed_job, look,
-        prepared, remaining_budget, resolved_command, with_git_bin_first, with_path_first, with_safe_directory, with_unreal, without_engine,
+        STARTING_COMMAND, StopSignal, UE_ROOT, WorkGit, before_the_job, client_gone, command_spent, command_variables, gap_spent, handed_job, is_cut,
+        look, prepared, remaining_budget, resolved_command, with_git_bin_first, with_path_first, with_safe_directory, with_unreal, without_engine,
         written_retrying,
     };
     use gate_args::{EnvRefusal, env_refusal};
@@ -4387,6 +4538,16 @@ mod tests {
     use crate::boxside::forward::{ClientGone, OutputLock};
     use crate::console::Console;
     use crate::environment::{BOX_EXE_VARIABLE, BOX_JOB_VARIABLE, Variables};
+
+    #[test]
+    fn a_run_is_cut_when_its_client_went_or_its_stop_reads_set_and_never_when_the_stop_cannot_be_read() {
+        let unread = || Err(io::Error::other("the signal cannot be read"));
+        assert!(is_cut(true, Ok(false)), "a gone client");
+        assert!(is_cut(false, Ok(true)), "a stop");
+        assert!(!is_cut(false, Ok(false)), "neither");
+        assert!(!is_cut(false, unread()), "an unread signal is no stop");
+        assert!(is_cut(true, unread()), "a gone client, the signal unread");
+    }
 
     #[test]
     fn a_warm_up_budget_left_is_rounded_up_to_whole_seconds() {

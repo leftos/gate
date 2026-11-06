@@ -4283,6 +4283,8 @@ The box seams go in any order before the verb, each also as `--<seam>=<value>`. 
 
 `--test-box-park-launch <path>` parks the launch after the donor is in the job and before the output lock, writes the empty file `<path>.parked`, and goes on once `<path>` exists (at most 600 s).
 
+`--test-box-park-outputs <path>` parks the run just before it decides what to pack, and `--test-box-park-back-paths <path>` just before it reads its back commit's paths (`diff-tree`); each writes `<path>.parked` and goes on once `<path>` exists, as the launch park does. `--test-box-pack-delay-ms <n>` (whole milliseconds above 0) makes the pack sleep after its archive file is created and before its first byte.
+
 The box's ceiling has three seams: `--test-box-sample-ms <n>` replaces the 5 s sample period, in milliseconds, `--test-box-sampler-fail true|false` makes every sample fail (`true`), so only the backstop watches and no adjusted line is said, and `--test-box-free-percent <1-100>` makes the samples find that share of the machine free, so the load-adjusted clock runs at that share of wall time.
 
 `--test-box-kill-leaves <n>` stands in for the number of processes the last ending of a ceiling or backstop kill leaves (a whole number above 0), so the box says its note for a job that is still not ended.
@@ -4399,7 +4401,7 @@ Built verbs:
 
   A step that writes the shared bare repository (`update-ref -d` in the bare, `push`, `git init --bare`) is the exception: it runs on a hidden console to its end or its bound, and still starts after the client is gone, so a killed git leaves no `packed-refs.lock` the box never removes; every other step is not started once the client is gone.
 
-  `gate box stop` during a git step that is not such a write ends that step and its process tree at once: `gate: remote <step> failed: the job <job> was stopped` and status 1. After a stop no git step that a stop ends is started (nothing is synced back, no `add -A`). A git that exits by itself is never reported stopped. A stop signal that cannot be read says `gate: remote cannot read the stop signal of job <job>: <error>`, at most once per run.
+  `gate box stop` during a git step that is not such a write ends that step and its process tree at once: `gate: remote <step> failed: the job <job> was stopped` and status 1. After a stop no git step that a stop ends is started (nothing is synced back, no `add -A`, and no `gate: remote sync-back failed` line before the cut pack). A git that exits by itself is never reported stopped. A stop signal that cannot be read says `gate: remote cannot read the stop signal of job <job>: <error>`, at most once per run.
 
   Before its first git step a run, or the lay-out of a work folder, removes each tree's `.git\index.lock`, `.git\HEAD.lock`, `.git\config.lock`, `{Work}.index.lock` and the bare's `refs\gate-back\<key>.lock` (the lock sweep), through handles held one folder beneath another, never following a link: behind a junction at `.git` it touches nothing.
 
@@ -4610,7 +4612,7 @@ Built verbs:
 
   It is removed with `.warm` when a tree is made anew (a missing `.git` or `.git\HEAD`) by a preflight or a run, when a run relays the folder for another layout, and when a run finds the folder missing; a folder at the name is removed rather than refusing the run. The interrupted-command clear leaves it, as a folder a command ran in is not new.
 
-  The interrupted-command record `<Work>.command` holds `{UTC start, round-trip format} {job}`, the job being the run's `Local\gate-remote-{key}-{nonce}` name. The box writes it, flushed to the disk, just before it resumes a command, once the command is in its job, and removes it once the command exited with no stop signal set and the client still there.
+  The interrupted-command record `<Work>.command` holds `{UTC start, round-trip format} {job}`, the job being the run's `Local\gate-remote-{key}-{nonce}` name. The box writes it, flushed to the disk, just before it resumes a command, once the command is in its job, and removes it when the run was not cut. A run is cut when its client went away or its stop signal reads as set; an unreadable stop signal is not a cut.
 
   A command whose launch is refused, or whose record cannot be written, leaves none (a partial one is removed; a write failure says `gate: remote could not write <Work>.command: <error>` and exits 1). A warm-up's command writes one only when none is at the name, and removes only its own. A record found by a later run is therefore of a command that was ended mid-run: killed at its ceiling, or its client lost.
 
@@ -4978,7 +4980,7 @@ Built verbs:
 
   A failure says `gate: cannot end the run's job: <problem>` on stderr, the problem worded as the local run end words it (the pass cap's `<n> of its processes still ran after 5 passes; first: <first problem>` included); a state root that cannot be resolved says the fixed line `gate: cannot end the run's job: the box's state root cannot be resolved; ending the whole job` (no path) and the whole job is terminated. The run's status stands either way.
 
-  A failed write by a forwarder to the box's stdout or stderr, or a heartbeat's failed beat or probe (above), means the PC's ssh connection closed, as when the PC's gate is killed, and a closed connection always stops the job, whether it is noticed while the command runs or during the final drain. The box terminates the job with 124 and polls its processes every 100 ms for up to 10 s. It then drains the readers, skips the sync-back, releases the work-folder lock and exits 255.
+  A failed write by a forwarder to the box's stdout or stderr, or a heartbeat's failed beat or probe (above), means the PC's ssh connection closed, as when the PC's gate is killed, and a closed connection always stops the job, whether it is noticed while the command runs or during the final drain. The box terminates the job with 124 and polls its processes every 100 ms for up to 10 s. It then drains the readers, makes no back commit, packs the cut run's set when its command started ([Outputs](#the-box-side), the cut pack), releases the work-folder lock and exits 255.
 
   On stderr, best effort, it says `gate: remote the client closed the connection; stopped job <name>` once the job is empty. Otherwise it says `gate: remote the client closed the connection; stopping job <name>` followed by the could-not-stop line or the `still has <n> process(es)` line of `stop`. The stdin closing is not the signal. A command that itself exits 255 is indistinguishable from a lost connection, as with the PowerShell wrapper.
 
@@ -5019,7 +5021,7 @@ Built verbs:
   - Right after a pack that wrote an archive, the box trims `OutputFolder` to at most 50 GiB of outputs archives (files named as in the first step; other files are neither counted nor removed). It removes the archives last written strictly before the run's own, oldest first (by path among equals), until the total fits; an archive written with the run's own or after it is never removed, so the folder may stay over the budget until the newer run's own trim.
   - The run's own archive is opened sharing reads only, so another run's trim cannot remove it mid-write; such a removal fails, is said as above (`gate: remote could not remove the old outputs archive <path>: <error>`) and that trim goes on to the next oldest. An entry whose metadata cannot be read is said (`gate: remote could not read the outputs archive <path>: <error>`, control characters escaped), left out of the total, and the trim goes on.
   - A run whose own archive alone is larger than the budget removes only its own archive, leaves the others, and says `gate: remote outputs not brought back: the archive is <X.X> GiB, more than the box keeps (50 GiB)`. A run whose own archive is gone before its trim says `gate: remote outputs not brought back: the archive was removed before it could be sent`. Either turns a passed 0 into 1.
-  - A pack that fails removes its half-written archive, says `gate: remote outputs not brought back: <reason>` and turns the passed 0 into 1 (a failed run ends on the command's own status, whatever the pack does). A failed sync-back packs nothing.
+  - A pack that fails removes its half-written archive, says `gate: remote outputs not brought back: <reason>` and turns the passed 0 into 1 (a failed run ends on the command's own status, whatever the pack does). A failed sync-back packs nothing, unless the run was cut (the cut pack below).
   - A failed command (exit other than 0), or one the box killed at its ceiling (which makes no back commit, so none of its paths is left out), packs only the files matched by the failed run's set: the output globs that name a `TestResults` folder (`Globs::test_results_only` in `gate-inputs`: a folder segment, not the last, equal to `TestResults` in any letter case) followed by the `FailureOutputs` globs (`failure::failed_run_globs`).
 
     It says its usual `gate-remote-outputs-size:` and `gate-remote-outputs:` lines, or `gate-remote-outputs: 0` when nothing matched. With neither kind of glob a failed run packs nothing and says no outputs line.
@@ -5028,6 +5030,11 @@ Built verbs:
   - A file only a `FailureOutputs` glob matches is held to caps in walk order (`gate_inputs::failure`): one over 256 MiB, or one that would take the failure files past 1 GiB in all (it and every later one are left; a file over the per-file cap does not count toward the total), stays on the builder. A file the `TestResults` globs match is never capped.
 
     Each file left is said, before the size line, as `gate: remote failure output left on the builder: <path> (<n> MiB, past the <cap> cap)`, `<n>` rounded up and `<cap>` `256 MiB` or `1 GiB in all`. The Windows box's seam `--test-box-failure-cap-bytes <n>` sets the per-file cap to `n` bytes and the total to `4n`; the Unix box always uses the built-in caps.
+- A cut run (its client went away, or its stop signal reads as set; an unreadable stop signal is not a cut) whose command started packs the failed run's narrowed set (the `TestResults` globs and the `FailureOutputs` globs, under the failure caps above) whatever the command's status, with nothing left out for a back commit. This holds before the back commit, when the back commit fails after a cut (a stop during `add -A` or the push included; the box says `gate: remote sync-back failed: <why>` first, then packs), while the back commit's paths are read, and after a pushed back commit, for a passing command or a failing one.
+
+  A cut run ends as one: 255 for a gone client, or a failure for a stopped passing command. A stopped run makes no back commit and says no `gate: remote sync-back failed` before its pack. A command that never started packs nothing, and neither does a warm-up. The box's own ceiling kill keeps the rules above.
+
+  Only the box packs: the PC still fetches nothing after its own cut, so the archive waits on the builder for a call of the `outputs` verb with `CutWaitMs`.
 - **`stop`** sets the job's stop event, then terminates the payload's job, taking no lock. It terminates the job again on every 100 ms poll of the job's process ids, until the job is empty or 10 s pass, so a process that joins late is ended; its processes end with 124.
 
   A terminate after the first that fails is not a failure of the stop: it is said once, `gate: remote could not terminate job <name> again: <error>`, after the other lines. An event that cannot be set prints `gate: remote could not signal the stop of job <name>: <error>` on stderr, and the job is terminated all the same. A stopped job prints `gate: remote stopped job <name>` on stdout and exits 0; no such job exits 0 with no output.
@@ -5041,6 +5048,10 @@ Built verbs:
   It renews a live drain session. For a session that is dead or missing under a standing barrier it still sends the archive and keeps it, saying `gate: remote outputs kept: the builder is drained` on stderr; a drain error also sends and keeps it.
 
   A payload without `Name`, `Work` or `OutputFolder`, or with a `Work` or `OutputFolder` that is not the work folder's own, exits 2.
+
+  A payload with `CutWaitMs` (whole milliseconds from 1, capped at 120000; else `gate: box payload CutWaitMs is not a whole number of milliseconds` and exit 2) asks the verb to wait for a cut run's pack. It renews the drain session, then waits until the run's own `<job>-stopped` event no longer exists, and opens the archive with read and delete sharing only: a sharing violation means the pack is still writing it, and the wait goes on. While it waits it says `gate-remote-heartbeat: 0` on stderr every heartbeat period.
+
+  Its answers: the archive, sent and removed as above; `gate-remote-outputs: 0` on stderr with empty stdout and status 0 when nothing was packed; `gate: remote outputs archive <name> is not finished: the run is still going after <n> s` and status 1 once the bound is spent; nothing said and status 255 when its own caller goes while it waits. Without the key the verb is as above.
 
   A `Name` that is not `<Key>-<32 lower-case hex digits>.tar.zst` for the payload's own key (`gate: remote outputs archive name '<name>' is not an outputs archive of this work folder`), an archive that does not exist (`gate: remote outputs archive <name> does not exist`) or one that cannot be read or sent exits 1. The file is opened without following a link, and only a plain file is sent.
 
@@ -5886,7 +5897,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
   A tree equal to `HEAD^{tree}` makes no commit and pushes nothing. Else `commit-tree -p HEAD` writes a commit with the message `gate-remote back` and the payload's identity, and `push -q` sends it, to its end though the client goes. The steps are the run's git steps below, with its attribute and LFS pins, their groups recorded in `<Work>.pgid`.
 
-  A back commit that fails says `gate: remote sync-back failed: <why>` and the status becomes 1 when the command exited 0, else the command's own; a client gone during it gives 255. The reasons of the copy and the lock are:
+  A back commit that fails says `gate: remote sync-back failed: <why>` and the status becomes 1 when the command exited 0, else the command's own; a client gone during it gives 255, and a cut run then packs after that line (the cut pack, Outputs). The reasons of the copy and the lock are:
   - `write-tree failed: the copied index <Index> is gone`
   - `<step> failed: the work folder lock <Lock> is no longer held`, for `write-tree`, `commit-tree` or `push`
   - `cannot copy <Work>/.git/index to <Index>: <Index> is a link or not a file`

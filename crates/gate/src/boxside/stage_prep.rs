@@ -108,6 +108,8 @@ impl CommandLines for PrepLines {
             Ran::Exited(status) => format!("exited {status}"),
             Ran::NotStarted(status) => format!("could not start (status {status})"),
             Ran::Killed(_) => format!("ran past its budget of {} s", self.budget),
+            // A closed connection ended it, which never says a failure.
+            Ran::Gone => return None,
         };
         clean.then(|| format!("gate: remote stage prep failed: {} {ending}", spoken(at.words)))
     }

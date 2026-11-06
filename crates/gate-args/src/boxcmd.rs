@@ -7,13 +7,16 @@
 //! `--test-outputs-budget-bytes <n>`, `--test-box-failure-cap-bytes <n>` (the Windows box's alone: the Unix box always
 //! holds failure outputs to the built-in caps), `--test-inputs-budget-bytes <n>`, `--test-lfs-budget-bytes <n>`,
 //! `--test-dotnet-limit-ms <n>`,
-//! `--test-box-sample-ms <n>`, `--test-box-sampler-fail true|false`, `--test-box-free-percent <1-100>`,
+//! `--test-box-sample-ms <n>`, `--test-box-pack-delay-ms <n>` (the pack waits once its archive file is made, before its
+//! first byte), `--test-box-sampler-fail true|false`, `--test-box-free-percent <1-100>`,
 //! `--test-box-drain-lease-ms <n>`, `--test-box-drain-lapse-ms <n>`, `--test-box-drain-lock-ms <n>`, `--test-box-now <unix s>`,
 //! `--test-box-drain-readable-only true|false`,
 //! `--test-box-kill-leaves <n>`, `--test-box-start-shift-ms <i64>`, `--test-probe-limit-ms <n>`, `--test-probe-drain-ms <n>`,
 //! `--test-box-desktop <fault>`, `--test-box-desktop-session <state>`, `--test-box-desktop-mutex <name>`, `--test-box-desktop-ms <n>`,
 //! `--test-box-desktop-message-ms <n>` and `--test-box-register ok|fail`, `--test-box-root-walk-stop <folder>`,
 //! `--test-box-git-limit <step>:<ms>`, `--test-box-git-armed-by <path>`, `--test-box-git-long-ms <ms>`, `--test-box-gone-reached <path>`,
+//! `--test-box-park-outputs <path>` (the run waits for the path just before it decides what to pack),
+//! `--test-box-park-back-paths <path>` (the run waits for the path just before it reads its back commit's paths),
 //! `--test-box-channel-ports <first>-<last>`, `--test-box-channel-accept-ms <n>`, `--test-box-channel-proof-ms <n>`,
 //! `--test-box-channel-idle-ms <n>` and `--test-box-channel-send-buffer-bytes <n>` (each also as `--<seam>=<value>`)
 //! before the verb; without the feature each is no verb, and so the box usage.
@@ -215,6 +218,9 @@ enum Seam {
     DotnetLimitMs,
     /// `--test-box-sample-ms <n>`: the period of the run's samples of its machine.
     SampleMs,
+    /// `--test-box-pack-delay-ms <n>`: how long the run's pack waits once its archive file is made, before its first
+    /// byte.
+    PackDelayMs,
     /// `--test-box-sampler-fail true|false`: every sample of the machine fails.
     SamplerFail,
     /// `--test-box-free-percent <1-100>`: the share of the machine the samples find free.
@@ -263,6 +269,10 @@ enum Seam {
     GitArmedBy,
     /// `--test-box-gone-reached <path>`: the file the box makes the first time it sees its client gone.
     GoneReached,
+    /// `--test-box-park-outputs <path>`: the run waits for the path just before it decides what to pack.
+    ParkOutputs,
+    /// `--test-box-park-back-paths <path>`: the run waits for the path just before it reads its back commit's paths.
+    ParkBackPaths,
     /// `--test-box-git-long-ms <ms>`: how long each of the box's long git steps may take, in milliseconds.
     GitLongMs,
     /// `--test-box-hold-poll-ms <n>`: how long `hold` waits between its looks for a free slot, in milliseconds.
@@ -295,6 +305,7 @@ impl Seam {
             "--test-lfs-budget-bytes" => Some(Seam::LfsBudgetBytes),
             "--test-dotnet-limit-ms" => Some(Seam::DotnetLimitMs),
             "--test-box-sample-ms" => Some(Seam::SampleMs),
+            "--test-box-pack-delay-ms" => Some(Seam::PackDelayMs),
             "--test-box-sampler-fail" => Some(Seam::SamplerFail),
             "--test-box-free-percent" => Some(Seam::FreePercent),
             "--test-box-drain-lease-ms" => Some(Seam::DrainLeaseMs),
@@ -317,6 +328,8 @@ impl Seam {
             "--test-box-git-limit" => Some(Seam::GitLimit),
             "--test-box-git-armed-by" => Some(Seam::GitArmedBy),
             "--test-box-gone-reached" => Some(Seam::GoneReached),
+            "--test-box-park-outputs" => Some(Seam::ParkOutputs),
+            "--test-box-park-back-paths" => Some(Seam::ParkBackPaths),
             "--test-box-git-long-ms" => Some(Seam::GitLongMs),
             "--test-box-hold-poll-ms" => Some(Seam::HoldPollMs),
             "--test-box-channel-ports" => Some(Seam::ChannelPorts),
@@ -341,6 +354,7 @@ impl Seam {
             Seam::LfsBudgetBytes => "--test-lfs-budget-bytes",
             Seam::DotnetLimitMs => "--test-dotnet-limit-ms",
             Seam::SampleMs => "--test-box-sample-ms",
+            Seam::PackDelayMs => "--test-box-pack-delay-ms",
             Seam::SamplerFail => "--test-box-sampler-fail",
             Seam::FreePercent => "--test-box-free-percent",
             Seam::DrainLeaseMs => "--test-box-drain-lease-ms",
@@ -363,6 +377,8 @@ impl Seam {
             Seam::GitLimit => "--test-box-git-limit",
             Seam::GitArmedBy => "--test-box-git-armed-by",
             Seam::GoneReached => "--test-box-gone-reached",
+            Seam::ParkOutputs => "--test-box-park-outputs",
+            Seam::ParkBackPaths => "--test-box-park-back-paths",
             Seam::GitLongMs => "--test-box-git-long-ms",
             Seam::HoldPollMs => "--test-box-hold-poll-ms",
             Seam::ChannelPorts => "--test-box-channel-ports",
@@ -431,6 +447,7 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::LfsBudgetBytes => seams.lfs_budget_bytes = Some(crate::values::above_zero(name, &value)?),
         Seam::DotnetLimitMs => seams.dotnet_limit_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::SampleMs => seams.sample_ms = Some(crate::values::above_zero(name, &value)?),
+        Seam::PackDelayMs => seams.pack_delay_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::SamplerFail => seams.sampler_fail = crate::values::true_or_false(name, &value)?,
         Seam::FreePercent => seams.free_percent = Some(crate::values::in_range(name, &value, 1, 100)?),
         Seam::DrainLeaseMs => seams.drain_lease_ms = Some(crate::values::above_zero(name, &value)?),
@@ -458,6 +475,8 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::GitLimit => seams.git_limit = Some(crate::values::git_limit(name, &value)?),
         Seam::GitArmedBy => seams.git_armed_by = Some(PathBuf::from(value)),
         Seam::GoneReached => seams.gone_reached = Some(PathBuf::from(value)),
+        Seam::ParkOutputs => seams.park_outputs = Some(PathBuf::from(value)),
+        Seam::ParkBackPaths => seams.park_back_paths = Some(PathBuf::from(value)),
         Seam::GitLongMs => seams.git_long_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::ChannelPorts => seams.channel_ports = Some(crate::values::port_range(name, &value)?),
         Seam::ChannelAcceptMs => seams.channel_accept_ms = Some(crate::values::above_zero(name, &value)?),

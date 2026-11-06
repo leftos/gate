@@ -3,7 +3,9 @@
 //! passing command and its back commit packs the files the PC lacks or holds otherwise into `<key>-<nonce>.tar.zst` in
 //! the output folder, as the PowerShell wrapper's `Publish-RunOutput` does. The `outputs` verb sends one such archive
 //! raw on stdout, or over a data channel the request asks for, then removes it unless a barrier stands and the run's
-//! session is not live; it takes no work folder lock, so it never waits on a run. A pack that pushes the folder past
+//! session is not live; it takes no work folder lock, and waits on a run only when the PC asks it to, after a cut
+//! (`CutWaitMs`), by the run's stop event and the archive's sharing, never a lock. A run whose command started and whose
+//! client went, or whose stop came, packs its failed run's set for that call. A pack that pushes the folder past
 //! its size budget removes the archives last written before its own, oldest first, never one written with or after
 //! it, and removes its own when that alone is over the budget, ending the run's outputs as not brought back.
 
@@ -11,23 +13,29 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufWriter, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::Ordering;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use gate_args::BoxSeams;
 use gate_inputs::failure::{self, Capping, Caps};
 use gate_inputs::hash::Hashing;
 use gate_router::escaped;
+use gate_win32::NamedEvent;
 use gate_win32::socket::Stream;
 use gate_wire::{
     Channel, Payload, Refusal, SHA256_BYTES, archive_file_name, archive_key, channel_not_completed_line, channel_sent_line, lower_hex, refused_line,
 };
-use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
 use crate::boxside::channel::{Acked, CHANNEL_CHUNK, Limit, SEND_BUFFER, Watch, proved, read_exactly, shown_error, written};
 use crate::boxside::drain;
-use crate::boxside::run::{FILE_FLAG_OPEN_REPARSE_POINT, REFUSED_STATUS};
+use crate::boxside::forward::{ClientGone, DRAIN, OutputLock};
+use crate::boxside::heartbeat;
+use crate::boxside::run::{CLOSED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, REFUSED_STATUS, SHARING_VIOLATION};
 use crate::boxside::stamping;
+use crate::boxside::stop::stop_event_name;
 use crate::console::Console;
 use crate::outputs::archive::pack;
 use crate::outputs::glob::Globs;
@@ -389,13 +397,15 @@ fn unlisted_line(error: &str) -> String {
 /// Else why the outputs are not brought back; an archive left half written is removed. The archive is made anew: a file
 /// or a link already at its name fails the pack and is left as it is. A file whose final path is not inside `work`
 /// fails the pack ([`pack`]). The archive is opened sharing reads only while it is packed, so another run's trim cannot
-/// remove it before it is whole.
+/// remove it before it is whole, and an `outputs` call that waits for its run sends none of it before it is whole.
+/// `--test-box-pack-delay-ms` stands in for a slow pack as `delay`: the wait between the archive's creation and its
+/// first byte.
 pub(super) fn bring_back(
     asked: &Asked<'_>,
     manifest: &Result<Manifest, String>,
     listing: Option<&Listing>,
     work: &Path,
-    skip: &[String],
+    (skip, delay): (&[String], Option<Duration>),
 ) -> Result<Brought, String> {
     let manifest = manifest.as_ref().map_err(Clone::clone)?;
     if asked.globs.is_empty() {
@@ -429,6 +439,9 @@ pub(super) fn bring_back(
         .share_mode(FILE_SHARE_READ)
         .open(&path)
         .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
+    if let Some(delay) = delay {
+        thread::sleep(delay);
+    }
     match pack(BufWriter::new(file), work, &chosen, &manifest.by_hash(skip)) {
         Ok(packed) => Ok(Brought {
             skipped,
@@ -501,6 +514,12 @@ pub(super) fn not_brought_back(reason: &str) -> String {
 /// ([`served`]), only once every check above passed and the archive is open: nothing goes on stdout, the archive is
 /// removed (or kept, as above) only once the PC's ack matched what was sent, and a channel that did not complete keeps
 /// it, says the `channel` refusal tag and why, and ends with the refusal status.
+///
+/// A payload with `CutWaitMs` ([`Payload::cut_wait`]), sent after the PC cut the run, also names the run's `Job` and
+/// has the call wait, once its session is renewed, for that run to be over ([`waited`]) before it opens the archive: a
+/// run over that packed nothing says `gate-remote-outputs: 0` and sends nothing, status 0, and a run still going once
+/// the wait's bound has passed is said as not finished, status 1, nothing sent. A call whose own caller goes while it
+/// waits stops waiting, sends and says nothing, and ends with 255, the archive left for the prune.
 pub(super) fn outputs(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
     let (work, folder, session, channel) = match asked_of(payload) {
         Ok(read) => read,
@@ -517,20 +536,131 @@ pub(super) fn outputs(payload: &Payload, seams: &BoxSeams, console: &mut Console
             return u32::from(if lacking { USAGE_STATUS } else { FAILED_STATUS });
         }
     };
+    let waits = match cut_waited(payload) {
+        Ok(waits) => waits,
+        Err(line) => {
+            stamping::err(console, &line);
+            return u32::from(USAGE_STATUS);
+        }
+    };
     let path = Path::new(folder).join(name);
     let (_held, removal) = renewal(work, session, seams, console);
-    let archive = match opened(&path) {
+    let archive = match archive_opened(&path, name, waits, seams, console) {
         Ok(archive) => archive,
-        Err(unsent) => {
-            stamping::err(console, &unsent.line(name));
-            return u32::from(FAILED_STATUS);
-        }
+        Err(status) => return status,
     };
     let then = |console: &mut Console| removed(&removal, &path, name, console);
     match &channel {
         Some((channel, nonce)) => over_channel(&archive, (channel, nonce), seams, console, then),
         None => over_stdout(archive, name, console, then),
     }
+}
+
+/// The archive `name` at `path` opened for sending: at once for a call that does not wait, else once the run that
+/// `waits` names, with its bound, is over ([`waited`]). Else the status the verb ends on, its line said: 0 for a run
+/// over that packed nothing, 1 for a run still going or an archive that cannot be opened, and 255, saying nothing, for
+/// a call whose own caller went while it waited, the archive left for the prune.
+fn archive_opened(path: &Path, name: &str, waits: Option<(Duration, &str)>, seams: &BoxSeams, console: &mut Console) -> Result<File, u32> {
+    let Some((bound, job)) = waits else {
+        let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        return opened(path, share).map_err(|unsent| failed_said(&unsent.line(name), console));
+    };
+    match waited(path, &stop_event_name(job), bound, seams, console) {
+        Ok(archive) => Ok(archive),
+        Err(Unwaited::Nothing) => {
+            stamping::protocol(console, NOTHING_PACKED);
+            Err(0)
+        }
+        // No one is left to tell: nothing is sent or said.
+        Err(Unwaited::CallerGone) => Err(CLOSED_STATUS),
+        Err(Unwaited::Going) => Err(failed_said(&still_going_line(name, bound), console)),
+        Err(Unwaited::Unsent(unsent)) => Err(failed_said(&unsent.line(name), console)),
+    }
+}
+
+/// Says `line` on stderr; the verb's failure status, 1.
+fn failed_said(line: &str, console: &mut Console) -> u32 {
+    stamping::err(console, line);
+    u32::from(FAILED_STATUS)
+}
+
+/// How often a call that waits for its run ([`waited`]) looks whether the run is over.
+const CUT_WAIT_STEP: Duration = Duration::from_millis(100);
+
+/// The wait the payload asks for ([`Payload::cut_wait`]) and the job name of the run it waits for; `None` for a call
+/// that does not wait, which reads no job name. Else the usage line.
+fn cut_waited(payload: &Payload) -> Result<Option<(Duration, &str)>, String> {
+    match payload.cut_wait()? {
+        Some(bound) => Ok(Some((bound, payload.key().and_then(|key| payload.job(key))?))),
+        None => Ok(None),
+    }
+}
+
+/// Why a call that waits for its run sends no archive.
+enum Unwaited {
+    /// The run is over and packed nothing: no archive is at its name.
+    Nothing,
+    /// The run was still going, or still writing the archive, once the wait's bound had passed.
+    Going,
+    /// The archive could not be opened, for this.
+    Unsent(Unsent),
+    /// The call's own caller went while it waited: its heartbeat found stderr's reader gone.
+    CallerGone,
+}
+
+/// The archive at `path` opened once the run that packs it is over: once the run's stop event `event` no longer
+/// exists, as the run drops it only after its pack, and then only once no writer holds the archive open. Looks every
+/// [`CUT_WAIT_STEP`] for up to `bound`; meanwhile the heartbeat says `gate-remote-heartbeat: 0` on stderr every period
+/// ([`heartbeat::period`]), so the PC's watch of a silent call does not cut it. An event that cannot be looked at is a
+/// run still going: nothing half written is ever sent. A beat that finds the call's own caller gone ends the wait
+/// ([`Unwaited::CallerGone`]).
+fn waited(path: &Path, event: &str, bound: Duration, seams: &BoxSeams, console: &mut Console) -> Result<File, Unwaited> {
+    let lock = OutputLock::default();
+    let gone = ClientGone::default();
+    let pump = heartbeat::start(&lock, &gone, heartbeat::period(seams))
+        .inspect_err(|error| stamping::err(console, &gate_watchdog::start_failed_line(&error)))
+        .ok();
+    let began = Instant::now();
+    let found = loop {
+        if gone.load(Ordering::SeqCst) {
+            break Err(Unwaited::CallerGone);
+        }
+        if let Some(found) = run_over(path, event) {
+            break found;
+        }
+        if began.elapsed() >= bound {
+            break Err(Unwaited::Going);
+        }
+        thread::sleep(CUT_WAIT_STEP);
+    };
+    if let Some(pump) = pump {
+        // Stopped before any other line, so none lands inside a beat; a pump left stuck changes nothing here.
+        let _ = pump.stop_within(DRAIN);
+    }
+    found
+}
+
+/// The archive at `path` once the run whose stop event is `event` is over and no writer holds the archive open:
+/// opened sharing reads and deletes only, so an open writer fails the open with a sharing violation; `Nothing` when
+/// the run is over and no archive is there. `None` while the run or its writer may still be going.
+fn run_over(path: &Path, event: &str) -> Option<Result<File, Unwaited>> {
+    // The handle is dropped at once: the look holds nothing of the run's.
+    if !matches!(NamedEvent::open_existing(event), Ok(None)) {
+        return None;
+    }
+    match opened(path, FILE_SHARE_READ | FILE_SHARE_DELETE) {
+        Ok(archive) => Some(Ok(archive)),
+        Err(Unsent::Missing) => Some(Err(Unwaited::Nothing)),
+        Err(Unsent::Unread(error)) if error.raw_os_error() == Some(SHARING_VIOLATION) => None,
+        Err(unsent) => Some(Err(Unwaited::Unsent(unsent))),
+    }
+}
+
+/// The line a call that waited `bound` for its run says of the archive `name` it did not send: the bound in whole
+/// seconds, rounded up, at least 1.
+fn still_going_line(name: &str, bound: Duration) -> String {
+    let seconds = bound.as_millis().div_ceil(1000).max(1);
+    format!("gate: remote outputs archive {name} is not finished: the run is still going after {seconds} s")
 }
 
 /// The work folder, the output folder, the drain session and the data channel with its nonce the payload asks for;
@@ -686,9 +816,15 @@ impl Unsent {
     }
 }
 
-/// The plain file at `path` opened for reading, never a link's target; else why it cannot be sent.
-fn opened(path: &Path) -> Result<File, Unsent> {
-    let archive = match OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path) {
+/// The plain file at `path` opened for reading, sharing what `share` allows, never a link's target; else why it cannot
+/// be sent.
+fn opened(path: &Path, share: u32) -> Result<File, Unsent> {
+    let archive = match OpenOptions::new()
+        .read(true)
+        .share_mode(share)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    {
         Ok(archive) => archive,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(Unsent::Missing),
         Err(error) => return Err(Unsent::Unread(error)),
@@ -798,7 +934,7 @@ mod tests {
                 && line.ends_with("; outputs under .tmp are not brought back this run"),
             "{line}"
         );
-        let brought = super::bring_back(&asked, &Ok(super::Manifest::default()), taken.as_ref(), &work, &[]).expect("the pack works");
+        let brought = super::bring_back(&asked, &Ok(super::Manifest::default()), taken.as_ref(), &work, (&[], None)).expect("the pack works");
         assert_eq!(
             brought.line,
             format!("gate-remote-outputs: 1 {}", asked.archive),

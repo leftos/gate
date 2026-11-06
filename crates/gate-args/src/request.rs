@@ -162,6 +162,15 @@ pub struct BoxSeams {
     /// The file the box makes, empty, the first time it sees its client gone, so a case arms a bound on that moment;
     /// `None` without the feature, and nothing is written.
     pub gone_reached: Option<PathBuf>,
+    /// The file `gate box run` waits for, once its back commit is made and just before it decides what to pack,
+    /// making `<path>.parked` as it starts to wait; `None` without the feature, and the run does not wait.
+    pub park_outputs: Option<PathBuf>,
+    /// The file `gate box run` waits for just before it reads the paths its back commit changes (`diff-tree`), making
+    /// `<path>.parked` as it starts to wait; `None` without the feature, and the read does not wait.
+    pub park_back_paths: Option<PathBuf>,
+    /// How long, in milliseconds, `gate box run`'s pack waits once its archive file is made, before it writes the
+    /// archive's first byte; `None` without the feature, and the pack does not wait.
+    pub pack_delay_ms: Option<u64>,
     /// How long each of `gate box`'s long git steps (`fetch`, `checkout`, `lfs checkout`, `clean`, `add -A`, `push`,
     /// prune's `gc --auto`) may take, in milliseconds, in place of the built-in 30 minutes; a step `git_limit` names keeps that limit.
     /// `None` without the feature.
