@@ -118,7 +118,7 @@ fn a_gate_whose_script_has_its_caller_runs() {
 }
 
 /// Git's own bash, `usr\bin\bash.exe` under the Git root of the `git.exe` the suite's git cases find on PATH: the
-/// folder above `cmd\git.exe`, `bin\git.exe` or `mingw64\bin\git.exe`.
+/// folder above `cmd\git.exe`, `bin\git.exe`, `mingw64\bin\git.exe` or `ucrt64\bin\git.exe`.
 fn git_bash() -> PathBuf {
     let path = std::env::var_os("PATH").expect("PATH is set");
     let git = std::env::split_paths(&path)
@@ -130,7 +130,7 @@ fn git_bash() -> PathBuf {
     let above = folder.parent();
     let root = if named(folder, "cmd") {
         above
-    } else if named(folder, "bin") && above.is_some_and(|above| named(above, "mingw64")) {
+    } else if named(folder, "bin") && above.is_some_and(|above| named(above, "mingw64") || named(above, "ucrt64")) {
         above.and_then(Path::parent)
     } else if named(folder, "bin") {
         above
@@ -139,7 +139,7 @@ fn git_bash() -> PathBuf {
     };
     assert!(
         root.is_some(),
-        "{} lies in no cmd, bin or mingw64\\bin folder of a Git root",
+        "{} lies in no cmd, bin, mingw64\\bin or ucrt64\\bin folder of a Git root",
         git.display()
     );
     let root = root.expect("checked above");
