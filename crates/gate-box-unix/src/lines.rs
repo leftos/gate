@@ -446,8 +446,13 @@ pub enum CommandEnd {
     Exited(i32),
     /// A signal, this one, ended it.
     Signalled(i32),
-    /// Its client is gone.
+    /// Its client is gone: before the command started; while the box killed it for its ceiling or its backstop; or once
+    /// it started and its runner failed, its group perhaps still there or the work lock lost, which deliberately packs
+    /// nothing.
     Gone,
+    /// It started, then its client went: the PC cut the run, and its failed run's set is packed for a later `outputs`
+    /// call.
+    Cut,
     /// It could not be started.
     NotStarted,
     /// The box could not see it to its end: its exit unread, its group still there, or a record not changed.
@@ -472,7 +477,7 @@ pub fn command_status(end: CommandEnd) -> u8 {
         // 1 to 126, so the status is 129 to 254 and never the lost connection's 255.
         CommandEnd::Signalled(signal) if (1..127).contains(&signal) => u8::try_from(128 + signal).ok(),
         CommandEnd::Signalled(_) | CommandEnd::Failed => None,
-        CommandEnd::Gone => Some(GONE_STATUS),
+        CommandEnd::Gone | CommandEnd::Cut => Some(GONE_STATUS),
         CommandEnd::NotStarted => Some(NOT_STARTED_STATUS),
     };
     status.unwrap_or(FAILED_STATUS)

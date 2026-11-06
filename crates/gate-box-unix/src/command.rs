@@ -645,7 +645,7 @@ fn cross_of(end: CommandEnd, took: Duration) -> CrossEnd {
         CommandEnd::Exited(0) => CrossEnd::Passed(took),
         CommandEnd::Exited(_) => CrossEnd::Failed(command_status(end)),
         CommandEnd::Killed(_) => CrossEnd::Killed,
-        CommandEnd::Gone => CrossEnd::Gone,
+        CommandEnd::Gone | CommandEnd::Cut => CrossEnd::Gone,
         CommandEnd::Signalled(_) | CommandEnd::NotStarted | CommandEnd::Failed => CrossEnd::Ended(command_status(end)),
     }
 }
@@ -696,7 +696,9 @@ fn started_program<'a>(godot: Godot<'a>, word: &'a str) -> io::Result<&'a str> {
 /// How the run's command, `launch`'s words, ended, having run as `ran`, its record `record` removed when the command
 /// ended clean or never started, and the line of a start that failed or of the box's own failure said, after the line
 /// of the ceiling's sampler's failure when `verdict` holds one; a command that ran is followed by the ceiling's end
-/// lines ([`said_end_lines`]). For a command the box killed, what [`killed`] gives.
+/// lines ([`said_end_lines`]). For a command the box killed, what [`killed`] gives. A client gone once the runner
+/// failed is [`CommandEnd::Gone`], never cut: the group may still be there or the lock lost, so nothing is packed; only
+/// a command that ran to an end is cut ([`end_of`]).
 fn ended<S: LineSink>(launch: &Launch<'_>, record: &str, ran: Result<Ran, NotRan>, verdict: &Verdict, output: &Output<S>) -> CommandEnd {
     if let Some(kill) = verdict.kill {
         return killed(launch, kill, ran, verdict, output);
@@ -738,7 +740,7 @@ fn ended<S: LineSink>(launch: &Launch<'_>, record: &str, ran: Result<Ran, NotRan
 /// of its sampler's failure when `verdict` holds one, then, after an exit or a signal, its load-adjusted seconds when
 /// `verdict` has them.
 fn said_end_lines<S: LineSink>(launch: &Launch<'_>, verdict: &Verdict, end: CommandEnd, output: &Output<S>) {
-    if matches!(end, CommandEnd::Gone) {
+    if matches!(end, CommandEnd::Gone | CommandEnd::Cut) {
         return;
     }
     let adjusted = verdict
@@ -793,10 +795,11 @@ fn killed<S: LineSink>(launch: &Launch<'_>, kill: Kill, ran: Result<Ran, NotRan>
     CommandEnd::Killed(tag)
 }
 
-/// How the command that ran as `ran` ended, its client gone when `gone`.
+/// How the command that ran as `ran` ended, its client gone when `gone`: a command that ran and whose client went is
+/// cut ([`CommandEnd::Cut`]), whatever its exit; one that exits 255 of itself is that exit.
 fn end_of(ran: &Ran, gone: bool) -> CommandEnd {
     if gone || ran.ended_by == Some(EndedBy::Gone) {
-        return CommandEnd::Gone;
+        return CommandEnd::Cut;
     }
     match (ran.status.code(), ran.status.signal()) {
         (Some(code), _) => CommandEnd::Exited(code),
@@ -975,8 +978,8 @@ mod tests {
     use gate_wire::{BoxKill, adjusted_prefix, killed_line, started_line};
 
     use super::{
-        Beat, Ceiling, CrossEnd, Launch, Sampler, Verdict, command_record, cross_end, cross_of, ended, removed_if_held, run_command, run_with,
-        with_folder,
+        Beat, Ceiling, CrossEnd, Launch, Sampler, Verdict, command_record, cross_end, cross_of, end_of, ended, removed_if_held, run_command,
+        run_with, with_folder,
     };
     use crate::console::{Forwarding, HungUpSink, LineSink, Output, RecordingSink, Stamp, Stream};
     use crate::files::{HeldLock, held_for_test};
@@ -1361,9 +1364,31 @@ mod tests {
             (CommandEnd::Killed(BoxKill::TimedOut), CrossEnd::Killed),
             (CommandEnd::Killed(BoxKill::Backstop), CrossEnd::Killed),
             (CommandEnd::Gone, CrossEnd::Gone),
+            (CommandEnd::Cut, CrossEnd::Gone),
         ] {
             assert_eq!(cross_of(end, took), crossed, "{end:?}");
         }
+    }
+
+    #[test]
+    fn a_command_whose_client_went_after_it_ran_is_cut_and_255_and_one_that_exits_255_itself_is_its_exit() {
+        let ran = |status: i32, ended_by: Option<EndedBy>| Ran {
+            status: ExitStatus::from_raw(status),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            leftover: false,
+            ended_by,
+        };
+        assert_eq!(command_status(CommandEnd::Cut), 255);
+        assert_eq!(end_of(&ran(255 << 8, None), false), CommandEnd::Exited(255), "its own 255 is no cut");
+        assert_eq!(command_status(end_of(&ran(255 << 8, None), false)), 255);
+        assert_eq!(end_of(&ran(1 << 8, None), true), CommandEnd::Cut, "a client gone once it ran");
+        assert_eq!(end_of(&ran(0, None), true), CommandEnd::Cut, "a passing command whose client went");
+        assert_eq!(
+            end_of(&ran(libc::SIGTERM, Some(EndedBy::Gone)), false),
+            CommandEnd::Cut,
+            "ended for its gone client"
+        );
     }
 
     #[test]

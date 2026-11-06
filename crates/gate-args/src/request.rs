@@ -162,8 +162,9 @@ pub struct BoxSeams {
     /// The file the box makes, empty, the first time it sees its client gone, so a case arms a bound on that moment;
     /// `None` without the feature, and nothing is written.
     pub gone_reached: Option<PathBuf>,
-    /// The file `gate box run` waits for, once its back commit is made and just before it decides what to pack,
-    /// making `<path>.parked` as it starts to wait; `None` without the feature, and the run does not wait.
+    /// The file `gate box run` waits for, making `<path>.parked` as it starts to wait: on the Windows box once its back
+    /// commit is made, just before it decides what to pack; on the Unix box right after its command ends, before its
+    /// back commit. `None` without the feature, and the run does not wait.
     pub park_outputs: Option<PathBuf>,
     /// The file `gate box run` waits for just before it reads the paths its back commit changes (`diff-tree`), making
     /// `<path>.parked` as it starts to wait; `None` without the feature, and the read does not wait.

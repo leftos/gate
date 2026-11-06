@@ -4,12 +4,14 @@
 //! and, after a passing command, its outputs packed for the PC to fetch ([`run`]). Each line is said as the Windows box says it, byte for
 //! byte.
 
+use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, OsStr};
 use std::fs;
 use std::io::{self, BufRead};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use gate_args::BoxSeams;
@@ -366,6 +368,8 @@ pub struct Ready<'p> {
     /// The PC's outputs manifest and the listing taken before the command, for a run with output globs; `None`
     /// without.
     pub outputs: Option<RunOutputs>,
+    /// What the run's packs leave for its last step ([`cut_ended`]).
+    packs: Packs,
     /// The run's hold of its drain session, its end stamped once the run is done ([`drain::passed`]).
     #[expect(dead_code, reason = "a guard, held for its drop, which stamps the session's end")]
     pub(crate) admitted: drain::Admitted,
@@ -640,6 +644,7 @@ fn prepared<'p, S: LineSink + 'static>(
             godot_root,
             temp,
             outputs,
+            packs: Packs::default(),
             admitted,
         }),
         // A refusal sends the PC to run the command itself; any other end, whatever its status, is a pair run's back
@@ -691,7 +696,7 @@ pub(crate) fn run_git<'a, S: LineSink + 'static>(
 }
 
 /// How a run's watches look and where its ceiling reads the machine's load from: the defaults, or the test seams'.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Watches {
     /// How often the heartbeat looks and the ceiling samples.
     pub periods: Periods,
@@ -704,6 +709,12 @@ pub struct Watches {
     /// When the run verb started, taken as its watches are read ([`started_at`]). The pack after a kill measures the
     /// PC's backstop from it ([`pack_after_kill`]).
     pub started: Instant,
+    /// `--test-box-pack-delay-ms`: how long a pack waits between making its archive and its first byte, standing in
+    /// for a slow pack ([`outputs::bring_back`]).
+    pub pack_delay: Option<Duration>,
+    /// `--test-box-park-outputs`: the path a run parks on right after its command ends, before its back commit and
+    /// every pack decision ([`parked`]).
+    pub park_outputs: Option<PathBuf>,
 }
 
 /// When the run verb started, taken as it starts: shifted by `--test-box-start-shift-ms` when `seams` give it, earlier
@@ -781,6 +792,8 @@ impl Watches {
             budget: outputs::budget(seams),
             drain: DrainSeams::of(seams),
             started: started_at(seams),
+            pack_delay: seams.pack_delay_ms.map(Duration::from_millis),
+            park_outputs: seams.park_outputs.clone(),
         }
     }
 }
@@ -789,12 +802,12 @@ impl Watches {
 ///
 /// The login shell's `PATH` is read once, by [`prepared`] ([`process::login_shell`]); the git steps and the command run
 /// along it ([`run_along`]), and a Godot run finds its install under the login shell's `GATE_GODOT_ROOT`.
-pub fn run<S: LineSink + 'static>(payload: &Payload, output: &Arc<Output<S>>, watches: Watches) -> u8 {
+pub fn run<S: LineSink + 'static>(payload: &Payload, output: &Arc<Output<S>>, watches: &Watches) -> u8 {
     run_along(payload, output, watches, process::login_shell)
 }
 
 /// [`run`], the login shell's `PATH` read from `login` and the PC's outputs manifest from stdin ([`run_reading`]).
-fn run_along<S: LineSink + 'static>(payload: &Payload, output: &Arc<Output<S>>, watches: Watches, login: LoginShell) -> u8 {
+fn run_along<S: LineSink + 'static>(payload: &Payload, output: &Arc<Output<S>>, watches: &Watches, login: LoginShell) -> u8 {
     run_reading(payload, output, watches, login, &mut io::stdin().lock())
 }
 
@@ -806,7 +819,7 @@ fn run_along<S: LineSink + 'static>(payload: &Payload, output: &Arc<Output<S>>, 
 fn run_reading<S: LineSink + 'static>(
     payload: &Payload,
     output: &Arc<Output<S>>,
-    watches: Watches,
+    watches: &Watches,
     login: LoginShell,
     input: &mut dyn BufRead,
 ) -> u8 {
@@ -839,10 +852,10 @@ fn run_reading<S: LineSink + 'static>(
 /// ([`command_status`]), the back commit made only after an end of its own ([`of_its_own`]) and the outputs trimmed to
 /// `watches`' budget; a command the box killed at its ceiling early enough has its failure outputs packed after its
 /// kill line and tag ([`killed_brought_back`]) and still ends killed, and any other kill packs nothing
-/// ([`pack_after_kill`]). A run with a chosen
-/// Godot version runs with the install of it under the login shell's `GATE_GODOT_ROOT` ([`probe::installed_godot`]),
-/// or with Godot missing when there is no root or no such install.
-fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, watches: Watches) -> u8 {
+/// ([`pack_after_kill`]). Whatever path the run took, a client gone is ruled last, in one place ([`cut_ended`]). A run
+/// with a chosen Godot version runs with the install of it under the login shell's `GATE_GODOT_ROOT`
+/// ([`probe::installed_godot`]), or with Godot missing when there is no root or no such install.
+fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, watches: &Watches) -> u8 {
     let request = &ready.request;
     let login_path = ready.login_path.as_deref();
     let installed;
@@ -875,19 +888,106 @@ fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, 
         pump: ready.pump.as_ref(),
     };
     let end = run_command(&launch, output);
+    if let Some(park) = watches.park_outputs.as_deref() {
+        parked(park, output);
+    }
     let status = command_status(end);
-    if !of_its_own(end) {
+    let status = if of_its_own(end) {
+        synced_back(ready, output, status, watches, &launch)
+    } else {
         let status = back_commits_failed(output, request, status);
         // Only a ceiling kill early enough packs: a pack after the backstop, or too near the PC's own backstop of the
         // run call, could outlast that backstop.
         if let CommandEnd::Killed(kill) = end
             && pack_after_kill(kill, watches.started, request.timeout)
         {
-            killed_brought_back(ready, output, watches.budget);
+            killed_brought_back(ready, output, watches);
         }
+        status
+    };
+    cut_ended(ready, output, watches, end, status)
+}
+
+/// What a run's packs leave for its last step ([`cut_ended`]).
+#[derive(Default)]
+struct Packs {
+    /// Whether the failed run's set of a cut run was packed, or its pack tried ([`cut_brought_back`]): it is made once.
+    cut: Cell<bool>,
+    /// The last of the run's own packs that wrote an archive, held under its pack's shared lock until the run's last
+    /// step, so one whose client went after it is replaced by the failed run's set before an `outputs` call can send it
+    /// ([`brought_back`], [`cut_once`]).
+    kept: RefCell<Option<outputs::Brought>>,
+}
+
+/// The status the run `ready`, whose command ended as `end` and whose run gave `status`, ends on: the one place a
+/// started command's gone client is ruled (decision 1), after every other step. With the client there, `status`. With
+/// it gone, or a command cut ([`CommandEnd::Cut`]): a ceiling kill keeps its own status, 124, and packs nothing more
+/// (GATE-827), and a command that never started keeps its own; a runner failure, or a kill whose client went before
+/// its lines, packs nothing, as its group may still be there or the work lock lost, and ends closed; any other end has
+/// its failed run's set packed once ([`cut_once`]), for the PC's later `outputs` call and with no time margin, as the
+/// PC has already cut the call, and ends closed, [`CLOSED_STATUS`]. The pack kept to here ([`Packs::kept`]) is let go.
+fn cut_ended<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, watches: &Watches, end: CommandEnd, status: u8) -> u8 {
+    let kept = ready.packs.kept.take();
+    if !output.client_gone() && end != CommandEnd::Cut {
         return status;
     }
-    synced_back(ready, output, status, watches.budget, &launch)
+    match end {
+        CommandEnd::Killed(_) | CommandEnd::NotStarted => status,
+        CommandEnd::Failed | CommandEnd::Gone => CLOSED_STATUS,
+        CommandEnd::Exited(_) | CommandEnd::Signalled(_) | CommandEnd::Cut => cut_once(ready, kept, output, watches),
+    }
+}
+
+/// The failed run's set of the cut run `ready` packed, unless it was already ([`Packs::cut`]): the run's own pack
+/// `kept` removed first and the set packed in its place ([`discarded_for_cut`]), else the set packed
+/// ([`cut_brought_back`]); the closed status.
+fn cut_once<S: LineSink + 'static>(ready: &Ready<'_>, kept: Option<outputs::Brought>, output: &Arc<Output<S>>, watches: &Watches) -> u8 {
+    if ready.packs.cut.get() {
+        return CLOSED_STATUS;
+    }
+    match (kept, &ready.request.outputs) {
+        (Some(brought), Some(asked)) => discarded_for_cut(ready, (asked, brought), output, watches),
+        _ => cut_brought_back(ready, output, watches),
+    }
+}
+
+/// How often a parked run looks for the path it waits on ([`parked`]).
+const PARK_STEP: Duration = Duration::from_millis(20);
+/// The longest a parked run waits ([`parked`]).
+const PARK_LIMIT: Duration = Duration::from_secs(600);
+
+/// Parks the run on `path` (`--test-box-park-outputs`) right after its command ends, before its back commit and every
+/// pack decision: makes `<path>.parked`, its failure said, then waits until `path` exists, at most [`PARK_LIMIT`].
+fn parked<S: LineSink>(path: &Path, output: &Output<S>) {
+    let mut parked = path.as_os_str().to_owned();
+    parked.push(".parked");
+    if let Err(error) = fs::File::create(&parked) {
+        let line = format!("gate: remote park seam cannot create {}: {error}", Path::new(&parked).display());
+        noted(output, GAT, &line);
+    }
+    let began = Instant::now();
+    while !path.exists() && began.elapsed() < PARK_LIMIT {
+        thread::sleep(PARK_STEP);
+    }
+}
+
+/// Packs the failed run's set of the run `ready`, whose command started and whose client then went: its test reports
+/// and failure outputs as a failed command's are ([`Asked::failed_run`] under [`Caps::BUILT_IN`]), whatever the
+/// command's status, with no back commit left out, then the output folder trimmed to `watches`' budget, both whatever
+/// the client, for the PC's `outputs` call that waits for it ([`packed_said`], [`trimmed`]). Nothing for a run that
+/// asks for no outputs or whose failed run set is empty. The run ends as a closed connection, [`CLOSED_STATUS`],
+/// whatever the pack gives. Made once a run ([`Packs::cut`]): a pack's cut ([`gone_pack`]) and the run's last step
+/// ([`cut_once`]) call it.
+fn cut_brought_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, watches: &Watches) -> u8 {
+    ready.packs.cut.set(true);
+    if let (Some(asked), Some(read)) = (&ready.request.outputs, &ready.outputs)
+        && let Some(reports) = asked.failed_run(Caps::BUILT_IN)
+        && let Ok(brought) = packed_said(ready, (&reports, read), Ok(Vec::new()), output, watches)
+    {
+        // A cut run ends closed, so the trim's own status is only said, to no one.
+        let _ = trimmed(&reports, &brought, output, watches);
+    }
+    CLOSED_STATUS
 }
 
 /// Whether a command the box killed for `kill`, in a run whose verb started at `started` under the payload's ceiling
@@ -906,23 +1006,25 @@ fn pack_after_kill(kill: BoxKill, started: Instant, ceiling: Option<u64>) -> boo
 
 /// Packs the test reports and failure outputs of the run `ready`, whose command the box killed at its ceiling, as a
 /// failed command's are ([`Asked::failed_run`] under [`Caps::BUILT_IN`], [`brought_back`]), with no back commit to
-/// leave out, the output folder trimmed to `budget` bytes; nothing, and no line, for a run that asks for no outputs or
-/// whose failed run set is empty. The run ends killed whatever the pack gives. Only a kill [`pack_after_kill`] allows
-/// comes here.
-fn killed_brought_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, budget: u64) {
+/// leave out, the output folder trimmed to `watches`' budget; nothing, and no line, for a run that asks for no outputs
+/// or whose failed run set is empty. The run ends killed whatever the pack gives or the client does: a client gone at
+/// the pack is ruled by [`gone_pack`], one gone later by the run's last step ([`cut_ended`]). Only a kill
+/// [`pack_after_kill`] allows comes here.
+fn killed_brought_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, watches: &Watches) {
     if let (Some(asked), Some(read)) = (&ready.request.outputs, &ready.outputs)
         && let Some(reports) = asked.failed_run(Caps::BUILT_IN)
     {
         // A killed command ends killed, so the pack's own status is only said.
-        let _ = brought_back(ready, (&reports, read), None, output, budget);
+        let _ = brought_back(ready, (&reports, read), None, output, watches, Packing::Killed);
     }
 }
 
 /// Whether the command that ended as `end` reached an end of its own, an exit or a signal the box did not send, which
 /// alone is followed by a back commit: one the box killed for its ceiling or backstop, whose client is gone, that never
 /// started or that the box could not see to its end makes none, as the PC applies nothing of it; one the box killed at
-/// its ceiling early enough still has its failure outputs packed ([`killed_brought_back`], [`pack_after_kill`]). A
-/// `box stop`'s `SIGTERM` reads as any other signal.
+/// its ceiling early enough still has its failure outputs packed ([`killed_brought_back`], [`pack_after_kill`]), and
+/// one cut once it started has its failed run's set packed by the run's last step ([`cut_ended`]). A `box stop`'s
+/// `SIGTERM` reads as any other signal.
 fn of_its_own(end: CommandEnd) -> bool {
     matches!(end, CommandEnd::Exited(_) | CommandEnd::Signalled(_))
 }
@@ -937,76 +1039,124 @@ fn of_its_own(end: CommandEnd) -> bool {
 /// ([`Asked::failed_run`] under [`Caps::BUILT_IN`]), with no cross
 /// build, and ends on its own status whatever the pack gives, and one with no glob naming a `TestResults` folder, a
 /// failed sync-back or a cross build that did not pass packs nothing. A command the box killed never reaches here: its
-/// failure outputs are packed with no back commit ([`killed_brought_back`]).
-fn synced_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, status: u8, budget: u64, launch: &Launch<'_>) -> u8 {
-    let request = &ready.request;
-    let commits = match back::back_commit(request, &ready.lock, ready.login_path.as_deref(), output) {
+/// failure outputs are packed with no back commit ([`killed_brought_back`]). A client gone at a pack is ruled there
+/// ([`brought_back`]); one gone at any other point, during the back commit or the cross build among them, has the
+/// failed run's set packed, after the line of a back commit that failed, and the run's status set, by the run's last
+/// step ([`cut_ended`]).
+fn synced_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, status: u8, watches: &Watches, launch: &Launch<'_>) -> u8 {
+    let commits = match back_committed(ready, output, status) {
         Ok(commits) => commits,
-        Err(BackFailed::Gone(failed)) => return failure(output, &failed),
+        Err(ended) => return ended,
+    };
+    commits_said(&ready.request, &commits, output, status);
+    let main = commits.first().and_then(Option::as_deref);
+    outputs_brought(ready, output, (status, main), watches, launch)
+}
+
+/// The back commits of the run `ready`, whose command ended with `status`, made and pushed ([`back::back_commit`]);
+/// else the status the run ends on, its lines said: a failure as the client went, said to no one; a step that failed
+/// says, on a pair run, [`BACK_COMMITS_FAILED`], then `gate: remote sync-back failed: <why>`, and gives
+/// [`FAILED_STATUS`] for a command that exited 0, else `status`. A client gone has the failed run's set packed after
+/// these lines, by the run's last step ([`cut_ended`]).
+fn back_committed<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, status: u8) -> Result<Vec<Option<String>>, u8> {
+    let request = &ready.request;
+    match back::back_commit(request, &ready.lock, ready.login_path.as_deref(), output) {
+        Ok(commits) => Ok(commits),
+        // Said to no one: the client is gone.
+        Err(BackFailed::Gone(failed)) => Err(failure(output, &failed)),
         Err(BackFailed::Step(why)) => {
             let failed = if status == 0 { FAILED_STATUS } else { status };
             let line = format!("gate: remote sync-back failed: {why}");
-            return if request.siblings.is_empty() {
-                said(output, &[&line], failed)
+            let lines: &[&str] = if request.siblings.is_empty() {
+                &[&line]
             } else {
-                said(output, &[BACK_COMMITS_FAILED, &line], failed)
+                &[BACK_COMMITS_FAILED, &line]
             };
+            Err(said(output, lines, failed))
         }
-    };
+    }
+}
+
+/// Says the back commits `commits` of `request`: a pair run's on one line ([`back_commits_line`]), and
+/// [`BACK_COMMIT_NONE`] for a run of one repo whose command left the tree as the snapshot had it.
+fn commits_said<S: LineSink>(request: &Request<'_>, commits: &[Option<String>], output: &Output<S>, status: u8) {
     if !request.siblings.is_empty() {
         let named: Vec<(&str, Option<&str>)> = request
             .repos()
-            .zip(&commits)
+            .zip(commits)
             .map(|(repo, commit)| (repo.name.as_deref().unwrap_or_default(), commit.as_deref()))
             .collect();
         said(output, &[&back_commits_line(&named)], status);
     } else if commits.first().is_none_or(Option::is_none) {
-        // A run of one repo whose command left the tree as the snapshot had it: nothing for the PC to bring back.
+        // Nothing for the PC to bring back.
         said(output, &[BACK_COMMIT_NONE], status);
-    }
-    let main = commits.first().and_then(Option::as_deref);
-    match (&request.outputs, &ready.outputs) {
-        (Some(asked), Some(read)) if status == 0 => {
-            if let Some(ended) = request.cross.as_ref().and_then(|cross| cross_built(launch, cross, output)) {
-                return ended;
-            }
-            brought_back(ready, (asked, read), main, output, budget)
-        }
-        (Some(asked), Some(read)) => {
-            if let Some(reports) = asked.failed_run(Caps::BUILT_IN) {
-                // A failed command ends on its own status, so the pack's own is only said.
-                let _ = brought_back(ready, (&reports, read), main, output, budget);
-            }
-            status
-        }
-        _ => status,
     }
 }
 
-/// Runs the cross build `build` as `launch` started the command ([`command::run_cross`]): `None` once it passed, the
-/// line saying how long it took said; else the status the run ends on, its outputs not brought back. A cross build that
+/// The status of the run `ready`, whose command ended with `status` and whose main repo's back commit is `main`, once
+/// its outputs are brought back: a passing command's cross build run first ([`cross_built`]), then its outputs
+/// ([`brought_back`]); a failed command's failed run set, ending on its own status; `status` for a run asking for no
+/// outputs.
+fn outputs_brought<S: LineSink + 'static>(
+    ready: &Ready<'_>,
+    output: &Arc<Output<S>>,
+    (status, main): (u8, Option<&str>),
+    watches: &Watches,
+    launch: &Launch<'_>,
+) -> u8 {
+    let request = &ready.request;
+    let (Some(asked), Some(read)) = (&request.outputs, &ready.outputs) else {
+        return status;
+    };
+    if status != 0 {
+        if let Some(reports) = asked.failed_run(Caps::BUILT_IN) {
+            // A failed command ends on its own status, so the pack's own is only said.
+            let _ = brought_back(ready, (&reports, read), main, output, watches, Packing::Failed);
+        }
+        return status;
+    }
+    match request.cross.as_ref().map(|cross| cross_built(launch, cross, output)) {
+        None | Some(Crossed::Passed) => brought_back(ready, (asked, read), main, output, watches, Packing::Passed),
+        Some(Crossed::Ended(ended)) => ended,
+        Some(Crossed::Gone) => CLOSED_STATUS,
+    }
+}
+
+/// How a run's cross build leaves the run ([`cross_built`]).
+enum Crossed {
+    /// It passed: the outputs are brought back.
+    Passed,
+    /// The run ends on this status, its outputs not brought back.
+    Ended(u8),
+    /// Its client went before or during it: the run is cut, its failed run's set packed by the run's last step
+    /// ([`cut_ended`]).
+    Gone,
+}
+
+/// Runs the cross build `build` as `launch` started the command ([`command::run_cross`]): [`Crossed::Passed`] once it
+/// passed, the line saying how long it took said; else the status the run ends on, its outputs not brought back
+/// ([`Crossed::Ended`]), or [`Crossed::Gone`] for a client gone before or during it. A cross build that
 /// exited by a non-zero code says it failed and [`outputs::not_brought_back`]'s line, and leaves the passing command's
 /// 0, a build that trapped a `box stop`'s signal and exited by code among them; one a signal ended, that could not
 /// start or that the box could not see to its end says the same lines and gives [`FAILED_STATUS`]; one the box killed gives
-/// [`KILLED_STATUS`](crate::lines::KILLED_STATUS) after its kill line and tag, as the box's kill of the command does;
-/// a client gone before or during it gives the closed status.
-fn cross_built<S: LineSink + 'static>(launch: &Launch<'_>, build: &CrossBuild, output: &Arc<Output<S>>) -> Option<u8> {
+/// [`KILLED_STATUS`](crate::lines::KILLED_STATUS) after its kill line and tag, as the box's kill of the command does.
+fn cross_built<S: LineSink + 'static>(launch: &Launch<'_>, build: &CrossBuild, output: &Arc<Output<S>>) -> Crossed {
     if output.client_gone() {
-        return Some(CLOSED_STATUS);
+        return Crossed::Gone;
     }
     noted(output, GAT, &cross_start_line(&build.rid, &build.words));
     let (cross_status, status) = match command::run_cross(launch, &build.words, output) {
         CrossEnd::Passed(took) => {
             noted(output, GAT, &cross::passed_line(&build.rid, took.as_secs_f64()));
-            return None;
+            return Crossed::Passed;
         }
         CrossEnd::Failed(cross_status) => (cross_status, 0),
         CrossEnd::Ended(cross_status) => (cross_status, FAILED_STATUS),
-        CrossEnd::Killed => return Some(crate::lines::KILLED_STATUS),
-        CrossEnd::Gone => return Some(CLOSED_STATUS),
+        CrossEnd::Killed => return Crossed::Ended(crate::lines::KILLED_STATUS),
+        CrossEnd::Gone => return Crossed::Gone,
     };
     let not_brought = outputs::not_brought_back(cross::FAILED_REASON);
-    Some(said(output, &[&cross::failed_line(&build.rid, cross_status), &not_brought], status))
+    Crossed::Ended(said(output, &[&cross::failed_line(&build.rid, cross_status), &not_brought], status))
 }
 
 /// The line the box says before it starts a cross build for `rid` with `words`, each word as it is run: the PC's
@@ -1019,39 +1169,139 @@ fn cross_start_line(rid: &str, words: &[String]) -> String {
 /// before the command as `read`, are brought back from the main repo's tree alone, as the Windows box's `RunOutputs`
 /// brings them: the paths the main repo's back commit `main` changes read first ([`back::back_paths`]), none without
 /// one, and left out; then the pack ([`outputs::bring_back`]), its skipped line, when there is one, and its
-/// `gate-remote-outputs:` line said; then, when it wrote an archive, the output folder trimmed to `budget` bytes
-/// ([`outputs::trim`]), each line said, the archive held under its pack's lock until the trim is done. 0, or
-/// [`FAILED_STATUS`] with [`outputs::not_brought_back`]'s line when the outputs are not brought back, but 0 when a cross
-/// build's set is refused for a program the PC cannot run, which leaves the passing command's status; a client gone
-/// while the paths are read, or found gone before the pack or before the trim, gives the closed status, nothing more
-/// packed or trimmed.
+/// `gate-remote-outputs:` line said; then, when it wrote an archive, the output folder trimmed to `watches`' budget
+/// ([`outputs::trim`]), each line said, the archive held under its pack's lock through the trim and on to the run's last
+/// step ([`Packs::kept`]). 0, or [`FAILED_STATUS`] with [`outputs::not_brought_back`]'s line when the outputs are not
+/// brought back, but 0 when a cross build's set is refused for a program the PC cannot run, which leaves the passing
+/// command's status. A client gone before or while the paths are read ([`skip_read`]), or found gone after the pack,
+/// is ruled here by `packing` ([`gone_pack`]); one that goes later, and the run's status once its client went, are
+/// the run's last step's ([`cut_ended`]). `watches`' pack delay stands in for a slow pack.
 fn brought_back<S: LineSink + 'static>(
     ready: &Ready<'_>,
     (asked, read): (&Asked<'_>, &RunOutputs),
     main: Option<&str>,
     output: &Arc<Output<S>>,
-    budget: u64,
+    watches: &Watches,
+    packing: Packing,
 ) -> u8 {
-    let request = &ready.request;
-    // Read after the push and only for outputs, so failing to read them fails the outputs, never the sync-back.
-    let skip = match main.map(|commit| back::back_paths(request, &ready.lock, ready.login_path.as_deref(), output, commit)) {
-        None => Ok(Vec::new()),
-        Some(Ok(paths)) => Ok(paths),
-        Some(Err(BackFailed::Gone(failed))) => return failure(output, &failed),
-        Some(Err(BackFailed::Step(why))) => Err(why),
-    };
-    let work = Path::new(request.tree());
-    if output.client_gone() {
-        return CLOSED_STATUS;
+    // Decide, pack, decide again, trim.
+    let skip = skip_read(ready, main, output);
+    match gone_pack(packing, output) {
+        Some(GonePack::Cut) => return cut_brought_back(ready, output, watches),
+        Some(GonePack::Closed) => return CLOSED_STATUS,
+        None => {}
     }
-    let brought = match skip.and_then(|skip| outputs::bring_back(asked, &read.manifest, read.listing.as_ref(), work, &skip)) {
-        Ok(brought) => brought,
-        Err(reason) => return said(output, &[&outputs::not_brought_back(&reason)], FAILED_STATUS),
+    let packed = packed_said(ready, (asked, read), skip, output, watches);
+    match (gone_pack(packing, output), packed) {
+        (None, Ok(brought)) => {
+            let status = trimmed(asked, &brought, output, watches);
+            // Held to the run's last step, which puts the failed run's set in its place for a client gone meanwhile.
+            *ready.packs.kept.borrow_mut() = Some(brought);
+            status
+        }
+        (None, Err(status)) => status,
+        (Some(GonePack::Cut), Ok(brought)) => discarded_for_cut(ready, (asked, brought), output, watches),
+        // A pack that failed as the client went still leaves the failed run's set for the PC.
+        (Some(GonePack::Cut), Err(_)) => cut_brought_back(ready, output, watches),
+        (Some(GonePack::Closed), _) => CLOSED_STATUS,
+    }
+}
+
+/// What a client gone does to a pack ([`gone_pack`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GonePack {
+    /// The run is cut: any pack already written is removed, and the failed run's set is packed with nothing left out
+    /// and no git read, then trimmed ([`cut_brought_back`], [`discarded_for_cut`]).
+    Cut,
+    /// The run ends with nothing more packed or trimmed.
+    Closed,
+}
+
+/// The one rule for a pack of `packing` whose client is found gone, before its pack or after it: `None` while the
+/// client is there. A started command's own pack, a passing or a failed one's, is cut; a ceiling kill's packs nothing
+/// more (GATE-827). A client gone after the last look here is the run's last step's to rule ([`cut_ended`]).
+fn gone_pack<S: LineSink>(packing: Packing, output: &Output<S>) -> Option<GonePack> {
+    if !output.client_gone() {
+        return None;
+    }
+    Some(match packing {
+        Packing::Passed | Packing::Failed => GonePack::Cut,
+        Packing::Killed => GonePack::Closed,
+    })
+}
+
+/// The paths the main repo's back commit `main` changes, which a pack leaves out ([`back::back_paths`]), none
+/// without one, or why they could not be read. A client already gone is never read for, so a cut run makes no git
+/// read; what is read for a client that goes meanwhile is ruled by [`gone_pack`].
+fn skip_read<S: LineSink + 'static>(ready: &Ready<'_>, main: Option<&str>, output: &Arc<Output<S>>) -> Result<Vec<String>, String> {
+    let commit = match main {
+        Some(commit) if !output.client_gone() => commit,
+        _ => return Ok(Vec::new()),
     };
-    // A cross build that built a program the PC cannot run brings nothing back, and leaves the passing command's
-    // status as it was.
+    // Read after the push and only for outputs, so failing to read them fails the outputs, never the sync-back.
+    match back::back_paths(&ready.request, &ready.lock, ready.login_path.as_deref(), output, commit) {
+        Ok(paths) => Ok(paths),
+        Err(BackFailed::Gone(failed)) => {
+            // Said to no one: the client is gone, and the pack is cut.
+            let _ = failure(output, &failed);
+            Ok(Vec::new())
+        }
+        Err(BackFailed::Step(why)) => Err(why),
+    }
+}
+
+/// A started command's pack `brought` of `asked`, made as its client went: the PC has no back commit, so it never
+/// fetches a set built against one. The archive is removed, a removal that fails said to no one, and the failed run's
+/// set packed in its place ([`cut_brought_back`]); the closed status.
+fn discarded_for_cut<S: LineSink + 'static>(
+    ready: &Ready<'_>,
+    (asked, brought): (&Asked<'_>, outputs::Brought),
+    output: &Arc<Output<S>>,
+    watches: &Watches,
+) -> u8 {
+    if let Err(error) = outputs::discarded(asked, brought) {
+        let line = format!(
+            "gate: remote could not remove the outputs archive {}: {}",
+            asked.archive,
+            escaped(&error.to_string())
+        );
+        noted(output, GAT, &line);
+    }
+    cut_brought_back(ready, output, watches)
+}
+
+/// What a pack brings back, which rules what a client found gone does to it ([`brought_back`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Packing {
+    /// A passing command's outputs, its back commit's paths left out: cut once its client goes ([`gone_pack`]).
+    Passed,
+    /// A failed command's test reports and failure outputs, its back commit's paths left out: cut once its client goes
+    /// ([`gone_pack`]).
+    Failed,
+    /// The failure outputs of a command the box killed at its ceiling: a client gone before the pack or before the trim
+    /// has nothing more packed or trimmed, and the run ends with the kill's own status, 124 ([`gone_pack`]).
+    Killed,
+}
+
+/// The pack of `asked` from the main repo's tree of the run `ready`, read before the command as `read`, leaving out
+/// `skip` or failing for why the back commit's paths could not be read ([`outputs::bring_back`]), each of its lines
+/// said; else the status the run's outputs end on, their line said: [`FAILED_STATUS`] for outputs not brought back, 0
+/// for a cross build's set refused for a program the PC cannot run, which leaves the passing command's status.
+fn packed_said<S: LineSink + 'static>(
+    ready: &Ready<'_>,
+    (asked, read): (&Asked<'_>, &RunOutputs),
+    skip: Result<Vec<String>, String>,
+    output: &Arc<Output<S>>,
+    watches: &Watches,
+) -> Result<outputs::Brought, u8> {
+    let work = Path::new(ready.request.tree());
+    let packed = skip.and_then(|skip| outputs::bring_back(asked, &read.manifest, read.listing.as_ref(), work, (&skip, watches.pack_delay)));
+    let brought = match packed {
+        Ok(brought) => brought,
+        Err(reason) => return Err(said(output, &[&outputs::not_brought_back(&reason)], FAILED_STATUS)),
+    };
     if let Some(refused) = &brought.refused {
-        return said(output, &[refused, &outputs::not_brought_back(cross::REFUSED_REASON)], 0);
+        return Err(said(output, &[refused, &outputs::not_brought_back(cross::REFUSED_REASON)], 0));
     }
     if let Some(skipped) = &brought.skipped {
         noted(output, GAT, skipped);
@@ -1063,16 +1313,19 @@ fn brought_back<S: LineSink + 'static>(
         noted(output, Stamp::Bare, size);
     }
     noted(output, Stamp::Bare, &brought.line);
+    Ok(brought)
+}
+
+/// The status of a run once the pack `brought` of `asked` is done: 0 when it wrote no archive; else the output folder
+/// trimmed to `watches`' budget ([`outputs::trim`]) whatever the client, `brought` holding the archive under its pack's
+/// lock through the trim, so no other run's trim removes it, each line said; then [`FAILED_STATUS`] with
+/// [`outputs::not_brought_back`]'s line when the outputs are not brought back, else 0. A client gone is the run's last
+/// step's to rule ([`cut_ended`]).
+fn trimmed<S: LineSink>(asked: &Asked<'_>, brought: &outputs::Brought, output: &Output<S>, watches: &Watches) -> u8 {
     if !brought.wrote_archive() {
         return 0;
     }
-    // A PC gone takes no archive, so none is trimmed for it: the closed status, as the run's other steps end on.
-    if output.client_gone() {
-        return CLOSED_STATUS;
-    }
-    let trimmed = outputs::trim(asked, budget);
-    // Held to here, so no other run's trim removes the archive before this one's is done.
-    drop(brought);
+    let trimmed = outputs::trim(asked, watches.budget);
     for line in &trimmed.lines {
         noted(output, GAT, line);
     }
@@ -2251,6 +2504,8 @@ mod tests {
             budget: OUTPUTS_BUDGET,
             drain: DrainSeams::default(),
             started: Instant::now(),
+            pack_delay: None,
+            park_outputs: None,
         }
     }
 
@@ -2268,7 +2523,7 @@ mod tests {
     fn whole_run(json: &Value) -> (u8, Vec<(Stream, String)>) {
         let payload = decoded(json);
         let output = Arc::new(Output::new(RecordingSink::default()));
-        let status = run_along(&payload, &output, free_watches(), own_path);
+        let status = run_along(&payload, &output, &free_watches(), own_path);
         (status, output.sink().said())
     }
 
@@ -2419,7 +2674,7 @@ mod tests {
         let script = format!("echo x > x.txt; mkdir -p '{in_the_way}'; echo x > '{in_the_way}/in-the-way'");
         let payload = decoded(&case.commanded(&commit, &["/bin/sh", "-c", &script]));
         let output = Arc::new(Output::new(RecordingSink::default()));
-        let status = run_along(&payload, &output, free_watches(), own_path);
+        let status = run_along(&payload, &output, &free_watches(), own_path);
         let err: Vec<String> = output
             .sink()
             .said()
@@ -2614,7 +2869,7 @@ mod tests {
         }
         let payload = decoded(&case.json(&commit, &keys));
         let output = Arc::new(Output::new(RecordingSink::default()));
-        let status = run_along(&payload, &output, free_watches(), godot_login);
+        let status = run_along(&payload, &output, &free_watches(), godot_login);
         let out = output
             .sink()
             .said()
@@ -2696,7 +2951,7 @@ mod tests {
         assert!(matches!(held, Ok(Locked::Held(_))), "the case holds the work lock");
         let payload = decoded(&case.json(&commit, &json!({})));
         let output = Arc::new(Output::new(RecordingSink::default()));
-        let status = run_along(&payload, &output, free_watches(), counted_login);
+        let status = run_along(&payload, &output, &free_watches(), counted_login);
         assert_eq!(status, REFUSED_STATUS);
         assert!(!LOGIN_READ.load(std::sync::atomic::Ordering::SeqCst), "no login shell was asked for");
         let err = err_of(&output);
@@ -2711,7 +2966,7 @@ mod tests {
         shim_after_add(&case, "rm -f \"$GIT_INDEX_FILE\"");
         let payload = decoded(&case.commanded(&commit, &["/bin/sh", "-c", "echo x > x.txt"]));
         let output = Arc::new(Output::new(RecordingSink::default()));
-        let status = run_along(&payload, &output, free_watches(), own_path);
+        let status = run_along(&payload, &output, &free_watches(), own_path);
         let err = err_of(&output);
         assert_eq!(status, 1, "{err:?}");
         assert_eq!(
@@ -2734,7 +2989,7 @@ mod tests {
         shim_after_add(&case, &format!("rm -f '{}'", case.lock()));
         let payload = decoded(&case.commanded(&commit, &["/bin/sh", "-c", "echo x > x.txt"]));
         let output = Arc::new(Output::new(RecordingSink::default()));
-        let status = run_along(&payload, &output, free_watches(), own_path);
+        let status = run_along(&payload, &output, &free_watches(), own_path);
         let err = err_of(&output);
         assert_eq!(status, 1, "{err:?}");
         // The lock goes inside the add step, which may see it lost itself, else the look before write-tree does.
@@ -2761,7 +3016,7 @@ mod tests {
         symlink(&target, &copy).expect("a link takes the copy's name");
         let payload = decoded(&case.commanded(&commit, &["/bin/sh", "-c", "echo x > x.txt"]));
         let output = Arc::new(Output::new(RecordingSink::default()));
-        let status = run_along(&payload, &output, free_watches(), own_path);
+        let status = run_along(&payload, &output, &free_watches(), own_path);
         let err = err_of(&output);
         assert_eq!(status, 1, "{err:?}");
         assert!(
@@ -4206,13 +4461,13 @@ mod tests {
         let (status, said) = run_fed(
             &case.outputs_json(&commit, "true", &json!(["bin/**"])),
             &mut fed(NO_FILES),
-            free_watches(),
+            &free_watches(),
         );
         assert_eq!(status, 0, "{said:?}");
         assert_eq!(outputs_said(&said), ["gate-remote-outputs: 0"], "{said:?}");
 
         let full = case.json(&commit, &json!({ "OutputsFull": true }));
-        let (status, said) = run_fed(&full, &mut fed(NO_FILES), free_watches());
+        let (status, said) = run_fed(&full, &mut fed(NO_FILES), &free_watches());
         assert_eq!(status, 0, "{said:?}");
         assert!(outputs_said(&said).is_empty(), "no globs bring nothing: {said:?}");
     }
@@ -4227,7 +4482,7 @@ mod tests {
 
     /// Runs the whole run of `json` on the box's own `PATH`, watched as `watches` says, the PC's input after the
     /// request line read from `input`; the status and every line said, with its stream.
-    fn run_fed(json: &Value, input: &mut Cursor<Vec<u8>>, watches: Watches) -> (u8, Vec<(Stream, String)>) {
+    fn run_fed(json: &Value, input: &mut Cursor<Vec<u8>>, watches: &Watches) -> (u8, Vec<(Stream, String)>) {
         let payload = decoded(json);
         let output = Arc::new(Output::new(RecordingSink::default()));
         let status = run_reading(&payload, &output, watches, own_path, input);
@@ -4281,7 +4536,7 @@ mod tests {
     fn a_run_with_globs_packs_a_new_file_and_names_its_archive() {
         let (case, commit) = outputs_case("outputs-packed");
         let json = case.outputs_json(&commit, "mkdir -p bin && echo new > bin/new.txt", &json!(["bin/**"]));
-        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), &free_watches());
         assert_eq!(status, 0, "{said:?}");
         let line = format!("gate-remote-outputs: 1 {}", archive_name());
         assert_eq!(outputs_said(&said), [line.as_str()], "{said:?}");
@@ -4306,7 +4561,7 @@ mod tests {
         let case = Case::new("outputs-unread");
         let commit = case.snapshot(&[("a.txt", "a\n")]);
         let mut input = fed(NO_FILES);
-        let (status, said) = run_fed(&case.commanded(&commit, &["true"]), &mut input, free_watches());
+        let (status, said) = run_fed(&case.commanded(&commit, &["true"]), &mut input, &free_watches());
         assert_eq!(status, 0, "{said:?}");
         assert_eq!(input.position(), 0, "nothing past the request line is read");
         assert!(outputs_said(&said).is_empty(), "{said:?}");
@@ -4395,7 +4650,7 @@ mod tests {
     fn a_failed_command_with_no_test_results_glob_packs_nothing_and_says_no_outputs_line() {
         let (case, commit) = outputs_case("outputs-failed");
         let json = case.outputs_json(&commit, "mkdir -p bin && echo new > bin/new.txt; exit 3", &json!(["bin/**"]));
-        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), &free_watches());
         assert_eq!(status, 3, "{said:?}");
         assert!(outputs_said(&said).is_empty(), "{said:?}");
         assert!(!said.iter().any(|(_, line)| line.starts_with("gate: remote outputs")), "{said:?}");
@@ -4420,7 +4675,7 @@ mod tests {
     fn a_failed_command_packs_its_test_reports_alone() {
         let (case, commit) = reports_case("outputs-failed-reports");
         let json = case.outputs_json(&commit, FAILS_WITH_A_REPORT, &json!(BIN_AND_REPORTS));
-        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), &free_watches());
         assert_eq!(status, 3, "the command's own status: {said:?}");
         let line = format!("gate-remote-outputs: 1 {}", archive_name());
         assert_eq!(outputs_said(&said), [line.as_str()], "{said:?}");
@@ -4456,7 +4711,7 @@ mod tests {
     fn a_failed_command_with_a_failure_output_glob_packs_its_file() {
         let (case, commit) = dumps_case("outputs-failed-dump");
         let json = failure_json(&case, &commit, FAILS_WITH_A_DUMP, (&["bin/**"], &["dumps/*.dmp"]));
-        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), &free_watches());
         assert_eq!(status, 3, "the command's own status: {said:?}");
         let line = format!("gate-remote-outputs: 1 {}", archive_name());
         assert_eq!(outputs_said(&said), [line.as_str()], "{said:?}");
@@ -4467,7 +4722,7 @@ mod tests {
     fn a_failed_command_with_both_kinds_of_glob_packs_both() {
         let (case, commit) = dumps_case("outputs-failed-both");
         let json = failure_json(&case, &commit, FAILS_WITH_A_DUMP, (&BIN_AND_REPORTS, &["dumps/*.dmp"]));
-        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), &free_watches());
         assert_eq!(status, 3, "the command's own status: {said:?}");
         let line = format!("gate-remote-outputs: 2 {}", archive_name());
         assert_eq!(outputs_said(&said), [line.as_str()], "{said:?}");
@@ -4479,7 +4734,7 @@ mod tests {
         let (case, commit) = dumps_case("outputs-passed-dump");
         let command = "mkdir -p dumps && echo dmp > dumps/a.dmp";
         let json = failure_json(&case, &commit, command, (&[], &["dumps/*.dmp"]));
-        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), &free_watches());
         assert_eq!(status, 0, "{said:?}");
         assert_eq!(outputs_said(&said), [crate::outputs::NOTHING_PACKED], "{said:?}");
         assert!(!case.archive().exists(), "nothing is packed");
@@ -4499,7 +4754,7 @@ mod tests {
                 "CrossBuild": { "Rid": "win-x64", "Words": ["/bin/sh", "-c", cross] },
             }),
         );
-        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), &free_watches());
         assert_eq!(status, 3, "the command's own status: {said:?}");
         assert!(!marker.exists(), "no cross build ran");
         assert!(!said.iter().any(|(_, line)| line.starts_with("gate: the cross build")), "{said:?}");
@@ -4513,7 +4768,7 @@ mod tests {
         let (case, commit) = reports_case("outputs-failed-unmatched");
         let script = "mkdir -p bin && echo new > bin/new.txt; exit 3";
         let json = case.outputs_json(&commit, script, &json!(BIN_AND_REPORTS));
-        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), &free_watches());
         assert_eq!(status, 3, "the command's own status: {said:?}");
         assert_eq!(outputs_said(&said), ["gate-remote-outputs: 0"], "{said:?}");
         assert!(!case.archive().exists(), "nothing is packed");
@@ -4523,7 +4778,7 @@ mod tests {
     fn a_failed_command_whose_reports_are_not_brought_back_keeps_its_status() {
         let (case, commit) = reports_case("outputs-failed-malformed");
         let json = case.outputs_json(&commit, FAILS_WITH_A_REPORT, &json!(BIN_AND_REPORTS));
-        let (status, said) = run_fed(&json, &mut fed("not a manifest\n"), free_watches());
+        let (status, said) = run_fed(&json, &mut fed("not a manifest\n"), &free_watches());
         assert_eq!(status, 3, "the command's own status, not 1: {said:?}");
         assert!(
             said.iter()
@@ -4540,7 +4795,7 @@ mod tests {
         let (status, said) = run_fed(
             &case.outputs_json(&commit, script, &json!(["out/**", "bin/**"])),
             &mut fed(NO_FILES),
-            free_watches(),
+            &free_watches(),
         );
         assert_eq!(status, 0, "{said:?}");
         let back = case.back_commit().expect("the back ref is pushed");
@@ -4555,7 +4810,7 @@ mod tests {
     fn a_malformed_manifest_is_said_after_the_command_and_ends_the_run_1() {
         let (case, commit) = outputs_case("outputs-malformed");
         let json = case.outputs_json(&commit, "echo ran; mkdir -p bin && echo new > bin/new.txt", &json!(["bin/**"]));
-        let (status, said) = run_fed(&json, &mut fed("not a manifest\n"), free_watches());
+        let (status, said) = run_fed(&json, &mut fed("not a manifest\n"), &free_watches());
         assert_eq!(status, 1, "{said:?}");
         let ran = said.iter().position(|(stream, line)| *stream == Stream::Out && line == "ran");
         let failed = said
@@ -4570,7 +4825,7 @@ mod tests {
         let (case, commit) = outputs_case("outputs-budget");
         let json = case.outputs_json(&commit, "mkdir -p bin && echo new > bin/new.txt", &json!(["bin/**"]));
         let watches = Watches { budget: 1, ..free_watches() };
-        let (status, said) = run_fed(&json, &mut fed(NO_FILES), watches);
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), &watches);
         assert_eq!(status, 1, "{said:?}");
         let line = format!("gate-remote-outputs: 1 {}", archive_name());
         assert_eq!(outputs_said(&said), [line.as_str()], "{said:?}");
@@ -4588,7 +4843,7 @@ mod tests {
         let (status, said) = run_fed(
             &case.outputs_json(&commit, script, &json!(["bin/**"])),
             &mut fed(NO_FILES),
-            free_watches(),
+            &free_watches(),
         );
         assert_eq!(status, 0, "{:?}", said.iter().rev().take(5).collect::<Vec<_>>());
         let line = format!("gate-remote-outputs: 1 {}", archive_name());
@@ -4629,28 +4884,187 @@ mod tests {
 
     /// Runs the whole run of `json` as [`run_fed`] does, its lines said to a client that is gone from the first line
     /// starting with `from`; the status.
-    fn run_gone_from(json: &Value, from: &'static str, watches: Watches) -> u8 {
+    fn run_gone_from(json: &Value, from: &'static str, watches: &Watches) -> u8 {
         let payload = decoded(json);
         let output = Arc::new(Output::new(GoneFrom::new(from)));
         run_reading(&payload, &output, watches, own_path, &mut fed(NO_FILES))
     }
 
+    /// The keys of a run running `script` in `sh` with the case's identity, asking for the outputs `bin/**` and the
+    /// failure outputs `.tmp/dumps/**`, which a failed run's set takes.
+    fn dump_keys(script: &str) -> Value {
+        json!({
+            "Command": ["/bin/sh", "-c", script],
+            "Identity": identity(),
+            "Outputs": ["bin/**"],
+            "FailureOutputs": [".tmp/dumps/**"],
+        })
+    }
+
     #[test]
-    fn a_client_gone_before_the_pack_or_the_trim_packs_or_trims_nothing_and_ends_closed() {
+    fn a_client_gone_before_the_pack_or_the_trim_packs_the_failed_set_and_trims_and_ends_closed() {
         let (case, commit) = outputs_case("outputs-gone");
         let lib = case.lib_snapshot(&[("b.txt", "b\n")]);
-        let script = "mkdir -p bin && echo new > bin/new.txt && echo d > ../lib/d.txt";
-        let extra = json!({ "Command": ["/bin/sh", "-c", script], "Identity": identity(), "Outputs": ["bin/**"] });
-        let status = run_gone_from(&case.pair_json(&commit, &lib, &extra), "gate: remote back commits:", free_watches());
+        let script = "mkdir -p bin .tmp/dumps && echo new > bin/new.txt && echo dmp > .tmp/dumps/new.dmp && echo d > ../lib/d.txt";
+        let old = case.old_archive_staged(64 * 1024);
+        // Room for the new archive alone: the trim after the cut's pack removes the old one.
+        let watches = Watches {
+            budget: 48 * 1024,
+            ..free_watches()
+        };
+        let status = run_gone_from(&case.pair_json(&commit, &lib, &dump_keys(script)), "gate: remote back commits:", &watches);
         assert_eq!(status, CLOSED_STATUS, "gone at the back commits line, before the pack");
-        assert!(!case.archive().exists(), "nothing is packed for a client gone");
+        assert_eq!(
+            members_of(&case.archive()),
+            [".tmp/dumps/new.dmp"],
+            "a passing command whose client went packs only the failed run's set"
+        );
+        assert!(
+            !old.exists(),
+            "the cut run's pack is followed by the trim, which removes the older archive"
+        );
 
-        let (case, commit) = outputs_case("outputs-gone-trim");
-        let json = case.outputs_json(&commit, "mkdir -p bin && echo new > bin/new.txt", &json!(["bin/**"]));
-        let watches = Watches { budget: 1, ..free_watches() };
-        let status = run_gone_from(&json, "gate-remote-outputs:", watches);
-        assert_eq!(status, CLOSED_STATUS, "gone at the outputs line, before the trim");
-        assert!(case.archive().exists(), "the archive over the budget is not trimmed for a client gone");
+        let (case, commit) = outputs_case("outputs-gone-line");
+        let script = "mkdir -p bin .tmp/dumps && echo new > bin/new.txt && echo dmp > .tmp/dumps/new.dmp";
+        let status = run_gone_from(&case.json(&commit, &dump_keys(script)), "gate-remote-outputs:", &free_watches());
+        assert_eq!(status, CLOSED_STATUS, "gone at the outputs line");
+        assert_eq!(
+            members_of(&case.archive()),
+            [".tmp/dumps/new.dmp"],
+            "the full pack the PC never heard of is replaced by the failed run's set"
+        );
+    }
+
+    impl Case {
+        /// An older run's archive of `size` bytes staged in the output folder, made 0700; its path.
+        fn old_archive_staged(&self, size: usize) -> PathBuf {
+            let folder = format!("{}/outputs", self.root());
+            std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700)
+                .create(&folder)
+                .expect("the output folder is made");
+            let old = PathBuf::from(format!("{folder}/{KEY}-fedcba9876543210fedcba9876543210.tar.zst"));
+            fs::write(&old, vec![7_u8; size]).expect("the older archive is written");
+            old
+        }
+    }
+
+    #[test]
+    fn a_run_whose_client_goes_after_its_command_ends_255_whatever_its_back_commit_gave() {
+        // A push that fails: its sync-back line finds the client gone.
+        let case = Case::new("gone-back-step");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let in_the_way = format!("{}/refs/gate-back/{KEY}", case.bare());
+        let script = format!("echo x > x.txt; mkdir -p '{in_the_way}'; echo x > '{in_the_way}/in-the-way'");
+        let json = case.commanded(&commit, &["/bin/sh", "-c", &script]);
+        let status = run_gone_from(&json, "gate: remote sync-back failed:", &free_watches());
+        assert_eq!(status, CLOSED_STATUS, "a back step that failed as the client went");
+
+        // No outputs asked: gone at the back commits line of a pair run.
+        let (case, commit) = outputs_case("gone-no-outputs");
+        let lib = case.lib_snapshot(&[("b.txt", "b\n")]);
+        let extra = json!({ "Command": ["/bin/sh", "-c", "echo d > ../lib/d.txt"], "Identity": identity() });
+        let status = run_gone_from(&case.pair_json(&commit, &lib, &extra), "gate: remote back commits:", &free_watches());
+        assert_eq!(status, CLOSED_STATUS, "a run with no outputs whose client went after its back commit");
+    }
+
+    #[test]
+    fn a_failed_pair_run_whose_client_goes_at_its_back_commits_packs_its_dump_unskipped() {
+        // Only `bin/` ignored: the back commit holds the dump, and a skip of its paths would leave it out.
+        let (case, commit) = outputs_case("outputs-failed-pair-gone");
+        let lib = case.lib_snapshot(&[("b.txt", "b\n")]);
+        let script = "mkdir -p .tmp/dumps && echo dmp > .tmp/dumps/new.dmp && echo d > ../lib/d.txt; exit 1";
+        let status = run_gone_from(
+            &case.pair_json(&commit, &lib, &dump_keys(script)),
+            "gate: remote back commits:",
+            &free_watches(),
+        );
+        assert_eq!(status, CLOSED_STATUS, "a failed run whose client went ends closed");
+        assert_eq!(
+            members_of(&case.archive()),
+            [".tmp/dumps/new.dmp"],
+            "the dump comes back though the back commit holds it: nothing is left out after a cut"
+        );
+    }
+
+    #[test]
+    fn a_failed_command_whose_client_goes_before_its_pack_packs_the_failed_set() {
+        let case = Case::new("outputs-failed-gone");
+        // `.tmp` ignored too: the command leaves the tree as it was, so there is no back commit to read.
+        let commit = case.snapshot(&[("a.txt", "a\n"), (".gitignore", "bin/\n.tmp/\n")]);
+        let script = "mkdir -p .tmp/dumps && echo dmp > .tmp/dumps/new.dmp; exit 1";
+        let status = run_gone_from(&case.json(&commit, &dump_keys(script)), gate_wire::BACK_COMMIT_NONE, &free_watches());
+        assert_eq!(status, CLOSED_STATUS, "a failed command whose client went ends closed");
+        assert_eq!(members_of(&case.archive()), [".tmp/dumps/new.dmp"], "its failed run's set is packed");
+    }
+
+    #[test]
+    fn a_full_pack_that_fails_as_its_client_goes_packs_the_failed_set() {
+        let (case, commit) = outputs_case("outputs-full-fails-gone");
+        // A file the pack cannot read fails the full set; the failed run's set holds only the dump.
+        let script = "mkdir -p bin .tmp/dumps && echo s > bin/secret.txt && chmod 000 bin/secret.txt && echo dmp > .tmp/dumps/new.dmp";
+        let status = run_gone_from(
+            &case.json(&commit, &dump_keys(script)),
+            "gate: remote outputs not brought back:",
+            &free_watches(),
+        );
+        assert_eq!(status, CLOSED_STATUS, "a cut run ends closed, not on the full pack's failure");
+        assert_eq!(members_of(&case.archive()), [".tmp/dumps/new.dmp"], "the failed run's set in its place");
+    }
+
+    #[test]
+    fn a_ceiling_kill_whose_client_goes_before_the_pack_packs_nothing() {
+        let (case, commit) = outputs_case("outputs-killed-gone");
+        let mut keys = dump_keys("mkdir -p .tmp/dumps && echo dmp > .tmp/dumps/new.dmp && sleep 30");
+        keys["Timeout"] = json!(1);
+        let status = run_gone_from(&case.json(&commit, &keys), "gate-remote-killed:", &free_watches());
+        assert_eq!(status, 124, "the kill's own status");
+        assert!(!case.archive().exists(), "a ceiling kill whose client went after its tag packs nothing");
+    }
+
+    #[test]
+    fn a_command_whose_client_goes_after_it_started_packs_the_failed_set() {
+        let (case, commit) = outputs_case("outputs-cut");
+        let script = "mkdir -p bin .tmp/dumps && echo new > bin/new.txt && echo dmp > .tmp/dumps/new.dmp && echo cut-here; exit 1";
+        let status = run_gone_from(&case.json(&commit, &dump_keys(script)), "cut-here", &free_watches());
+        assert_eq!(status, CLOSED_STATUS, "a cut run ends as a closed connection");
+        assert_eq!(members_of(&case.archive()), [".tmp/dumps/new.dmp"], "the failed run's set alone");
+    }
+
+    #[test]
+    fn a_passing_run_whose_cross_build_fails_as_its_client_goes_packs_the_failed_set() {
+        let (case, commit) = outputs_case("outputs-cross-fails-gone");
+        let script = "mkdir -p bin .tmp/dumps && echo new > bin/new.txt && echo dmp > .tmp/dumps/new.dmp";
+        let mut keys = dump_keys(script);
+        keys["CrossBuild"] = json!({ "Rid": "win-x64", "Words": ["/bin/sh", "-c", "exit 3"] });
+        let status = run_gone_from(&case.json(&commit, &keys), "gate: the cross build for win-x64 failed", &free_watches());
+        assert_eq!(status, CLOSED_STATUS, "a cut run ends closed, not on the passing command's 0");
+        assert!(case.archive().exists(), "the failed run's set is packed after the cross build's failure");
+        assert_eq!(members_of(&case.archive()), [".tmp/dumps/new.dmp"], "the failed run's set alone");
+    }
+
+    #[test]
+    fn a_runner_failure_whose_client_goes_after_its_check_packs_nothing_and_ends_closed() {
+        let (case, commit) = outputs_case("outputs-runner-failed-gone");
+        // A folder at the command's own group record's name, which the runner then cannot remove: the box cannot see
+        // the command to its end. Tried until it holds, as the runner stamps the record once after the start.
+        let record = record_of(&case);
+        let script = format!("mkdir -p .tmp/dumps && echo dmp > .tmp/dumps/new.dmp && until mkdir '{record}' 2>/dev/null; do rm -f '{record}'; done");
+        let status = run_gone_from(
+            &case.json(&commit, &dump_keys(&script)),
+            "gate: the gate failed while running the command:",
+            &free_watches(),
+        );
+        assert_eq!(status, CLOSED_STATUS, "a runner failure whose client went ends closed, not on its own 1");
+        assert!(!case.archive().exists(), "a runner failure packs nothing: the work lock may be lost");
+    }
+
+    #[test]
+    fn a_client_gone_before_the_command_starts_packs_nothing() {
+        let (case, commit) = outputs_case("outputs-gone-unstarted");
+        let script = "mkdir -p .tmp/dumps && echo dmp > .tmp/dumps/new.dmp; exit 1";
+        let status = run_gone_from(&case.json(&commit, &dump_keys(script)), "gate-remote-started:", &free_watches());
+        assert_eq!(status, CLOSED_STATUS, "a client gone before the start ends closed");
+        assert!(!case.archive().exists(), "a command that never started packs nothing");
     }
 
     #[test]
@@ -4707,7 +5121,7 @@ mod tests {
         let json = case.json(&commit, &json!({}));
         assert!(preflight_says_new(&json), "no command has started in the folder yet");
 
-        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), &free_watches());
 
         assert_eq!(status, 0, "{said:?}");
         let text = fs::read_to_string(crate::command::ran_record(&case.work())).expect("the run wrote the ran record");
@@ -4728,7 +5142,7 @@ mod tests {
         fs::create_dir(&record).expect("a folder takes the record's name");
 
         assert!(preflight_says_new(&json), "only a plain file counts as ran");
-        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), &free_watches());
         assert_eq!(status, 0, "the folder refuses no run: {said:?}");
         fs::write(format!("{}.layout", case.work()), "changing").expect("the layout record is written");
         let (status, said) = ran(&json);
@@ -4741,7 +5155,7 @@ mod tests {
         let case = Case::new("relaid-ran");
         let commit = case.snapshot(&[("a.txt", "a\n")]);
         let json = case.json(&commit, &json!({}));
-        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), &free_watches());
         assert_eq!(status, 0, "{said:?}");
         let record = crate::command::ran_record(&case.work());
         assert!(Path::new(&record).is_file(), "{said:?}");

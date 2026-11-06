@@ -15,7 +15,8 @@
 //! `--test-box-desktop <fault>`, `--test-box-desktop-session <state>`, `--test-box-desktop-mutex <name>`, `--test-box-desktop-ms <n>`,
 //! `--test-box-desktop-message-ms <n>` and `--test-box-register ok|fail`, `--test-box-root-walk-stop <folder>`,
 //! `--test-box-git-limit <step>:<ms>`, `--test-box-git-armed-by <path>`, `--test-box-git-long-ms <ms>`, `--test-box-gone-reached <path>`,
-//! `--test-box-park-outputs <path>` (the run waits for the path just before it decides what to pack),
+//! `--test-box-park-outputs <path>` (the run waits for the path: the Windows box after its back commit, just before it
+//! decides what to pack; the Unix box right after the command ends, before its back commit),
 //! `--test-box-park-back-paths <path>` (the run waits for the path just before it reads its back commit's paths),
 //! `--test-box-channel-ports <first>-<last>`, `--test-box-channel-accept-ms <n>`, `--test-box-channel-proof-ms <n>`,
 //! `--test-box-channel-idle-ms <n>` and `--test-box-channel-send-buffer-bytes <n>` (each also as `--<seam>=<value>`)
@@ -269,7 +270,8 @@ enum Seam {
     GitArmedBy,
     /// `--test-box-gone-reached <path>`: the file the box makes the first time it sees its client gone.
     GoneReached,
-    /// `--test-box-park-outputs <path>`: the run waits for the path just before it decides what to pack.
+    /// `--test-box-park-outputs <path>`: the run waits for the path; the Windows box after its back commit, just before
+    /// it decides what to pack, the Unix box right after the command ends, before its back commit.
     ParkOutputs,
     /// `--test-box-park-back-paths <path>`: the run waits for the path just before it reads its back commit's paths.
     ParkBackPaths,

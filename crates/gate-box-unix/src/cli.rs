@@ -132,7 +132,7 @@ fn answer(action: Action, console: &mut crate::console::Console) -> u8 {
         BoxVerb::Run => {
             // The run says its lines through an output its threads share; the console says nothing more.
             let output = std::sync::Arc::new(crate::console::Output::new(crate::console::StdioSink));
-            crate::run::run(&payload, &output, crate::run::Watches::of(&request.seams))
+            crate::run::run(&payload, &output, &crate::run::Watches::of(&request.seams))
         }
         // Every other verb was refused as unbuilt above.
         _ => crate::lines::USAGE_STATUS,

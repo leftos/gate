@@ -6,7 +6,8 @@
 //! [`not_brought_back`] says why a run's outputs did not come back. A trim removes the archives last written before the
 //! run's own, oldest first, never one written with or after it nor one a pack still writes, and removes the run's own
 //! when that alone is over the budget. [`outputs`] answers the verb: it sends one archive raw on stdout, then removes
-//! it, taking no work folder lock, so it never waits on a run. The archive is the only state outputs keep.
+//! it, taking no work folder lock; it waits on a run only when the PC asks it to after a cut (`CutWaitMs`), by the
+//! archive's `flock` and the run's work lock, never holding the latter. The archive is the only state outputs keep.
 //!
 //! The output folder is `<root>/outputs`, reached beneath the judged work root and the box user's own, 0700. The
 //! command the box runs is the box's own user and may rename or link anything in the work folder, so the walk and the
@@ -17,11 +18,14 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufWriter, Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gate_args::BoxSeams;
 use gate_inputs::archive::{Item, held_size, refused};
@@ -34,9 +38,11 @@ use gate_inputs::walk::{Found, Walked, relative_path};
 use gate_wire::{Payload, archive_file_name, archive_key, escaped};
 
 use crate::beneath::{self, Folder};
-use crate::console::Console;
+use crate::console::{Console, Forwarding, Output, StdioSink};
 use crate::cross::{self, Portable};
 use crate::drain;
+use crate::git::CLOSED_STATUS;
+use crate::heartbeat;
 use crate::lines::{FAILED_STATUS, USAGE_STATUS, channel_refusal};
 use crate::request::{Unread, bounded_line};
 use crate::run::REFUSED_STATUS;
@@ -516,19 +522,58 @@ fn remove_unless_written(folder: &Folder, name: &OsStr) -> io::Result<bool> {
 /// no longer holding it, when the name no longer names it after the lock, gone or another file in its place, which is
 /// then left alone.
 fn remove_held(folder: &Folder, name: &OsStr, archive: &File) -> io::Result<bool> {
+    match held_alone(folder, name, archive)? {
+        Alone::Written => Ok(false),
+        Alone::Moved => Ok(true),
+        Alone::Held => remove_archive(folder, name).map(|()| true),
+    }
+}
+
+/// What [`held_alone`] found of an open archive.
+enum Alone {
+    /// Held now under an exclusive `flock`, and still the file at its name.
+    Held,
+    /// A writer, its pack, holds it.
+    Written,
+    /// Locked, but no longer at its name: gone, or another file in its place.
+    Moved,
+}
+
+/// Whether the archive `name` in `folder`, open as `archive`, is the file at its name and no writer holds it: an
+/// exclusive `flock` taken without waiting, `EWOULDBLOCK` a pack still holding it, then its device and inode
+/// compared with the name's, so the file locked is the one named.
+fn held_alone(folder: &Folder, name: &OsStr, archive: &File) -> io::Result<Alone> {
     match flock(archive, libc::LOCK_EX | libc::LOCK_NB) {
-        Err(error) if error.raw_os_error() == Some(libc::EWOULDBLOCK) => return Ok(false),
+        Err(error) if error.raw_os_error() == Some(libc::EWOULDBLOCK) => return Ok(Alone::Written),
         locked => locked?,
     }
     let locked = beneath::file_stat(archive)?;
     let named = match folder.stat_child(name) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Alone::Moved),
         looked => looked?,
     };
-    if (named.st_dev, named.st_ino) != (locked.st_dev, locked.st_ino) {
-        return Ok(true);
+    if (named.st_dev, named.st_ino) == (locked.st_dev, locked.st_ino) {
+        Ok(Alone::Held)
+    } else {
+        Ok(Alone::Moved)
     }
-    remove_archive(folder, name).map(|()| true)
+}
+
+/// Removes the archive `brought` wrote for `asked`, still held under its pack's lock as it goes: a pack the PC never
+/// fetches. Nothing for a pack that wrote none.
+///
+/// # Errors
+///
+/// The output folder's open or the removal.
+pub fn discarded(asked: &Asked<'_>, brought: Brought) -> io::Result<()> {
+    let removed = if brought.wrote_archive() {
+        output_folder(asked.folder, false).and_then(|folder| remove_archive(&folder, OsStr::new(&asked.archive)))
+    } else {
+        Ok(())
+    };
+    // Held to here, so no other run's pack takes the name before this one's is gone.
+    drop(brought);
+    removed
 }
 
 /// Applies the `flock` `operation` to the open file `file`, a wait a signal broke tried again.
@@ -793,7 +838,8 @@ impl Brought {
 /// would have packed but for a name this PC cannot take ([`skipped_line`]), when there were any. The output folder is
 /// made when missing ([`output_folder`]), and the archive is made anew beneath it, 0600: a file or a link already at
 /// its name fails the pack and is left as it is; an archive left half written is removed. The archive is held under a
-/// shared `flock` from its making until the [`Brought`] returned is dropped.
+/// shared `flock` from its making until the [`Brought`] returned is dropped. `--test-box-pack-delay-ms` stands in for
+/// a slow pack as `delay`: the wait between the archive's shared lock and its first byte.
 ///
 /// # Errors
 ///
@@ -804,7 +850,7 @@ pub fn bring_back(
     manifest: &Result<Manifest, String>,
     listing: Option<&Listing>,
     work: &Path,
-    skip: &[String],
+    (skip, delay): (&[String], Option<Duration>),
 ) -> Result<Brought, String> {
     let manifest = manifest.as_ref().map_err(Clone::clone)?;
     if asked.globs.is_empty() {
@@ -861,9 +907,12 @@ pub fn bring_back(
     let file = folder
         .create_file(name)
         .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
-    let packed = flock(&file, libc::LOCK_SH)
-        .map_err(|error| in_context(&path, &error))
-        .and_then(|()| pack(BufWriter::new(&file), &tree, &chosen, &manifest.by_hash(skip)));
+    let packed = flock(&file, libc::LOCK_SH).map_err(|error| in_context(&path, &error)).and_then(|()| {
+        if let Some(delay) = delay {
+            thread::sleep(delay);
+        }
+        pack(BufWriter::new(&file), &tree, &chosen, &manifest.by_hash(skip))
+    });
     match packed {
         Ok(packed) => Ok(Brought {
             skipped,
@@ -1012,6 +1061,15 @@ pub fn not_brought_back(reason: &str) -> String {
 ///
 /// A request asking for a data channel is refused `channel` before anything is sent ([`channel_refusal`]): this builder
 /// has none, so the PC sends over ssh.
+///
+/// A payload with `CutWaitMs` ([`Payload::cut_wait`]), sent after the PC cut the run, has the call wait, once its
+/// session is renewed, for the run that packs the archive to be done with it ([`waited`]): it sends the archive once it
+/// is not empty and an exclusive `flock` taken without waiting holds it, through the send and the removal; a run over,
+/// its work lock free, that packed nothing says `gate-remote-outputs: 0` and sends nothing, status 0; a run still going
+/// once the wait's bound has passed is said as not finished, status 1, nothing sent. While it waits, the call says
+/// `gate-remote-heartbeat: 0` every heartbeat period. A call whose own caller goes while it waits stops waiting, sends
+/// and says nothing, and ends with 255, the archive left for the prune. A `CutWaitMs` that is not a whole number of
+/// milliseconds is a usage error. Without it, the call looks once, as above.
 #[must_use]
 pub fn outputs(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u8 {
     answered(payload, seams, &mut io::stdout().lock(), console)
@@ -1032,58 +1090,101 @@ enum Removal {
 
 /// [`outputs`], the archive sent to `sink`.
 fn answered(payload: &Payload, seams: &BoxSeams, sink: &mut impl Write, console: &mut Console) -> u8 {
+    let (work, folder, session) = match folders_read(payload, console) {
+        Ok(read) => read,
+        Err(status) => return status,
+    };
+    let (name, waits) = match named(payload, console) {
+        Ok(named) => named,
+        Err(status) => return status,
+    };
+    let (_held, removal) = renewed(work, session, seams, console);
+    // The archive a waiting call sent stays held under its exclusive lock until it is removed.
+    let (outputs, _locked) = match archive_sent((work, folder, name), waits, seams, sink, console) {
+        Ok(sent) => sent,
+        Err(status) => return status,
+    };
+    removed(&removal, &outputs, name, console);
+    0
+}
+
+/// The work folder, the output folder and the drain session the payload names, once a request for a data channel is
+/// refused ([`channel_refusal`]); else the status the call ends on, its lines said: the usage status for a payload
+/// that gets them wrong, the refusal status for a channel asked for.
+fn folders_read<'p>(payload: &'p Payload, console: &mut Console) -> Result<(&'p str, &'p str, Option<&'p str>), u8> {
     let read = payload
         .work_folder()
         .and_then(|(_, work)| Ok((work, payload.output_folder(work)?, payload.session()?)));
-    let (work, folder, session) = match read {
-        Ok(read) => read,
-        Err(line) => {
-            console.err(&line);
-            return USAGE_STATUS;
-        }
-    };
+    let read = read.map_err(|line| {
+        console.err(&line);
+        USAGE_STATUS
+    })?;
     match channel_refusal(payload) {
-        Ok(None) => {}
+        Ok(None) => Ok(read),
         Ok(Some(lines)) => {
             for line in &lines {
                 console.err(line);
             }
-            return REFUSED_STATUS;
+            Err(REFUSED_STATUS)
         }
         Err(line) => {
             console.err(&line);
-            return USAGE_STATUS;
+            Err(USAGE_STATUS)
         }
     }
-    let name = match payload.archive_name() {
-        Ok(name) => name,
-        Err(line) => {
-            console.err(&line);
-            let lacking = payload.text("Name").is_err();
-            return if lacking { USAGE_STATUS } else { FAILED_STATUS };
-        }
-    };
-    let (_held, removal) = match drain::renewed_at(work, session, seams, console) {
+}
+
+/// The archive name the payload asks for and how long the call waits for its run (`CutWaitMs`); else the status the
+/// call ends on, its line said: the usage status for no `Name` or a malformed wait, 1 for a `Name` that is not an
+/// outputs archive of the work folder.
+fn named<'p>(payload: &'p Payload, console: &mut Console) -> Result<(&'p str, Option<Duration>), u8> {
+    let name = payload.archive_name().map_err(|line| {
+        console.err(&line);
+        if payload.text("Name").is_err() { USAGE_STATUS } else { FAILED_STATUS }
+    })?;
+    let waits = payload.cut_wait().map_err(|line| {
+        console.err(&line);
+        USAGE_STATUS
+    })?;
+    Ok((name, waits))
+}
+
+/// The payload's drain session renewed ([`drain::renewed_at`]), held until the call returns, and what the call does
+/// with the archive it sends: removes it, or keeps it for a session dead under a standing barrier, or for a drain that
+/// could not be read, its failure said.
+fn renewed(work: &str, session: Option<&str>, seams: &BoxSeams, console: &mut Console) -> (Option<drain::Admitted>, Removal) {
+    match drain::renewed_at(work, session, seams, console) {
         Ok(renewal) if renewal.may_delete => (renewal.held, Removal::Remove),
         Ok(renewal) => (renewal.held, Removal::KeepDrained),
         Err(why) => {
             console.err(&drain::failed_line(&why));
             (None, Removal::Keep)
         }
-    };
-    let sent = output_folder(folder, false)
-        .map_err(Unsent::of_open)
-        .and_then(|outputs| send(&outputs, name, sink).map(|()| outputs));
-    let outputs = match sent {
-        Ok(outputs) => outputs,
-        Err(unsent) => {
-            console.err(&unsent.line(name));
-            return FAILED_STATUS;
-        }
-    };
+    }
+}
+
+/// The archive `name` in `folder` sent to `sink`, at once, or once the run of the work folder `work` is done with it
+/// when the call `waits` ([`waited_and_sent`]): its folder, and the archive a waiting call holds under its exclusive
+/// lock; else the status the call ends on, its line said.
+fn archive_sent(
+    (work, folder, name): (&str, &str, &str),
+    waits: Option<Duration>,
+    seams: &BoxSeams,
+    sink: &mut impl Write,
+    console: &mut Console,
+) -> Result<(Folder, Option<File>), u8> {
+    match waits {
+        None => sent_at_once((folder, name), sink, console).map(|outputs| (outputs, None)),
+        Some(bound) => waited_and_sent((work, folder, name), bound, seams, sink, console).map(|(outputs, archive)| (outputs, Some(archive))),
+    }
+}
+
+/// Does with the archive `name` in `outputs`, sent, what `removal` says: removes it, a removal that fails said and the
+/// archive left for a later run's [`prune`]; or keeps it, saying [`KEPT_DRAINED`] for a session dead under a barrier.
+fn removed(removal: &Removal, outputs: &Folder, name: &str, console: &mut Console) {
     match removal {
         Removal::Remove => {
-            if let Err(error) = remove_archive(&outputs, OsStr::new(name)) {
+            if let Err(error) = remove_archive(outputs, OsStr::new(name)) {
                 console.err(&format!(
                     "gate: remote could not remove the outputs archive {name}: {}",
                     escaped(&error.to_string())
@@ -1093,7 +1194,6 @@ fn answered(payload: &Payload, seams: &BoxSeams, sink: &mut impl Write, console:
         Removal::KeepDrained => console.err(KEPT_DRAINED),
         Removal::Keep => {}
     }
-    0
 }
 
 /// Why an archive was not sent.
@@ -1125,7 +1225,12 @@ impl Unsent {
 
 /// Copies the plain file `name` in `folder`, never a link's target, to `sink` through a fixed buffer, then flushes it.
 fn send(folder: &Folder, name: &str, sink: &mut impl Write) -> Result<(), Unsent> {
-    let mut archive = folder.open_file(OsStr::new(name)).map_err(Unsent::of_open)?;
+    let archive = folder.open_file(OsStr::new(name)).map_err(Unsent::of_open)?;
+    sent(&archive, sink)
+}
+
+/// Copies the open archive `archive` to `sink` through a fixed buffer, then flushes it.
+fn sent(mut archive: &File, sink: &mut impl Write) -> Result<(), Unsent> {
     let mut buffer = vec![0_u8; SEND_BUFFER];
     loop {
         let read = match archive.read(&mut buffer) {
@@ -1137,6 +1242,190 @@ fn send(folder: &Folder, name: &str, sink: &mut impl Write) -> Result<(), Unsent
         sink.write_all(&buffer[..read]).map_err(Unsent::Unwritten)?;
     }
     sink.flush().map_err(Unsent::Unwritten)
+}
+
+/// How often a call that waits for its run ([`waited`]) looks whether the run is over, as the Windows box looks.
+const CUT_WAIT_STEP: Duration = Duration::from_millis(100);
+
+/// The work lock of the work folder `work`, `<work>.lock`: the lock its run holds from before its command to after its
+/// pack and trim.
+fn work_lock(work: &str) -> String {
+    format!("{work}.lock")
+}
+
+/// The archive `name` in the output folder `folder` sent to `sink` at once, as a call that does not wait sends it, with
+/// its folder; else [`FAILED_STATUS`], why it was not sent said.
+fn sent_at_once((folder, name): (&str, &str), sink: &mut impl Write, console: &mut Console) -> Result<Folder, u8> {
+    output_folder(folder, false)
+        .map_err(Unsent::of_open)
+        .and_then(|outputs| send(&outputs, name, sink).map(|()| outputs))
+        .map_err(|unsent| {
+            console.err(&unsent.line(name));
+            FAILED_STATUS
+        })
+}
+
+/// The archive `name` in the output folder `folder` of the work folder `work`, sent to `sink` once the run that packs
+/// it is done with it ([`waited`]), with its folder, still held under its exclusive `flock` for the removal. Else the
+/// status the call ends on, its line said: 0 for a run over that packed nothing (`gate-remote-outputs: 0`), 1 for a
+/// run still going past `bound` or an archive that cannot be looked at or sent, 255 with nothing said for a caller
+/// gone, the archive left for the prune.
+fn waited_and_sent(
+    (work, folder, name): (&str, &str, &str),
+    bound: Duration,
+    seams: &BoxSeams,
+    sink: &mut impl Write,
+    console: &mut Console,
+) -> Result<(Folder, File), u8> {
+    let unsent = match waited((folder, name), Path::new(&work_lock(work)), bound, seams, console) {
+        Ok((outputs, archive)) => match sent(&archive, sink) {
+            Ok(()) => return Ok((outputs, archive)),
+            Err(unsent) => unsent,
+        },
+        Err(Unwaited::Nothing) => {
+            console.err(NOTHING_PACKED);
+            return Err(0);
+        }
+        // No one is left to tell: nothing is sent or said.
+        Err(Unwaited::CallerGone) => return Err(CLOSED_STATUS),
+        Err(Unwaited::Going) => {
+            console.err(&still_going_line(name, bound));
+            return Err(FAILED_STATUS);
+        }
+        Err(Unwaited::Unsent(unsent)) => unsent,
+    };
+    console.err(&unsent.line(name));
+    Err(FAILED_STATUS)
+}
+
+/// Why a call that waits for its run sends no archive.
+enum Unwaited {
+    /// The run is over and packed nothing: no archive is at its name and no run holds the work lock.
+    Nothing,
+    /// The run was still going, or its archive still being written, once the wait's bound had passed.
+    Going,
+    /// The archive could not be looked at, for this.
+    Unsent(Unsent),
+    /// The call's own caller went while it waited.
+    CallerGone,
+}
+
+/// The archive `name` in the output folder `folder` once the run that packs it is done with it ([`run_over`]), with
+/// its folder, opened and held under an exclusive `flock` for the caller to send and remove. Looks every
+/// [`CUT_WAIT_STEP`] for up to `bound`, the run's work lock at `lock`; meanwhile the heartbeat says
+/// `gate-remote-heartbeat: 0` on stderr every period (`--test-heartbeat-ms`, else [`heartbeat::PERIOD`]), so the PC's
+/// watch of a silent call does not cut it, and is stopped before any other line is said. A caller found gone ends the
+/// wait ([`Unwaited::CallerGone`]).
+fn waited((folder, name): (&str, &str), lock: &Path, bound: Duration, seams: &BoxSeams, console: &mut Console) -> Result<(Folder, File), Unwaited> {
+    let output = Arc::new(Output::new(StdioSink));
+    let period = seams.heartbeat_ms.map_or(heartbeat::PERIOD, Duration::from_millis);
+    let pump = heartbeat::start(Arc::clone(&output) as Arc<dyn Forwarding>, period)
+        .inspect_err(|error| console.err(&gate_watchdog::start_failed_line(error)))
+        .ok();
+    let began = Instant::now();
+    let found = loop {
+        if output.client_gone() {
+            break Err(Unwaited::CallerGone);
+        }
+        if let Some(found) = run_over(folder, name, lock) {
+            break found;
+        }
+        if began.elapsed() >= bound {
+            break Err(Unwaited::Going);
+        }
+        thread::sleep(CUT_WAIT_STEP);
+    };
+    if let Some(pump) = pump {
+        // Stopped before any other line, so none lands inside a beat.
+        heartbeat::stop(pump);
+    }
+    found
+}
+
+/// What one look at the archive found ([`looked`]).
+enum Looked {
+    /// Whole and no longer written: its folder and the archive, held under an exclusive `flock`.
+    Whole(Folder, File),
+    /// Nothing at its name, or no output folder.
+    Missing,
+    /// Empty, held by its pack, or replaced since it was opened: still being written.
+    Busy,
+    /// It could not be looked at.
+    Failed(Unsent),
+}
+
+/// The archive `name` in `folder` once its run is done with it: whole and unlocked, held now under an exclusive
+/// `flock`; else, with no archive there, [`Unwaited::Nothing`] once no run holds the work lock at `lock`
+/// ([`work_lock_free`]) and a second look still finds none. `None` while the run or its pack may still be going.
+fn run_over(folder: &str, name: &str, lock: &Path) -> Option<Result<(Folder, File), Unwaited>> {
+    let missing = match looked(folder, name) {
+        Looked::Missing => Ok(()),
+        Looked::Busy => return None,
+        found => Err(found),
+    };
+    if missing.is_ok() && !work_lock_free(lock) {
+        return None;
+    }
+    // Looked at once more after the lock: a pack that ended between the two looks left its archive.
+    match missing.err().unwrap_or_else(|| looked(folder, name)) {
+        Looked::Whole(outputs, archive) => Some(Ok((outputs, archive))),
+        Looked::Missing => Some(Err(Unwaited::Nothing)),
+        Looked::Busy => None,
+        Looked::Failed(unsent) => Some(Err(Unwaited::Unsent(unsent))),
+    }
+}
+
+/// One look at the archive `name` in the output folder `folder`, opened beneath it as [`send`] opens it: whole when
+/// it is not empty and an exclusive `flock` taken without waiting holds the very file at its name, as
+/// [`remove_held`] checks it.
+fn looked(folder: &str, name: &str) -> Looked {
+    let outputs = match output_folder(folder, false) {
+        Ok(outputs) => outputs,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Looked::Missing,
+        Err(error) => return Looked::Failed(Unsent::Unread(error)),
+    };
+    let child = OsStr::new(name);
+    let archive = match outputs.open_file(child) {
+        Ok(archive) => archive,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Looked::Missing,
+        Err(error) => return Looked::Failed(Unsent::Unread(error)),
+    };
+    match held_alone(&outputs, child, &archive) {
+        Ok(Alone::Held) => {}
+        // Held by its pack, or gone or replaced since the open: looked at again at the next step.
+        Ok(Alone::Written | Alone::Moved) => return Looked::Busy,
+        Err(error) => return Looked::Failed(Unsent::Unread(error)),
+    }
+    match archive.metadata() {
+        // Made, not yet locked by its pack: the lock is let go as the file closes.
+        Ok(metadata) if metadata.len() == 0 => Looked::Busy,
+        Ok(_) => Looked::Whole(outputs, archive),
+        Err(error) => Looked::Failed(Unsent::Unread(error)),
+    }
+}
+
+/// Whether no run holds the work lock at `lock`: the lock file opened read-only as the run's lock opens it, never made,
+/// a link never followed and a FIFO never waited on (`O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`), then, for a plain file, an
+/// exclusive `flock` taken without waiting and let go at once as the file closes; a missing lock file is free. Anything
+/// but a plain file, and a lock file that cannot be opened or locked for another reason, counts as held, so nothing is
+/// ever said packed too early.
+fn work_lock_free(lock: &Path) -> bool {
+    let opened = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(lock);
+    let file = match opened {
+        Ok(file) => file,
+        Err(error) => return error.kind() == io::ErrorKind::NotFound,
+    };
+    file.metadata().is_ok_and(|metadata| metadata.is_file()) && flock(&file, libc::LOCK_EX | libc::LOCK_NB).is_ok()
+}
+
+/// The line a call that waited `bound` for its run says of the archive `name` it did not send: the bound in whole
+/// seconds, rounded up, at least 1.
+fn still_going_line(name: &str, bound: Duration) -> String {
+    let seconds = bound.as_millis().div_ceil(1000).max(1);
+    format!("gate: remote outputs archive {name} is not finished: the run is still going after {seconds} s")
 }
 
 #[cfg(test)]
@@ -1642,7 +1931,7 @@ pub(crate) mod tests {
         work: &Path,
         skip: &[String],
     ) -> Result<(Option<String>, String), String> {
-        bring_back(asked, manifest, listing, work, skip).map(|brought: Brought| {
+        bring_back(asked, manifest, listing, work, (skip, None)).map(|brought: Brought| {
             let size = brought.wrote_archive().then(|| {
                 let written = fs::metadata(Path::new(asked.folder).join(&asked.archive)).expect("the archive packed is there");
                 format!("gate-remote-outputs-size: {}", written.len())
@@ -1667,7 +1956,7 @@ pub(crate) mod tests {
         let asked = case.asked(&["bin/**"], true, '1');
         let path = case.outputs().join(archive('1'));
 
-        let brought = bring_back(&asked, &Ok(Manifest::default()), None, &case.work(), &[]).expect("the pack is made");
+        let brought = bring_back(&asked, &Ok(Manifest::default()), None, &case.work(), (&[], None)).expect("the pack is made");
 
         assert!(locked_by_another(&path), "the run holds its archive while it trims");
         drop(brought);
@@ -1716,6 +2005,42 @@ pub(crate) mod tests {
         let reason = trimmed.reason.expect("the outputs are not brought back");
         let cannot = format!("cannot open the output folder {}: ", case.folder);
         assert!(reason.starts_with(&cannot), "{reason}");
+    }
+
+    #[test]
+    fn a_cut_wait_whose_work_lock_is_a_link_or_a_fifo_says_the_run_is_still_going() {
+        for kind in ["link", "fifo"] {
+            let case = Case::new(&format!("cut-wait-lock-{kind}"));
+            let lock = PathBuf::from(format!("{}.lock", case.work().display()));
+            if kind == "link" {
+                // A free lock file it would find were it to follow the link.
+                let target = case.base.join("free.lock");
+                fs::write(&target, b"").expect("the link's target is written");
+                symlink(&target, &lock).expect("the link is made");
+            } else {
+                let fifo = CString::new(lock.as_os_str().as_bytes()).expect("the path holds no NUL");
+                // SAFETY: `fifo` is a NUL-terminated path that lives across the call; `mkfifo` only reads it.
+                assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "{}", io::Error::last_os_error());
+            }
+            let name = archive('1');
+            let value = json!({
+                "Key": KEY,
+                "Work": case.work().to_str().expect("the temp folder is UTF-8"),
+                "OutputFolder": case.folder,
+                "Name": name,
+                "CutWaitMs": 100,
+            });
+            let payload = Payload::decode(&STANDARD.encode(value.to_string()), PathForm::Unix).expect("the payload decodes");
+
+            let (sender, receiver) = mpsc::channel();
+            thread::spawn(move || sender.send(verb(&payload)));
+            let (status, sent, console) = receiver.recv_timeout(HANG_GUARD).expect("the call never waits on the lock");
+
+            assert_eq!(status, FAILED_STATUS, "{kind}: {:?}", console.err);
+            assert!(sent.is_empty(), "{kind}: nothing is sent");
+            let going = format!("gate: remote outputs archive {name} is not finished: the run is still going after 1 s");
+            assert_eq!(console.err, [going], "{kind}: a lock that is not a plain file is a run still going");
+        }
     }
 
     #[test]

@@ -18,10 +18,11 @@ mod unix {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, ChildStderr, Command, Stdio};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
+    use std::time::Duration;
 
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
@@ -1678,6 +1679,238 @@ mod unix {
             "the dump the run wrote comes back; the one an earlier run left stays, though the PC lacks it"
         );
         case.ended_clean();
+    }
+
+    /// The idle heartbeat a waiting `outputs` call says.
+    const IDLE_BEAT: &str = "gate-remote-heartbeat: 0";
+
+    /// The `extra` payload keys of an `outputs` call that waits up to `ms` for the run that packs its archive.
+    fn cut_wait(ms: u64) -> Value {
+        json!({ "CutWaitMs": ms })
+    }
+
+    /// The bytes of a test archive.
+    fn some_bytes() -> Vec<u8> {
+        (0..=255_u8).cycle().take(70_001).collect()
+    }
+
+    /// The lines of `err` that are not idle heartbeats.
+    fn beyond_beats(err: &[String]) -> Vec<&str> {
+        err.iter().map(String::as_str).filter(|line| *line != IDLE_BEAT).collect()
+    }
+
+    /// Applies the `flock` `operation` to `file`; whether it was taken.
+    fn flocked(file: &fs::File, operation: libc::c_int) -> bool {
+        // SAFETY: `file` is open for the call; `flock` touches no memory.
+        unsafe { libc::flock(file.as_raw_fd(), operation) == 0 }
+    }
+
+    /// A waiting `outputs` call ([`Case::waiting_outputs`]): the call and its stderr, read up to its first beat.
+    struct Waiting {
+        child: Child,
+        stderr: BufReader<ChildStderr>,
+    }
+
+    impl Waiting {
+        /// The call run to its end: its status, the bytes it sent and its lines on stderr after the first beat.
+        fn ended(self) -> (Option<i32>, Vec<u8>, Vec<String>) {
+            let Waiting { child, stderr } = self;
+            // Stdout read to its end first: the archive can be more than a pipe holds.
+            let ran = child.wait_with_output().expect("gate-box is waited for");
+            let err = stderr.lines().map(|line| line.expect("stderr reads")).collect();
+            (ran.status.code(), ran.stdout, err)
+        }
+    }
+
+    impl Case {
+        /// The case's output folder made, 0700, and `bytes` written at its archive's name; the archive's path.
+        fn archive_made(&self, bytes: &[u8]) -> PathBuf {
+            std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700)
+                .create(format!("{}/outputs", self.root()))
+                .expect("the output folder is made");
+            let archive = self.archive();
+            fs::write(&archive, bytes).expect("the archive is written");
+            archive
+        }
+
+        /// `gate-box box --test-heartbeat-ms 50 outputs --stdin` for this case's archive, asking to wait up to `ms`
+        /// (`CutWaitMs`), started, its stderr read up to its first idle heartbeat: the call is waiting.
+        fn waiting_outputs(&self, ms: u64) -> Waiting {
+            let (root, work) = (self.root(), self.work());
+            let payload = json!({
+                "Key": KEY,
+                "Work": work,
+                "OutputFolder": format!("{root}/outputs"),
+                "Name": archive_name(),
+                "CutWaitMs": ms,
+            });
+            let mut child = Command::new(env!("CARGO_BIN_EXE_gate-box"))
+                .args(["box", "--test-heartbeat-ms", "50", "outputs", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("gate-box starts");
+            let mut stdin = child.stdin.take().expect("stdin is piped");
+            stdin
+                .write_all(format!("{}\n", STANDARD.encode(payload.to_string())).as_bytes())
+                .expect("the request is written");
+            drop(stdin);
+            let mut stderr = BufReader::new(child.stderr.take().expect("stderr is piped"));
+            let mut line = String::new();
+            while line.trim_end() != IDLE_BEAT {
+                line.clear();
+                assert!(stderr.read_line(&mut line).expect("stderr reads") > 0, "a beat before the end");
+            }
+            Waiting { child, stderr }
+        }
+
+        /// The work lock, made and held exclusively, as a run that is still going holds it.
+        fn run_going(&self) -> fs::File {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(self.lock())
+                .expect("the lock file opens");
+            assert!(flocked(&file, libc::LOCK_EX | libc::LOCK_NB), "the work lock is taken");
+            file
+        }
+    }
+
+    #[test]
+    fn outputs_with_a_cut_wait_sends_the_archive_once_its_pack_is_done() {
+        let case = Case::new("outputs-cut-wait-pack");
+        let commit = case.snapshot_holding(&[(".gitignore", "bin/\n.tmp/\n")]);
+        let keys = json!({
+            "Command": ["/bin/sh", "-c", "mkdir -p .tmp/dumps && echo new > .tmp/dumps/new.dmp; exit 3"],
+            "Outputs": ["bin/**"],
+            "FailureOutputs": [".tmp/dumps/**"],
+        });
+        let request = case.outputs_request(&commit, &keys, &Manifest::default());
+        let beaten = case.base.join("beaten");
+        let run = thread::spawn(move || ran(&["--test-box-pack-delay-ms", "1500"], &request, Reading::All, &beaten));
+        let archive = case.archive();
+        while !archive.exists() && !run.is_finished() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(archive.exists(), "the run makes its archive");
+
+        let (status, sent, err) = case.outputs_sent_as(&archive_name(), &cut_wait(10_000), &[]);
+        let ended = run.join().expect("the run's reader ends");
+
+        assert_eq!(status, Some(0), "{err:?}");
+        assert!(beyond_beats(&err).is_empty(), "{err:?}");
+        assert_eq!(members_of(&sent), [".tmp/dumps/new.dmp"], "the whole archive is sent");
+        assert!(!archive.exists(), "the archive sent is removed");
+        assert_eq!(ended.status, Some(3), "{:?}", ended.err);
+    }
+
+    #[test]
+    fn outputs_with_a_cut_wait_waits_while_the_archive_is_locked() {
+        let case = Case::new("outputs-cut-wait-locked");
+        let bytes = some_bytes();
+        let archive = case.archive_made(&bytes);
+        let held = fs::File::open(&archive).expect("the archive opens");
+        assert!(flocked(&held, libc::LOCK_SH), "the archive is held as a pack holds it");
+
+        let waiting = case.waiting_outputs(120_000);
+        // The call beat while the lock was held: it waited; only now is the lock let go.
+        drop(held);
+        let (status, sent, err) = waiting.ended();
+
+        assert_eq!(status, Some(0), "{err:?}");
+        assert!(beyond_beats(&err).is_empty(), "{err:?}");
+        assert!(sent == bytes, "the archive's bytes, exactly: {} bytes came", sent.len());
+        assert!(!archive.exists(), "the archive sent is removed");
+    }
+
+    #[test]
+    fn outputs_with_a_cut_wait_and_no_archive_says_nothing_was_packed() {
+        let case = Case::new("outputs-cut-wait-nothing");
+
+        let (status, sent, err) = case.outputs_sent_as(&archive_name(), &cut_wait(10_000), &[]);
+
+        assert_eq!(status, Some(0), "{err:?}");
+        assert!(sent.is_empty(), "nothing is sent: {} bytes came", sent.len());
+        assert_eq!(beyond_beats(&err), ["gate-remote-outputs: 0"]);
+    }
+
+    #[test]
+    fn outputs_with_a_cut_wait_past_its_bound_says_the_run_is_still_going() {
+        let case = Case::new("outputs-cut-wait-bound");
+        let going = case.run_going();
+
+        let (status, sent, err) = case.outputs_sent_as(&archive_name(), &cut_wait(300), &[]);
+        drop(going);
+
+        assert_eq!(status, Some(1), "{err:?}");
+        assert!(sent.is_empty(), "nothing is sent: {} bytes came", sent.len());
+        let line = format!(
+            "gate: remote outputs archive {} is not finished: the run is still going after 1 s",
+            archive_name()
+        );
+        assert_eq!(beyond_beats(&err), [line.as_str()]);
+    }
+
+    #[test]
+    fn outputs_with_a_cut_wait_says_heartbeats_while_it_waits() {
+        let case = Case::new("outputs-cut-wait-beats");
+        let going = case.run_going();
+
+        let (status, _, err) = case.outputs_sent_as(&archive_name(), &cut_wait(1000), &["--test-heartbeat-ms", "50"]);
+        drop(going);
+
+        assert_eq!(status, Some(1), "{err:?}");
+        let beat = err.iter().position(|line| line == IDLE_BEAT);
+        let going_line = err
+            .iter()
+            .position(|line| line.contains("is not finished: the run is still going after 1 s"));
+        assert!(
+            beat.is_some() && going_line.is_some() && beat < going_line,
+            "a beat before the not-finished line: {err:?}"
+        );
+    }
+
+    #[test]
+    fn outputs_with_a_cut_wait_keeps_waiting_on_an_empty_archive() {
+        let case = Case::new("outputs-cut-wait-empty");
+        let archive = case.archive_made(b"");
+        let bytes = some_bytes();
+        let staged = case.base.join("staged.tar.zst");
+        fs::write(&staged, &bytes).expect("the archive's bytes are staged");
+
+        let waiting = case.waiting_outputs(120_000);
+        // The call beat while the archive was empty: it waited. Put in place whole, so it never sees half of it.
+        fs::rename(&staged, &archive).expect("the archive is filled");
+        let (status, sent, err) = waiting.ended();
+
+        assert_eq!(status, Some(0), "{err:?}");
+        assert!(beyond_beats(&err).is_empty(), "{err:?}");
+        assert!(sent == bytes, "the archive's bytes, exactly: {} bytes came", sent.len());
+        assert!(!archive.exists(), "the archive sent is removed");
+    }
+
+    /// A call waiting for its run whose own caller goes stops waiting: it sends nothing, says nothing and exits 255, and
+    /// the archive stays for the prune.
+    #[test]
+    fn outputs_with_a_cut_wait_whose_caller_goes_stops_waiting() {
+        let case = Case::new("outputs-cut-wait-gone");
+        let archive = case.archive_made(&some_bytes());
+        let held = fs::File::open(&archive).expect("the archive opens");
+        assert!(flocked(&held, libc::LOCK_SH), "the archive is held as a pack holds it");
+        let Waiting { mut child, stderr } = case.waiting_outputs(120_000);
+        // The caller goes: both of the call's streams lose their reader.
+        drop(stderr);
+        drop(child.stdout.take());
+
+        let status = child.wait().expect("gate-box is waited for");
+        drop(held);
+
+        assert_eq!(status.code(), Some(255), "a gone caller ends the wait");
+        assert!(archive.exists(), "an archive not sent stays");
     }
 
     #[test]
