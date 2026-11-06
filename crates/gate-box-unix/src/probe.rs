@@ -1,7 +1,7 @@
 //! The preflight's tool probes and SDK list: each program found along the login shell's `PATH` and run in the bounded
 //! runner from `/`, so no project file of the ssh session's folder (a `rust-toolchain.toml`, a `global.json`) bends
-//! what it says. Godot is read from the installs under the login shell's `GATE_GODOT_ROOT`, as the Windows box reads
-//! its own.
+//! what it says. Godot is read from the installs under the login shell's `GATE_GODOT_ROOT`, and Blender from those
+//! under its `GATE_BLENDER_ROOT`, as the Windows box reads its own.
 
 use std::fs;
 use std::io;
@@ -27,9 +27,14 @@ const RUN_FOLDER: &str = "/";
 const GODOT_ROOT: &str = "GATE_GODOT_ROOT";
 /// The program of a Godot install, inside its version's folder.
 const GODOT_PROGRAM: &str = "Godot.app/Contents/MacOS/Godot";
-/// The most subfolders of the Godot root the probe reads.
+/// The variable naming the folder of the builder's Blender installs, one subfolder per version
+/// ([`gate_wire::blender_folder_version`]).
+const BLENDER_ROOT: &str = "GATE_BLENDER_ROOT";
+/// The program of a Blender install, inside its version's folder.
+const BLENDER_PROGRAM: &str = "Blender.app/Contents/MacOS/Blender";
+/// The most subfolders of the Godot or Blender root the probe reads.
 const ROOT_ENTRIES: usize = 64;
-/// The most characters of a Godot install's answer the no-version reason carries.
+/// The most characters of a Godot or Blender install's answer the no-version reason carries.
 const GODOT_ANSWER_MAX: usize = 200;
 
 /// How a tool is probed.
@@ -39,6 +44,8 @@ enum Plan {
     Runs { program: &'static str, args: &'static [&'static str] },
     /// Read the installs under the Godot root ([`godot`]).
     Godot,
+    /// Read the installs under the Blender root ([`blender`]).
+    Blender,
     /// A tool this builder never has: a run that needs it is not routed here.
     Missing,
     /// A name the box knows no probe for.
@@ -52,21 +59,28 @@ fn plan(name: &str) -> Plan {
     }
     match name {
         "godot" => Plan::Godot,
+        "blender" => Plan::Blender,
         "unreal" | "netfx-sdk" => Plan::Missing,
         _ => Plan::Unknown,
     }
 }
 
+/// The roots of the builder's installs a probe reads, each `None` when the login shell gives none.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Roots<'a> {
+    /// The Godot root, `GATE_GODOT_ROOT`.
+    pub godot: Option<&'a str>,
+    /// The Blender root, `GATE_BLENDER_ROOT`.
+    pub blender: Option<&'a str>,
+}
+
 /// What each tool of `names` is, in their order, probed in parallel along `path` (the box's own `PATH` when `None`)
-/// under one shared [`PROBE_LIMIT`], Godot under the Godot root `godot_root` (none when `None`).
+/// under one shared [`PROBE_LIMIT`], Godot and Blender under their `roots`.
 #[must_use]
-pub fn probe_all(names: &[String], path: Option<&str>, godot_root: Option<&str>) -> Vec<Probed> {
+pub fn probe_all(names: &[String], path: Option<&str>, roots: Roots<'_>) -> Vec<Probed> {
     let deadline = Instant::now() + PROBE_LIMIT;
     thread::scope(|scope| {
-        let probes: Vec<_> = names
-            .iter()
-            .map(|name| scope.spawn(move || probe(name, path, godot_root, deadline)))
-            .collect();
+        let probes: Vec<_> = names.iter().map(|name| scope.spawn(move || probe(name, path, roots, deadline))).collect();
         probes
             .into_iter()
             .map(|probe| probe.join().unwrap_or_else(|_| Probed::Skipped("the probe failed".to_owned())))
@@ -74,13 +88,14 @@ pub fn probe_all(names: &[String], path: Option<&str>, godot_root: Option<&str>)
     })
 }
 
-/// What the tool `name` is, its program run along `path` until `deadline`, Godot read under `godot_root`.
-fn probe(name: &str, path: Option<&str>, godot_root: Option<&str>, deadline: Instant) -> Probed {
+/// What the tool `name` is, its program run along `path` until `deadline`, Godot and Blender read under `roots`.
+fn probe(name: &str, path: Option<&str>, roots: Roots<'_>, deadline: Instant) -> Probed {
     match plan(name) {
         Plan::Runs { program, args } => ran(program, args, path, deadline, |ran| {
             probed(ran.status.success(), &ran.stdout, &ran.stderr)
         }),
-        Plan::Godot => godot(godot_root, path, deadline),
+        Plan::Godot => godot(roots.godot, path, deadline),
+        Plan::Blender => blender(roots.blender, path, deadline),
         Plan::Missing => Probed::Missing,
         Plan::Unknown => Probed::Skipped("unknown tool".to_owned()),
     }
@@ -110,32 +125,137 @@ fn ran(program: &str, args: &[&str], path: Option<&str>, deadline: Instant, read
 /// root or no install under it; `skipped` when the root is not an absolute path or cannot be read, or with the first
 /// reason an install gave when installs are there and none of them gives its version.
 fn godot(root: Option<&str>, path: Option<&str>, deadline: Instant) -> Probed {
-    let Some(root) = root else {
-        return Probed::Missing;
-    };
-    if !root.starts_with('/') {
-        return Probed::Skipped(format!("{GODOT_ROOT} {root} is not an absolute path"));
-    }
-    let folders = match listed(Path::new(root), deadline) {
-        Ok(folders) => folders,
-        Err(why) => return Probed::Skipped(why),
-    };
-    gathered(folders.iter().filter_map(|folder| {
-        godot_install(folder).map(|candidate| match candidate {
+    root_probe(GODOT_ROOT, root, path, deadline, |folder, path, deadline| {
+        app_install(folder, GODOT_PROGRAM).map(|candidate| match candidate {
             Candidate::Install(program) => {
                 let found = ran(&program.to_string_lossy(), &["--version"], path, deadline, read_godot);
                 named_as(&folder.file_name().unwrap_or_default().to_string_lossy(), found)
             }
             Candidate::Skipped(why) => Probed::Skipped(why),
         })
-    }))
+    })
 }
 
-/// The direct subfolders of the Godot root `root`, the first [`ROOT_ENTRIES`] read, in name order; one whose name is no
-/// Unicode and an entry that cannot be read are left out, and the listing ends at `deadline`, which with nothing read
-/// at all is the probe's own `no answer` reason. Else why the root cannot be read.
-fn listed(root: &Path, deadline: Instant) -> Result<Vec<PathBuf>, String> {
-    let entries = fs::read_dir(root).map_err(|error| format!("cannot read {GODOT_ROOT} {}: {error}", root.display()))?;
+/// What a probe of the installs under the root `root`, which the variable `variable` names, finds, `per_folder`
+/// judging each of its listed folders ([`listed`]) along `path` until `deadline`, and [`gathered`] joining what they
+/// come to: `missing` with no root, `skipped` when the root is not an absolute path or cannot be read.
+fn root_probe(
+    variable: &str,
+    root: Option<&str>,
+    path: Option<&str>,
+    deadline: Instant,
+    per_folder: impl Fn(&Path, Option<&str>, Instant) -> Option<Probed>,
+) -> Probed {
+    let Some(root) = root else {
+        return Probed::Missing;
+    };
+    if !root.starts_with('/') {
+        return Probed::Skipped(format!("{variable} {root} is not an absolute path"));
+    }
+    let folders = match listed(variable, Path::new(root), deadline) {
+        Ok(folders) => folders,
+        Err(why) => return Probed::Skipped(why),
+    };
+    gathered(folders.iter().filter_map(|folder| per_folder(folder, path, deadline)))
+}
+
+/// What the blender probe finds under the Blender root `root`, each install's `--version` run along `path` until
+/// `deadline`: the version of every install, `,`-joined in version order ([`gathered`]), a folder whose name names no
+/// version ([`gate_wire::blender_folder_version`]) not looked at, and an install whose folder names a version the one
+/// it reports does not meet left out ([`blender_named_as`]), as a run finds an install by its folder's name
+/// ([`installed_blender`]); `missing` with no root, as nothing is looked for along the `PATH`, or no install under it;
+/// `skipped` when the root is not an absolute path or cannot be read, or with the first reason an install gave when
+/// installs are there and none of them gives its version.
+fn blender(root: Option<&str>, path: Option<&str>, deadline: Instant) -> Probed {
+    root_probe(BLENDER_ROOT, root, path, deadline, blender_found)
+}
+
+/// What the Blender install in `folder`, one direct subfolder of the Blender root, comes to, the one judgement the
+/// probe ([`blender`]) and a run ([`installed_blender`]) share: nothing when the folder's name names no version
+/// ([`gate_wire::blender_folder_version`]) or it holds no install; why it is left out when [`app_install`] leaves it
+/// out; else what its `--version` run along `path` until `deadline` reports, kept only when it meets the folder's
+/// version ([`blender_named_as`]).
+fn blender_found(folder: &Path, path: Option<&str>, deadline: Instant) -> Option<Probed> {
+    let name = folder.file_name()?.to_str()?;
+    let named = gate_wire::blender_folder_version(name)?;
+    app_install(folder, BLENDER_PROGRAM).map(|candidate| match candidate {
+        Candidate::Install(program) => {
+            let found = ran(&program.to_string_lossy(), &["--version"], path, deadline, read_blender);
+            blender_named_as(name, named, found)
+        }
+        Candidate::Skipped(why) => Probed::Skipped(why),
+    })
+}
+
+/// The version a Blender install whose folder is named `folder`, for the version `named`, `found`, kept only when it
+/// meets that version ([`gate_wire::version_meets`]): else skipped with the reason `named <folder> but reports
+/// <version>`. Any other finding as it is.
+fn blender_named_as(folder: &str, named: &str, found: Probed) -> Probed {
+    match found {
+        Probed::Version(version) if !gate_wire::version_meets(named, &version) => Probed::Skipped(format!("named {folder} but reports {version}")),
+        found => found,
+    }
+}
+
+/// What a Blender install's `--version` run `ran` found: the first version of the first line of its standard output
+/// ([`gate_wire::first_version`]), as Blender writes it (`Blender 5.2.2 LTS`), or why it gave none: that line, cut as
+/// [`read_godot`] cuts Godot's.
+fn read_blender(ran: &Ran) -> Probed {
+    let stdout = String::from_utf8_lossy(&ran.stdout);
+    let line = stdout.lines().next().unwrap_or("");
+    gate_wire::first_version(line).map_or_else(
+        || Probed::Skipped(format!("Blender --version gave no version: {}", answer_cut(&stdout))),
+        Probed::Version,
+    )
+}
+
+/// The Blender program of the install the version `version` resolves to under the Blender root `root`, exactly as the
+/// probe keeps installs: of the root's folders whose name's version `version` meets
+/// ([`gate_wire::blender_folder_version`], [`gate_wire::version_meets`]), taken most parts first and then in name
+/// order, the first the probe keeps ([`blender_found`], its `--version` run along `path` within [`PROBE_LIMIT`]) and
+/// that reports `version` itself: its `<folder>/Blender.app/Contents/MacOS/Blender`.
+///
+/// # Errors
+///
+/// Why not: the root is not an absolute path or cannot be read; the first such folder's reason when one was tried and
+/// passed over, as the probe says it when it skips the folder (`named <folder> but reports <version>`, the program
+/// giving no answer, a link), an install the probe keeps that reports another version than `version` itself passed
+/// over as `named <folder> but reports <version>`; or, when no folder gives a reason,
+/// `GATE_BLENDER_ROOT <root> holds no folder for blender <version>`.
+pub(crate) fn installed_blender(root: &str, version: &str, path: Option<&str>) -> Result<PathBuf, String> {
+    if !root.starts_with('/') {
+        return Err(format!("{BLENDER_ROOT} {root} is not an absolute path"));
+    }
+    let deadline = Instant::now() + PROBE_LIMIT;
+    let folders = listed(BLENDER_ROOT, Path::new(root), deadline)?;
+    let mut met: Vec<(usize, &str, &PathBuf)> = folders
+        .iter()
+        .filter_map(|folder| {
+            let name = folder.file_name()?.to_str()?;
+            let named = gate_wire::blender_folder_version(name)?;
+            gate_wire::version_meets(named, version).then(|| (named.split('.').count(), name, folder))
+        })
+        .collect();
+    // A stable sort keeps the listing's name order among folders naming as many parts.
+    met.sort_by_key(|(parts, _, _)| std::cmp::Reverse(*parts));
+    let mut first_why = None;
+    for (_, name, folder) in met {
+        let why = match blender_found(folder, path, deadline) {
+            Some(Probed::Version(found)) if found == version => return Ok(folder.join(BLENDER_PROGRAM)),
+            Some(Probed::Version(found)) => Some(format!("named {name} but reports {found}")),
+            Some(Probed::Skipped(why)) => Some(why),
+            Some(Probed::Present | Probed::Missing) | None => None,
+        };
+        first_why = first_why.or(why);
+    }
+    Err(first_why.unwrap_or_else(|| format!("{BLENDER_ROOT} {root} holds no folder for blender {version}")))
+}
+
+/// The direct subfolders of the root `root`, which the variable `variable` names, the first [`ROOT_ENTRIES`] read, in
+/// name order; one whose name is no Unicode and an entry that cannot be read are left out, and the listing ends at
+/// `deadline`, which with nothing read at all is the probe's own `no answer` reason. Else why the root cannot be read.
+fn listed(variable: &str, root: &Path, deadline: Instant) -> Result<Vec<PathBuf>, String> {
+    let entries = fs::read_dir(root).map_err(|error| format!("cannot read {variable} {}: {error}", root.display()))?;
     let mut folders = Vec::new();
     for entry in entries.take(ROOT_ENTRIES) {
         if Instant::now() >= deadline {
@@ -155,24 +275,24 @@ fn listed(root: &Path, deadline: Instant) -> Result<Vec<PathBuf>, String> {
     Ok(folders)
 }
 
-/// One direct subfolder of the Godot root as the godot probe reads it.
+/// One direct subfolder of the Godot or Blender root as its probe reads it.
 #[derive(Debug, PartialEq, Eq)]
 enum Candidate {
-    /// The Godot program to run, by path.
+    /// The program to run, by path.
     Install(PathBuf),
     /// A folder, or the program in it, that is a symbolic link or not what its place holds: left out for this reason.
     Skipped(String),
 }
 
-/// What `folder`, one direct subfolder of the Godot root, comes to: the [`GODOT_PROGRAM`] in it to run; why it is left
-/// out when the folder, its `Godot.app`, `Contents` or `MacOS` folder or the program is a link, or one of those
-/// folders is no folder or the program no plain file; nothing when the folder is no folder or holds no such program.
-/// The Godot root above it may be a link: the builder's own setting.
-fn godot_install(folder: &Path) -> Option<Candidate> {
-    let program = folder.join(GODOT_PROGRAM);
+/// What `folder`, one direct subfolder of the Godot or Blender root, comes to: the program at `relative` in it to run,
+/// a path relative to it such as [`GODOT_PROGRAM`]; why it is left out when the folder, a folder on the way to the
+/// program or the program is a link, or one of those folders is no folder or the program no plain file; nothing when the
+/// folder is no folder or holds no such program. The root above it may be a link: the builder's own setting.
+fn app_install(folder: &Path, relative: &str) -> Option<Candidate> {
+    let program = folder.join(relative);
     let skipped = |path: &Path, flaw: &str| Some(Candidate::Skipped(format!("cannot run {}: {} {flaw}", program.display(), path.display())));
     // The folder and every level down to the program, the folder first.
-    let mut levels: Vec<&Path> = program.ancestors().take(Path::new(GODOT_PROGRAM).components().count() + 1).collect();
+    let mut levels: Vec<&Path> = program.ancestors().take(Path::new(relative).components().count() + 1).collect();
     levels.reverse();
     for (depth, level) in levels.iter().enumerate() {
         let kind = fs::symlink_metadata(level).ok()?.file_type();
@@ -195,12 +315,12 @@ fn godot_install(folder: &Path) -> Option<Candidate> {
 
 /// The Godot program of the install of `version` under the Godot root `root`, as a run finds it by name:
 /// `<root>/<version>/Godot.app/Contents/MacOS/Godot`, when the root is an absolute path and that program is a plain
-/// file in plain folders, no level of it under the root a link ([`godot_install`]); else `None`.
+/// file in plain folders, no level of it under the root a link ([`app_install`]); else `None`.
 pub(crate) fn installed_godot(root: &str, version: &str) -> Option<PathBuf> {
     if !root.starts_with('/') {
         return None;
     }
-    match godot_install(&Path::new(root).join(version))? {
+    match app_install(&Path::new(root).join(version), GODOT_PROGRAM)? {
         Candidate::Install(program) => Some(program),
         Candidate::Skipped(_) => None,
     }
@@ -244,16 +364,20 @@ fn gathered(found: impl Iterator<Item = Probed>) -> Probed {
 fn read_godot(ran: &Ran) -> Probed {
     let stdout = String::from_utf8_lossy(&ran.stdout);
     godot_version(&stdout).map_or_else(
-        || {
-            let line = stdout.lines().next().unwrap_or("").trim();
-            let mut cut: String = line.chars().take(GODOT_ANSWER_MAX).collect();
-            if cut.len() < line.len() {
-                cut.push('…');
-            }
-            Probed::Skipped(format!("Godot --version gave no version: {cut}"))
-        },
+        || Probed::Skipped(format!("Godot --version gave no version: {}", answer_cut(&stdout))),
         Probed::Version,
     )
+}
+
+/// The first line of an install's answer `stdout`, trimmed and cut to [`GODOT_ANSWER_MAX`] characters with `…` after
+/// when it is longer.
+fn answer_cut(stdout: &str) -> String {
+    let line = stdout.lines().next().unwrap_or("").trim();
+    let mut cut: String = line.chars().take(GODOT_ANSWER_MAX).collect();
+    if cut.len() < line.len() {
+        cut.push('…');
+    }
+    cut
 }
 
 /// The version a Godot install's standard output `stdout` gives: the leading dot-separated runs of ASCII digits of its
@@ -316,7 +440,9 @@ pub(crate) mod tests {
 
     use gate_wire::Probed;
 
-    use super::{GODOT_PROGRAM, Plan, godot_version, installed_godot, listed, plan, probe_all};
+    use super::{
+        BLENDER_PROGRAM, GODOT_PROGRAM, GODOT_ROOT, Plan, Roots, godot_version, installed_blender, installed_godot, listed, plan, probe_all,
+    };
 
     #[test]
     fn each_tool_has_its_probe() {
@@ -349,6 +475,7 @@ pub(crate) mod tests {
             }
         );
         assert_eq!(plan("godot"), Plan::Godot);
+        assert_eq!(plan("blender"), Plan::Blender);
         for name in ["unreal", "netfx-sdk"] {
             assert_eq!(plan(name), Plan::Missing, "{name}");
         }
@@ -359,7 +486,7 @@ pub(crate) mod tests {
     fn the_probes_answer_in_the_order_asked() {
         let names = ["godot", "bogus", "netfx-sdk"].map(str::to_owned);
         assert_eq!(
-            probe_all(&names, None, None),
+            probe_all(&names, None, Roots::default()),
             [Probed::Missing, Probed::Skipped("unknown tool".to_owned()), Probed::Missing],
             "no Godot root is Godot missing"
         );
@@ -406,7 +533,111 @@ pub(crate) mod tests {
 
     /// What the probe of `godot` finds under `root`.
     fn godot_probed(root: Option<&str>) -> Probed {
-        probe_all(&["godot".to_owned()], None, root).remove(0)
+        let roots = Roots { godot: root, blender: None };
+        probe_all(&["godot".to_owned()], None, roots).remove(0)
+    }
+
+    /// Puts at `<base>/<folder>/Blender.app/Contents/MacOS/Blender` the runnable `script`, standing in for Blender; the
+    /// program's path.
+    pub(crate) fn fake_blender(base: &Path, folder: &str, script: &str) -> PathBuf {
+        let program = base.join(folder).join(BLENDER_PROGRAM);
+        fs::create_dir_all(program.parent().expect("the program has a folder")).expect("the install's folders are made");
+        fs::write(&program, script).expect("the fake Blender is written");
+        fs::set_permissions(&program, std::os::unix::fs::PermissionsExt::from_mode(0o700)).expect("the fake Blender is made runnable");
+        program
+    }
+
+    /// What the probe of `blender` finds under `root`, with a Godot root that would answer for Godot.
+    fn blender_probed(root: Option<&str>) -> Probed {
+        let roots = Roots {
+            godot: Some("/no/godot"),
+            blender: root,
+        };
+        probe_all(&["blender".to_owned()], None, roots).remove(0)
+    }
+
+    #[test]
+    fn the_blender_probe_lists_each_install_whose_folder_its_version_meets_and_leaves_out_links() {
+        let case = Folder::new("blender-probe");
+        let root = case.0.join("blender").display().to_string();
+        let installs = Path::new(&root);
+        let outside = case.0.join("outside");
+        let says = answering("Blender 5.2.2 LTS");
+        let full = fake_blender(installs, "5.2.2", &says);
+        let minor = fake_blender(installs, "Blender 5.2", &says);
+        fake_blender(installs, "5.3", &says);
+        fake_blender(installs, "Blender", &says);
+        fake_blender(&outside, "5.2.9", &says);
+        symlink(outside.join("5.2.9"), installs.join("5.2.9")).expect("a link at the folder is made");
+
+        assert_eq!(
+            blender_probed(Some(&root)),
+            Probed::Version("5.2.2,5.2.2".to_owned()),
+            "5.2.2 and Blender 5.2 are kept; 5.3, the folder naming no version and the link are left out"
+        );
+        assert_eq!(installed_blender(&root, "5.2.2", None), Ok(full), "the folder naming the most parts");
+        let linked = installs.join("5.2.9");
+        let link = format!("cannot run {}: {} is a link", linked.join(BLENDER_PROGRAM).display(), linked.display());
+        let none = format!("GATE_BLENDER_ROOT {root} holds no folder for blender 6.0.0");
+        for (version, said, why) in [
+            ("5.2.7", "named Blender 5.2 but reports 5.2.2", "Blender 5.2 reports another 5.2"),
+            (
+                "5.2.9",
+                link.as_str(),
+                "a link, then Blender 5.2 reporting another 5.2: the link's reason",
+            ),
+            ("5.3.0", "named 5.3 but reports 5.2.2", "5.3 reports 5.2.2"),
+            ("6.0.0", none.as_str(), "no folder"),
+        ] {
+            assert_eq!(installed_blender(&root, version, None), Err(said.to_owned()), "{why}");
+        }
+        assert_eq!(
+            installed_blender("blender", "5.2.2", None),
+            Err("GATE_BLENDER_ROOT blender is not an absolute path".to_owned())
+        );
+        fs::remove_dir_all(installs.join("5.2.2")).expect("the full install is removed");
+        assert_eq!(installed_blender(&root, "5.2.2", None), Ok(minor), "then the minor folder");
+
+        fs::remove_dir_all(installs.join("Blender 5.2")).expect("the minor install is removed");
+        assert_eq!(
+            blender_probed(Some(&root)),
+            Probed::Skipped(link),
+            "no version: the first reason, 5.2.9's"
+        );
+        fs::remove_file(&linked).expect("the link is removed");
+        assert_eq!(blender_probed(Some(&root)), Probed::Skipped("named 5.3 but reports 5.2.2".to_owned()));
+    }
+
+    #[test]
+    fn a_run_s_blender_is_the_first_install_the_probe_keeps_past_an_empty_folder_naming_more_parts() {
+        let case = Folder::new("blender-empty");
+        let root = case.0.join("blender").display().to_string();
+        let installs = Path::new(&root);
+        let minor = fake_blender(installs, "Blender 5.2", &answering("Blender 5.2.2 LTS"));
+        fs::create_dir_all(installs.join("5.2.2")).expect("an empty 5.2.2 folder is made");
+        assert_eq!(installed_blender(&root, "5.2.2", None), Ok(minor));
+    }
+
+    #[test]
+    fn a_run_s_blender_whose_one_matching_folder_reports_another_version_says_that_reason() {
+        let case = Folder::new("blender-misreports");
+        let root = case.0.join("blender").display().to_string();
+        fake_blender(Path::new(&root), "5.2.2", &answering("Blender 5.2.1"));
+        assert_eq!(installed_blender(&root, "5.2.2", None), Err("named 5.2.2 but reports 5.2.1".to_owned()));
+    }
+
+    #[test]
+    fn a_blender_probe_with_no_root_is_missing() {
+        assert_eq!(blender_probed(None), Probed::Missing, "no PATH fallback");
+        let case = Folder::new("blender-roots");
+        let root = case.0.join("blender").display().to_string();
+        fs::create_dir_all(&root).expect("the root is made");
+        assert_eq!(blender_probed(Some(&root)), Probed::Missing, "a root with no install");
+        fake_blender(Path::new(&root), "5.2.2", &answering("Blender"));
+        assert_eq!(
+            blender_probed(Some(&root)),
+            Probed::Skipped("Blender --version gave no version: Blender".to_owned())
+        );
     }
 
     #[test]
@@ -509,7 +740,7 @@ pub(crate) mod tests {
             fs::create_dir_all(root.join(format!("4.0.{n}"))).expect("a version folder is made");
         }
         fs::write(root.join(".DS_Store"), "").expect("a file is written");
-        let considered = listed(&root, Instant::now() + Duration::from_secs(3600)).expect("the root is listed");
+        let considered = listed(GODOT_ROOT, &root, Instant::now() + Duration::from_secs(3600)).expect("the root is listed");
         assert_eq!(considered.len(), 64, "{considered:?}");
         assert!(considered.is_sorted(), "{considered:?}");
     }

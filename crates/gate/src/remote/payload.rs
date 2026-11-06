@@ -11,7 +11,7 @@ use base64::engine::general_purpose::STANDARD;
 use gate_args::{BoxVerb, DrainAction, MAX_WHOLE_NUMBER};
 use gate_router::CrossBuild;
 use gate_router::desktop::DesktopMode;
-use gate_wire::{PathForm, lower_hex};
+use gate_wire::{EngineKind, PathForm, lower_hex};
 use serde_json::{Map, Value, json};
 
 use crate::remote::channel::Asked;
@@ -190,10 +190,13 @@ pub(crate) struct RunCall<'a> {
     /// The version, `major.minor.patch`, of the builder's Unreal Engine install the run uses (`UnrealVersion`, sent
     /// only when one is chosen), which a warm-up sends too.
     pub unreal_version: Option<&'a str>,
-    /// The names the repo's toolchain manifest `[env]` sets to the root of the chosen Unreal Engine install
-    /// (`EngineEnv`, an object of each name and `"unreal"`, sent only when there is one, whether or not a version is
-    /// chosen, so the box removes a value it inherited), which a warm-up sends too.
-    pub engine_env: &'a [String],
+    /// The version, `major.minor.patch`, of the builder's Blender install the run uses (`BlenderVersion`, sent only
+    /// when one is chosen), which a warm-up sends too.
+    pub blender_version: Option<&'a str>,
+    /// The names the repo's toolchain manifest `[env]` sets to a chosen engine install, each with its kind
+    /// (`EngineEnv`, an object of each name and `"unreal"` or `"blender"`, sent only when there is one, whether or not
+    /// a version is chosen, so the box removes a value it inherited), which a warm-up sends too.
+    pub engine_env: &'a [(String, EngineKind)],
     /// How the run uses the builder's desktop, `None` for not at all (`Desktop: true` and `DesktopWait`, the run's
     /// desktop wait in whole seconds ([`desktop_wait`]), sent only for a desktop run, with `DesktopSession: true` for a
     /// session or hidden one and `DesktopHidden: true` for a hidden one); a warm-up never sends them, as the box
@@ -461,8 +464,8 @@ fn identity() -> Value {
 }
 
 /// Adds `run`'s `SiblingSnapshots`, when it has any, its `InputsDigest`, `LfsDigest` and `SentDigest`, each when it has
-/// one, its `SiblingLfsDigests`, when a sibling holds pointers, its `GodotVersion` and `UnrealVersion`, each when one is
-/// chosen, and its `EngineEnv`, when it names any, to `object`.
+/// one, its `SiblingLfsDigests`, when a sibling holds pointers, its `GodotVersion`, `UnrealVersion` and
+/// `BlenderVersion`, each when one is chosen, and its `EngineEnv`, when it names any, to `object`.
 fn insert_siblings_and_inputs(object: &mut Map<String, Value>, run: &RunCall<'_>) {
     if let Some(version) = run.godot_version {
         object.insert("GodotVersion".to_owned(), json!(version));
@@ -470,11 +473,14 @@ fn insert_siblings_and_inputs(object: &mut Map<String, Value>, run: &RunCall<'_>
     if let Some(version) = run.unreal_version {
         object.insert("UnrealVersion".to_owned(), json!(version));
     }
+    if let Some(version) = run.blender_version {
+        object.insert("BlenderVersion".to_owned(), json!(version));
+    }
     if !run.engine_env.is_empty() {
         let names: Map<String, Value> = run
             .engine_env
             .iter()
-            .map(|name| (name.clone(), Value::String("unreal".to_owned())))
+            .map(|(name, kind)| (name.clone(), Value::String(kind.text().to_owned())))
             .collect();
         object.insert("EngineEnv".to_owned(), Value::Object(names));
     }
@@ -561,7 +567,7 @@ mod tests {
     };
     use crate::remote::transport::Profile;
     use gate_router::{Builder, BuilderOs, CrossBuild};
-    use gate_wire::{PathForm, Payload};
+    use gate_wire::{EngineKind, PathForm, Payload};
 
     fn decoded(word: &str) -> Value {
         let bytes = STANDARD.decode(word).expect("the word is base64");
@@ -727,6 +733,7 @@ mod tests {
             env: &[],
             godot_version: None,
             unreal_version: None,
+            blender_version: None,
             engine_env: &[],
             desktop: None,
         };
@@ -1087,6 +1094,7 @@ mod tests {
             env: &[],
             godot_version: None,
             unreal_version: None,
+            blender_version: None,
             engine_env: &[],
             desktop: None,
         };
@@ -1139,6 +1147,7 @@ mod tests {
             env: &[],
             godot_version: None,
             unreal_version: None,
+            blender_version: None,
             engine_env: &[],
             desktop: None,
         };
@@ -1252,6 +1261,7 @@ mod tests {
             env: &env,
             godot_version: None,
             unreal_version: None,
+            blender_version: None,
             engine_env: &[],
             desktop: None,
         };
@@ -1297,6 +1307,7 @@ mod tests {
             env: &[],
             godot_version: Some("4.7.2"),
             unreal_version: None,
+            blender_version: None,
             engine_env: &[],
             desktop: None,
         };
@@ -1348,6 +1359,7 @@ mod tests {
             env: &[],
             godot_version: None,
             unreal_version: Some("5.8.0"),
+            blender_version: None,
             engine_env: &[],
             desktop: None,
         };
@@ -1375,9 +1387,8 @@ mod tests {
     }
 
     #[test]
-    fn a_run_and_a_warm_up_send_the_engine_env_names_and_none_without_any() {
+    fn a_run_and_a_warm_up_send_the_chosen_blender_version_and_none_without_one() {
         let words = ["build.cmd".to_owned()];
-        let names = ["UE_MCP_TEST_ENGINE_ROOT".to_owned()];
         let mut run = RunCall {
             cross_build: None,
             words: &words,
@@ -1400,6 +1411,63 @@ mod tests {
             env: &[],
             godot_version: None,
             unreal_version: None,
+            blender_version: Some("5.2.2"),
+            engine_env: &[],
+            desktop: None,
+        };
+        let commands = warm_commands();
+        let warm = WarmCall {
+            commands: &commands,
+            hash: WARM_HASH,
+        };
+
+        let word = run_word(&location(), &run);
+        assert_eq!(decoded(&word)["BlenderVersion"], json!("5.2.2"));
+        assert_eq!(on_the_box(&word).blender_version(), Ok(Some("5.2.2")), "the box reads it back");
+        let warm_word_sent = warm_word(&location(), &run, &warm);
+        assert_eq!(decoded(&warm_word_sent)["BlenderVersion"], json!("5.2.2"), "a warm-up sends it too");
+        assert!(on_the_box(&warm_word_sent).commands().is_ok(), "the box takes a warm-up with it");
+
+        run.blender_version = None;
+        let word = run_word(&location(), &run);
+        assert!(
+            decoded(&word).get("BlenderVersion").is_none(),
+            "no version chosen sends no BlenderVersion key"
+        );
+        assert_eq!(on_the_box(&word).blender_version(), Ok(None));
+        assert!(decoded(&warm_word(&location(), &run, &warm)).get("BlenderVersion").is_none());
+    }
+
+    #[test]
+    fn a_run_and_a_warm_up_send_the_engine_env_names_and_none_without_any() {
+        let words = ["build.cmd".to_owned()];
+        let names = [
+            ("UE_MCP_TEST_ENGINE_ROOT".to_owned(), EngineKind::Unreal),
+            ("BLENDER_EXE".to_owned(), EngineKind::Blender),
+        ];
+        let mut run = RunCall {
+            cross_build: None,
+            words: &words,
+            subfolder: "",
+            nonce: "0123456789abcdef0123456789abcdef",
+            snapshot: SHA,
+            outputs: &[],
+            failure_outputs: &[],
+            full: false,
+            timeout: 1,
+            host: "builder",
+            sibling_snapshots: &[],
+            base: None,
+            sibling_bases: &[],
+            commit_stage_head: None,
+            inputs_digest: None,
+            lfs_digest: None,
+            sibling_lfs_digests: &[],
+            sent_digest: None,
+            env: &[],
+            godot_version: None,
+            unreal_version: None,
+            blender_version: None,
             engine_env: &names,
             desktop: None,
         };
@@ -1412,14 +1480,14 @@ mod tests {
         let word = run_word(&location(), &run);
         assert_eq!(
             decoded(&word)["EngineEnv"],
-            json!({ "UE_MCP_TEST_ENGINE_ROOT": "unreal" }),
+            json!({ "UE_MCP_TEST_ENGINE_ROOT": "unreal", "BLENDER_EXE": "blender" }),
             "sent with no version chosen too"
         );
         assert_eq!(on_the_box(&word).engine_env(), Ok(names.to_vec()), "the box reads it back");
         let warm_word_sent = warm_word(&location(), &run, &warm);
         assert_eq!(
             decoded(&warm_word_sent)["EngineEnv"],
-            json!({ "UE_MCP_TEST_ENGINE_ROOT": "unreal" }),
+            json!({ "UE_MCP_TEST_ENGINE_ROOT": "unreal", "BLENDER_EXE": "blender" }),
             "a warm-up sends it too"
         );
         assert!(on_the_box(&warm_word_sent).commands().is_ok(), "the box takes a warm-up with it");
@@ -1456,6 +1524,7 @@ mod tests {
             env: &[],
             godot_version: None,
             unreal_version: None,
+            blender_version: None,
             engine_env: &[],
             desktop: Some(gate_router::desktop::DesktopMode::Locked),
         };
@@ -1544,6 +1613,7 @@ mod tests {
             env: &[],
             godot_version: None,
             unreal_version: None,
+            blender_version: None,
             engine_env: &[],
             desktop: Some(gate_router::desktop::DesktopMode::Hidden),
         };
@@ -1598,6 +1668,7 @@ mod tests {
             env: &[],
             godot_version: None,
             unreal_version: None,
+            blender_version: None,
             engine_env: &[],
             desktop: None,
         };
@@ -1669,6 +1740,7 @@ mod tests {
             env: &[],
             godot_version: None,
             unreal_version: None,
+            blender_version: None,
             engine_env: &[],
             desktop: None,
         }

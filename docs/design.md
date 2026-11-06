@@ -448,6 +448,9 @@ The tool lines, for each tool of the manifest, probed as the box probes the tool
 - `unreal <found> ok (needs <pin> exactly)` and `unreal missing (needs <pin> exactly: <found>)` for the manifest's `unreal` pin, worded and judged as `godot`'s are (`<found>` is the versions under `GATE_UNREAL_ROOT`, `none`, or `not probed (<why>)`), with no install hint.
 
   With `GATE_UNREAL_ROOT` unset on this PC it is `unreal not checked here: GATE_UNREAL_ROOT is not set`, which counts as neither missing nor skipped; a root that overlaps the worktree gives `unreal skipped: GATE_UNREAL_ROOT <root> overlaps <worktree root>, which a run writes`;
+- `blender <found> ok (needs <pin> exactly)` and `blender missing (needs <pin> exactly: <found>)` for the manifest's `blender` pin, worded and judged as `unreal`'s are (`<found>` is the versions under `GATE_BLENDER_ROOT`, `none`, or `not probed (<why>)`).
+
+  With `GATE_BLENDER_ROOT` unset on this PC it is `blender not checked here: GATE_BLENDER_ROOT is not set`, neither missing nor skipped. On a builder a missing blender has the hint `install: <host>: blender: copy tools/builder/ from the gate repo to <host> and run install-toolchains.ps1 -User <user> -Only Blender there, elevated (docs/routing-a-repo.md, Builder setup)`, naming the installer's Blender step;
 - `netfx-sdk <found> ok (needs 4.6.0 or later)`, `netfx-sdk <found> too old (needs 4.6.0 or later)` and `netfx-sdk missing (needs 4.6.0 or later)`, for the .NET Framework SDK that `UnrealBuildTool` looks for, which a manifest naming `unreal` (at any version) needs besides ([Toolchain manifest](#routing)); `<found>` is every SDK this PC's registry lists, and the highest is judged.
 
   With `GATE_UNREAL_ROOT` unset on this PC it is `netfx-sdk not checked here: GATE_UNREAL_ROOT is not set, so the Unreal builds that need it are not checked here`, which counts as neither missing nor skipped. Test-seams builds accept the hidden `--test-netfx-key <path>`, a key under `HKEY_CURRENT_USER` read in place of the registry's own list;
@@ -466,7 +469,7 @@ The SDK list is read with the folders inside the worktree dropped from `PATH`. A
 
 A manifest that lists workloads gets one line, `workloads <ids, comma separated> not checked yet`, which counts as neither skipped nor missing.
 
-The tools in `.config/dotnet-tools.json` and a `Godot.NET.Sdk` pin are not checked by `gate check` and say nothing; a routed run does read a Godot pin (Toolchain manifest, under Routing), and `gate check` judges a manifest `godot` or `unreal` pin as a routed run does (the first two tool lines above), and a `godot` of `""` and every other tool as a minimum.
+The tools in `.config/dotnet-tools.json` and a `Godot.NET.Sdk` pin are not checked by `gate check` and say nothing; a routed run does read a Godot pin (Toolchain manifest, under Routing), and `gate check` judges a manifest `godot`, `unreal` or `blender` pin as a routed run does (the first three tool lines above), and a `godot` of `""` and every other tool as a minimum.
 
 Each sibling the repo declares is checked as routing checks it, and gets one line:
 
@@ -557,7 +560,7 @@ On stdout, each line prefixed `check: <host>: `, in this order:
 
    Text from the builder is escaped.
 
-8. The install hints `install: <host>: <tool>: <command>`: `cargo install cargo-nextest --locked`, `npm install -g pnpm@<min>` (`npm install -g pnpm` with no minimum), `rustup toolchain install <min> && rustup default <min>`, `dotnet-install.ps1 -Version <v>`, and for node, pwsh, ffmpeg and a rust with no minimum a hint that names `tools/builder/install-toolchains.ps1` and points to [routing-a-repo.md, Builder setup](routing-a-repo.md#builder-setup).
+8. The install hints `install: <host>: <tool>: <command>`: `cargo install cargo-nextest --locked`, `npm install -g pnpm@<min>` (`npm install -g pnpm` with no minimum), `rustup toolchain install <min> && rustup default <min>`, `dotnet-install.ps1 -Version <v>`, and for node, pwsh, ffmpeg, blender and a rust with no minimum a hint that names `tools/builder/install-toolchains.ps1` and points to [routing-a-repo.md, Builder setup](routing-a-repo.md#builder-setup).
 
    `netfx-sdk` gets the same hint, with the script's step `'.NET Framework 4.8 Developer Pack'`.
 9. The summary.
@@ -3269,11 +3272,11 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     `toolchain::meets` compares a found version with a minimum. A repo's sibling worktrees are not declared here but in `.gate/siblings.toml` ([Sibling worktrees](#routing)), whose problems keep a run local.
 
-    The file has a `[tools]` table of `name = "version"` and a top-level `workloads` array of .NET workload ids. A version is a minimum, "this or later", written `major[.minor[.patch]]` with the missing parts 0 (`"24"` is 24.0.0), and `""` means the tool is present at any version; a routed run reads the `godot` and `unreal` entries as exact pins instead (below).
+    The file has a `[tools]` table of `name = "version"` and a top-level `workloads` array of .NET workload ids. A version is a minimum, "this or later", written `major[.minor[.patch]]` with the missing parts 0 (`"24"` is 24.0.0), and `""` means the tool is present at any version; a routed run reads the `godot`, `unreal` and `blender` entries as exact pins instead (below).
 
-    The known names are `rust`, `cargo-nextest`, `node`, `pnpm`, `pwsh`, `godot`, `unreal`, `ffmpeg`, `git-lfs` and `netfx-sdk`; an unknown name is kept and flagged unknown, for the consumer to skip with a line. A leading byte order mark is skipped.
+    The known names are `rust`, `cargo-nextest`, `node`, `pnpm`, `pwsh`, `godot`, `unreal`, `blender`, `ffmpeg`, `git-lfs` and `netfx-sdk`; an unknown name is kept and flagged unknown, for the consumer to skip with a line. A leading byte order mark is skipped.
 
-    An optional `[env]` table of `NAME = "unreal"` names variables the box sets to the root of the Unreal Engine install the run chose, the folder `UE_ROOT` gets (below). `"unreal"` is the only value, and at most 64 entries are read.
+    An optional `[env]` table of `NAME = "unreal"` or `NAME = "blender"` names variables the box sets for the run's chosen install: an `"unreal"` name to the root of the Unreal Engine install, the folder `UE_ROOT` gets, and a `"blender"` name to the chosen Blender executable (below). Those are the only values, and at most 64 entries are read.
 
     A repo's minimums are the lowest versions its own files require: `rust-version`, `rust-toolchain.toml` or the edition, `packageManager`, the launcher's `#requires`. Where nothing pins a floor, the minimum is the oldest toolchain the builders install (rust 1.89, the first with edition 2024's let chains); where neither applies, the entry is `""`. pwsh is `7.4` everywhere, since the launcher needs PowerShell 7. A minimum set higher than the repo needs would refuse a builder that can run it.
 
@@ -3283,9 +3286,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     A bad entry is skipped alone and named in the reader's problems: `tools.<name> is not a version: "<text>"`, `tools.<name> is not a string (TOML <type>)`, `tools is not a table (TOML <type>)`, `workloads is not an array (TOML <type>)`, `workloads[<i>] is not a string (TOML <type>)`, `workloads[<i>] is empty` and `<key> is not a key of the manifest (tools, workloads, env)`.
 
-    The `[env]` problems are `env is not a table (TOML <type>)`, `env has more than 64 names`, `env.<name> is not a string (TOML <type>)`, `env.<name> is not "unreal": "<value>"`, `env.<name> is a name the gate sets or refuses` (not an ASCII letter or `_` followed by letters, digits and `_`, or starting with `GIT_` in any case, or a name `--env` refuses).
+    The `[env]` problems are `env is not a table (TOML <type>)`, `env has more than 64 names`, `env.<name> is not a string (TOML <type>)`, `env.<name> is not "unreal" or "blender": "<value>"`, `env.<name> is a name the gate sets or refuses` (not an ASCII letter or `_` followed by letters, digits and `_`, or starting with `GIT_` in any case, or `TMPDIR` in any case, or a name `--env` refuses).
 
-    Also `env.<name> is named twice` (in any ASCII case; the first is kept) and `env.<name> names the unreal install but the manifest pins no unreal` (the name is still sent).
+    Also `env.<name> is named twice` (in any ASCII case; the first is kept) and `env.<name> names the unreal install but the manifest pins no unreal` or `env.<name> names the blender install but the manifest pins no blender`, by the name's kind (the name is still sent).
 
     **On a routed run**, the client lists the snapshot's tree once before the preflight, with `git ls-tree -r -t -z <commit>` (a sibling's listing keeps `--name-only`): the file names parity needs and the `.gate` folder and `toolchain.toml` candidates for the manifest are read from that one listing. The `.gate` folder and `toolchain.toml` are found ignoring letter case, and the exact-case regular file wins.
 
@@ -3341,7 +3344,11 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     After the preflight the client chooses, from the main repo's manifest pin, the highest reported version that meets it and sends it, spelled `x.y.z`, as the optional `UnrealVersion` of the run payload and of a warm-up's; a pin of `""` chooses the highest reported version, and no pin, or a pin no reported version meets, chooses none, and the field is left out. The box sets `UE_ROOT` from it (The box side, the command's environment).
 
-    The names of the manifest's `[env]` are sent as the optional `EngineEnv` of the run payload and of a warm-up's, an object of `{NAME: "unreal"}`, whenever the manifest has a usable name, an engine chosen or not; the box sets each to the chosen engine's folder. A builder whose gate predates `EngineEnv` ignores it.
+    The names of the manifest's `[env]` are sent as the optional `EngineEnv` of the run payload and of a warm-up's, an object of `{NAME: "unreal"}` or `{NAME: "blender"}`, whenever the manifest has a usable name, an install chosen or not; the box sets each to the chosen install (an unreal name to the engine's folder, a blender name to the Blender executable). A builder whose gate predates `EngineEnv` ignores it.
+
+    `blender` is an exact pin judged as `unreal` is, read from the manifest only: `"5.2"` matches any 5.2.x, `"5.2.2"` that one, and `""` any version. It is sent as a `blender` need and judged on every routed run whatever the command; the builder's answer is `gate: remote tool blender <v1>,<v2>,...` and an unmet pin is the mismatch line `gate: remote toolchain mismatch: <repo> needs blender <pin> exactly; <host> has <found>` (`needs blender` for `""`), so a builder lacking the version is skipped for `parity` and another builder, or this PC, takes the run.
+
+    After the preflight the client chooses the highest reported blender version that meets the pin and sends it, spelled `x.y.z`, as the optional `BlenderVersion` of the run payload and of a warm-up's, left out when none is chosen.
 
     A tool the builder did not probe, gave no answer for, or found at a version that cannot be read against a minimum gets `gate: <host> did not probe <name>: <why>; not checking it` and is not a need. The lines come in this order: the SDK step's own, then the manifest's problem lines, then the per-tool skip lines in the manifest's order, then the mismatch lines.
 
@@ -4455,6 +4462,12 @@ Built verbs:
 
   When no install gives a version the line is `gate: remote tool unreal skipped: <why>`, the first reason met: `GATE_UNREAL_ROOT <root> overlaps <folder>, which a run writes` (a root inside one of the run's own folders, or holding one), `GATE_UNREAL_ROOT <root>: <path> is a link or a junction`, `named <folder> but reports <version>`, `GATE_UNREAL_ROOT <x> is not an absolute path on a drive` or `no answer in <n> s`.
 
+  The `blender` probe reads `GATE_BLENDER_ROOT`, an environment variable of the builder naming a folder of side-by-side Blender installs (on the Windows builder `C:\Program Files\Blender Foundation`, holding folders like `Blender 5.2`). It takes the root's checks of the unreal probe (an absolute path on a drive, no link above it, overlapping none of the run's folders) and the godot probe's 64-entry cap.
+
+  A candidate is a folder whose name, after an optional `Blender ` prefix, is a version of one to three dot-separated numbers (`gate_wire::blender_folder_version`: `Blender 5.2` is `5.2`, `5.2.2` itself, `Blender 5.2 LTS` none) and that holds a plain `blender.exe` (a folder or exe that is a reparse point is left out). Its `blender.exe --version` is run, and the version is the first one on the first line of its output (`Blender 5.2.2 LTS` gives `5.2.2`).
+
+  An install is kept only when the version it reports meets its folder's name on every part the name gives (`gate_wire::version_meets`: `5.2` meets `5.2.2`, `5.3` does not), else it is skipped as `named <folder> but reports <version>`; the line is `gate: remote tool blender <v1>,<v2>,...` as godot's is. There is no `PATH` fallback: with no `GATE_BLENDER_ROOT`, or no kept install, it is `gate: remote tool blender missing`. A program that gives no version is `blender.exe --version gave no version: <line>`.
+
   The probe runs on a thread of its own under the batch's deadline, so a slow root never delays another tool's probe, and a listing the deadline cuts short answers `skipped: no answer in <n> s` even when it had read some versions, so a pin is judged not probed rather than against part of the list.
 
   A `Build.version` that cannot be used gives `<file> gives no integer MajorVersion, MinorVersion and PatchVersion`, `<file> is over 64 KiB`, `<file> is not UTF-8` or `cannot read <file>: <why>`.
@@ -4554,7 +4567,9 @@ Built verbs:
 
   `UnrealVersion`'s: `gate: box payload UnrealVersion is not a version: '<value>'`, exit 2, for any value `GodotVersion` refuses and shown the same way, as it is joined into an install's path. A null `UnrealVersion` is not set.
 
-  `EngineEnv`'s: `gate: box payload EngineEnv is not an object of texts`, `gate: box payload EngineEnv gives <name> a value other than "unreal": '<value>'`, `gate: box payload EngineEnv sets <name>, a name the gate sets or refuses`, `gate: box payload EngineEnv names <name> twice` and `gate: box payload EngineEnv is over its cap of 64 names or 32 KiB`, the names shortened and escaped.
+  `BlenderVersion`'s: `gate: box payload BlenderVersion is not a version: '<value>'`, exit 2, on the same rule. A null `BlenderVersion` is not set.
+
+  `EngineEnv`'s: `gate: box payload EngineEnv is not an object of texts`, `gate: box payload EngineEnv gives <name> a value other than "unreal" or "blender": '<value>'`, `gate: box payload EngineEnv sets <name>, a name the gate sets or refuses`, `gate: box payload EngineEnv names <name> twice` and `gate: box payload EngineEnv is over its cap of 64 names or 32 KiB`, the names shortened and escaped.
 
   `EngineEnv` and `Env` share the one cap, counted over both raw objects. A null `EngineEnv` is not set. A malformed `EngineEnv` is refused when the request is read, before the engine folder is probed; a warm-up may carry it though it may not carry `Env`.
 
@@ -4926,7 +4941,11 @@ Built verbs:
 
    When it cannot resolve, the run exits 127 with `gate: could not resolve unreal <version>: <why>`, before any desktop lock.
 
-  A run with no `UnrealVersion` removes an inherited `UE_ROOT` and an inherited value of each `EngineEnv` name; a caller's `--env` pair for an `EngineEnv` name is kept. The package restore and the dotnet tool restore run without `UE_ROOT` and without the inherited values of the `EngineEnv` names, whatever the box inherited.
+  A run with a `BlenderVersion` resolves it the same way, once when it reads the request, and sets each `EngineEnv` name of kind blender to `<GATE_BLENDER_ROOT>\<folder>\blender.exe`, after the caller's pairs; `UE_ROOT` and an unreal name stay the Unreal folder's, and no fixed variable is set for Blender. The folder is the one the `blender` probe keeps that the version meets (most name parts first, then in name order), the first whose `blender.exe` reports exactly the version, so a run and a preflight agree on the install; the exe must exist and no part of its path may be a link.
+
+  When it cannot resolve, the run exits 127 as for unreal with `gate: could not resolve blender <version>: <why>`, `<why>` being `GATE_BLENDER_ROOT is not set` with no root, the reason the first folder named for the version was passed over (the probe's skip text, such as `named 5.2.2 but reports 5.2.1`), `GATE_BLENDER_ROOT <root> holds no folder for blender <version>` when no folder's name meets the version, or the root check's reason.
+
+  A run with no `UnrealVersion` removes an inherited `UE_ROOT` and an inherited value of each unreal `EngineEnv` name; a caller's `--env` pair for one is kept. A run with no `BlenderVersion` does the same for the blender names: the inherited value is removed and a caller's pair is kept. The package restore and the dotnet tool restore run without `UE_ROOT` and without the inherited values of the `EngineEnv` names (both kinds), whatever the box inherited.
 
   Every command of a plain, warm-up or desktop run gets the trusted Git `bin` at the front of its `PATH`, so a recipe's bare `bash` resolves to Git's own `bash.exe` rather than WSL's in the system folder, and the command's first word resolves on that same `PATH`. The folder is `<Git root>\bin`, the root being the one the MSYS keeper's lookup finds above the box's `git.exe`, and it must hold `bash.exe`.
 
@@ -5573,6 +5592,12 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
   The run checks a payload's `InputsDigest` as the Windows box does ([The box side](#the-box-side)), and refuses a `SentDigest`, `LfsDigest` or `SiblingLfsDigests` as not built (`gate-remote-refused: <nonce> <tag>`, then `gate: remote <key> is not built on this builder`, status 75; a `SiblingLfsDigests` is refused `lfs`), so the PC runs such a run itself. A payload with `CommitStage` true is refused `layout` the same way, naming `CommitStage` in the line.
 
+  An `UnrealVersion` is refused `layout` the same way, and so is an `EngineEnv` only when it names an `"unreal"` value; one whose values are all `"blender"` is taken. The box resolves `BlenderVersion` under the login shell's `GATE_BLENDER_ROOT` and sets each blender `EngineEnv` name to `<folder>/Blender.app/Contents/MacOS/Blender`.
+
+  The folder is the one the `blender` probe keeps that the version meets, most parts first, then in name order, and whose program reports that version. The names are set after the payload's `Env`. The version is resolved once the login record is read, before the tool and package restores. One that does not resolve skips the restores and ends the run 127 after the start marker, before the command, with `gate: could not resolve blender <version>: <why>`. The `<why>` texts are the Windows box's, plus `the login shell could not be read: <error>` when the login record failed. The tool and package restores remove each blender `EngineEnv` name from what they inherit.
+
+  With no `BlenderVersion`, each blender name's inherited value is removed and a caller's `Env` pair for it is kept. The tool and package restores run without the inherited values of the blender names.
+
   It has no install tripwire, no desktop helper and no MSYS keeper. Its `test-seams` feature passes `gate-args`' hidden `--test-*` seams through, given before the verb; `--test-heartbeat-ms`, `--test-box-sample-ms`, `--test-box-sampler-fail` and `--test-box-free-percent` reach `box run`.
 - **`boot`** reads `kern.boottime` and prints the same line, with the same format.
 - **`prune`** (`prune.rs`) is the Windows box's prune ([The box side](#the-box-side)) on plain `std::fs` calls: `gate-box box prune --root <folder>` is the age prune and `--keys <key>...` the keyed prune. It reads no request and never reads stdin. The keys follow the Windows rules (1 to 50, a repeat pruned once), and a word that is no key exits 2 as there.
@@ -5778,6 +5803,8 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
   `godot` reads the installs under the login shell's `GATE_GODOT_ROOT`, as the Windows probe does under its own. A candidate is `<root>/<version>/Godot.app/Contents/MacOS/Godot`, run with `--version`, whose reported version must be its folder's name. The root itself may be a link; the version folder and each level below it (`Godot.app`, `Contents`, `MacOS`, the program) may not. At most the first 64 entries read are considered, then sorted.
 
+  `blender` reads the installs under the login shell's `GATE_BLENDER_ROOT` the same way, with no `PATH` fallback. A candidate is a folder whose name names a version (`5.2.2`, or `Blender 5.2`; `gate_wire::blender_folder_version`), its `Blender.app/Contents/MacOS/Blender` run with `--version`. The version is the first one on the first line of its output (`Blender 5.2.2 LTS` gives `5.2.2`). An install is kept only when that version meets its folder's (`5.2` meets `5.2.2`), else skipped as `named <folder> but reports <version>`.
+
   With no root, or none that holds an install, the line is `gate: remote tool godot missing` (the Windows probe falls back to `PATH` instead); a root that is not an absolute path or cannot be read is `gate: remote tool godot skipped: <why>`, as is a root whose installs all give no version, with the first reason met.
 
   A candidate left out says `cannot run <program>: <level> is a link`, `<level> is not a folder` or `<level> is not a file`; the version line otherwise names `named <folder> but reports <version>` and `Godot --version gave no version: <line>` as the Windows probe does for its console exe.
@@ -5847,6 +5874,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
   - **Godot.** A payload without `GodotVersion` runs every word as written and leaves `GODOT_PATH` as the environment has it. With one, the install is `<root>/<version>/Godot.app/Contents/MacOS/Godot` under the login shell's `GATE_GODOT_ROOT`, found by the probe's checks (no link below the version folder). A Godot console word then runs that program, and `GODOT_PATH` is set to it after the payload's `Env`; any other word runs as written.
 
     When the run resolves no Godot (no root, the root not an absolute path, or no such install), `GODOT_PATH` is removed, an inherited value included, and a Godot console word fails 127 with `gate: remote could not start <word>: <error>`, never falling back to the `PATH`. A version with no root fails 127 here where the Windows box falls back to the `PATH` (GATE-699 owns the difference). The payload's `Env` setting `GODOT_PATH` is refused as on the Windows box.
+  - **Blender.** A payload with a `BlenderVersion` resolves `<GATE_BLENDER_ROOT>/<folder>/Blender.app/Contents/MacOS/Blender` under the login shell's root, by the probe's choice of folder, and sets each blender-kind `EngineEnv` name to that path after the payload's `Env`, for every command. A payload without one removes each blender name's inherited value and keeps a caller's `Env` pair for it. A version that does not resolve ends the run 127 before its command (above, the run's refused keys).
   - **`<Work>.command`.** The record is `{UTC start, round-trip format} {job}`, mode 0600, written before the spawn. It is kept when a signal ended the command, the box ended it (client gone), the client is gone at the end, the runner failed or left the group, the lock was lost, or a leftover process still held the output; it is removed after a clean exit and for a command that never started, each removal only while the work lock is still held.
 
     A failed write says `gate: remote could not write <Work>.command: <error>` with status 1; a failed removal says `gate: remote could not remove <Work>.command: <error>` and the run's status stands. A `<Work>.command` that is not a plain file (a folder, a link) refuses `layout` (75) before the start marker, with the layout line `<Work>.command is a link or not a file`.

@@ -56,6 +56,12 @@ pub struct Launch<'a> {
     pub tmp: Option<&'a str>,
     /// The run's Godot: the program a Godot console word starts ([`started_program`]) and the command's `GODOT_PATH`.
     pub godot: Godot<'a>,
+    /// The run's Blender: the program of the install of its chosen version, which each of [`Launch::blender_names`]
+    /// names; `Ok(None)` for a run that chose none; `Err` with the line of a chosen version that did not resolve, which
+    /// ends the run before its command ([`run_command`]).
+    pub blender: Result<Option<&'a str>, &'a str>,
+    /// The names `EngineEnv` sets to the run's Blender program ([`crate::lines::Along::blender_names`]).
+    pub blender_names: &'a [String],
     /// The work lock, held: no record is written or removed once it is lost.
     pub lock: &'a HeldLock,
     /// The run's ceiling in whole seconds of load-adjusted time, `None` for none.
@@ -467,7 +473,8 @@ pub fn ran_removed(work: &str) -> io::Result<()> {
 /// ([`crate::lines::command_status`]) the run ends on: a command that exits 127 itself is [`CommandEnd::Exited`], one
 /// that never started [`CommandEnd::NotStarted`], both status 127.
 ///
-/// The start marker is said first; the client is probed, the interrupted-command record written
+/// The start marker is said first; the client is probed, and a run whose chosen Blender did not resolve
+/// ([`Launch::blender`]) says that line and ends [`CommandEnd::NotStarted`], nothing written; the interrupted-command record written
 /// (`{UTC start} {job}`, [`files::replace_plain`]), and the client probed again, so a client gone at either probe
 /// ends the run as [`CommandEnd::Gone`] and nothing started; then the command runs ([`run_watched`]) with standard input
 /// null, its group written to `<work>.pgid` from the child, ended `SIGTERM` first on a gone client. The record is kept
@@ -507,6 +514,11 @@ fn run_with<S: LineSink + 'static>(launch: &Launch<'_>, output: &Arc<Output<S>>,
     let _ = output.say(Stream::Err, Stamp::Bare, &started_line(launch.nonce));
     if output.client_gone_probe() {
         return CommandEnd::Gone;
+    }
+    // A chosen Blender that did not resolve starts nothing, as a program that is not there does.
+    if let Err(line) = launch.blender {
+        let _ = output.say(Stream::Err, GAT, line);
+        return CommandEnd::NotStarted;
     }
     let record = command_record(launch.work);
     if let Err(failure) = files::replace_plain(Path::new(&record), record_text(launch.job).as_bytes()) {
@@ -878,6 +890,8 @@ fn command_of(launch: &Launch<'_>, program: &str, rest: &[String], ceiling: Opti
         path: launch.login_path,
         tmp: launch.tmp,
         godot: launch.godot,
+        blender: launch.blender.ok().flatten(),
+        blender_names: launch.blender_names,
         ceiling,
     };
     let environment = command_environment(std::env::vars_os().collect(), along, launch.env, &run, launch.job);
@@ -1059,6 +1073,8 @@ mod tests {
                 login_path: None,
                 tmp: None,
                 godot: Godot::Unchosen,
+                blender: Ok(None),
+                blender_names: &[],
                 lock: &self.lock,
                 timeout: watched.timeout,
                 host: watched.host,

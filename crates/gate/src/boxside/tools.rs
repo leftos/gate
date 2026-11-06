@@ -20,7 +20,7 @@ use std::time::Instant;
 use sha2::{Digest, Sha256};
 
 use gate_win32::{Job, PipedConsole, PipedLaunch, PipedSuspended};
-use gate_wire::ordinal_upper;
+use gate_wire::{EngineKind, ordinal_upper};
 
 use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
 use crate::boxside::preflight::locate;
@@ -176,7 +176,7 @@ enum Restored {
 /// The launch of `dotnet tool restore` in `place`, the `dotnet` found on the box's `PATH` and the box's own environment
 /// as a run's processes get it, less the run's `EngineEnv` names `engine_env` ([`box_variables`]), given; else why it
 /// cannot be launched.
-fn restore_launch(place: &Path, engine_env: &[String]) -> Result<PipedLaunch, String> {
+fn restore_launch(place: &Path, engine_env: &[(String, EngineKind)]) -> Result<PipedLaunch, String> {
     let dotnet = locate("dotnet")?.ok_or_else(|| gate_win32::win32_message(ERROR_FILE_NOT_FOUND))?;
     let variables = box_variables(engine_env);
     let environment = variables.block().map_err(|error| format!("cannot build its environment: {error}"))?;

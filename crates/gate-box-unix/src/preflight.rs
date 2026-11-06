@@ -334,14 +334,14 @@ fn alternates_written(work: &str, bare: &str) -> Result<(), Failed> {
 
 /// Says the SDK line and one line for each tool the payload's `Needs` names, in its order, the SDK list and the probes
 /// read at the same time along the login shell's `PATH` ([`process::login_shell`]), or the box's own `PATH`, said so,
-/// when that cannot be read; Godot is looked for under the login shell's `GATE_GODOT_ROOT`, and is missing when the
-/// login shell cannot be read.
+/// when that cannot be read; Godot and Blender are looked for under the login shell's `GATE_GODOT_ROOT` and
+/// `GATE_BLENDER_ROOT`, and are missing when the login shell cannot be read.
 fn say_sdks_and_tools(payload: &Payload, console: &mut Console) {
-    let (path, godot_root) = match process::login_shell() {
-        Ok(login) => (Some(login.path), login.godot_root),
+    let (path, godot_root, blender_root) = match process::login_shell() {
+        Ok(login) => (Some(login.path), login.godot_root, login.blender_root),
         Err(why) => {
             console.err(&login_path_line(&why));
-            (None, None)
+            (None, None, None)
         }
     };
     let names: Vec<String> = if let Ok(needs) = payload.pairs("Needs") {
@@ -352,7 +352,11 @@ fn say_sdks_and_tools(payload: &Payload, console: &mut Console) {
     };
     let (sdks, tools) = thread::scope(|scope| {
         let sdks = scope.spawn(|| probe::sdks(path.as_deref()));
-        let tools = probe::probe_all(&names, path.as_deref(), godot_root.as_deref());
+        let roots = probe::Roots {
+            godot: godot_root.as_deref(),
+            blender: blender_root.as_deref(),
+        };
+        let tools = probe::probe_all(&names, path.as_deref(), roots);
         (sdks.join().unwrap_or_else(|_| Err("the SDK read failed".to_owned())), tools)
     });
     match sdks {

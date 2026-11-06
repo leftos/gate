@@ -39,6 +39,8 @@ mod unix {
     const SAMPLER_FAILED: &str = "gate: sampler failed: ";
     /// The program of a Godot install, inside its version's folder, where the box runs it from.
     const GODOT_PROGRAM: &str = "Godot.app/Contents/MacOS/Godot";
+    /// The program of a Blender install, inside its version's folder.
+    const BLENDER_PROGRAM: &str = "Blender.app/Contents/MacOS/Blender";
 
     /// Runs git with `args`; its standard output, trimmed, and whether it exited 0.
     fn git_said(args: &[&str]) -> (String, bool) {
@@ -339,6 +341,11 @@ mod unix {
 
     /// [`ran`], the box's `SHELL`, which its login `PATH` is read from, set to `shell` when one is given.
     fn ran_in(seams: &[&str], request: &str, reading: Reading, beaten: &Path, shell: Option<&Path>) -> Ended {
+        ran_in_env(seams, request, reading, beaten, shell, &[])
+    }
+
+    /// [`ran_in`], the variables `env` set in the box's own environment.
+    fn ran_in_env(seams: &[&str], request: &str, reading: Reading, beaten: &Path, shell: Option<&Path>, env: &[(&str, &str)]) -> Ended {
         let mut words = vec!["box", "--test-heartbeat-ms", "50"];
         // A case that gives its own sample period has it in place of the 50 ms one, as the box refuses a seam twice.
         if !seams.contains(&"--test-box-sample-ms") {
@@ -350,6 +357,7 @@ mod unix {
         if let Some(shell) = shell {
             command.env("SHELL", shell);
         }
+        command.envs(env.iter().copied());
         let mut child: Child = command
             .args(&words)
             .stdin(Stdio::piped())
@@ -1120,6 +1128,57 @@ mod unix {
             "the command never ran: {:?}",
             logged(&log)
         );
+        case.ended_clean();
+    }
+
+    #[test]
+    fn a_tool_restore_and_a_package_restore_see_no_blender_name_the_box_holds() {
+        let case = Case::new("restore-blender");
+        let log = case.base.join("restores.log");
+        let says = |what: &str| format!("#!/bin/sh\necho \"{what} MY_BLENDER=${{MY_BLENDER-unset}}\" >> '{}'\n", log.display());
+        let npm = format!("{}if [ \"$1\" = ci ]; then mkdir -p node_modules; fi\n", says("npm $1"));
+        let shell = shell_with_shim(&case, "npm", &npm);
+        runnable(&case.base.join("shims").join("dotnet"), &says("dotnet $1"));
+        let mut files = node_project("package-lock.json").to_vec();
+        files.push((".config/dotnet-tools.json", "{\n  \"version\": 1\n}\n"));
+        let commit = case.snapshot_holding(&files);
+        let keys = json!({ "Command": ["npm", "test"], "EngineEnv": { "MY_BLENDER": "blender" } });
+        let request = case.request(&commit, &keys);
+        let held = [("MY_BLENDER", "/box/blender")];
+        let ended = ran_in_env(&[], &request, Reading::All, &case.base.join("beaten"), Some(&shell), &held);
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(
+            logged(&log),
+            ["dotnet tool MY_BLENDER=unset", "npm ci MY_BLENDER=unset", "npm test MY_BLENDER=unset"],
+            "neither restore nor the command sees the box's value: {:?}",
+            ended.err
+        );
+        case.ended_clean();
+    }
+
+    #[test]
+    fn a_blender_version_that_does_not_resolve_ends_127_before_any_package_restore() {
+        let case = Case::new("blender-before-restore");
+        let log = case.base.join("npm.log");
+        let shell = shell_with_shim(&case, "npm", &format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()));
+        let shims = case.base.join("shims");
+        let unset = format!(
+            "#!/bin/sh\nPATH='{}':\"$PATH\"\nexport PATH\nunset GATE_BLENDER_ROOT\nshift\nexec /bin/sh \"$@\"\n",
+            shims.display()
+        );
+        runnable(&shell, &unset);
+        let commit = case.snapshot_holding(&node_project("package-lock.json"));
+        let keys = json!({ "Command": ["npm", "test"], "BlenderVersion": "5.2.2", "EngineEnv": { "MY_BLENDER": "blender" } });
+        let ended = ran_in(&[], &case.request(&commit, &keys), Reading::All, &case.base.join("beaten"), Some(&shell));
+        assert_eq!(ended.status, Some(127), "{:?}", ended.err);
+        assert_eq!(logged(&log), Vec::<String>::new(), "no install and no command: {:?}", ended.err);
+        assert!(
+            !ended.err_texts().iter().any(|line| line.starts_with("gate: npm install took ")),
+            "{:?}",
+            ended.err
+        );
+        let why = "gate: could not resolve blender 5.2.2: GATE_BLENDER_ROOT is not set";
+        assert!(ended.err_texts().contains(&why), "{:?}", ended.err);
         case.ended_clean();
     }
 
@@ -1989,6 +2048,96 @@ mod unix {
         let said = format!("--headless --path src/X --build-solutions --quit|{}", program.display());
         assert_eq!(texts(&ended.out), [said.as_str()], "{:?}", ended.err);
         assert!(ended.err_has(&started_line(NONCE)), "the start marker on standard error: {:?}", ended.err);
+        case.ended_clean();
+    }
+
+    /// A case whose login shell exports `GATE_BLENDER_ROOT` as a root holding a Blender 5.2.2 install, or unsets it
+    /// with `root` false, then runs as `sh`; the case, the root and the install's program.
+    fn blender_case(name: &str, root: bool) -> (Case, PathBuf, PathBuf) {
+        let case = Case::new(name);
+        let blender_root = case.base.join("blender root");
+        let program = blender_root.join("5.2.2").join(BLENDER_PROGRAM);
+        fs::create_dir_all(program.parent().expect("the program has a folder")).expect("the install is made");
+        runnable(&program, "#!/bin/sh\necho 'Blender 5.2.2 LTS'\n");
+        let export = if root {
+            format!("GATE_BLENDER_ROOT='{}'\nexport GATE_BLENDER_ROOT", blender_root.display())
+        } else {
+            "unset GATE_BLENDER_ROOT".to_owned()
+        };
+        let shell = case.base.join("login-shell");
+        runnable(&shell, &format!("#!/bin/sh\n{export}\nshift\nexec /bin/sh \"$@\"\n"));
+        (case, blender_root, program)
+    }
+
+    /// A command that says its `MY_BLENDER` and `OTHER_BLENDER`, `|`-joined, `unset` for one not set.
+    const SAYS_BLENDER: [&str; 3] = ["/bin/sh", "-c", "printf '%s|%s\\n' \"${MY_BLENDER-unset}\" \"${OTHER_BLENDER-unset}\""];
+
+    #[test]
+    fn a_blender_version_sets_each_blender_engine_env_name_to_the_install_under_the_login_shell_s_blender_root() {
+        let (case, _, program) = blender_case("blender", true);
+        let commit = case.snapshot();
+        let keys = json!({
+            "Command": SAYS_BLENDER,
+            "BlenderVersion": "5.2.2",
+            "EngineEnv": { "MY_BLENDER": "blender", "OTHER_BLENDER": "blender" },
+            "Env": { "MY_BLENDER": "/theirs/blender" },
+        });
+        let request = case.request(&commit, &keys);
+        let ended = ran_in(
+            &[],
+            &request,
+            Reading::All,
+            &case.base.join("beaten"),
+            Some(&case.base.join("login-shell")),
+        );
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        let said = format!("{0}|{0}", program.display());
+        assert_eq!(texts(&ended.out), [said.as_str()], "both names, over the caller's: {:?}", ended.err);
+        case.ended_clean();
+    }
+
+    #[test]
+    fn a_blender_version_with_no_install_ends_127_saying_why() {
+        let keys = |version: &str| {
+            json!({
+                "Command": SAYS_BLENDER,
+                "BlenderVersion": version,
+                "EngineEnv": { "MY_BLENDER": "blender" },
+            })
+        };
+        let (case, root, _) = blender_case("blender-none", true);
+        let commit = case.snapshot();
+        let shell = case.base.join("login-shell");
+        let ended = ran_in(
+            &[],
+            &case.request(&commit, &keys("5.3.0")),
+            Reading::All,
+            &case.base.join("beaten"),
+            Some(&shell),
+        );
+        assert_eq!(ended.status, Some(127), "{:?}", ended.err);
+        assert!(ended.out.is_empty(), "the command never ran: {:?}", ended.out);
+        let why = format!(
+            "gate: could not resolve blender 5.3.0: GATE_BLENDER_ROOT {} holds no folder for blender 5.3.0",
+            root.display()
+        );
+        assert!(ended.err.iter().any(|line| unstamped(line).text == why), "{:?}", ended.err);
+        assert!(ended.err_has(&started_line(NONCE)), "after the start marker: {:?}", ended.err);
+        case.ended_clean();
+
+        let (case, _, _) = blender_case("blender-unset", false);
+        let commit = case.snapshot();
+        let shell = case.base.join("login-shell");
+        let ended = ran_in(
+            &[],
+            &case.request(&commit, &keys("5.2.2")),
+            Reading::All,
+            &case.base.join("beaten"),
+            Some(&shell),
+        );
+        assert_eq!(ended.status, Some(127), "{:?}", ended.err);
+        let why = "gate: could not resolve blender 5.2.2: GATE_BLENDER_ROOT is not set";
+        assert!(ended.err.iter().any(|line| unstamped(line).text == why), "{:?}", ended.err);
         case.ended_clean();
     }
 

@@ -167,6 +167,10 @@ pub(crate) struct Checked {
     /// [`toolchain::unreal_required`](crate::remote::toolchain::unreal_required) reads them: empty for any version,
     /// `None` when the manifest names no unreal. The `unreal` tool is judged by them, as a routed run is.
     pub unreal: Option<Vec<Pin>>,
+    /// The exact Blender versions the manifest requires, as
+    /// [`toolchain::blender_required`](crate::remote::toolchain::blender_required) reads them: empty for any version,
+    /// `None` when the manifest names no blender. The `blender` tool is judged by them, as a routed run is.
+    pub blender: Option<Vec<Pin>>,
     /// The SDK pin's check; `None` when the root has no `global.json`.
     pub sdk: Option<Sdk>,
     /// The manifest's workload ids, which the check lists without checking them.
@@ -224,11 +228,12 @@ pub(crate) enum DataChannel {
 
 impl Checked {
     /// The exact versions the repo requires of the tool `name`, for the tools whose manifest entry is an exact pin
-    /// (`godot` and `unreal`); `None` for any other tool, and for one of them the manifest does not name.
+    /// (`godot`, `unreal` and `blender`); `None` for any other tool, and for one of them the manifest does not name.
     fn exact_pins(&self, name: &str) -> Option<&[Pin]> {
         match name {
             "godot" => self.godot.as_deref(),
             "unreal" => self.unreal.as_deref(),
+            "blender" => self.blender.as_deref(),
             _ => None,
         }
     }
@@ -605,7 +610,7 @@ fn tool_item(at: At<'_>, exact: Option<&[Pin]>, tool: &Tool) -> Item {
     }
 }
 
-/// The line of the manifest tool `name`, `godot` or `unreal`, against the exact versions `pins` the repo requires, as a
+/// The line of the manifest tool `name`, `godot`, `unreal` or `blender`, against the exact versions `pins` the repo requires, as a
 /// routed run judges the same answer: met, or missing saying what the probe found of the pin, with the same hint a
 /// missing tool has.
 fn pinned_item(name: &str, pins: &[Pin], reported: &Reported, hint: &impl Fn(Kind) -> Option<(String, String)>) -> Item {
@@ -674,6 +679,7 @@ fn builder_hint(host: &str, name: &str, min: Option<Version>) -> Option<String> 
         ("node", _) => script("Node.js"),
         ("pwsh", _) => script("PowerShell"),
         ("ffmpeg", _) => script("FFmpeg"),
+        ("blender", _) => script("Blender"),
         _ => return None,
     })
 }
@@ -782,6 +788,7 @@ mod tests {
             tools,
             godot: None,
             unreal: None,
+            blender: None,
             sdk: None,
             workloads: Vec::new(),
             consent_problem: None,
@@ -1215,6 +1222,41 @@ mod tests {
         assert_eq!(body(&checked), ["check: here: unreal missing (needs 5.8 exactly: 5.9.0)"]);
         assert_eq!(summary(&checked), "check: here: 1 missing, 0 too old");
         assert_eq!(said(HERE, &checked).status, 1);
+    }
+
+    /// A pinned blender the probe found at another version is missing, as a routed run judges the pin exact on the
+    /// parts it gives, though the found version is past the pin.
+    #[test]
+    fn a_pinned_blender_at_another_version_is_missing() {
+        let Some(pin) = Pin::parse("5.2") else {
+            unreachable!("5.2 is a pin");
+        };
+        let checked = Checked {
+            blender: Some(vec![pin]),
+            ..checked(vec![tool("blender", Some("5.2"), found("5.3.0"))])
+        };
+        assert_eq!(body(&checked), ["check: here: blender missing (needs 5.2 exactly: 5.3.0)"]);
+        assert_eq!(summary(&checked), "check: here: 1 missing, 0 too old");
+        assert_eq!(said(HERE, &checked).status, 1);
+    }
+
+    /// A pinned blender a builder lacks names the installer's Blender step.
+    #[test]
+    fn a_pinned_blender_missing_on_a_builder_names_the_blender_step() {
+        let Some(pin) = Pin::parse("5.2") else {
+            unreachable!("5.2 is a pin");
+        };
+        let checked = Checked {
+            blender: Some(vec![pin]),
+            ..checked(vec![tool("blender", Some("5.2"), Probed::Missing)])
+        };
+        let hints: Vec<String> = builder_body(&checked).into_iter().filter(|line| line.starts_with("install: ")).collect();
+        assert_eq!(
+            hints,
+            [
+                "install: box-1: blender: copy tools/builder/ from the gate repo to box-1 and run install-toolchains.ps1 -User <user> -Only Blender there, elevated (docs/routing-a-repo.md, Builder setup)"
+            ]
+        );
     }
 
     /// A pinned unreal the probe found at a version the pin names is ok, whatever else its version list holds.

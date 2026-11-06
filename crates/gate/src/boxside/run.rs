@@ -35,7 +35,7 @@ use gate_win32::{
 };
 use gate_wire::stamp::Tag;
 use gate_wire::{
-    BACK_COMMIT_NONE, BACK_COMMITS_FAILED, CEILING_FILE_VARIABLE, LAYOUT_CHANGING, PathForm, Payload, bare_stem, checkout_done_line,
+    BACK_COMMIT_NONE, BACK_COMMITS_FAILED, CEILING_FILE_VARIABLE, EngineKind, LAYOUT_CHANGING, PathForm, Payload, bare_stem, checkout_done_line,
     checkout_start_line, layout_text, names_another_layout, ordinal_upper, trees, warm_line,
 };
 
@@ -62,6 +62,7 @@ use crate::boxside::tools;
 use crate::console::Console;
 use crate::environment::{BOX_EXE_VARIABLE, BOX_JOB_VARIABLE, Variables};
 use crate::outputs::manifest::{Listing, Manifest};
+use crate::remote::git::ProgramPlace;
 use crate::remote::{Refusal, refused_line, started_line};
 use crate::resolve::{self, Environment};
 use crate::run::{ERROR_FILE_NOT_FOUND, Written, end_leftovers, find_program, written};
@@ -179,10 +180,13 @@ pub(super) struct Request<'a> {
     /// ([`resolved_engine`]) and handed to every command alike: `Ok(None)` when none is chosen, `Err` with the line its
     /// commands fail to start with when it does not resolve.
     engine: Result<Option<PathBuf>, String>,
-    /// The names `EngineEnv` sets to the root of the chosen engine ([`with_unreal`]), as the repo's toolchain manifest
-    /// `[env]` names them; none when the payload gives none. Every process the box starts for the run's repo loses the
-    /// values it inherited for them ([`box_variables`]).
-    pub(super) engine_env: Vec<String>,
+    /// The `blender.exe` of the Blender install the run's `BlenderVersion` names, resolved once as the request is read
+    /// ([`resolved_blender`]) and handed to every command alike, as [`Request::engine`] is.
+    blender: Result<Option<PathBuf>, String>,
+    /// The names `EngineEnv` sets to a chosen engine install, each with its kind ([`with_unreal`], [`with_blender`]), as the repo's
+    /// toolchain manifest `[env]` names them; none when the payload gives none. Every process the box starts for the
+    /// run's repo loses the values it inherited for them, whatever their kind ([`box_variables`]).
+    pub(super) engine_env: Vec<(String, EngineKind)>,
     /// The folders the run writes ([`preflight::refused_folders`]): no folder a command runs from may lie inside one,
     /// neither the chosen engine's ([`resolved_engine`]) nor Git's `bin` ([`with_git_bin_first`]).
     refused: Vec<PathBuf>,
@@ -270,7 +274,13 @@ impl Request<'_> {
         let refused = preflight::refused_folders(payload, work);
         // Before the engine is resolved, so a malformed one is refused before any engine folder is probed.
         let engine_env = payload.engine_env()?;
-        let engine = resolved_engine(payload.unreal_version()?, &refused);
+        let unreal_version = payload.unreal_version()?;
+        let blender_version = payload.blender_version()?;
+        // The box's own environment, read once for both installs' roots.
+        let variables = box_variables(&[]);
+        let engine = resolved_engine(unreal_version, variables.get(probe::UNREAL_ROOT), &refused);
+        let blender_root = variables.get(probe::BLENDER_ROOT).map(OsStr::to_os_string);
+        let blender = resolved_blender(blender_version, blender_root.as_deref(), variables, &refused);
         let inputs_digest = payload.inputs_digest()?;
         let sent_digest = payload.sent_digest()?;
         let spare = payload.spare_folders()?;
@@ -293,6 +303,7 @@ impl Request<'_> {
             env,
             godot,
             engine,
+            blender,
             engine_env,
             refused,
             outputs,
@@ -2364,7 +2375,9 @@ fn prepared<'w>(request: &Request<'_>, one: &One<'w>, ceiling_file: Option<&Path
     };
     let variables = with_git_bin_first(variables, &request.refused);
     let (variables, found) = resolved_command(request.godot, word, variables, one.place);
-    let variables = match with_unreal(&request.engine, &request.engine_env, variables) {
+    let variables = match with_unreal(&request.engine, &request.engine_env, variables)
+        .and_then(|variables| with_blender(&request.blender, &request.engine_env, variables))
+    {
         Ok(variables) => variables,
         Err(line) => {
             stamping::err(console, &line);
@@ -2402,7 +2415,7 @@ fn prepared<'w>(request: &Request<'_>, one: &One<'w>, ceiling_file: Option<&Path
 /// the Event Log logging provider off ([`with_event_log_off`]), and the box run's own names: [`BOX_JOB_VARIABLE`] the job `job` the command runs in, as the command reaches it
 /// ([`handed_job`]), and [`BOX_EXE_VARIABLE`] the box's own image `exe`. The caller's pairs stand before every setting
 /// the gate applies, so none of them can undo one.
-fn command_variables(env: &[(String, String)], engine_env: &[String], run: &str, job: &str, exe: &Path) -> Variables {
+fn command_variables(env: &[(String, String)], engine_env: &[(String, EngineKind)], run: &str, job: &str, exe: &Path) -> Variables {
     with_event_log_off(with_safe_directory(box_variables(engine_env).with_caller(env).with_build_servers(run)))
         .with(BOX_JOB_VARIABLE, job)
         .with(BOX_EXE_VARIABLE, &exe.to_string_lossy())
@@ -2517,32 +2530,29 @@ const UE_ROOT: &str = "UE_ROOT";
 
 /// The box's own environment as every process it starts for a run's repo gets it — the command, a package install, a
 /// tool restore — before what each sets over it: the box's process environment less any `UE_ROOT` it inherited and any
-/// value of the run's `EngineEnv` names `engine_env` ([`without_engine`]), so none of them sees an engine the run did
-/// not choose.
-pub(super) fn box_variables(engine_env: &[String]) -> Variables {
+/// value of the run's `EngineEnv` names `engine_env`, of either kind ([`without_engine`]), so none of them sees an
+/// engine the run did not choose.
+pub(super) fn box_variables(engine_env: &[(String, EngineKind)]) -> Variables {
     without_engine(Variables::from_process(), engine_env)
 }
 
-/// `inherited` with every value it holds for `UE_ROOT` and for each of the names `engine_env` removed.
-fn without_engine(inherited: Variables, engine_env: &[String]) -> Variables {
+/// `inherited` with every value it holds for `UE_ROOT` and for each of the names `engine_env`, of either kind, removed.
+fn without_engine(inherited: Variables, engine_env: &[(String, EngineKind)]) -> Variables {
     engine_env
         .iter()
-        .fold(inherited.without(UE_ROOT), |variables, name| variables.without(name))
+        .fold(inherited.without(UE_ROOT), |variables, (name, _)| variables.without(name))
 }
 
 /// The Unreal Engine install a run whose chosen version is `unreal` uses, resolved once for all its commands: the
-/// install of that version under the box's `GATE_UNREAL_ROOT`, a root overlapping none of the run's folders `refused`
-/// ([`probe::installed_unreal`]); `Ok(None)` with no version. `Err` with the line
+/// install of that version under `root`, the box's `GATE_UNREAL_ROOT`, a root overlapping none of the run's folders
+/// `refused` ([`probe::installed_unreal`]); `Ok(None)` with no version. `Err` with the line
 /// `gate: could not resolve unreal <version>: <why>` when the version does not resolve.
-fn resolved_engine(unreal: Option<&str>, refused: &[PathBuf]) -> Result<Option<PathBuf>, String> {
+fn resolved_engine(unreal: Option<&str>, root: Option<&OsStr>, refused: &[PathBuf]) -> Result<Option<PathBuf>, String> {
     let Some(version) = unreal else {
         return Ok(None);
     };
     let worktrees: Vec<&Path> = refused.iter().map(PathBuf::as_path).collect();
-    let variables = box_variables(&[]);
-    variables
-        .get(probe::UNREAL_ROOT)
-        .ok_or_else(|| format!("{} is not set", probe::UNREAL_ROOT))
+    root.ok_or_else(|| format!("{} is not set", probe::UNREAL_ROOT))
         .and_then(|root| probe::installed_unreal(root, version, &worktrees))
         .map(Some)
         .map_err(|why| format!("gate: could not resolve unreal {version}: {why}"))
@@ -2550,19 +2560,56 @@ fn resolved_engine(unreal: Option<&str>, refused: &[PathBuf]) -> Result<Option<P
 
 /// The environment `variables` of a command of a run whose engine resolved to `engine` ([`resolved_engine`]): with
 /// one, `UE_ROOT` set over every other value they hold for it, the caller's having been refused, to that engine's
-/// folder, and then each of the `EngineEnv` names `engine_env` set to the same folder, over a caller's pair for it;
-/// with none, as they are, the box's inherited values already gone ([`box_variables`]). `Err` with the line the engine
-/// failed to resolve with. The command's first word is never read.
-fn with_unreal(engine: &Result<Option<PathBuf>, String>, engine_env: &[String], variables: Variables) -> Result<Variables, String> {
+/// folder, and then each of the unreal `EngineEnv` names of `engine_env` set to the same folder, over a caller's pair
+/// for it; with none, as they are, the box's inherited values already gone ([`box_variables`]). `Err` with the line the
+/// engine failed to resolve with. The command's first word is never read.
+fn with_unreal(engine: &Result<Option<PathBuf>, String>, engine_env: &[(String, EngineKind)], variables: Variables) -> Result<Variables, String> {
     match engine {
         Ok(None) => Ok(variables),
         Ok(Some(folder)) => {
             let folder = folder.to_string_lossy();
             let variables = variables.with(UE_ROOT, &folder);
-            Ok(engine_env.iter().fold(variables, |variables, name| variables.with(name, &folder)))
+            Ok(named_of(engine_env, EngineKind::Unreal).fold(variables, |variables, name| variables.with(name, &folder)))
         }
         Err(line) => Err(line.clone()),
     }
+}
+
+/// The `blender.exe` of the Blender install a run whose chosen version is `blender` uses, resolved once for all its
+/// commands: the install that version resolves to under `root`, the box's `GATE_BLENDER_ROOT`, a root overlapping none
+/// of the run's folders `refused`, its `blender.exe` run in the place the box's own environment `variables` make
+/// ([`probe::installed_blender`]); `Ok(None)` with no version. `Err` with the line
+/// `gate: could not resolve blender <version>: <why>` when the version does not resolve.
+fn resolved_blender(blender: Option<&str>, root: Option<&OsStr>, variables: Variables, refused: &[PathBuf]) -> Result<Option<PathBuf>, String> {
+    let Some(version) = blender else {
+        return Ok(None);
+    };
+    let worktrees: Vec<&Path> = refused.iter().map(PathBuf::as_path).collect();
+    root.ok_or_else(|| format!("{} is not set", probe::BLENDER_ROOT))
+        .and_then(|root| ProgramPlace::new(variables).map(|place| (root, place)))
+        .and_then(|(root, place)| probe::installed_blender(root, version, &place, &worktrees))
+        .map(Some)
+        .map_err(|why| format!("gate: could not resolve blender {version}: {why}"))
+}
+
+/// The environment `variables` of a command of a run whose Blender resolved to `blender` ([`resolved_blender`]): with
+/// one, each of the blender `EngineEnv` names of `engine_env` set to its `blender.exe`, over a caller's pair for it;
+/// with none, as they are, the box's inherited values already gone ([`box_variables`]). `Err` with the line the install
+/// failed to resolve with.
+fn with_blender(blender: &Result<Option<PathBuf>, String>, engine_env: &[(String, EngineKind)], variables: Variables) -> Result<Variables, String> {
+    match blender {
+        Ok(None) => Ok(variables),
+        Ok(Some(program)) => {
+            let program = program.to_string_lossy();
+            Ok(named_of(engine_env, EngineKind::Blender).fold(variables, |variables, name| variables.with(name, &program)))
+        }
+        Err(line) => Err(line.clone()),
+    }
+}
+
+/// The names of `engine_env` whose kind is `kind`, in order.
+fn named_of(engine_env: &[(String, EngineKind)], kind: EngineKind) -> impl Iterator<Item = &str> {
+    engine_env.iter().filter(move |(_, named)| *named == kind).map(|(name, _)| name.as_str())
 }
 
 /// The variable that counts the config entries git reads from the environment.
@@ -4533,7 +4580,7 @@ mod tests {
         written_retrying,
     };
     use gate_args::{EnvRefusal, env_refusal};
-    use gate_wire::engine_env_name_refused;
+    use gate_wire::{EngineKind, engine_env_name_refused};
 
     use crate::boxside::forward::{ClientGone, OutputLock};
     use crate::console::Console;
@@ -5033,12 +5080,20 @@ mod tests {
         let inherited = Variables::from_process()
             .with("UE_ROOT", r"C:\stale\UE_5.0")
             .with("UE_MCP_TEST_ENGINE_ROOT", r"C:\stale\engine")
+            .with("ZZ_BLENDER_EXE", r"C:\stale\blender.exe")
             .with("ZZ_KEPT", "1");
 
-        let base = without_engine(inherited, &["ue_mcp_test_engine_root".to_owned()]);
+        let base = without_engine(
+            inherited,
+            &[
+                ("ue_mcp_test_engine_root".to_owned(), EngineKind::Unreal),
+                ("ZZ_BLENDER_EXE".to_owned(), EngineKind::Blender),
+            ],
+        );
 
         assert_eq!(base.get("UE_ROOT"), None);
         assert_eq!(base.get("UE_MCP_TEST_ENGINE_ROOT"), None, "removed in any ASCII case");
+        assert_eq!(base.get("ZZ_BLENDER_EXE"), None, "a blender name is removed too");
         assert_eq!(base.get("ZZ_KEPT"), Some(OsStr::new("1")), "the rest is kept");
     }
 

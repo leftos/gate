@@ -831,7 +831,8 @@ mod restore {
     }
 
     /// Runs `manager`'s install in `folder`, named `place` in the main tree, found along `along.path`, with
-    /// `CI=true` and its `TMPDIR` `along.tmp` when given, as the leader of a process group of its own recorded in
+    /// `CI=true` and its `TMPDIR` `along.tmp` when given, each of `along.blender_names` removed from the environment
+    /// it inherits, as the leader of a process group of its own recorded in
     /// `<work>.packages.pgid` under the job `<job>-packages`, which `box stop` reads; both its streams forwarded
     /// through `output`, no deadline, and a client gone ending its group. An install that exited or was ended by a
     /// signal is followed by a line saying how long it ran.
@@ -846,6 +847,10 @@ mod restore {
             command.env("TMPDIR", tmp);
         }
         command.env("CI", "true");
+        // No Blender for a restore: the box's own value of a blender name never reaches it.
+        for name in restore.along.blender_names {
+            command.env_remove(name);
+        }
         // SAFETY: the closure runs in the child between fork and exec and only resets the umask, signal dispositions and
         // the mask with async-signal-safe calls ([`signals_reset`]), as the command's does.
         unsafe {
@@ -1052,6 +1057,8 @@ mod restore {
                     path: Some(path),
                     tmp: None,
                     godot: Godot::Unchosen,
+                    blender: None,
+                    blender_names: &[],
                     ceiling: None,
                 };
                 let place = self.work().join(subfolder);

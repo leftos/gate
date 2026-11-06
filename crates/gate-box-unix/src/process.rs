@@ -938,9 +938,9 @@ pub fn status_text(status: ExitStatus) -> String {
     }
 }
 
-/// The `PATH` and `GATE_GODOT_ROOT` of the box user's login shell, `$SHELL` (`/bin/zsh` when `SHELL` is unset or empty)
-/// as [`login_shell_of`] reads them: an ssh command's own environment lacks what the login profile adds, such as
-/// dotnet's folder and the installer's Godot root. Read anew on every call.
+/// The `PATH`, `GATE_GODOT_ROOT` and `GATE_BLENDER_ROOT` of the box user's login shell, `$SHELL` (`/bin/zsh` when
+/// `SHELL` is unset or empty) as [`login_shell_of`] reads them: an ssh command's own environment lacks what the login
+/// profile adds, such as dotnet's folder and the installer's Godot and Blender roots. Read anew on every call.
 ///
 /// # Errors
 ///
@@ -952,12 +952,12 @@ pub fn login_shell() -> Result<Login, String> {
     login_shell_of(&shell)
 }
 
-/// The `PATH` and `GATE_GODOT_ROOT` the login shell `shell` says when run once as `shell -l -c` with a command that
+/// The `PATH`, `GATE_GODOT_ROOT` and `GATE_BLENDER_ROOT` the login shell `shell` says when run once as `shell -l -c` with a command that
 /// prints a marker of its own ([`crate::lines::login_marker`]) between NULs, then the shell's environment NUL-separated,
 /// in the bounded runner within [`LOGIN_PATH_LIMIT`]; only that record is taken ([`crate::lines::marked_login`]), so
 /// anything the login profile prints around it is left out. The command is two programs by absolute path with
 /// single-quoted words, which every login shell (sh, zsh, bash, fish, tcsh) parses alike, and it expands no variable,
-/// so a profile's `set -u` cannot fail it; only an exported `GATE_GODOT_ROOT` is read.
+/// so a profile's `set -u` cannot fail it; only an exported `GATE_GODOT_ROOT` or `GATE_BLENDER_ROOT` is read.
 ///
 /// # Errors
 ///
@@ -1767,6 +1767,7 @@ mod tests {
             Ok(Login {
                 path: "/fake/bin:/usr/bin".to_owned(),
                 godot_root: None,
+                blender_root: None,
             }),
             "no root is Godot missing"
         );
@@ -1783,10 +1784,29 @@ mod tests {
             Ok(Login {
                 path: "/fake/bin:/usr/bin".to_owned(),
                 godot_root: Some("/Users/b/gate dir/godot".to_owned()),
+                blender_root: None,
             })
         );
         let empty = login_after("godot-empty", "GATE_GODOT_ROOT=\nexport GATE_GODOT_ROOT");
         assert_eq!(empty.map(|login| login.godot_root), Ok(None), "an empty root is none");
+    }
+
+    #[test]
+    fn the_login_shell_s_blender_root_is_read_with_its_path_spaces_kept() {
+        let login = login_after(
+            "blender",
+            "PATH=/fake/bin:/usr/bin\nGATE_BLENDER_ROOT='/Users/b/gate dir/blender'\nexport GATE_BLENDER_ROOT\nunset GATE_GODOT_ROOT",
+        );
+        assert_eq!(
+            login,
+            Ok(Login {
+                path: "/fake/bin:/usr/bin".to_owned(),
+                godot_root: None,
+                blender_root: Some("/Users/b/gate dir/blender".to_owned()),
+            })
+        );
+        let empty = login_after("blender-empty", "GATE_BLENDER_ROOT=\nexport GATE_BLENDER_ROOT");
+        assert_eq!(empty.map(|login| login.blender_root), Ok(None), "an empty root is none");
     }
 
     #[test]
@@ -1799,6 +1819,7 @@ mod tests {
             Ok(Login {
                 path: "/fake/bin:/usr/bin".to_owned(),
                 godot_root: Some("/g/godot".to_owned()),
+                blender_root: None,
             })
         );
     }
@@ -1811,6 +1832,7 @@ mod tests {
             Ok(Login {
                 path: "/fake/bin:/usr/bin".to_owned(),
                 godot_root: None,
+                blender_root: None,
             })
         );
     }

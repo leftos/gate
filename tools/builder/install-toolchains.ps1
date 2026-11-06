@@ -624,8 +624,10 @@ Invoke-Step 'VB-CABLE 45 virtual audio output' {
         throw "VBCABLE_Setup_x64.exe exited $($setup.ExitCode) and no VB-Audio sound device is present"
     }
 }
-# Routed headless Blender jobs name blender.exe by its installed path, so the builder keeps the PC's folder. download.blender.org
-# answers scripted requests 403, so this comes from a mirror the Blender project lists, with the hash it publishes.
+# Routed headless Blender jobs read the chosen blender.exe from a variable their `.gate/toolchain.toml` `[env]` names, which the
+# box finds under GATE_BLENDER_ROOT; the builder keeps the PC's folder so a job that names the path still runs.
+# download.blender.org answers scripted requests 403, so this comes from a mirror the Blender project lists, with the hash it
+# publishes.
 Invoke-Step 'Blender 5.2.2 LTS' {
     $sha = '3849D17A682CBA006075AAA3F3597ECB5C9C30EC31035B2E092C53E40679B535'
     $f = Get-File 'https://mirrors.ocf.berkeley.edu/blender/release/Blender5.2/blender-5.2.2-windows-x64.zip'
@@ -638,6 +640,14 @@ Invoke-Step 'Blender 5.2.2 LTS' {
     New-Item -ItemType Directory -Force $blenderDir | Out-Null
     Copy-Item -Path (Join-Path $src.FullName '*') -Destination $blenderDir -Recurse -Force
     Remove-Item $tmp -Recurse -Force
+    $blenderRoot = 'C:\Program Files\Blender Foundation'
+    $env:GATE_BLENDER_ROOT = $blenderRoot
+    [Environment]::SetEnvironmentVariable('GATE_BLENDER_ROOT', $blenderRoot, 'Machine')
+    foreach ($item in $blenderRoot, $blenderDir, (Join-Path $blenderDir 'blender.exe')) {
+        if ((Get-Item -LiteralPath $item -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "$item is a reparse point; the gate refuses a Blender install that is one"
+        }
+    }
 }
 Invoke-Step 'FFmpeg 9.0.2' {
     $sha = '759D0A9831C436A0EB331AD36F236C06CB04AAA0005DA46571F0E9D3D9206F6B'
@@ -966,7 +976,7 @@ $checks = [ordered]@{
     'python' = @('--version'); 'python3' = @('--version'); 'rustup' = @('toolchain', 'list')
     'cargo' = @('--version'); 'cargo-nextest' = @('nextest', '--version'); 'just' = @('--version'); $godotConsole = @('--version', '--headless')
     'ffmpeg' = @('-version'); 'ffprobe' = @('-version'); 'zstd' = @('--version'); 'bun' = @('--revision'); 'sccache' = @('--version')
-    $makensis = @('/VERSION')
+    $makensis = @('/VERSION'); 'C:\Program Files\Blender Foundation\Blender 5.2\blender.exe' = @('--version')
 }
 foreach ($exe in $checks.Keys) {
     $out = try { (& $exe @($checks[$exe]) 2>&1) -join ' | ' } catch { "error: $($_.Exception.Message)" }

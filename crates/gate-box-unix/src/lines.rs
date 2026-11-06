@@ -43,12 +43,16 @@ pub struct Login {
     /// Its exported `GATE_GODOT_ROOT`, the folder holding the builder's Godot installs; `None` when it is unset or
     /// empty, so Godot is missing on the builder.
     pub godot_root: Option<String>,
+    /// Its exported `GATE_BLENDER_ROOT`, the folder holding the builder's Blender installs; `None` when it is unset or
+    /// empty, so Blender is missing on the builder.
+    pub blender_root: Option<String>,
 }
 
 /// What the login shell's output `stdout` says in its record: the first NUL, `marker` ([`login_marker`]), NUL, then
-/// its environment, each entry `NAME=value` ended by a NUL, of which the first `PATH` and the first `GATE_GODOT_ROOT`
-/// are read. What the login profile prints before the record is left out, as is what follows its last NUL; marker
-/// text inside a value is part of that value. The root is `None` when it is not there, empty or not UTF-8.
+/// its environment, each entry `NAME=value` ended by a NUL, of which the first `PATH`, the first `GATE_GODOT_ROOT` and
+/// the first `GATE_BLENDER_ROOT` are read. What the login profile prints before the record is left out, as is what
+/// follows its last NUL; marker text inside a value is part of that value. Each root is `None` when it is not there,
+/// empty or not UTF-8.
 ///
 /// # Errors
 ///
@@ -73,11 +77,17 @@ pub fn marked_login(stdout: &[u8], marker: &str) -> Result<Login, String> {
         Some(Ok(path)) => path.to_owned(),
         Some(Err(_)) => return Err("said a PATH that is not UTF-8".to_owned()),
     };
-    let godot_root = value(b"GATE_GODOT_ROOT=")
-        .and_then(|root| std::str::from_utf8(root).ok())
-        .filter(|root| !root.is_empty())
-        .map(str::to_owned);
-    Ok(Login { path, godot_root })
+    let root = |name: &[u8]| {
+        value(name)
+            .and_then(|root| std::str::from_utf8(root).ok())
+            .filter(|root| !root.is_empty())
+            .map(str::to_owned)
+    };
+    Ok(Login {
+        path,
+        godot_root: root(b"GATE_GODOT_ROOT="),
+        blender_root: root(b"GATE_BLENDER_ROOT="),
+    })
 }
 
 /// The note said when the login shell's `PATH` cannot be read, for `why`.
@@ -577,17 +587,26 @@ pub struct Along<'a> {
     pub tmp: Option<&'a str>,
     /// The run's Godot, which sets or removes [`GODOT_PATH`] over the payload's `Env`.
     pub godot: Godot<'a>,
+    /// The program of the run's chosen Blender install, which each of [`Along::blender_names`] is set to over the
+    /// payload's `Env`; `None` for a run that chose none, which removes each of those names from the box's own
+    /// environment, a caller's pair for it kept, and for a tool or package restore, which removes each of them from the
+    /// environment it inherits and takes no caller's pairs.
+    pub blender: Option<&'a str>,
+    /// The names `EngineEnv` sets to the chosen Blender install's program.
+    pub blender_names: &'a [String],
     /// The command's ceiling reading, which [`gate_wire::CEILING_FILE_VARIABLE`] names; `None` for a command under no
     /// ceiling, and for a tool or package restore, which removes the variable.
     pub ceiling: Option<&'a str>,
 }
 
 /// The command's environment: `start` (the box's own), its `PATH` the login shell's `along.path` and its `TMPDIR` the
-/// run's folder `along.tmp` when there are, the payload's `Env` pairs `caller` set over that, each replacing its name;
-/// [`GODOT_PATH`] then set to the program of `along.godot`'s install over any value it holds, or removed for a run whose
-/// chosen version has none; then the build-server settings of the run `run` ([`gate_wire::build_server_settings`]) and
-/// [`BOX_JOB_VARIABLE`] the job `job`, each first removing every name that differs from it only in case, so the command
-/// sees one value per name, as on the Windows box; last [`gate_wire::CEILING_FILE_VARIABLE`] set the same way to the
+/// run's folder `along.tmp` when there are, each of `along.blender_names` removed when `along.blender` is `None`, the
+/// payload's `Env` pairs `caller` set over that, each replacing its name; [`GODOT_PATH`] then set to the program of
+/// `along.godot`'s install over any value it holds, or removed for a run whose chosen version has none; each of
+/// `along.blender_names` set to the program `along.blender` when there is one; then the build-server settings of the
+/// run `run` ([`gate_wire::build_server_settings`]) and [`BOX_JOB_VARIABLE`] the job `job`, each first removing every
+/// name that differs from it only in case, so the command sees one value per name, as on the Windows box; last
+/// [`gate_wire::CEILING_FILE_VARIABLE`] set the same way to the
 /// command's ceiling reading `along.ceiling`, or, with `None`, removed in any case, so neither the payload's `Env` nor
 /// the box's own environment hands the command a reading that is not its own.
 #[must_use]
@@ -605,6 +624,9 @@ pub fn command_environment(
     if let Some(tmp) = along.tmp {
         set_variable(&mut environment, "TMPDIR", tmp, false);
     }
+    if along.blender.is_none() {
+        environment.retain(|(set, _)| !along.blender_names.iter().any(|name| set.as_os_str() == OsStr::new(name)));
+    }
     for (name, value) in caller {
         set_variable(&mut environment, name, value, false);
     }
@@ -612,6 +634,11 @@ pub fn command_environment(
         Godot::Unchosen => {}
         Godot::Installed(program) => set_variable(&mut environment, GODOT_PATH, program, false),
         Godot::Missing => environment.retain(|(name, _)| name.as_os_str() != OsStr::new(GODOT_PATH)),
+    }
+    if let Some(program) = along.blender {
+        for name in along.blender_names {
+            set_variable(&mut environment, name, program, false);
+        }
     }
     for (name, value) in gate_wire::build_server_settings(run) {
         set_variable(&mut environment, name, &value, true);
@@ -767,6 +794,8 @@ mod tests {
             path,
             tmp: None,
             godot: Godot::Unchosen,
+            blender: None,
+            blender_names: &[],
             ceiling: None,
         }
     }
@@ -796,6 +825,54 @@ mod tests {
     }
 
     #[test]
+    fn a_blender_engine_env_name_is_the_run_s_install_over_the_caller_s_and_with_no_version_the_box_s_own_goes() {
+        let start = vec![
+            (OsString::from("MY_BLENDER"), OsString::from("/ssh/blender")),
+            (OsString::from("my_blender"), OsString::from("/ssh/other")),
+        ];
+        let names = ["MY_BLENDER".to_owned()];
+        let theirs = [("MY_BLENDER".to_owned(), "/theirs/blender".to_owned())];
+        let with = |blender: Option<&str>, caller: &[(String, String)]| {
+            let along = Along {
+                blender,
+                blender_names: &names,
+                ..along_path(None)
+            };
+            command_environment(start.clone(), along, caller, "r", "j")
+        };
+        let mine = |environment: &[(OsString, OsString)]| -> Vec<(String, String)> {
+            environment
+                .iter()
+                .filter(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("MY_BLENDER"))
+                .map(|(name, value)| (name.to_string_lossy().into_owned(), value.to_string_lossy().into_owned()))
+                .collect()
+        };
+        let pair = |name: &str, value: &str| (name.to_owned(), value.to_owned());
+        let program = "/Users/b/gate-tools/blender/5.2.2/Blender.app/Contents/MacOS/Blender";
+        assert_eq!(
+            mine(&with(Some(program), &theirs)),
+            [pair("my_blender", "/ssh/other"), pair("MY_BLENDER", program)],
+            "the install over the caller's; a name differing in case is another name"
+        );
+        assert_eq!(
+            mine(&with(None, &theirs)),
+            [pair("my_blender", "/ssh/other"), pair("MY_BLENDER", "/theirs/blender")],
+            "no version: the caller's pair is kept"
+        );
+        assert_eq!(
+            mine(&with(None, &[])),
+            [pair("my_blender", "/ssh/other")],
+            "no version: the box's own value goes, as for a tool or package restore"
+        );
+        let unnamed = command_environment(start.clone(), along_path(None), &[], "r", "j");
+        assert_eq!(
+            mine(&unnamed),
+            [pair("MY_BLENDER", "/ssh/blender"), pair("my_blender", "/ssh/other")],
+            "no names, no change"
+        );
+    }
+
+    #[test]
     fn the_command_s_environment_is_the_login_path_and_tmp_then_the_payload_s_env_then_the_box_s_own_names_once() {
         let start = vec![
             (OsString::from("PATH"), OsString::from("/ssh/bin")),
@@ -812,6 +889,8 @@ mod tests {
             path: Some("/login/bin:/usr/bin"),
             tmp: Some("/tmp/gate.abcdefgh/"),
             godot: Godot::Unchosen,
+            blender: None,
+            blender_names: &[],
             ceiling: None,
         };
         let environment = command_environment(start.clone(), along, &caller, "gate-box-n", "gate-remote-k-n");
@@ -850,6 +929,8 @@ mod tests {
             path: None,
             tmp: Some("/tmp/gate.abcdefgh/"),
             godot: Godot::Unchosen,
+            blender: None,
+            blender_names: &[],
             ceiling: None,
         };
         let environment = command_environment(start, along, &[], "r", "j");
@@ -870,6 +951,8 @@ mod tests {
             path: None,
             tmp: Some("/tmp/gate.abcdefgh/"),
             godot: Godot::Unchosen,
+            blender: None,
+            blender_names: &[],
             ceiling: None,
         };
         let environment = command_environment(start, along, &caller, "r", "j");
@@ -1265,12 +1348,50 @@ mod tests {
         format!("{before}\0{MARKER}\0{block}{after}").into_bytes()
     }
 
-    /// The login `path` and `root`.
+    /// The login `path` and Godot root `root`, with no Blender root.
     fn login(path: &str, root: Option<&str>) -> Login {
         Login {
             path: path.to_owned(),
             godot_root: root.map(str::to_owned),
+            blender_root: None,
         }
+    }
+
+    #[test]
+    fn the_blender_root_is_read_from_the_same_record_as_the_path_and_the_godot_root() {
+        let all = ["PATH=/usr/bin", "GATE_GODOT_ROOT=/g", "GATE_BLENDER_ROOT=/Users/b/gate tools/blender"];
+        assert_eq!(
+            marked_login(&printed("banner", &all, ""), MARKER),
+            Ok(Login {
+                blender_root: Some("/Users/b/gate tools/blender".to_owned()),
+                ..login("/usr/bin", Some("/g"))
+            }),
+            "spaces are kept"
+        );
+        let after = format!("\0{MARKER}\0PATH=/after\0GATE_BLENDER_ROOT=/after-root\0");
+        assert_eq!(
+            marked_login(&printed("", &["PATH=/usr/bin", "GATE_BLENDER_ROOT=/b"], &after), MARKER),
+            Ok(Login {
+                blender_root: Some("/b".to_owned()),
+                ..login("/usr/bin", None)
+            }),
+            "the first record is read, with no Godot root"
+        );
+        for no_root in [
+            &["PATH=/usr/bin", "GATE_BLENDER_ROOT="][..],
+            &["PATH=/usr/bin"],
+            &["PATH=/usr/bin", "XGATE_BLENDER_ROOT=/b"],
+        ] {
+            assert_eq!(
+                marked_login(&printed("", no_root, ""), MARKER),
+                Ok(login("/usr/bin", None)),
+                "{no_root:?}"
+            );
+        }
+        let mut bad_root = format!("\0{MARKER}\0PATH=/usr/bin\0GATE_BLENDER_ROOT=/b").into_bytes();
+        bad_root.push(0xff);
+        bad_root.push(0);
+        assert_eq!(marked_login(&bad_root, MARKER), Ok(login("/usr/bin", None)), "a root that is not UTF-8");
     }
 
     #[test]

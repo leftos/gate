@@ -35,6 +35,8 @@ const SIBLINGS: &str = "siblings.toml";
 const NO_READABLE_PIN: &str = "global.json has no readable sdk pin";
 /// The manifest tool whose engines this PC is looked for in only when its environment names `GATE_UNREAL_ROOT`.
 const UNREAL: &str = "unreal";
+/// The manifest tool whose installs this PC is looked for in only when its environment names `GATE_BLENDER_ROOT`.
+const BLENDER: &str = "blender";
 /// The manifest tool an Unreal Engine build needs beside the engine, at a .NET Framework SDK `UnrealBuildTool` finds.
 const NETFX_SDK: &str = "netfx-sdk";
 /// Why a `.gate` that is not a folder leaves the manifest unreadable.
@@ -94,6 +96,9 @@ pub(super) struct Declared {
     /// The exact Unreal Engine versions the manifest requires, as [`toolchain::unreal_required`] reads them: empty for
     /// any version, `None` when it names no unreal.
     pub unreal: Option<Vec<Pin>>,
+    /// The exact Blender versions the manifest requires, as [`toolchain::blender_required`] reads them: empty for any
+    /// version, `None` when it names no blender.
+    pub blender: Option<Vec<Pin>>,
     pub pin: Option<parity::Pin>,
     pub problems: Vec<Problem>,
     /// Whether the manifest is there but cannot be read whole.
@@ -212,6 +217,7 @@ pub(super) fn declared(root: &Path, declarations: &mut Declarations) -> Declared
     let read = Ok(manifest.clone());
     let godot = toolchain::godot_required(Some(&read), &[]);
     let unreal = toolchain::unreal_required(Some(&read));
+    let blender = toolchain::blender_required(Some(&read));
     let (pin, pin_problem) = read_pin(root);
     let pin_unreadable = pin_problem.is_some();
     if let Some(text) = pin_problem {
@@ -225,6 +231,7 @@ pub(super) fn declared(root: &Path, declarations: &mut Declarations) -> Declared
         manifest,
         godot,
         unreal,
+        blender,
         pin,
         problems,
         toolchain_unreadable,
@@ -329,6 +336,7 @@ fn checked(place: &Place, seams: &CheckSeams) -> Checked {
         tools,
         godot: declared.godot,
         unreal: declared.unreal,
+        blender: declared.blender,
         sdk,
         workloads: declared.manifest.workloads,
         consent_problem,
@@ -582,34 +590,52 @@ fn read_manifest(root: &Path, declarations: &mut Declarations) -> Result<Option<
 /// are looked for as this PC's SDK list looks for dotnet: along `PATH` with the folders inside the worktree `root`
 /// dropped, and one found that still lies inside it refused. An unreal on a PC whose environment names no
 /// `GATE_UNREAL_ROOT` is not checked here, as nothing says where its engines are, and a netfx-sdk beside it is not
-/// checked either, as the Unreal builds that need it are the ones not checked. A netfx-sdk is read from this PC's own
-/// list of .NET Framework SDKs, or from the key `netfx_key` names when a test seam gives one.
+/// checked either, as the Unreal builds that need it are the ones not checked. A blender on a PC whose environment names
+/// no `GATE_BLENDER_ROOT` is not checked here either. A netfx-sdk is read from this PC's own list of .NET Framework
+/// SDKs, or from the key `netfx_key` names when a test seam gives one.
 fn probed(needs: Vec<ToolNeed>, windows: probe::Windows, root: &Path, netfx_key: Option<&str>) -> Vec<Tool> {
     if needs.is_empty() {
         return Vec::new();
     }
     let names: Vec<String> = needs.iter().map(|need| need.name.clone()).collect();
     let variables = outside_worktree(Variables::from_process(), root);
-    let no_unreal_root = variables.as_ref().is_ok_and(|variables| variables.get(probe::UNREAL_ROOT).is_none());
-    let unreal_not_checked = no_unreal_root && names.iter().any(|name| name == UNREAL);
+    let no_root = |variable: &str| variables.as_ref().is_ok_and(|variables| variables.get(variable).is_none());
+    let no_unreal_root = no_root(probe::UNREAL_ROOT);
+    let roots = Unrooted {
+        no_unreal_root,
+        unreal_not_checked: no_unreal_root && names.iter().any(|name| name == UNREAL),
+        no_blender_root: no_root(probe::BLENDER_ROOT),
+    };
     probe::probe(&names, windows, variables, &[root], netfx_key)
         .into_iter()
         .zip(needs)
         .map(|((_, probed), need)| Tool {
-            not_checked: not_checked(&need.name, no_unreal_root, unreal_not_checked),
+            not_checked: not_checked(&need.name, roots),
             need,
             reported: Reported::from(&probed),
         })
         .collect()
 }
 
-/// Why the tool `name` is not checked here, `no_unreal_root` saying this PC's environment names no `GATE_UNREAL_ROOT`
-/// and `unreal_not_checked` that a need of unreal is therefore not checked: the unreal tool itself, and the netfx-sdk
-/// its builds need; `None` for a tool that is checked.
-fn not_checked(name: &str, no_unreal_root: bool, unreal_not_checked: bool) -> Option<String> {
+/// Which install roots this PC's environment does not name, so the tools found under them are not checked here.
+#[derive(Clone, Copy)]
+struct Unrooted {
+    /// The environment names no `GATE_UNREAL_ROOT`.
+    no_unreal_root: bool,
+    /// A need of unreal is not checked, as the environment names no `GATE_UNREAL_ROOT`.
+    unreal_not_checked: bool,
+    /// The environment names no `GATE_BLENDER_ROOT`.
+    no_blender_root: bool,
+}
+
+/// Why the tool `name` is not checked here, given the install roots `roots` this PC's environment does not name: the
+/// unreal tool itself and the netfx-sdk its builds need with no `GATE_UNREAL_ROOT`, and the blender tool with no
+/// `GATE_BLENDER_ROOT`; `None` for a tool that is checked.
+fn not_checked(name: &str, roots: Unrooted) -> Option<String> {
     match name {
-        UNREAL if no_unreal_root => Some(format!("{} is not set", probe::UNREAL_ROOT)),
-        NETFX_SDK if unreal_not_checked => Some(format!(
+        UNREAL if roots.no_unreal_root => Some(format!("{} is not set", probe::UNREAL_ROOT)),
+        BLENDER if roots.no_blender_root => Some(format!("{} is not set", probe::BLENDER_ROOT)),
+        NETFX_SDK if roots.unreal_not_checked => Some(format!(
             "{} is not set, so the Unreal builds that need it are not checked here",
             probe::UNREAL_ROOT
         )),
@@ -937,6 +963,7 @@ mod tests {
             manifest: Manifest::default(),
             godot: None,
             unreal: None,
+            blender: None,
             pin: None,
             problems: Vec::new(),
             toolchain_unreadable: true,

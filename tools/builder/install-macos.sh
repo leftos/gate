@@ -16,7 +16,7 @@
 #   bash install-macos.sh --admin --only Homebrew,FFmpeg
 #
 # Flags:
-#   --prefix <dir>   where every tool lands (default $HOME/gate-tools): dotnet, pwsh, node, godot, bin, downloads and
+#   --prefix <dir>   where every tool lands (default $HOME/gate-tools): dotnet, pwsh, node, godot, blender, bin, downloads and
 #                    install.log. A leading ~/ is expanded, so a quoted ~/dir passes through ssh.
 #   --root <dir>     the gate's work root (default $HOME/gate-remote), with work/ and bin/ under it, all mode 0700.
 #                    With --system the default is <builder home>/gate-remote, the home read with dscl; a ~/ given
@@ -345,6 +345,29 @@ step_godot() {
     rm -rf "$unpacked"
 }
 
+# The gate's macOS Blender support reads GATE_BLENDER_ROOT/<x.y.z>/Blender.app; this step only installs it.
+step_blender() {
+    local dest="$prefix/blender/5.2.2" mnt
+    # download.blender.org answers scripted requests 403; from a mirror the Blender project lists, with the SHA-256 its
+    # blender-5.2.2.sha256 publishes.
+    fetch 'https://mirrors.ocf.berkeley.edu/blender/release/Blender5.2/blender-5.2.2-macos-arm64.dmg'
+    check_sum 256 "$fetched" 'dc4125399b8bfefe283cc1624d6cfc7809d1cac20ace51072127eb371f31f210'
+    mnt=$(mktemp -d "${TMPDIR:-/tmp}/blender-dmg.XXXXXX")
+    hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$fetched" >/dev/null
+    # run_step runs a step in a subshell that exits right after it, so the subshell's EXIT trap detaches on success and
+    # on every failure alike; the mount point is expanded now, as the local is gone once the step returns, and neither
+    # command may fail the trap under set -e.
+    # shellcheck disable=SC2064
+    trap "hdiutil detach $(printf '%q' "$mnt") >/dev/null 2>&1 || :; rmdir $(printf '%q' "$mnt") 2>/dev/null || :" EXIT
+    [ -d "$mnt/Blender.app" ] || fail "no Blender.app at the top of ${fetched##*/}"
+    mkdir -p "$dest"
+    # Copied beside the old install and swapped in, so a failed copy leaves the old install whole.
+    rm -rf "$dest/Blender.app.new"
+    cp -R "$mnt/Blender.app" "$dest/Blender.app.new"
+    rm -rf "$dest/Blender.app"
+    mv "$dest/Blender.app.new" "$dest/Blender.app"
+}
+
 step_bun() {
     # From https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/SHASUMS256.txt
     fetch 'https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-darwin-aarch64.zip'
@@ -429,6 +452,7 @@ zprofile_block() {
         "export DOTNET_ROOT=\"$prefix/dotnet\"" \
         'export DOTNET_CLI_TELEMETRY_OPTOUT=1' \
         "export GATE_GODOT_ROOT=\"$prefix/godot\"" \
+        "export GATE_BLENDER_ROOT=\"$prefix/blender\"" \
         'export HOMEBREW_NO_AUTO_UPDATE=1' \
         'export HOMEBREW_NO_ANALYTICS=1' \
         "$zprofile_end"
@@ -790,6 +814,7 @@ summary() {
     version_of just "$cargo_home/bin/just" --version
     version_of git-lfs "$prefix/bin/git-lfs" --version
     version_of godot "$prefix/godot/4.7.2/Godot.app/Contents/MacOS/Godot" --headless --version
+    version_of blender "$prefix/blender/5.2.2/Blender.app/Contents/MacOS/Blender" --version
     version_of bun "$prefix/bin/bun" --version
     ffmpeg_summary
 }
@@ -807,6 +832,7 @@ step 'cargo-nextest 0.9.148' step_nextest
 step 'just 1.58.0' step_just
 step 'Git LFS 3.8.0' step_git_lfs
 step 'Godot 4.7.2 mono' step_godot
+step 'Blender 5.2.2 LTS' step_blender
 step 'Bun 1.4.2' step_bun
 step 'Homebrew' step_homebrew
 step 'FFmpeg' step_ffmpeg

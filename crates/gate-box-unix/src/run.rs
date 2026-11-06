@@ -19,9 +19,9 @@ use gate_inputs::failure::Caps;
 use gate_inputs::manifest::{Listing, Manifest};
 use gate_wire::drain::refused_lines;
 use gate_wire::{
-    BACK_COMMIT_NONE, BACK_COMMITS_FAILED, BoxKill, CROSS_STEP_START, CrossBuild, LAYOUT_CHANGING, PairSibling, PathForm, Payload, Refusal,
-    back_commits_line, bare_stem, busy_line, checkout_done_line, checkout_start_line, escaped, layout_line, layout_text, names_another_layout,
-    refused_line, trees,
+    BACK_COMMIT_NONE, BACK_COMMITS_FAILED, BoxKill, CROSS_STEP_START, CrossBuild, EngineKind, LAYOUT_CHANGING, PairSibling, PathForm, Payload,
+    Refusal, back_commits_line, bare_stem, busy_line, checkout_done_line, checkout_start_line, escaped, layout_line, layout_text,
+    names_another_layout, refused_line, trees,
 };
 
 use gate_watchdog::Pump;
@@ -190,6 +190,12 @@ pub struct Request<'p> {
     pub env: Vec<(String, String)>,
     /// The Godot version the run chose, `GodotVersion`; `None` for none.
     pub godot: Option<&'p str>,
+    /// The Blender version the run chose, `BlenderVersion`; `None` for none.
+    pub blender: Option<&'p str>,
+    /// The names `EngineEnv` sets to the chosen Blender install's program, in order; with no [`Request::blender`],
+    /// each is removed from what the box hands the command, a caller's pair for it kept. The tool and package restores
+    /// never see one: each is removed from the environment they inherit, and they take no caller's pairs.
+    pub blender_names: Vec<String>,
     /// The digest of the inputs manifest the PC sent before the run, `InputsDigest`; `None` for none.
     pub inputs_digest: Option<&'p str>,
     /// The outputs the run brings back after a passing command, and the test reports among them after a failed one,
@@ -204,7 +210,7 @@ pub struct Request<'p> {
 impl<'p> Request<'p> {
     /// Reads `payload` in the order the Windows box reads it, each key checked as it does, the outputs asked for
     /// ([`Asked::new`]) read once the output folder is; then notes the first thing asking for what this builder does not
-    /// build: `Desktop`, `CommitStage`, a warm-up's `WarmCommands`, `EngineEnv`, `UnrealVersion`, `SentDigest`,
+    /// build: `Desktop`, `CommitStage`, a warm-up's `WarmCommands`, an unreal `EngineEnv` name, `UnrealVersion`, `SentDigest`,
     /// `LfsDigest` or `SiblingLfsDigests`; then, last, the repos ([`repos`]), a sibling pair as `gate-wire` checks it. A work root holding a `:` is refused just
     /// after the work folder is read ([`work_layout`]).
     ///
@@ -239,8 +245,16 @@ impl<'p> Request<'p> {
         let identity = payload.identity()?;
         let env = payload.caller_env()?;
         let godot = payload.godot_version()?;
-        let engine_env = !payload.engine_env()?.is_empty();
+        let engine_env = payload.engine_env()?;
+        // Only an unreal name is refused: this builder serves Blender, never Unreal Engine.
+        let unreal_env = engine_env.iter().any(|(_, kind)| *kind == EngineKind::Unreal);
+        let blender_names: Vec<String> = engine_env
+            .into_iter()
+            .filter(|(_, kind)| *kind == EngineKind::Blender)
+            .map(|(name, _)| name)
+            .collect();
         let unreal = payload.unreal_version()?.is_some();
+        let blender = payload.blender_version()?;
         let inputs_digest = payload.inputs_digest()?;
         let sent = payload.sent_digest()?.is_some();
         let lfs = payload.lfs_digest()?.is_some();
@@ -254,7 +268,7 @@ impl<'p> Request<'p> {
             (desktop, Refusal::Desktop, "Desktop"),
             (commit_stage, Refusal::Layout, "CommitStage"),
             (warm, Refusal::Layout, "WarmCommands"),
-            (engine_env, Refusal::Layout, "EngineEnv"),
+            (unreal_env, Refusal::Layout, "EngineEnv"),
             (unreal, Refusal::Layout, "UnrealVersion"),
             (sent, Refusal::Sent, "SentDigest"),
             (lfs, Refusal::Lfs, "LfsDigest"),
@@ -280,6 +294,8 @@ impl<'p> Request<'p> {
             identity,
             env,
             godot,
+            blender,
+            blender_names,
             inputs_digest,
             outputs,
             cross,
@@ -362,6 +378,10 @@ pub struct Ready<'p> {
     /// The login shell's `GATE_GODOT_ROOT`, the folder of the builder's Godot installs; `None` when it is unset or
     /// empty, or the login shell could not be read, so Godot is missing.
     pub godot_root: Option<String>,
+    /// The program of the run's chosen Blender install, resolved before the restores under the login shell's
+    /// `GATE_BLENDER_ROOT` ([`resolved_blender`]); `Ok(None)` with no chosen version, `Err` with the line the command
+    /// ends 127 on when it did not resolve.
+    pub blender: Result<Option<String>, String>,
     /// The run's own temp folder, the command's `TMPDIR`, removed at the run's end ([`temp_removed`]); `None` when the
     /// caller's `Env` sets `TMPDIR`.
     pub temp: Option<RunTemp>,
@@ -631,6 +651,7 @@ fn prepared<'p, S: LineSink + 'static>(
             pump,
             login_path,
             godot_root,
+            blender,
             temp,
             outputs,
         }) => Ok(Ready {
@@ -642,6 +663,7 @@ fn prepared<'p, S: LineSink + 'static>(
             periods,
             login_path,
             godot_root,
+            blender,
             temp,
             outputs,
             packs: Packs::default(),
@@ -654,26 +676,37 @@ fn prepared<'p, S: LineSink + 'static>(
     }
 }
 
-/// The login shell's `PATH` and `GATE_GODOT_ROOT` read from `login`, the `PATH`'s empty and relative folders left out;
-/// `None`, with the box's own `PATH` kept, no Godot root and [`login_path_line`] said, when it cannot be read or its
-/// `PATH` holds no absolute folder.
+/// The login shell's `PATH`, `GATE_GODOT_ROOT` and `GATE_BLENDER_ROOT` read from `login`, the `PATH`'s empty and
+/// relative folders left out; `None`, with the box's own `PATH` kept, no Godot or Blender root and [`login_path_line`]
+/// said, when it cannot be read or its `PATH` holds no absolute folder.
 fn login_read<S: LineSink>(output: &Output<S>, login: LoginShell) -> Option<Login> {
-    let read = login().and_then(|Login { path, godot_root }| {
-        let folders: Vec<&str> = path.split(':').filter(|folder| folder.starts_with('/')).collect();
-        if folders.is_empty() {
-            Err("said a PATH with no absolute folder".to_owned())
-        } else {
-            Ok(Login {
-                path: folders.join(":"),
-                godot_root,
-            })
-        }
-    });
+    login_result(output, login).ok()
+}
+
+/// [`login_read`], `Err` with why the login shell could not be read in place of `None`.
+fn login_result<S: LineSink>(output: &Output<S>, login: LoginShell) -> Result<Login, String> {
+    let read = login().and_then(
+        |Login {
+             path,
+             godot_root,
+             blender_root,
+         }| {
+            let folders: Vec<&str> = path.split(':').filter(|folder| folder.starts_with('/')).collect();
+            if folders.is_empty() {
+                Err("said a PATH with no absolute folder".to_owned())
+            } else {
+                Ok(Login {
+                    path: folders.join(":"),
+                    godot_root,
+                    blender_root,
+                })
+            }
+        },
+    );
     read.inspect_err(|why| {
         // A note: the run goes on, and a client gone finds out at the next line.
         let _ = output.say(Stream::Err, GAT, &login_path_line(why));
     })
-    .ok()
 }
 
 /// The run's git for `request`, holding the work lock `lock`, found along `login_path`, its lines said through
@@ -854,7 +887,9 @@ fn run_reading<S: LineSink + 'static>(
 /// kill line and tag ([`killed_brought_back`]) and still ends killed, and any other kill packs nothing
 /// ([`pack_after_kill`]). Whatever path the run took, a client gone is ruled last, in one place ([`cut_ended`]). A run
 /// with a chosen Godot version runs with the install of it under the login shell's `GATE_GODOT_ROOT`
-/// ([`probe::installed_godot`]), or with Godot missing when there is no root or no such install.
+/// ([`probe::installed_godot`]), or with Godot missing when there is no root or no such install. A run with a chosen
+/// Blender version runs with the install [`locked`] resolved it to ([`resolved_blender`]), or, when it did not
+/// resolve, ends 127 before its command saying why.
 fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, watches: &Watches) -> u8 {
     let request = &ready.request;
     let login_path = ready.login_path.as_deref();
@@ -870,6 +905,7 @@ fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, 
             installed.as_deref().map_or(Godot::Missing, Godot::Installed)
         }
     };
+    let blender = &ready.blender;
     let launch = Launch {
         words: &request.command,
         place: &ready.place,
@@ -880,6 +916,8 @@ fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, 
         login_path,
         tmp: ready.temp.as_ref().map(RunTemp::tmpdir),
         godot,
+        blender: blender.as_ref().map(Option::as_deref).map_err(String::as_str),
+        blender_names: &request.blender_names,
         lock: &ready.lock,
         timeout: request.timeout,
         host: request.host,
@@ -906,6 +944,25 @@ fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, 
         status
     };
     cut_ended(ready, output, watches, end, status)
+}
+
+/// The program of the Blender install a run whose chosen version is `blender` uses, resolved once for the run: the
+/// install that version resolves to under the Blender root of the login shell read as `login`, its `--version` run
+/// along that shell's `PATH` ([`probe::installed_blender`]); `Ok(None)` with no version. `Err` with the line
+/// `gate: could not resolve blender <version>: <why>` when it does not resolve: `the login shell could not be read:
+/// <error>` when `login` is the error it could not be read with, `GATE_BLENDER_ROOT is not set` with no root.
+fn resolved_blender(blender: Option<&str>, login: Result<&Login, &str>) -> Result<Option<String>, String> {
+    let Some(version) = blender else {
+        return Ok(None);
+    };
+    login
+        .map_err(|error| format!("the login shell could not be read: {error}"))
+        .and_then(|login| {
+            let root = login.blender_root.as_deref().ok_or_else(|| "GATE_BLENDER_ROOT is not set".to_owned())?;
+            probe::installed_blender(root, version, Some(&login.path))
+        })
+        .map(|program| Some(program.to_string_lossy().into_owned()))
+        .map_err(|why| format!("gate: could not resolve blender {version}: {}", escaped(&why)))
 }
 
 /// What a run's packs leave for its last step ([`cut_ended`]).
@@ -1414,7 +1471,10 @@ fn locked<S: LineSink + 'static>(
     // the PC's files.
     let mut outputs = request.outputs.as_ref().map(|asked| RunOutputs::read(asked, input, output));
     let fresh = layout_checked(&laying).map_err(|not| not_laid_out(output, request, not))?;
-    let (login_path, godot_root) = login_read(output, login).map_or((None, None), |login| (Some(login.path), login.godot_root));
+    let login = login_result(output, login);
+    // Resolved before the tool and package restores, so a run whose Blender does not resolve restores nothing.
+    let blender = resolved_blender(request.blender, login.as_ref().map_err(String::as_str));
+    let (login_path, godot_root) = login.map_or((None, None), |login| (Some(login.path), login.godot_root));
     let git = run_git(request, lock, login_path.as_deref(), output);
     laid_out(&laying, &git, &fresh).map_err(|not| not_laid_out(output, request, not))?;
     inputs_matched(request, lock, output)?;
@@ -1437,13 +1497,21 @@ fn locked<S: LineSink + 'static>(
         return Err(Unready::Ended(said(output, &[&not_inside(request.subfolder)], USAGE_STATUS)));
     }
     let temp = temp_for(request, output)?;
+    // No Blender for a restore: each restore removes every blender name from what it inherits.
     let along = Along {
         path: login_path.as_deref(),
         tmp: temp.as_ref().map(RunTemp::tmpdir),
         godot: Godot::Unchosen,
+        blender: None,
+        blender_names: &request.blender_names,
         ceiling: None,
     };
-    let restored = tools::update(request, &place, lock, along, output).and_then(|()| packages::update(request, &place, lock, along, &git, output));
+    // A Blender that did not resolve skips the restores: the command then says why and ends 127 before it starts.
+    let restored = if blender.is_err() {
+        Ok(())
+    } else {
+        tools::update(request, &place, lock, along, output).and_then(|()| packages::update(request, &place, lock, along, &git, output))
+    };
     if let Err(unready) = restored {
         if let Some(temp) = temp {
             temp_removed(temp, output);
@@ -1458,18 +1526,21 @@ fn locked<S: LineSink + 'static>(
         pump,
         login_path,
         godot_root,
+        blender,
         temp,
         outputs,
     })
 }
 
 /// What [`locked`] readies for the command: its place, the heartbeat's pump, the login shell's `PATH` and
-/// `GATE_GODOT_ROOT`, the run's temp folder, and its outputs as they stand before the command.
+/// `GATE_GODOT_ROOT`, the run's Blender as it resolved ([`resolved_blender`]), the run's temp folder, and its outputs as
+/// they stand before the command.
 struct Placed {
     place: PathBuf,
     pump: Option<Pump>,
     login_path: Option<String>,
     godot_root: Option<String>,
+    blender: Result<Option<String>, String>,
     temp: Option<RunTemp>,
     outputs: Option<RunOutputs>,
 }
@@ -2466,6 +2537,8 @@ mod tests {
             login_path: None,
             tmp: None,
             godot: Godot::Unchosen,
+            blender: Ok(None),
+            blender_names: &[],
             lock: &ready.lock,
             timeout: None,
             host: "",
@@ -2762,7 +2835,11 @@ mod tests {
     /// The box's own `PATH` as the login shell's, and no Godot root, so a case starts no login shell.
     fn own_path() -> Result<Login, String> {
         let path = std::env::var("PATH").map_err(|error| error.to_string())?;
-        Ok(Login { path, godot_root: None })
+        Ok(Login {
+            path,
+            godot_root: None,
+            blender_root: None,
+        })
     }
 
     /// Whether [`counted_login`] was called.
@@ -2794,6 +2871,7 @@ mod tests {
         Ok(Login {
             path: "bin:".to_owned(),
             godot_root: Some("/Users/b/godot".to_owned()),
+            blender_root: Some("/Users/b/blender".to_owned()),
         })
     }
 
@@ -2818,6 +2896,7 @@ mod tests {
             Ok(Login {
                 path: "/usr/bin::bin".to_owned(),
                 godot_root: Some("/Users/b/godot".to_owned()),
+                blender_root: Some("/Users/b/blender".to_owned()),
             })
         };
         assert_eq!(
@@ -2825,8 +2904,33 @@ mod tests {
             Some(Login {
                 path: "/usr/bin".to_owned(),
                 godot_root: Some("/Users/b/godot".to_owned()),
+                blender_root: Some("/Users/b/blender".to_owned()),
             })
         );
+    }
+
+    /// A login shell that cannot be read.
+    fn unread_login() -> Result<Login, String> {
+        Err("the case's login shell".to_owned())
+    }
+
+    #[test]
+    fn a_blender_version_with_a_login_shell_that_cannot_be_read_ends_127_saying_so() {
+        let case = Case::new("blender-login-unread");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let keys = json!({
+            "Command": ["true"],
+            "Identity": identity(),
+            "BlenderVersion": "5.2.2",
+            "EngineEnv": { "MY_BLENDER": "blender" },
+        });
+        let payload = decoded(&case.json(&commit, &keys));
+        let output = Arc::new(Output::new(RecordingSink::default()));
+        let status = run_along(&payload, &output, &free_watches(), unread_login);
+        let err = err_of(&output);
+        assert_eq!(status, 127, "{err:?}");
+        let why = "gate: could not resolve blender 5.2.2: the login shell could not be read: the case's login shell";
+        assert!(err.iter().any(|line| line == why), "{err:?}");
     }
 
     thread_local! {
@@ -2845,6 +2949,7 @@ mod tests {
         let login = Login {
             path: front.map_or_else(|| own.clone(), |front| format!("{}:{own}", front.display())),
             godot_root: root.map(|root| root.display().to_string()),
+            blender_root: None,
         };
         GODOT_LOGIN.with(|cell| *cell.borrow_mut() = Some(login));
     }
@@ -5078,6 +5183,19 @@ mod tests {
         );
         let engine_env = json!({ "EngineEnv": { "MY_ENGINE": "unreal" } });
         assert_refused(&case, &engine_env, Refusal::Layout, &unbuilt_layout("EngineEnv"));
+        let mixed = json!({ "EngineEnv": { "MY_BLENDER": "blender", "MY_ENGINE": "unreal" } });
+        assert_refused(&case, &mixed, Refusal::Layout, &unbuilt_layout("EngineEnv"));
+    }
+
+    #[test]
+    fn a_blender_engine_env_is_not_refused_layout() {
+        let case = Case::new("blender-env");
+        let keys = json!({ "EngineEnv": { "MY_BLENDER": "blender" }, "BlenderVersion": "5.2.2" });
+        let payload = decoded(&case.json(&"a".repeat(40), &keys));
+        let request = Request::read(&payload).expect("the request reads");
+        assert!(request.unbuilt.is_none(), "{:?}", request.unbuilt.map(|unbuilt| unbuilt.key));
+        assert_eq!(request.blender, Some("5.2.2"));
+        assert_eq!(request.blender_names, ["MY_BLENDER"]);
     }
 
     #[test]
@@ -5628,6 +5746,7 @@ mod tests {
         Ok(Login {
             path: SHIM_PATH.with(|path| path.borrow().clone()),
             godot_root: None,
+            blender_root: None,
         })
     }
 

@@ -4,9 +4,10 @@
 //!
 //! The manifest is a `[tools]` table of `name = "version"`, where a version is a minimum (`major[.minor[.patch]]`, its
 //! missing parts 0) and `""` means present at any version, a top-level `workloads` array of .NET workload ids, and an
-//! `[env]` table of `NAME = "unreal"`, variables a routed run sets to the chosen Unreal Engine install's root. A
-//! file that does not parse is unreadable whole; a bad entry is skipped alone, with a problem naming it. The entries
-//! read otherwise are `godot` and `unreal`, whose values pin an exact version, as the pins read beside the manifest do:
+//! `[env]` table of `NAME = "unreal"` or `NAME = "blender"`, variables a routed run sets to the chosen Unreal Engine
+//! install's root or the chosen Blender install's `blender.exe`. A file that does not parse is unreadable whole; a bad
+//! entry is skipped alone, with a problem naming it. The entries read otherwise are `godot`, `unreal` and `blender`,
+//! whose values pin an exact version, as the pins read beside the manifest do:
 //! each local dotnet tool's version in `.config/dotnet-tools.json` and the `Godot.NET.Sdk` version a project file names.
 //! A manifest naming unreal needs a `netfx-sdk`, the .NET Framework SDK `UnrealBuildTool` looks for, at 4.6 or later
 //! besides, read as though it named one.
@@ -16,13 +17,13 @@ use toml::{Table, Value};
 
 use gate_args::MOST_ENV_NAMES;
 use gate_router::{escaped, parse_failure, spelled};
-use gate_wire::{Probed, engine_env_name_refused};
+use gate_wire::{EngineKind, Probed, engine_env_name_refused};
 
 use crate::remote::git::{FAILURE_BYTES, first_bytes};
 use crate::remote::parity::{Need, NeedKind, number};
 
 /// The tool names the manifest knows, as its `[tools]` keys spell them.
-pub(crate) const KNOWN_TOOLS: [&str; 10] = [
+pub(crate) const KNOWN_TOOLS: [&str; 11] = [
     "rust",
     "cargo-nextest",
     "node",
@@ -33,6 +34,7 @@ pub(crate) const KNOWN_TOOLS: [&str; 10] = [
     "unreal",
     "git-lfs",
     "netfx-sdk",
+    "blender",
 ];
 
 /// A tool whose manifest entry pins an exact version rather than a minimum, as its key spells it; its project files
@@ -42,6 +44,10 @@ const GODOT: &str = "godot";
 /// The other tool whose manifest entry pins an exact version rather than a minimum, as its key spells it; only the
 /// manifest pins it.
 const UNREAL: &str = "unreal";
+
+/// A third tool whose manifest entry pins an exact version rather than a minimum, as its key spells it; only the
+/// manifest pins it.
+const BLENDER: &str = "blender";
 
 /// The SDK a Godot .NET project names, its letter case aside as package ids are.
 const GODOT_SDK: &str = "Godot.NET.Sdk";
@@ -199,10 +205,13 @@ pub(crate) struct Manifest {
     pub godot: Option<Exact>,
     /// The `[tools] unreal` entry when the manifest names unreal, read as [`Manifest::godot`] is.
     pub unreal: Option<Exact>,
-    /// The `[env]` names that read, in file order: each a variable a routed run's commands get set to the root of the
-    /// Unreal Engine install the run chose, its value in the file being `"unreal"`. A name stays here when the manifest
-    /// pins no unreal, so the builder still removes a value it inherited, though [`Manifest::problems`] names it.
-    pub env: Vec<String>,
+    /// The `[tools] blender` entry when the manifest names blender, read as [`Manifest::godot`] is.
+    pub blender: Option<Exact>,
+    /// The `[env]` names that read, in file order, each with its kind: a variable a routed run's commands get set to
+    /// the root of the Unreal Engine install the run chose (`"unreal"` in the file) or to the `blender.exe` of the
+    /// Blender install it chose (`"blender"`). A name stays here when the manifest pins no install of its kind, so the
+    /// builder still removes a value it inherited, though [`Manifest::problems`] names it.
+    pub env: Vec<(String, EngineKind)>,
 }
 
 /// The line said when the manifest cannot be read, `why` being the reason [`read`] or [`read_bytes`] gives.
@@ -428,9 +437,16 @@ pub(crate) fn unreal_required(manifest: Option<&Result<Manifest, String>>) -> Op
     readable(manifest).and_then(|manifest| manifest.unreal).map(exact_pins)
 }
 
-/// The names a repo's manifest `[env]` sets to the root of the Unreal Engine install a routed run chose
+/// The versions a repo requires of a routed run's builder Blender installs: the manifest's own `blender` entry, empty
+/// for any version. `None` when the manifest names no blender, cannot be read or the repo has none, so nothing is
+/// judged and no version is chosen.
+pub(crate) fn blender_required(manifest: Option<&Result<Manifest, String>>) -> Option<Vec<Pin>> {
+    readable(manifest).and_then(|manifest| manifest.blender).map(exact_pins)
+}
+
+/// The names a repo's manifest `[env]` sets to an engine install a routed run chose, each with its kind
 /// ([`Manifest::env`]); none when the manifest names none, cannot be read or the repo has none.
-pub(crate) fn engine_env(manifest: Option<&Result<Manifest, String>>) -> Vec<String> {
+pub(crate) fn engine_env(manifest: Option<&Result<Manifest, String>>) -> Vec<(String, EngineKind)> {
     readable(manifest).map(|manifest| manifest.env.clone()).unwrap_or_default()
 }
 
@@ -514,9 +530,21 @@ pub(crate) fn godot_choice(required: Option<&[Pin]>, reported: &[(String, Report
 /// highest it listed at all, as godot's no-pin choice takes the newest; none for no entry or a pin no listed version
 /// meets.
 pub(crate) fn unreal_choice(required: Option<&[Pin]>, reported: &[(String, Reported)]) -> Option<String> {
+    exact_choice(required, reported, UNREAL)
+}
+
+/// Which of the builder's Blender installs a routed run uses, given the versions `required` the repo requires
+/// ([`blender_required`]) and what the preflight `reported` of each tool, chosen as [`unreal_choice`] chooses.
+pub(crate) fn blender_choice(required: Option<&[Pin]>, reported: &[(String, Reported)]) -> Option<String> {
+    exact_choice(required, reported, BLENDER)
+}
+
+/// Which of the builder's installs of the manifest-pinned tool `name` a routed run uses, given the versions `required`
+/// ([`unreal_choice`]).
+fn exact_choice(required: Option<&[Pin]>, reported: &[(String, Reported)], name: &str) -> Option<String> {
     match required? {
-        [] => listed_versions(reported, UNREAL).max().map(|version| version.to_string()),
-        [pin] => highest_meeting(pin, reported, UNREAL),
+        [] => listed_versions(reported, name).max().map(|version| version.to_string()),
+        [pin] => highest_meeting(pin, reported, name),
         _ => None,
     }
 }
@@ -640,7 +668,8 @@ fn reported_as(said: &str) -> Reported {
 /// is no regular file), declares that the builder `host` lacks, given the versions `godot` the repo requires of the
 /// builder's Godot installs ([`godot_required`]; `None` when it requires nothing of godot), the tools `sent` in the
 /// preflight's `Needs` and what it `reported` of them: a need for each sent tool it found missing or below its minimum,
-/// and one for a `godot`, or a manifest `unreal` ([`unreal_required`]), its installs do not serve, and a skip line for a
+/// and one for a `godot`, a manifest `unreal` ([`unreal_required`]) or a manifest `blender` ([`blender_required`]) its
+/// installs do not serve, and a skip line for a
 /// manifest that cannot be read, then for each problem of the manifest, then, in the manifest's order, for each tool not
 /// sent as unknown and each sent tool it did not probe, gave no answer for, or found at a version that cannot be read
 /// against a minimum. A known tool left unsent, as when the preflight could not carry the needs, says nothing, and so
@@ -660,7 +689,8 @@ pub(crate) fn judge(
         judged.skips.push(skip_line(file, why));
     }
     let unreal = unreal_required(manifest);
-    let exact = [(GODOT, godot), (UNREAL, unreal.as_deref())];
+    let blender = blender_required(manifest);
+    let exact = [(GODOT, godot), (UNREAL, unreal.as_deref()), (BLENDER, blender.as_deref())];
     if let Some(Ok(manifest)) = manifest {
         judged.skips.extend(manifest.problems.iter().map(|problem| skip_line(file, problem)));
         for tool in &manifest.tools {
@@ -840,8 +870,8 @@ pub(crate) fn read_bytes(bytes: &[u8]) -> Result<Manifest, String> {
 /// [`Manifest::problems`]: a tool whose value is not a string or not a version, a `tools` that is not a table, a
 /// `workloads` that is not an array, a workload that is not a string or is empty, a bad `env` entry ([`read_env`]), and
 /// a top-level key other than `tools`, `workloads` and `env`. A `godot` entry that reads is kept as its exact pin in
-/// [`Manifest::godot`] as well as among the tools. `env` names kept in a manifest that pins no unreal are each named
-/// as a problem too, and kept.
+/// [`Manifest::godot`] as well as among the tools. `env` names kept in a manifest that pins no install of their kind
+/// (no unreal for an `"unreal"` name, no blender for a `"blender"` one) are each named as a problem too, and kept.
 pub(crate) fn read(text: &str) -> Result<Manifest, String> {
     let table = text.parse::<Table>().map_err(|error| parse_failure(text, &error))?;
     let mut manifest = Manifest::default();
@@ -855,11 +885,16 @@ pub(crate) fn read(text: &str) -> Result<Manifest, String> {
                 .push(format!("{} is not a key of the manifest (tools, workloads, env)", spelled(&key))),
         }
     }
-    if manifest.unreal.is_none() {
-        for name in &manifest.env {
+    for (name, kind) in &manifest.env {
+        let pinned = match kind {
+            EngineKind::Unreal => manifest.unreal.is_some(),
+            EngineKind::Blender => manifest.blender.is_some(),
+        };
+        if !pinned {
+            let kind = kind.text();
             manifest
                 .problems
-                .push(format!("env.{} names the unreal install but the manifest pins no unreal", spelled(name)));
+                .push(format!("env.{} names the {kind} install but the manifest pins no {kind}", spelled(name)));
         }
     }
     add_netfx_sdk(&mut manifest);
@@ -892,12 +927,10 @@ fn add_netfx_sdk(manifest: &mut Manifest) {
     }
 }
 
-/// The one value an `[env]` entry may have: the root of the Unreal Engine install a routed run chose.
-const ENV_UNREAL: &str = "unreal";
-
-/// Reads the `env` value `value` into `manifest`, each entry a name or a problem: a value that is not the string
-/// `"unreal"`, a name the gate refuses ([`engine_env_name_refused`]), and a name an earlier entry kept in another
-/// ASCII letter case, the first one kept. Only the first [`MOST_ENV_NAMES`] entries are read; the rest are one problem.
+/// Reads the `env` value `value` into `manifest`, each entry a name and its kind or a problem: a value that is not the
+/// string `"unreal"` or `"blender"` ([`EngineKind`]), a name the gate refuses ([`engine_env_name_refused`]), and a name
+/// an earlier entry kept in another ASCII letter case, the first one kept. Only the first [`MOST_ENV_NAMES`] entries
+/// are read; the rest are one problem.
 fn read_env(value: Value, manifest: &mut Manifest) {
     let entries = match value {
         Value::Table(entries) => entries,
@@ -911,27 +944,28 @@ fn read_env(value: Value, manifest: &mut Manifest) {
     }
     for (name, value) in entries.into_iter().take(MOST_ENV_NAMES) {
         match env_entry(&name, &value, &manifest.env) {
-            Ok(()) => manifest.env.push(name),
+            Ok(kind) => manifest.env.push((name, kind)),
             Err(problem) => manifest.problems.push(problem),
         }
     }
 }
 
-/// Whether the `[env]` entry `name` whose value is `value` is kept beside the names `kept`; `Err` with its problem.
-fn env_entry(name: &str, value: &Value, kept: &[String]) -> Result<(), String> {
+/// The kind of the `[env]` entry `name` whose value is `value`, when it is kept beside the names `kept`; `Err` with
+/// its problem.
+fn env_entry(name: &str, value: &Value, kept: &[(String, EngineKind)]) -> Result<EngineKind, String> {
     let Value::String(text) = value else {
         return Err(format!("env.{} is not a string (TOML {})", spelled(name), value.type_str()));
     };
     if engine_env_name_refused(name) {
         return Err(format!("env.{} is a name the gate sets or refuses", spelled(name)));
     }
-    if text != ENV_UNREAL {
-        return Err(format!("env.{} is not \"{ENV_UNREAL}\": {text:?}", spelled(name)));
-    }
-    if kept.iter().any(|earlier| earlier.eq_ignore_ascii_case(name)) {
+    let Some(kind) = EngineKind::from_text(text) else {
+        return Err(format!("env.{} is not \"unreal\" or \"blender\": {text:?}", spelled(name)));
+    };
+    if kept.iter().any(|(earlier, _)| earlier.eq_ignore_ascii_case(name)) {
         return Err(format!("env.{} is named twice", spelled(name)));
     }
-    Ok(())
+    Ok(kind)
 }
 
 /// `text` without a leading byte order mark.
@@ -957,6 +991,9 @@ fn read_tools(value: Value, manifest: &mut Manifest) {
                 if tool.name == UNREAL {
                     manifest.unreal = exact_entry(&value);
                 }
+                if tool.name == BLENDER {
+                    manifest.blender = exact_entry(&value);
+                }
                 manifest.tools.push(tool);
             }
             Err(problem) => manifest.problems.push(problem),
@@ -981,7 +1018,7 @@ fn tool_need(name: &str, value: &Value) -> Result<ToolNeed, String> {
     })
 }
 
-/// The `[tools] godot` or `[tools] unreal` entry the value `value` pins, [`tool_need`] having just read it: `None` for a
+/// The `[tools] godot`, `[tools] unreal` or `[tools] blender` entry the value `value` pins, [`tool_need`] having just read it: `None` for a
 /// value that is no string or names no version at all, which [`tool_need`] has already named as a problem, so that no
 /// entry is read as a pin and, for godot, the project files' own pins apply.
 fn exact_entry(value: &Value) -> Option<Exact> {
@@ -1168,12 +1205,14 @@ fn attributes(text: &str) -> Vec<(&str, &str)> {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a fixture that does not read must fail loudly")]
 mod tests {
+    use gate_wire::EngineKind;
+
     use super::{
         Exact, GodotChoice, Judged, MANIFEST_SAID, Manifest, NoChosenGodot, Pin, Pinned, Reported, Standing, ToolNeed, Version, add_git_lfs,
-        dotnet_tools, engine_env, godot_choice, godot_not_listed_line, godot_pins_read, godot_required, godot_sdk_pins, is_sent, judge,
-        judge_with_git_lfs, meets, needs_of, newest_godot, no_chosen_godot, no_godot_install_line, no_pin_godot_warning, pinned, read, read_bytes,
-        reported, reported_as, routed_needs, several_godot_line, skip_line, standing, unreadable_godot_pins_line, unreadable_line, unreal_choice,
-        with_git_lfs,
+        blender_choice, blender_required, dotnet_tools, engine_env, godot_choice, godot_not_listed_line, godot_pins_read, godot_required,
+        godot_sdk_pins, is_sent, judge, judge_with_git_lfs, meets, needs_of, newest_godot, no_chosen_godot, no_godot_install_line,
+        no_pin_godot_warning, pinned, read, read_bytes, reported, reported_as, routed_needs, several_godot_line, skip_line, standing,
+        unreadable_godot_pins_line, unreadable_line, unreal_choice, with_git_lfs,
     };
     use crate::remote::git::FAILURE_BYTES;
     use crate::remote::parity::{Need, NeedKind};
@@ -1547,35 +1586,113 @@ mod tests {
         format!("[tools]\nunreal = \"5.8\"\n[env]\n{entries}")
     }
 
+    /// The `[env]` pairs naming each of `names` with the unreal kind, in order.
+    fn unreal_env(names: &[&str]) -> Vec<(String, EngineKind)> {
+        names.iter().map(|name| ((*name).to_owned(), EngineKind::Unreal)).collect()
+    }
+
     #[test]
     fn an_env_entry_naming_unreal_is_read() {
         let read = manifest(&with_env("UE_MCP_TEST_ENGINE_ROOT = \"unreal\"\n"));
-        assert_eq!(read.env, owned(&["UE_MCP_TEST_ENGINE_ROOT"]));
+        assert_eq!(read.env, unreal_env(&["UE_MCP_TEST_ENGINE_ROOT"]));
         assert_eq!(read.problems, Vec::<String>::new());
-        assert_eq!(engine_env(Some(&Ok(read))), owned(&["UE_MCP_TEST_ENGINE_ROOT"]));
-        assert_eq!(engine_env(None), Vec::<String>::new(), "no manifest names none");
+        assert_eq!(engine_env(Some(&Ok(read))), unreal_env(&["UE_MCP_TEST_ENGINE_ROOT"]));
+        assert_eq!(engine_env(None), Vec::new(), "no manifest names none");
+        assert_eq!(engine_env(Some(&Err("bad".to_owned()))), Vec::new(), "an unreadable one names none");
+    }
+
+    #[test]
+    fn an_env_value_other_than_unreal_or_blender_is_a_problem() {
+        let read = manifest(&with_env("A = \"godot\"\nB = \"Unreal\"\nC = 1\nD = \"unreal\"\nE = \"Blender\"\n"));
+        assert_eq!(read.env, unreal_env(&["D"]));
         assert_eq!(
-            engine_env(Some(&Err("bad".to_owned()))),
-            Vec::<String>::new(),
-            "an unreadable one names none"
+            read.problems,
+            [
+                "env.A is not \"unreal\" or \"blender\": \"godot\"",
+                "env.B is not \"unreal\" or \"blender\": \"Unreal\"",
+                "env.C is not a string (TOML integer)",
+                "env.E is not \"unreal\" or \"blender\": \"Blender\"",
+            ]
+        );
+        let read = manifest("env = \"unreal\"\n[tools]\nunreal = \"\"\n");
+        assert_eq!(read.env, Vec::new());
+        assert_eq!(read.problems, ["env is not a table (TOML string)"]);
+    }
+
+    #[test]
+    fn an_env_blender_name_is_kept_with_its_kind() {
+        let read = manifest("[tools]\nblender = \"5.2\"\nunreal = \"5.8\"\n[env]\nBLENDER_EXE = \"blender\"\nUE_ENGINE = \"unreal\"\n");
+        let kept = vec![
+            ("BLENDER_EXE".to_owned(), EngineKind::Blender),
+            ("UE_ENGINE".to_owned(), EngineKind::Unreal),
+        ];
+        assert_eq!(read.env, kept);
+        assert_eq!(read.problems, Vec::<String>::new());
+        assert_eq!(engine_env(Some(&Ok(read))), kept);
+    }
+
+    #[test]
+    fn an_env_blender_name_without_a_blender_pin_is_a_problem() {
+        let read = manifest("[tools]\nunreal = \"5.8\"\n[env]\nBLENDER_EXE = \"blender\"\nUE_ENGINE = \"unreal\"\n");
+        assert_eq!(
+            read.env,
+            vec![
+                ("BLENDER_EXE".to_owned(), EngineKind::Blender),
+                ("UE_ENGINE".to_owned(), EngineKind::Unreal)
+            ],
+            "the name is still kept"
+        );
+        assert_eq!(
+            read.problems,
+            ["env.BLENDER_EXE names the blender install but the manifest pins no blender"]
         );
     }
 
     #[test]
-    fn an_env_value_other_than_unreal_is_a_problem() {
-        let read = manifest(&with_env("A = \"godot\"\nB = \"Unreal\"\nC = 1\nD = \"unreal\"\n"));
-        assert_eq!(read.env, owned(&["D"]));
+    fn a_blender_pin_is_read_as_an_exact_pin() {
         assert_eq!(
-            read.problems,
-            [
-                "env.A is not \"unreal\": \"godot\"",
-                "env.B is not \"unreal\": \"Unreal\"",
-                "env.C is not a string (TOML integer)",
-            ]
+            manifest("[tools]\nblender = \"5.2\"\n").blender,
+            Some(Exact::Exactly(Pin::parse("5.2").expect("the pin reads")))
         );
-        let read = manifest("env = \"unreal\"\n[tools]\nunreal = \"\"\n");
-        assert_eq!(read.env, Vec::<String>::new());
-        assert_eq!(read.problems, ["env is not a table (TOML string)"]);
+        assert_eq!(manifest("[tools]\nblender = \"\"\n").blender, Some(Exact::Any));
+        assert_eq!(manifest("[tools]\nnode = \"24\"\n").blender, None, "a manifest naming no blender");
+        assert_eq!(
+            blender_required(Some(&Ok(manifest("[tools]\nblender = \"5.2.2\"\n")))),
+            Some(pins_of(&["5.2.2"]))
+        );
+        assert_eq!(blender_required(Some(&Ok(manifest("[tools]\nnode = \"24\"\n")))), None);
+        assert_eq!(
+            manifest("[tools]\nblender = \"5.2\"\n").tools,
+            [tool("blender", Some(version(5, 2, 0)), true)]
+        );
+    }
+
+    #[test]
+    fn a_blender_pin_the_builder_lacks_is_a_parity_mismatch() {
+        assert_eq!(
+            judged("[tools]\nblender = \"5.3\"\n", &["gate: remote tool blender 5.2.2"]),
+            Judged {
+                needs: vec![lacks("blender 5.3 exactly", "5.2.2")],
+                skips: Vec::new(),
+            }
+        );
+        assert_eq!(
+            judged("[tools]\nblender = \"5.2\"\n", &["gate: remote tool blender 5.2.2"]),
+            Judged::default(),
+            "a listed version meeting the pin"
+        );
+    }
+
+    #[test]
+    fn blender_choice_picks_the_highest_listed_meeting_the_pin() {
+        let listed = vec![
+            ("node".to_owned(), Reported::Version("24.0.0".to_owned())),
+            ("blender".to_owned(), Reported::Version("5.2.2,5.2.1".to_owned())),
+        ];
+        assert_eq!(blender_choice(Some(&pins_of(&["5.2"])), &listed).as_deref(), Some("5.2.2"));
+        assert_eq!(blender_choice(Some(&[]), &listed).as_deref(), Some("5.2.2"), "any version");
+        assert_eq!(blender_choice(Some(&pins_of(&["5.3"])), &listed), None, "a pin none meets");
+        assert_eq!(blender_choice(None, &listed), None, "no blender entry");
     }
 
     #[test]
@@ -1585,13 +1702,14 @@ mod tests {
             "GODOT_PATH",
             "GATE_ANYTHING",
             "ue_root",
+            "TMPDIR",
             "GIT_WORK_TREE",
             "git_dir",
             "A-B",
             "_1-",
         ] {
             let read = manifest(&with_env(&format!("{name} = \"unreal\"\nKEPT = \"unreal\"\n")));
-            assert_eq!(read.env, owned(&["KEPT"]), "{name}");
+            assert_eq!(read.env, unreal_env(&["KEPT"]), "{name}");
             assert_eq!(read.problems, [format!("env.{name} is a name the gate sets or refuses")]);
         }
         let read = manifest(&with_env("\"A=B\" = \"unreal\"\n"));
@@ -1603,7 +1721,8 @@ mod tests {
         let names = |count: usize| -> Vec<String> { (0..count).map(|at| format!("N{at}")).collect() };
         let entries = |count: usize| -> String { names(count).iter().map(|name| name.clone() + " = \"unreal\"\n").collect() };
         let read = manifest(&with_env(&entries(66)));
-        assert_eq!(read.env, names(64));
+        let kept: Vec<String> = read.env.iter().map(|(name, _)| name.clone()).collect();
+        assert_eq!(kept, names(64));
         assert_eq!(read.problems, ["env has more than 64 names"]);
         assert_eq!(manifest(&with_env(&entries(64))).problems, Vec::<String>::new(), "64 is within the cap");
     }
@@ -1611,19 +1730,19 @@ mod tests {
     #[test]
     fn an_env_name_twice_in_another_case_is_a_problem() {
         let read = manifest(&with_env("Engine_Root = \"unreal\"\nENGINE_ROOT = \"unreal\"\n"));
-        assert_eq!(read.env, owned(&["Engine_Root"]), "the first is kept");
+        assert_eq!(read.env, unreal_env(&["Engine_Root"]), "the first is kept");
         assert_eq!(read.problems, ["env.ENGINE_ROOT is named twice"]);
     }
 
     #[test]
     fn an_env_entry_without_an_unreal_pin_is_a_problem_and_still_named() {
         let read = manifest("[env]\nUE_MCP_TEST_ENGINE_ROOT = \"unreal\"\n[tools]\nnode = \"24\"\n");
-        assert_eq!(read.env, owned(&["UE_MCP_TEST_ENGINE_ROOT"]));
+        assert_eq!(read.env, unreal_env(&["UE_MCP_TEST_ENGINE_ROOT"]));
         assert_eq!(
             read.problems,
             ["env.UE_MCP_TEST_ENGINE_ROOT names the unreal install but the manifest pins no unreal"]
         );
-        assert_eq!(engine_env(Some(&Ok(read))), owned(&["UE_MCP_TEST_ENGINE_ROOT"]));
+        assert_eq!(engine_env(Some(&Ok(read))), unreal_env(&["UE_MCP_TEST_ENGINE_ROOT"]));
     }
 
     #[test]

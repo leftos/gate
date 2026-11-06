@@ -250,18 +250,43 @@ pub struct Payload {
     form: PathForm,
 }
 
-/// The key naming the variables a run's commands get set to the chosen Unreal Engine install's root.
+/// The key naming the variables a run's commands get set to a chosen engine install: the Unreal Engine install's root,
+/// or the Blender install's `blender.exe`.
 const ENGINE_ENV: &str = "EngineEnv";
 
-/// The one value an [`ENGINE_ENV`] entry may have.
-const ENGINE_ENV_UNREAL: &str = "unreal";
+/// The install a repo's toolchain manifest `[env]` name, and an [`ENGINE_ENV`] entry, points at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineKind {
+    /// The chosen Unreal Engine install's root folder.
+    Unreal,
+    /// The chosen Blender install's program.
+    Blender,
+}
+
+impl EngineKind {
+    /// The text the manifest and the payload spell the kind with: `"unreal"` or `"blender"`.
+    #[must_use]
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::Unreal => "unreal",
+            Self::Blender => "blender",
+        }
+    }
+
+    /// The kind `text` spells ([`EngineKind::text`]), compared exactly; `None` for any other text.
+    #[must_use]
+    pub fn from_text(text: &str) -> Option<Self> {
+        [Self::Unreal, Self::Blender].into_iter().find(|kind| kind.text() == text)
+    }
+}
 
 /// The prefix of the names git reads, none of which a manifest `[env]` may set, compared without regard to ASCII case.
 const GIT_NAME_PREFIX: &str = "GIT_";
 
 /// Whether `name` cannot be a name a repo's toolchain manifest `[env]` sets, as the PC reads the manifest and the box
 /// reads `EngineEnv`: a name that is not an ASCII letter or `_` followed by ASCII letters, digits and `_`, a name
-/// starting with `GIT_` in any ASCII case, and a name `--env` refuses ([`env_refusal`]).
+/// starting with `GIT_` in any ASCII case, `TMPDIR` in any ASCII case, which a macOS box sets to the run's own temp
+/// folder, and a name `--env` refuses ([`env_refusal`]).
 #[must_use]
 pub fn engine_env_name_refused(name: &str) -> bool {
     let mut bytes = name.bytes();
@@ -270,7 +295,7 @@ pub fn engine_env_name_refused(name: &str) -> bool {
     let git = name
         .get(..GIT_NAME_PREFIX.len())
         .is_some_and(|start| start.eq_ignore_ascii_case(GIT_NAME_PREFIX));
-    !well_formed || git || env_refusal(name, "").is_some()
+    !well_formed || git || name.eq_ignore_ascii_case("TMPDIR") || env_refusal(name, "").is_some()
 }
 
 /// A macOS builder's cross build, the payload's `CrossBuild`: a second build the box runs after a passing command, whose
@@ -703,6 +728,11 @@ impl Payload {
         self.install_version("UnrealVersion")
     }
 
+    /// The version of the builder's Blender install the run uses, `BlenderVersion` ([`Payload::install_version`]).
+    pub fn blender_version(&self) -> Result<Option<&str>, String> {
+        self.install_version("BlenderVersion")
+    }
+
     /// The version of an install of the builder the run uses, under the key `key`: a canonical `major.minor.patch`
     /// ([`is_canonical_version`]), as it is joined into an install's path; `None` when the key is absent or null. Else
     /// the usage line, the value shortened and shown with its control characters escaped.
@@ -717,13 +747,13 @@ impl Payload {
         }
     }
 
-    /// The names the run's commands get set to the root of the Unreal Engine install it uses, `EngineEnv`: an object of
-    /// each name and `"unreal"`, as the repo's toolchain manifest `[env]` names them; none when the key is absent or
-    /// null. Else the usage line: not an object of texts, over the cap `Env` and `EngineEnv` share
-    /// (`gate_args::MOST_ENV_NAMES`, `gate_args::MOST_ENV_BYTES`), a name the gate refuses ([`engine_env_name_refused`]),
-    /// a value other than `"unreal"`, or a name given twice in any ASCII case, the name shortened and escaped. The cap is
-    /// counted over the raw objects before any pair is copied.
-    pub fn engine_env(&self) -> Result<Vec<String>, String> {
+    /// The names the run's commands get set to an engine install it uses, each with its kind, `EngineEnv`: an object of
+    /// each name and `"unreal"` or `"blender"` ([`EngineKind`]), as the repo's toolchain manifest `[env]` names them;
+    /// none when the key is absent or null. Else the usage line: not an object of texts, over the cap `Env` and
+    /// `EngineEnv` share (`gate_args::MOST_ENV_NAMES`, `gate_args::MOST_ENV_BYTES`), a name the gate refuses
+    /// ([`engine_env_name_refused`]), a value other than `"unreal"` or `"blender"`, or a name given twice in any ASCII
+    /// case, the name shortened and escaped. The cap is counted over the raw objects before any pair is copied.
+    pub fn engine_env(&self) -> Result<Vec<(String, EngineKind)>, String> {
         let (names, bytes) = self.pair_size(ENGINE_ENV)?.unwrap_or_default();
         let (env_names, env_bytes) = self.pair_size("Env")?.unwrap_or_default();
         if over_cap(names + env_names, bytes + env_bytes) {
@@ -733,22 +763,22 @@ impl Payload {
             ));
         }
         let pairs = self.pairs(ENGINE_ENV)?;
-        let mut names: Vec<String> = Vec::with_capacity(pairs.len());
+        let mut names: Vec<(String, EngineKind)> = Vec::with_capacity(pairs.len());
         for (name, value) in pairs {
             let shown = escaped(&shown_name(&name));
             if engine_env_name_refused(&name) {
                 return Err(format!("gate: box payload {ENGINE_ENV} sets {shown}, a name the gate sets or refuses"));
             }
-            if value != ENGINE_ENV_UNREAL {
+            let Some(kind) = EngineKind::from_text(&value) else {
                 return Err(format!(
-                    "gate: box payload {ENGINE_ENV} gives {shown} a value other than \"{ENGINE_ENV_UNREAL}\": '{}'",
+                    "gate: box payload {ENGINE_ENV} gives {shown} a value other than \"unreal\" or \"blender\": '{}'",
                     escaped(&shown_name(&value))
                 ));
-            }
-            if names.iter().any(|earlier| earlier.eq_ignore_ascii_case(&name)) {
+            };
+            if names.iter().any(|(earlier, _)| earlier.eq_ignore_ascii_case(&name)) {
                 return Err(format!("gate: box payload {ENGINE_ENV} names {shown} twice"));
             }
-            names.push(name);
+            names.push((name, kind));
         }
         Ok(names)
     }
@@ -1665,6 +1695,35 @@ pub fn is_canonical_version(text: &str) -> bool {
     parts.len() == 3 && parts.iter().all(canonical)
 }
 
+/// The prefix a Blender install's folder may carry before its version, as Blender's Windows installer names it.
+const BLENDER_FOLDER_PREFIX: &str = "Blender ";
+
+/// Whether `name` is a version as a folder or a registry key names one: one to three dot-separated runs of ASCII
+/// digits, each of 1 to [`MAX_PART_DIGITS`] digits, such as `4.8` or `4.7.2`.
+#[must_use]
+pub fn is_version_name(name: &str) -> bool {
+    let parts: Vec<&str> = name.split('.').collect();
+    let part = |part: &&str| (1..=MAX_PART_DIGITS).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_digit());
+    (1..=3).contains(&parts.len()) && parts.iter().all(part)
+}
+
+/// The version a Blender install's folder is named for: the name with an optional leading `Blender ` removed, when the
+/// rest is a version name ([`is_version_name`]), so `Blender 5.2` gives `5.2` and `5.2.2` gives itself. `None` for any
+/// other name, such as `Blender`, `5.x` or `Blender 5.2 LTS`.
+#[must_use]
+pub fn blender_folder_version(name: &str) -> Option<&str> {
+    let version = name.strip_prefix(BLENDER_FOLDER_PREFIX).unwrap_or(name);
+    is_version_name(version).then_some(version)
+}
+
+/// Whether `version` meets the version a folder is named for, `folder`: each part `folder` gives equals `version`'s
+/// part at the same place, so `5.2` meets `5.2.2` and `5.2.2` meets only `5.2.2`.
+#[must_use]
+pub fn version_meets(folder: &str, version: &str) -> bool {
+    let mut given = version.split('.');
+    folder.split('.').all(|part| given.next() == Some(part))
+}
+
 /// Whether `value` is a path absolute on a drive, `X:\…` or `X:/…`, with no character below U+0020.
 #[must_use]
 pub fn is_drive_path(value: &str) -> bool {
@@ -2137,9 +2196,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        BACK_COMMIT_NONE, BACK_COMMITS_FAILED, CROSS_BUILD_START, CROSS_NOT_BROUGHT_BACK, CROSS_STEP_START, CrossBuild, NEW_WORK_TREE, PathForm,
-        Payload, Probed, back_commits_line, created_line, escaped, first_version, is_cross_not_brought_back, is_cross_step_start, probed,
-        root_busy_line, root_unsafe_line, runs_probe, sdk_list, sdks_line, tool_line, version_line, version_of, version_text, warm_line, work_root,
+        BACK_COMMIT_NONE, BACK_COMMITS_FAILED, CROSS_BUILD_START, CROSS_NOT_BROUGHT_BACK, CROSS_STEP_START, CrossBuild, EngineKind, NEW_WORK_TREE,
+        PathForm, Payload, Probed, back_commits_line, blender_folder_version, created_line, escaped, first_version, is_cross_not_brought_back,
+        is_cross_step_start, probed, root_busy_line, root_unsafe_line, runs_probe, sdk_list, sdks_line, tool_line, version_line, version_meets,
+        version_of, version_text, warm_line, work_root,
     };
 
     #[test]
@@ -2919,8 +2979,93 @@ mod tests {
         );
     }
 
+    /// What the `BlenderVersion` reader makes of the payload whose `BlenderVersion` is `version`.
+    fn blender_version_of(version: &serde_json::Value) -> Result<Option<String>, String> {
+        decoded(&json!({ "BlenderVersion": version }).to_string()).and_then(|payload| payload.blender_version().map(|read| read.map(str::to_owned)))
+    }
+
+    /// `BlenderVersion` is read as `UnrealVersion` is, with its own key in the refusal, and a null one is none.
+    #[test]
+    fn a_blender_version_is_read_like_an_unreal_version() {
+        for version in ["5.2.2", "0.0.0", "5.10.3", "9999999999.0.1"] {
+            assert_eq!(blender_version_of(&json!(version)), Ok(Some(version.to_owned())), "{version}");
+        }
+        for version in ["05.2.2", "5.02.2", "5.2.00", "5.2", "99999999999.0.1", "5.2.12345678901"] {
+            assert_eq!(
+                blender_version_of(&json!(version)),
+                Err(format!("gate: box payload BlenderVersion is not a version: '{version}'")),
+                "{version}"
+            );
+        }
+        assert_eq!(blender_version_of(&serde_json::Value::Null), Ok(None));
+        assert_eq!(
+            decoded("{}").and_then(|payload| payload.blender_version().map(|read| read.is_none())),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn blender_folder_version_reads_a_prefixed_minor_folder() {
+        assert_eq!(blender_folder_version("Blender 5.2"), Some("5.2"));
+    }
+
+    #[test]
+    fn blender_folder_version_reads_a_bare_version_folder() {
+        assert_eq!(blender_folder_version("5.2.2"), Some("5.2.2"));
+    }
+
+    #[test]
+    fn blender_folder_version_refuses_a_folder_with_no_version() {
+        assert_eq!(blender_folder_version("Blender"), None);
+    }
+
+    #[test]
+    fn blender_folder_version_refuses_a_part_that_is_not_digits() {
+        assert_eq!(blender_folder_version("5.x"), None);
+    }
+
+    #[test]
+    fn blender_folder_version_refuses_a_label_after_the_version() {
+        assert_eq!(blender_folder_version("Blender 5.2 LTS"), None);
+    }
+
+    #[test]
+    fn blender_folder_version_refuses_two_spaces_after_the_prefix() {
+        assert_eq!(blender_folder_version("Blender  5.2"), None);
+    }
+
+    #[test]
+    fn blender_folder_version_refuses_a_part_past_the_digit_cap() {
+        assert_eq!(blender_folder_version("Blender 99999999999999999999.2"), None);
+    }
+
+    #[test]
+    fn a_minor_folder_meets_each_patch_of_its_minor() {
+        assert!(version_meets("5.2", "5.2.2"));
+    }
+
+    #[test]
+    fn a_full_folder_meets_its_own_version() {
+        assert!(version_meets("5.2.2", "5.2.2"));
+    }
+
+    #[test]
+    fn a_full_folder_does_not_meet_another_patch() {
+        assert!(!version_meets("5.2.2", "5.2.3"));
+    }
+
+    #[test]
+    fn a_minor_folder_does_not_meet_another_minor() {
+        assert!(!version_meets("5.3", "5.2.2"));
+    }
+
+    #[test]
+    fn a_major_folder_meets_each_version_of_its_major() {
+        assert!(version_meets("5", "5.2.2"));
+    }
+
     /// What the `EngineEnv` reader makes of the payload whose `EngineEnv` is `engine_env`.
-    fn engine_env_of(engine_env: &serde_json::Value) -> Result<Vec<String>, String> {
+    fn engine_env_of(engine_env: &serde_json::Value) -> Result<Vec<(String, EngineKind)>, String> {
         decoded(&json!({ "EngineEnv": engine_env }).to_string()).and_then(|payload| payload.engine_env())
     }
 
@@ -2928,10 +3073,18 @@ mod tests {
     fn engine_env_names_are_read_in_order_and_none_when_absent_or_null() {
         assert_eq!(
             engine_env_of(&json!({ "UE_MCP_TEST_ENGINE_ROOT": "unreal", "OTHER_ROOT": "unreal" })),
-            Ok(vec!["UE_MCP_TEST_ENGINE_ROOT".to_owned(), "OTHER_ROOT".to_owned()])
+            Ok(vec![
+                ("UE_MCP_TEST_ENGINE_ROOT".to_owned(), EngineKind::Unreal),
+                ("OTHER_ROOT".to_owned(), EngineKind::Unreal)
+            ])
         );
         assert_eq!(engine_env_of(&serde_json::Value::Null), Ok(Vec::new()));
         assert_eq!(decoded("{}").and_then(|payload| payload.engine_env()), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn a_blender_engine_env_name_is_read_with_its_kind() {
+        assert_eq!(engine_env_of(&json!({ "A": "blender" })), Ok(vec![("A".to_owned(), EngineKind::Blender)]));
     }
 
     #[test]
@@ -2944,8 +3097,12 @@ mod tests {
             );
         }
         assert_eq!(
+            engine_env_of(&json!({ "A": "maya" })),
+            Err("gate: box payload EngineEnv gives A a value other than \"unreal\" or \"blender\": 'maya'".to_owned())
+        );
+        assert_eq!(
             engine_env_of(&json!({ "A": "godot\n" })),
-            Err("gate: box payload EngineEnv gives A a value other than \"unreal\": 'godot\\n'".to_owned())
+            Err("gate: box payload EngineEnv gives A a value other than \"unreal\" or \"blender\": 'godot\\n'".to_owned())
         );
         assert_eq!(
             engine_env_of(&json!({ "Engine_Root": "unreal", "ENGINE_ROOT": "unreal" })),
@@ -2983,6 +3140,7 @@ mod tests {
             "GODOT_PATH",
             "GATE_X",
             "PATH",
+            "TMPDIR",
             "A=B",
             "GIT_WORK_TREE",
             "git_dir",

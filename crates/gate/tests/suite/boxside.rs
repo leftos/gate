@@ -2016,6 +2016,79 @@ fn preflight_says_a_root_holding_no_unreal_is_missing() {
     assert_eq!(after_sdks(&outcome), ["gate: remote tool unreal missing"], "{outcome:?}");
 }
 
+/// Puts a copy of fake-tool named `blender.exe` in `folder`, answering `--version` with the line `line`, so the folder
+/// stands in for a Blender install.
+fn fake_blender(folder: &Path, line: &str) {
+    fs::create_dir_all(folder).expect("the fake blender's folder can be made");
+    fs::copy(FAKE_TOOL, folder.join("blender.exe")).expect("the fake blender can be copied");
+    fs::write(folder.join("version.txt"), line).expect("the line the fake blender answers with can be written");
+}
+
+/// The folder a case's `GATE_BLENDER_ROOT` names, made and holding no install: one goes in a subfolder of it, put there
+/// with [`fake_blender`].
+fn blender_root(case: &Case) -> PathBuf {
+    let root = case.folder().join("blender");
+    fs::create_dir_all(&root).expect("the blender root can be made");
+    root
+}
+
+/// A `gate box preflight` needing `blender`, its `GATE_BLENDER_ROOT` the folder `root`, taken out of the box's
+/// environment when there is none.
+fn probed_with_blender_root(case: &Case, root: Option<&Path>) -> Outcome {
+    let mut command = preflight_call(case, &json!({"blender": "5.2.2"}), &[]);
+    if let Some(root) = root {
+        command.env("GATE_BLENDER_ROOT", root);
+    } else {
+        command.env_remove("GATE_BLENDER_ROOT");
+    }
+    command.finish_read()
+}
+
+/// Every Blender the root names is run, a folder named for a minor or a full version alike, and the line carries every
+/// version found, by number.
+#[test]
+fn preflight_says_every_blender_the_root_names() {
+    let case = Case::new("preflight_blender_root");
+    let root = blender_root(&case);
+    fake_blender(&root.join("Blender 5.2"), "Blender 5.2.2 LTS\n");
+    fake_blender(&root.join("5.1.0"), "Blender 5.1.0\n");
+
+    let outcome = probed_with_blender_root(&case, Some(&root));
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool blender 5.1.0,5.2.2"], "{outcome:?}");
+}
+
+/// An install whose folder names a version the one it reports does not meet is left out, as a run finds an install by
+/// its folder's name; a root whose only install is misnamed is skipped with that reason.
+#[test]
+fn preflight_leaves_out_a_blender_whose_folder_is_named_another_version() {
+    let case = Case::new("preflight_blender_misnamed");
+    let root = blender_root(&case);
+    fake_blender(&root.join("Blender 5.3"), "Blender 5.2.2 LTS\n");
+
+    let outcome = probed_with_blender_root(&case, Some(&root));
+
+    assert_eq!(
+        after_sdks(&outcome),
+        ["gate: remote tool blender skipped: named Blender 5.3 but reports 5.2.2"],
+        "{outcome:?}"
+    );
+}
+
+/// With no `GATE_BLENDER_ROOT` blender is missing: nothing is looked for along the `PATH`.
+#[test]
+fn preflight_says_blender_missing_with_no_root() {
+    let case = Case::new("preflight_blender_no_root");
+    let stub = case.folder().join("stub");
+    fake_blender(&stub, "Blender 5.2.2 LTS\n");
+
+    let mut command = preflight_call(&case, &json!({"blender": "5.2.2"}), &[stub]);
+    command.env_remove("GATE_BLENDER_ROOT");
+    let outcome = command.finish_read();
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool blender missing"], "{outcome:?}");
+}
+
 /// A `gate box preflight` needing `netfx-sdk`, its probe pointed at the key `key` by `--test-netfx-key`.
 fn probed_netfx(case: &Case, key: &NetfxKey) -> Outcome {
     let folders = Folders::new(case);
@@ -4662,6 +4735,161 @@ fn box_run_with_a_root_lacking_the_chosen_unreal_fails_127_saying_why() {
     let outcome = run_box_with_unreal(&case, &payload, Some(&root), None);
 
     assert_unreal_not_resolved(&outcome, "named 5.8.0 but reports 5.7.3");
+}
+
+/// A name a repo's toolchain manifest `[env]` sets to the chosen Blender's `blender.exe`, as `EngineEnv` names it.
+const BLENDER_ENV_NAME: &str = "BLENDER_EXE";
+
+/// A stale value of [`BLENDER_ENV_NAME`] the box inherited, which no run's command may see.
+const STALE_BLENDER_EXE: &str = r"C:\stale\blender.exe";
+
+/// A run payload of `words`, snapshotted, whose `EngineEnv` names [`BLENDER_ENV_NAME`] as blender, with the
+/// `BlenderVersion` `version` when given.
+fn blender_payload(case: &Case, words: &[&str], version: Option<&str>) -> Value {
+    let mut payload = box_payload(case, "k", words);
+    snapshot(case, &mut payload, &[("a.txt", "a\n")]);
+    if let Some(version) = version {
+        payload["BlenderVersion"] = json!(version);
+    }
+    payload["EngineEnv"] = json!({ BLENDER_ENV_NAME: "blender" });
+    payload
+}
+
+/// `gate box run` of `payload` with the box's `GATE_BLENDER_ROOT` the folder `root` and its own [`BLENDER_ENV_NAME`]
+/// `inherited`, each taken out of its environment when there is none.
+fn run_box_with_blender(case: &Case, payload: &Value, root: Option<&Path>, inherited: Option<&str>) -> Outcome {
+    let mut command = box_call(case, &["box", "run"], &self::payload(payload));
+    if let Some(root) = root {
+        command.env("GATE_BLENDER_ROOT", root);
+    } else {
+        command.env_remove("GATE_BLENDER_ROOT");
+    }
+    command.env("PATH", path_for_run(&[]));
+    if let Some(inherited) = inherited {
+        command.env(BLENDER_ENV_NAME, inherited);
+    } else {
+        command.env_remove(BLENDER_ENV_NAME);
+    }
+    command.finish_read()
+}
+
+/// A run with a `BlenderVersion` gives each blender `EngineEnv` name the `blender.exe` of the root's folder that
+/// version meets, out of a root of two, over the value the box inherited.
+#[test]
+fn box_run_sets_a_blender_engine_env_name_to_the_chosen_blender_exe() {
+    let case = Case::new("box_run_blender_chosen");
+    let root = blender_root(&case);
+    fake_blender(&root.join("Blender 5.1"), "Blender 5.1.0\n");
+    fake_blender(&root.join("Blender 5.2"), "Blender 5.2.2 LTS\n");
+    let payload = blender_payload(&case, &[FAKE_TOOL, "env", BLENDER_ENV_NAME], Some("5.2.2"));
+
+    let outcome = run_box_with_blender(&case, &payload, Some(&root), Some(STALE_BLENDER_EXE));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout,
+        format!("{}\n", root.join("Blender 5.2").join("blender.exe").display()),
+        "{outcome:?}"
+    );
+}
+
+/// A run takes the install the probe keeps for its `BlenderVersion`: a folder naming more of the version's parts that
+/// holds no `blender.exe` is passed over for one naming fewer that does.
+#[test]
+fn box_run_takes_the_blender_the_probe_keeps_over_a_broken_folder_naming_more_parts() {
+    let case = Case::new("box_run_blender_broken_full");
+    let root = blender_root(&case);
+    fake_blender(&root.join("Blender 5.2"), "Blender 5.2.2 LTS\n");
+    fs::create_dir_all(root.join("5.2.2")).expect("the empty folder can be made");
+    let payload = blender_payload(&case, &[FAKE_TOOL, "env", BLENDER_ENV_NAME], Some("5.2.2"));
+
+    let outcome = run_box_with_blender(&case, &payload, Some(&root), Some(STALE_BLENDER_EXE));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout,
+        format!("{}\n", root.join("Blender 5.2").join("blender.exe").display()),
+        "{outcome:?}"
+    );
+}
+
+/// A run takes the install the probe keeps for its `BlenderVersion`: a folder naming the version whose `blender.exe`
+/// reports another is passed over for one that reports the version.
+#[test]
+fn box_run_takes_the_blender_the_probe_keeps_over_a_folder_reporting_another_version() {
+    let case = Case::new("box_run_blender_misreporting");
+    let root = blender_root(&case);
+    fake_blender(&root.join("Blender 5.2"), "Blender 5.2.2 LTS\n");
+    fake_blender(&root.join("5.2.2"), "Blender 5.2.1\n");
+    let payload = blender_payload(&case, &[FAKE_TOOL, "env", BLENDER_ENV_NAME], Some("5.2.2"));
+
+    let outcome = run_box_with_blender(&case, &payload, Some(&root), Some(STALE_BLENDER_EXE));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout,
+        format!("{}\n", root.join("Blender 5.2").join("blender.exe").display()),
+        "{outcome:?}"
+    );
+}
+
+/// A run whose chosen Blender the root holds no folder for, or whose root is unset, fails to start, as a run whose
+/// chosen engine does not resolve does, saying why.
+#[test]
+fn box_run_with_a_root_lacking_the_chosen_blender_fails_saying_why() {
+    let case = Case::new("box_run_blender_missing");
+    let root = blender_root(&case);
+    fake_blender(&root.join("Blender 5.1"), "Blender 5.1.0\n");
+    let payload = blender_payload(&case, &[FAKE_TOOL, "env", BLENDER_ENV_NAME], Some("5.2.2"));
+    let assert_not_resolved = |outcome: &Outcome, why: &str| {
+        assert_eq!(outcome.code, Some(127), "{outcome:?}");
+        assert_eq!(outcome.stdout, "", "{outcome:?}");
+        let said = format!("gate: could not resolve blender 5.2.2: {why}");
+        assert!(outcome.stderr.lines().any(|line| line == said), "{said}: {outcome:?}");
+    };
+
+    let outcome = run_box_with_blender(&case, &payload, Some(&root), Some(STALE_BLENDER_EXE));
+
+    assert_not_resolved(
+        &outcome,
+        &format!("GATE_BLENDER_ROOT {} holds no folder for blender 5.2.2", root.display()),
+    );
+
+    let outcome = run_box_with_blender(&case, &payload, None, Some(STALE_BLENDER_EXE));
+
+    assert_not_resolved(&outcome, "GATE_BLENDER_ROOT is not set");
+}
+
+/// A run whose chosen Blender's one matching folder reports another version fails to start, saying that folder's
+/// reason rather than that the root holds no folder for it.
+#[test]
+fn box_run_with_the_one_blender_folder_reporting_another_version_fails_saying_so() {
+    let case = Case::new("box_run_blender_one_misreporting");
+    let root = blender_root(&case);
+    fake_blender(&root.join("5.2.2"), "Blender 5.2.1\n");
+    let payload = blender_payload(&case, &[FAKE_TOOL, "env", BLENDER_ENV_NAME], Some("5.2.2"));
+
+    let outcome = run_box_with_blender(&case, &payload, Some(&root), Some(STALE_BLENDER_EXE));
+
+    assert_eq!(outcome.code, Some(127), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    let said = "gate: could not resolve blender 5.2.2: named 5.2.2 but reports 5.2.1";
+    assert!(outcome.stderr.lines().any(|line| line == said), "{said}: {outcome:?}");
+}
+
+/// A run with a blender `EngineEnv` name but no `BlenderVersion` gives its command none of the variable, the box's
+/// inherited one removed, though the root holds an install.
+#[test]
+fn box_run_removes_an_inherited_blender_engine_env_name_with_no_blender_version() {
+    let case = Case::new("box_run_blender_none");
+    let root = blender_root(&case);
+    fake_blender(&root.join("Blender 5.2"), "Blender 5.2.2 LTS\n");
+    let payload = blender_payload(&case, &[FAKE_TOOL, "env", BLENDER_ENV_NAME], None);
+
+    let outcome = run_box_with_blender(&case, &payload, Some(&root), Some(STALE_BLENDER_EXE));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, format!("fake-tool: {BLENDER_ENV_NAME} is not set\n"), "{outcome:?}");
 }
 
 /// An engine of the chosen version behind a junction is never taken: the run fails to start.

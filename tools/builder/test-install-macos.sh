@@ -98,6 +98,7 @@ cargo-nextest 0.9.148
 just 1.58.0
 Git LFS 3.8.0
 Godot 4.7.2 mono
+Blender 5.2.2 LTS
 Bun 1.4.2
 Homebrew
 FFmpeg
@@ -339,6 +340,7 @@ case_login_path_block() {
         expect [ "$(line_count "export DOTNET_ROOT=\"$second/dotnet\"" "$zp")" = 1 ] &&
         expect [ "$(line_count 'export DOTNET_CLI_TELEMETRY_OPTOUT=1' "$zp")" = 1 ] &&
         expect [ "$(line_count "export GATE_GODOT_ROOT=\"$second/godot\"" "$zp")" = 1 ] &&
+        expect [ "$(line_count "export GATE_BLENDER_ROOT=\"$second/blender\"" "$zp")" = 1 ] &&
         expect [ "$(line_count 'export HOMEBREW_NO_AUTO_UPDATE=1' "$zp")" = 1 ] &&
         expect [ "$(line_count 'export HOMEBREW_NO_ANALYTICS=1' "$zp")" = 1 ] &&
         expect [ "$(head -n 1 "$zp")" = 'export KEEP_ME=1' ]
@@ -393,9 +395,9 @@ case_root_step_beside_system_refused() {
 case_list_homebrew() {
     run --list
     expect rc_is 0 &&
-        expect [ "$(sed -n '15p' "$scratch/out")" = 'Homebrew' ] &&
-        expect [ "$(sed -n '16p' "$scratch/out")" = 'FFmpeg' ] &&
-        expect [ "$(sed -n '17p' "$scratch/out")" = 'Login PATH' ]
+        expect [ "$(sed -n '16p' "$scratch/out")" = 'Homebrew' ] &&
+        expect [ "$(sed -n '17p' "$scratch/out")" = 'FFmpeg' ] &&
+        expect [ "$(sed -n '18p' "$scratch/out")" = 'Login PATH' ]
 }
 
 # The dry run comes before the steps may change the machine: it prints both steps' commands and logs SKIP for both.

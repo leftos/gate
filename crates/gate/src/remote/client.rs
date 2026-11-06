@@ -38,9 +38,9 @@ use gate_args::is_godot_console;
 use gate_state::v1::{self, WarmFailure};
 use gate_state::{FallbackReason, KernelObject, key_hash};
 use gate_win32::{AcquireError, Interrupt, Job, NamedMutex, OwnedMutexGuard, PipedConsole, Running, Share};
-use gate_wire::build_version;
 use gate_wire::slots::{BOX_SLOTS_LINE, BoxSlots};
 use gate_wire::stamp::{self, Tag};
+use gate_wire::{EngineKind, build_version};
 use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
@@ -715,12 +715,14 @@ struct Prepared {
 }
 
 /// The versions, `major.minor.patch`, of the builder's installs a routed run uses, as the parity step chose them after
-/// the preflight: its Godot install and its Unreal Engine install, each `None` when none is chosen; and the names the
-/// main repo's manifest `[env]` sets to the Unreal Engine install's root, sent whether or not one is chosen.
+/// the preflight: its Godot install, its Unreal Engine install and its Blender install, each `None` when none is chosen;
+/// and the names the main repo's manifest `[env]` sets to an engine install, each with its kind, sent whether or not
+/// one is chosen.
 struct Chosen {
     godot: Option<String>,
     unreal: Option<String>,
-    engine_env: Vec<String>,
+    blender: Option<String>,
+    engine_env: Vec<(String, EngineKind)>,
 }
 
 /// What the snapshot's tree gives the parity check, read before the preflight: the git that listed it, the worktree it
@@ -1754,6 +1756,7 @@ impl Attempt<'_, '_> {
             env: self.call.env,
             godot_version: chosen.godot.as_deref(),
             unreal_version: chosen.unreal.as_deref(),
+            blender_version: chosen.blender.as_deref(),
             engine_env: &chosen.engine_env,
             desktop: self.call.desktop,
             cross_build: self.call.cross_build,
@@ -2811,8 +2814,9 @@ impl Attempt<'_, '_> {
     /// is.
     ///
     /// The Unreal Engine version is chosen beside it ([`toolchain::unreal_choice`]): the highest the builder listed that
-    /// meets the main repo's manifest `unreal` pin, none for no pin or any version; the manifest's `[env]` names are
-    /// carried beside it ([`toolchain::engine_env`]).
+    /// meets the main repo's manifest `unreal` pin, none for no pin or any version, and the Blender version the same way
+    /// from its `blender` pin ([`toolchain::blender_choice`]); the manifest's `[env]` names are carried beside them
+    /// ([`toolchain::engine_env`]).
     fn parity(&mut self, repos: &[Repo], snapshots: &[Snapshot], trees: &[Option<Tree>], prepared: &Prepared, lfs: bool) -> Result<Chosen, End> {
         let mut refused = false;
         let main = trees.first().and_then(Option::as_ref);
@@ -2868,9 +2872,11 @@ impl Attempt<'_, '_> {
             self.say(warning);
         }
         let unreal = main.and_then(|tree| toolchain::unreal_required(tree.manifest.as_ref()));
+        let blender = main.and_then(|tree| toolchain::blender_required(tree.manifest.as_ref()));
         Ok(Chosen {
             godot: chosen,
             unreal: toolchain::unreal_choice(unreal.as_deref(), &prepared.tools),
+            blender: toolchain::blender_choice(blender.as_deref(), &prepared.tools),
             engine_env: main.map(|tree| toolchain::engine_env(tree.manifest.as_ref())).unwrap_or_default(),
         })
     }

@@ -109,9 +109,10 @@ This repo's `tools/builder/install-toolchains.ps1` does the rest: the toolchains
 - **Exit codes:** a missing or unknown `-User` exits 2, a `-Only` prefix that matches no step exits 2 before anything is written, and a session that is not elevated exits 1 with `install-toolchains: not elevated; ...`.
 - **Steps**, each a valid `-Only` prefix, run in this order: Git, PowerShell, .NET SDK 10.0.401, .NET SDK 8.0.425, .NET Framework 4.8 Developer Pack, .NET workload wasm-tools, Node.js, uv and prek, Python, Visual C++ Redistributable 14.51, Visual Studio Build Tools 2022 (C++), Rust, cargo-nextest and just.
 
-  The remaining steps are WSL Ubuntu (registers and starts the `gate-wsl-keepalive` logon task and waits for the VM before the elevated setup), sccache, Git usr\bin on the builder user Path, Bun, Godot, VB-CABLE (a virtual audio output: the builder's sound cards have nothing plugged in, and Godot falls back to its Dummy audio driver without an active render endpoint), Blender (in the PC's install folder, so a routed headless job's `blender.exe` path holds on both).
+  The remaining steps are WSL Ubuntu (registers and starts the `gate-wsl-keepalive` logon task and waits for the VM before the elevated setup), sccache, Git usr\bin on the builder user Path, Bun, Godot, VB-CABLE (a virtual audio output: the builder's sound cards have nothing plugged in, and Godot falls back to its Dummy audio driver without an active render endpoint), Blender (in the PC's install folder, so a job that names the `blender.exe` path still runs; it also sets the machine variable `GATE_BLENDER_ROOT` to `C:\Program Files\Blender Foundation`, where the box finds the `Blender 5.2` folder).
 
   After them come FFmpeg, zstd (for ad-hoc compressed copies to the builder; the gate's own transfers compress without it), NSIS (rustling-tulip's `rt.ps1 installer` runs its `makensis`), pnpm, Playwright browsers (1.63.0, then 1.64.1's Chromium), Git system config for gate runs, Smart App Control off, keeper: MSYS sleep task, keeper: MSYS console sleep task (a second MSYS keeper in the console session, where desktop runs start their commands), Gate work root, Work-folder prune task and Summary.
+- **Blender config (from the PC, not the installer):** a Blender job reads the builder user's Blender preferences and add-ons, so copy this PC's `%APPDATA%\Blender Foundation\Blender\5.2` to the same path under the builder user's profile (`C:\Users\{builder user}\AppData\Roaming\Blender Foundation\Blender\5.2`). A job run with `--factory-startup` reads none of it. See [A repo that runs headless Blender](#a-repo-that-runs-headless-blender).
 - **Tasks:** `\build-box\sccache-server`, `build-box-msys-keeper`, `build-box-msys-console-keeper`, `gate-wsl-keepalive` and `\build-box\gate-prune-work`. All five run as the builder user at the Limited run level: all but `gate-wsl-keepalive` and `build-box-msys-console-keeper` by S4U, whether or not the user is logged on, and those two in the user's interactive logon.
 
   The sccache server's log is `%LOCALAPPDATA%\build-box\sccache-server.log` in the builder user's profile, not under `C:\build-box`; the step refuses a `LOCALAPPDATA` that holds a quote or bracket.
@@ -171,7 +172,7 @@ The words a macOS builder is sent are spelled for the Mac: the recognised paths 
 A word that still holds a `\` (a regex, a list, script text after `bash -c` or `pwsh -Command`, a path the repo does not carry) keeps the command off the Mac: it runs on a Windows builder or here, silently. A Windows builder is sent the words as written. Details: [design.md, Routing](design.md#routing).
 
 - **Private home** runs first, before every toolchain step: it sets the builder's home to mode 700 (logging `<home> had mode <mode>; set to 700` when it changed), since the package restore's caches (`~/.npm`, `~/Library/pnpm/store`, `~/.bun/install/cache`) are made at 755 and 644 and every standard macOS account is in the home's group `staff`. It refuses a home that is a symlink or owned by another account.
-- **Toolchain steps** need no sudo and land under `--prefix` (default `~/gate-tools`), Rust under `CARGO_HOME` and `RUSTUP_HOME`: .NET SDK 10.0.401 and 8.0.425, the wasm-tools workload, PowerShell, Node.js, pnpm, uv and prek, Rust, cargo-nextest, just, Git LFS, Godot 4.7.2 mono, Bun.
+- **Toolchain steps** need no sudo and land under `--prefix` (default `~/gate-tools`), Rust under `CARGO_HOME` and `RUSTUP_HOME`: .NET SDK 10.0.401 and 8.0.425, the wasm-tools workload, PowerShell, Node.js, pnpm, uv and prek, Rust, cargo-nextest, just, Git LFS, Godot 4.7.2 mono, Blender 5.2.2 LTS, Bun.
 - **Homebrew and FFmpeg** come from Homebrew, since no official source publishes a macOS arm64 FFmpeg build with a checksum. The FFmpeg step also installs zstd, for ad-hoc compressed copies to the builder. Homebrew's installer needs an admin account and refuses root, so these two steps run as an admin account, never the builder user or `sudo`: `bash install-macos.sh --admin --only Homebrew,FFmpeg`, interactively (over `ssh -t`), since the installer may ask for the admin's password.
 
   The builder's home is mode 700, so the admin cannot read an installer copy kept there: it runs its own copy, or pipes the script in (`ssh <admin> 'bash -s' -- --admin --only Homebrew,FFmpeg < install-macos.sh`). Without `--admin` they print the commands they would run. Auto-update and analytics are off for the builder, and its login PATH puts `/opt/homebrew/bin` after the pinned tools, so a pinned tool always wins.
@@ -179,7 +180,10 @@ A word that still holds a `\` (a regex, a list, script text after `bash -c` or `
 
   The block also exports `GATE_GODOT_ROOT` (`<prefix>/godot`, one folder per Godot version holding `Godot.app`), which the box reads from the same login shell to probe the builder's Godot and to run a pinned version's install for a Godot console command.
 
+  It exports `GATE_BLENDER_ROOT` (`<prefix>/blender`, one folder per Blender version, `5.2.2`, holding `Blender.app`) the same way, for the box's blender probe and a pinned blender's run.
+
   The step ends by checking that a fresh `zsh -l` finds `dotnet`, `pwsh`, `node`, `cargo`, `pnpm`, `npm` and `bun`, with `pnpm` and `npm` under `<prefix>/node/bin/` and `bun` under `<prefix>/bin/`.
+- **Blender config (from the PC, not the installer):** copy this PC's `%APPDATA%\Blender Foundation\Blender\5.2` to the Mac's `~/Library/Application Support/Blender/5.2` as the builder user; a job run with `--factory-startup` reads none of it. See [A repo that runs headless Blender](#a-repo-that-runs-headless-blender).
 - **Git config** sets `core.autocrlf false` and `gc.pruneExpire never`. **Gate work root** (`--root`, default `~/gate-remote`) makes the root, `work` and `bin` at mode 700; the box refuses a root another account may write in.
 - **System** runs only as `sudo bash install-macos.sh --system --user <builder user> --only System`: no sleep, restart after power loss, wake on network, the open-file limits, Remote Login, Spotlight indexing off on every volume (`mdutil -a -i off`), and Rosetta 2, which runs the x86_64-only macOS tools some NuGet packages ship (Grpc.Tools' `protoc`, which yaat's build needs). Without `--system` it prints the commands it would run.
 
@@ -400,6 +404,15 @@ The engine is not in the worktree and not on the builder's `PATH`: the builder h
 - **Git LFS.** A repo with LFS-tracked files routes with them: the PC sends the objects the snapshot's pointers name to the builder's per-repo LFS store, and the box checks them out with no download.
 
   The builder needs git-lfs 3.1.3 or later whenever a tracked `.gitattributes` names the LFS filter (a builder without it keeps the run here, `parity`), and the PC must hold the objects: run `git lfs fetch` first, else the run falls back `lfs` with a log line naming the missing object. See [design.md, Routing](design.md#routing) (Git LFS).
+
+## A repo that runs headless Blender
+
+Blender is not on the builder's `PATH`: each builder holds its installs side by side under `GATE_BLENDER_ROOT` ([design.md, Tool probes](design.md#the-box-side)). The Windows builder's installer step `Blender` copies the PC's `Blender 5.2` folder under `C:\Program Files\Blender Foundation` and sets the variable; the Mac installer's `Blender 5.2.2 LTS` step puts `5.2.2/Blender.app` under `<prefix>/blender`, which its login block exports. `gate check --builder` shows the versions each lists.
+
+- **The pin.** The repo pins `blender = "5.2"` in `.gate/toolchain.toml`, an exact pin like godot's (`"5.2"` takes any 5.2.x). A builder with no matching install is skipped for `parity`, so the job routes to either builder that has one and runs here otherwise.
+- **The path.** Name an `[env]` variable the job's wrapper reads, `BLENDER_EXE = "blender"`, in place of a Windows path: the box sets it to the chosen install's executable (`blender.exe` on Windows, `Blender.app/Contents/MacOS/Blender` on the Mac), so one tracked wrapper runs on both. A PC path passed with `--env` is not rewritten for the builder.
+- **The config.** Copy the PC's Blender config to each builder as the Builder setup steps say. A job run with `--factory-startup` reads none of it.
+- **The GPU.** A Mac job that wants the GPU lists `METAL` among its Cycles devices.
 
 ## Build files that read back as zeros
 

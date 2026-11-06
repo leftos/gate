@@ -3,14 +3,16 @@
 //! installs of is godot: the folder the batch's environment names as its root holds one install per subfolder, and each
 //! is asked for its version, so the line carries every version the box has. The unreal probe reads the folder the
 //! batch's environment names as `GATE_UNREAL_ROOT` likewise, one Unreal Engine install per subfolder, each one's version
-//! read from its `Engine\Build\Build.version` file without running anything. The netfx-sdk probe reads the .NET
+//! read from its `Engine\Build\Build.version` file without running anything. The blender probe reads the folder the
+//! batch's environment names as `GATE_BLENDER_ROOT`, one Blender install per subfolder named for its version
+//! (`Blender 5.2`, `5.2.2`), and asks each one's `blender.exe` for its version. The netfx-sdk probe reads the .NET
 //! Framework SDKs the registry lists, as `UnrealBuildTool` looks for one, also running nothing. Every probe of a batch
 //! that runs a program runs at once, under one deadline the batch shares, in the system folder and on a hidden console
 //! of its own, as [`git::program_output`] runs a program; a probe still running at the deadline is ended with its job.
 //! Nothing here writes to the console or reads a payload: the caller hands over the names and says the lines.
 
 use std::any::Any;
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
@@ -21,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use gate_router::escaped;
 use gate_win32::{Hive, PipedConsole, Subkey};
-use gate_wire::{MAX_PART_DIGITS, Probed, is_canonical_version, is_drive_path};
+use gate_wire::{MAX_PART_DIGITS, Probed, is_canonical_version, is_drive_path, is_version_name};
 use serde_json::Value;
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT};
 
@@ -64,8 +66,17 @@ const GODOT_ROOT: &str = "GATE_GODOT_ROOT";
 /// The variable naming the folder of the box's Unreal Engine installs.
 pub(crate) const UNREAL_ROOT: &str = "GATE_UNREAL_ROOT";
 
-/// The most entries of the folder `GATE_GODOT_ROOT` or `GATE_UNREAL_ROOT` names that are looked at: a folder holding
-/// more is no install root.
+/// The variable naming the folder of the box's Blender installs.
+pub(crate) const BLENDER_ROOT: &str = "GATE_BLENDER_ROOT";
+
+/// The console program of a Blender install.
+const BLENDER: &str = "blender.exe";
+
+/// The word a Blender install is asked for its version with.
+const BLENDER_VERSION: &[&str] = &["--version"];
+
+/// The most entries of the folder `GATE_GODOT_ROOT`, `GATE_UNREAL_ROOT` or `GATE_BLENDER_ROOT` names that are looked
+/// at: a folder holding more is no install root.
 const ROOT_ENTRIES: usize = 64;
 
 /// The most bytes of an Unreal Engine install's `Build.version` that are read: a longer one is no version file.
@@ -89,6 +100,8 @@ enum ToolProbe {
     Godot,
     /// Reads the `Build.version` of every Unreal Engine install the batch's environment names, running nothing.
     Unreal,
+    /// Runs the `--version` of every Blender install the batch's environment names.
+    Blender,
     /// Reads the .NET Framework SDKs the registry lists, running nothing.
     NetfxSdk,
 }
@@ -102,6 +115,7 @@ fn probe_of(name: &str) -> Option<ToolProbe> {
     match name {
         "godot" => Some(ToolProbe::Godot),
         "unreal" => Some(ToolProbe::Unreal),
+        "blender" => Some(ToolProbe::Blender),
         "netfx-sdk" => Some(ToolProbe::NetfxSdk),
         _ => None,
     }
@@ -114,8 +128,8 @@ enum Pending<'scope> {
 }
 
 /// What one batch of probes shares beyond the place a program is looked for in: the folders no program may come from,
-/// the folders the batch's environment names as `GATE_GODOT_ROOT` and `GATE_UNREAL_ROOT` (the latter `Err` with why
-/// the environment could not be made), the key under `HKEY_CURRENT_USER` a test seam has the netfx-sdk probe read in
+/// the folders the batch's environment names as `GATE_GODOT_ROOT`, `GATE_UNREAL_ROOT` and `GATE_BLENDER_ROOT` (the
+/// latter two `Err` with why the environment could not be made), the key under `HKEY_CURRENT_USER` a test seam has the netfx-sdk probe read in
 /// place of the machine's own list, the batch's deadline and its limit, and how long the readers of each program it runs
 /// get to end once it has exited.
 #[derive(Clone, Copy)]
@@ -123,6 +137,7 @@ struct Batch<'a> {
     worktrees: &'a [&'a Path],
     godot_root: Option<&'a OsStr>,
     unreal_root: Result<Option<&'a OsStr>, &'a str>,
+    blender_root: Result<Option<&'a OsStr>, &'a str>,
     netfx_key: Option<&'a str>,
     deadline: Instant,
     limit: Duration,
@@ -137,7 +152,8 @@ struct Batch<'a> {
 /// be made, for the reason given, skip every probe that runs a program. The godot probe reads the folder `variables`
 /// names as `GATE_GODOT_ROOT` to find the installs it runs, and the unreal probe the folder they name as
 /// `GATE_UNREAL_ROOT`, refused when it lies inside any of `worktrees`; it runs no program, so a place no program can be
-/// looked for in never skips it. The netfx-sdk probe reads the machine's list of .NET Framework SDKs, or the key
+/// looked for in never skips it. The blender probe runs the `blender.exe` of each install in the folder they name as
+/// `GATE_BLENDER_ROOT`, a root taken as the unreal one is. The netfx-sdk probe reads the machine's list of .NET Framework SDKs, or the key
 /// `netfx_key` names under `HKEY_CURRENT_USER` when a test seam gives one ([`netfx_sdk`]).
 pub(crate) fn probe(
     names: &[String],
@@ -155,11 +171,13 @@ pub(crate) fn probe(
     };
     let godot_root = root_of(GODOT_ROOT).ok().flatten();
     let unreal_root = root_of(UNREAL_ROOT);
+    let blender_root = root_of(BLENDER_ROOT);
     let place = variables.and_then(ProgramPlace::new);
     let batch = Batch {
         worktrees,
         godot_root: godot_root.as_deref(),
         unreal_root: unreal_root.as_ref().map(Option::as_deref).map_err(String::as_str),
+        blender_root: blender_root.as_ref().map(Option::as_deref).map_err(String::as_str),
         netfx_key,
         deadline,
         limit: windows.limit,
@@ -204,6 +222,12 @@ fn started<'scope, 'env>(
             Ok(place) => Pending::Running(scope.spawn(move || godot(place, batch))),
         },
         Some(ToolProbe::Unreal) => Pending::Running(scope.spawn(move || unreal(batch))),
+        // An unset root is missing whatever the place gives, as nothing is looked for along the `PATH`.
+        Some(ToolProbe::Blender) if batch.blender_root == Ok(None) => Pending::Found(Probed::Missing),
+        Some(ToolProbe::Blender) => match place {
+            Err(why) => Pending::Found(Probed::Skipped(format!("cannot run {BLENDER}: {why}"))),
+            Ok(place) => Pending::Running(scope.spawn(move || blender(place, batch))),
+        },
         Some(ToolProbe::NetfxSdk) => Pending::Found(netfx_sdk(batch.netfx_key)),
     }
 }
@@ -230,18 +254,10 @@ fn netfx_sdk(user_key: Option<&str>) -> Probed {
 }
 
 /// Whether the subkey `subkey` of the .NET Framework SDK list is an installed SDK: its name is a version
-/// ([`is_version_name`]) and its [`NETFX_KITS_FOLDER`] names, as an absolute path, a folder that exists.
+/// ([`gate_wire::is_version_name`]) and its [`NETFX_KITS_FOLDER`] names, as an absolute path, a folder that exists.
 fn netfx_installed(subkey: &Subkey) -> bool {
     let folder = subkey.value.as_deref().map(Path::new);
     is_version_name(&subkey.name) && folder.is_some_and(|folder| folder.is_absolute() && folder.is_dir())
-}
-
-/// Whether `name` is a version as the .NET Framework SDK list names one: one to three dot-separated runs of ASCII
-/// digits, each of 1 to [`MAX_PART_DIGITS`] digits, such as `4.8` or `4.7.2`.
-fn is_version_name(name: &str) -> bool {
-    let parts: Vec<&str> = name.split('.').collect();
-    let part = |part: &&str| (1..=MAX_PART_DIGITS).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_digit());
-    (1..=3).contains(&parts.len()) && parts.iter().all(part)
 }
 
 /// Why a probe did not answer: the batch had no time left for it.
@@ -297,7 +313,7 @@ fn godot(place: &ProgramPlace, batch: Batch<'_>) -> Probed {
         Candidate::Install(install) => {
             let found = ran(install, GODOT_VERSION, place, batch, read_godot);
             if batch.godot_root.is_some() {
-                named_as_found(install, found)
+                named_as_found(install, found, godot_named)
             } else {
                 found
             }
@@ -329,9 +345,9 @@ fn gathered(found: impl Iterator<Item = Probed>) -> Probed {
     Probed::Version(version_list(&versions))
 }
 
-/// What the probe of the root's install `install` `found`, kept only when it is a version the install's folder is named
-/// ([`named_as`]).
-fn named_as_found(install: &str, found: Probed) -> Probed {
+/// What the probe of the root's install `install` `found`, kept only when `named` says the install's folder is named
+/// for that version: else skipped with the reason `named <folder> but reports <version>`.
+fn named_as_found(install: &str, found: Probed, named: fn(&str, &str) -> bool) -> Probed {
     let Probed::Version(version) = found else {
         return found;
     };
@@ -340,7 +356,22 @@ fn named_as_found(install: &str, found: Probed) -> Probed {
         .and_then(Path::file_name)
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    named_as(&folder, version)
+    if named(&folder, &version) {
+        Probed::Version(version)
+    } else {
+        Probed::Skipped(format!("named {} but reports {version}", escaped(&folder)))
+    }
+}
+
+/// Whether a Godot install's folder `folder` is named for the version `version` it reports: it is that version.
+fn godot_named(folder: &str, version: &str) -> bool {
+    folder == version
+}
+
+/// Whether a Blender install's folder `folder` is named for the version `version` it reports: the version the folder
+/// is named for ([`gate_wire::blender_folder_version`]) is met by it ([`gate_wire::version_meets`]).
+fn blender_named(folder: &str, version: &str) -> bool {
+    gate_wire::blender_folder_version(folder).is_some_and(|named| gate_wire::version_meets(named, version))
 }
 
 /// The `version` an install whose folder is named `folder` reports, kept only when it is that name: else skipped with
@@ -355,10 +386,10 @@ fn named_as(folder: &str, version: String) -> Probed {
 
 /// The `Godot_console.exe` of the install of `version` under the root `root`, the box's `GATE_GODOT_ROOT`, as a run
 /// finds it by name: `<root>\<version>\Godot_console.exe`, when the root is an absolute path on a drive and that file is
-/// a plain one in a plain folder, neither of them a reparse point ([`godot_install`]); else `None`.
+/// a plain one in a plain folder, neither of them a reparse point ([`program_install`]); else `None`.
 pub(crate) fn installed_godot(root: &OsStr, version: &str) -> Option<PathBuf> {
     let root = root.to_str().filter(|root| is_drive_path(root))?;
-    match godot_install(&Path::new(root).join(version))? {
+    match program_install(&Path::new(root).join(version), GODOT)? {
         Candidate::Install(program) => Some(PathBuf::from(program)),
         Candidate::Skipped(_) => None,
     }
@@ -374,13 +405,15 @@ enum Candidate {
 }
 
 /// The subfolders the godot probe reads, in name order: those of the folder the batch's environment names as
-/// `GATE_GODOT_ROOT` ([`listed`], each judged by [`godot_install`]), or `Godot_console.exe` itself, looked for along the
-/// `PATH`, when it names none. Else why that folder is refused.
+/// `GATE_GODOT_ROOT` ([`listed`], each judged by [`program_install`]), or `Godot_console.exe` itself, looked for along
+/// the `PATH`, when it names none. Else why that folder is refused.
 fn godot_candidates(root: Option<&OsStr>, deadline: Instant, limit: Duration) -> Result<Vec<Candidate>, String> {
     let Some(root) = root else {
         return Ok(vec![Candidate::Install(GODOT.to_owned())]);
     };
-    listed(GODOT_ROOT, drive_root(GODOT_ROOT, root)?, deadline, limit, godot_install)
+    listed(GODOT_ROOT, drive_root(GODOT_ROOT, root)?, deadline, limit, |folder| {
+        program_install(folder, GODOT)
+    })
 }
 
 /// The root `root` the variable `variable` names as a path, when it is an absolute path on a drive; else why it is
@@ -440,9 +473,9 @@ fn unreal(batch: Batch<'_>) -> Probed {
 }
 
 /// What each subfolder of the Unreal Engine root `root` comes to, in name order ([`listed`], then [`unreal_read`]):
-/// else why the root is refused ([`checked_unreal_root`]) or cannot be read.
+/// else why the root is refused ([`checked_root`]) or cannot be read.
 fn unreal_installs(root: &OsStr, worktrees: &[&Path], deadline: Instant, limit: Duration) -> Result<Vec<Probed>, String> {
-    let folder = checked_unreal_root(root, worktrees)?;
+    let folder = checked_root(UNREAL_ROOT, root, worktrees)?;
     let folders = listed(UNREAL_ROOT, folder, deadline, limit, |folder| Some(folder.to_path_buf()))?;
     // A listing the deadline cut short leaves the deadline passed, so the reading says `no answer` before its first
     // install: a partial list is never taken for the whole.
@@ -463,15 +496,16 @@ fn unreal_read(folders: &[PathBuf], limit: Duration, mut passed: impl FnMut() ->
     Ok(found)
 }
 
-/// The folder the Unreal Engine root `root`, the box's `GATE_UNREAL_ROOT`, names, as the probe and a run both take
-/// it: an absolute path on a drive ([`drive_root`]), neither it nor any folder above it a link or a junction
-/// ([`linked`]), and overlapping none of `worktrees`, the folders a run writes, followed through links: neither inside
-/// one nor holding one. Else why it is refused, naming the first folder it overlaps.
-pub(crate) fn checked_unreal_root<'r>(root: &'r OsStr, worktrees: &[&Path]) -> Result<&'r Path, String> {
-    let folder = drive_root(UNREAL_ROOT, root)?;
+/// The folder the install root `root`, which the box's variable `variable` names (`GATE_UNREAL_ROOT` or
+/// `GATE_BLENDER_ROOT`), comes to as the probe and a run both take it: an absolute path on a drive ([`drive_root`]),
+/// neither it nor any folder above it a link or a junction ([`linked`]), and overlapping none of `worktrees`, the
+/// folders a run writes, followed through links: neither inside one nor holding one. Else why it is refused, naming
+/// `variable` and the first folder it overlaps.
+fn checked_root<'r>(variable: &str, root: &'r OsStr, worktrees: &[&Path]) -> Result<&'r Path, String> {
+    let folder = drive_root(variable, root)?;
     if let Some(link) = folder.ancestors().find(|path| linked(path)) {
         return Err(format!(
-            "{UNREAL_ROOT} {}: {} is a link or a junction",
+            "{variable} {}: {} is a link or a junction",
             escaped(&folder.to_string_lossy()),
             escaped(&link.to_string_lossy())
         ));
@@ -483,7 +517,7 @@ pub(crate) fn checked_unreal_root<'r>(root: &'r OsStr, worktrees: &[&Path]) -> R
     };
     if let Some(written) = worktrees.iter().find(overlaps) {
         return Err(format!(
-            "{UNREAL_ROOT} {} overlaps {}, which a run writes",
+            "{variable} {} overlaps {}, which a run writes",
             escaped(&folder.to_string_lossy()),
             escaped(&written.to_string_lossy())
         ));
@@ -493,15 +527,128 @@ pub(crate) fn checked_unreal_root<'r>(root: &'r OsStr, worktrees: &[&Path]) -> R
 
 /// The engine folder of the install of `version` under the root `root`, the box's `GATE_UNREAL_ROOT`, as a run finds
 /// it by name: `<root>\<version>`, when the root passes the probe's checks against the run's folders `worktrees`
-/// ([`checked_unreal_root`]) and that folder is an install that reports that version ([`unreal_install`]); else why
-/// not.
+/// ([`checked_root`]) and that folder is an install that reports that version ([`unreal_install`]); else why not.
 pub(crate) fn installed_unreal(root: &OsStr, version: &str, worktrees: &[&Path]) -> Result<PathBuf, String> {
-    let folder = checked_unreal_root(root, worktrees)?.join(version);
+    let folder = checked_root(UNREAL_ROOT, root, worktrees)?.join(version);
     match unreal_install(&folder) {
         Some(Probed::Version(_)) => Ok(folder),
         Some(Probed::Skipped(why)) => Err(why),
         Some(Probed::Present | Probed::Missing) | None => Err(format!("{} is not a file", escaped(&unreal_build_version(&folder).to_string_lossy()))),
     }
+}
+
+/// What the blender probe finds in `place`: the version of every install the folder the batch's environment names as
+/// `GATE_BLENDER_ROOT` holds, `,`-joined, as [`gathered`] comes to it; `missing` with no root, as nothing is looked for
+/// along the `PATH`; `skipped` when the root is refused ([`checked_root`]), cannot be read, or the environment could not
+/// be read. Each install's `blender.exe --version` is run, and an install whose folder names a version the one it
+/// reports does not meet is left out ([`kept_blender`]), as a run keeps the same install ([`installed_blender`]).
+fn blender(place: &ProgramPlace, batch: Batch<'_>) -> Probed {
+    let root = match batch.blender_root {
+        Err(why) => return Probed::Skipped(format!("cannot read {BLENDER_ROOT}: {why}")),
+        Ok(None) => return Probed::Missing,
+        Ok(Some(root)) => root,
+    };
+    let candidates = match checked_root(BLENDER_ROOT, root, batch.worktrees)
+        .and_then(|folder| listed(BLENDER_ROOT, folder, batch.deadline, batch.limit, blender_install))
+    {
+        Ok(candidates) => candidates,
+        Err(why) => return Probed::Skipped(why),
+    };
+    gathered(candidates.iter().map(|candidate| kept_blender(candidate, place, batch)))
+}
+
+/// What `folder`, one direct subfolder of `GATE_BLENDER_ROOT`, comes to: nothing when its name names no version
+/// ([`gate_wire::blender_folder_version`]), else the `blender.exe` in it as [`program_install`] judges a program.
+fn blender_install(folder: &Path) -> Option<Candidate> {
+    let name = folder.file_name()?.to_str()?;
+    gate_wire::blender_folder_version(name)?;
+    program_install(folder, BLENDER)
+}
+
+/// What the probe and a run both keep of the root's install `candidate`: the version its `blender.exe --version`
+/// reports in `place` by the batch's deadline ([`ran`], [`read_blender`]), kept only when the version its folder is
+/// named for is met by it ([`blender_named`]), else skipped with why; a candidate left out is skipped with its reason.
+fn kept_blender(candidate: &Candidate, place: &ProgramPlace, batch: Batch<'_>) -> Probed {
+    match candidate {
+        Candidate::Install(install) => named_as_found(install, ran(install, BLENDER_VERSION, place, batch, read_blender), blender_named),
+        Candidate::Skipped(why) => Probed::Skipped(why.clone()),
+    }
+}
+
+/// What a Blender install's `--version` output found: the first version of the first line of its standard output
+/// ([`gate_wire::first_version`]), as Blender writes it (`Blender 5.2.2 LTS`), or why it gave none.
+fn read_blender(output: &ProgramOutput) -> Probed {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().next().unwrap_or("");
+    gate_wire::first_version(line).map_or_else(
+        || Probed::Skipped(format!("{BLENDER} --version gave no version: {}", escaped(&godot_answered(&stdout)))),
+        Probed::Version,
+    )
+}
+
+/// The `blender.exe` of the install the version `version` resolves to under the root `root`, the box's
+/// `GATE_BLENDER_ROOT`, the one the probe keeps for that version: the root passes the probe's checks against the run's
+/// folders `worktrees` ([`checked_root`]), and of its folders whose name's version `version` meets
+/// ([`gate_wire::blender_folder_version`], [`gate_wire::version_meets`]), taken naming the most parts first and then in
+/// name order, the first whose `blender.exe` the probe keeps ([`kept_blender`]) and reports exactly `version`, run in
+/// `place` within [`PROBE_LIMIT`] for all of them together. Else why not: why the root is refused or cannot be read;
+/// the first such folder's reason when one was tried and passed over, as the probe says it when it skips the folder
+/// (`named <folder> but reports <version>`, the program giving no answer, a link), an install the probe keeps that
+/// reports another version than `version` itself passed over as `named <folder> but reports <version>`; or, when no
+/// folder gives a reason, `GATE_BLENDER_ROOT <root> holds no folder for blender <version>`.
+pub(crate) fn installed_blender(root: &OsStr, version: &str, place: &ProgramPlace, worktrees: &[&Path]) -> Result<PathBuf, String> {
+    let folder = checked_root(BLENDER_ROOT, root, worktrees)?;
+    let windows = Windows::of(None, None);
+    let deadline = Instant::now() + windows.limit;
+    let parts_met = |candidate: &Path| {
+        candidate
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(gate_wire::blender_folder_version)
+            .filter(|named| gate_wire::version_meets(named, version))
+            .map(|named| (named.split('.').count(), candidate.to_path_buf()))
+    };
+    // Listed in name order; the stable sort keeps that order among folders naming as many parts.
+    let mut candidates = listed(BLENDER_ROOT, folder, deadline, windows.limit, parts_met)?;
+    candidates.sort_by_key(|(parts, _)| Reverse(*parts));
+    let batch = Batch {
+        worktrees,
+        godot_root: None,
+        unreal_root: Ok(None),
+        blender_root: Ok(Some(root)),
+        netfx_key: None,
+        deadline,
+        limit: windows.limit,
+        drain: windows.drain,
+    };
+    let reported = Probed::Version(version.to_owned());
+    let mut first_why = None;
+    for (_, candidate) in &candidates {
+        let Some(install) = program_install(candidate, BLENDER) else {
+            continue;
+        };
+        let kept = kept_blender(&install, place, batch);
+        if let Candidate::Install(program) = &install
+            && kept == reported
+        {
+            return Ok(PathBuf::from(program));
+        }
+        let why = match kept {
+            Probed::Skipped(why) => Some(why),
+            Probed::Version(other) => {
+                let name = candidate.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+                Some(format!("named {} but reports {other}", escaped(&name)))
+            }
+            Probed::Present | Probed::Missing => None,
+        };
+        first_why = first_why.or(why);
+    }
+    Err(first_why.unwrap_or_else(|| {
+        format!(
+            "{BLENDER_ROOT} {} holds no folder for blender {version}",
+            escaped(&folder.to_string_lossy())
+        )
+    }))
 }
 
 /// The file an Unreal Engine install in `folder` says its version in: `<folder>\Engine\Build\Build.version`.
@@ -568,10 +715,10 @@ fn unreal_version(text: &str) -> Option<String> {
     is_canonical_version(&version).then_some(version)
 }
 
-/// What `folder`, one direct subfolder of `GATE_GODOT_ROOT`, comes to: the `Godot_console.exe` in it to run, why a
-/// link or a junction leaves it out, or nothing when it holds no program to run.
-fn godot_install(folder: &Path) -> Option<Candidate> {
-    let program = folder.join(GODOT);
+/// What `folder`, one direct subfolder of an install root such as `GATE_GODOT_ROOT`, comes to: the program named `exe`
+/// in it to run, why a link or a junction leaves it out, or nothing when it holds no such program.
+fn program_install(folder: &Path, exe: &str) -> Option<Candidate> {
+    let program = folder.join(exe);
     if linked(folder) {
         return Some(Candidate::Skipped(linked_reason(&program, folder)));
     }
@@ -724,9 +871,9 @@ mod tests {
 
     use super::GODOT;
     use super::{
-        Batch, Candidate, Pending, Probed, Windows, build_version, godot_candidates, godot_gave_no_version, godot_version, is_reparse_point,
-        is_version_name, late_reason, named_as_found, netfx_sdk, panic_reason, probe, read_godot, started, unreal_installs, unreal_read,
-        unreal_version, version_list,
+        Batch, Candidate, Pending, Probed, Windows, build_version, godot_candidates, godot_gave_no_version, godot_named, godot_version,
+        is_reparse_point, is_version_name, late_reason, named_as_found, netfx_sdk, panic_reason, probe, read_godot, started, unreal_installs,
+        unreal_read, unreal_version, version_list,
     };
     use crate::environment::Variables;
     use crate::remote::git::{ProgramOutput, ProgramPlace};
@@ -745,18 +892,18 @@ mod tests {
         assert_eq!(godot_version("4.3.00.stable\n"), Some("4.3.0".to_owned()));
         let install = |folder: &str| format!(r"C:\godot\{folder}\Godot_console.exe");
         assert_eq!(
-            named_as_found(&install("4.7.2"), Probed::Version("4.7.2".to_owned())),
+            named_as_found(&install("4.7.2"), Probed::Version("4.7.2".to_owned()), godot_named),
             Probed::Version("4.7.2".to_owned())
         );
         for (folder, version) in [("04.7.2", "4.7.2"), ("4.3", "4.3.0"), ("4.7.2", "4.7.10")] {
             assert_eq!(
-                named_as_found(&install(folder), Probed::Version(version.to_owned())),
+                named_as_found(&install(folder), Probed::Version(version.to_owned()), godot_named),
                 Probed::Skipped(format!("named {folder} but reports {version}")),
                 "{folder}"
             );
         }
         assert_eq!(
-            named_as_found(&install("4.7.2"), Probed::Missing),
+            named_as_found(&install("4.7.2"), Probed::Missing, godot_named),
             Probed::Missing,
             "no version, nothing to judge"
         );
@@ -1099,6 +1246,7 @@ mod tests {
             worktrees: &[],
             godot_root: None,
             unreal_root: Ok(None),
+            blender_root: Ok(None),
             netfx_key: None,
             deadline: Instant::now(),
             limit: Duration::ZERO,
@@ -1108,6 +1256,27 @@ mod tests {
         thread::scope(|scope| {
             let pending = started(scope, "unreal", &place, batch);
             assert!(matches!(pending, Pending::Running(_)), "the unreal probe runs inline");
+        });
+    }
+
+    /// With no `GATE_BLENDER_ROOT` blender is missing, even where no program can be looked for: nothing would be run.
+    #[test]
+    fn an_unset_blender_root_is_missing_whatever_the_place_gives() {
+        let place: Result<ProgramPlace, String> = Err("no place".to_owned());
+        let batch = Batch {
+            worktrees: &[],
+            godot_root: None,
+            unreal_root: Ok(None),
+            blender_root: Ok(None),
+            netfx_key: None,
+            deadline: Instant::now(),
+            limit: Duration::ZERO,
+            drain: Duration::ZERO,
+        };
+
+        thread::scope(|scope| {
+            let pending = started(scope, "blender", &place, batch);
+            assert!(matches!(pending, Pending::Found(Probed::Missing)), "an unset root is not skipped");
         });
     }
 

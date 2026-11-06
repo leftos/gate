@@ -183,7 +183,8 @@ fn record_written<S: LineSink>(record: &str, digest: &str, lock: &HeldLock, outp
     written.map_err(|why| said(output, &[&format!("gate: remote could not write {record}: {why}")], FAILED_STATUS))
 }
 
-/// Runs `dotnet tool restore` in `place`, found along `along.path` and its `TMPDIR` `along.tmp` when given, as the
+/// Runs `dotnet tool restore` in `place`, found along `along.path` and its `TMPDIR` `along.tmp` when given, each of
+/// `along.blender_names` removed from the environment it inherits, as the
 /// leader of a process group of its own recorded in `<work>.tools.pgid` under the job `<job>-tools`, which `box stop`
 /// reads; both its streams forwarded through `output`, no deadline, and a client gone ending its group. A restore that
 /// exited or was ended by a signal is followed by a line saying how long it ran.
@@ -194,6 +195,10 @@ fn restored<S: LineSink + 'static>(request: &Request<'_>, place: &Path, lock: &H
     process::with_path(&mut command, along.path);
     if let Some(tmp) = along.tmp {
         command.env("TMPDIR", tmp);
+    }
+    // No Blender for a restore: the box's own value of a blender name never reaches it.
+    for name in along.blender_names {
+        command.env_remove(name);
     }
     // SAFETY: the closure runs in the child between fork and exec and only resets the umask, signal dispositions and the
     // mask with async-signal-safe calls ([`signals_reset`]), as the command's does.
