@@ -124,7 +124,7 @@ pub(super) fn desktop_command(
     beat: &Beat<'_>,
     console: &mut Console,
 ) -> Result<Ran, DesktopEnd> {
-    let prepared = match prepared(request, one, console) {
+    let prepared = match prepared(request, one, None, console) {
         Ok(prepared) => prepared,
         Err(answer) => return answer.map_err(DesktopEnd::Ended),
     };

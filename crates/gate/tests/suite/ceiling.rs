@@ -8,7 +8,7 @@ use std::time::Duration;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::support::{Case, Escapee, FAKE_TOOL, UNTIL_KILLED, assert_in_order, release, run_words, shown};
+use crate::support::{Case, Escapee, FAKE_TOOL, UNTIL_KILLED, assert_in_order, log_texts, release, run_words, shown};
 
 /// The line the gate says once `--test-sampler-fail` has failed its first sample.
 const SAMPLER_FAILED: &str = "gate: sampler failed: --test-sampler-fail makes every sample fail (test seam only); watching by wall time only";
@@ -162,4 +162,93 @@ fn a_run_that_passes_after_its_sampler_failed_reads_unknown() {
     let release = release(&case);
     assert_eq!(release.get("adjustedSeconds"), Some(&Value::Null), "{release}");
     assert_eq!(release["verdict"], "passed", "{release}");
+}
+
+/// The variable naming the file a command reads its ceiling from.
+const CEILING_FILE: &str = "GATE_CEILING_FILE";
+
+/// The ceiling reading the command printed into the log `out.log` of `case`: its one line that starts `{"v":`, parsed.
+fn printed_reading(case: &Case) -> Value {
+    let log = log_texts(&case.folder().join("out.log"));
+    let line = log.lines().find(|line| line.starts_with(r#"{"v":"#));
+    assert!(line.is_some(), "the command printed a reading: {log}");
+    let line = line.expect("checked above");
+    let reading = serde_json::from_str(line);
+    assert!(reading.is_ok(), "the reading is JSON: {line}");
+    reading.expect("checked above")
+}
+
+/// The ceiling reading file of the case's log `out.log`, beside it.
+fn reading_file(case: &Case) -> std::path::PathBuf {
+    case.folder().join("out.log.ceiling.json")
+}
+
+#[test]
+fn a_command_reads_its_ceiling_from_the_file_its_gate_names() {
+    let case = Case::new("a_command_reads_its_ceiling_from_the_file_its_gate_names");
+    let mut words = run_words("out.log", &[], &[FAKE_TOOL, "env-file", CEILING_FILE]);
+    words[4] = "600";
+
+    let outcome = case.run(&words);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let reading = printed_reading(&case);
+    assert_eq!(reading["v"], 1, "{reading}");
+    assert_eq!(reading["ceiling_s"], 600, "{reading}");
+    let adjusted = reading["adjusted_s"].as_f64();
+    assert!(adjusted.is_some_and(|seconds| seconds >= 0.0), "a number of seconds: {reading}");
+}
+
+#[test]
+fn the_ceiling_file_s_adjusted_seconds_move_while_the_command_runs() {
+    let case = Case::new("the_ceiling_file_s_adjusted_seconds_move_while_the_command_runs");
+
+    let outcome = case.run(&run_words(
+        "out.log",
+        &["--test-sample-ms", "50"],
+        &[FAKE_TOOL, "env-file-moved", CEILING_FILE],
+    ));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let reading = printed_reading(&case);
+    let adjusted = reading["adjusted_s"].as_f64();
+    assert!(adjusted.is_some_and(|seconds| seconds > 0.0), "the clock moved: {reading}");
+}
+
+#[test]
+fn a_command_whose_sampler_failed_reads_null_adjusted_seconds() {
+    let case = Case::new("a_command_whose_sampler_failed_reads_null_adjusted_seconds");
+    let seams = ["--test-sampler-fail", "--test-sample-ms", "100"];
+
+    let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "env-file-moved", CEILING_FILE]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let log = log_texts(&case.folder().join("out.log"));
+    assert!(
+        log.lines().any(|line| line.contains(r#""adjusted_s":null"#)),
+        "the reading after the failed sample: {log}"
+    );
+    assert_eq!(printed_reading(&case)["adjusted_s"], Value::Null);
+}
+
+#[test]
+fn the_ceiling_file_is_gone_once_the_run_ends() {
+    let case = Case::new("the_ceiling_file_is_gone_once_the_run_ends");
+
+    let outcome = case.run(&run_words("out.log", &[], &[FAKE_TOOL, "env-file", CEILING_FILE]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(printed_reading(&case)["v"], 1, "the file was there while the command ran");
+    assert!(!reading_file(&case).exists(), "the reading is removed at the run's end");
+}
+
+#[test]
+fn the_ceiling_file_is_gone_once_a_failed_run_ends() {
+    let case = Case::new("the_ceiling_file_is_gone_once_a_failed_run_ends");
+
+    let outcome = case.run(&run_words("out.log", &[], &[FAKE_TOOL, "env-file", CEILING_FILE, "exit", "3"]));
+
+    assert_eq!(outcome.code, Some(3), "{outcome:?}");
+    assert_eq!(printed_reading(&case)["v"], 1, "the file was there while the command ran");
+    assert!(!reading_file(&case).exists(), "the reading is removed at the run's end");
 }

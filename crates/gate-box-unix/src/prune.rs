@@ -47,7 +47,7 @@ use crate::stop::{Record, own_group, record_current, records_folder, unusable_re
 /// How long a work folder goes unused before a sweep removes it.
 const IDLE_AGE: Duration = Duration::from_hours(24);
 /// The extensions of the files beside a work folder `<key>` named `<key>.<extension>`: its lock and its records.
-const KEY_FILES: [&str; 14] = [
+const KEY_FILES: [&str; 15] = [
     "lock",
     "warm",
     "layout",
@@ -56,6 +56,7 @@ const KEY_FILES: [&str; 14] = [
     "tools",
     "packages",
     "index",
+    "ceiling",
     "command",
     "ran",
     "pgid",
@@ -72,15 +73,16 @@ pub(crate) fn group_current(recorded: Recorded, written: SystemTime) -> bool {
     signal_guard(recorded.group, own_group()).is_ok() && record_current(recorded, written) == Record::Current
 }
 /// The records a sweep removes before it renames the work folder aside, in the order the box clears them, then the
-/// group records; `command` is the interrupted-command record, cleared like the others, and `ran` the record of a
-/// command started there.
-const RECORDS_BEFORE: [&str; 10] = [
+/// group records; `command` is the interrupted-command record, cleared like the others, `ran` the record of a
+/// command started there, and `ceiling` the ceiling reading a hard-killed box left.
+const RECORDS_BEFORE: [&str; 11] = [
     "warm",
     "ran",
     "packages",
     "tools",
     "inputs",
     "sent-build",
+    "ceiling",
     "command",
     "pgid",
     "tools.pgid",
@@ -1137,7 +1139,7 @@ mod tests {
     use gate_wire::ROOT_UNSAFE;
     use gate_wire::drain::Clock;
 
-    use super::{GIB, IDLE_AGE, Seams, free_bytes, idle_for, key_file_stem, no_rename_seen, prune, pruned_with};
+    use super::{GIB, IDLE_AGE, RECORDS_BEFORE, Seams, free_bytes, idle_for, key_file_stem, no_rename_seen, prune, pruned_with};
     use crate::console::Console;
     use crate::files::held_for_test;
 
@@ -2160,6 +2162,12 @@ mod tests {
         assert_eq!(key_file_stem("k.INDEX.lock"), Some("k"));
         assert_eq!(key_file_stem("k.layout.gate-new-1-0"), None, "a temp file names no key");
         assert_eq!(key_file_stem("k.nope"), None);
+    }
+
+    #[test]
+    fn a_key_s_ceiling_reading_is_one_of_its_files() {
+        assert_eq!(key_file_stem("k.ceiling"), Some("k"));
+        assert!(RECORDS_BEFORE.contains(&"ceiling"), "a sweep clears it with the run's records");
     }
 
     #[test]

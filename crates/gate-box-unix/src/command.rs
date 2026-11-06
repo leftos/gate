@@ -86,23 +86,41 @@ pub enum Sampler {
 /// gate-watchdog's watch, begun when the command started, sampled every period from the machine's CPU load and the
 /// CPU of the command's group, and asked for its kill on every look. A read that fails is the sampler's failure: from
 /// then on the watch goes by wall time alone, so only the backstop, five ceilings of wall time, can fire. The kill it
-/// decides and the line of its sampler's failure are kept for the run's end, as this thread writes nothing.
+/// decides and the line of its sampler's failure are kept for the run's end, as this thread writes nothing. The command
+/// reads the ceiling from its reading ([`ceiling_record`]), written before it starts, rewritten after each sample and
+/// removed once the runner is done with it; the line of the first failed rewrite is kept for the run's end too, unless
+/// the first write's failure was said.
 struct Ceiling {
-    timeout: Option<u64>,
+    /// The ceiling in seconds and the path of the command's ceiling reading ([`ceiling_record`]), `None` for no
+    /// ceiling.
+    limit: Option<(u64, String)>,
     sample: Duration,
     sampler: Sampler,
+    /// Whether a failed write of the reading was said, so no later one is.
+    reading_said: Cell<bool>,
     watching: RefCell<Option<Watching>>,
     kill: Cell<Option<Kill>>,
 }
 
 /// A begun watch: since when, when it samples next, what its samples read, and the line of its sampler's failure once
-/// one failed.
+/// one failed; and the line of the first rewrite of the ceiling reading that failed once one did, unless one failed
+/// before. The reading itself is the [`Ceiling`]'s ([`ReadingAt`]).
 struct Watching {
     watch: gate_watchdog::Watch,
     started: Instant,
     next: Duration,
     reads: Reads,
     failed: Option<String>,
+    reading_failed: Option<String>,
+}
+
+/// The command's ceiling reading as a sample rewrites it: its path, its ceiling in seconds, and whether a failed write
+/// of it was said, so no later one is.
+#[derive(Clone, Copy)]
+struct ReadingAt<'a> {
+    path: &'a str,
+    ceiling: u64,
+    said: &'a Cell<bool>,
 }
 
 /// What a sample reads: the command's group's CPU, and the system's times from where the run's [`Sampler`] says, the
@@ -163,32 +181,65 @@ impl Synthetic {
     }
 }
 
-/// What the ceiling leaves for the run's end lines: the kill it decided, the line of its sampler's failure, and the
-/// load-adjusted seconds of its closed watch, `None` for no ceiling or once the sampler failed.
+/// What the ceiling leaves for the run's end lines: the kill it decided, the lines of its sampler's failure and of the
+/// first failed rewrite of its reading, in that order, and the load-adjusted seconds of its closed watch, `None` for no
+/// ceiling or once the sampler failed.
 #[derive(Default)]
 struct Verdict {
     kill: Option<Kill>,
-    failed: Option<String>,
+    failed: Vec<String>,
     adjusted: Option<f64>,
 }
 
 impl Ceiling {
-    /// The ceiling of `timeout` seconds, `None` for none, sampled every `sample` from `sampler`; not begun.
-    fn new(timeout: Option<u64>, sample: Duration, sampler: Sampler) -> Ceiling {
+    /// The ceiling of `timeout` seconds, `None` for none, sampled every `sample` from `sampler`, its reading beside the
+    /// work folder `work` ([`ceiling_record`]); not begun, its reading not written.
+    fn new(timeout: Option<u64>, sample: Duration, sampler: Sampler, work: &str) -> Ceiling {
         Ceiling {
-            timeout,
+            limit: timeout.map(|timeout| (timeout, ceiling_record(work))),
             sample,
             sampler,
+            reading_said: Cell::new(false),
             watching: RefCell::new(None),
             kill: Cell::new(None),
         }
     }
 
+    /// Writes the command's reading before it starts, no seconds counted yet; nothing for no ceiling. A write that
+    /// fails is said, and the command starts all the same.
+    fn reading_written<S: LineSink>(&self, output: &Output<S>) {
+        let Some((timeout, path)) = &self.limit else {
+            return;
+        };
+        if let Err(line) = reading_replaced(path, *timeout, Some(0.0)) {
+            self.reading_said.set(true);
+            // A client gone meanwhile has no one left to tell; the run goes on.
+            let _ = output.say(Stream::Err, GAT, &line);
+        }
+    }
+
+    /// Removes the command's reading once the runner is done with it, however the command ended; nothing for no
+    /// ceiling. A removal that fails is said and changes nothing else. This run's work lock is held for the whole
+    /// command, so no other run's reading can be at the name.
+    fn reading_removed<S: LineSink>(&self, output: &Output<S>) {
+        let Some((_, path)) = &self.limit else {
+            return;
+        };
+        if let Err(error) = files::remove_if_there(Path::new(path)) {
+            let line = format!(
+                "gate: cannot remove the ceiling reading {}: {}",
+                escaped(path),
+                escaped(&error.to_string())
+            );
+            let _ = output.say(Stream::Err, GAT, &line);
+        }
+    }
+
     /// Begins the watch now, the command started, on every core of the builder, with a first read of `cpu`, the
     /// command's group's CPU, and of the machine's times; nothing for a run with no ceiling. A first read that fails is
-    /// the sampler's failure, its line kept.
+    /// the sampler's failure, its line kept, and its reading rewritten at once from the watch's state.
     fn begin(&self, cpu: Arc<dyn CpuSource>) {
-        let Some(timeout) = self.timeout else {
+        let Some(&(timeout, _)) = self.limit.as_ref() else {
             return;
         };
         let cores = thread::available_parallelism().map_or(1, |cores| u32::try_from(cores.get()).unwrap_or(u32::MAX));
@@ -220,13 +271,34 @@ impl Ceiling {
         let (job_cpu, system) = first.as_ref().map_or((Ticks(0), none), |&(job_cpu, _, system)| (job_cpu, system));
         let mut watch = gate_watchdog::Watch::new(config, Machine::new(cores, cores, false), system, job_cpu, None);
         let failed = first.err().map(|why| watch.sampler_failed(&why));
-        *self.watching.borrow_mut() = Some(Watching {
+        let mut watching = Watching {
             watch,
             started,
             next: self.sample,
             reads,
             failed,
-        });
+            reading_failed: None,
+        };
+        // A first read that failed has the reading say so at once, its seconds `null`, rather than a period later; a
+        // sampler that reads leaves the `0.0` written before the start.
+        if watching.watch.sampler_has_failed() {
+            watching.reading_rewritten(self.reading_at());
+        }
+        *self.watching.borrow_mut() = Some(watching);
+    }
+
+    /// The path of the command's reading, the one its variable names; `None` for no ceiling.
+    fn reading_path(&self) -> Option<&str> {
+        self.limit.as_ref().map(|(_, path)| path.as_str())
+    }
+
+    /// The command's reading as a sample rewrites it; `None` for no ceiling.
+    fn reading_at(&self) -> Option<ReadingAt<'_>> {
+        self.limit.as_ref().map(|(ceiling, path)| ReadingAt {
+            path,
+            ceiling: *ceiling,
+            said: &self.reading_said,
+        })
     }
 
     /// One look: a sample once its period has passed, then the kill that holds now, kept and given as the halt that
@@ -237,7 +309,7 @@ impl Ceiling {
         let began = watching.started.elapsed();
         if began >= watching.next {
             watching.next = began + self.sample;
-            watching.take_sample(began);
+            watching.take_sample(began, self.reading_at());
         }
         let kill = watching.watch.kill_check(watching.started.elapsed())?;
         self.kill.set(Some(kill));
@@ -259,7 +331,10 @@ impl Ceiling {
         let watching = watching.as_ref();
         Verdict {
             kill: self.kill.get(),
-            failed: watching.and_then(|watching| watching.failed.clone()),
+            failed: watching
+                .into_iter()
+                .flat_map(|watching| watching.failed.iter().chain(&watching.reading_failed).cloned())
+                .collect(),
             adjusted: watching
                 .filter(|watching| !watching.watch.sampler_has_failed())
                 .map(|watching| watching.watch.adjusted_seconds()),
@@ -269,8 +344,32 @@ impl Ceiling {
 
 impl Watching {
     /// Takes the sample whose reads begin at `began`, or, once the sampler has failed, brings the watch's wall time up
-    /// to it; a sample that fails is the sampler's failure, its line kept.
-    fn take_sample(&mut self, began: Duration) {
+    /// to it; a sample that fails is the sampler's failure, its line kept. The command's `reading` is then rewritten
+    /// with the seconds the clock reached, `null` once the sampler has failed; the line of the run's first failed write
+    /// is kept.
+    fn take_sample(&mut self, began: Duration, reading: Option<ReadingAt<'_>>) {
+        self.sample_once(began);
+        self.reading_rewritten(reading);
+    }
+
+    /// Rewrites `reading`, when there is one, with the seconds the clock has reached, `null` once the sampler has
+    /// failed; the line of the run's first failed write is kept.
+    fn reading_rewritten(&mut self, reading: Option<ReadingAt<'_>>) {
+        let Some(ReadingAt { path, ceiling, said }) = reading else {
+            return;
+        };
+        // Both figures of the reading come from the watch's state now: the sample just taken, or the failed first read
+        // at begin.
+        let adjusted = (!self.watch.sampler_has_failed()).then(|| self.watch.adjusted_seconds());
+        if let Err(line) = reading_replaced(path, ceiling, adjusted)
+            && !said.replace(true)
+        {
+            self.reading_failed = Some(line);
+        }
+    }
+
+    /// The pass of [`Watching::take_sample`] that moves the clock.
+    fn sample_once(&mut self, began: Duration) {
         if self.watch.sampler_has_failed() {
             self.watch.wall_only(began, false);
             return;
@@ -316,6 +415,28 @@ pub fn command_record(work: &str) -> String {
 #[must_use]
 pub fn ran_record(work: &str) -> String {
     format!("{work}.ran")
+}
+
+/// The ceiling reading of the work folder `work`, `<work>.ceiling`, beside it as the Windows box's: the file a command
+/// under the box's ceiling reads its ceiling and load-adjusted seconds from ([`gate_wire::CEILING_FILE_VARIABLE`]),
+/// written before the command starts, rewritten at each sample and removed when its ceiling clock ends.
+#[must_use]
+pub fn ceiling_record(work: &str) -> String {
+    format!("{work}.ceiling")
+}
+
+/// Puts the reading of a ceiling of `ceiling` seconds with `adjusted` load-adjusted seconds counted, `None` once the
+/// sampler has failed, at `path` ([`gate_wire::ceiling_reading_text`]), so a reader sees a whole text; nothing is synced
+/// to the disk ([`files::replace_unsynced`]), as the reading is short-lived and a sync would hold up the thread that
+/// makes the kill check. The line that says a write that failed.
+fn reading_replaced(path: &str, ceiling: u64, adjusted: Option<f64>) -> Result<(), String> {
+    files::replace_unsynced(Path::new(path), gate_wire::ceiling_reading_text(ceiling, adjusted).as_bytes()).map_err(|error| {
+        format!(
+            "gate: cannot write the ceiling reading {}: {}",
+            escaped(path),
+            escaped(&error.to_string())
+        )
+    })
 }
 
 /// Whether a plain file is at the ran record of the work folder `work` ([`ran_record`]), looked at as itself: a folder,
@@ -403,7 +524,7 @@ fn run_with<S: LineSink + 'static>(launch: &Launch<'_>, output: &Arc<Output<S>>,
     let group = GroupRecord::new(PathBuf::from(group_record(launch.work)), launch.job, launch.lock);
     let forwarding: Arc<dyn Forwarding> = Arc::clone(output) as Arc<dyn Forwarding>;
     let processes = ProcessLines::new(Arc::clone(&forwarding));
-    let ceiling = Ceiling::new(launch.timeout, launch.sample, launch.sampler);
+    let ceiling = Ceiling::new(launch.timeout, launch.sample, launch.sampler, launch.work);
     let ran = ran_record(launch.work);
     let started = |group: i32| {
         let cpu = (beat.cpu_of)(group);
@@ -437,15 +558,18 @@ fn run_with<S: LineSink + 'static>(launch: &Launch<'_>, output: &Arc<Output<S>>,
         on_leader_exit: Some(&leader_exited),
         processes: Some(&processes),
     };
+    // Written before the command starts, so the file its variable names is there from its first instruction.
+    ceiling.reading_written(output);
     let ran = match started_program(launch.godot, program) {
         Ok(program) => {
             processes.root();
-            let ran = run_watched(command_of(launch, program, rest), &watch);
+            let ran = run_watched(command_of(launch, program, rest, ceiling.reading_path()), &watch);
             processes.finish();
             ran
         }
         Err(error) => Err(NotRan::Start(error)),
     };
+    ceiling.reading_removed(output);
     ended(launch, &record, ran, &ceiling.verdict(), output)
 }
 
@@ -476,7 +600,7 @@ pub fn run_cross<S: LineSink + 'static>(launch: &Launch<'_>, words: &[String], o
         return CrossEnd::Ended(command_status(CommandEnd::NotStarted));
     };
     let group = GroupRecord::new(PathBuf::from(group_record(launch.work)), launch.job, launch.lock);
-    let ceiling = Ceiling::new(launch.timeout, launch.sample, launch.sampler);
+    let ceiling = Ceiling::new(launch.timeout, launch.sample, launch.sampler, launch.work);
     let started = |group: i32| {
         let cpu: Arc<dyn CpuSource> = Arc::new(GroupCpu::new(group));
         ceiling.begin(Arc::clone(&cpu));
@@ -504,9 +628,12 @@ pub fn run_cross<S: LineSink + 'static>(launch: &Launch<'_>, words: &[String], o
         on_leader_exit: Some(&leader_exited),
         processes: None,
     };
+    // The command's reading was removed when it ended: the cross build's is its own, at the same name.
+    ceiling.reading_written(output);
     let began = Instant::now();
-    let ran = run_watched(command_of(launch, program, rest), &watch);
+    let ran = run_watched(command_of(launch, program, rest, ceiling.reading_path()), &watch);
     let took = began.elapsed();
+    ceiling.reading_removed(output);
     cross_of(cross_end(launch, program, ran, &ceiling.verdict(), output), took)
 }
 
@@ -740,13 +867,15 @@ fn with_folder(words: &[String], folder: &Path) -> Vec<String> {
 }
 
 /// The command `program` with the arguments `rest`, run in `launch`'s place with the environment
-/// [`command_environment`] composes, the build servers named by the run id `gate-box-<nonce>`.
-fn command_of(launch: &Launch<'_>, program: &str, rest: &[String]) -> Command {
+/// [`command_environment`] composes, the build servers named by the run id `gate-box-<nonce>`, told its ceiling reading
+/// `ceiling`, the [`Ceiling`]'s, `None` for no ceiling.
+fn command_of(launch: &Launch<'_>, program: &str, rest: &[String], ceiling: Option<&str>) -> Command {
     let run = format!("gate-box-{}", launch.nonce);
     let along = Along {
         path: launch.login_path,
         tmp: launch.tmp,
         godot: launch.godot,
+        ceiling,
     };
     let environment = command_environment(std::env::vars_os().collect(), along, launch.env, &run, launch.job);
     let mut command = Command::new(program);
@@ -1317,16 +1446,21 @@ mod tests {
         let (beats, beaten) = channel();
         let (release, hold) = channel();
         let output = Output::new(BeatSink::holding(beats, hold, HoldFrom::First, None));
+        // A work folder in a folder that is not there: each sample's rewrite of the reading fails, kept, not said.
+        let work = std::env::temp_dir()
+            .join(format!("gate-box-unix-no-folder-{}", std::process::id()))
+            .join("k");
+        let work = work.to_string_lossy();
         thread::scope(|scope| {
             let stuck = scope.spawn(|| output.say(Stream::Err, Stamp::Bare, "gate-remote-heartbeat: 0"));
             assert!(beaten.recv_timeout(GUARD).is_ok(), "the other thread holds the output lock in its write");
             // A check that took the lock would wait for the stuck write, which is let go only after it.
             // The failing sampler leaves the backstop the only kill, and its failure is kept, not said.
-            let ceiling = Ceiling::new(Some(0), Duration::from_millis(1), Sampler::Failing);
+            let ceiling = Ceiling::new(Some(0), Duration::from_millis(1), Sampler::Failing, &work);
             ceiling.begin(idle_cpu(0));
             let halt = ceiling.check();
             // A sampler that reads: its first read and a sample, at once, then the ceiling.
-            let reading = Ceiling::new(Some(0), Duration::ZERO, Sampler::FreePercent(100));
+            let reading = Ceiling::new(Some(0), Duration::ZERO, Sampler::FreePercent(100), &work);
             reading.begin(idle_cpu(0));
             let timed_out = reading.check();
             let _ = release.send(());
@@ -1336,7 +1470,7 @@ mod tests {
             assert_eq!(timed_out, Some(Halt("ceiling".to_owned())), "a 0 s ceiling holds at once");
             assert!(matches!(reading.kill.get(), Some(Kill::TimedOut { .. })), "the kill is kept");
         });
-        let none = Ceiling::new(None, Duration::from_millis(1), Sampler::Machine);
+        let none = Ceiling::new(None, Duration::from_millis(1), Sampler::Machine, &work);
         none.begin(idle_cpu(0));
         assert_eq!(none.check(), None, "no ceiling, no kill");
     }

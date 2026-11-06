@@ -572,6 +572,9 @@ pub struct Along<'a> {
     pub tmp: Option<&'a str>,
     /// The run's Godot, which sets or removes [`GODOT_PATH`] over the payload's `Env`.
     pub godot: Godot<'a>,
+    /// The command's ceiling reading, which [`gate_wire::CEILING_FILE_VARIABLE`] names; `None` for a command under no
+    /// ceiling, and for a tool or package restore, which removes the variable.
+    pub ceiling: Option<&'a str>,
 }
 
 /// The command's environment: `start` (the box's own), its `PATH` the login shell's `along.path` and its `TMPDIR` the
@@ -579,7 +582,9 @@ pub struct Along<'a> {
 /// [`GODOT_PATH`] then set to the program of `along.godot`'s install over any value it holds, or removed for a run whose
 /// chosen version has none; then the build-server settings of the run `run` ([`gate_wire::build_server_settings`]) and
 /// [`BOX_JOB_VARIABLE`] the job `job`, each first removing every name that differs from it only in case, so the command
-/// sees one value per name, as on the Windows box.
+/// sees one value per name, as on the Windows box; last [`gate_wire::CEILING_FILE_VARIABLE`] set the same way to the
+/// command's ceiling reading `along.ceiling`, or, with `None`, removed in any case, so neither the payload's `Env` nor
+/// the box's own environment hands the command a reading that is not its own.
 #[must_use]
 pub fn command_environment(
     start: Vec<(OsString, OsString)>,
@@ -607,21 +612,32 @@ pub fn command_environment(
         set_variable(&mut environment, name, &value, true);
     }
     set_variable(&mut environment, BOX_JOB_VARIABLE, job, true);
+    match along.ceiling {
+        Some(path) => set_variable(&mut environment, gate_wire::CEILING_FILE_VARIABLE, path, true),
+        None => remove_variable(&mut environment, gate_wire::CEILING_FILE_VARIABLE),
+    }
     environment
 }
 
 /// Sets `name` to `value` in `environment`, last: every value it holds for that name removed first, and with
 /// `any_case` every value for a name that differs from it only in ASCII case.
 fn set_variable(environment: &mut Vec<(OsString, OsString)>, name: &str, value: &str, any_case: bool) {
-    environment.retain(|(set, _)| {
-        let same = if any_case {
-            set.to_str().is_some_and(|set| set.eq_ignore_ascii_case(name))
-        } else {
-            set.as_os_str() == OsStr::new(name)
-        };
-        !same
-    });
+    environment.retain(|(set, _)| !same_name(set, name, any_case));
     environment.push((OsString::from(name), OsString::from(value)));
+}
+
+/// Removes every value `environment` holds for `name` or for a name that differs from it only in ASCII case.
+fn remove_variable(environment: &mut Vec<(OsString, OsString)>, name: &str) {
+    environment.retain(|(set, _)| !same_name(set, name, true));
+}
+
+/// Whether the variable name `set` is `name`, or with `any_case` differs from it only in ASCII case.
+fn same_name(set: &OsStr, name: &str, any_case: bool) -> bool {
+    if any_case {
+        set.to_str().is_some_and(|set| set.eq_ignore_ascii_case(name))
+    } else {
+        set == OsStr::new(name)
+    }
 }
 
 #[cfg(test)]
@@ -746,6 +762,7 @@ mod tests {
             path,
             tmp: None,
             godot: Godot::Unchosen,
+            ceiling: None,
         }
     }
 
@@ -790,6 +807,7 @@ mod tests {
             path: Some("/login/bin:/usr/bin"),
             tmp: Some("/tmp/gate.abcdefgh/"),
             godot: Godot::Unchosen,
+            ceiling: None,
         };
         let environment = command_environment(start.clone(), along, &caller, "gate-box-n", "gate-remote-k-n");
         assert_eq!(values_of(&environment, "PATH"), [("PATH", "/login/bin:/usr/bin")]);
@@ -827,6 +845,7 @@ mod tests {
             path: None,
             tmp: Some("/tmp/gate.abcdefgh/"),
             godot: Godot::Unchosen,
+            ceiling: None,
         };
         let environment = command_environment(start, along, &[], "r", "j");
         assert_eq!(values_of(&environment, "TMPDIR"), [("TMPDIR", "/tmp/gate.abcdefgh/")]);
@@ -846,9 +865,42 @@ mod tests {
             path: None,
             tmp: Some("/tmp/gate.abcdefgh/"),
             godot: Godot::Unchosen,
+            ceiling: None,
         };
         let environment = command_environment(start, along, &caller, "r", "j");
         assert_eq!(values_of(&environment, "TMPDIR"), [("TMPDIR", "/theirs/")]);
+    }
+
+    #[test]
+    fn command_environment_sets_the_ceiling_file_when_given_one() {
+        let start = vec![(OsString::from("GATE_CEILING_FILE"), OsString::from("/parent/run.ceiling"))];
+        let caller = [("gate_ceiling_file".to_owned(), "/theirs/run.ceiling".to_owned())];
+        let along = Along {
+            ceiling: Some("/root/work/k.ceiling"),
+            ..along_path(None)
+        };
+        let environment = command_environment(start, along, &caller, "r", "j");
+        assert_eq!(
+            values_of(&environment, gate_wire::CEILING_FILE_VARIABLE),
+            [("GATE_CEILING_FILE", "/root/work/k.ceiling")],
+            "the run's own reading, over the box's and the caller's"
+        );
+    }
+
+    #[test]
+    fn command_environment_removes_an_inherited_ceiling_file_when_given_none() {
+        let start = vec![(OsString::from("Gate_Ceiling_File"), OsString::from("/parent/run.ceiling"))];
+        let caller = [("gate_CEILING_file".to_owned(), "/theirs/run.ceiling".to_owned())];
+        let environment = command_environment(start.clone(), along_path(None), &caller, "r", "j");
+        assert!(
+            values_of(&environment, gate_wire::CEILING_FILE_VARIABLE).is_empty(),
+            "no reading, no variable: {environment:?}"
+        );
+        let inherited = command_environment(start, along_path(None), &[], "r", "j");
+        assert!(
+            values_of(&inherited, gate_wire::CEILING_FILE_VARIABLE).is_empty(),
+            "the box's own goes too: {inherited:?}"
+        );
     }
 
     #[test]

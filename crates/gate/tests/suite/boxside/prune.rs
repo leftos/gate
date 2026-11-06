@@ -19,7 +19,9 @@ use crate::support::{Case, Outcome, finish, git, junction, shown};
 /// How long ago an idle work folder and its records were last written: two days, well past the sweep's one.
 const AGED: Duration = Duration::from_hours(48);
 /// The records beside a work folder `k`, as `k.<record>`.
-const RECORDS: [&str; 9] = ["lock", "warm", "layout", "inputs", "tools", "packages", "index", "command", "ran"];
+const RECORDS: [&str; 10] = [
+    "lock", "warm", "layout", "inputs", "tools", "packages", "index", "ceiling", "command", "ran",
+];
 /// The summary line of a sweep that removed nothing and saw no work folder.
 const NOTHING: &str = "gate: remote prune removed 0 of 0 work folders\n";
 

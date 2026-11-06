@@ -1188,6 +1188,7 @@ fn locked<S: LineSink + 'static>(
         path: login_path.as_deref(),
         tmp: temp.as_ref().map(RunTemp::tmpdir),
         godot: Godot::Unchosen,
+        ceiling: None,
     };
     let restored = tools::update(request, &place, lock, along, output).and_then(|()| packages::update(request, &place, lock, along, &git, output));
     if let Err(unready) = restored {

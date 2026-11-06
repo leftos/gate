@@ -16,6 +16,7 @@ use crate::boxside::stamping;
 use crate::boxside::stop::Ending;
 use crate::console::Console;
 use crate::remote::{BoxKill, adjusted_line, killed_line};
+use crate::watch::CeilingReading;
 
 /// How often the box samples its machine unless `--test-box-sample-ms` says otherwise: the local gate's period.
 const SAMPLE_PERIOD: Duration = Duration::from_secs(5);
@@ -46,6 +47,8 @@ pub(super) struct Ceiling<'a> {
     host: String,
     spoken: String,
     nonce: &'a str,
+    /// The ceiling reading the command reads, rewritten after each sample; `None` when it is given none.
+    reading: Option<&'a CeilingReading>,
 }
 
 /// Where a sample's system times come from.
@@ -133,6 +136,7 @@ impl<'a> Ceiling<'a> {
             host: spec.host,
             spoken: spec.spoken,
             nonce: spec.nonce,
+            reading: None,
         };
         if let Sampler::Synthetic(synthetic) = &mut ceiling.sampler {
             synthetic.job_cpu = job_cpu;
@@ -143,6 +147,19 @@ impl<'a> Ceiling<'a> {
             ceiling.say(console, &[line]);
         }
         Some(ceiling)
+    }
+
+    /// This watch, rewriting the command's ceiling reading `reading` after each sample, when it has one. A first read
+    /// that already failed rewrites it at once, its seconds `null`, rather than a period later; the command, already
+    /// running, may read `0.0` before this write. A watch whose sampler reads writes nothing here, its reading already
+    /// saying `0.0`.
+    pub(super) fn rewriting(mut self, reading: Option<&'a CeilingReading>, console: &mut Console) -> Self {
+        self.reading = reading;
+        // The command is already running and may hold the file, so the move is retried.
+        if let Some(reading) = reading.filter(|_| self.watch.sampler_has_failed()) {
+            reading.rewrite_retried(None, |line| self.say(console, &[line.to_owned()]));
+        }
+        self
     }
 
     /// One look while the command runs: a sample once its period has passed, then the kill that holds now, if any.
@@ -198,7 +215,8 @@ impl<'a> Ceiling<'a> {
         }
     }
 
-    /// The load-adjusted seconds of the closed watch, `None` once the sampler failed, its clock stopped there.
+    /// The load-adjusted seconds the watch has counted, `None` once the sampler failed, its clock stopped there: read on
+    /// the open watch at each sample, and on the closed one at the run's end.
     pub(super) fn adjusted_seconds(&self) -> Option<f64> {
         (!self.watch.sampler_has_failed()).then(|| self.watch.adjusted_seconds())
     }
@@ -209,8 +227,18 @@ impl<'a> Ceiling<'a> {
     }
 
     /// Takes the sample whose reads begin at `began`, or, once the sampler has failed, brings the watch's wall time up
-    /// to it; a sample that fails is the sampler's failure, said.
+    /// to it; a sample that fails is the sampler's failure, said. The ceiling reading is then rewritten with the seconds
+    /// the clock reached, `null` once the sampler has failed.
     fn take_sample(&mut self, began: Duration, console: &mut Console) {
+        self.sample_once(began, console);
+        if let Some(reading) = self.reading {
+            // Both figures of the reading come from the sample just taken.
+            reading.rewrite(self.adjusted_seconds(), |line| self.say(console, &[line.to_owned()]));
+        }
+    }
+
+    /// The pass of [`Ceiling::take_sample`] that moves the clock.
+    fn sample_once(&mut self, began: Duration, console: &mut Console) {
         if self.watch.sampler_has_failed() {
             self.watch.wall_only(began, false);
             return;

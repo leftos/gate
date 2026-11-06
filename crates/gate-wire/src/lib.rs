@@ -1832,6 +1832,20 @@ pub fn build_server_settings(run: &str) -> [(&'static str, String); 6] {
     ]
 }
 
+/// The variable a gate sets for each command it runs under a load-adjusted ceiling: the absolute path of the file
+/// holding the command's ceiling reading ([`ceiling_reading_text`]). A gate with no reading to give removes an inherited
+/// one, so a nested command never reads its parent's file. Both boxes and the PC's gate set it.
+pub const CEILING_FILE_VARIABLE: &str = "GATE_CEILING_FILE";
+
+/// The text of a ceiling reading: `{"v":1,"ceiling_s":<n>,"adjusted_s":<s>}`, the ceiling in whole seconds the kill
+/// compares the command's load-adjusted seconds against, and those seconds as of the last sample with one decimal
+/// place, `null` once the sampler has failed. No spaces and no line end. Both boxes and the PC's gate write it.
+#[must_use]
+pub fn ceiling_reading_text(ceiling_s: u64, adjusted_s: Option<f64>) -> String {
+    let adjusted = adjusted_s.map_or_else(|| "null".to_owned(), |seconds| format!("{seconds:.1}"));
+    format!(r#"{{"v":1,"ceiling_s":{ceiling_s},"adjusted_s":{adjusted}}}"#)
+}
+
 /// The refusal tag the box says on stderr just before the human line of a refusal of the run whose payload carries
 /// `nonce`: `gate-remote-refused: <nonce> <word>` ([`Refusal::word`]). The client reads a refusal from this line alone.
 ///
@@ -2106,6 +2120,25 @@ mod tests {
         Payload, Probed, back_commits_line, created_line, escaped, first_version, is_cross_not_brought_back, is_cross_step_start, probed,
         root_busy_line, root_unsafe_line, runs_probe, sdk_list, sdks_line, tool_line, version_line, version_of, version_text, warm_line, work_root,
     };
+
+    #[test]
+    fn ceiling_reading_text_gives_the_ceiling_and_the_adjusted_seconds() {
+        assert_eq!(
+            super::ceiling_reading_text(1800, Some(12.5)),
+            r#"{"v":1,"ceiling_s":1800,"adjusted_s":12.5}"#
+        );
+        assert_eq!(super::ceiling_reading_text(600, Some(0.0)), r#"{"v":1,"ceiling_s":600,"adjusted_s":0.0}"#);
+        assert_eq!(
+            super::ceiling_reading_text(1, Some(3.04)),
+            r#"{"v":1,"ceiling_s":1,"adjusted_s":3.0}"#,
+            "one decimal place"
+        );
+    }
+
+    #[test]
+    fn ceiling_reading_text_writes_null_for_unknown_adjusted_seconds() {
+        assert_eq!(super::ceiling_reading_text(1800, None), r#"{"v":1,"ceiling_s":1800,"adjusted_s":null}"#);
+    }
 
     #[test]
     fn lower_hex_writes_two_lower_case_digits_a_byte_in_order() {

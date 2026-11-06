@@ -323,7 +323,8 @@ mod unix {
         text.split(' ').find_map(|word| word.strip_prefix(key)?.strip_prefix('='))
     }
 
-    /// Starts `gate-box box --test-heartbeat-ms 50 --test-box-sample-ms 50 <seams> run --stdin`, writes `request` on
+    /// Starts `gate-box box --test-heartbeat-ms 50 --test-box-sample-ms 50 <seams> run --stdin`, the sample period the
+    /// one `seams` gives when they give one, writes `request` on
     /// its stdin, and reads it as `reading` says until it ends. Once the start marker and then a heartbeat were read,
     /// `beaten` is made, which a command can wait on.
     fn ran(seams: &[&str], request: &str, reading: Reading, beaten: &Path) -> Ended {
@@ -332,7 +333,11 @@ mod unix {
 
     /// [`ran`], the box's `SHELL`, which its login `PATH` is read from, set to `shell` when one is given.
     fn ran_in(seams: &[&str], request: &str, reading: Reading, beaten: &Path, shell: Option<&Path>) -> Ended {
-        let mut words = vec!["box", "--test-heartbeat-ms", "50", "--test-box-sample-ms", "50"];
+        let mut words = vec!["box", "--test-heartbeat-ms", "50"];
+        // A case that gives its own sample period has it in place of the 50 ms one, as the box refuses a seam twice.
+        if !seams.contains(&"--test-box-sample-ms") {
+            words.extend(["--test-box-sample-ms", "50"]);
+        }
         words.extend(seams);
         words.extend(["run", "--stdin"]);
         let mut command = Command::new(env!("CARGO_BIN_EXE_gate-box"));
@@ -613,6 +618,97 @@ mod unix {
         let tmpdir = ended.out.last().map(|line| unstamped(line).text).expect("the command said its TMPDIR");
         assert!(tmpdir.starts_with("/tmp/gate.") && tmpdir.ends_with('/') && tmpdir.len() < 38, "{tmpdir}");
         assert!(!Path::new(tmpdir).exists(), "the run's temp folder is gone: {tmpdir}");
+        case.ended_clean();
+    }
+
+    /// A command that says its ceiling reading: the variable's value and then the file's text, or `unset` when the
+    /// variable is empty.
+    const SAYS_ITS_CEILING: &str = concat!(
+        "if [ -z \"$GATE_CEILING_FILE\" ]; then echo unset; exit 0; fi; ",
+        "printf '%s\\n' \"$GATE_CEILING_FILE\"; cat \"$GATE_CEILING_FILE\" || exit 9; echo"
+    );
+
+    /// The reading a run of [`SAYS_ITS_CEILING`] said: the variable's value and the file's text, read as JSON.
+    fn said_reading(ended: &Ended) -> (String, Value) {
+        let said = texts(&ended.out);
+        assert_eq!(said.len(), 2, "the path and the reading: {:?} {:?}", ended.out, ended.err);
+        let reading = serde_json::from_str(said[1]).expect("the reading is JSON");
+        (said[0].to_owned(), reading)
+    }
+
+    #[test]
+    fn a_run_with_a_timeout_tells_its_command_its_ceiling_file() {
+        let case = Case::new("ceiling-file");
+        let commit = case.snapshot();
+        let request = case.request(&commit, &json!({"Command": ["/bin/sh", "-c", SAYS_ITS_CEILING], "Timeout": 3600}));
+        let ended = ran(&[], &request, Reading::All, &case.base.join("beaten"));
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        let (path, reading) = said_reading(&ended);
+        assert_eq!(path, format!("{}.ceiling", case.work()), "beside the work folder");
+        assert_eq!(reading["v"], json!(1), "{reading}");
+        assert_eq!(reading["ceiling_s"], json!(3600), "{reading}");
+        assert!(reading["adjusted_s"].is_number(), "seconds counted while the sampler reads: {reading}");
+        case.ended_clean();
+    }
+
+    #[test]
+    fn a_run_s_ceiling_file_is_gone_when_the_command_ends() {
+        let case = Case::new("ceiling-gone");
+        let commit = case.snapshot();
+        let request = case.request(&commit, &json!({"Command": ["/bin/sh", "-c", SAYS_ITS_CEILING], "Timeout": 3600}));
+        let ended = ran(&[], &request, Reading::All, &case.base.join("beaten"));
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        let (path, _) = said_reading(&ended);
+        assert!(!Path::new(&path).exists(), "the reading is removed once the command ended: {path}");
+        case.ended_clean();
+    }
+
+    #[test]
+    fn a_run_without_a_timeout_gives_its_command_no_ceiling_file() {
+        let case = Case::new("ceiling-none");
+        let commit = case.snapshot();
+        let request = case.request(&commit, &json!({"Command": ["/bin/sh", "-c", SAYS_ITS_CEILING]}));
+        let ended = ran(&[], &request, Reading::All, &case.base.join("beaten"));
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(texts(&ended.out), ["unset"], "{:?}", ended.err);
+        assert!(!Path::new(&format!("{}.ceiling", case.work())).exists(), "no reading written");
+        case.ended_clean();
+    }
+
+    /// A command that waits for its ceiling reading to say `null` and then says it as [`SAYS_ITS_CEILING`] does; past
+    /// 6000 looks 50 ms apart (300 s, a hang guard below the suite's, not a timing) it says `never read null` on
+    /// standard error and exits 1.
+    const SAYS_ITS_NULL_CEILING: &str = concat!(
+        "i=0; until grep -q null \"$GATE_CEILING_FILE\" 2>/dev/null; do ",
+        "i=$((i+1)); if [ $i -gt 6000 ]; then echo 'never read null' >&2; exit 1; fi; sleep 0.05; done; ",
+        "printf '%s\\n' \"$GATE_CEILING_FILE\"; cat \"$GATE_CEILING_FILE\" || exit 9; echo"
+    );
+
+    #[test]
+    fn a_run_whose_sampler_fails_writes_null_adjusted_seconds() {
+        let case = Case::new("ceiling-null");
+        let commit = case.snapshot();
+        let request = case.request(&commit, &json!({"Command": ["/bin/sh", "-c", SAYS_ITS_NULL_CEILING], "Timeout": 3600}));
+        let ended = ran(&["--test-box-sampler-fail", "true"], &request, Reading::All, &case.base.join("beaten"));
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        let (_, reading) = said_reading(&ended);
+        assert_eq!(reading["ceiling_s"], json!(3600), "{reading}");
+        assert_eq!(reading["adjusted_s"], Value::Null, "{reading}");
+        case.ended_clean();
+    }
+
+    #[test]
+    fn a_run_whose_first_sample_fails_writes_null_adjusted_seconds_at_once() {
+        let case = Case::new("ceiling-null-first");
+        let commit = case.snapshot();
+        let request = case.request(&commit, &json!({"Command": ["/bin/sh", "-c", SAYS_ITS_NULL_CEILING], "Timeout": 3600}));
+        // No periodic sample comes within the case, so only the failed first read can write the null.
+        let seams = ["--test-box-sample-ms", "600000", "--test-box-sampler-fail", "true"];
+        let ended = ran(&seams, &request, Reading::All, &case.base.join("beaten"));
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        let (_, reading) = said_reading(&ended);
+        assert_eq!(reading["ceiling_s"], json!(3600), "{reading}");
+        assert_eq!(reading["adjusted_s"], Value::Null, "{reading}");
         case.ended_clean();
     }
 

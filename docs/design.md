@@ -128,6 +128,8 @@ A routed run sends the pairs as the payload's `Env` ([The box side](#the-box-sid
 
 A command tells that it runs routed by `GATE_BOX_JOB`: both boxes set it on every routed command, the Windows box as `Local\` or `Global\gate-remote-<key>-<12 hex>` and the Unix box as `gate-remote-<key>-<12 hex>` ([The box side](#the-box-side)), and a local run's command never has it, since a gate outside a box job removes it from its command's environment ([Critical drain and nesting](#critical-drain-and-nesting)).
 
+A command under a ceiling reads how much of the ceiling is left from the file `GATE_CEILING_FILE` names, a local run's and a routed run's alike ([Watchdog](#watchdog), the ceiling reading).
+
 A test that needs what only the PC gives skips when it is set. One example is a named pipe whose ACL admits the interactive user and denies NETWORK: the Windows builder runs a routed command with a network logon's token. Only whether the variable is set is the contract; its value is the box's own.
 
 Files a routed command writes in the worktree come back after the run, whether it passed or failed. That covers tracked files and untracked files git does not ignore, which travel by the sync-back ([The box side](#the-box-side): the back commit and its apply). Ignored files come back only through the outputs globs.
@@ -2176,6 +2178,15 @@ All kept, with each knob's default unchanged:
 - The load-adjusted clock and the ceiling (W3): each sample adds `interval * free`, the interval running between the samples' `at` stamps, to the clock `--timeout` runs on (for `auto:<n>`, the ceiling the take resolved; the backstop below uses it too); a sample taken while a nested gate is paused adds to the paused time instead; `gate: TIMED OUT after ...`.
 
   The free share is 1 for a High-priority command; otherwise `busy` is the share of the interval's system time that was not idle, the cores others held are `max(0, busy * cores - own cores)` with `own cores` the CPU gained over the interval by the job and by the escaped tree (below), and `free = clamp((cores - others) / demand, 0.05, 1)`. `demand` is every core, `min(cores, 2)` for a light gate, or 1 for a gate on no slot, so its ceiling stays near wall time on a loaded PC.
+- The ceiling reading: a command run under a load-adjusted ceiling clock reads how much of its ceiling is left from the file `GATE_CEILING_FILE` names ([Command launching](#command-launching), Environment). The file is one JSON object, no spaces and no line end: `{"v":1,"ceiling_s":<integer>,"adjusted_s":<x.y|null>}`.
+
+  `ceiling_s` is the ceiling the kill compares the command's load-adjusted seconds against (for a warm-up or a commit stage, the budget it was given), and `adjusted_s` is those seconds as of the last sample, with one decimal. It is `0.0` before the first sample and `null` once the sampler has failed (at once when the first read fails). `ceiling_s - adjusted_s` is what is left. The text is `gate_wire::ceiling_reading_text`; both boxes and the PC's gate write it.
+
+  The gate writes the file before the command starts, rewrites it after each sample by writing a temporary file and renaming it over (`gate_state::write_text_replacing_once`), and removes it when the watch ends, however the run ended. A local run's file is `<absolute log path>.ceiling.json`.
+
+  A failed write never changes the run: the first of a run says `gate: cannot write the ceiling reading <path>: <error>` once, and the next sample tries again. A failed removal says `gate: cannot remove the ceiling reading <path>: <error>`.
+
+  No signal is the variable being absent (an older gate, or a command with no ceiling clock); a reader that finds the variable set but the file missing has no reading. The variable is set for a local run's command and for a routed run's command that has a `Timeout`; it is removed, an inherited value included, for a box run without one, a `--desktop` run and a local restore, so a nested command never reads its parent's file.
 - The backstop (W4): wall time less paused time reaching 5 times the ceiling, whatever the load: `gate: BACKSTOP: ...`. One sample's precedence is STALLED, TIMED OUT, BACKSTOP.
 - Sampler failure (W5): `gate: sampler failed: <message>; watching by wall time only`, then the backstop alone watches. The pause markers are still read, and a paused stretch, that of the failing sample included and running to the failure's own fresh stamp, is left out of the backstop's wall time.
 
@@ -2407,6 +2418,8 @@ A period with no beat due flushes instead, and the box's flush probes stderr for
   A commit run ([Commit run](#critical-drain-and-nesting)) also gives its command `GATE_COMMIT_SLOT=<its marker>`, the same text as its `GATE_SLOT_HELD`; any other gate removes `GATE_COMMIT_SLOT` from its command's environment. Every command's environment also has `GATE_HANDED_OVER` removed ([A stale gate](#routing)).
 
   `GATE_BOX_JOB` and `GATE_BOX_EXE`, given to a box run's command ([The box side](#the-box-side)), pass through a trusted in-box gate to its command, which gets no `GATE_SLOT_HELD`; any other gate removes `GATE_BOX_JOB` from its command's environment.
+
+  A command run under a load-adjusted ceiling clock also gets `GATE_CEILING_FILE=<absolute path>`, `<absolute log path>.ceiling.json` for a local run, over an inherited value; a gate with no reading to give removes an inherited one, as for a local restore. The file's text and life are under [Watchdog](#watchdog) (the ceiling reading). A caller's `--env` cannot set it, as with any `GATE_` name.
 
   The vendor-source quotes for these settings, the cold-start cost of a per-run server and the priority a server runs at are in [research/2026-10-25-per-run-build-servers.md](research/2026-10-25-per-run-build-servers.md).
 
@@ -4921,6 +4934,8 @@ Built verbs:
 
   A gate the command starts reads them ([Critical drain and nesting](#critical-drain-and-nesting), the in-box gate).
 
+  With a `Timeout` the command also gets `GATE_CEILING_FILE`, `{Work}.ceiling`, beside the work folder: the box writes it before the command starts and again right after the start, rewrites it after each sample and removes it when the watch ends ([Watchdog](#watchdog), the ceiling reading). A run without a `Timeout`, a `--desktop` run included, gets none, and an inherited value is removed.
+
   A box that cannot read its own path ends the run before any job is made: status 1, `the box's own path cannot be read: <error>`.
 
   The command's environment also sets `Logging__EventLog__LogLevel__Default=None`, replacing any inherited value, so a .NET host with default logging writes nothing to the Windows Event Log; its console output is unchanged. Of the groups the Application log's default access lets write, a restricted copy of the box's token could hold only Administrators, INTERACTIVE, SERVICE, BATCH and WRITE_RESTRICTED, and the command's token holds none of them.
@@ -5191,7 +5206,7 @@ Built verbs:
 
   For each key under `work` it takes `{key}.lock` (a lock it cannot open prints `gate: remote could not open the work folder lock <path>: <error>`), so a key whose lock a run or a sweep holds is kept, and `inflight` does not see a key whose lock a sweep holds. Idleness is the newest write time among the folder, each tree's `.git\FETCH_HEAD`, the key's records and the lock's write time (the stamp of the last take or release by a run, `inputs` or `lfs`).
 
-  A key idle for over 24 hours loses its records in this order: `.layout` is written as `changing` first; `.warm`, `.ran`, `.packages`, `.tools`, `.inputs`, `.sent-build` and `.command` are removed; the folder is renamed by handle into `{root}\pruned\{key}-{pid}-{nanos}`; `.layout` and `.index` are removed. The lock is released and the renamed folder is deleted through its handle. The `.lock` file stays.
+  A key idle for over 24 hours loses its records in this order: `.layout` is written as `changing` first; `.warm`, `.ran`, `.packages`, `.tools`, `.inputs`, `.sent-build`, `.ceiling` and `.command` are removed; the folder is renamed by handle into `{root}\pruned\{key}-{pid}-{nanos}`; `.layout` and `.index` are removed. The lock is released and the renamed folder is deleted through its handle. The `.lock` file stays.
 
   Every step works beneath held handles and never follows a link. A failed rename leaves `.layout` reading `changing`, so the next run clears the folder whole.
 
@@ -5557,7 +5572,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
   A lock the age prune cannot open prints `gate: remote could not open the work folder lock <path>: <error>`, and the keyed prune that key's could-not line.
 
-  Under the lock, an idle key (or any named key) loses its records in this order: `<key>.layout` is written as `changing`; `.warm`, `.ran`, `.packages`, `.tools`, `.inputs`, `.sent-build`, `.command`, `.pgid`, `.tools.pgid` and `.packages.pgid` are removed; the folder is renamed to `<root>/pruned/<key>.<pid>.<nanos>`; then `.layout`, `.index`, `.index.lock` and the temp files of the key's records (`<key>.<name>.gate-new-*`) are removed.
+  Under the lock, an idle key (or any named key) loses its records in this order: `<key>.layout` is written as `changing`; `.warm`, `.ran`, `.packages`, `.tools`, `.inputs`, `.sent-build`, `.ceiling`, `.command`, `.pgid`, `.tools.pgid` and `.packages.pgid` are removed; the folder is renamed to `<root>/pruned/<key>.<pid>.<nanos>`; then `.layout`, `.index`, `.index.lock` and the temp files of the key's records (`<key>.<name>.gate-new-*`) are removed.
 
   The lock is let go and the renamed folder deleted. A key with no folder has its records removed. A failed rename leaves `.layout` reading `changing`, so the next run clears the folder whole.
 
@@ -5575,6 +5590,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
   | `<key>.lock` | the work lock | keeps; the keyed prune removes one it made |
   | `<key>.pgid`, `<key>.tools.pgid`, `<key>.packages.pgid` | the git steps', the tool restore's and the package restore's process groups | read first (a live group keeps the key), then removes |
   | `<key>.command`, `<key>.tools` | the command record, the tool manifests' hash | removes before the rename |
+  | `<key>.ceiling` | a command's ceiling reading, which a box ended hard leaves | removes before the rename |
   | `<key>.inputs` | the `inputs` verb's record of installed inputs | removes before the rename |
   | `<key>.packages` | the package restore's record of the lockfile folders whose install passed | removes before the rename |
   | `<key>.ran` | the ran record: when a command first started in the folder | removes before the rename |
@@ -5796,7 +5812,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
   A record that cannot be read again before a signal fails the stop with `gate: remote could not stop job <name>: cannot read <record>: <error>` (status 1), and nothing more is signalled. The lines are the Windows box's `gate: remote stopped job <name>` and `gate: remote could not stop job <name>: <why>`.
 - **The command.** The routed command starts from the payload's word list, exec'd directly with no shell, the program found along the login `PATH`, with stdin null and both streams forwarded line by line. The order is the start marker `gate-remote-started: <nonce>` on stderr, bare, as the Windows box says it, a client-gone probe, `<Work>.command` written, a second probe, the spawn; a client gone at a probe starts nothing and gives 255.
-  - **Environment.** The box's own, then `PATH` set to the login shell's, then the payload's `Env`, then `GODOT_PATH` (Godot, below), then the build-server settings (every case variant of each name removed first; the list is `build_server_settings` in `gate-wire`, which the Windows gate maps over unchanged), then `GATE_BOX_JOB=<job>`. In the child before the exec, `SIGTERM`, `SIGINT`, `SIGHUP` and `SIGQUIT` are back to default and the signal mask is cleared.
+  - **Environment.** The box's own, then `PATH` set to the login shell's, then the payload's `Env`, then `GODOT_PATH` (Godot, below), then the build-server settings (every case variant of each name removed first; the list is `build_server_settings` in `gate-wire`, which the Windows gate maps over unchanged), then `GATE_BOX_JOB=<job>`, then `GATE_CEILING_FILE=<Work>.ceiling` for a run with a `Timeout` (removed, an inherited value included, for one without). In the child before the exec, `SIGTERM`, `SIGINT`, `SIGHUP` and `SIGQUIT` are back to default and the signal mask is cleared.
 
     `TMPDIR` is the run's temp folder unless the payload's `Env` sets it (exact name, case-sensitive), in which case the caller's value is used as given and no folder is made.
 
@@ -5827,6 +5843,8 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
   - **Ceiling and backstop.** The box's watch runs `gate-watchdog`'s clocks on the machine's CPU load, read from `host_statistics(HOST_CPU_LOAD_INFO)` once per sample and kept as 64-bit totals of the counters' wrapping differences, so a wrap of the 32-bit counters never reads as a busy sample.
 
     The cores are `available_parallelism`, unweighted. The ceiling and the heartbeat share one CPU source: the pump's group CPU when the run has a pump, else the ceiling's own reading of the command group. The first read is at the watch's start.
+
+    The ceiling reading ([Watchdog](#watchdog)) is `<Work>.ceiling`, text as the Windows box's: written before the spawn, rewritten after each sample by a temporary file renamed over it, without a sync to the disk, and removed once the runner is done with the command. A cross build uses the same path for its commands one after the other. The first failed write or removal is kept for the run's end and said as `gate: cannot write the ceiling reading <path>: <error>` or `gate: cannot remove the ceiling reading <path>: <error>`.
 
     A command past its ceiling in load-adjusted time is ended through the runner. The run then says, in one write, an optional note (`gate: note: the box's {ceiling|backstop} kill could not end job <job>: <why>` when the group is still there, else `gate: note: after the box's {ceiling|backstop} kill: <why>`), the kill line, `gate-remote-killed: <nonce> timed-out|backstop` and `gate-remote-adjusted: <nonce> <s.sss>`, and exits 124 with the records kept.
 

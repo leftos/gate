@@ -3,11 +3,11 @@
 //! kill gathers before it terminates the job, and the end of the wait: the command's exit, a kill as stalled, timed out
 //! or past the backstop, or a Ctrl+C.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::OpenOptions;
 use std::io::{self, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gate_args::{RunRequest, Slot};
@@ -129,6 +129,8 @@ pub(crate) struct Watcher<'a> {
     peak: Option<u32>,
     /// The priority class the command started in, read as the watch began; `None` when it could not be read.
     priority: Option<Priority>,
+    /// The ceiling reading the command reads, rewritten after each sample ([`Watching::reading`]).
+    reading: &'a CeilingReading,
 }
 
 /// The flags one run's watch takes from the request's `--test-*` seams, none of which an unflagged run sets.
@@ -194,6 +196,94 @@ impl<R: FnMut() -> io::Result<Option<u64>>> VmReader<R> {
     }
 }
 
+/// The file a local run's command reads its ceiling from ([`gate_wire::CEILING_FILE_VARIABLE`]): `<log>.ceiling.json`,
+/// beside the run's absolute log path `log`.
+pub(crate) fn ceiling_reading_path(log: &Path) -> PathBuf {
+    let mut path = log.as_os_str().to_owned();
+    path.push(".ceiling.json");
+    PathBuf::from(path)
+}
+
+/// The ceiling reading file of one command's ceiling clock ([`gate_wire::ceiling_reading_text`]): written before the
+/// command starts, rewritten at each sample, and removed when the clock ends. No write's failure changes the run: the
+/// first of a run is said, once, and the next sample tries again. [`CeilingReading::end`] removes the file and says a
+/// removal that failed; a reading dropped without it, on a path that missed it, is removed without a word.
+pub(crate) struct CeilingReading {
+    /// The file; `None` once removed.
+    path: Option<PathBuf>,
+    /// The ceiling in whole seconds the kill compares the command's load-adjusted seconds against.
+    ceiling: u64,
+    /// Whether a failed write has been said.
+    said: Cell<bool>,
+}
+
+impl CeilingReading {
+    /// The reading of a command under the ceiling `ceiling`, written at `path` with no seconds counted yet, before the
+    /// command starts; a write that fails is said through `say`, and the command still starts.
+    pub(crate) fn written(path: PathBuf, ceiling: u64, say: impl FnOnce(&str)) -> CeilingReading {
+        let written = gate_state::write_text_replacing(&path, &gate_wire::ceiling_reading_text(ceiling, Some(0.0)));
+        let reading = CeilingReading {
+            path: Some(path),
+            ceiling,
+            said: Cell::new(false),
+        };
+        if let Err(error) = written {
+            reading.failed(&error, say);
+        }
+        reading
+    }
+
+    /// Rewrites the reading with the load-adjusted seconds `adjusted` of the sample just taken, `None` once the sampler
+    /// has failed; tried once, so a reader holding the file costs this sample's write and no more.
+    pub(crate) fn rewrite(&self, adjusted: Option<f64>, say: impl FnOnce(&str)) {
+        self.rewritten_by(adjusted, gate_state::write_text_replacing_once, say);
+    }
+
+    /// Rewrites the reading as [`CeilingReading::rewrite`] does, with the move over the file tried ten times: for a
+    /// write the command may already be reading, which a reader holding the file must not cost.
+    pub(crate) fn rewrite_retried(&self, adjusted: Option<f64>, say: impl FnOnce(&str)) {
+        self.rewritten_by(adjusted, gate_state::write_text_replacing, say);
+    }
+
+    /// Rewrites the reading with the seconds `adjusted` through `write`, saying the run's first failed write.
+    fn rewritten_by(&self, adjusted: Option<f64>, write: fn(&Path, &str) -> io::Result<()>, say: impl FnOnce(&str)) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let text = gate_wire::ceiling_reading_text(self.ceiling, adjusted);
+        if let Err(error) = write(path, &text) {
+            self.failed(&error, say);
+        }
+    }
+
+    /// Says the run's first failed write through `say`; a later one says nothing.
+    fn failed(&self, error: &io::Error, say: impl FnOnce(&str)) {
+        if let Some(path) = &self.path
+            && !self.said.replace(true)
+        {
+            say(&format!("gate: cannot write the ceiling reading {}: {error}", path.display()));
+        }
+    }
+
+    /// Removes the reading as the command's ceiling clock ends, saying through `say` a removal that failed.
+    pub(crate) fn end(mut self, say: impl FnOnce(&str)) {
+        if let Some(path) = self.path.take()
+            && let Err(error) = crate::slots::delete(&path)
+        {
+            say(&format!("gate: cannot remove the ceiling reading {}: {error}", path.display()));
+        }
+    }
+}
+
+impl Drop for CeilingReading {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            // A reading not ended through `end` is removed on the way out; there is no console left to say a failure on.
+            let _ = crate::slots::delete(&path);
+        }
+    }
+}
+
 /// The facts a watch begins from, read as the command starts: when it began, by both clocks.
 pub(crate) struct Start {
     pub since: u64,
@@ -236,6 +326,8 @@ pub(crate) struct Watching<'a> {
     /// The watch of the parent gate whose slot covers a heavy or light run, which takes a slot of the run's kind once
     /// that parent ends; `None` for any other run.
     pub late: Option<Late<'a>>,
+    /// The ceiling reading the command reads, which each sample rewrites.
+    pub reading: &'a CeilingReading,
 }
 
 /// One sample pass's gathered facts: the sample itself, the bytes of the command's stdout and stderr, the two kept apart
@@ -268,6 +360,7 @@ impl<'a> Watcher<'a> {
             hands_on,
             recorded,
             late,
+            reading,
         } = run;
         let system = system_times()?;
         let job_cpu = Ticks(job.accounting()?.cpu);
@@ -315,6 +408,7 @@ impl<'a> Watcher<'a> {
             peak: None,
             // A class the handle cannot read, or one Windows never answers with, is not said.
             priority: running.priority().ok().flatten(),
+            reading,
         })
     }
 
@@ -478,8 +572,15 @@ impl<'a> Watcher<'a> {
     /// Takes one sample, or moves the clock by wall time once the sampler has failed. The sample is stamped twice:
     /// `began` before any of its reads, so the stall does not count the time its own reads took as the command's quiet
     /// time, and `at` with the system times and the job's accounting, so the interval covers the stretch those two
-    /// measure.
+    /// measure. The ceiling reading is then rewritten with the seconds the clock reached.
     fn take_sample(&mut self, console: &mut Console) {
+        self.sample_once(console);
+        // Both figures of the reading come from the sample just taken.
+        self.reading.rewrite(self.adjusted_seconds(), |line| console.err(line));
+    }
+
+    /// The pass of [`Watcher::take_sample`] that moves the clock.
+    fn sample_once(&mut self, console: &mut Console) {
         let began = self.started.elapsed();
         // A gate under this one waiting behind a critical request is progress, and the wall-only path counts it too.
         let paused = self.paused(console);

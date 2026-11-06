@@ -177,6 +177,34 @@ fn a_gate_under_a_covering_parent_takes_no_slot() {
 }
 
 #[test]
+fn a_nested_gate_s_command_reads_its_own_ceiling_file() {
+    let case = Case::new("a_nested_gate_s_command_reads_its_own_ceiling_file");
+    let mut inner = vec![GATE];
+    inner.extend(run_words(
+        "inner.log",
+        &[],
+        &[FAKE_TOOL, "env", "GATE_CEILING_FILE", "env-file", "GATE_CEILING_FILE"],
+    ));
+    // The outer gate's ceiling differs from the inner's, so the reading tells whose it is.
+    let mut outer_words = heavy_words("outer.log", &[], &inner);
+    outer_words[4] = "1800";
+    let outer = case.start(&outer_words);
+    assert_passed(&outer.finish());
+
+    let inner_log = log_texts(&case.folder().join("inner.log"));
+    let own = format!("{}.ceiling.json", shown(&case.folder().join("inner.log")));
+    let mut said = inner_log.lines().filter(|line| !line.starts_with("gate: "));
+    assert_eq!(
+        said.next(),
+        Some(own.as_str()),
+        "the inner gate's own file, never the outer's: {inner_log}"
+    );
+    let reading: Value = serde_json::from_str(said.next().expect("the command printed the file")).expect("the reading is JSON");
+    assert_eq!(reading["v"], 1, "{reading}");
+    assert_eq!(reading["ceiling_s"], 3600, "the inner gate's own ceiling: {reading}");
+}
+
+#[test]
 fn a_covered_gate_whose_desktop_command_runs_on_this_pc_says_so() {
     let case = routed_case("nesting-desktop-under-parent");
     declare_desktop(&case, &["*tool* argv*"]);

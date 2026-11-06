@@ -1052,6 +1052,7 @@ mod restore {
                     path: Some(path),
                     tmp: None,
                     godot: Godot::Unchosen,
+                    ceiling: None,
                 };
                 let place = self.work().join(subfolder);
                 let status = match update(&request, &place, &lock, along, &git, &output) {

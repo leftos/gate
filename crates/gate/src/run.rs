@@ -20,8 +20,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 use std::{fs, io};
 
-use gate_wire::build_version;
 use gate_wire::stamp::{self, Tag};
+use gate_wire::{CEILING_FILE_VARIABLE, build_version};
 
 use gate_args::{
     Ceiling, ProgramSearch, RunRequest, Slot, Spelling, batch_command_line, batch_refusal, command_line, is_batch_target, resolve_program,
@@ -81,7 +81,7 @@ use crate::stopping::failure;
 use crate::tailscale;
 use crate::wait::{self, Arrival, Host, PoolNow, UnderParent, Wait, Waited};
 use crate::warm;
-use crate::watch::{Start, Watched, Watcher, Watching};
+use crate::watch::{self, CeilingReading, Start, Watched, Watcher, Watching};
 use crate::worktree_record;
 
 /// The status of a run the gate itself failed.
@@ -181,11 +181,13 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, started
             return exit_status(GATE_FAILED);
         }
     };
+    let log_path = log;
     let log = Log::new(log);
     let at = Where {
         root,
         gate: &gate,
         nesting: &nesting,
+        log: log_path,
     };
     let (plan, client) = match ready(request, &at, console) {
         Ok(ready) => ready,
@@ -705,11 +707,13 @@ impl NotRun {
     }
 }
 
-/// Under which state root a planned command runs, which gate runs it, and under which parent's slot.
+/// Under which state root a planned command runs, which gate runs it, under which parent's slot, and the run's absolute
+/// log path, beside which its ceiling reading is written ([`watch::ceiling_reading_path`]).
 struct Where<'a> {
     root: &'a ResolvedRoot,
     gate: &'a ThisGate,
     nesting: &'a Nesting,
+    log: &'a Path,
 }
 
 /// The command as it will be started, or the start failure found before any call.
@@ -756,7 +760,7 @@ impl Plan {
         adjusted: Adjusted<'_>,
         console: &mut Console,
     ) -> Result<Plan, NotRun> {
-        let Where { root, gate, nesting } = *at;
+        let Where { root, gate, nesting, log } = *at;
         let folder = std::env::current_dir().map_err(|error| NotRun::failed(format!("gate: cannot read the working directory: {error}")))?;
         // A covered gate hands on the marker of the parent whose slot its command runs under. Any other hands on its own,
         // a gate its light parent lends its slot included: that gate's marker names it as a heavy holder, so every gate
@@ -783,6 +787,8 @@ impl Plan {
         } else {
             variables.without(COMMIT_SLOT_VARIABLE)
         };
+        // Every gate names its own reading, so a command never reads the file of a gate around this one.
+        let variables = variables.with(CEILING_FILE_VARIABLE, &watch::ceiling_reading_path(log).to_string_lossy());
         let variables = adjusted.applied(variables);
         let environment = variables
             .block()
@@ -3663,8 +3669,14 @@ impl Run<'_> {
             root: self.root,
             gate: &self.gate,
             nesting,
+            log: self.log.path(),
         };
-        let withheld: &[&str] = if nesting.covering().is_none() { &[SLOT_HELD_VARIABLE] } else { &[] };
+        // A restore runs under no ceiling clock, so it is given no ceiling reading.
+        let withheld: &[&str] = if nesting.covering().is_none() {
+            &[SLOT_HELD_VARIABLE, CEILING_FILE_VARIABLE]
+        } else {
+            &[CEILING_FILE_VARIABLE]
+        };
         let adjusted = Adjusted {
             withheld,
             set: &[],
@@ -4408,6 +4420,7 @@ impl Run<'_> {
             root: self.root,
             gate: &self.gate,
             nesting: self.nesting,
+            log: self.log.path(),
         };
         Plan::prepare_without(self.request, words, &at, adjusted, console).map_err(|NotRun { status, line }| {
             console.err(&line);
@@ -4916,9 +4929,10 @@ impl Run<'_> {
 
     /// Starts the command in the gate's job and sees it to its end under `figures`.
     fn command(&mut self, plan: Plan, figures: Figures, console: &mut Console) -> Ended {
-        let launch = match plan.launch {
+        let Plan { word, resolved, launch, .. } = plan;
+        let launch = match launch {
             Ok(launch) => launch,
-            Err(message) => return self.not_started(&plan.word, plan.resolved.as_deref(), &message, console),
+            Err(message) => return self.not_started(&word, resolved.as_deref(), &message, console),
         };
         if self.host.interrupt.is_some_and(Interrupt::is_raised) {
             return self.interrupted_before_start(console);
@@ -4929,14 +4943,33 @@ impl Run<'_> {
         } else {
             Job::create(&name)
         };
-        let mut job = match created {
+        let job = match created {
             Ok(job) => job,
             Err(error) => return self.gate_failed(&format!("cannot create the job {name}: {error}"), None, console),
         };
+        // Written before the command starts, so the file its variable names is there from its first instruction, and
+        // removed once its watch is over, however the run ended.
+        let path = watch::ceiling_reading_path(self.log.path());
+        let reading = CeilingReading::written(path, figures.ceiling, |line| console.err(line));
+        let ended = self.launched((word.as_str(), resolved.as_deref()), &launch, job, (figures, &reading), console);
+        reading.end(|line| console.err(line));
+        ended
+    }
+
+    /// Starts the command whose first word is `word`, found as `resolved`, by `launch` in `job` and sees it to its end
+    /// under `figures`, its ceiling reading `reading` rewritten at each sample.
+    fn launched(
+        &mut self,
+        (word, resolved): (&str, Option<&str>),
+        launch: &Launch,
+        mut job: Job,
+        (figures, reading): (Figures, &CeilingReading),
+        console: &mut Console,
+    ) -> Ended {
         let start = Start::now();
         let mut suspended = match launch.start_suspended() {
             Ok(suspended) => suspended,
-            Err(LaunchError::CreateProcess { message, .. }) => return self.not_started(&plan.word, plan.resolved.as_deref(), &message, console),
+            Err(LaunchError::CreateProcess { message, .. }) => return self.not_started(word, resolved, &message, console),
             Err(error) => return self.gate_failed(&error.to_string(), None, console),
         };
         // The job remembers every process put in it from the command on, so a kill still reaches what one that has
@@ -4950,7 +4983,7 @@ impl Run<'_> {
             }
         };
         match suspended.assign_and_resume(&job) {
-            Ok(running) => self.watched(&job, &running, &start, &bytes, figures, console),
+            Ok(running) => self.watched(&job, &running, &start, &bytes, (figures, reading), console),
             Err(error) => {
                 self.end_streams(Some(&job), console);
                 self.gate_failed(&error.to_string(), None, console)
@@ -4973,8 +5006,17 @@ impl Run<'_> {
     }
 
     /// Watches the started command to its exit, a kill or a Ctrl+C, then reaches the verdict. Should the gate fail
-    /// or panic first, the job is terminated, so the command does not outlive the run. The command runs under `figures`.
-    fn watched(&mut self, job: &Job, running: &Running, start: &Start, output: &OutputBytes, figures: Figures, console: &mut Console) -> Ended {
+    /// or panic first, the job is terminated, so the command does not outlive the run. The command runs under `figures`,
+    /// its ceiling reading `reading` rewritten at each sample.
+    fn watched(
+        &mut self,
+        job: &Job,
+        running: &Running,
+        start: &Start,
+        output: &OutputBytes,
+        (figures, reading): (Figures, &CeilingReading),
+        console: &mut Console,
+    ) -> Ended {
         // A copy of the run's own reference, so the stopper holds no borrow of the run while it is watched.
         let root = self.root;
         let recorded = RefCell::new(Recorded::default());
@@ -4993,7 +5035,7 @@ impl Run<'_> {
             recorded: &recorded,
             armed: true,
         };
-        let ended = match self.watch(started, &recorded, start, console) {
+        let ended = match self.watch(started, (&recorded, reading), start, console) {
             Ok((watched, timing)) => self.after_watch(watched, timing, started, console),
             Err(problem) => self.gate_failed(&problem, Some(started), console),
         };
@@ -5004,11 +5046,12 @@ impl Run<'_> {
     /// Watches the command until it exits, is killed or the console is interrupted; how it ended and how long it ran,
     /// with the cores it kept busy, else the gate's problem. The watch's samples write what they find outside the job to
     /// `recorded`. A heavy or light run a parent's slot covers watches that parent too, and takes a slot of its own kind
-    /// into [`Run::late`] when the parent ends first ([`Late`]), its covered marker in hand.
+    /// into [`Run::late`] when the parent ends first ([`Late`]), its covered marker in hand. Each sample rewrites the
+    /// ceiling reading `reading`.
     fn watch(
         &mut self,
         started: Started<'_>,
-        recorded: &RefCell<Recorded>,
+        (recorded, reading): (&RefCell<Recorded>, &CeilingReading),
         start: &Start,
         console: &mut Console,
     ) -> Result<(Watched, Timing), String> {
@@ -5045,6 +5088,7 @@ impl Run<'_> {
             hands_on: covering,
             recorded,
             late,
+            reading,
         };
         let mut watcher =
             Watcher::begin(request, watching, start, host.processors).map_err(|error| format!("cannot begin to watch the command: {error}"))?;

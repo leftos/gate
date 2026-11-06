@@ -43,7 +43,7 @@ pwsh -NoProfile -File tools/gate.ps1 run --log .tmp/test.log --timeout 900 --slo
 ## What it does
 
 - **Slots.** `--slot heavy` for work that fills several cores, `light` for one or two, `none` for a command that only watches remote work, and `critical` for a timing run that needs the machine to itself. The counts come from the core count and can be set in `%LOCALAPPDATA%\gate\v1\slot-counts.json`.
-- **Watchdog.** A command past its `--timeout` (load-adjusted seconds), quiet for the stall window, or past the wall-time backstop is killed with its whole process tree, and the gate exits 124.
+- **Watchdog.** A command past its `--timeout` (load-adjusted seconds), quiet for the stall window, or past the wall-time backstop is killed with its whole process tree, and the gate exits 124. A command under a `--timeout` can read how much of it is left: `GATE_CEILING_FILE` names a small JSON file with the ceiling and the load-adjusted seconds counted so far, on a local run and a routed one.
 - **Verdicts.** A command that exits 0 but whose log holds a failure marker (`Build FAILED.`, `error CS1234`) fails. After a run whose slot did not fit, gate says which slot the command belongs on.
 - **Learned durations.** With `--timeout auto:<seconds>` the ceiling rises from the command's own history, and a run says what to expect and when it is far past its usual time.
 - **Builders (optional).** With a `%LOCALAPPDATA%\gate\remote.json`, matching commands run on a builder and their changes and outputs come back to the worktree. `gate push` deploys gate to the builders, `gate check --builder <host>` asks one what it lacks, and `tools/builder/` holds the scripts that prepare one.

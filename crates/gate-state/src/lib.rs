@@ -27,7 +27,10 @@ mod verdict;
 mod win32;
 
 pub use archive::{ARCHIVE_DIR, archive_rolled_journal};
-pub use counts::{ApplyError, WriteError, apply_slot_count, read_slot_count_setting, slot_count_path, write_slot_counts, write_text_replacing};
+pub use counts::{
+    ApplyError, WriteError, apply_slot_count, read_slot_count_setting, slot_count_path, write_slot_counts, write_text_replacing,
+    write_text_replacing_once,
+};
 #[doc(hidden)]
 pub use cutover::link_no_replace;
 pub use cutover::{CountsCopy, copy_slot_counts_to_v1, write_cutover_flag};

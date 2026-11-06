@@ -154,18 +154,43 @@ pub fn replace_plain(path: &Path, bytes: &[u8]) -> Result<(), ReplaceFailure> {
 
 /// [`replace_plain`] through the temp file numbered `number`.
 fn replace_numbered(path: &Path, bytes: &[u8], number: u64) -> Result<(), ReplaceFailure> {
-    let folder = put_in_place(path, bytes, number).map_err(ReplaceFailure::NotWritten)?;
+    // A path that cannot be replaced is refused before the folder is opened, as before the temp file is made.
+    replaceable(path).map_err(ReplaceFailure::NotWritten)?;
+    let folder = folder_of(path).map_err(ReplaceFailure::NotWritten)?;
+    put_in_place(path, bytes, number, Flush::Synced).map_err(ReplaceFailure::NotWritten)?;
     synced(&folder).map_err(ReplaceFailure::Unsynced)
 }
 
-/// Puts `bytes` at `path` through the temp file numbered `number` ([`replace_plain`]); the folder, open, for its sync.
-fn put_in_place(path: &Path, bytes: &[u8], number: u64) -> io::Result<File> {
+/// [`replace_plain`] with nothing synced to the disk, neither the temp file nor the folder after the rename, and the
+/// folder not opened.
+/// It is for a short-lived file rewritten often that no restart needs, such as a command's ceiling reading, whose
+/// syncs would hold up the thread that writes it.
+/// A reader still sees the old text or the new one whole.
+///
+/// # Errors
+///
+/// As [`ReplaceFailure::NotWritten`] of [`replace_plain`], less its syncs.
+pub fn replace_unsynced(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    put_in_place(path, bytes, REPLACES.fetch_add(1, Ordering::Relaxed), Flush::Unsynced)
+}
+
+/// Whether [`put_in_place`] syncs the temp file before its rename.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Flush {
+    /// The temp file is synced to the disk before its rename.
+    Synced,
+    /// Nothing is synced.
+    Unsynced,
+}
+
+/// Puts `bytes` at `path` through the temp file numbered `number` ([`replace_plain`]), the temp file synced first as
+/// `sync` says. The folder's sync after the rename is the caller's.
+fn put_in_place(path: &Path, bytes: &[u8], number: u64, sync: Flush) -> io::Result<()> {
     replaceable(path)?;
-    let folder = folder_of(path)?;
     let (temp, mut file) = temp_beside(path, number)?;
     let replaced = file
         .write_all(bytes)
-        .and_then(|()| synced(&file))
+        .and_then(|()| if sync == Flush::Synced { synced(&file) } else { Ok(()) })
         .and_then(|()| replaceable(path))
         .and_then(|()| fs::rename(&temp, path));
     drop(file);
@@ -178,7 +203,7 @@ fn put_in_place(path: &Path, bytes: &[u8], number: u64) -> io::Result<File> {
             )),
         };
     }
-    Ok(folder)
+    Ok(())
 }
 
 /// The longest name a file may have on the box's volumes, in bytes (`NAME_MAX`).
@@ -583,7 +608,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use super::{HeldLock, Locked, lock_file_seen, replace_numbered, replace_plain, take_lock, take_lock_between, temp_name};
+    use super::{HeldLock, Locked, lock_file_seen, replace_numbered, replace_plain, replace_unsynced, take_lock, take_lock_between, temp_name};
 
     /// How long a write may take before the case calls it hung: a hang guard, never reached by a write that works.
     const HANG_GUARD: Duration = Duration::from_secs(300);
@@ -636,6 +661,16 @@ mod tests {
             Ok(Locked::Held(held)) => held,
             other => panic!("the lock is not held: {other:?}"),
         }
+    }
+
+    #[test]
+    fn replace_unsynced_puts_the_text_in_place_and_leaves_no_temp_file() {
+        let case = Case::new("replace-unsynced");
+        let path = case.base.join("k.ceiling");
+        replace_unsynced(&path, b"first").expect("a missing file is written");
+        replace_unsynced(&path, b"second").expect("a plain file is replaced");
+        assert_eq!(fs::read(&path).expect("the file is read"), b"second");
+        assert_eq!(case.names(), ["k.ceiling"], "no temp file is left");
     }
 
     #[test]

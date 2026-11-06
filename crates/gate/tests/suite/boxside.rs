@@ -3831,6 +3831,92 @@ fn box_run_tells_its_command_the_box_exe_and_job() {
     );
 }
 
+/// The variable naming the file a command reads its ceiling from.
+const CEILING_FILE: &str = "GATE_CEILING_FILE";
+
+/// The ceiling reading file of the work folder of `payload`: `{work}.ceiling`.
+fn ceiling_record_of(payload: &Value) -> String {
+    format!("{}.ceiling", field(payload, "Work"))
+}
+
+#[test]
+fn box_run_tells_its_command_its_ceiling_file() {
+    let case = Case::new("box_run_ceiling_file");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "env", CEILING_FILE, "env-file", CEILING_FILE]);
+    payload["Timeout"] = json!(600);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let mut lines = outcome.stdout.lines();
+    assert_eq!(lines.next(), Some(ceiling_record_of(&payload).as_str()), "{outcome:?}");
+    let reading: Value = serde_json::from_str(lines.next().expect("the command printed the file")).expect("the reading is JSON");
+    assert_eq!(reading["v"], 1, "{reading}");
+    assert_eq!(reading["ceiling_s"], 600, "the payload's Timeout: {reading}");
+    assert!(reading["adjusted_s"].as_f64().is_some_and(|seconds| seconds >= 0.0), "{reading}");
+}
+
+#[test]
+fn box_run_removes_its_ceiling_file_when_the_command_ends() {
+    let case = Case::new("box_run_ceiling_file_removed");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "env-file", CEILING_FILE]);
+    payload["Timeout"] = json!(600);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stdout.starts_with(r#"{"v":1,"#),
+        "the file was there while the command ran: {outcome:?}"
+    );
+    assert!(!Path::new(&ceiling_record_of(&payload)).exists(), "the reading is removed: {outcome:?}");
+}
+
+#[test]
+fn box_run_without_a_timeout_gives_its_command_no_ceiling_file() {
+    let case = Case::new("box_run_ceiling_file_none");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "env-file", CEILING_FILE]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "env-file: GATE_CEILING_FILE unset\n", "{outcome:?}");
+}
+
+#[test]
+fn box_run_whose_first_sample_fails_writes_null_adjusted_seconds_at_once() {
+    let case = Case::new("box_run_ceiling_file_null");
+    // The command starts before the box's first read, so it reads until the null is there; no periodic sample comes
+    // within the case, so only the failed first read can write it.
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "env-file-null", CEILING_FILE]);
+    payload["Timeout"] = json!(600);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box_with_seams(&case, &payload, &["--test-box-sample-ms", "600000", "--test-box-sampler-fail", "true"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let reading: Value = serde_json::from_str(outcome.stdout.trim_end()).expect("the reading is JSON");
+    assert_eq!(reading["adjusted_s"], Value::Null, "{reading}");
+    assert_eq!(reading["ceiling_s"], 600, "{reading}");
+}
+
+#[test]
+fn box_run_does_not_hand_on_an_inherited_ceiling_file() {
+    let case = Case::new("box_run_ceiling_file_inherited");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "env-file", CEILING_FILE]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let mut call = box_call(&case, &["box", "run"], &self::payload(&payload));
+    call.command.env(CEILING_FILE, shown(&case.folder().join("parent.ceiling.json")));
+
+    let outcome = call.finish_read();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "env-file: GATE_CEILING_FILE unset\n", "{outcome:?}");
+}
+
 /// The line a gate inside a box run's job says of it.
 const IN_BOX_LINE: &str = "gate: inside a routed run; running without a slot on this builder";
 

@@ -34,8 +34,8 @@ use gate_win32::{
 };
 use gate_wire::stamp::Tag;
 use gate_wire::{
-    BACK_COMMIT_NONE, BACK_COMMITS_FAILED, LAYOUT_CHANGING, PathForm, Payload, bare_stem, checkout_done_line, checkout_start_line, layout_text,
-    names_another_layout, ordinal_upper, trees, warm_line,
+    BACK_COMMIT_NONE, BACK_COMMITS_FAILED, CEILING_FILE_VARIABLE, LAYOUT_CHANGING, PathForm, Payload, bare_stem, checkout_done_line,
+    checkout_start_line, layout_text, names_another_layout, ordinal_upper, trees, warm_line,
 };
 
 use crate::answer::USAGE_STATUS;
@@ -64,6 +64,7 @@ use crate::outputs::manifest::{Listing, Manifest};
 use crate::remote::{Refusal, refused_line, started_line};
 use crate::resolve::{self, Environment};
 use crate::run::{ERROR_FILE_NOT_FOUND, Written, end_leftovers, find_program, written};
+use crate::watch::CeilingReading;
 
 mod desktop_run;
 
@@ -1477,6 +1478,14 @@ pub(super) fn command_record(work: &str) -> String {
     format!("{work}{COMMAND_SUFFIX}")
 }
 
+/// The ceiling reading of the work folder `work`, `{work}.ceiling`, beside it: the file a command under the box's
+/// ceiling reads its ceiling and load-adjusted seconds from ([`CEILING_FILE_VARIABLE`]).
+fn ceiling_record(work: &Path) -> PathBuf {
+    let mut record = work.as_os_str().to_owned();
+    record.push(".ceiling");
+    PathBuf::from(record)
+}
+
 /// Writes the interrupted-command record `record` for a command of the job `job` starting now, flushed to the disk,
 /// tried again while another process holds it ([`retried`]).
 fn written_command_record(record: &str, job: &str) -> io::Result<()> {
@@ -2094,13 +2103,15 @@ pub(super) fn full_path(path: &Path) -> Option<PathBuf> {
 /// with a restricted copy of the box's token ([`restricted_token`]). The program and a run's `GODOT_PATH` are
 /// [`resolved_command`]'s, and its `UE_ROOT` and `EngineEnv` names [`with_unreal`]'s, through [`prepared`].
 fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<Ran, u32> {
+    // Only a command under the box's ceiling has a reading to read.
+    let ceiling_file = one.timeout.map(|_| ceiling_record(Path::new(request.work)));
     let Prepared {
         word,
         program,
         application,
         command_line,
         environment,
-    } = match prepared(request, one, console) {
+    } = match prepared(request, one, ceiling_file.as_deref(), console) {
         Ok(prepared) => prepared,
         Err(answer) => return answer,
     };
@@ -2131,9 +2142,18 @@ fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut 
         refuse_token: beat.seams.refuse_token,
         keep_restricted: request.carries_lfs(),
     };
+    // Written before the command starts, so the file its variable names is there from its first instruction, and
+    // removed once its watch is over, however it ended.
+    let reading = one
+        .timeout
+        .zip(ceiling_file)
+        .map(|(timeout, path)| CeilingReading::written(path, timeout, |line| beat.say(console, line)));
     let launched = match start_command(&mut start, donor.as_ref().map_err(String::as_str), beat, console) {
         Ok(launched) => launched,
-        Err(answer) => return answer.map(Ran::NotStarted),
+        Err(answer) => {
+            reading_ended(reading, beat, console);
+            return answer.map(Ran::NotStarted);
+        }
     };
     ran_written(request.work, beat, console);
     let mut stopper = Stopper { job: &job, armed: true };
@@ -2144,7 +2164,7 @@ fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut 
         spoken: escaped(&one.words.join(" ")),
         nonce: request.nonce,
     };
-    let ceiling = Ceiling::begin(spec, &job, beat.lock, beat.seams, console);
+    let ceiling = Ceiling::begin(spec, &job, beat.lock, beat.seams, console).map(|ceiling| ceiling.rewriting(reading.as_ref(), console));
     let started = Started {
         job: &job,
         launched,
@@ -2154,6 +2174,7 @@ fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut 
         wsl: one.wsl(),
     };
     let watched = watch_of(started, one.of, console);
+    reading_ended(reading, beat, console);
     stopper.armed = false;
     // Ended only now, so the command's console stays up for as long as the command may use it.
     drop(donor);
@@ -2162,6 +2183,14 @@ fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut 
         ended_whole(&job, beat, console);
     }
     watched
+}
+
+/// Removes the command's ceiling reading `reading`, when it has one, as its ceiling clock ends; a removal that fails is
+/// said under the box's output lock.
+fn reading_ended(reading: Option<CeilingReading>, beat: &Beat<'_>, console: &mut Console) {
+    if let Some(reading) = reading {
+        reading.end(|line| beat.say(console, line));
+    }
 }
 
 /// A command ready to start: its first word, the program that word resolved to, the application and command line it is
@@ -2179,8 +2208,10 @@ struct Prepared<'w> {
 /// [`with_unreal`]'s, before anything holds a job or the builder's desktop for it, so a desktop run gets the same
 /// program and environment as any run. `Err` with the run's answer when it cannot start: `Ok` with 127 for a chosen Unreal Engine that does not
 /// resolve, a program not found or one with no shell to run it, its line said; `Err` with 2 for a batch word refused,
-/// or 1 for the box's own failure, its line said.
-fn prepared<'w>(request: &Request<'_>, one: &One<'w>, console: &mut Console) -> Result<Prepared<'w>, Result<Ran, u32>> {
+/// or 1 for the box's own failure, its line said. The command is told its ceiling reading `ceiling_file`
+/// ([`CEILING_FILE_VARIABLE`]); with `None` that variable is removed, so neither the caller's pairs nor the box's own
+/// environment hand it one.
+fn prepared<'w>(request: &Request<'_>, one: &One<'w>, ceiling_file: Option<&Path>, console: &mut Console) -> Result<Prepared<'w>, Result<Ran, u32>> {
     let run = format!("gate-box-{}", request.nonce);
     let Some((word, rest)) = one.words.split_first() else {
         return Err(Err(failed(console, "the run has no command")));
@@ -2188,6 +2219,10 @@ fn prepared<'w>(request: &Request<'_>, one: &One<'w>, console: &mut Console) -> 
     let exe = std::env::current_exe().map_err(|error| Err(failed(console, &format!("the box's own path cannot be read: {error}"))))?;
     let job = handed_job(request.job, gate_win32::own_session());
     let variables = command_variables(&request.env, &request.engine_env, &run, &job, &exe);
+    let variables = match ceiling_file {
+        Some(path) => variables.with(CEILING_FILE_VARIABLE, &path.to_string_lossy()),
+        None => variables.without(CEILING_FILE_VARIABLE),
+    };
     let variables = with_git_bin_first(variables, &request.refused);
     let (variables, found) = resolved_command(request.godot, word, variables, one.place);
     let variables = match with_unreal(&request.engine, &request.engine_env, variables) {
@@ -4995,7 +5030,7 @@ mod tests {
         };
         let mut console = Console::new();
 
-        let environment = prepared(&request, &one, &mut console).map(|prepared| prepared.environment).ok();
+        let environment = prepared(&request, &one, None, &mut console).map(|prepared| prepared.environment).ok();
 
         let entries = environment.map(|block| String::from_utf16_lossy(block.as_wide()));
         assert!(

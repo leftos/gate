@@ -308,6 +308,17 @@ pub(crate) fn write_replacing_once(path: &Path, text: &str) -> io::Result<()> {
     replace_with(path, 1, |file| file.write_all(text.as_bytes()))
 }
 
+/// [`write_text_replacing`] with the move over `path` tried once ([`write_replacing_once`]): for a writer that rewrites
+/// a file a reader may be holding again and again, such as a command's ceiling reading at each sample, which skips a
+/// write a reader blocks rather than wait it out.
+///
+/// # Errors
+///
+/// As [`write_text_replacing`], the move tried once.
+pub fn write_text_replacing_once(path: &Path, text: &str) -> io::Result<()> {
+    write_replacing_once(path, text)
+}
+
 /// [`write_replacing`] with the temp file written by `stage`, which is handed it open: the temp file is made new, a
 /// link or junction standing at its name opened as itself; a name something already stands at is passed over for the
 /// next, up to [`TEMP_NAMES`] names, and what stands there is left. A temp file `stage` fails to write is removed, and

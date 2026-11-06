@@ -17,8 +17,16 @@
 //! those words and no standard handles, prints `spawned <its pid>` and ends at once without waiting for it, so the
 //! program is left with its parent gone, and is always the last step; `exit <n>` exits with status n, any 32-bit code,
 //! negative ones as Windows reads them back;
-//! `env <name>` prints the variable's value, or `fake-tool: <name> is not set`, on its own line; `bytes <hex>` writes the
-//! bytes the hex digits spell to stdout as they are, with no line feed added; `lines <n> <text>` prints n lines on
+//! `env <name>` prints the variable's value, or `fake-tool: <name> is not set`, on its own line; `env-file <name>` prints
+//! the contents of the file the variable names, then a line end, or `env-file: <name> unset` when the variable is not
+//! set, or `env-file: <path> missing` when the file is not there; a read refused for a moment (a sharing violation or
+//! access denied, as the file is replaced) is read again 50 ms later, up to 20 times, then any read that failed prints
+//! `env-file: cannot read <path>: <error>` and ends the run 2; `env-file-moved <name>` reads that file every 50 ms,
+//! sleeping between reads, until its text no longer holds `"adjusted_s":0.0`, then prints it as `env-file` does, and
+//! prints `env-file-moved: <path> never moved` and ends the run 1 when it has not after 300 s; `env-file-null <name>`
+//! reads it the same way until its text holds `"adjusted_s":null`, and prints `env-file-null: <path> never read null`
+//! and ends the run 1 when it has not after 300 s; both read a refused read again until their bound;
+//! `bytes <hex>` writes the bytes the hex digits spell to stdout as they are, with no line feed added; `lines <n> <text>` prints n lines on
 //! stdout, the i-th `<text><i>` counting from 1; `pid` prints `pid <its own pid>` on stdout; `session` prints
 //! `session <its session id>`, `priority` prints `priority 0x<its priority class>` from `GetPriorityClass`, and
 //! `cwd` prints `cwd <its working folder>`, each on stdout; `mark <path>` adds the line `run` to the file at the path,
@@ -137,6 +145,11 @@ fn run(args: &[OsString]) -> Result<i32, String> {
             "test" | "run" => {}
             "out" => writeln!(stdout, "{}", operand(&mut steps, "out")?).map_err(|error| write_failed(&error))?,
             "env" => writeln!(stdout, "{}", variable(&operand(&mut steps, "env")?)).map_err(|error| write_failed(&error))?,
+            step @ ("env-file" | "env-file-moved" | "env-file-null") => {
+                if let Some(status) = env_file_step(step, &mut steps, &mut stdout)? {
+                    return Ok(status);
+                }
+            }
             "bytes" => bytes(&operand(&mut steps, "bytes")?, &mut stdout)?,
             "err" => {
                 stdout.flush().map_err(|error| write_failed(&error))?;
@@ -893,6 +906,112 @@ fn own_folder() -> Result<PathBuf, String> {
 /// The value of the variable `name`, or the line saying it is not set.
 fn variable(name: &str) -> String {
     std::env::var_os(name).map_or_else(|| format!("fake-tool: {name} is not set"), |value| value.to_string_lossy().into_owned())
+}
+
+/// The step `step`, one of `env-file <name>`, `env-file-moved <name>` and `env-file-null <name>`: prints what it read,
+/// then a line end; the status the run ends with when the step gave up, `None` to go on.
+fn env_file_step<'a>(step: &str, steps: &mut impl Iterator<Item = &'a OsString>, stdout: &mut impl Write) -> Result<Option<i32>, String> {
+    let name = operand(steps, step)?;
+    let (line, status) = match step {
+        "env-file-moved" => env_file_until(&name, Until::Moved),
+        "env-file-null" => env_file_until(&name, Until::Null),
+        _ => env_file_until(&name, Until::Read),
+    };
+    writeln!(stdout, "{line}").map_err(|error| write_failed(&error))?;
+    Ok(status)
+}
+
+/// What one read of the file a variable names found.
+enum EnvFile {
+    /// The file's text.
+    Text(String),
+    /// What `env-file` prints in place of a text: the variable unset, or the file missing.
+    Absent(String),
+    /// The read was refused for a moment, as a read meeting the file's replacement can be (a sharing violation, or
+    /// access denied while the old file is going): the line said if it lasts.
+    Refused(String),
+    /// The read failed otherwise: the line said at once.
+    Failed(String),
+}
+
+/// `ERROR_ACCESS_DENIED` and `ERROR_SHARING_VIOLATION`, the refusals a read meeting the file's replacement can get.
+const TRANSIENT_READ_ERRORS: [i32; 2] = [5, 32];
+
+/// One read of the file the variable `name` names.
+fn env_file(name: &str) -> EnvFile {
+    let Some(path) = std::env::var_os(name) else {
+        return EnvFile::Absent(format!("env-file: {name} unset"));
+    };
+    let path = PathBuf::from(path);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => EnvFile::Text(text),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => EnvFile::Absent(format!("env-file: {} missing", path.display())),
+        Err(error) => {
+            let line = format!("env-file: cannot read {}: {error}", path.display());
+            if error.raw_os_error().is_some_and(|code| TRANSIENT_READ_ERRORS.contains(&code)) {
+                EnvFile::Refused(line)
+            } else {
+                EnvFile::Failed(line)
+            }
+        }
+    }
+}
+
+/// How long the `env-file` steps sleep between two reads.
+const ENV_FILE_STEP: Duration = Duration::from_millis(50);
+/// How many times `env-file` reads again a read refused for a moment.
+const ENV_FILE_RETRIES: u32 = 20;
+/// How long `env-file-moved` and `env-file-null` read before they give up: a hang guard below the suite's own
+/// (600 s), so a reading that never comes fails its case with the step's own line.
+const READ_WAIT_LIMIT: Duration = Duration::from_secs(300);
+
+/// What an `env-file` step reads until.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Until {
+    /// One read (`env-file`), a refused one read again up to [`ENV_FILE_RETRIES`] times.
+    Read,
+    /// A text no longer holding `"adjusted_s":0.0` (`env-file-moved`), within [`READ_WAIT_LIMIT`].
+    Moved,
+    /// A text holding `"adjusted_s":null` (`env-file-null`), within [`READ_WAIT_LIMIT`].
+    Null,
+}
+
+/// Reads the file the variable `name` names every [`ENV_FILE_STEP`] until `until` holds: the line to print, and the
+/// status the run ends with when the step gave up. An unset variable or a missing file is said at once, as is a read
+/// that failed but for a refusal ([`EnvFile::Refused`]), which is read again until the step's bound and then said with
+/// status 2. Past [`READ_WAIT_LIMIT`], `env-file-moved` says `env-file-moved: <path> never moved` and `env-file-null` says
+/// `env-file-null: <path> never read null`, status 1. The bounds are hang guards, not timings.
+fn env_file_until(name: &str, until: Until) -> (String, Option<i32>) {
+    let began = Instant::now();
+    let mut reads = 0;
+    loop {
+        reads += 1;
+        let out_of_time = match until {
+            Until::Read => reads > ENV_FILE_RETRIES,
+            Until::Moved | Until::Null => began.elapsed() >= READ_WAIT_LIMIT,
+        };
+        match env_file(name) {
+            EnvFile::Absent(line) => return (line, None),
+            EnvFile::Failed(line) => return (line, Some(2)),
+            EnvFile::Refused(line) if out_of_time => return (line, Some(2)),
+            EnvFile::Text(text) => {
+                // The waiting steps: whether the text is the one waited for, and the step's give-up line's words.
+                let (done, step, missed) = match until {
+                    Until::Read => return (text, None),
+                    Until::Moved => (!text.contains(r#""adjusted_s":0.0"#), "env-file-moved", "never moved"),
+                    Until::Null => (text.contains(r#""adjusted_s":null"#), "env-file-null", "never read null"),
+                };
+                if done {
+                    return (text, None);
+                }
+                if out_of_time {
+                    return (format!("{step}: {} {missed}", variable(name)), Some(1));
+                }
+            }
+            EnvFile::Refused(_) => {}
+        }
+        thread::sleep(ENV_FILE_STEP);
+    }
 }
 
 /// The `bytes <hex>` step: writes the bytes the hex digits spell to stdout as they are, with no line feed added.
