@@ -261,7 +261,8 @@ mod unix {
     enum Reading {
         /// Every line, to the end.
         All,
-        /// Until the start marker and a heartbeat after it, then standard error closed: a client gone.
+        /// Until the start marker and then the spawn line of the command's leader, then both streams closed: a client
+        /// gone while its command runs.
         CloseAfterStart,
     }
 
@@ -320,10 +321,18 @@ mod unix {
         text.split(' ').find_map(|word| word.strip_prefix(key)?.strip_prefix('='))
     }
 
+    /// Whether `line` is the spawn line of a leader the box `box_pid` started, `spawn pid=<leader> ppid=<box_pid> …`,
+    /// which the box says as soon as the command has started.
+    fn leader_spawned(line: &str, box_pid: u32) -> bool {
+        let read = unstamped(line);
+        read.tag == Some(Tag::Gat) && read.text.starts_with("spawn pid=") && word(read.text, "ppid") == Some(box_pid.to_string().as_str())
+    }
+
     /// Starts `gate-box box --test-heartbeat-ms 50 --test-box-sample-ms 50 <seams> run --stdin`, the sample period the
     /// one `seams` gives when they give one, writes `request` on
-    /// its stdin, and reads it as `reading` says until it ends. Once the start marker and then a heartbeat were read,
-    /// `beaten` is made, which a command can wait on.
+    /// its stdin, and reads it as `reading` says until it ends ([`Reading::CloseAfterStart`] closes once the leader's
+    /// spawn line follows the start marker). Once the start marker and then a heartbeat were read, `beaten` is made,
+    /// which a command can wait on.
     fn ran(seams: &[&str], request: &str, reading: Reading, beaten: &Path) -> Ended {
         ran_in(seams, request, reading, beaten, None)
     }
@@ -348,6 +357,7 @@ mod unix {
             .stderr(Stdio::piped())
             .spawn()
             .expect("gate-box starts");
+        let box_pid = child.id();
         let mut stdin = child.stdin.take().expect("stdin is piped");
         stdin.write_all(format!("{request}\n").as_bytes()).expect("the request is written");
         drop(stdin);
@@ -368,15 +378,15 @@ mod unix {
                 line.clear();
                 started |= text == marker;
                 let beat = text.starts_with("gate-remote-heartbeat:") && started;
+                let spawned = started && leader_spawned(&text, box_pid);
                 said.push(text);
-                if beat {
-                    if !beaten.exists() {
-                        fs::write(&beaten, "").expect("the beaten marker is made");
-                    }
-                    if reading == Reading::CloseAfterStart {
-                        stop.store(true, Ordering::SeqCst);
-                        break;
-                    }
+                if beat && !beaten.exists() {
+                    fs::write(&beaten, "").expect("the beaten marker is made");
+                }
+                // No beat is waited for: once the heartbeat watches the command, an idle one earns none.
+                if spawned && reading == Reading::CloseAfterStart {
+                    stop.store(true, Ordering::SeqCst);
+                    break;
                 }
             }
             said
@@ -868,6 +878,11 @@ mod unix {
         let request = case.request(&commit, &json!({"Command": ["/bin/sh", "-c", "echo z > z.txt; sleep 600"]}));
         let ended = ran(&[], &request, Reading::CloseAfterStart, &case.base.join("beaten"));
         assert_eq!(ended.status, Some(255), "{:?}", ended.err);
+        // Kept only for a command the box ended because its client went; one that ran to its end has it removed.
+        assert!(
+            Path::new(&format!("{}.command", case.work())).exists(),
+            "the box ended the command for its gone client, not after it ran out"
+        );
         assert_eq!(case.back(), None, "no back commit for a client gone");
         assert!(!Path::new(&format!("{}.pgid", case.work())).exists(), "no .pgid left");
         assert!(case.lock_free(), "the work lock is free");
@@ -2710,13 +2725,21 @@ mod unix {
         let case = Case::new("drain-process");
         let root = case.root();
         raised(&root);
-        // The shell waits on its input itself, so no child of it outlives it, and its last argument names the root.
+        // The shell waits on its input itself, so no child of it outlives it, and its last argument names the root. It
+        // says it runs before the status is asked: macOS's /bin/sh re-executes the shell it selects, and while that exec
+        // is under way its arguments cannot be read, which the readable-only scan skips.
         let mut held = Command::new("/bin/sh")
-            .args(["-c", "read line", "sh", &case.work()])
+            .args(["-c", "echo started; read line", "sh", &case.work()])
             .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .spawn()
             .expect("the shell starts");
         let pid = held.id();
+        let mut said = String::new();
+        BufReader::new(held.stdout.take().expect("stdout is piped"))
+            .read_line(&mut said)
+            .expect("the shell's line is read");
+        assert_eq!(said, "started\n", "the shell runs");
 
         let waiting = drained(&root, "status");
         held.kill().expect("the shell is killed");
