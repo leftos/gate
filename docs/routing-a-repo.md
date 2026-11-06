@@ -52,7 +52,7 @@ A sibling pair (a run carrying siblings; declared siblings that are all absent m
 
 A builder that is not Windows, the macOS builder, does not take a pair's `inputs` yet: the router sends a pair whose repos declare any, or that carries a file, to a Windows builder instead.
 With no Windows builder that routes the command it runs here, saying `gate: not routed: a sibling pair's inputs go only to a Windows builder, and no Windows builder routes this command`, and `--builder` naming the macOS builder for it is refused.
-A pair that carries no inputs, and a single repo's run, still go to the Mac. A pair with a repo holding a `.gitmodules` counts as declaring inputs to the macOS builder, which refuses it, so the run stays here.
+A pair that carries no inputs, and a single repo's run, still go to the Mac. A pair with a repo holding an initialized submodule counts as declaring inputs to the macOS builder, which refuses it, so the run stays here; a `.gitmodules` whose submodules are all uninitialized does not count.
 
 A routed run that fails on its builder names, in a `gate: hint:` line before the failure line, each gitignored file (never a folder) its words name that no `inputs` glob covers and that was not carried (a file in a carried folder included); the fix is an `inputs` glob for it (in the sibling repo's `remote.json` for a file of a sibling, named `../<sibling>/<path>`), or `--local`.
 

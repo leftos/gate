@@ -410,7 +410,7 @@ fn submodules(asked: &Asked<'_>, finder: &Finder<'_>, go_on: &impl Fn() -> bool)
         return Ok(carried);
     }
     let git = finder.git().map_err(|why| Unbuilt::Failed(format!("git cannot be found: {why}")))?;
-    let paths = submodule_paths(git, asked).map_err(|unbuilt| unbuilt.failed_as(unread))?;
+    let paths = submodule_paths(git, asked.root, asked.bounds, asked.interrupt).map_err(|unbuilt| unbuilt.failed_as(unread))?;
     let (paths, refused): (Vec<String>, Vec<String>) = paths.into_iter().partition(|path| carried_form(path));
     carried.said.extend(refused.iter().map(|path| not_carried(path)));
     let linked = gitlinks(git, asked, &paths)
@@ -485,14 +485,14 @@ fn utf8(output: Vec<u8>) -> Result<String, Unbuilt> {
     String::from_utf8(output).map_err(|_| Unbuilt::Failed("git's output is not UTF-8".to_owned()))
 }
 
-/// Each path the `.gitmodules` at `asked`'s root gives a submodule, once each, sorted, read by one `git config` call
-/// bounded as the run's git calls are; none when git finds no such key (status 1); else the interrupt, or why git
+/// Each path the `.gitmodules` at `root` gives a submodule, once each, sorted, read by one `git config` call bounded by
+/// `bounds` and stopped by `interrupt`; none when git finds no such key (status 1); else the interrupt, or why git
 /// failed.
-fn submodule_paths(git: &Git, asked: &Asked<'_>) -> Result<BTreeSet<String>, Unbuilt> {
+fn submodule_paths(git: &Git, root: &Path, bounds: GitBounds, interrupt: Option<Interrupt>) -> Result<BTreeSet<String>, Unbuilt> {
     let args = ["config", "-z", "-f", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"];
     let call = Call {
-        interrupt: asked.interrupt,
-        ..Call::bounded(asked.root, &args, asked.bounds)
+        interrupt,
+        ..Call::bounded(root, &args, bounds)
     };
     let (status, output, errors) = git.status_within(&call, OUTPUT_CAP).map_err(super::lfs::unbuilt)?;
     match status.code() {
@@ -1044,14 +1044,14 @@ pub(super) fn run_refused(attempt: &mut Attempt<'_, '_>) -> End {
 /// ([`single`]). A run with no input globs and no submodule file carried sends the empty manifest when an earlier run's
 /// carried copies are to be removed ([`emptied`]), else none. A sibling pair's run sends each repo's inputs and its
 /// initialized submodules' files in its own tree ([`pair_sent`]), on a Windows builder only ([`pair_inputs`]): a pair
-/// any of whose trees has globs or a `.gitmodules` ([`pair_declared`]) refuses another builder. A manifest that cannot
+/// any of whose trees has globs or an initialized submodule ([`pair_declared`]) refuses another builder. A manifest that cannot
 /// be built or is past a cap refuses the route `inputs` before anything is sent.
 pub(super) fn sent(attempt: &mut Attempt<'_, '_>) -> Result<Option<Built>, End> {
     let call = attempt.call;
     if !call.siblings.is_empty() {
         let trees = std::iter::once((Path::new(call.root), call.inputs))
             .chain(call.siblings.iter().map(|sibling| (Path::new(sibling.root()), sibling.inputs())));
-        return match pair_inputs(call.builder.os, pair_declared(trees)) {
+        return match pair_inputs(call.builder.os, pair_declared(trees, attempt.git, call.interrupt)) {
             PairInputs::Sent => pair_sent(attempt),
             PairInputs::None => Ok(None),
             PairInputs::Refused(why) => Err(refused(attempt, why)),
@@ -1126,12 +1126,36 @@ enum PairInputs {
 }
 
 /// Whether a sibling pair's `trees`, each its root and its repo's input globs, may send inputs: any tree has globs or
-/// holds a regular `.gitmodules` ([`gitmodules_at`]), one that cannot be read counting as held, so a builder that does
-/// not take a pair's inputs refuses rather than run without a submodule's files.
-fn pair_declared<'a>(trees: impl IntoIterator<Item = (&'a Path, &'a [String])>) -> bool {
+/// an initialized submodule ([`initialized_submodule`]), git called bounded by `bounds` and stopped by `interrupt`, so
+/// a builder that does not take a pair's inputs refuses rather than run without a submodule's files. A tree whose
+/// `.gitmodules` lists only uninitialized submodules declares nothing.
+fn pair_declared<'a>(trees: impl IntoIterator<Item = (&'a Path, &'a [String])>, bounds: GitBounds, interrupt: Option<Interrupt>) -> bool {
     trees
         .into_iter()
-        .any(|(root, globs)| !globs.is_empty() || !matches!(gitmodules_at(root), Ok(false)))
+        .any(|(root, globs)| !globs.is_empty() || initialized_submodule(root, bounds, interrupt))
+}
+
+/// Whether `root` may hold an initialized submodule: false, and no git process started, when its `.gitmodules` is not a
+/// regular file ([`gitmodules_at`]); else whether any path `git config` lists there, of a form the gate carries
+/// ([`carried_form`]), is a real folder holding a `.git` entry ([`Placed::Ready`]). Uncertainty counts as one: a
+/// `.gitmodules` that cannot be read, git that cannot be found, `git config` failing or interrupted, or a folder that
+/// cannot be read or is refused ([`submodule_folder`]).
+fn initialized_submodule(root: &Path, bounds: GitBounds, interrupt: Option<Interrupt>) -> bool {
+    match gitmodules_at(root) {
+        Ok(false) => return false,
+        Ok(true) => {}
+        Err(_) => return true,
+    }
+    let Ok(git) = Git::find(root) else {
+        return true;
+    };
+    let Ok(paths) = submodule_paths(&git, root, bounds, interrupt) else {
+        return true;
+    };
+    paths
+        .iter()
+        .filter(|path| carried_form(path))
+        .any(|path| !matches!(submodule_folder(root, path), Ok(Placed::Absent)))
 }
 
 /// What a sibling pair's run on a builder of `os` does with its inputs, `declared` when any of its trees declares
@@ -2200,13 +2224,24 @@ mod tests {
     }
 
     #[test]
-    fn a_pair_tree_s_gitmodules_declares_inputs_as_its_globs_do() {
-        let root = scratch("pair-declared");
+    fn a_pair_tree_declares_inputs_by_its_globs_or_an_initialized_submodule() {
+        let root = worktree("pair-declared", "");
         let globs = ["secrets/**".to_owned()];
-        assert!(!pair_declared([(&*root, &[][..])]), "no globs and no .gitmodules declare nothing");
-        assert!(pair_declared([(&*root, &globs[..])]), "globs declare inputs");
+        assert!(
+            !pair_declared([(&*root, &[][..])], GIT_BOUNDS, None),
+            "no globs and no .gitmodules declare nothing"
+        );
+        assert!(pair_declared([(&*root, &globs[..])], GIT_BOUNDS, None), "globs declare inputs");
         put(&root, ".gitmodules", &gitmodules(&["tools/shared"]));
-        assert!(pair_declared([(&*root, &[][..])]), "a .gitmodules may carry a submodule's files");
+        assert!(
+            !pair_declared([(&*root, &[][..])], GIT_BOUNDS, None),
+            "a .gitmodules whose submodule is not initialized carries no file"
+        );
+        with_submodule(&root);
+        assert!(
+            pair_declared([(&*root, &[][..])], GIT_BOUNDS, None),
+            "an initialized submodule carries its files"
+        );
     }
 
     #[test]
