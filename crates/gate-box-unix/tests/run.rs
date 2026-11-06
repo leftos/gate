@@ -215,12 +215,8 @@ mod unix {
             json!({ "Pair": { "Leaf": "repo", "Siblings": ["lib"] }, "SiblingSnapshots": { "lib": lib } })
         }
 
-        /// The `box inputs` request word of `step` for this case's work folder: base64 of the JSON payload.
-        fn inputs_request(&self, step: &str) -> String {
-            self.inputs_request_with(step, &json!({}))
-        }
-
-        /// [`Case::inputs_request`], with `extra` keys set over it.
+        /// The `box inputs` request word of `step` for this case's work folder, with `extra` keys set over it: base64 of
+        /// the JSON payload.
         fn inputs_request_with(&self, step: &str, extra: &Value) -> String {
             let (root, work) = (self.root(), self.work());
             let mut payload = json!({
@@ -432,13 +428,23 @@ mod unix {
         unsafe { libc::poll(&raw mut polled, 1, READ_SLICE_MS) != 0 }
     }
 
-    /// A command that writes `file` and waits until `beaten` is made, so a heartbeat is read while it runs.
+    /// A command that runs `script`, then waits until `beaten` is made, so a heartbeat is read while it runs.
     fn waits_for_a_beat(script: &str, beaten: &Path) -> Value {
-        json!([
-            "/bin/sh",
-            "-c",
-            format!("{script}; while [ ! -e '{}' ]; do sleep 0.05; done", beaten.display())
-        ])
+        json!(["/bin/sh", "-c", format!("{script}; {}", waits_for_file(beaten))])
+    }
+
+    /// A shell loop that waits until `file` is made. It also ends, with exit 1, once `file`'s folder is gone or past
+    /// 6000 looks 50 ms apart (300 s, a hang guard below the suite's, not a timing), so a case dropped or killed while
+    /// its command waits leaves no shell polling behind it.
+    fn waits_for_file(file: &Path) -> String {
+        let folder = file.parent().expect("a case file lies in a folder");
+        format!(
+            "i=0; while [ ! -e '{}' ]; do [ -d '{}' ] || exit 1; i=$((i+1)); \
+             if [ $i -gt 6000 ]; then echo 'never saw {}' >&2; exit 1; fi; sleep 0.05; done",
+            file.display(),
+            folder.display(),
+            file.display()
+        )
     }
 
     #[test]
@@ -3170,9 +3176,9 @@ mod unix {
         ended_of(&command.output().expect("gate-box runs"))
     }
 
-    /// A command that makes `started`, then waits until `go` is made.
+    /// A command that makes `started`, then waits until `go` is made, as [`waits_for_file`] waits.
     fn waits_for_go(started: &Path, go: &Path) -> String {
-        format!(": > '{}'; while [ ! -e '{}' ]; do sleep 0.05; done", started.display(), go.display())
+        format!(": > '{}'; {}", started.display(), waits_for_file(go))
     }
 
     /// Waits until `done`, failing as hung after 120 s, a hang guard only.
@@ -3195,9 +3201,10 @@ mod unix {
     }
 
     /// The script of a command run as `/bin/sh -c <script> <marker>`: a shell carrying `marker` started in the
-    /// background, looping until it is killed, then `then`.
+    /// background, looping until it is killed or past 6000 looks 50 ms apart (300 s, a hang guard so a killed case
+    /// leaves none for long, not a timing), then `then`.
     fn marked_script(marker: &str, then: &str) -> String {
-        format!("/bin/sh -c 'while :; do sleep 0.05; done' {marker} & {then}")
+        format!("/bin/sh -c 'i=0; while [ $i -lt 6000 ]; do i=$((i+1)); sleep 0.05; done' {marker} & {then}")
     }
 
     /// Whether a process whose command line holds `marker` runs (`pgrep -f`).
