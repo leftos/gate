@@ -71,7 +71,8 @@ pub(crate) fn utc_clock(seconds: i64) -> String {
     format!("{:02}:{:02}", day / 3_600, day % 3_600 / 60)
 }
 
-/// The drain marker a routed run holds while it waits behind a builder's drain: its file in the builder's marker folder
+/// The drain marker a routed run holds while it waits behind a builder's drain, or for a pending gate push to bring the
+/// builder to its build: its file in the builder's marker folder
 /// ([`v1::drain_marker_dir`]), open sharing nothing until [`Marker::end`].
 pub(crate) struct Marker {
     path: PathBuf,

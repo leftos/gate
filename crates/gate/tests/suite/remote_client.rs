@@ -3046,6 +3046,210 @@ fn no_installed_gate_keeps_today_s_fallback() {
     assert_kept_here(&case, &outcome, None);
 }
 
+/// The drain poll of the push-wait cases, short so a wait of a few polls ends soon.
+const PUSH_POLL: [&str; 2] = ["--test-drain-poll-ms", "50"];
+/// The steps of a push-wait case whose builder keeps its other build, for every call however many the wait makes.
+const OTHER_BUILD_POLLS: [&str; 1] = ["repeat version 0.0.0-other"];
+
+/// Writes the case's push-pending marker beside its installed gate, `<LOCALAPPDATA>\gate\bin\push-pending`, naming
+/// `version` as the install writes it; its path.
+fn write_push_pending(case: &Case, version: &str) -> PathBuf {
+    let bin = case.local_app_data().join("gate").join("bin");
+    fs::create_dir_all(&bin).expect("the installed gate's folder can be made");
+    let marker = bin.join("push-pending");
+    fs::write(&marker, format!("{version}\n")).expect("the marker can be written");
+    marker
+}
+
+/// The line a routed run of the case's gate says as it starts to wait for the pending push.
+fn push_waiting_line(case: &Case) -> String {
+    format!(
+        "gate: waiting for the pending gate push to bring the builder {HOST} to gate {}",
+        build_version(case)
+    )
+}
+
+/// The gate of a push-wait case's routed run through `steps`, polling every [`PUSH_POLL`], its command saying `said`.
+fn push_wait_gate(case: &Case, steps: &Path, said: &str) -> Command {
+    let tuned = Tuned {
+        extra: &PUSH_POLL,
+        ..Tuned::default()
+    };
+    client_gate_tuned(case, "out.log", steps, &tuned, &[r".\tool.exe", "out", said])
+}
+
+/// Asserts the run that ended `outcome` waited for the push once and then ran on the builder, its calls through `steps`
+/// `preflights` preflights and one run, with no fallback.
+fn assert_waited_for_the_push_then_ran(case: &Case, outcome: &Outcome, steps: &Path, preflights: usize) {
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
+    let waiting = push_waiting_line(case);
+    assert_eq!(
+        outcome.stderr.lines().filter(|line| *line == waiting).count(),
+        1,
+        "the waiting line is said once: {outcome:?}"
+    );
+    let mut expected = vec!["preflight"; preflights];
+    expected.push("run");
+    assert_eq!(calls(steps), expected, "{outcome:?}");
+    assert_eq!(fallbacks(&events(case)), Vec::<&str>::new(), "{outcome:?}");
+}
+
+#[test]
+fn a_run_waits_for_a_pending_push_and_routes_once_the_builder_has_its_build() {
+    let case = client_case("client-push-wait");
+    write_push_pending(&case, &build_version(&case));
+    // The call and the first poll meet the builder's other build; the second poll finds this PC's, the call after it
+    // runs there.
+    let steps = ssh_steps(&case, "ssh", &["version 0.0.0-other", "version 0.0.0-other", "ok", "ok", "ok"]);
+
+    let outcome = finish(push_wait_gate(&case, &steps, "ran there"));
+
+    assert_waited_for_the_push_then_ran(&case, &outcome, &steps, 4);
+}
+
+#[test]
+fn a_run_stops_waiting_once_gate_push_clears_the_marker_and_falls_back_version() {
+    let case = client_case("client-push-wait-cleared");
+    let marker = write_push_pending(&case, &build_version(&case));
+    let steps = ssh_steps(&case, "ssh", &OTHER_BUILD_POLLS);
+    let running = start(push_wait_gate(&case, &steps, "ran here"));
+
+    running.wait_until("the call and a poll of the wait", || calls(&steps).len() >= 2);
+    fs::remove_file(&marker).expect("the marker can be removed, as gate push clears it");
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let stopped = format!("gate: stopped waiting for the builder {HOST}: the push is no longer pending");
+    let waiting = push_waiting_line(&case);
+    assert_in_order(
+        &outcome.stderr,
+        &[waiting.as_str(), stopped.as_str(), "gate: remote builder version; running here"],
+    );
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), ["version"]);
+    assert!(calls(&steps).iter().all(|verb| verb == "preflight"), "nothing ran there");
+}
+
+#[test]
+fn a_first_call_with_no_gate_box_waits_for_the_push_too() {
+    let case = client_case("client-push-wait-no-box-first");
+    write_push_pending(&case, &build_version(&case));
+    // The call meets the builder between the push's move of its old gate.exe aside and its move of the new one in: a
+    // version refusal that names no build.
+    let steps = ssh_steps(&case, "ssh", &["exit 9009", "ok", "ok", "ok"]);
+
+    let outcome = finish(push_wait_gate(&case, &steps, "ran there"));
+
+    assert_waited_for_the_push_then_ran(&case, &outcome, &steps, 3);
+}
+
+#[test]
+fn a_malformed_push_pending_marker_is_said_to_the_log_alone_and_takes_no_wait() {
+    let case = client_case("client-push-wait-malformed");
+    let marker = write_push_pending(&case, "two\nlines");
+    let steps = ssh_steps(&case, "ssh", &["version 0.0.0-other"]);
+
+    let outcome = finish(push_wait_gate(&case, &steps, "ran here"));
+
+    assert_kept_here(&case, &outcome, None);
+    assert!(!outcome.stderr.contains("push-pending marker"), "said to the log alone: {outcome:?}");
+    let line = format!("gate: the push-pending marker {} is malformed", marker.display());
+    let log = log_texts(&case.folder().join("out.log"));
+    assert_eq!(log.lines().filter(|said| said.ends_with(&line)).count(), 1, "said to the log once: {log}");
+    assert_eq!(calls(&steps), ["preflight"]);
+}
+
+#[test]
+fn a_poll_with_no_gate_box_keeps_the_push_wait() {
+    let case = client_case("client-push-wait-no-box");
+    write_push_pending(&case, &build_version(&case));
+    // The poll meets the builder between the push's move of its old gate.exe aside and its move of the new one in.
+    let steps = ssh_steps(&case, "ssh", &["version 0.0.0-other", "exit 9009", "ok", "ok", "ok"]);
+
+    let outcome = finish(push_wait_gate(&case, &steps, "ran there"));
+
+    assert_waited_for_the_push_then_ran(&case, &outcome, &steps, 4);
+}
+
+#[test]
+fn a_stale_or_future_push_pending_marker_takes_no_wait() {
+    for (name, at) in [
+        ("stale", SystemTime::now() - Duration::from_mins(11)),
+        ("future", SystemTime::now() + Duration::from_hours(24)),
+    ] {
+        let case = client_case(&format!("client-push-wait-{name}"));
+        let marker = write_push_pending(&case, &build_version(&case));
+        fs::File::options()
+            .write(true)
+            .open(&marker)
+            .and_then(|file| file.set_modified(at))
+            .expect("the marker's last write can be set");
+        let steps = ssh_steps(&case, "ssh", &["version 0.0.0-other"]);
+
+        let outcome = finish(push_wait_gate(&case, &steps, "ran here"));
+
+        assert_kept_here(&case, &outcome, None);
+        assert!(!outcome.stderr.contains("pending gate push"), "{name}: {outcome:?}");
+        assert_eq!(calls(&steps), ["preflight"], "{name}");
+    }
+}
+
+#[test]
+fn a_stale_gate_still_hands_over_with_a_push_pending_marker() {
+    let case = client_case("client-push-wait-stale-gate");
+    let bin = install_fake_gate(&case, OTHER_BUILD, Some("7"));
+    write_push_pending(&case, OTHER_BUILD);
+    let (gate, start, words) = stale_gate(&case, &[]);
+
+    let (pid, outcome) = finish_with_pid(gate);
+
+    assert_handed_over(&case, pid, &outcome, (&bin, &start, &words));
+    assert!(!outcome.stderr.contains("pending gate push"), "{outcome:?}");
+}
+
+#[test]
+fn a_run_waiting_for_a_push_holds_a_drain_marker() {
+    let case = client_case("client-push-wait-marker");
+    let marker = write_push_pending(&case, &build_version(&case));
+    let steps = ssh_steps(&case, "ssh", &OTHER_BUILD_POLLS);
+    let running = start(push_wait_gate(&case, &steps, "ran here"));
+    let pid = running.id();
+    let folder = gate_state::v1::drain_marker_dir(&case.root(), None);
+    let own = |folder: &Path| {
+        fs::read_dir(folder).map_or(0, |entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with(&format!("{pid}-")))
+                .count()
+        })
+    };
+
+    running.wait_until("the run's drain marker", || own(&folder) == 1);
+    fs::remove_file(&marker).expect("the marker can be removed, as gate push clears it");
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(&push_waiting_line(&case)), "{outcome:?}");
+    assert_eq!(own(&folder), 0, "the drain marker is gone once the wait ends: {outcome:?}");
+}
+
+#[test]
+fn a_commit_stage_takes_no_push_wait() {
+    let case = stage_case("client-stage-push-wait", &["write", "a.txt", "fixed"]);
+    write_push_pending(&case, &build_version(&case));
+    let steps = ssh_steps(&case, "ssh", &["version 0.0.0-other"]);
+    let base = git_out(&case, &[], &["rev-parse", "HEAD"]);
+
+    let outcome = finish(stage_gate(&case, &steps));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains("pending gate push"), "{outcome:?}");
+    assert!(local_hooks_ran(&case), "the commit ran its hooks here: {outcome:?}");
+    assert_eq!(git_out(&case, &[], &["rev-parse", "HEAD~1"]), base, "the commit was made: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"]);
+}
+
 /// A builder with no gate box is refused for `version` by what the box said, not by this PC's compare of its build:
 /// no handover, whatever the installed gate runs.
 #[test]

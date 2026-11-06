@@ -483,9 +483,10 @@ fn an_install_while_a_push_holds_the_lock_changes_nothing() {
     );
     assert_same_bytes(&installed_gate(&case), &exe);
     assert!(aside.exists(), "the aside copy is left: {outcome:?}");
+    // The push-pending marker is the first install's.
     assert_eq!(
         names(&install_dir(&case)),
-        ["gate-desktop-helper.exe", "gate.exe", ASIDE, "push.lock"],
+        ["gate-desktop-helper.exe", "gate.exe", ASIDE, "push-pending", "push.lock"],
         "nothing was added or deleted"
     );
     assert_eq!(path_value(&key), None, "the PATH step did not run: {outcome:?}");
@@ -517,9 +518,10 @@ fn an_install_refuses_a_push_lock_that_is_a_hard_link() {
     );
     assert_same_bytes(&installed_gate(&case), &exe);
     assert!(aside.exists(), "the aside copy is left: {outcome:?}");
+    // The push-pending marker is the first install's.
     assert_eq!(
         names(&install_dir(&case)),
-        ["gate-desktop-helper.exe", "gate.exe", ASIDE, "push.lock"],
+        ["gate-desktop-helper.exe", "gate.exe", ASIDE, "push-pending", "push.lock"],
         "nothing was added or deleted"
     );
     assert_eq!(path_value(&key), None, "the PATH step did not run: {outcome:?}");
@@ -1040,6 +1042,176 @@ fn a_new_helper_beside_the_same_gate_replaces_only_the_helper() {
     assert_same_bytes(&installed_gate(&case), &first);
     assert_same_bytes(&installed_helper(&case), &new_helper);
     assert!(aside_copies(&case).is_empty(), "gate.exe was not moved aside: {:?}", aside_copies(&case));
+}
+
+/// The push-pending marker beside a case's installed gate, which an install that changed the gate or its helper writes.
+fn push_pending(case: &Case) -> PathBuf {
+    install_dir(case).join("push-pending")
+}
+
+/// Asserts the case's push-pending marker holds exactly `version` and one LF: no byte-order mark, no CR.
+fn assert_push_pending(case: &Case, version: &str, outcome: &Outcome) {
+    assert!(push_pending(case).is_file(), "the marker was written: {outcome:?}");
+    let bytes = fs::read(push_pending(case)).expect("the marker can be read");
+    assert_eq!(
+        bytes,
+        format!("{version}\n").into_bytes(),
+        "the marker names the installed version: {outcome:?}"
+    );
+}
+
+#[test]
+fn an_install_that_changes_the_gate_writes_the_push_pending_marker() {
+    let case = Case::new("an_install_that_changes_the_gate_writes_the_push_pending_marker");
+    let key = EnvironmentKey::new("an_install_that_changes_the_gate_writes_the_push_pending_marker");
+    let exe = copy_gate(&case, "gate-a.exe");
+    let version = version_of(&exe);
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&exe)]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert!(
+        unix(&outcome.stdout).contains(&format!("install: installed gate {version} at {}", shown(&installed_gate(&case)))),
+        "{outcome:?}"
+    );
+    assert_push_pending(&case, &version, &outcome);
+    assert!(
+        !names(&install_dir(&case)).iter().any(|name| name.starts_with("push-pending.")),
+        "no temp is left: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_helper_only_install_writes_the_push_pending_marker() {
+    let case = Case::new("a_helper_only_install_writes_the_push_pending_marker");
+    let key = EnvironmentKey::new("a_helper_only_install_writes_the_push_pending_marker");
+    let (first, _) = installed_pair_a(&case, &key);
+    // The first install's marker is taken away, as a push clears it, so only the helper install can write one.
+    fs::remove_file(push_pending(&case)).expect("the first install's marker can be removed");
+    let new_helper = stand_in_helper(&case, "helper-b.exe", b"helper two");
+
+    let outcome = install_with_helper(&case, &key, &new_helper, &["-Exe", &shown(&first)]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_same_bytes(&installed_helper(&case), &new_helper);
+    assert_push_pending(&case, &version_of(&first), &outcome);
+}
+
+#[test]
+fn an_install_of_the_same_files_writes_no_push_pending_marker() {
+    let case = Case::new("an_install_of_the_same_files_writes_no_push_pending_marker");
+    let key = EnvironmentKey::new("an_install_of_the_same_files_writes_no_push_pending_marker");
+    let exe = copy_gate(&case, "gate-a.exe");
+    let first = install(&case, &key, &["-Exe", &shown(&exe)]);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let marker = push_pending(&case);
+    fs::remove_file(&marker).expect("the first install's marker can be removed");
+
+    let second = install(&case, &key, &["-Exe", &shown(&exe)]);
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert!(!marker.exists(), "an install of the same files writes no marker: {second:?}");
+
+    // One already there, written by an earlier install whose push has not run, is left as it is.
+    fs::write(&marker, b"0.0.0-earlier\n").expect("an earlier marker can be written");
+    let at = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+    fs::File::options()
+        .write(true)
+        .open(&marker)
+        .and_then(|file| file.set_modified(at))
+        .expect("the marker's last write can be set");
+
+    let third = install(&case, &key, &["-Exe", &shown(&exe)]);
+
+    assert_eq!(third.code, Some(0), "{third:?}");
+    assert_eq!(fs::read(&marker).expect("the marker is still there"), b"0.0.0-earlier\n", "{third:?}");
+    assert_eq!(
+        fs::metadata(&marker)
+            .and_then(|metadata| metadata.modified())
+            .expect("the marker has a last write"),
+        at,
+        "the marker was not written again: {third:?}"
+    );
+}
+
+#[test]
+fn an_install_whose_gate_does_not_run_writes_no_push_pending_marker() {
+    let case = Case::new("an_install_whose_gate_does_not_run_writes_no_push_pending_marker");
+    let key = EnvironmentKey::new("an_install_whose_gate_does_not_run_writes_no_push_pending_marker");
+    let (exe, _) = installed_with_an_aside(&case, &key);
+    fs::remove_file(push_pending(&case)).expect("the first install's marker can be removed");
+    let denied = DenyEntry::new(&install_dir(&case), NO_RUNNING_IN);
+    let other = copy_gate_with_a_byte(&case, "gate-b.exe");
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&other)]);
+
+    drop(denied);
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_same_bytes(&installed_gate(&case), &exe);
+    assert!(!push_pending(&case).exists(), "a gate put back writes no marker: {outcome:?}");
+}
+
+#[test]
+fn a_whatif_install_lists_the_push_pending_marker() {
+    let case = Case::new("a_whatif_install_lists_the_push_pending_marker");
+    let key = EnvironmentKey::new("a_whatif_install_lists_the_push_pending_marker");
+    let exe = copy_gate(&case, "gate-a.exe");
+    let listed = format!(
+        "What if: Performing the operation \"Write push-pending marker\" on target \"{}\".\n",
+        shown(&push_pending(&case))
+    );
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&exe), "-WhatIf"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(unix(&outcome.stdout).contains(&listed), "the write is listed: {outcome:?}");
+    assert!(!install_dir(&case).exists(), "nothing was installed: {outcome:?}");
+
+    // A preview of the files already installed lists no marker.
+    let first = install(&case, &key, &["-Exe", &shown(&exe)]);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    fs::remove_file(push_pending(&case)).expect("the install's marker can be removed");
+
+    let same = install(&case, &key, &["-Exe", &shown(&exe), "-WhatIf"]);
+
+    assert_eq!(same.code, Some(0), "{same:?}");
+    assert!(!unix(&same.stdout).contains("push-pending"), "the same files list no marker: {same:?}");
+    assert!(!push_pending(&case).exists(), "nothing was written: {same:?}");
+}
+
+#[test]
+fn a_push_pending_marker_that_cannot_be_written_does_not_fail_the_install() {
+    let case = Case::new("a_push_pending_marker_that_cannot_be_written_does_not_fail_the_install");
+    let key = EnvironmentKey::new("a_push_pending_marker_that_cannot_be_written_does_not_fail_the_install");
+    let exe = copy_gate(&case, "gate-a.exe");
+    // A folder where the marker goes, holding a file, so no rename can replace it.
+    let marker = push_pending(&case);
+    fs::create_dir_all(&marker).expect("the folder at the marker's name can be made");
+    fs::write(marker.join("a file"), "left here\n").expect("the file in it can be written");
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&exe)]);
+
+    assert_eq!(outcome.code, Some(0), "the install still passes: {outcome:?}");
+    let stderr = unix(&outcome.stderr);
+    assert_eq!(stderr.lines().count(), 1, "the failure is one line: {outcome:?}");
+    assert!(
+        stderr.starts_with(&format!("install: could not write the push-pending marker {}: ", shown(&marker)))
+            && stderr.ends_with("; routed runs fall back until gate push ends\n"),
+        "{outcome:?}"
+    );
+    assert_same_bytes(&installed_gate(&case), &exe);
+    assert!(marker.join("a file").exists(), "the folder is left as it was: {outcome:?}");
+    assert!(
+        !names(&install_dir(&case)).iter().any(|name| name.starts_with("push-pending.")),
+        "no temp is left: {outcome:?}"
+    );
+    assert_eq!(
+        path_value(&key),
+        Some(("ExpandString".to_owned(), shown(&install_dir(&case)))),
+        "the install went on to the PATH step: {outcome:?}"
+    );
 }
 
 /// Makes the case folder the scratch repository a `-Source` case records, holding one commit of `file` with `text`.

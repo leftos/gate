@@ -1294,21 +1294,249 @@ fn behind_drain(
 
 /// What a routed run's waits after its call may use: the run's request, whose seams set each wait's poll
 /// (`--test-drain-poll-ms`) and heartbeat (`--test-heartbeat-ms`), what is left of the run's remote budget for its waits
-/// for a builder slot, and the time the run's remote waits have taken, which those waits add to.
+/// for a builder slot, the time the run's slot waits have taken, which those waits add to (a wait for a push adds
+/// nothing), and the push-pending marker a version refusal waits on.
 struct SlotWait<'w> {
     request: &'w RunRequest,
     left: Duration,
     waited: &'w mut Duration,
     /// Set once any call of the attempt began its run call, however the waits end, a Ctrl+C included.
     run_called: &'w mut bool,
+    /// The push-pending marker ([`installed::push_pending_path`]) a run that the builder refused `version` waits on
+    /// ([`behind_push`]); `None` for a run that never waits for a push: a commit's stage and a rerouted held-back run.
+    pending: Option<PathBuf>,
+}
+
+/// Whether a routed run may wait for a pending gate push after its builder refused it `version`: never a commit's
+/// stage (`commit_stage`), which holds the commit's slot, nor a rerouted held-back run (`rerouted`), which goes back to
+/// its local wait.
+fn may_wait_for_push(commit_stage: bool, rerouted: bool) -> bool {
+    !commit_stage && !rerouted
+}
+
+/// How the push-pending marker of a routed run's wait for a gate push judged, read once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Pending {
+    /// A fresh marker naming this gate's own build, before its deadline: the run waits.
+    Mine,
+    /// Any other marker, or none: the run does not wait, for this reason.
+    NotMine(NotMine),
+}
+
+/// Why the push-pending marker is not a routed run's to wait on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NotMine {
+    /// No marker: the push ended.
+    Absent,
+    /// A marker naming another build, a later install's.
+    Other(String),
+    /// A marker past its life or its deadline, or dated ahead past the skew.
+    Stale,
+    /// A marker that cannot be read, or is malformed.
+    Unreadable,
+}
+
+impl NotMine {
+    /// Why a run stops waiting for the push, as its stopped line says it.
+    fn why(&self) -> String {
+        match self {
+            NotMine::Absent => "the push is no longer pending".to_owned(),
+            NotMine::Other(version) => format!("a later install is pending, gate {}", gate_router::escaped(version)),
+            NotMine::Stale => "the pending push is over 10 minutes old".to_owned(),
+            NotMine::Unreadable => "the push-pending marker cannot be read".to_owned(),
+        }
+    }
+}
+
+/// How long a pass of the wait for a push sleeps at `now`: the drain `poll`, cut short at the marker's `deadline`, and
+/// nothing once that deadline passed.
+fn nap(poll: Duration, deadline: Option<Instant>, now: Instant) -> Duration {
+    deadline.map_or(poll, |deadline| poll.min(deadline.saturating_duration_since(now)))
+}
+
+/// What a routed run's waits for a gate push watch across its attempts: the push-pending marker's path; the identity
+/// last seen (the marker's version and last write) with its deadline, the time that identity was first seen plus what
+/// was left then of its life; and whether the run's log was told the marker cannot be read.
+struct PushWatch {
+    path: PathBuf,
+    seen: Option<(installed::PushPending, Instant)>,
+    said_unreadable: bool,
+}
+
+impl PushWatch {
+    fn new(path: PathBuf) -> PushWatch {
+        PushWatch {
+            path,
+            seen: None,
+            said_unreadable: false,
+        }
+    }
+
+    /// Whether the run waits for the push after `outcome`: the builder refused it `version`, with a build or none (a
+    /// Windows builder's gate.exe is missing for a moment while it is pushed), no Ctrl+C was raised, and the marker is
+    /// the run's ([`PushWatch::judged`]).
+    fn waits_on(&mut self, outcome: &RemoteOutcome, call: &RemoteCall<'_>, console: &mut Console) -> bool {
+        outcome.fallback() == Some(FallbackReason::Version)
+            && !call.interrupt.is_some_and(Interrupt::is_raised)
+            && self.judged(console) == Pending::Mine
+    }
+
+    /// The marker read once and judged now ([`PushWatch::judge`]).
+    fn judged(&mut self, console: &mut Console) -> Pending {
+        let read = installed::read_push_pending(&self.path);
+        self.judge(read, (SystemTime::now(), Instant::now()), console)
+    }
+
+    /// How the marker `read` judges at the wall time and the monotonic time of `now`: mine only when it names this
+    /// gate's own build ([`build_version`]), is fresh ([`installed::fresh`]) and its identity's deadline is ahead. A
+    /// marker of a new identity is given its deadline here. A marker that cannot be read is said to the run's log, once
+    /// for the watch.
+    fn judge(&mut self, read: Result<Option<installed::PushPending>, String>, (wall, now): (SystemTime, Instant), console: &mut Console) -> Pending {
+        let marker = match read {
+            Ok(Some(marker)) => marker,
+            Ok(None) => return Pending::NotMine(NotMine::Absent),
+            Err(line) => return self.unreadable(&line, console),
+        };
+        if marker.version != build_version() {
+            return Pending::NotMine(NotMine::Other(marker.version));
+        }
+        if !installed::fresh(&marker, wall) {
+            return Pending::NotMine(NotMine::Stale);
+        }
+        if now < self.deadline_of(marker, wall, now) {
+            Pending::Mine
+        } else {
+            Pending::NotMine(NotMine::Stale)
+        }
+    }
+
+    /// A marker that cannot be read, `line` saying why, said to the run's log the first time for the watch.
+    fn unreadable(&mut self, line: &str, console: &mut Console) -> Pending {
+        if !std::mem::replace(&mut self.said_unreadable, true) {
+            console.note(&format!("gate: {line}"));
+        }
+        Pending::NotMine(NotMine::Unreadable)
+    }
+
+    /// The deadline of `marker`'s identity: the one it was given when first seen, else, for a new identity, `now` plus
+    /// what is left of its life at `wall`, kept.
+    fn deadline_of(&mut self, marker: installed::PushPending, wall: SystemTime, now: Instant) -> Instant {
+        if let Some((seen, deadline)) = &self.seen
+            && *seen == marker
+        {
+            return *deadline;
+        }
+        let age = wall.duration_since(marker.written).unwrap_or(Duration::ZERO);
+        let deadline = now + installed::PUSH_PENDING_LIFE.saturating_sub(age);
+        self.seen = Some((marker, deadline));
+        deadline
+    }
+
+    /// The deadline of the identity last seen; `None` before any.
+    fn deadline(&self) -> Option<Instant> {
+        self.seen.as_ref().map(|(_, deadline)| *deadline)
+    }
+}
+
+/// Waits for the pending gate push to bring the builder of `call`, which refused the run `version`, to this gate's own
+/// build, its key and remote slot kept and its drain marker ([`drain::Marker`]) held throughout, so runs queued behind
+/// it hold their bounds off; the poll and heartbeat read from the seams of `request` as [`SlotWait`] says. It says the
+/// waiting line, and each pass sleeps a drain poll, never past the marker's deadline, says the still-waiting line when
+/// a heartbeat is due, judges the marker of `watch` and, while it is still this build's and fresh, polls the builder's
+/// preflight alone ([`RemoteClient::poll_drain`]). A poll refused `version` keeps waiting; a poll the drain refused is
+/// [`PushEnd::Drained`]; any other poll, or a marker no longer this build's and fresh, said, is [`PushEnd::Recall`],
+/// and the run calls the builder again. Its time counts into no remote budget. `None` for a Ctrl+C during the wait.
+fn behind_push(
+    client: &mut dyn RemoteClient,
+    call: &RemoteCall<'_>,
+    (request, watch): (&RunRequest, &mut PushWatch),
+    console: &mut Console,
+) -> Option<PushEnd> {
+    let alias = &call.builder.alias;
+    let own = build_version();
+    console.err(&format!(
+        "gate: waiting for the pending gate push to bring the builder {alias} to gate {own}"
+    ));
+    let marker = held_marker(call, console);
+    let ended = pushed_out(client, call, (request, watch), console);
+    end_marker(marker, console);
+    ended
+}
+
+/// The passes of [`behind_push`]'s wait, as it says.
+fn pushed_out(
+    client: &mut dyn RemoteClient,
+    call: &RemoteCall<'_>,
+    (request, watch): (&RunRequest, &mut PushWatch),
+    console: &mut Console,
+) -> Option<PushEnd> {
+    let alias = &call.builder.alias;
+    let own = build_version();
+    let poll = request.test_seams.drain_poll_ms.map_or(wait::DRAIN_POLL, Duration::from_millis);
+    let mut beat = Beat::new(request.test_seams.heartbeat_ms.map_or(wait::HEARTBEAT, Duration::from_millis));
+    loop {
+        if !slept(nap(poll, watch.deadline(), Instant::now()), call.interrupt) {
+            return None;
+        }
+        if let Some(waited) = beat.due() {
+            console.err(&format!(
+                "gate: still waiting for the pending gate push to bring the builder {alias} to gate {own} ({} s)",
+                waited.as_secs()
+            ));
+        }
+        if let Pending::NotMine(why) = watch.judged(console) {
+            console.err(&format!("gate: stopped waiting for the builder {alias}: {}", why.why()));
+            return Some(PushEnd::Recall);
+        }
+        let polled = client.poll_drain(call);
+        if call.interrupt.is_some_and(Interrupt::is_raised) {
+            return None;
+        }
+        if polled.draining.is_some() {
+            return Some(PushEnd::Drained(Box::new(polled)));
+        }
+        if polled.fallback() != Some(FallbackReason::Version) {
+            return Some(PushEnd::Recall);
+        }
+    }
+}
+
+/// How a routed run's wait for a pending gate push ([`behind_push`]) ended, when no Ctrl+C ended it.
+enum PushEnd {
+    /// A poll that was no `version` refusal, or a marker no longer the run's: the run calls the builder again.
+    Recall,
+    /// A poll the builder's drain refused, this one: the run waits behind the drain.
+    Drained(Box<RemoteOutcome>),
+}
+
+/// Waits for the pending gate push as [`behind_push`] does, then gives the outcome the run goes on with: the call made
+/// after the wait, admitted just before it, `run_called` set once that call began its run call; or the poll the drain
+/// refused, with no admission. `None` for a Ctrl+C during the wait.
+fn after_push(
+    client: &mut dyn RemoteClient,
+    call: &RemoteCall<'_>,
+    (request, watch, run_called): (&RunRequest, &mut PushWatch, &mut bool),
+    console: &mut Console,
+) -> Option<(RemoteOutcome, Option<Instant>)> {
+    match behind_push(client, call, (request, watch), console)? {
+        PushEnd::Drained(polled) => Some((*polled, None)),
+        PushEnd::Recall => {
+            let admitted = Instant::now();
+            let outcome = client.run(call);
+            *run_called |= outcome.run_called;
+            Some((outcome, Some(admitted)))
+        }
+    }
 }
 
 /// The outcome a routed run of `call` goes on with once `first`, the outcome of its call, ended. Each call of the
 /// attempt is judged in turn: one the builder's drain refused waits behind the drain ([`behind_drain`]), unbounded by
 /// the remote budget; one the builder refused `full` while some of the budget is `left` waits for a slot there
-/// ([`behind_full`]), whose own time alone counts into the `waited` of `wait`; any other is the outcome. A slot wait a
-/// poll ends calls the builder once more, and the builder admitted the run just before the last such call, or the
-/// drain wait's admitted one. `None` for a Ctrl+C during either wait.
+/// ([`behind_full`]), whose own time alone counts into the `waited` of `wait`; one the builder refused `version` while
+/// the push-pending marker of `wait` is fresh and names this gate's build waits for the push ([`behind_push`]), its time
+/// counted into no budget; any other is the outcome. A slot or push wait a poll ends, or a push wait whose marker stops
+/// being this build's, calls the builder once more, and the builder admitted the run just before the last such call, or
+/// the drain wait's admitted one. `None` for a Ctrl+C during any wait.
 fn after_waits(
     client: &mut dyn RemoteClient,
     call: &RemoteCall<'_>,
@@ -1321,12 +1549,22 @@ fn after_waits(
         left,
         waited,
         run_called,
+        pending,
     } = wait;
+    let mut watch = pending.map(PushWatch::new);
     let (mut outcome, mut admitted, mut spent) = (first, None, Duration::ZERO);
     loop {
         let behind = behind_drain(client, call, outcome, (request, &mut *run_called), console)?;
         admitted = behind.admitted.or(admitted);
         outcome = behind.outcome;
+        if let Some(watch) = watch.as_mut()
+            && watch.waits_on(&outcome, call, console)
+        {
+            let (next, at) = after_push(client, call, (request, watch, &mut *run_called), console)?;
+            outcome = next;
+            admitted = at.or(admitted);
+            continue;
+        }
         let rest = left.saturating_sub(spent);
         if !waits_for_slot(&outcome, rest, call) {
             return Some(Behind { outcome, admitted });
@@ -1569,7 +1807,8 @@ fn slept(period: Duration, interrupt: Option<Interrupt>) -> bool {
 }
 
 /// What a wait for the worktree's key says once its bound passed and a live drain marker holds that bound off.
-const KEY_HELD_OFF_LINE: &str = "gate: still waiting for the worktree's key past its bound: a routed run waits behind a builder drain";
+const KEY_HELD_OFF_LINE: &str =
+    "gate: still waiting for the worktree's key past its bound: a routed run waits on a builder (its drain or a pending gate push)";
 
 /// Says `line` unless `said` says it was, and marks it said.
 fn say_once(console: &mut Console, said: &mut bool, line: &str) {
@@ -3102,8 +3341,10 @@ impl Run<'_> {
     /// the client ended it. A refusal or a client that cannot start is a refusal, with the slot still held. A Ctrl+C
     /// during the call over a refusal ends the run here, with the remote slot released. A call the builder refused
     /// `full` waits for a slot there within what is left of the run's remote budget after `waited`, which the wait adds
-    /// to ([`behind_full`]), and a call the builder's drain refused waits behind the drain ([`behind_drain`]), each with
-    /// the slot still held; a Ctrl+C during either wait ends the run here as one before the command started. A client
+    /// to ([`behind_full`]), a call the builder's drain refused waits behind the drain ([`behind_drain`]), and a call
+    /// the builder refused `version` while a fresh push-pending marker names this gate's build waits for the push
+    /// ([`behind_push`]), unless the run is a commit's stage or a rerouted held-back run, each with the slot still held;
+    /// a Ctrl+C during any wait ends the run here as one before the command started. A client
     /// that ended on its own keeps its own status, and the run writes or clears the worktree's nothing-back record
     /// ([`Run::leave_nothing_back`]).
     fn call_builder(
@@ -3137,9 +3378,17 @@ impl Run<'_> {
             left: self.remote_left(self.is_desktop(remote), *waited),
             waited,
             run_called: &mut run_called,
+            // A commit's stage holds the commit's slot, and a rerouted held-back run goes back to its local wait: neither
+            // waits for a push.
+            pending: if may_wait_for_push(self.staging.is_some(), self.rerouted_for.is_some()) {
+                installed::push_pending_path(self.environment)
+            } else {
+                None
+            },
         };
-        // A full builder is waited for within the run's remote budget, and a drain's refusal is no fallback: the run
-        // waits behind it, and goes on with the outcome of its admitted attempt.
+        // A full builder is waited for within the run's remote budget, a drain's refusal is no fallback, and neither is
+        // a version refusal while this build's push is pending: the run waits, and goes on with the outcome of its
+        // admitted attempt.
         let behind = after_waits(self.client.as_mut(), &call, first, wait, console);
         // Under the key lock the run holds: a run call that began, however the attempt ended, a Ctrl+C during a wait
         // after it included, left the builder a work folder.
@@ -3149,8 +3398,8 @@ impl Run<'_> {
         let Some(Behind { outcome, admitted }) = behind else {
             return Attempt::Done(Remotely::Ended(self.interrupted_before_start(console)));
         };
-        // A wait for a builder slot or behind the drain is no part of the run's time: its slot's hold and its wall time
-        // count from the admission.
+        // A wait for a builder slot, behind the drain or for a pending push is no part of the run's time: its slot's hold
+        // and its wall time count from the admission.
         if let Some(admitted) = admitted {
             started = admitted;
             hold.took = Some(admitted);
@@ -6377,18 +6626,21 @@ mod tests {
     #[cfg(feature = "test-seams")]
     mod waits {
         use std::collections::VecDeque;
-        use std::path::Path;
-        use std::time::Duration;
+        use std::fs;
+        use std::path::{Path, PathBuf};
+        use std::time::{Duration, Instant, SystemTime};
 
         use gate_args::Slot;
         use gate_state::FallbackReason;
         use gate_win32::Interrupt;
+        use gate_wire::build_version;
         use jiff::Timestamp;
 
         use crate::console::Console;
+        use crate::installed;
         use crate::remote::drain::Drain;
         use crate::remote::{REFUSED, RemoteCall, RemoteClient, RemoteOutcome};
-        use crate::run::{SlotWait, after_waits};
+        use crate::run::{Behind, NotMine, Pending, PushWatch, SlotWait, after_waits, may_wait_for_push, nap};
         use crate::wait::scratch::{Scratch, request};
 
         /// A client each of whose calls began its run call and ended as `ended` makes it, and whose drain or slot poll
@@ -6491,6 +6743,7 @@ mod tests {
                     left: Duration::from_secs(3600),
                     waited: &mut waited,
                     run_called: &mut run_called,
+                    pending: None,
                 };
                 let mut console = Console::new();
 
@@ -6566,6 +6819,7 @@ mod tests {
                 left: Duration::from_secs(3600),
                 waited: &mut waited,
                 run_called: &mut run_called,
+                pending: None,
             };
             let behind = after_waits(&mut client, &call, first, wait, &mut Console::new());
             assert!(client.runs.is_empty() && client.polls.is_empty(), "every planned call was made");
@@ -6600,6 +6854,513 @@ mod tests {
 
             assert!(interrupted, "the Ctrl+C ends the wait");
             assert!(run_called, "a later call began its run call, so the builder is listed");
+        }
+
+        /// What a push-wait case's client does once it answered a poll, before the wait's next pass.
+        enum Then {
+            Nothing,
+            /// Raises the interrupt, as a Ctrl+C during the poll does.
+            Raise,
+            /// Removes the marker, as `gate push` clears it.
+            Remove,
+            /// Writes the marker again holding this text.
+            Write(&'static str),
+            /// Dates the marker's last write 11 minutes back.
+            Age,
+        }
+
+        /// A client answering each run call from its list, and each poll from its list then doing what the poll's
+        /// [`Then`] says to the marker at `marker`.
+        struct PushScripted {
+            runs: VecDeque<RemoteOutcome>,
+            polls: VecDeque<(RemoteOutcome, Then)>,
+            marker: PathBuf,
+            interrupt: Interrupt,
+        }
+
+        impl RemoteClient for PushScripted {
+            fn run(&mut self, _call: &RemoteCall<'_>) -> RemoteOutcome {
+                self.runs.pop_front().expect("a run call the test planned")
+            }
+
+            fn poll_drain(&mut self, _call: &RemoteCall<'_>) -> RemoteOutcome {
+                let (outcome, then) = self.polls.pop_front().expect("a poll the test planned");
+                match then {
+                    Then::Nothing => {}
+                    Then::Raise => self.interrupt.raise(),
+                    Then::Remove => fs::remove_file(&self.marker).expect("the marker can be removed"),
+                    Then::Write(text) => fs::write(&self.marker, text).expect("the marker can be written"),
+                    Then::Age => aged(&self.marker, SystemTime::now() - Duration::from_mins(11)),
+                }
+                outcome
+            }
+        }
+
+        /// Sets the last write of `marker` to `at`.
+        fn aged(marker: &Path, at: SystemTime) {
+            fs::File::options()
+                .write(true)
+                .open(marker)
+                .and_then(|file| file.set_modified(at))
+                .expect("the marker's last write can be set");
+        }
+
+        /// A refusal `version` by the builder's preflight, the builder saying it runs `theirs`.
+        fn version_refused(theirs: &str) -> RemoteOutcome {
+            RemoteOutcome {
+                status: REFUSED,
+                reason: Some(FallbackReason::Version),
+                other_build: Some(theirs.to_owned()),
+                ..RemoteOutcome::default()
+            }
+        }
+
+        /// A refusal of the builder's preflight for `reason`, with no build named.
+        fn refused(reason: FallbackReason) -> RemoteOutcome {
+            RemoteOutcome {
+                status: REFUSED,
+                reason: Some(reason),
+                ..RemoteOutcome::default()
+            }
+        }
+
+        /// A call that passed and began its run call.
+        fn ran() -> RemoteOutcome {
+            RemoteOutcome {
+                run_called: true,
+                ..RemoteOutcome::default()
+            }
+        }
+
+        /// What a push-wait case ended with: the waits' outcome, the time counted into the remote waits, the flag
+        /// `call_builder` reads to list the builder, the notes said, whether every planned call was made, and the
+        /// marker's path.
+        struct Pushed {
+            behind: Option<Behind>,
+            waited: Duration,
+            run_called: bool,
+            notes: Vec<String>,
+            all_called: bool,
+            marker: PathBuf,
+        }
+
+        /// This build's marker text, as the install writes it.
+        fn mine() -> String {
+            format!("{}\n", build_version())
+        }
+
+        /// How a push-wait case starts: the marker's text (none written when `None`) and its last write when set; whether
+        /// the run waits on it at all (its `pending` path); the first call's outcome; and whether a Ctrl+C was raised
+        /// before the waits.
+        struct Start {
+            marker: Option<String>,
+            written: Option<SystemTime>,
+            waits: bool,
+            first: RemoteOutcome,
+            raised: bool,
+        }
+
+        impl Start {
+            /// This build's fresh marker, waited on, from a refusal `version` naming `0.0.0-first`.
+            fn mine() -> Start {
+                Start {
+                    marker: Some(mine()),
+                    written: None,
+                    waits: true,
+                    first: version_refused("0.0.0-first"),
+                    raised: false,
+                }
+            }
+        }
+
+        /// Runs `after_waits` as `start` says, the marker in the case's own scratch folder, the client answering `runs`
+        /// and `polls` in turn.
+        fn pushed(test: &str, start: Start, (runs, polls): (Vec<RemoteOutcome>, Vec<(RemoteOutcome, Then)>)) -> Pushed {
+            let scratch = Scratch::new(test);
+            let log = scratch.path().join("out.log");
+            let marker = scratch.path().join("push-pending");
+            if let Some(text) = &start.marker {
+                fs::write(&marker, text).expect("the marker can be written");
+            }
+            if let Some(at) = start.written {
+                aged(&marker, at);
+            }
+            let interrupt = Interrupt::install().expect("the console handler is installed");
+            if start.raised {
+                interrupt.raise();
+            }
+            let mut request = request(Slot::Heavy);
+            request.test_seams.drain_poll_ms = Some(1);
+            let call = waiting_call(&scratch, &log, interrupt);
+            let mut client = PushScripted {
+                runs: runs.into(),
+                polls: polls.into(),
+                marker: marker.clone(),
+                interrupt,
+            };
+            let (mut waited, mut run_called) = (Duration::ZERO, false);
+            let wait = SlotWait {
+                request: &request,
+                left: Duration::from_secs(3600),
+                waited: &mut waited,
+                run_called: &mut run_called,
+                pending: start.waits.then(|| marker.clone()),
+            };
+            let mut console = Console::new();
+            let behind = after_waits(&mut client, &call, start.first, wait, &mut console);
+            let all_called = client.runs.is_empty() && client.polls.is_empty();
+            Pushed {
+                behind,
+                waited,
+                run_called,
+                notes: console.take_notes(),
+                all_called,
+                marker,
+            }
+        }
+
+        /// The line a run says as it starts to wait for the push to bring the unit tests' builder to this build.
+        fn waiting_line() -> String {
+            format!(
+                "gate: waiting for the pending gate push to bring the builder {} to gate {}",
+                crate::test_support::HOST.alias,
+                build_version()
+            )
+        }
+
+        /// How many of `notes` are `line`.
+        fn said(notes: &[String], line: &str) -> usize {
+            notes.iter().filter(|note| *note == line).count()
+        }
+
+        /// The line a run says as it stops waiting for the push for `why`.
+        fn stopped_line(why: &str) -> String {
+            format!("gate: stopped waiting for the builder {}: {why}", crate::test_support::HOST.alias)
+        }
+
+        #[test]
+        fn a_version_refusal_with_a_fresh_marker_of_this_build_waits_and_runs_once_the_poll_passes() {
+            let pushed = pushed(
+                "push-wait-passes",
+                Start::mine(),
+                (vec![ran()], vec![(RemoteOutcome::default(), Then::Nothing)]),
+            );
+
+            assert!(pushed.all_called, "the poll, then the builder called again");
+            let behind = pushed.behind.expect("no Ctrl+C");
+            assert_eq!(behind.outcome.fallback(), None, "the call after the poll is the outcome");
+            assert!(behind.admitted.is_some(), "the builder admitted the run at that call");
+            assert!(pushed.run_called, "the call after the wait began its run call, so the builder is listed");
+            assert_eq!(said(&pushed.notes, &waiting_line()), 1, "{:?}", pushed.notes);
+            assert_eq!(pushed.waited, Duration::ZERO, "the push wait counts into no remote budget");
+        }
+
+        #[test]
+        fn a_version_refusal_with_no_build_waits_for_the_push_too() {
+            // A builder whose gate.exe is missing for a moment while it is pushed answers with no gate box: a version
+            // refusal that names no build.
+            let start = Start {
+                first: refused(FallbackReason::Version),
+                ..Start::mine()
+            };
+            let pushed = pushed(
+                "push-wait-no-box-first",
+                start,
+                (vec![ran()], vec![(RemoteOutcome::default(), Then::Nothing)]),
+            );
+
+            assert!(pushed.all_called, "the run waited, polled and called the builder again");
+            assert_eq!(pushed.behind.expect("no Ctrl+C").outcome.fallback(), None);
+            assert_eq!(said(&pushed.notes, &waiting_line()), 1, "{:?}", pushed.notes);
+        }
+
+        #[test]
+        fn a_version_poll_keeps_the_push_wait() {
+            let pushed = pushed(
+                "push-wait-version-poll",
+                Start::mine(),
+                (
+                    vec![ran()],
+                    vec![
+                        (version_refused("0.0.0-other"), Then::Nothing),
+                        (refused(FallbackReason::Version), Then::Nothing),
+                        (RemoteOutcome::default(), Then::Nothing),
+                    ],
+                ),
+            );
+
+            assert!(pushed.all_called, "every version poll kept the wait, the passing one ended it");
+            let behind = pushed.behind.expect("no Ctrl+C");
+            assert_eq!(behind.outcome.fallback(), None);
+            assert_eq!(said(&pushed.notes, &waiting_line()), 1, "one wait: {:?}", pushed.notes);
+        }
+
+        #[test]
+        fn a_draining_poll_during_the_push_wait_waits_behind_the_drain() {
+            let pushed = pushed(
+                "push-wait-drain",
+                Start::mine(),
+                (
+                    vec![ran()],
+                    vec![(drained(false), Then::Nothing), (RemoteOutcome::default(), Then::Nothing)],
+                ),
+            );
+
+            assert!(pushed.all_called, "the drain's poll, then its own poll and the call");
+            let behind = pushed.behind.expect("no Ctrl+C");
+            assert_eq!(behind.outcome.fallback(), None);
+            assert!(
+                pushed.notes.iter().any(|note| note.starts_with("gate: waiting behind the builder drain")),
+                "{:?}",
+                pushed.notes
+            );
+        }
+
+        #[test]
+        fn a_full_poll_during_the_push_wait_calls_the_builder_again() {
+            let pushed = pushed("push-wait-full", Start::mine(), (vec![ran()], vec![(full(false), Then::Nothing)]));
+
+            assert!(pushed.all_called, "the full poll ends the push wait and the builder is called again");
+            assert_eq!(pushed.behind.expect("no Ctrl+C").outcome.fallback(), None);
+        }
+
+        #[test]
+        fn an_unreachable_or_other_refused_poll_calls_the_builder_again() {
+            for reason in [FallbackReason::Unreachable, FallbackReason::Busy, FallbackReason::Tools] {
+                let pushed = pushed(
+                    &format!("push-wait-other-{reason:?}"),
+                    Start::mine(),
+                    (vec![refused(reason)], vec![(refused(reason), Then::Nothing)]),
+                );
+
+                assert!(pushed.all_called, "{reason:?}: the poll ends the wait and the builder is called again");
+                let behind = pushed.behind.expect("no Ctrl+C");
+                assert_eq!(behind.outcome.fallback(), Some(reason), "the call's own refusal is the outcome");
+            }
+            // A poll whose call ended with a status and no reason is never the outcome either.
+            let status = RemoteOutcome {
+                status: 1,
+                ..RemoteOutcome::default()
+            };
+            let pushed = pushed("push-wait-status-poll", Start::mine(), (vec![ran()], vec![(status, Then::Nothing)]));
+            assert!(pushed.all_called);
+            assert_eq!(
+                pushed.behind.expect("no Ctrl+C").outcome.status,
+                0,
+                "the call after the poll is the outcome"
+            );
+        }
+
+        #[test]
+        fn a_marker_gone_mid_wait_calls_the_builder_once_more_and_goes_on_with_that_refusal() {
+            let pushed = pushed(
+                "push-wait-gone",
+                Start::mine(),
+                (vec![version_refused("0.0.0-again")], vec![(version_refused("0.0.0-other"), Then::Remove)]),
+            );
+
+            assert!(pushed.all_called, "one poll, then the builder called once more");
+            let behind = pushed.behind.expect("no Ctrl+C");
+            assert_eq!(
+                behind.outcome.other_build.as_deref(),
+                Some("0.0.0-again"),
+                "the refusal of the call after the wait goes on, not the first"
+            );
+            assert_eq!(
+                said(&pushed.notes, &stopped_line("the push is no longer pending")),
+                1,
+                "{:?}",
+                pushed.notes
+            );
+            assert_eq!(said(&pushed.notes, &waiting_line()), 1, "no second wait: {:?}", pushed.notes);
+        }
+
+        #[test]
+        fn a_marker_of_another_build_or_stale_mid_wait_calls_the_builder_once_more() {
+            for (name, then, why) in [
+                ("other", Then::Write("0.0.0-later\n"), "a later install is pending, gate 0.0.0-later"),
+                ("stale", Then::Age, "the pending push is over 10 minutes old"),
+            ] {
+                let pushed = pushed(
+                    &format!("push-wait-{name}"),
+                    Start::mine(),
+                    (vec![version_refused("0.0.0-again")], vec![(version_refused("0.0.0-other"), then)]),
+                );
+
+                assert!(pushed.all_called, "{name}");
+                let behind = pushed.behind.expect("no Ctrl+C");
+                assert_eq!(behind.outcome.other_build.as_deref(), Some("0.0.0-again"), "{name}");
+                assert_eq!(said(&pushed.notes, &stopped_line(why)), 1, "{name}: {:?}", pushed.notes);
+            }
+        }
+
+        #[test]
+        fn a_marker_that_cannot_be_read_mid_wait_stops_it_and_says_so_to_the_log_once() {
+            // The marker turns malformed after the first poll: the wait stops, the builder is called once more, and its
+            // version refusal is judged against the same unreadable marker, said only the first time.
+            let pushed = pushed(
+                "push-wait-unreadable",
+                Start::mine(),
+                (
+                    vec![version_refused("0.0.0-again")],
+                    vec![(version_refused("0.0.0-other"), Then::Write("two\nlines\n"))],
+                ),
+            );
+
+            assert!(pushed.all_called);
+            let behind = pushed.behind.expect("no Ctrl+C");
+            assert_eq!(behind.outcome.other_build.as_deref(), Some("0.0.0-again"));
+            assert_eq!(
+                said(&pushed.notes, &stopped_line("the push-pending marker cannot be read")),
+                1,
+                "{:?}",
+                pushed.notes
+            );
+            let line = format!("gate: the push-pending marker {} is malformed", pushed.marker.display());
+            assert_eq!(said(&pushed.notes, &line), 1, "said once for the wait: {:?}", pushed.notes);
+        }
+
+        #[test]
+        fn a_ctrl_c_during_the_push_wait_ends_it() {
+            // The Ctrl+C comes during a poll that passed: only the check after the poll keeps the run from calling the
+            // builder again, which this client has no answer for.
+            let pushed = pushed(
+                "push-wait-ctrl-c",
+                Start::mine(),
+                (Vec::new(), vec![(RemoteOutcome::default(), Then::Raise)]),
+            );
+
+            assert!(pushed.all_called);
+            assert!(pushed.behind.is_none(), "the Ctrl+C ends the wait");
+        }
+
+        #[test]
+        fn a_ctrl_c_raised_before_the_refusal_takes_no_push_wait() {
+            let start = Start {
+                raised: true,
+                ..Start::mine()
+            };
+
+            let pushed = pushed("push-wait-raised-before", start, (Vec::new(), Vec::new()));
+
+            let behind = pushed.behind.expect("the refusal is the outcome, as with no wait");
+            assert_eq!(behind.outcome.other_build.as_deref(), Some("0.0.0-first"));
+            assert_eq!(said(&pushed.notes, &waiting_line()), 0, "{:?}", pushed.notes);
+        }
+
+        #[test]
+        fn a_version_refusal_after_the_push_wait_admitted_waits_again_under_the_same_deadline() {
+            let pushed = pushed(
+                "push-wait-again",
+                Start::mine(),
+                (
+                    vec![version_refused("0.0.0-back"), ran()],
+                    vec![(RemoteOutcome::default(), Then::Nothing), (RemoteOutcome::default(), Then::Nothing)],
+                ),
+            );
+
+            assert!(pushed.all_called, "two waits, each ended by a poll and a call");
+            assert_eq!(pushed.behind.expect("no Ctrl+C").outcome.fallback(), None);
+            assert_eq!(said(&pushed.notes, &waiting_line()), 2, "{:?}", pushed.notes);
+
+            // The same marker seen again keeps the deadline it was given when first seen, and is no longer the run's
+            // once that deadline passed, however fresh its last write says it is.
+            let scratch = Scratch::new("push-wait-deadline");
+            let mut watch = PushWatch::new(scratch.path().join("push-pending"));
+            let wall = SystemTime::now();
+            let marker = installed::PushPending {
+                version: build_version(),
+                written: wall - Duration::from_mins(1),
+            };
+            let first = Instant::now();
+            let mut console = Console::new();
+            assert_eq!(watch.judge(Ok(Some(marker.clone())), (wall, first), &mut console), Pending::Mine);
+            let deadline = watch.deadline().expect("a deadline");
+            assert_eq!(deadline, first + Duration::from_mins(9), "the life left at first sight");
+            let later = first + Duration::from_secs(30);
+            assert_eq!(watch.judge(Ok(Some(marker.clone())), (wall, later), &mut console), Pending::Mine);
+            assert_eq!(watch.deadline(), Some(deadline), "the same identity keeps its deadline");
+            assert_eq!(
+                watch.judge(Ok(Some(marker.clone())), (wall, deadline), &mut console),
+                Pending::NotMine(NotMine::Stale),
+                "past its deadline, the wall clock aside"
+            );
+            let rewritten = installed::PushPending { written: wall, ..marker };
+            assert_eq!(watch.judge(Ok(Some(rewritten)), (wall, deadline), &mut console), Pending::Mine);
+            assert_eq!(
+                watch.deadline(),
+                Some(deadline + Duration::from_mins(10)),
+                "a rewrite is a new identity with a new deadline"
+            );
+        }
+
+        #[test]
+        fn a_push_wait_sleeps_a_poll_but_never_past_the_marker_s_deadline() {
+            let now = Instant::now();
+            let poll = Duration::from_secs(5);
+
+            assert_eq!(nap(poll, None, now), poll, "no deadline seen yet");
+            assert_eq!(nap(poll, Some(now + Duration::from_mins(1)), now), poll, "a deadline far off");
+            assert_eq!(
+                nap(poll, Some(now + Duration::from_secs(2)), now),
+                Duration::from_secs(2),
+                "cut short at the deadline"
+            );
+            assert_eq!(nap(poll, Some(now), now), Duration::ZERO, "the deadline is now");
+            assert_eq!(nap(poll, Some(now), now + Duration::from_secs(1)), Duration::ZERO, "the deadline passed");
+        }
+
+        #[test]
+        fn no_marker_or_a_stale_or_other_build_marker_takes_no_push_wait() {
+            for (name, marker, written) in [
+                ("none", None, None),
+                ("stale", Some(mine()), Some(SystemTime::now() - Duration::from_mins(11))),
+                ("other", Some("0.0.0-later\n".to_owned()), None),
+                ("malformed", Some("two\nlines\n".to_owned()), None),
+            ] {
+                let start = Start {
+                    marker,
+                    written,
+                    ..Start::mine()
+                };
+
+                let pushed = pushed(&format!("push-wait-none-{name}"), start, (Vec::new(), Vec::new()));
+
+                assert!(pushed.all_called, "{name}");
+                let behind = pushed.behind.expect("no Ctrl+C");
+                assert_eq!(
+                    behind.outcome.other_build.as_deref(),
+                    Some("0.0.0-first"),
+                    "{name}: the first refusal goes on"
+                );
+                assert!(behind.admitted.is_none(), "{name}");
+                assert_eq!(said(&pushed.notes, &waiting_line()), 0, "{name}: {:?}", pushed.notes);
+                if name == "malformed" {
+                    let line = format!("gate: the push-pending marker {} is malformed", pushed.marker.display());
+                    assert_eq!(said(&pushed.notes, &line), 1, "said to the log once: {:?}", pushed.notes);
+                }
+            }
+        }
+
+        #[test]
+        fn a_run_with_no_pending_path_takes_no_push_wait() {
+            let start = Start {
+                waits: false,
+                ..Start::mine()
+            };
+
+            let pushed = pushed("push-wait-no-path", start, (Vec::new(), Vec::new()));
+
+            let behind = pushed.behind.expect("no Ctrl+C");
+            assert_eq!(behind.outcome.other_build.as_deref(), Some("0.0.0-first"), "the refusal goes on as today");
+            assert_eq!(said(&pushed.notes, &waiting_line()), 0, "{:?}", pushed.notes);
+        }
+
+        #[test]
+        fn only_a_plain_routed_run_may_wait_for_a_push() {
+            assert!(may_wait_for_push(false, false), "a plain routed run");
+            assert!(!may_wait_for_push(true, false), "a commit's stage");
+            assert!(!may_wait_for_push(false, true), "a rerouted held-back run");
         }
     }
 

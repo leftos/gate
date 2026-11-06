@@ -9,7 +9,8 @@
 //! one line to `<steps file>.lines`, and acts on the step of its call: the first call takes the first step, a file
 //! without an `on {alias}` line counted by that log as a whole. An `on {alias}` line starts a block of steps that answer
 //! only calls to that host, numbered by that host's own lines of `<steps file>.lines`; the steps before the first `on`
-//! line answer the hosts with no block, numbered the same way; an alias has one block at most. A line that holds none of
+//! line answer the hosts with no block, numbered the same way; an alias has one block at most. A block's last step may
+//! be `repeat <step>`, which answers its own call and every later call of that block as `<step>`. A line that holds none of
 //! these, as git's `-G` probe of which ssh it runs, fails with no step taken. Started with `--version` alone, as a push
 //! case starts a copy of it standing in for a builder's old gate, it says `gate 0.0.0-old`, or `gate <v>` when the
 //! variable `GATE_FAKE_SSH_VERSION` holds `<v>`, and exits 0;
@@ -119,6 +120,8 @@ const NO_CARGO: &str = "GATE_FAKE_NO_CARGO";
 /// The variable naming the mode bits the stand-in `stat` answers macOS's `stat -f %Lp` with; `700` when unset, as Git
 /// for Windows lists every folder `drwxr-xr-x` whatever its mode.
 const ROOT_MODE: &str = "GATE_FAKE_ROOT_MODE";
+/// What starts a last step that answers every call from its own on: `repeat <step>`.
+const REPEAT: &str = "repeat ";
 /// The variable naming the root the routing file gives the macOS builders.
 const UNIX_ROOT_VARIABLE: &str = "GATE_FAKE_SSH_UNIX_ROOT";
 /// The stand-in `lockf`: busy when `GATE_FAKE_LOCKF` is `busy`, else it takes the words the script gives and locks
@@ -470,13 +473,15 @@ impl<'a> Blocks<'a> {
         !self.named.is_empty()
     }
 
-    /// The step numbered `index` of a call to `host`: its own block's, else the steps before the first `on` line.
+    /// The step numbered `index` of a call to `host`: its own block's, else the steps before the first `on` line. A
+    /// last step `repeat <step>` answers its call and every later one with `<step>`.
     fn step(&self, host: &str, index: usize) -> Option<&'a str> {
         let steps = match self.named.iter().find(|(alias, _)| *alias == host) {
             Some((_, steps)) => steps,
             None => &self.shared,
         };
-        steps.get(index).copied()
+        let found = steps.get(index).or_else(|| steps.last().filter(|last| last.starts_with(REPEAT)))?;
+        Some(found.strip_prefix(REPEAT).unwrap_or(found))
     }
 }
 

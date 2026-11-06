@@ -255,6 +255,8 @@ A note on stderr never fails the push: `push: <host>: no slot count written: <wh
 
 `push: <host>: could not stop the version read of <path>: <message>` says a version read past its bound could not be killed (the read still gives no version).
 
+Last of all, after the prune sweep, a push that got past reading the installed files (a partial failure included) clears the push-pending marker `tools/install.ps1` wrote ([Install](#install)), under this PC's `push.lock` (tried again for up to 10 s while an install holds it). A marker naming the version this push sent is removed, saying nothing. A marker naming another build stays, with `push: left the push-pending marker for gate <v>: this push sent gate <raw_version>` on stderr; one that cannot be read, removed or locked for is left with `push: could not clear the push-pending marker: <why>; it expires within 10 minutes`. The push's exit never changes for it, and a push refused before any builder (the refusals above) leaves the marker.
+
 After the builder's other stdout lines, a push that ends with `gate.exe` missing or one it could not verify left in place, and with aside copies in the folder, says `push: <host>: kept <n> aside copies: gate.exe is not verified` on stdout, `<n>` counting every `gate.exe.*.old` present, this push's own included. It is never a failure by itself: an exe identical to the installed one that does not answer `--version` still says `already installed` and exits 0, with this line after it.
 
 A failure reason is one of: `timed out after <n> s`, `no answer`, ssh's last stderr line, `cannot feed the call: <error>`, or the builder script's own.
@@ -2537,6 +2539,14 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   Nothing is handed over, and the run takes the `version` fallback silently, for a commit stage, a rerouted held-back run, a gate that was itself handed over (`GATE_HANDED_OVER` set, so a run is handed over once), after a Ctrl+C, and when the installed gate is missing, unreadable, of this gate's own build or unlike the builder's. The installed gate's `--version` is read last, once every other check passed, with the 30 s bound `gate push` gives it (`installed.rs`, which `push` shares).
 
+  **A pending gate push.** A routed run between a reinstall and its `gate push` finds the builder on the old build, so it is refused `version` (with a build, with none, or with no gate box at all while the push replaces gate.exe). While the push-pending marker `tools/install.ps1` wrote ([Install](#install)) names this gate's own build and is fresh, the run waits and checks again instead of falling back. Fresh is a last-write time under 10 minutes old and no more than 5 s ahead of now, plus a monotonic deadline kept per marker (a marker of a new identity, its version and last write, gets one), so 10 minutes is also the longest a run waits when no push follows.
+
+  The run says once `gate: waiting for the pending gate push to bring the builder <alias> to gate <own>` and every heartbeat `gate: still waiting for the pending gate push to bring the builder <alias> to gate <own> (<n> s)`, polling the builder's preflight alone every drain poll, as the wait behind a builder drain does ([Builder drain](#routing)). A poll that is no version refusal ends the wait and calls the builder again; a poll the drain refuses sends the run to wait behind the drain.
+
+  The wait also ends when the marker stops being fresh and this build's, saying `gate: stopped waiting for the builder <alias>: <why>`, `<why>` being `the push is no longer pending`, `a later install is pending, gate <v>`, `the pending push is over 10 minutes old` or `the push-pending marker cannot be read`; the builder is then called once more and the run goes on with that outcome: a handover, a fallback or a run there. A marker that cannot be read or is malformed is noted to the log once per wait.
+
+  The wait keeps the run's work-folder key and remote slot, holds a drain marker as the drain wait does (so other runs' remote-slot and key waits are held off), and adds nothing to the remote budget. A commit's pre-commit stage and a rerouted held-back run never wait, and a stale PC gate (its own build differs from the marker's) never waits, so the stale-gate handover above is unchanged.
+
   `GATE_HANDED_OVER` is removed from every command's environment and is among the names a caller's `--env` may not set.
 
   **Words sent to a `macos` builder.** Beyond the recognised spans, a relative word written with `\` (`src\Duel.sln`, `-p:Props=src\a.props`, an MSBuild `/p:Name=value` switch's value) is sent with `/` when it names something the snapshot carries: a file `git --literal-pathspecs ls-files -z --cached --others --exclude-standard` lists (limited to the gate's folder when it is below the root), or a folder holding one, compared in its exact letter case.
@@ -3152,7 +3162,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     An older box never says the line, so its refusal stays `preparing ... failed (status 1)`, and an older PC gate fails such a run with status 1 rather than falling back.
 
-    Any other non-zero status says `gate: preparing <builder root> on <host> failed (status <n>)` and ends the run with that status. A reported version text other than this PC's whole one, build id included, says `gate: not routed: <host> runs gate <theirs|unknown>, this PC <ours>; run gate push` and falls back `version`; the builder's version is its first 4 KiB, escaped.
+    Any other non-zero status says `gate: preparing <builder root> on <host> failed (status <n>)` and ends the run with that status. A reported version text other than this PC's whole one, build id included, says `gate: not routed: <host> runs gate <theirs|unknown>, this PC <ours>; run gate push` and falls back `version`, unless a fresh push-pending marker names this gate's own build, when the run waits for the push instead (A pending gate push, under [Routing](#routing)); the builder's version is its first 4 KiB, escaped.
 
     The client also reads the preflight's `gate: remote warm <none|64 lower-case hex>` line, only the line right after the last `gate: remote version` line: anything else there, no such line, or a warm line elsewhere reads as no warmth.
 
@@ -3481,7 +3491,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     While it waits the run holds a drain marker, `remote\drain\<builder>\<pid>-<session>` ([Files](#files)), open sharing nothing for the whole wait. While a live marker stands, other waits on this PC end in no fallback: the remote-slot wait for that builder's pool goes on past its 60 s, and the waits for a work folder's key (a routed run's, and the nothing-back record's) go on past 90 s for a marker of any builder, since the key is the worktree's on every builder.
 
-    A key wait held past its bound says once `gate: still waiting for the worktree's key past its bound: a routed run waits behind a builder drain`.
+    A key wait held past its bound says once `gate: still waiting for the worktree's key past its bound: a routed run waits on a builder (its drain or a pending gate push)`; a run that waits for a pending gate push holds the same marker ([A pending gate push](#routing)).
 
     A wait whose limit is zero is never held off, and a warm-up's own key wait keeps its bound and ends busy. A marker that cannot be held says `gate: cannot hold a drain marker in <folder>: <error>; the run waits without one`, and the run keeps waiting.
 
@@ -5944,6 +5954,9 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
   `-Source <folder>` (the suite's; given only with `-Exe`, else `install: -Source is given only with -Exe`) names the work tree the record describes in place of the script's own. It must be the root of a git work tree (a junction to one or a trailing separator is accepted); a subfolder or a non-repo is refused with `install: -Source <folder> is not a git work tree`, a repo with no commits with `install: -Source <folder> has no commits yet`, each exit 1 with nothing changed.
 
   `-WhatIf` lists `What if: Performing the operation "Write" on target "<bin>\source.json".`, or `"Delete"` when the files are already installed and the installed gate does not answer, and writes and deletes nothing. The script sets `$PSNativeCommandUseErrorActionPreference = $false`, so a caller profile's `$true` does not turn git's exit 1 into a throw.
+- An install that changed gate.exe or the helper, and whose gate answered `--version`, writes the push-pending marker `%LOCALAPPDATA%\gate\bin\push-pending` ([Push-pending marker](GLOSSARY.md)): the installed gate's whole version text and one LF, UTF-8 without a byte order mark. An install of the same files writes none.
+
+  It goes through a temp file `push-pending.<pid>.tmp` and a move, a leftover temp of that name from a killed run being removed first and the move tried again a few times; the source.json temp is swept the same way (`Remove-LeftoverTemp -Pattern`). A write that fails leaves the install as it was, exit 0, and prints `install: could not write the push-pending marker <path>: <message>; routed runs fall back until gate push ends`. `-WhatIf` lists `Write push-pending marker` for an install that changes the files and none for files already in place. The marker is what a routed run of this build waits on and `gate push` clears ([`gate push`](#gate-push), [Routing](#routing), A pending gate push).
 - Every install deletes a leftover `remote-bridge.ps1` file in the install folder, which no gate starts. When it cannot, it prints `install: cannot remove the old remote-bridge.ps1 (<reason>); it is unused` on stderr and carries on with exit 0; a folder at that name is left alone.
 - The script installs locally only. `gate push` copies the installed gate.exe and the desktop helper to each builder in `remote.json` (`host`, then `hosts`), into the builder's `C:\Program Files\gate\bin` with the same rename-aside, and registers the desktop task there on every push, so a machine with builders runs `pwsh tools/install.ps1` and then `gate push` ([`gate push`](#gate-push)).
 
@@ -6269,7 +6282,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   Its steps are `ok`, `hold`, `version`, `boot <time>` (as `version`, for the box's boot line), `no-boot` (drops the box's boot line), `drop` (exits 255 at once, writing nothing), `exit`, `fail-banner`, `fail-other`, `out-then-drop`, `fail-host <host>` (writes `ssh: connect to host <host> port 22: Connection refused` and exits 255).
 
-  An `on {alias}` line starts a block of steps that answer only calls to that host, numbered by that host's own calls; the steps before the first `on` line answer the hosts with no block, and a file with no `on` line keeps one order for every call.
+  An `on {alias}` line starts a block of steps that answer only calls to that host, numbered by that host's own calls; the steps before the first `on` line answer the hosts with no block, and a file with no `on` line keeps one order for every call. A block's last step may be `repeat <step>`, which answers its own call and every later call of that block as `<step>`.
   An `on` with no alias, with more than one alias, or for an alias that already has a block is refused with its line number: `line N: on takes a builder's alias`, `line N: on takes one builder's alias, got '<a b>'`, `line N: <alias> already has its own steps`.
 
   They also include `ok-then-out <line>` (as `ok`, then writes the line on stdout), `say-exit <n> <line>` (writes the line on stderr and exits `<n>`, as a call that fails with a line of its own does).

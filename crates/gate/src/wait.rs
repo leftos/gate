@@ -29,7 +29,8 @@ use crate::slots::{self, BesideTry, BuilderPool, Pool, Survey, Taken, ThisGate};
 const POLL: Duration = Duration::from_secs(2);
 /// How often a waiter says it still waits, a routed run's wait for its work folder's key among them.
 pub(crate) const HEARTBEAT: Duration = Duration::from_secs(30);
-/// How often a routed run waiting behind the builder drain polls the builder's preflight.
+/// How often a routed run waiting behind the builder drain, for a slot there or for a pending gate push polls the
+/// builder's preflight.
 pub(crate) const DRAIN_POLL: Duration = Duration::from_secs(5);
 /// The longest a waiter sleeps after a pass that found the beside mutex held by another gate: that gate wakes the
 /// waiters only once it took or lent something, so a pass that found no room for this reason alone looks again soon.
@@ -608,8 +609,8 @@ impl<'a> Wait<'a> {
     /// Whether this pass ended the wait, and how. The console is read first, so a Ctrl+C raised by this pass's own
     /// still-waiting line is the interrupt, and never a remote pool read as full at the wait's limit. A pass past a
     /// limit above zero that finds a live drain marker of the pool's builder, or of any builder a several-pool wait
-    /// lists ([`drain::marker_stands`]), ends nothing: a run waiting behind that builder's drain holds a slot, and this
-    /// wait goes on without its limit while the marker stands. A wait whose limit is zero never waits, marker or not.
+    /// lists ([`drain::marker_stands`]), ends nothing: a run waiting behind that builder's drain, or for a pending gate
+    /// push to reach it, holds a slot, and this wait goes on without its limit while the marker stands. A wait whose limit is zero never waits, marker or not.
     fn pass_ended(&mut self, console: &mut Console) -> Option<Waited> {
         if self.waiter.interrupted() {
             return Some(Waited::Interrupted);

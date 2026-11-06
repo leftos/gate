@@ -266,7 +266,7 @@ The Mac's `root` in `remote.json` is that same absolute work root.
    Later changes to a repo's pattern lists need no hand edit: `gate remote add|remove <section> <repo> <pattern>...` changes one list, keeps the rest of the file as it is and backs the file up first ([design.md, `gate remote`](design.md#gate-remote)).
 2. Run `gate push`. It copies the installed `gate.exe` and desktop helper to each Windows builder, into `C:\Program Files\gate\bin` (so the builder's ssh session must be an administrator's), registers the desktop task there and writes the builder's slot count, one `push: <host>: ...` line at a time. A Mac builds its [box](GLOSSARY.md), the program that runs routed work there, from the commit the install recorded, so install from a clean tree first.
 
-   Run `gate push` again after every reinstall on this PC: a builder that runs another build of gate refuses routed runs, which then go to the next builder or run here.
+   Run `gate push` again after every reinstall on this PC: a builder that runs another build of gate refuses routed runs, which then go to the next builder or run here. Between the reinstall and the push, a routed run of the new build waits for the push (`gate: waiting for the pending gate push to bring the builder <alias> to gate <build>`) for up to 10 minutes, then falls back.
 3. Run `gate check --builder {builder}` from a repo. It runs the builder's preflight once and prints `check: {builder}: ...` lines and `install: {builder}: ...` hints, like `gate check` does for this PC. It exits 1 when the builder lacks something, cannot be reached, runs another gate build, or `remote.json` is missing or unusable.
 
 ### Route a repo
@@ -296,7 +296,7 @@ A new worktree's first routed run meets a cold work folder, and gate raises its 
 | `gate: TIMED OUT ...` | The command ran past its ceiling. Raise `--timeout`, or give `--timeout auto:<seconds>`. |
 | `gate: refused: the script that started this gate lost its caller (...)` | The shell running a background script was killed, and gate refuses the script's later steps. Start the script again from a live shell. |
 | `gate: ignored <path>: <reason>; running locally` | `remote.json` cannot be used, so nothing routes. Fix what the reason names. |
-| `gate: remote <host> version; running here` | The builder runs another gate build. Run `gate push`. |
+| `gate: remote <host> version; running here` | The builder runs another gate build. Run `gate push`. A run that started after a reinstall waits for the push first (`gate: waiting for the pending gate push ...`) and falls back only when none comes within 10 minutes. |
 | `gate: remote <host> unreachable; running here` | ssh to the builder failed. Check that `ssh {builder}` logs in without a prompt. |
 | `gate: the snapshot push to <host> failed; running here` | The builder answered but the push of the snapshot failed for a reason other than the connection; the push's own lines above say why. With `(a partial clone lacks objects the push needs; git backfill fetches them)`, run `git backfill` in the repo. |
 | `push: no installed gate at <path>; run tools/install.ps1` | Install gate on this PC before pushing it. |

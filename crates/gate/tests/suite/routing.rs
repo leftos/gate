@@ -3491,9 +3491,9 @@ fn a_local_build_s_wait_for_a_held_key_ends_at_its_bound_with_a_drain_marker_sta
     // A wait the marker holds off says so and goes on waiting: either line ends the case's wait.
     build.wait_until("the wait for the key ending or being held off", || {
         fs::read_to_string(case.folder().join("build.log"))
-            .is_ok_and(|text| text.contains("without the work folder's key") || text.contains("behind a builder drain"))
+            .is_ok_and(|text| text.contains("without the work folder's key") || text.contains(KEY_HELD_OFF))
     });
-    let held_off = fs::read_to_string(case.folder().join("build.log")).is_ok_and(|text| text.contains("behind a builder drain"));
+    let held_off = fs::read_to_string(case.folder().join("build.log")).is_ok_and(|text| text.contains(KEY_HELD_OFF));
     drop(held);
     drop(standing);
     let build = build.finish();
@@ -3509,7 +3509,7 @@ fn a_local_build_s_wait_for_a_held_key_ends_at_its_bound_with_a_drain_marker_sta
             .any(|line| line.contains("gate: removed ") && line.ends_with("outputs-from without the work folder's key: held for 300 ms")),
         "{logged}"
     );
-    assert!(!logged.contains("behind a builder drain"), "{logged}");
+    assert!(!logged.contains(KEY_HELD_OFF), "{logged}");
     assert!(!build.stderr.contains(KEY_WAIT_TO_REMOVE), "said in the log only: {build:?}");
     assert!(!outputs_from.exists(), "{build:?}");
 }
@@ -6088,7 +6088,8 @@ fn a_drain_wait_is_left_out_of_the_release_s_held_and_wall_seconds_and_the_durat
 }
 
 /// What a run whose key wait passed its bound says once a drain marker holds that bound off.
-const KEY_HELD_OFF: &str = "gate: still waiting for the worktree's key past its bound: a routed run waits behind a builder drain";
+const KEY_HELD_OFF: &str =
+    "gate: still waiting for the worktree's key past its bound: a routed run waits on a builder (its drain or a pending gate push)";
 
 #[test]
 fn a_held_off_remote_wait_takes_its_limit_again_once_the_marker_is_gone() {
@@ -6184,7 +6185,7 @@ fn a_finished_run_s_wait_to_add_to_nothing_back_ends_at_its_bound_with_a_drain_m
         "{build:?}"
     );
     assert!(!build.stderr.contains(KEY_HELD_OFF), "{build:?}");
-    assert!(!log_text(&case, "build.log").contains("behind a builder drain"), "{build:?}");
+    assert!(!log_text(&case, "build.log").contains(KEY_HELD_OFF), "{build:?}");
     assert_eq!(nothing_back(&case).as_deref(), Some(RELEASE_RECORD), "the add was missed: {build:?}");
 }
 

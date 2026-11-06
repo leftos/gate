@@ -327,17 +327,18 @@ function Remove-SourceJson {
     return $true
 }
 
-# Removes the source.json temps in $Dir that a run killed between its write and its rename left behind, so no earlier
-# run's record is read back instead of this one's and the folder never holds more than the one this run writes. Each is
-# tried on its own: one that cannot be removed is noted at verbose and the rest still go.
-function Remove-LeftoverSourceTemp {
-    param([string]$Dir)
+# Removes the temps matching $Pattern in $Dir that a run killed between its write and its rename left behind (the
+# source.json record's, source.json.*.tmp, or the push-pending marker's, push-pending.*.tmp), so no earlier run's file is
+# read back instead of this one's and the folder never holds more than the one this run writes. Each is tried on its
+# own: one that cannot be removed is noted at verbose and the rest still go.
+function Remove-LeftoverTemp {
+    param([string]$Dir, [Parameter(Mandatory)][string]$Pattern)
 
     try {
-        $leftovers = [IO.Directory]::GetFiles($Dir, 'source.json.*.tmp')
+        $leftovers = [IO.Directory]::GetFiles($Dir, $Pattern)
     }
     catch {
-        Write-Verbose "The leftover record temps in ${Dir} could not be listed: $($_.Exception.Message)"
+        Write-Verbose "The leftover temps $Pattern in ${Dir} could not be listed: $($_.Exception.Message)"
         return
     }
     foreach ($leftover in $leftovers) {
@@ -345,9 +346,54 @@ function Remove-LeftoverSourceTemp {
             [IO.File]::Delete($leftover)
         }
         catch {
-            Write-Verbose "A leftover record temp, ${leftover}, could not be removed: $($_.Exception.Message)"
+            Write-Verbose "A leftover temp, ${leftover}, could not be removed: $($_.Exception.Message)"
         }
     }
+}
+
+# Records beside the installed gate that a gate push is pending, in push-pending: the whole version text of the gate
+# just installed and one LF, UTF-8 without a byte-order mark, which a routed run of that build reads to wait for the
+# builders to be pushed instead of falling back, and gate push removes once it has sent that build. It is written as
+# push-pending.<pid>.tmp and renamed over push-pending, so a reader never sees half a marker; the rename is tried again a
+# few times, since a reader may hold the marker for a moment. A marker that cannot be written says one line and the
+# install goes on: with no marker, routed runs fall back as they did before it.
+function Set-PushPending {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([string]$Dir, [string]$Version)
+
+    $path = Join-Path $Dir 'push-pending'
+    if (-not $PSCmdlet.ShouldProcess($path, 'Write push-pending marker')) { return }
+    Remove-LeftoverTemp -Dir $Dir -Pattern 'push-pending.*.tmp'
+    $temp = Join-Path $Dir "push-pending.$PID.tmp"
+    $failure = $null
+    try {
+        [IO.File]::WriteAllText($temp, "$Version`n", [Text.UTF8Encoding]::new($false))
+        for ($try = 1; ; $try++) {
+            try {
+                [IO.File]::Move($temp, $path, $true)
+                $failure = $null
+                break
+            }
+            catch [IO.IOException], [UnauthorizedAccessException] {
+                $failure = $_.Exception.Message
+                if ($try -ge 5) { break }
+                Start-Sleep -Milliseconds 100
+            }
+        }
+    }
+    catch {
+        $failure = $_.Exception.Message
+    }
+    if ($null -eq $failure) { return }
+    if (Test-Path -LiteralPath $temp) {
+        try {
+            [IO.File]::Delete($temp)
+        }
+        catch {
+            Write-Verbose "The push-pending temp, ${temp}, could not be removed: $($_.Exception.Message)"
+        }
+    }
+    Write-InstallError "install: could not write the push-pending marker ${path}: $failure; routed runs fall back until gate push ends"
 }
 
 # Records where the installed gate was built from beside it, in source.json, the one file gate push reads to know which
@@ -366,7 +412,7 @@ function Set-SourceJson {
         return Remove-SourceJson -Path $path -NotAnswering:$NotAnswering -WhatIf:$WhatIfPreference
     }
     if (-not $PSCmdlet.ShouldProcess($path, 'Write')) { return $true }
-    Remove-LeftoverSourceTemp -Dir $Dir
+    Remove-LeftoverTemp -Dir $Dir -Pattern 'source.json.*.tmp'
     $record = [ordered]@{
         repoRoot = $Root
         commit = $Commit
@@ -1274,6 +1320,9 @@ try {
             if ($null -ne $oldVersion) { Write-Output "install: replaced gate $oldVersion" }
             Write-Output "install: installed gate $newVersion at $dest$withHelper"
         }
+        # The gate or its helper changed, so the builders need a push: the marker says so until gate push ends. A gate
+        # that does not answer was put back above, which ends the install before this.
+        if ($answered) { Set-PushPending -Dir $installDir -Version $newVersion }
     }
 
     # The record gate push reads to know which commit the installed gate was built from, beside it, written only for an
@@ -1289,6 +1338,11 @@ try {
         # -Exe that does not answer stops it first, and a gate.exe placed that does not answer is put back). A real run
         # uses the answer its own path already read.
         $answering = if ($WhatIfPreference -and (-not $previewSame)) { $true } else { $answered }
+        # A preview of an install that changes the files lists the push-pending marker a real run writes; one of the
+        # files already in place lists none.
+        if ($WhatIfPreference -and (-not $previewSame)) {
+            Set-PushPending -Dir $installDir -Version $newVersion -WhatIf
+        }
         $keepSource = $answering -and ($null -ne $buildSource)
         $sourceCommit = if ($keepSource) { $buildSource.Commit } else { $null }
         $sourceBuildId = if ($keepSource) { $buildSource.BuildId } else { $null }

@@ -762,6 +762,114 @@ fn a_push_while_an_install_holds_the_local_lock_sends_nothing() {
     assert_eq!(calls(&steps), Vec::<String>::new(), "no builder was called");
 }
 
+/// The push-pending marker beside the case's installed gate, which `tools/install.ps1` writes and a push clears.
+fn push_pending(case: &Case) -> PathBuf {
+    installed_gate(case).with_file_name("push-pending")
+}
+
+/// Writes the case's push-pending marker naming `version`, as the install writes it.
+fn write_push_pending(case: &Case, version: &str) -> PathBuf {
+    let marker = push_pending(case);
+    fs::write(&marker, format!("{version}\n")).expect("the marker can be written");
+    marker
+}
+
+#[test]
+fn a_push_clears_the_push_pending_marker_of_its_build() {
+    let case = push_case("a_push_clears_the_push_pending_marker_of_its_build");
+    let marker = write_push_pending(&case, version());
+    let steps = steps(&case, &["ok"]);
+
+    let outcome = push(&case, &steps);
+
+    assert_installed(&case, &outcome);
+    assert!(!marker.exists(), "the marker of the build the push sent is gone: {outcome:?}");
+}
+
+#[test]
+fn a_push_keeps_a_push_pending_marker_of_another_build() {
+    let case = push_case("a_push_keeps_a_push_pending_marker_of_another_build");
+    let marker = write_push_pending(&case, "0.0.0-later");
+    let steps = steps(&case, &["ok"]);
+
+    let outcome = push(&case, &steps);
+
+    assert_eq!(outcome.code, Some(0), "the push's own status: {outcome:?}");
+    assert_eq!(unix(&outcome.stdout), installed_lines(HOST), "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        format!(
+            "push: left the push-pending marker for gate 0.0.0-later: this push sent gate {}\n",
+            version()
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(fs::read(&marker).expect("the marker is still there"), b"0.0.0-later\n", "{outcome:?}");
+}
+
+#[test]
+fn a_push_that_fails_a_builder_still_clears_the_push_pending_marker() {
+    let case = Case::new("a_push_that_fails_a_builder_still_clears_the_push_pending_marker");
+    install_gate(&case);
+    route(&case, &json!({ "host": HOST, "hosts": [OTHER_HOST], "repos": {} }));
+    let marker = write_push_pending(&case, version());
+    let steps = steps(&case, &["fail-other", "ok"]);
+
+    let outcome = push(&case, &steps);
+
+    assert_eq!(
+        outcome.code,
+        Some(1),
+        "the push still fails for the builder it could not reach: {outcome:?}"
+    );
+    assert_eq!(calls(&steps), ["push", "push"], "both builders were tried");
+    assert!(!marker.exists(), "a push that ended clears its build's marker: {outcome:?}");
+}
+
+#[test]
+fn a_push_pending_marker_that_cannot_be_read_is_said_and_keeps_the_push_s_status() {
+    let case = push_case("a_push_pending_marker_that_cannot_be_read_is_said_and_keeps_the_push_s_status");
+    // A folder where the marker goes: no file open can read it, and the push leaves it.
+    let marker = push_pending(&case);
+    fs::create_dir_all(&marker).expect("the folder at the marker's name can be made");
+    let steps = steps(&case, &["ok"]);
+
+    let outcome = push(&case, &steps);
+
+    assert_eq!(outcome.code, Some(0), "the push's own status: {outcome:?}");
+    assert_eq!(unix(&outcome.stdout), installed_lines(HOST), "{outcome:?}");
+    let stderr = unix(&outcome.stderr);
+    assert!(
+        stderr.starts_with(&format!(
+            "push: could not clear the push-pending marker: cannot read the push-pending marker {}: ",
+            marker.display()
+        )) && stderr.ends_with("; it expires within 10 minutes\n")
+            && stderr.lines().count() == 1,
+        "{outcome:?}"
+    );
+    assert!(marker.is_dir(), "the folder is left: {outcome:?}");
+}
+
+#[test]
+fn a_push_refused_before_any_builder_keeps_the_push_pending_marker() {
+    // No remote.json: a refusal that leaves push.lock free, so only the refusal itself can keep the marker.
+    let case = Case::new("a_push_refused_before_any_builder_keeps_the_push_pending_marker");
+    install_gate(&case);
+    let marker = write_push_pending(&case, version());
+    let steps = steps(&case, &["ok"]);
+
+    let outcome = push(&case, &steps);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(unix(&outcome.stderr).starts_with("push: no remote.json at "), "{outcome:?}");
+    assert_eq!(calls(&steps), Vec::<String>::new(), "no builder was called");
+    assert_eq!(
+        fs::read(&marker).expect("the marker is still there"),
+        format!("{}\n", version()).into_bytes(),
+        "a push that sent nothing leaves the marker: {outcome:?}"
+    );
+}
+
 /// A `push.lock` on this PC that is a second name of another file is refused as a link is, and nothing is sent.
 #[test]
 fn a_push_lock_that_is_a_hard_link_is_refused() {

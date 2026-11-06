@@ -42,7 +42,7 @@ use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATT
 
 use crate::answer::FAILED_STATUS;
 use crate::console::Console;
-use crate::installed::{VERSION_BOUND, installed_gate, local_version};
+use crate::installed::{self, VERSION_BOUND, installed_gate, local_version};
 use crate::prune_cmd;
 use crate::remote::git;
 use crate::remote::transport::ssh::{BUILDER_ROOT, Ssh, git_ssh_command};
@@ -724,7 +724,60 @@ pub(crate) fn push(request: &PushRequest, environment: &Environment, console: &m
         }
     }
     swept(&ssh, environment, console);
+    clear_push_pending(&prepared.bin, &prepared.raw_version, console);
     status
+}
+
+/// How often the push-pending marker's clear tries `push.lock` again while an install holds it, and for how long.
+const CLEAR_LOCK_RETRY: Duration = Duration::from_millis(200);
+const CLEAR_LOCK_BOUND: Duration = Duration::from_secs(10);
+
+/// Clears the push-pending marker in `bin` ([`installed::PUSH_PENDING_FILE`]) once a push of the gate `raw_version`
+/// ended, under `bin`'s `push.lock`, tried again every [`CLEAR_LOCK_RETRY`] for up to [`CLEAR_LOCK_BOUND`] while an
+/// install holds it: a marker naming that version goes, saying nothing; one naming another build, a later install's,
+/// stays, said; none is nothing. A marker that cannot be read or removed, or a lock never taken, is said and left to
+/// expire. The push's status is never changed by any of it.
+fn clear_push_pending(bin: &Path, raw_version: &str, console: &mut Console) {
+    let cleared = lock_to_clear(bin).and_then(|lock| {
+        let ended = cleared_under_lock(bin, raw_version, console);
+        drop(lock);
+        ended
+    });
+    if let Err(why) = cleared {
+        console.err(&format!(
+            "push: could not clear the push-pending marker: {why}; it expires within 10 minutes"
+        ));
+    }
+}
+
+/// `bin`'s `push.lock` for the push-pending marker's clear, tried again every [`CLEAR_LOCK_RETRY`] for up to
+/// [`CLEAR_LOCK_BOUND`] while an install holds it; else why it was not taken.
+fn lock_to_clear(bin: &Path) -> Result<File, String> {
+    let begun = std::time::Instant::now();
+    loop {
+        match local_lock(bin) {
+            Ok(lock) => return Ok(lock),
+            Err(Unlocked::Installing) if begun.elapsed() < CLEAR_LOCK_BOUND => thread::sleep(CLEAR_LOCK_RETRY),
+            Err(unlocked) => return Err(unlocked.why()),
+        }
+    }
+}
+
+/// The push-pending marker in `bin`, `push.lock` held: removed when it names `raw_version`, said and kept when it names
+/// another build, nothing when there is none; else why it could not be read or removed.
+fn cleared_under_lock(bin: &Path, raw_version: &str, console: &mut Console) -> Result<(), String> {
+    let path = bin.join(installed::PUSH_PENDING_FILE);
+    match installed::read_push_pending(&path)? {
+        None => Ok(()),
+        Some(marker) if marker.version == raw_version => fs::remove_file(&path).map_err(|error| format!("cannot remove {}: {error}", path.display())),
+        Some(other) => {
+            console.err(&format!(
+                "push: left the push-pending marker for gate {}: this push sent gate {raw_version}",
+                escaped(&other.version)
+            ));
+            Ok(())
+        }
+    }
 }
 
 /// Pushes `prepared` to the Windows builder `builder` through `ssh`, each call with `variables` as its environment and
@@ -796,6 +849,8 @@ struct Prepared {
     macs: Vec<Mac>,
     source: Option<Result<Source, String>>,
     config: Config,
+    /// The installed gate's folder, which holds `push.lock` and the push-pending marker.
+    bin: PathBuf,
 }
 
 impl Prepared {
@@ -889,7 +944,11 @@ fn prepared(
     } = builders(&gate.join("remote.json"))?;
     // The lock tools/install.ps1 holds while it replaces and checks the exe and the helper, held for their reads and the
     // version only; with no bin folder there is no exe, which the read says.
-    let lock = if bin.is_dir() { Some(local_lock(bin)?) } else { None };
+    let lock = if bin.is_dir() {
+        Some(local_lock(bin).map_err(|unlocked| unlocked.line())?)
+    } else {
+        None
+    };
     let bytes = installed(&exe)?;
     let helper = installed_helper(&bin.join(gate_desktop::HELPER_FILE))?;
     let raw_version = local_version(&exe, variables).map_err(|why| format!("push: {why}"))?;
@@ -910,6 +969,7 @@ fn prepared(
         macs,
         source,
         config,
+        bin: bin.to_owned(),
     })
 }
 
@@ -1525,15 +1585,39 @@ fn sent(mac: &Mac, ssh: &Path, source: &Source, push: &MacPush<'_>) -> Result<()
     }
 }
 
+/// Why [`local_lock`] could not take `push.lock`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Unlocked {
+    /// Another process holds it, as an install does.
+    Installing,
+    /// It is a link, or could not be taken, as this says.
+    Refused(String),
+}
+
+impl Unlocked {
+    /// Why, as a clause.
+    fn why(&self) -> String {
+        match self {
+            Unlocked::Installing => "an install is in progress on this PC".to_owned(),
+            Unlocked::Refused(why) => why.clone(),
+        }
+    }
+
+    /// The line a push that sends nothing for it says.
+    fn line(&self) -> String {
+        format!("push: {}; nothing was sent", self.why())
+    }
+}
+
 /// `bin`'s `push.lock`, held open unshared until the file is dropped, as the builder script and `tools/install.ps1`
-/// hold it; else the line saying an install holds it, it is a link, or why it could not be taken. It is opened without
+/// hold it; else why not: an install holds it, it is a link, or why it could not be taken. It is opened without
 /// following a link there and kept only when the opened handle is a plain file with one name, so a link, a hard link
 /// included, is refused, and nothing can swap the file between the check and the open. One that cannot be opened is
 /// looked at without following a link: a link or a folder there, which no file open takes, is refused as a link too.
-fn local_lock(bin: &Path) -> Result<File, String> {
+fn local_lock(bin: &Path) -> Result<File, Unlocked> {
     let path = bin.join("push.lock");
-    let linked = || format!("push: {} is a link; nothing was sent", path.display());
-    let unlocked = |error: &io::Error| format!("push: could not lock {}: {error}; nothing was sent", bin.display());
+    let linked = || Unlocked::Refused(format!("{} is a link", path.display()));
+    let unlocked = |error: &io::Error| Unlocked::Refused(format!("could not lock {}: {error}", bin.display()));
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1544,7 +1628,7 @@ fn local_lock(bin: &Path) -> Result<File, String> {
         .open(&path)
         .map_err(|error| {
             if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
-                "push: an install is in progress on this PC; nothing was sent".to_owned()
+                Unlocked::Installing
             } else if is_link_or_folder(&path) {
                 linked()
             } else {
@@ -2076,6 +2160,7 @@ mod tests {
             macs: Vec::new(),
             source: None,
             config: tool_routing("{}"),
+            bin: PathBuf::from(r"C:\no-such-folder\gate\bin"),
         };
 
         // wa routes lib; wb, a `builders` entry, routes app alone, which names no tool: each gets all three.
