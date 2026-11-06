@@ -29,6 +29,8 @@ linear: gate
 
 The owner wants this project worked as autonomously as possible and holds no strong views on technical choices. The decision round settles every technical decision itself: formats, APIs, crate layout, Win32 mechanics, seams and test shape. It picks the option with the best worst case, quotes the reasoning into the brief, and **settle**s it into the issue.
 
+A review finding or a design choice about how caller repos' runs behave (what routes, what stays local, what a builder refuses) is checked against every repo `remote.json` lists before it is dismissed or settled, not only against the repo that asked for the change. A rule that looks safe for the asking repo can send another repo's runs back to this PC.
+
 Output text the gate prints for the agents that invoke it (its lines, refusals and failure messages) is designed by the round too, as well as the round can: the owner does not review its wording.
 
 The owner is asked only about what they know as a user and a developer and the round cannot settle from the code: a default that changes how a caller repo's runs behave, a change to a workflow in those repos, or anything that touches their machines beyond the builders' gate setup. A feature branch counts as technical: the round decides it and says so.
@@ -220,6 +222,8 @@ A landing that changes `tools/builder/install-toolchains.ps1` is followed by a r
 `gate push` installs only `gate.exe`, so an installer step that is never rerun stays missing on the builder; the landing's report names each step's `OK` or `FAIL` line.
 
 The install leaves a push-pending marker that makes a routed run of the new build wait for the push instead of falling back to local, and the push clears it.
+
+`gate push` runs straight after every `tools/install.ps1`, in the same step, whatever the change touches. A change that runs on the PC alone is no reason to hold it back: until the push, every routed run from this PC waits for it and then falls back.
 
 A push that fails is reported in the landing's report and never undoes the local install; the next reinstall pushes again. A push that fails before any builder, or is skipped, leaves the marker, so routed runs wait up to 10 minutes and then fall back; push soon after the install.
 
