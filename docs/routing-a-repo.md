@@ -140,6 +140,11 @@ This repo's `tools/builder/install-toolchains.ps1` does the rest: the toolchains
 - **Smart App Control off:** in Evaluation, Smart App Control asks the cloud for the reputation of every unsigned image the first time it is mapped, whatever the Defender exclusions, so each freshly built exe in the work root waited 1.5-16 s before its first start (0.05 s with it off).
 
   The step sets `VerifiedAndReputablePolicyState` to 0 and refreshes the policies with `CiTool`; Defender's real-time, cloud and behaviour protection stay as they are. A policy still enforced after the refresh asks for a restart of the drained builder.
+- **The build volume out of scheduled optimization:** the Windows builder's scheduled storage optimizer (`\Microsoft\Windows\Defrag\ScheduledDefrag`, run by Automatic Maintenance) once froze file I/O on the build volume (ReFS, holding the work root) for up to two minutes. A box process froze while it held the drain lock, and routed runs failed or stalled.
+
+  The task's arguments are set to `-e D: -h -o -$` in place of the default `-c -h -o -$`; `defrag /e` optimizes every volume except those listed, so name the build volume (here `D:`). The "Optimize Drives" app rewrites these arguments when its drive selection is saved, which can bring the volume back, so check them after anyone saves that selection there.
+
+  Evidence for such a freeze on the builder: its Security log audits process creation (events 4688 and 4689), the best record of which box verbs ran when; the ReFS/Operational log's event 147 records file I/Os over 30 s; the box writes nothing to the Application log. A box whose drain lock stays held past its retry refuses the call as `busy` and the run goes to the next builder or here ([design.md, The box side](design.md#the-box-side), `drain`).
 - **Test:** `pwsh -NoProfile -File tools/builder/test-install-toolchains.ps1`, run through `tools/gate.ps1 -Slot light`. It installs nothing and needs no admin.
 - **The Unreal engine install is not in the installer.**
 

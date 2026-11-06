@@ -91,7 +91,7 @@ fn answered(root: &str, action: DrainAction, seams: &BoxSeams, console: &mut Con
         return Ok(open_lines());
     }
     ready_drain(&drain, console)?;
-    let _lock = take_drain_lock(&drain.join(LOCK), LOCK_RETRY)?;
+    let _lock = take_drain_lock(&drain.join(LOCK), drain_lock_retry(seams)).map_err(DrainError::into_text)?;
     let state = State {
         drain: &drain,
         clock: Clock::of(seams),
@@ -253,20 +253,53 @@ fn moved_aside(drain: &Path, planted: Identity) -> Result<Option<String>, String
     ))
 }
 
+/// Why a call could not hold the drain lock: another process held it for the whole retry ([`DrainError::Busy`]), so the
+/// builder is busy, or the drain, its lock or the work under it could not be read or written ([`DrainError::Failed`]).
+#[derive(Debug)]
+pub(crate) enum DrainError {
+    /// The lock stayed held by another process for the whole retry.
+    Busy(String),
+    /// The drain, its lock or the work under it could not be read or written: why.
+    Failed(String),
+}
+
+impl From<String> for DrainError {
+    fn from(why: String) -> DrainError {
+        DrainError::Failed(why)
+    }
+}
+
+impl DrainError {
+    /// The line the error says, whichever it is.
+    pub(crate) fn into_text(self) -> String {
+        match self {
+            DrainError::Busy(why) | DrainError::Failed(why) => why,
+        }
+    }
+}
+
+/// How long a call waits for the drain lock: `--test-box-drain-lock-ms`'s milliseconds, else [`LOCK_RETRY`].
+fn drain_lock_retry(seams: &BoxSeams) -> Duration {
+    seams.drain_lock_ms.map_or(LOCK_RETRY, Duration::from_millis)
+}
+
 /// The drain lock `path`, taken as the work lock is ([`files::take_lock`]); a lock another open holds is tried again
-/// every [`LOCK_STEP`] until `retry` has passed, [`LOCK_RETRY`] for every call but a test's. Else why not.
-pub(crate) fn take_drain_lock(path: &Path, retry: Duration) -> Result<HeldLock, String> {
+/// every [`LOCK_STEP`] until `retry` has passed, [`DrainError::Busy`]; else why not.
+pub(crate) fn take_drain_lock(path: &Path, retry: Duration) -> Result<HeldLock, DrainError> {
     let begun = Instant::now();
     loop {
         match files::take_lock(path) {
             Ok(Locked::Held(held)) => return Ok(held),
             Ok(Locked::Busy) => {
                 if begun.elapsed() >= retry {
-                    return Err(format!("the drain lock {} is held by another process", escaped(&path.to_string_lossy())));
+                    return Err(DrainError::Busy(format!(
+                        "the drain lock {} is held by another process",
+                        escaped(&path.to_string_lossy())
+                    )));
                 }
                 thread::sleep(LOCK_STEP);
             }
-            Err(error) => return Err(cannot("take", path, &error)),
+            Err(error) => return Err(DrainError::Failed(cannot("take", path, &error))),
         }
     }
 }
@@ -769,22 +802,22 @@ pub(crate) struct Session<'p> {
 
 /// Runs `under` in one hold of the drain lock under the work root `root`, `drain/` readied as an admission readies it,
 /// giving it the judge of whether a session is live for a call of its own ([`State::own_session_live`]): the one lock
-/// every take and judge of the builder's own slots runs under. Else why the drain could not be read or written, or
-/// `under`'s own error.
+/// every take and judge of the builder's own slots runs under. Else [`DrainError::Busy`] for a lock another process held
+/// past its retry, why the drain could not be read or written, or `under`'s own error.
 pub(crate) fn under_drain_lock<T>(
     root: &Path,
     seams: &BoxSeams,
     console: &mut Console,
     under: impl FnOnce(&dyn Fn(&str) -> Result<bool, String>) -> Result<T, String>,
-) -> Result<T, String> {
+) -> Result<T, DrainError> {
     let drain = root.join(DRAIN);
     ready_drain(&drain, console)?;
-    let _lock = take_drain_lock(&drain.join(LOCK), LOCK_RETRY)?;
+    let _lock = take_drain_lock(&drain.join(LOCK), drain_lock_retry(seams))?;
     let state = State {
         drain: &drain,
         clock: Clock::of(seams),
     };
-    under(&|id| state.own_session_live(id))
+    under(&|id| state.own_session_live(id)).map_err(DrainError::Failed)
 }
 
 /// The folder `folder`, readied as one of the drain's own: made at mode 0700 when missing, and refused unless it is the
@@ -867,22 +900,22 @@ impl Drop for Admitted {
 /// Admits a call of `session` under the work root `root` or refuses it, in one hold of the drain lock: a call is
 /// refused while a barrier stands or an older live ticket waits, and a call with no session under a standing barrier
 /// ([`decided`]). A refused call of a session takes or renews its ticket unless `no_ticket`; an admitted one writes its
-/// session record and holds its holder before the lock is let go, and gives up its ticket. Else why the drain could not
-/// be read or written.
+/// session record and holds its holder before the lock is let go, and gives up its ticket. Else [`DrainError::Busy`] for
+/// a lock another process held past its retry, or why the drain could not be read or written.
 pub(crate) fn admit(
     root: &Path,
     session: Option<&Session<'_>>,
     no_ticket: bool,
     seams: &BoxSeams,
     console: &mut Console,
-) -> Result<Result<Admitted, Refused>, String> {
+) -> Result<Result<Admitted, Refused>, DrainError> {
     let drain = root.join(DRAIN);
     // With no `drain/`, no barrier stands and a call with no session takes no ticket: nothing to make.
     if session.is_none() && !files::exists(&drain) {
         return Ok(Ok(Admitted::none()));
     }
     ready_drain(&drain, console)?;
-    let _lock = take_drain_lock(&drain.join(LOCK), LOCK_RETRY)?;
+    let _lock = take_drain_lock(&drain.join(LOCK), drain_lock_retry(seams))?;
     let state = State {
         drain: &drain,
         clock: Clock::of(seams),
@@ -896,7 +929,7 @@ pub(crate) fn admit(
         None => false,
     };
     match (decided(standing, older, id, live), session) {
-        (Ok(()), Some(session)) => state.registered(&tickets, session, seams.now).map(Ok),
+        (Ok(()), Some(session)) => state.registered(&tickets, session, seams.now).map_err(DrainError::Failed).map(Ok),
         (Ok(()), None) => Ok(Ok(Admitted::none())),
         (Err(refused), session) => {
             if let Some(session) = session
@@ -917,13 +950,16 @@ pub(crate) enum Unpassed {
     Usage(String),
     /// The drain refused it.
     Refused(Refused),
+    /// The drain lock stayed held by another process for the whole retry: the builder is busy.
+    Busy(String),
     /// The drain could not be read or written: why.
     Failed(String),
 }
 
 impl Unpassed {
     /// Says why on `console`'s stderr; the status. A refusal says the `drain` refusal tag of `payload`'s nonce (left out
-    /// for a payload without one) and the [`refused_lines`], status 75; a drain that failed says [`failed_line`],
+    /// for a payload without one) and the [`refused_lines`], status 75; a builder whose drain lock stayed held says the
+    /// `busy` refusal tag and [`gate_wire::drain::builder_busy_line`], status 75; a drain that failed says [`failed_line`],
     /// [`FAILED_STATUS`]; a usage error its line, [`USAGE_STATUS`].
     pub(crate) fn said(self, payload: &Payload, console: &mut Console) -> u8 {
         match self {
@@ -938,6 +974,13 @@ impl Unpassed {
                 for line in refused_lines(refused) {
                     console.err(&line);
                 }
+                REFUSED_STATUS
+            }
+            Unpassed::Busy(why) => {
+                if let Ok(nonce) = payload.nonce() {
+                    console.err(&refused_line(nonce, gate_wire::Refusal::Busy));
+                }
+                console.err(&gate_wire::drain::builder_busy_line(&why));
                 REFUSED_STATUS
             }
             Unpassed::Failed(why) => {
@@ -957,12 +1000,14 @@ pub(crate) fn failed_line(why: &str) -> String {
 ///
 /// # Errors
 ///
-/// The call was refused, or the drain could not be read or written.
-pub(crate) fn admission_of(admission: Result<Result<Admitted, Refused>, String>) -> Result<Admitted, Unpassed> {
+/// The call was refused ([`Unpassed::Refused`]), a drain lock another process held past its retry refused it
+/// ([`Unpassed::Busy`]), or the drain could not be read or written ([`Unpassed::Failed`]).
+pub(crate) fn admission_of(admission: Result<Result<Admitted, Refused>, DrainError>) -> Result<Admitted, Unpassed> {
     match admission {
         Ok(Ok(admitted)) => Ok(admitted),
         Ok(Err(refused)) => Err(Unpassed::Refused(refused)),
-        Err(why) => Err(Unpassed::Failed(why)),
+        Err(DrainError::Busy(why)) => Err(Unpassed::Busy(why)),
+        Err(DrainError::Failed(why)) => Err(Unpassed::Failed(why)),
     }
 }
 
@@ -1023,7 +1068,7 @@ fn renewed(root: &Path, session: Option<&str>, seams: &BoxSeams, console: &mut C
         });
     }
     ready_drain(&drain, console)?;
-    let _lock = take_drain_lock(&drain.join(LOCK), LOCK_RETRY)?;
+    let _lock = take_drain_lock(&drain.join(LOCK), drain_lock_retry(seams)).map_err(DrainError::into_text)?;
     let state = State {
         drain: &drain,
         clock: Clock::of(seams),
@@ -1113,11 +1158,17 @@ mod tests {
     use gate_wire::drain::{Clock, LAPSE_MS, LEASE_MS, ProcessInfo, counted_processes};
     use serde_json::json;
 
-    use super::{State, Step, holder_live, ready_drain_seen, take_drain_lock, without_box_calls};
+    use base64::Engine as _;
+
+    use gate_args::BoxSeams;
+    use gate_wire::{DrainAction, Payload, refused_line};
+
+    use super::{Session, State, Step, admission_of, admit, answered, holder_live, ready_drain_seen, take_drain_lock, without_box_calls};
     use crate::console::Console;
     use crate::files;
-    use crate::lines::job_record_text;
+    use crate::lines::{FAILED_STATUS, job_record_text};
     use crate::pid_info::start_of;
+    use crate::run::REFUSED_STATUS;
 
     /// The Unix second the job cases judge at.
     const NOW: u64 = 1_800_000_000;
@@ -1421,11 +1472,117 @@ mod tests {
 
         let refused = take_drain_lock(&path, Duration::from_millis(50)).expect_err("a lock held for the whole wait is not taken");
         assert_eq!(
-            refused,
+            refused.into_text(),
             format!("the drain lock {} is held by another process", escaped(&path.to_string_lossy()))
         );
         drop(held);
         assert!(take_drain_lock(&path, Duration::from_millis(50)).is_ok(), "a lock let go is taken");
+    }
+
+    /// A payload naming the session `session` with the nonce `nonce`.
+    fn payload_of(nonce: &str, session: &str) -> Payload {
+        let word = base64::engine::general_purpose::STANDARD.encode(json!({ "Nonce": nonce, "Session": session }).to_string());
+        Payload::decode(&word, PathForm::Unix).expect("the payload decodes")
+    }
+
+    /// The line the drain lock at `lock` answers when it stays held.
+    fn held_line(lock: &Path) -> String {
+        format!("the drain lock {} is held by another process", escaped(&lock.to_string_lossy()))
+    }
+
+    /// The seams a case uses so a drain lock held past its retry gives up in milliseconds.
+    fn quick_retry() -> BoxSeams {
+        BoxSeams {
+            drain_lock_ms: Some(50),
+            ..BoxSeams::default()
+        }
+    }
+
+    #[test]
+    fn a_preflight_admission_that_finds_the_drain_lock_held_is_refused_busy() {
+        const NONCE: &str = "0123456789abcdef0123456789abcdef";
+        let case = Case::new("admission-lock-held");
+        let (root, drain, _work) = drain_of(&case);
+        let lock = drain.join("lock");
+        let held = files::held_for_test(&lock);
+        let mut console = Console::captured();
+        let payload = payload_of(NONCE, "s1");
+        let session = Session {
+            id: "s1",
+            pc: "pc1",
+            repo: "repo1",
+            command: "",
+            job: "",
+        };
+
+        let unpassed = admission_of(admit(&root, Some(&session), true, &quick_retry(), &mut console));
+        drop(held);
+        let status = unpassed
+            .err()
+            .expect("a drain lock held past its retry refuses the admission")
+            .said(&payload, &mut console);
+
+        assert_eq!(
+            status, REFUSED_STATUS,
+            "a busy builder is a refusal the PC falls back from, not a failed run"
+        );
+        assert_eq!(
+            console.err,
+            [
+                refused_line(NONCE, gate_wire::Refusal::Busy),
+                format!("gate: remote builder busy: {}", held_line(&lock))
+            ],
+            "the busy tag and line are said on stderr"
+        );
+    }
+
+    #[test]
+    fn a_drain_verb_that_finds_the_drain_lock_held_still_fails() {
+        let case = Case::new("drain-verb-lock-held");
+        let (root, drain, _work) = drain_of(&case);
+        let lock = drain.join("lock");
+        let held = files::held_for_test(&lock);
+        let mut console = Console::captured();
+        let root_text = root.to_string_lossy().into_owned();
+
+        let answered = answered(&root_text, DrainAction::Status, &quick_retry(), &mut console);
+        drop(held);
+
+        let why = answered
+            .err()
+            .expect("a drain verb whose lock stays held fails, its status read not being a call to fall back from");
+        assert_eq!(why, held_line(&lock), "it says the same line as today");
+    }
+
+    #[test]
+    fn an_admission_whose_drain_cannot_be_written_still_fails() {
+        let case = Case::new("admission-cannot-write");
+        let (root, drain, _work) = drain_of(&case);
+        let mut console = Console::captured();
+        let payload = payload_of("0123456789abcdef0123456789abcdef", "s1");
+        let session = Session {
+            id: "s1",
+            pc: "pc1",
+            repo: "repo1",
+            command: "",
+            job: "",
+        };
+        // A file where `tickets/` belongs: the drain's own folders cannot be readied, which is no busy builder.
+        fs::remove_dir(drain.join("tickets")).expect("the tickets folder is removed");
+        fs::write(drain.join("tickets"), "").expect("a file is planted at tickets");
+
+        let unpassed = admission_of(admit(&root, Some(&session), true, &quick_retry(), &mut console));
+        let status = unpassed
+            .err()
+            .expect("a drain that cannot be written fails the admission")
+            .said(&payload, &mut console);
+
+        assert_eq!(status, FAILED_STATUS, "a drain that cannot be written is no busy builder");
+        assert!(
+            console.err.iter().any(|line| line.starts_with("gate: drain failed: ")),
+            "the drain's failure is said: {:?}",
+            console.err
+        );
     }
 
     /// Makes the folder `path` at `mode`, whatever the umask.

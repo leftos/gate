@@ -470,6 +470,53 @@ fn a_run_of_a_session_not_live_under_a_barrier_is_refused_drain() {
     );
 }
 
+/// `gate box <verb>` of `asked` at the Unix second `now`, with `seams` before the verb, its request line then closed; to
+/// its end.
+fn verb_with_seams(case: &Case, verb: &str, asked: &Value, now: u64, seams: &[&str]) -> Outcome {
+    let now = now.to_string();
+    let mut args = vec!["box", "--test-box-now", &now, "--test-box-drain-readable-only", "true"];
+    args.extend_from_slice(seams);
+    args.push(verb);
+    box_call(case, &args, &payload(asked)).finish()
+}
+
+#[test]
+fn box_preflight_with_its_drain_lock_held_is_refused_busy() {
+    let case = Case::new("box_preflight_with_its_drain_lock_held_is_refused_busy");
+    let root = root_of(&case);
+    let base = run_payload(&case);
+    // A raise and a lift leave `drain\` readied and no barrier standing.
+    raised(&case, &root, T);
+    let lifted = drain(&case, &root, "lift", T + 1, &[]);
+    assert_eq!(lifted.code, Some(0), "{lifted:?}");
+    // Held as a box process frozen in a file operation under the lock holds it: open, shared with no one.
+    let _frozen = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(root.join("drain").join("lock"))
+        .expect("the drain lock can be held");
+
+    let outcome = verb_with_seams(&case, "preflight", &sessioned(&base, "s1"), T + 2, &["--test-box-drain-lock-ms", "50"]);
+    let lock = shown(&root.join("drain").join("lock"));
+
+    assert_eq!(
+        outcome.code,
+        Some(75),
+        "a held drain lock is busy, a refusal the PC falls back from: {outcome:?}"
+    );
+    assert_eq!(outcome.stdout, version_line(&case), "the version line comes first: {outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!(
+            "{}\ngate: remote builder busy: the drain lock {lock} is held by another process\n",
+            refused_line(&base, "busy")
+        ),
+        "the busy tag and line alone: {outcome:?}"
+    );
+    assert!(!root.join("work").join("k").exists(), "a refused preflight readies nothing");
+}
+
 /// `payload` asking for the step `diff`, its work folder readied by a preflight, as every route's first call does.
 fn diff_payload(case: &Case) -> Value {
     let mut payload = run_payload(case);

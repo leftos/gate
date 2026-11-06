@@ -702,8 +702,8 @@ pub struct Watches {
     pub drain: DrainSeams,
 }
 
-/// What the drain's clock reads of the test seams: `--test-box-now`, `--test-box-drain-lease-ms` and
-/// `--test-box-drain-lapse-ms`, each `None` for its default.
+/// What the drain's clock reads of the test seams: `--test-box-now`, `--test-box-drain-lease-ms`,
+/// `--test-box-drain-lapse-ms` and `--test-box-drain-lock-ms`, each `None` for its default.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DrainSeams {
     /// The Unix second the drain judges at.
@@ -712,6 +712,8 @@ pub struct DrainSeams {
     pub lease_ms: Option<u64>,
     /// The lapse of a barrier, in milliseconds.
     pub lapse_ms: Option<u64>,
+    /// How long the run waits for a drain lock another call holds, in milliseconds.
+    pub lock_ms: Option<u64>,
 }
 
 impl DrainSeams {
@@ -722,6 +724,7 @@ impl DrainSeams {
             now: seams.now,
             lease_ms: seams.drain_lease_ms,
             lapse_ms: seams.drain_lapse_ms,
+            lock_ms: seams.drain_lock_ms,
         }
     }
 
@@ -731,6 +734,7 @@ impl DrainSeams {
             now: self.now,
             drain_lease_ms: self.lease_ms,
             drain_lapse_ms: self.lapse_ms,
+            drain_lock_ms: self.lock_ms,
             ..BoxSeams::default()
         }
     }
@@ -1228,8 +1232,10 @@ fn inputs_matched<S: LineSink>(request: &Request<'_>, lock: &HeldLock, output: &
 /// The run of `request`, from `payload`, passed through the drain ([`drain::passed`]) as the session `payload` names,
 /// with its command's words joined by spaces and its job, the drain's clock as `seams` set it: the guard, held until the
 /// run ends. A line the drain said, a drain moved aside, is said stamped `gat`. Else the status the run ends on, its
-/// lines said: a refusal's `drain` tag, place and barrier lines, bare, and [`REFUSED_STATUS`]; a drain that could not
-/// be read or written fails the run as a lock that could not be taken does, its back commits never made.
+/// lines said: a refusal's `drain` tag, place and barrier lines, bare, and [`REFUSED_STATUS`]; a drain lock another
+/// process held past its retry, the `busy` tag and [`gate_wire::drain::builder_busy_line`], bare, and
+/// [`REFUSED_STATUS`]; a drain that could not be read or written fails the run as a lock that could not be taken does,
+/// its back commits never made.
 fn admitted<S: LineSink>(payload: &Payload, request: &Request<'_>, seams: &BoxSeams, output: &Output<S>) -> Result<drain::Admitted, u8> {
     let command = request.command.join(" ");
     let mut console = Console::captured();
@@ -1241,6 +1247,14 @@ fn admitted<S: LineSink>(payload: &Payload, request: &Request<'_>, seams: &BoxSe
     passed.map_err(|unpassed| match unpassed {
         Unpassed::Usage(line) => said(output, &[&line], USAGE_STATUS),
         Unpassed::Failed(why) => back_commits_failed(output, request, said(output, &[&drain::failed_line(&why)], FAILED_STATUS)),
+        Unpassed::Busy(why) => {
+            let tag = refused_line(request.nonce, Refusal::Busy);
+            said_as(
+                output,
+                &[(Stamp::Bare, &tag), (Stamp::Bare, &gate_wire::drain::builder_busy_line(&why))],
+                REFUSED_STATUS,
+            )
+        }
         Unpassed::Refused(refused) => {
             let tag = refused_line(request.nonce, Refusal::Drain);
             let [place, barrier] = refused_lines(refused);
@@ -1256,8 +1270,10 @@ fn admitted<S: LineSink>(payload: &Payload, request: &Request<'_>, seams: &BoxSe
 /// Holds the builder slot of the run of `request`, from `payload`, admitted as the session `payload` names
 /// ([`slots::run_taken`]), the drain's clock as `seams` set it: whether the session holds a claim. A line it said, a
 /// count file that cannot be read or a drain moved aside, is said stamped `gat`. Else the status the run ends on, its
-/// lines said: with every slot held the `full` tag and the full line, bare, and [`REFUSED_STATUS`]; a slot pool that
-/// could not be read or written fails the run as a drain that could not be, its back commits never made.
+/// lines said: with every slot held the `full` tag and the full line, bare, and [`REFUSED_STATUS`]; a drain lock another
+/// process held past its retry, the `busy` tag and [`gate_wire::drain::builder_busy_line`], bare, and
+/// [`REFUSED_STATUS`]; a slot pool that could not be read or written fails the run as a drain that could not be, its back
+/// commits never made.
 fn slot_taken<S: LineSink>(payload: &Payload, request: &Request<'_>, seams: &BoxSeams, output: &Output<S>) -> Result<bool, u8> {
     let command = request.command.join(" ");
     let mut console = Console::captured();
@@ -1270,6 +1286,14 @@ fn slot_taken<S: LineSink>(payload: &Payload, request: &Request<'_>, seams: &Box
         Untaken::Full { held, count } => {
             let [tag, full] = slots::full_lines(request.nonce, held, count);
             said_as(output, &[(Stamp::Bare, &tag), (Stamp::Bare, &full)], REFUSED_STATUS)
+        }
+        Untaken::Busy(why) => {
+            let tag = refused_line(request.nonce, Refusal::Busy);
+            said_as(
+                output,
+                &[(Stamp::Bare, &tag), (Stamp::Bare, &gate_wire::drain::builder_busy_line(&why))],
+                REFUSED_STATUS,
+            )
         }
         Untaken::Failed(why) => back_commits_failed(output, request, said(output, &[&slots::failed_line(&why)], FAILED_STATUS)),
     })
@@ -1764,6 +1788,7 @@ mod tests {
 
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
+    use gate_args::BoxSeams;
     use gate_inputs::hash::sha256_of;
     use gate_inputs::manifest::Manifest;
     use gate_wire::{
@@ -1775,7 +1800,7 @@ mod tests {
 
     use super::{
         DrainSeams, NotLaidOut, REFUSED_STATUS, Ready, Request, Sources, Unready, Watches, inputs_matched, login_read, place_of, prepare, prepared,
-        run_along, run_reading, temp_made, test_template, work_cleared,
+        run_along, run_reading, slot_taken, temp_made, test_template, work_cleared,
     };
     #[cfg(target_os = "macos")]
     use crate::beneath::ANOTHER_VOLUME;
@@ -1953,6 +1978,43 @@ mod tests {
 
     fn decoded(json: &Value) -> Payload {
         Payload::decode(&STANDARD.encode(json.to_string()), PathForm::Unix).expect("the payload decodes")
+    }
+
+    #[test]
+    fn a_run_slot_take_whose_drain_lock_is_held_is_refused_busy() {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let case = Case::new("slot-lock-held");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let payload = decoded(&case.json(&commit, &json!({ "Session": "s1", "Pc": "pc1", "Repo": "repo" })));
+        let request = Request::read(&payload).expect("the request reads");
+        let root = PathBuf::from(case.root());
+        let drain = root.join("drain");
+        fs::DirBuilder::new().mode(0o700).create(&drain).expect("the drain folder is made");
+        fs::write(root.join("slots.json"), json!({ "v": 1, "slots": 2 }).to_string()).expect("the count file is written");
+        let lock = drain.join("lock");
+        let held = files::held_for_test(&lock);
+        let seams = BoxSeams {
+            drain_lock_ms: Some(50),
+            ..BoxSeams::default()
+        };
+        let output = Output::new(RecordingSink::default());
+
+        let taken = slot_taken(&payload, &request, &seams, &output);
+        drop(held);
+
+        assert_eq!(taken, Err(REFUSED_STATUS), "{:?}", stderr_of(&output));
+        assert_eq!(
+            stderr_of(&output),
+            [
+                refused_line(NONCE, Refusal::Busy),
+                format!(
+                    "gate: remote builder busy: the drain lock {} is held by another process",
+                    escaped(&lock.to_string_lossy())
+                )
+            ],
+            "the busy tag and line, bare, and nothing else"
+        );
     }
 
     /// Readies the run of `json`; the status it ended on, 0 for a run ready for its command (its lock let go), and the

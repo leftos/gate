@@ -128,6 +128,8 @@ fn now_text(seams: &BoxSeams) -> String {
 pub(crate) enum Untaken {
     /// Every slot is held: `held` of `count`.
     Full { held: usize, count: u32 },
+    /// The drain lock stayed held by another process for the whole retry: the builder is busy.
+    Busy(String),
     /// The slot pool could not be read or written: why.
     Failed(String),
 }
@@ -169,7 +171,8 @@ fn session_taken(root: &Path, session: &Session<'_>, seams: &BoxSeams, console: 
     match took {
         Ok(None) => Ok(true),
         Ok(Some(held)) => Err(Untaken::Full { held, count }),
-        Err(why) => Err(Untaken::Failed(why)),
+        Err(drain::DrainError::Busy(why)) => Err(Untaken::Busy(why)),
+        Err(drain::DrainError::Failed(why)) => Err(Untaken::Failed(why)),
     }
 }
 
@@ -186,8 +189,10 @@ pub(crate) fn failed_line(why: &str) -> String {
 /// Takes a slot for the admitted preflight of `session` under the work root `root` when it has a count file
 /// ([`session_taken`]): whether the session now holds a claim, which is false with no session or no count file. With
 /// every slot held: the version line and the box slots line ([`looked`]) on stdout, then the `full` refusal tag of
-/// `payload`'s nonce (left out for a payload without one) and the full line, and [`REFUSED_STATUS`]. A slot pool that
-/// cannot be read or written fails the preflight: the version line, its line ([`failed_line`]), and [`FAILED_STATUS`].
+/// `payload`'s nonce (left out for a payload without one) and the full line, and [`REFUSED_STATUS`]. A drain lock
+/// another process held past its retry is refused `busy`: the version line, then the `busy` tag and
+/// [`gate_wire::drain::builder_busy_line`], and [`REFUSED_STATUS`]. A slot pool that cannot be read or written fails the
+/// preflight: the version line, its line ([`failed_line`]), and [`FAILED_STATUS`].
 pub(crate) fn taken(root: &Path, session: Option<&Session<'_>>, payload: &Payload, seams: &BoxSeams, console: &mut Console) -> Result<bool, u8> {
     let Some(session) = session else {
         return Ok(false);
@@ -204,6 +209,13 @@ pub(crate) fn taken(root: &Path, session: Option<&Session<'_>>, payload: &Payloa
                 console.err(&refused_line(nonce, Refusal::Full));
             }
             console.err(&full_line(held, count));
+            Err(REFUSED_STATUS)
+        }
+        Untaken::Busy(why) => {
+            if let Ok(nonce) = payload.nonce() {
+                console.err(&refused_line(nonce, Refusal::Busy));
+            }
+            console.err(&gate_wire::drain::builder_busy_line(&why));
             Err(REFUSED_STATUS)
         }
         Untaken::Failed(why) => {
@@ -322,7 +334,7 @@ fn released(root: &Path, session: &str) -> Result<(), String> {
     if !files::plain_folder(&folder) || !files::plain_folder(&drain) {
         return Ok(());
     }
-    let _lock = drain::take_drain_lock(&drain.join(LOCK), LOCK_RETRY)?;
+    let _lock = drain::take_drain_lock(&drain.join(LOCK), LOCK_RETRY).map_err(drain::DrainError::into_text)?;
     let claims = drain::names_in(&folder)?;
     // Case-sensitive, as the claims are written and as [`slot_index`] reads them.
     for name in claims.iter().filter(|name| Path::new(name).extension() == Some(OsStr::new("json"))) {
@@ -392,6 +404,7 @@ fn look(root: &Path, count: u32, hold: &HoldRequest, seams: &BoxSeams, console: 
         claim_written(&slot.folder.join(claim_name(n)), &claim)?;
         Ok(Looked::Slot(slot))
     })
+    .map_err(drain::DrainError::into_text)
 }
 
 /// Answers `gate-box box hold`: takes one of the builder's own slots under its root and runs its command while it holds
@@ -748,10 +761,22 @@ fn status_of(status: ExitStatus) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::process::ExitStatusExt;
+    use std::path::{Path, PathBuf};
     use std::process::ExitStatus;
 
-    use super::{slot_index, status_of};
+    use base64::Engine as _;
+    use gate_args::BoxSeams;
+    use gate_wire::{PathForm, Payload, Refusal, escaped, refused_line, version_line};
+    use serde_json::json;
+
+    use super::{Session, slot_index, status_of, taken};
+    use crate::console::Console;
+    use crate::files;
+    use crate::lines::FAILED_STATUS;
+    use crate::run::REFUSED_STATUS;
 
     #[test]
     fn a_slot_index_is_read_from_a_claim_or_a_lock_name_alone() {
@@ -783,5 +808,114 @@ mod tests {
         assert_eq!(status_of(ExitStatus::from_raw(255 << 8)), 255);
         assert_eq!(status_of(ExitStatus::from_raw(libc::SIGTERM)), 143);
         assert_eq!(status_of(ExitStatus::from_raw(libc::SIGKILL)), 137);
+    }
+
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+    /// A temp folder of the case `name`, private to this process, removed when the case ends.
+    struct Case {
+        base: PathBuf,
+    }
+
+    impl Case {
+        fn new(name: &str) -> Case {
+            let base = std::env::temp_dir().join(format!("gate-box-unix-slots-{}-{name}", std::process::id()));
+            if base.exists() {
+                fs::remove_dir_all(&base).expect("a stale case folder is removed");
+            }
+            fs::create_dir_all(&base).expect("the case folder is made");
+            Case { base }
+        }
+
+        /// The root `{case}/root` with its `drain/` made at mode 0700 and a count file of `count` slots; the root and
+        /// its drain.
+        fn counted_root(&self, count: u32) -> (PathBuf, PathBuf) {
+            let root = self.base.join("root");
+            let drain = root.join("drain");
+            for folder in [&root, &drain] {
+                fs::DirBuilder::new().mode(0o700).create(folder).expect("the folder is made");
+            }
+            fs::write(root.join("slots.json"), json!({ "v": 1, "slots": count }).to_string()).expect("the count file is written");
+            (root, drain)
+        }
+    }
+
+    impl Drop for Case {
+        fn drop(&mut self) {
+            // Best effort: a folder left behind is in the temp folder and named for this process.
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    /// The session every case takes a slot for.
+    fn session() -> Session<'static> {
+        Session {
+            id: "s1",
+            pc: "pc1",
+            repo: "repo1",
+            command: "",
+            job: "",
+        }
+    }
+
+    /// A payload naming the session `s1` with the nonce [`NONCE`].
+    fn payload() -> Payload {
+        let word = base64::engine::general_purpose::STANDARD.encode(json!({ "Nonce": NONCE, "Session": "s1" }).to_string());
+        Payload::decode(&word, PathForm::Unix).expect("the payload decodes")
+    }
+
+    /// The seams a case uses so a drain lock held past its retry gives up in milliseconds.
+    fn quick_retry() -> BoxSeams {
+        BoxSeams {
+            drain_lock_ms: Some(50),
+            ..BoxSeams::default()
+        }
+    }
+
+    /// The line a busy refusal says for the lock at `lock`.
+    fn busy_line(lock: &Path) -> String {
+        gate_wire::drain::builder_busy_line(&format!("the drain lock {} is held by another process", escaped(&lock.to_string_lossy())))
+    }
+
+    #[test]
+    fn a_slot_take_that_finds_the_drain_lock_held_is_refused_busy() {
+        let case = Case::new("lock-held");
+        let (root, drain) = case.counted_root(2);
+        let lock = drain.join("lock");
+        let held = files::held_for_test(&lock);
+        let mut console = Console::captured();
+
+        let said = taken(&root, Some(&session()), &payload(), &quick_retry(), &mut console);
+        drop(held);
+
+        assert_eq!(
+            said.err(),
+            Some(REFUSED_STATUS),
+            "a slot take whose drain lock stays held is busy, not failed"
+        );
+        assert_eq!(console.out, [version_line()], "the version line is said first");
+        assert_eq!(
+            console.err,
+            [refused_line(NONCE, Refusal::Busy), busy_line(&lock)],
+            "the busy tag and line are said on stderr"
+        );
+    }
+
+    #[test]
+    fn a_slot_take_whose_pool_cannot_be_written_still_fails() {
+        let case = Case::new("pool-file");
+        let (root, _drain) = case.counted_root(2);
+        fs::write(root.join("slots"), "not a folder").expect("a file can stand where the slots folder belongs");
+        let mut console = Console::captured();
+
+        let said = taken(&root, Some(&session()), &payload(), &quick_retry(), &mut console);
+
+        assert_eq!(said.err(), Some(FAILED_STATUS), "a slot pool that cannot be read is no busy builder");
+        assert_eq!(console.out, [version_line()], "the version line is said first");
+        assert!(
+            console.err.iter().any(|line| line.starts_with("gate: slots failed: ")),
+            "the slot pool's failure is said: {:?}",
+            console.err
+        );
     }
 }

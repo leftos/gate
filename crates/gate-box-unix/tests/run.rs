@@ -2068,6 +2068,44 @@ mod unix {
     }
 
     #[test]
+    fn a_box_run_whose_drain_lock_is_held_is_refused_busy() {
+        let case = Case::new("drain-run-lock-held");
+        let commit = case.snapshot();
+        let root = case.root();
+        // A raise and a lift leave `drain/` readied and no barrier standing.
+        raised(&root);
+        let lift = drained(&root, "lift");
+        assert_eq!(lift.status, Some(0), "{:?}", lift.err);
+        let lock = format!("{root}/drain/lock");
+        let held = OpenOptions::new().read(true).write(true).open(&lock).expect("the drain lock opens");
+        // SAFETY: `held` stays open, and its lock held, until the case ends.
+        let locked = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(locked, 0, "the case holds the drain lock");
+
+        let ended = ran(
+            &["--test-box-drain-lock-ms", "50"],
+            &case.request(&commit, &session_keys("s1")),
+            Reading::All,
+            &case.base.join("beaten"),
+        );
+        drop(held);
+
+        assert_eq!(ended.status, Some(75), "{:?}", ended.err);
+        assert!(ended.out.is_empty(), "nothing ran: {:?}", ended.out);
+        assert!(!ended.err_has(&started_line(NONCE)), "no start marker: {:?}", ended.err);
+        assert_eq!(
+            ended.err,
+            [
+                refused_line(NONCE, Refusal::Busy),
+                format!("gate: remote builder busy: the drain lock {} is held by another process", escaped(&lock))
+            ],
+            "the busy tag and line alone: {:?}",
+            ended.err
+        );
+        ended.protocol_bare();
+    }
+
+    #[test]
     fn a_run_of_a_live_session_under_a_barrier_runs() {
         let case = Case::new("drain-run-live");
         let commit = case.snapshot();

@@ -27,6 +27,12 @@ pub const MOST_COMMAND_CHARS: usize = 300;
 /// The most characters of a PC's host name and of a repository's name a session record keeps.
 pub const MOST_NAME_CHARS: usize = 100;
 
+/// The line a box says when another process held its drain lock past the retry, just after its `busy` refusal tag.
+#[must_use]
+pub fn builder_busy_line(why: &str) -> String {
+    format!("gate: remote builder busy: {why}")
+}
+
 /// The drain's folder beneath the work root.
 pub const DRAIN: &str = "drain";
 /// The drain lock, in the drain's folder.

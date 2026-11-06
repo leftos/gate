@@ -107,6 +107,9 @@ pub struct BoxSeams {
     /// How long, in milliseconds, a drain barrier stands after its last raise, in place of 30 minutes; `None` without
     /// the feature.
     pub drain_lapse_ms: Option<u64>,
+    /// How long, in milliseconds, a call waits for the drain lock another call holds, in place of 10 s; `None` without
+    /// the feature.
+    pub drain_lock_ms: Option<u64>,
     /// The time, in whole seconds since the Unix epoch, the drain's barrier, tickets and sessions are judged at, in
     /// place of the clock's; `None` without the feature.
     pub now: Option<u64>,

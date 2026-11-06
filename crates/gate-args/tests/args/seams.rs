@@ -2025,6 +2025,7 @@ fn box_seam_console_and_park_launch_are_unknown_words_without_the_feature() {
         ("--test-box-kill-leaves", "1"),
         ("--test-box-drain-lease-ms", "500"),
         ("--test-box-drain-lapse-ms", "60000"),
+        ("--test-box-drain-lock-ms", "50"),
         ("--test-box-now", "1800000000"),
         ("--test-box-drain-readable-only", "true"),
     ] {

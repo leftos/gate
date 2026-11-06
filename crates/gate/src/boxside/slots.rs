@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use gate_args::{BoxRequest, BoxSeams, HoldRequest};
 use gate_win32::{Descriptor, Job, Launch, LaunchOutput, Running};
-use gate_wire::drain::{DRAIN, LOCK};
+use gate_wire::drain::{DRAIN, LOCK, LOCK_RETRY};
 use gate_wire::slots::{
     BoxSlots, COUNT_FILE, Claim, HOLD_LINE_POLLS, HOLD_POLL, HoldClaim, Judged, NO_COUNT_LINE, SLOTS, SessionClaim, Take, ceiling_line, chosen,
     claim_index, claim_name, count_of, full_line, holder_line, holder_refusal, lock_name, unread_count_line, waiting_line,
@@ -28,7 +28,7 @@ use jiff::Timestamp;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
-use crate::boxside::drain::{self, HeldRoot, Session, cannot};
+use crate::boxside::drain::{self, DrainError, HeldRoot, Session, cannot};
 use crate::boxside::inputs::{Leftover, protected_folder, protected_security};
 use crate::boxside::run::REFUSED_STATUS;
 use crate::boxside::stamping;
@@ -141,9 +141,9 @@ fn count_said(root: &HeldRoot<'_>, console: &mut Console) -> Option<u32> {
 }
 
 /// Takes a slot for `session` under the root `root` when it has a count file ([`count_said`]): a session that holds a
-/// slot keeps it, else it takes the lowest free one with its session claim. Else why the slot pool could not be read or
-/// written.
-fn session_took(root: &HeldRoot<'_>, session: &Session<'_>, seams: &BoxSeams, console: &mut Console) -> Result<SessionTake, String> {
+/// slot keeps it, else it takes the lowest free one with its session claim. Else [`DrainError::Busy`] for a drain lock
+/// another process held past its retry, or why the slot pool could not be read or written.
+fn session_took(root: &HeldRoot<'_>, session: &Session<'_>, seams: &BoxSeams, console: &mut Console) -> Result<SessionTake, DrainError> {
     let Some(count) = count_said(root, console) else {
         return Ok(SessionTake::Unneeded);
     };
@@ -188,8 +188,9 @@ fn slots_failed(why: &str, console: &mut Console) -> u32 {
 /// Takes a slot for the admitted preflight of `session` under the root `root` when it has a count file
 /// ([`session_took`]): whether the session now holds a claim, which is false with no session or no count file. With
 /// every slot held: `version` and the box slots line ([`looked`]) on stdout, then the `full` refusal tag and the full
-/// line ([`full_said`]), and [`REFUSED_STATUS`]. A slot pool that cannot be read or written fails the preflight:
-/// `version`, its line, and [`FAILED_STATUS`].
+/// line ([`full_said`]), and [`REFUSED_STATUS`]. A drain lock another process held past its retry is refused `busy`:
+/// `version`, then the busy tag and line ([`drain::busy_said`]), and [`REFUSED_STATUS`]. A slot pool that cannot be read
+/// or written fails the preflight: `version`, its line, and [`FAILED_STATUS`].
 pub(super) fn taken(
     root: &HeldRoot<'_>,
     session: Option<&Session<'_>>,
@@ -258,21 +259,24 @@ pub(super) fn look_said(look: Result<Option<BoxSlots>, String>, console: &mut Co
 }
 
 /// Whether the look `took` left the session holding a claim; with every slot held, the `full` refusal ([`full_said`]);
-/// a pool that could not be read or written, `gate: slots failed: {why}` and [`FAILED_STATUS`].
-fn claim_held(took: Result<SessionTake, String>, payload: &Payload, console: &mut Console) -> Result<bool, u32> {
+/// a drain lock another process held past its retry, the `busy` refusal ([`drain::busy_said`]); a pool that could not
+/// be read or written, `gate: slots failed: {why}` and [`FAILED_STATUS`].
+fn claim_held(took: Result<SessionTake, DrainError>, payload: &Payload, console: &mut Console) -> Result<bool, u32> {
     match took {
         Ok(SessionTake::Held) => Ok(true),
         Ok(SessionTake::Unneeded) => Ok(false),
         Ok(SessionTake::Full { held, count }) => Err(full_said(payload, held, count, console)),
-        Err(why) => Err(slots_failed(&why, console)),
+        Err(DrainError::Busy(why)) => Err(drain::busy_said(payload, &why, console)),
+        Err(DrainError::Failed(why)) => Err(slots_failed(&why, console)),
     }
 }
 
 /// Holds a slot for the admitted run of the session `payload` names, its command text `command` and job `job`, under
 /// the work folder `work`'s root: the slot its preflight took, or a free one when its claim lapsed and was taken
 /// ([`session_took`]): whether the session now holds a claim. With every slot held: the `full` refusal tag and the full
-/// line ([`full_said`]), and [`REFUSED_STATUS`]. A run with no session, or under a root not there or with no count
-/// file, takes none. Else `gate: slots failed: {why}` and [`FAILED_STATUS`].
+/// line ([`full_said`]), and [`REFUSED_STATUS`]; a drain lock another process held past its retry, the `busy` tag and
+/// line ([`drain::busy_said`]), and [`REFUSED_STATUS`]. A run with no session, or under a root not there or with no
+/// count file, takes none. Else `gate: slots failed: {why}` and [`FAILED_STATUS`].
 pub(crate) fn run_taken(work: &str, payload: &Payload, run: (&str, &str), seams: &BoxSeams, console: &mut Console) -> Result<bool, u32> {
     let session = drain::session_of(payload, run.0, run.1).map_err(|why| slots_failed(&why, console))?;
     let Some(session) = session else {
@@ -341,7 +345,7 @@ fn released(work: &str, session: &str) -> Result<(), String> {
     {
         return Ok(());
     }
-    let _lock = drain::take_drain_lock(&drain_path.join(LOCK))?;
+    let _lock = drain::take_drain_lock(&drain_path.join(LOCK), LOCK_RETRY).map_err(DrainError::into_text)?;
     let names = gate_win32::names_beneath(&folder).map_err(|error| cannot("list", &path, &error))?;
     for name in names.iter().filter_map(|name| name.to_str()).filter(|name| {
         Path::new(name)
@@ -410,6 +414,7 @@ fn look(root: &HeldRoot<'_>, count: u32, hold: &HoldRequest, seams: &BoxSeams, c
         drain::write_text(&slot.folder, &name, &claim.text(), &security).map_err(|error| cannot("write", &path.join(&name), &error))?;
         Ok(Looked::Slot(slot))
     })
+    .map_err(DrainError::into_text)
 }
 
 /// Answers `gate box hold`: takes one of the builder's own slots under its root and runs its command while it holds
@@ -609,5 +614,135 @@ fn passed_on(mut from: File, mut to: impl Write) -> io::Result<()> {
         };
         to.write_all(&buffer[..read])?;
         to.flush()?;
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "a test that cannot make or read its slots must fail loudly")]
+mod tests {
+    use std::fs;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::path::{Path, PathBuf};
+
+    use base64::Engine as _;
+    use gate_args::BoxSeams;
+    use gate_wire::PathForm;
+    use serde_json::json;
+
+    use super::{HeldRoot, Session, taken};
+    use crate::answer::FAILED_STATUS;
+    use crate::boxside::drain::admit;
+    use crate::boxside::preflight;
+    use crate::boxside::run::REFUSED_STATUS;
+    use crate::console::Console;
+
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+    const VERSION: &str = "gate: remote version x";
+
+    /// A scratch root `gate-slots-{name}-{pid}` under the temp folder, made empty and held as the preflight holds one,
+    /// its `drain\` readied and a count file of two slots: the root and its held folder.
+    fn counted_root(name: &str) -> (PathBuf, fs::File) {
+        let root = crate::test_support::temp_dir().join(format!("gate-slots-{name}-{}", std::process::id()));
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("an earlier scratch root can be removed");
+        }
+        fs::create_dir_all(&root).expect("the scratch root can be made");
+        let held = preflight::held_folder_at(&root)
+            .expect("the scratch root can be opened")
+            .expect("the scratch root is a folder");
+        let held_root = HeldRoot { held: &held, path: &root };
+        let mut console = Console::new();
+        drop(admit(&held_root, Some(&session()), true, &BoxSeams::default(), &mut console).expect("the drain can be readied"));
+        let count = root.join(gate_wire::slots::COUNT_FILE);
+        fs::write(&count, json!({ "v": 1, "slots": 2 }).to_string()).expect("the count file can be written");
+        (root, held)
+    }
+
+    /// The session every case takes a slot for.
+    fn session() -> Session<'static> {
+        Session {
+            id: "s1",
+            pc: "pc1",
+            repo: "repo1",
+            command: "",
+            job: "",
+        }
+    }
+
+    /// A payload naming the session `s1`, with a nonce.
+    fn payload() -> gate_wire::Payload {
+        let word = base64::engine::general_purpose::STANDARD.encode(json!({ "Nonce": NONCE, "Session": "s1" }).to_string());
+        gate_wire::Payload::decode(&word, PathForm::Windows).expect("the payload decodes")
+    }
+
+    /// The seams a case uses so a drain lock held past its retry gives up in milliseconds.
+    fn quick_retry() -> BoxSeams {
+        BoxSeams {
+            drain_lock_ms: Some(50),
+            ..BoxSeams::default()
+        }
+    }
+
+    /// The drain lock of `root`, held open and shared with no one, as a box process frozen in a file operation under
+    /// the lock holds it.
+    fn frozen_lock(root: &Path) -> fs::File {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(root.join("drain").join("lock"))
+            .expect("the drain lock can be held")
+    }
+
+    /// The line a busy refusal says for the lock at `lock`.
+    fn busy_line(lock: &Path) -> String {
+        gate_wire::drain::builder_busy_line(&format!(
+            "the drain lock {} is held by another process",
+            gate_wire::escaped(&lock.to_string_lossy())
+        ))
+    }
+
+    #[test]
+    fn a_slot_take_that_finds_the_drain_lock_held_is_refused_busy() {
+        let (root, held) = counted_root("lock-held");
+        let held_root = HeldRoot { held: &held, path: &root };
+        let mut console = Console::new();
+        let lock = root.join("drain").join("lock");
+        let _frozen = frozen_lock(&root);
+
+        let said = taken(&held_root, Some(&session()), &payload(), VERSION, &quick_retry(), &mut console);
+        let notes = console.take_notes();
+
+        assert_eq!(
+            said.err(),
+            Some(REFUSED_STATUS),
+            "a slot take whose drain lock stays held is busy, not failed"
+        );
+        assert_eq!(
+            notes,
+            [gate_wire::refused_line(NONCE, gate_wire::Refusal::Busy), busy_line(&lock)],
+            "the busy tag and line are said on stderr"
+        );
+    }
+
+    #[test]
+    fn a_slot_take_whose_pool_cannot_be_written_still_fails() {
+        let (root, held) = counted_root("pool-file");
+        let held_root = HeldRoot { held: &held, path: &root };
+        let mut console = Console::new();
+        fs::write(root.join("slots"), "not a folder").expect("a file can stand where the slots folder belongs");
+
+        let said = taken(&held_root, Some(&session()), &payload(), VERSION, &quick_retry(), &mut console);
+        let notes = console.take_notes();
+
+        assert_eq!(
+            said.err(),
+            Some(u32::from(FAILED_STATUS)),
+            "a slot pool that cannot be read is no busy builder"
+        );
+        assert!(
+            notes.iter().any(|line| line.starts_with("gate: slots failed: ")),
+            "the slot pool's failure is said: {notes:?}"
+        );
     }
 }

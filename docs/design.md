@@ -255,7 +255,9 @@ A note on stderr never fails the push: `push: <host>: no slot count written: <wh
 
 `push: <host>: could not stop the version read of <path>: <message>` says a version read past its bound could not be killed (the read still gives no version).
 
-Last of all, after the prune sweep, a push that got past reading the installed files (a partial failure included) clears the push-pending marker `tools/install.ps1` wrote ([Install](#install)), under this PC's `push.lock` (tried again for up to 10 s while an install holds it). A marker naming the version this push sent is removed, saying nothing. A marker naming another build stays, with `push: left the push-pending marker for gate <v>: this push sent gate <raw_version>` on stderr; one that cannot be read, removed or locked for is left with `push: could not clear the push-pending marker: <why>; it expires within 10 minutes`. The push's exit never changes for it, and a push refused before any builder (the refusals above) leaves the marker.
+Last of all, after the prune sweep, a push that got past reading the installed files (a partial failure included) clears the push-pending marker `tools/install.ps1` wrote ([Install](#install)), under this PC's `push.lock` (tried again for up to 10 s while an install holds it). A marker naming the version this push sent is removed, saying nothing.
+
+A marker naming another build stays, with `push: left the push-pending marker for gate <v>: this push sent gate <raw_version>` on stderr; one that cannot be read, removed or locked for is left with `push: could not clear the push-pending marker: <why>; it expires within 10 minutes`. The push's exit never changes for it, and a push refused before any builder (the refusals above) leaves the marker.
 
 After the builder's other stdout lines, a push that ends with `gate.exe` missing or one it could not verify left in place, and with aside copies in the folder, says `push: <host>: kept <n> aside copies: gate.exe is not verified` on stdout, `<n>` counting every `gate.exe.*.old` present, this push's own included. It is never a failure by itself: an exe identical to the installed one that does not answer `--version` still says `already installed` and exits 0, with this line after it.
 
@@ -2539,11 +2541,15 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   Nothing is handed over, and the run takes the `version` fallback silently, for a commit stage, a rerouted held-back run, a gate that was itself handed over (`GATE_HANDED_OVER` set, so a run is handed over once), after a Ctrl+C, and when the installed gate is missing, unreadable, of this gate's own build or unlike the builder's. The installed gate's `--version` is read last, once every other check passed, with the 30 s bound `gate push` gives it (`installed.rs`, which `push` shares).
 
-  **A pending gate push.** A routed run between a reinstall and its `gate push` finds the builder on the old build, so it is refused `version` (with a build, with none, or with no gate box at all while the push replaces gate.exe). While the push-pending marker `tools/install.ps1` wrote ([Install](#install)) names this gate's own build and is fresh, the run waits and checks again instead of falling back. Fresh is a last-write time under 10 minutes old and no more than 5 s ahead of now, plus a monotonic deadline kept per marker (a marker of a new identity, its version and last write, gets one), so 10 minutes is also the longest a run waits when no push follows.
+  **A pending gate push.** A routed run between a reinstall and its `gate push` finds the builder on the old build, so it is refused `version` (with a build, with none, or with no gate box at all while the push replaces gate.exe). While the push-pending marker `tools/install.ps1` wrote ([Install](#install)) names this gate's own build and is fresh, the run waits and checks again instead of falling back.
+
+  Fresh is a last-write time under 10 minutes old and no more than 5 s ahead of now, plus a monotonic deadline kept per marker (a marker of a new identity, its version and last write, gets one), so 10 minutes is also the longest a run waits when no push follows.
 
   The run says once `gate: waiting for the pending gate push to bring the builder <alias> to gate <own>` and every heartbeat `gate: still waiting for the pending gate push to bring the builder <alias> to gate <own> (<n> s)`, polling the builder's preflight alone every drain poll, as the wait behind a builder drain does ([Builder drain](#routing)). A poll that is no version refusal ends the wait and calls the builder again; a poll the drain refuses sends the run to wait behind the drain.
 
-  The wait also ends when the marker stops being fresh and this build's, saying `gate: stopped waiting for the builder <alias>: <why>`, `<why>` being `the push is no longer pending`, `a later install is pending, gate <v>`, `the pending push is over 10 minutes old` or `the push-pending marker cannot be read`; the builder is then called once more and the run goes on with that outcome: a handover, a fallback or a run there. A marker that cannot be read or is malformed is noted to the log once per wait.
+  The wait also ends when the marker stops being fresh and this build's, saying `gate: stopped waiting for the builder <alias>: <why>`, `<why>` being `the push is no longer pending`, `a later install is pending, gate <v>`, `the pending push is over 10 minutes old` or `the push-pending marker cannot be read`; the builder is then called once more and the run goes on with that outcome: a handover, a fallback or a run there.
+
+  A marker that cannot be read or is malformed is noted to the log once per wait.
 
   The wait keeps the run's work-folder key and remote slot, holds a drain marker as the drain wait does (so other runs' remote-slot and key waits are held off), and adds nothing to the remote budget. A commit's pre-commit stage and a rerouted held-back run never wait, and a stale PC gate (its own build differs from the marker's) never waits, so the stale-gate handover above is unchanged.
 
@@ -3162,7 +3168,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     An older box never says the line, so its refusal stays `preparing ... failed (status 1)`, and an older PC gate fails such a run with status 1 rather than falling back.
 
-    Any other non-zero status says `gate: preparing <builder root> on <host> failed (status <n>)` and ends the run with that status. A reported version text other than this PC's whole one, build id included, says `gate: not routed: <host> runs gate <theirs|unknown>, this PC <ours>; run gate push` and falls back `version`, unless a fresh push-pending marker names this gate's own build, when the run waits for the push instead (A pending gate push, under [Routing](#routing)); the builder's version is its first 4 KiB, escaped.
+    Any other non-zero status says `gate: preparing <builder root> on <host> failed (status <n>)` and ends the run with that status.
+
+    A reported version text other than this PC's whole one, build id included, says `gate: not routed: <host> runs gate <theirs|unknown>, this PC <ours>; run gate push` and falls back `version`, unless a fresh push-pending marker names this gate's own build, when the run waits for the push instead (A pending gate push, under [Routing](#routing)); the builder's version is its first 4 KiB, escaped.
 
     The client also reads the preflight's `gate: remote warm <none|64 lower-case hex>` line, only the line right after the last `gate: remote version` line: anything else there, no such line, or a warm line elsewhere reads as no warmth.
 
@@ -4414,7 +4422,7 @@ Built verbs:
 
   A run with a `Session` under a root that has a `slots.json` holds a builder-side slot ([Builder-side slots](#slots)) from after its drain admission to its end: the slot its preflight took, kept; or, when that claim lapsed and was taken, a free one; or with every slot held it is refused as the preflight is, `gate-remote-refused: {nonce} full` and the full line on stderr, exit 75.
 
-  A slot pool that cannot be read or written says `gate: slots failed: {why}` and exits 1, and a pair run also says `gate: remote back commits: failed`.
+  A slot pool that cannot be read or written says `gate: slots failed: {why}` and exits 1 (a drain lock still held past its retry at the slot take is the busy refusal of `drain`, The gated verbs), and a pair run also says `gate: remote back commits: failed`.
 
   The run's slot is let go when the run returns, with `gate: slot release failed: {why}` on the box's stderr when its claim could not be removed. The release is armed only once the work-folder lock is taken, so a second call of a session refused `busy` leaves the live run's claim alone.
 
@@ -5190,7 +5198,7 @@ Built verbs:
 
   The root is held as the preflight holds it (read access, no delete sharing), and a raise makes a missing root and `drain\`; a `status` or a `lift` of a root or `drain\` that is not there answers as no barrier and changes nothing.
 
-  - `lock`: the drain lock, shared with no one, held around each read-modify of the files below and never across a wait or a child process; a call that finds it held tries again for 10 s, then fails.
+  - `lock`: the drain lock, shared with no one, held around each read-modify of the files below and never across a wait or a child process; a call that finds it held tries again for 10 s, then fails. The admission of `preflight`, `run`, `inputs` and `lfs` and the slot take of `preflight` and `run` answer a lock still held then as busy (below, The gated verbs); the `outputs` renewal, the slot release, the `hold` look and the `drain` verb fail as any drain error does.
   - `barrier`: `{"Raised","Lapses","Generation"}`, written by a raise. It lapses 30 minutes after the last raise, and a raise while it stands raises the generation by one. A barrier file that does not read stands as one raised at its last write, so a damaged one holds the drain for one lapse and no longer.
   - `lapsed` and `lifted`: `{"At"}`, the time the barrier lapsed or was lifted. A lift removes `barrier` and `lapsed` and writes `lifted`.
   - `tickets\{seq:08}-{session}`: `{"Session","Polled"}`, one per run waiting in line; a ticket is live for 120 s after its last poll, the box's boot or the last lift or lapse, whichever is latest.
@@ -5206,6 +5214,8 @@ Built verbs:
 
   The exit status is 0 once it answered, 1 after `gate: drain failed: {why}`, 2 on usage. The test seams `--test-box-drain-lease-ms <n>` (the 120 s lease), `--test-box-drain-lapse-ms <n>` (the 30 minute lapse), `--test-box-now <unix s>` (the time the drain judges at) and `--test-box-drain-readable-only true|false` (count only processes whose command line it reads) go before the verb.
 
+  `--test-box-drain-lock-ms <n>` (a whole number above 0) replaces the 10 s retry of the drain lock for the admission and the slot take; the slot release keeps the built-in 10 s.
+
   `admit` in the same module is the one admission function the routed verbs pass: in one hold of the lock it admits a call or refuses it, a refusal being the `Refused` place in line with the barrier's raise and lapse times.
 
   It writes the session record and takes the holder on admission, and takes or renews the ticket on a refusal unless `NoTicket`. The refusal tag word `drain` (`gate_wire::Refusal::Drain`, `gate-remote-refused: {nonce} drain`) is for that refusal; the PC's run waits on it ([Routing](#routing), Builder drain).
@@ -5216,7 +5226,11 @@ Built verbs:
 
   A refused `preflight` says `gate: remote version {v}` on stdout, then on stderr and unstamped: `gate-remote-refused: {nonce} drain` (when the payload has a `Nonce`), `gate: drain place {n}` or `gate: drain place none`, and `gate: drain barrier {raised} {lapses}` or `gate: drain barrier none`, and exits 75. Unless `NoTicket`, it leaves a ticket `drain\tickets\{seq:08}-{session}`.
 
-  A refused `run`, `inputs` or `lfs` says the same stderr lines, leaves no ticket and exits 75; `inputs` refuses before it reads its stdin manifest, and `lfs` is tagged `drain`, not `lfs`. A drain error from any gated verb is `gate: drain failed: {why}` on stderr and exit 1 (a preflight says its version line first, and a sibling pair's `run` also says `gate: remote back commits: failed`).
+  A refused `run`, `inputs` or `lfs` says the same stderr lines, leaves no ticket and exits 75; `inputs` refuses before it reads its stdin manifest, and `lfs` is tagged `drain`, not `lfs`.
+
+  A drain lock still held when its retry runs out refuses the admission of `preflight`, `run`, `inputs` and `lfs` (and the slot take of `preflight` and `run`) as busy: `gate-remote-refused: {nonce} busy` (when the payload has a `Nonce`), then `gate: remote builder busy: the drain lock {path} is held by another process`, exit 75. A refused `preflight` says its version line first, on stdout. The PC goes to the next builder, then runs here, and an `inputs` or `lfs` call ending busy falls back as its own `inputs` or `lfs` refusal.
+
+  `gate_wire::drain::builder_busy_line` makes the second line. Any other drain error from a gated verb is `gate: drain failed: {why}` on stderr and exit 1 (a preflight says its version line first, and a sibling pair's `run` also says `gate: remote back commits: failed`).
 
   **Order and liveness.** A ticket is numbered under the lock at a run's first refused preflight, keyed by its session, and renewed on each poll, never renumbered. A run is admitted only when no older live ticket waits, even with no barrier standing, so runs that arrive after a lift queue behind the waiters. `gate check --builder` and warm-ups send `NoTicket` and never queue.
 
@@ -5576,7 +5590,9 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
 - **`drain`** (`drain.rs`) is the builder drain's barrier ([The box side](#the-box-side), `drain`) on the Unix box: `gate-box box drain --stdin` with the payload `{"Root","Action"}`, `Action` being `raise`, `status` or `lift`. The shared pure rules (the clock, the barrier parse, tickets, the decision, the status and refusal lines, the constants, and the matching that counts processes) are in `gate_wire::drain`, which the Windows box calls too; this lists where the Unix box differs.
 
-  Its files are the Windows box's, under `{root}/drain/`: `lock`, `barrier`, `lapsed`, `lifted`, `tickets/`, `sessions/{session}` and the holder `sessions/{session}.{pid}`, an `flock` the admitted process keeps. The drain lock is the same file taken with `flock`, tried again every 20 ms for 10 s while it is busy.
+  Its files are the Windows box's, under `{root}/drain/`: `lock`, `barrier`, `lapsed`, `lifted`, `tickets/`, `sessions/{session}` and the holder `sessions/{session}.{pid}`, an `flock` the admitted process keeps.
+
+  The drain lock is the same file taken with `flock`, tried again every 20 ms for 10 s while it is busy (`--test-box-drain-lock-ms` as on the Windows box); a lock still held then refuses the admission and the slot take busy, status 75, as the Windows box does, and fails the other calls as a drain error.
 
   The folder is judged as every Unix box folder is: owned by the box's euid, mode 0700, not a link. A `drain` that is not that folder is renamed aside as itself and never followed (`gate: drain moved aside {path} to drain.gate-moved-{n}: it was not the box's protected folder`), where the Windows box moves aside a folder of other security. A raise on a missing root makes the root through the preflight's trusted-root path, at 0700.
 
@@ -5956,7 +5972,9 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
   `-WhatIf` lists `What if: Performing the operation "Write" on target "<bin>\source.json".`, or `"Delete"` when the files are already installed and the installed gate does not answer, and writes and deletes nothing. The script sets `$PSNativeCommandUseErrorActionPreference = $false`, so a caller profile's `$true` does not turn git's exit 1 into a throw.
 - An install that changed gate.exe or the helper, and whose gate answered `--version`, writes the push-pending marker `%LOCALAPPDATA%\gate\bin\push-pending` ([Push-pending marker](GLOSSARY.md)): the installed gate's whole version text and one LF, UTF-8 without a byte order mark. An install of the same files writes none.
 
-  It goes through a temp file `push-pending.<pid>.tmp` and a move, a leftover temp of that name from a killed run being removed first and the move tried again a few times; the source.json temp is swept the same way (`Remove-LeftoverTemp -Pattern`). A write that fails leaves the install as it was, exit 0, and prints `install: could not write the push-pending marker <path>: <message>; routed runs fall back until gate push ends`. `-WhatIf` lists `Write push-pending marker` for an install that changes the files and none for files already in place. The marker is what a routed run of this build waits on and `gate push` clears ([`gate push`](#gate-push), [Routing](#routing), A pending gate push).
+  It goes through a temp file `push-pending.<pid>.tmp` and a move, a leftover temp of that name from a killed run being removed first and the move tried again a few times; the source.json temp is swept the same way (`Remove-LeftoverTemp -Pattern`).
+
+  A write that fails leaves the install as it was, exit 0, and prints `install: could not write the push-pending marker <path>: <message>; routed runs fall back until gate push ends`. `-WhatIf` lists `Write push-pending marker` for an install that changes the files and none for files already in place. The marker is what a routed run of this build waits on and `gate push` clears ([`gate push`](#gate-push), [Routing](#routing), A pending gate push).
 - Every install deletes a leftover `remote-bridge.ps1` file in the install folder, which no gate starts. When it cannot, it prints `install: cannot remove the old remote-bridge.ps1 (<reason>); it is unused` on stderr and carries on with exit 0; a folder at that name is left alone.
 - The script installs locally only. `gate push` copies the installed gate.exe and the desktop helper to each builder in `remote.json` (`host`, then `hosts`), into the builder's `C:\Program Files\gate\bin` with the same rename-aside, and registers the desktop task there on every push, so a machine with builders runs `pwsh tools/install.ps1` and then `gate push` ([`gate push`](#gate-push)).
 

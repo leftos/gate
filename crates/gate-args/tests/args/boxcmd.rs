@@ -171,6 +171,22 @@ fn hold_takes_the_poll_seam_before_its_verb() {
     assert!(refused[0].contains("--test-box-hold-poll-ms"), "{refused:?}");
 }
 
+#[cfg(feature = "test-seams")]
+#[test]
+fn a_box_seam_sets_the_drain_lock_retry() {
+    let mut words = vec!["box", "--test-box-drain-lock-ms", "50"];
+    words.extend_from_slice(&hold_words(&["--root", r"C:\x", "--holder", "ci 7", "--ceiling", "60"], &["a"])[1..]);
+    let seams = BoxSeams {
+        drain_lock_ms: Some(50),
+        ..BoxSeams::default()
+    };
+    assert_eq!(invocation(&words), held_with(seams, 0, vec![OsString::from("a")]));
+    words[2] = "0";
+    let refused = problems(&words);
+    assert_eq!(refused.len(), 1, "a retry of 0 is refused: {refused:?}");
+    assert!(refused[0].contains("--test-box-drain-lock-ms"), "{refused:?}");
+}
+
 #[test]
 fn each_verb_parses_with_stdin() {
     for (word, verb) in [

@@ -8,7 +8,7 @@
 //! holds failure outputs to the built-in caps), `--test-inputs-budget-bytes <n>`, `--test-lfs-budget-bytes <n>`,
 //! `--test-dotnet-limit-ms <n>`,
 //! `--test-box-sample-ms <n>`, `--test-box-sampler-fail true|false`, `--test-box-free-percent <1-100>`,
-//! `--test-box-drain-lease-ms <n>`, `--test-box-drain-lapse-ms <n>`, `--test-box-now <unix s>`,
+//! `--test-box-drain-lease-ms <n>`, `--test-box-drain-lapse-ms <n>`, `--test-box-drain-lock-ms <n>`, `--test-box-now <unix s>`,
 //! `--test-box-drain-readable-only true|false`,
 //! `--test-box-kill-leaves <n>`, `--test-probe-limit-ms <n>`, `--test-probe-drain-ms <n>`, `--test-box-desktop <fault>`,
 //! `--test-box-desktop-session <state>`, `--test-box-desktop-mutex <name>`, `--test-box-desktop-ms <n>`,
@@ -224,6 +224,8 @@ enum Seam {
     DrainLeaseMs,
     /// `--test-box-drain-lapse-ms <n>`: how long a drain barrier stands after its last raise.
     DrainLapseMs,
+    /// `--test-box-drain-lock-ms <n>`: how long a call waits for the drain lock another call holds.
+    DrainLockMs,
     /// `--test-box-now <unix s>`: the fixed time the drain judges its barrier, tickets and sessions at.
     Now,
     /// `--test-box-drain-readable-only true|false`: the drained test counts only processes whose command line it reads.
@@ -295,6 +297,7 @@ impl Seam {
             "--test-box-free-percent" => Some(Seam::FreePercent),
             "--test-box-drain-lease-ms" => Some(Seam::DrainLeaseMs),
             "--test-box-drain-lapse-ms" => Some(Seam::DrainLapseMs),
+            "--test-box-drain-lock-ms" => Some(Seam::DrainLockMs),
             "--test-box-now" => Some(Seam::Now),
             "--test-box-drain-readable-only" => Some(Seam::DrainReadableOnly),
             "--test-box-kill-leaves" => Some(Seam::KillLeaves),
@@ -339,6 +342,7 @@ impl Seam {
             Seam::FreePercent => "--test-box-free-percent",
             Seam::DrainLeaseMs => "--test-box-drain-lease-ms",
             Seam::DrainLapseMs => "--test-box-drain-lapse-ms",
+            Seam::DrainLockMs => "--test-box-drain-lock-ms",
             Seam::Now => "--test-box-now",
             Seam::DrainReadableOnly => "--test-box-drain-readable-only",
             Seam::KillLeaves => "--test-box-kill-leaves",
@@ -427,6 +431,7 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::FreePercent => seams.free_percent = Some(crate::values::in_range(name, &value, 1, 100)?),
         Seam::DrainLeaseMs => seams.drain_lease_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::DrainLapseMs => seams.drain_lapse_ms = Some(crate::values::above_zero(name, &value)?),
+        Seam::DrainLockMs => seams.drain_lock_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::HoldPollMs => seams.hold_poll_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::Now => seams.now = Some(crate::values::above_zero(name, &value)?),
         Seam::DrainReadableOnly => {
