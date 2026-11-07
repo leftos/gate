@@ -8757,10 +8757,48 @@ struct LetGo<'c>(&'c Case);
 impl Drop for LetGo<'_> {
     #[expect(clippy::print_stderr, reason = "a let-go path that cannot be written says so in the case's output")]
     fn drop(&mut self) {
-        // A path that cannot be written leaves the command to its own wait limit, said so the case's output shows it.
-        if let Err(error) = fs::write(let_go_path(self.0), "") {
-            eprintln!("cannot write the let-go path {}: {error}", let_go_path(self.0).display());
+        // The case's path, which a box park seam names as written, and its twin in the builder's work folder, where the
+        // routed command's word resolves: the rewrite made it relative to the worktree, the case folder. A path that
+        // cannot be written leaves the command to its own wait limit, said so the case's output shows it.
+        let mut paths = vec![let_go_path(self.0)];
+        if let Some(work) = work_folder_if_queued(self.0) {
+            paths.push(work.join("ssh").join("let-go"));
         }
+        for path in paths {
+            let made = path.parent().map_or(Ok(()), fs::create_dir_all).and_then(|()| fs::write(&path, ""));
+            if let Err(error) = made {
+                eprintln!("cannot write the let-go path {}: {error}", path.display());
+            }
+        }
+    }
+}
+
+/// How long the box of a let-go run may take to end once its command is let go: a hang guard, as the command ends at
+/// its next 20 ms look for the path and the box with it.
+const LET_GO_GUARD: Duration = Duration::from_secs(60);
+
+/// Lets the held command of `case` go ([`LetGo`]) and waits until the builder's work folder lock is free, which the box
+/// holds, shared with no one, until its run ends: the case leaves no box and no command of its own running.
+fn let_go_and_see_the_box_end(case: &Case) {
+    drop(LetGo(case));
+    let work = work_folder(case);
+    let lock = work.with_file_name(format!(
+        "{}.lock",
+        work.file_name().expect("the work folder has a name").to_string_lossy()
+    ));
+    let free = || match fs::OpenOptions::new().read(true).share_mode(0).open(&lock) {
+        Ok(_) => true,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    };
+    let deadline = Instant::now() + LET_GO_GUARD;
+    while !free() {
+        assert!(
+            Instant::now() < deadline,
+            "{} s after the let-go, the box's run still holds {}: its command never saw the let-go",
+            LET_GO_GUARD.as_secs(),
+            lock.display()
+        );
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -8918,6 +8956,7 @@ fn a_pc_cut_fetch_the_watchdog_stops_keeps_the_stall_verdict() {
         kills.last().is_some_and(|line| line.starts_with("gate: TRANSFER TIMED OUT")),
         "the fetch's own kill line last: {log}"
     );
+    let_go_and_see_the_box_end(&case);
 }
 
 /// The PC stalls a run whose stop then fails, and the box's run outlasts the short wait the fetch asks for: the box
@@ -8950,6 +8989,7 @@ fn a_pc_cut_run_whose_pack_outlasts_the_cut_wait_says_transfer_failed_and_stays_
     );
     assert_eq!(verdict(&case), "stalled", "{outcome:?}");
     assert!(!case.folder().join("dumps").join("a.dmp").exists(), "nothing is installed: {outcome:?}");
+    let_go_and_see_the_box_end(&case);
 }
 
 /// The PC stalls a run, and the first fetch after the cut gets the whole archive, which the box then removes, but ends
