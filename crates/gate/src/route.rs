@@ -78,9 +78,6 @@ const DESKTOP_FILE: &str = "desktop file";
 const DESKTOP_NOT_ALLOWED: &str = "desktop not allowed";
 /// The `notRouted` value of a dotnet `--no-build` run kept here because its last build ran here and cannot be sent.
 const BUILT_HERE: &str = "built here";
-/// The `notRouted` value of a sibling pair's run whose inputs go only to a Windows builder, and none routes the
-/// command.
-const PAIR_INPUTS_MAC_ONLY: &str = "pair inputs mac only";
 /// The `notRouted` value of a command none of its repo's patterns matched.
 const NO_PATTERN: &str = "no pattern";
 /// The declaration file of the prefixes of the caller's variables a repo's commands read.
@@ -631,9 +628,7 @@ fn consented_hash(remote: &RemoteRun, machine: &Machine<'_>) -> Option<String> {
 ///   ([`LocalReason::DeclaredLocal`], [`LocalReason::LocalFile`]);
 /// - `gitignored input`: one whose word names a gitignored project input it cannot carry
 ///   ([`LocalReason::GitignoredPastCap`], [`LocalReason::GitignoredUnsent`]);
-/// - `built here`: a `--no-build` run whose last build ran here and cannot be sent ([`LocalReason::BuiltHere`]);
-/// - `pair inputs mac only`: a sibling pair's run that carries inputs, whose inputs go only to a Windows builder and
-///   none routes the command ([`LocalReason::PairInputsMacOnly`]).
+/// - `built here`: a `--no-build` run whose last build ran here and cannot be sent ([`LocalReason::BuiltHere`]).
 ///
 /// An unusable routing file ([`LocalReason::Ignored`]), a desktop command under a parent gate
 /// ([`LocalReason::DesktopUnderParent`]) and a routable command under one ([`LocalReason::RoutableUnderParent`]) write
@@ -665,7 +660,6 @@ pub(crate) fn not_routed(route: &Route, sent: Option<&Sent>) -> Option<String> {
             LocalReason::LocalFile { .. } | LocalReason::DeclaredLocal { .. } => DECLARED_LOCAL,
             LocalReason::GitignoredPastCap { .. } | LocalReason::GitignoredUnsent { .. } => GITIGNORED_INPUT,
             LocalReason::BuiltHere { .. } => BUILT_HERE,
-            LocalReason::PairInputsMacOnly => PAIR_INPUTS_MAC_ONLY,
         },
         Route::Local { reason: None } if sent.is_some_and(|sent| !sent.matched) => NO_PATTERN,
         _ => return None,
@@ -4876,7 +4870,6 @@ mod tests {
             ),
             (LocalReason::GitignoredUnsent { path: x(), why: x() }, "gitignored input"),
             (LocalReason::BuiltHere { project: x() }, "built here"),
-            (LocalReason::PairInputsMacOnly, "pair inputs mac only"),
             (LocalReason::DesktopUnderParent { pattern: x() }, NO_TOKEN),
             (LocalReason::RoutableUnderParent { pattern: x() }, NO_TOKEN),
         ];

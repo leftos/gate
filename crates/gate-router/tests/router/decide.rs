@@ -7004,25 +7004,26 @@ fn pair_facts_listing(host_repos: &str, builders: &str, extra: &str) -> FakeFact
 }
 
 #[test]
-fn a_pair_run_that_carries_a_gitignored_input_steers_off_the_mac_to_windows() {
+fn a_pair_run_that_carries_a_gitignored_input_stays_on_the_mac() {
     let command = words(&["dotnet", "test", ".tmp/probe"]);
     let facts = pair_facts(MAC_THEN_WINDOWS_PAIR, "");
     let run = routed(decide(&heavy(&command), &facts));
-    assert_eq!(run.builder.alias, "win-2", "a pair's carried input leaves the Mac");
+    assert_eq!(run.builder.alias, "mac-1", "the Mac takes a pair's carried input");
     assert_eq!(run.inputs, marked(&[".tmp/probe/Probe.csproj"]), "the input is still carried");
     assert_eq!(
         later_aliases(&run),
-        ["builder-1"],
-        "the host is still a later candidate; the Mac never takes the inputs"
+        ["win-2", "builder-1"],
+        "the Windows builders are still later candidates"
     );
 }
 
 #[test]
-fn a_pair_run_with_declared_inputs_steers_off_the_mac() {
+fn a_pair_run_with_declared_inputs_stays_on_the_mac() {
     let facts = pair_facts(MAC_THEN_WINDOWS_PAIR, r#", "inputs": {"yaat": [".tmp/probe/**"]}"#);
     let run = routed(decide(&heavy(&words(&["dotnet", "test"])), &facts));
-    assert_eq!(run.builder.alias, "win-2", "a pair's declared input leaves the Mac");
+    assert_eq!(run.builder.alias, "mac-1", "the Mac takes a pair's declared input");
     assert_eq!(run.inputs, [".tmp/probe/**"]);
+    assert_eq!(later_aliases(&run), ["win-2", "builder-1"]);
 }
 
 #[test]
@@ -7048,105 +7049,37 @@ fn a_single_repo_run_with_inputs_still_goes_to_the_mac() {
 }
 
 #[test]
-fn a_pair_run_pinned_to_the_mac_that_carries_inputs_is_refused() {
+fn a_pair_run_pinned_to_the_mac_that_carries_inputs_is_kept() {
     let command = words(&["dotnet", "test", ".tmp/probe"]);
     let facts = pair_facts(MAC_THEN_WINDOWS_PAIR, "");
-    assert_eq!(
-        refused(decide(&pinned_to(&command, "mac-1"), &facts)).line(),
-        "gate: --builder mac-1 cannot route this run: it sends a sibling pair's inputs, which a macOS builder does not take"
-    );
+    let run = routed(decide(&pinned_to(&command, "mac-1"), &facts));
+    assert_eq!(run.builder.alias, "mac-1", "the pin keeps the Mac");
+    assert_eq!(run.inputs, marked(&[".tmp/probe/Probe.csproj"]), "the input is still carried");
 }
 
 #[test]
-fn a_later_mac_candidate_is_skipped_for_a_pair_run_that_carries_inputs() {
+fn a_later_mac_candidate_takes_a_pair_run_that_carries_inputs() {
     let command = words(&["dotnet", "test", ".tmp/probe"]);
     let facts = pair_facts(WINDOWS_THEN_MAC_PAIR, "");
     let run = routed(decide(&heavy(&command), &facts));
     assert_eq!(run.builder.alias, "win-2");
     assert_eq!(later_aliases(&run), ["mac-1", "builder-1"]);
-    assert!(
-        matches!(later_of(&run, 0, &command, &facts), Err(None)),
-        "the Mac never takes a pair's inputs, so the candidate is skipped silently"
-    );
+    let later = later_of(&run, 0, &command, &facts).expect("the Mac takes a pair's inputs as a later candidate");
+    assert_eq!(later.builder.alias, "mac-1");
+    assert_eq!(later.inputs, marked(&[".tmp/probe/Probe.csproj"]), "the input is still carried");
 }
 
 #[test]
-fn a_steered_pair_run_asks_the_builder_figures_and_the_local_p50_once() {
-    let command = words(&["dotnet", "test", ".tmp/probe"]);
-    let facts = FakeFacts {
-        local_p50: Some(5.0),
-        ..pair_facts(MAC_THEN_WINDOWS_PAIR, "")
-    };
-    let run = routed(decide(&light(&command), &facts));
-    assert_eq!(run.builder.alias, "win-2", "the pair's carried input leaves the Mac");
-    assert_eq!(facts.local_p50_asked.get(), 1, "the local p50 is asked once");
-    assert_eq!(facts.figures_asked.get(), 1, "the builders' figures are asked once");
-    assert!(facts.cross_targets_asked.borrow().is_empty(), "no cross build is planned");
-}
-
-/// The facts of [`pair_facts`] over [`MAC_THEN_WINDOWS_PAIR`] whose builders are scored the Mac first, then `win-2`
-/// at 60 s, then the host at 80 s.
-fn scored_pair_facts() -> FakeFacts {
-    pair_facts(MAC_THEN_WINDOWS_PAIR, "")
-        .with_figures("mac-1", figures(0.0, Some(5.0)))
-        .with_figures("win-2", figures(0.0, Some(60.0)))
-        .with_figures("builder-1", figures(0.0, Some(80.0)))
-}
-
-#[test]
-fn a_light_steered_pair_run_faster_here_than_the_windows_builder_stays_here_saying_so() {
-    let command = words(&["dotnet", "test", ".tmp/probe"]);
-    let facts = FakeFacts {
-        local_p50: Some(9.0),
-        ..scored_pair_facts()
-    };
-    assert_eq!(
-        decide(&light(&command), &facts),
-        Route::Local {
-            reason: Some(LocalReason::FasterHere {
-                here_tenths: 90,
-                builder: "win-2".to_owned(),
-                there_tenths: 600,
-            })
-        },
-        "the Mac takes no pair's inputs, so its 5 s is no finish to compare with"
-    );
-}
-
-#[test]
-fn a_steered_pair_run_keeps_its_balanced_record_with_the_windows_pick_first() {
-    let command = words(&["dotnet", "test", ".tmp/probe"]);
-    let run = routed(decide(&heavy(&command), &scored_pair_facts()));
-    assert_eq!(run.builder.alias, "win-2", "the pair's carried input leaves the Mac");
-    let balanced = run.balanced.as_ref().expect("the steered run keeps its scored builders");
-    let aliases: Vec<&str> = balanced.entries.iter().map(|entry| entry.alias.as_str()).collect();
-    assert_eq!(
-        aliases,
-        ["win-2", "mac-1", "builder-1"],
-        "the Windows pick first, then the rest in score order"
-    );
-    assert_eq!(later_aliases(&run), ["builder-1"], "only a Windows builder is a later candidate");
-}
-
-#[test]
-fn a_pair_run_that_carries_inputs_with_only_a_mac_builder_stays_here_saying_why() {
+fn a_pair_run_that_carries_inputs_with_only_a_mac_builder_goes_to_the_mac() {
     let command = words(&["dotnet", "test", ".tmp/probe"]);
     let facts = pair_facts_listing(r#"{"other": ["*"]}"#, MAC_ONLY_TEST, "");
-    let route = decide(&heavy(&command), &facts);
-    assert_eq!(
-        route,
-        Route::Local {
-            reason: Some(LocalReason::PairInputsMacOnly)
-        }
-    );
-    assert_eq!(
-        local_line(&route).as_deref(),
-        Some("gate: not routed: a sibling pair's inputs go only to a Windows builder, and no Windows builder routes this command")
-    );
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "mac-1", "the one builder takes the pair's inputs");
+    assert!(run.later.is_empty(), "{:?}", later_aliases(&run));
 }
 
 #[test]
-fn a_pair_run_where_only_a_sibling_carries_inputs_steers_off_the_mac() {
+fn a_pair_run_where_only_a_sibling_carries_inputs_stays_on_the_mac() {
     let word = "-p:CustomBeforeMicrosoftCommonTargets=../b/.tmp/probe/probe.targets";
     let command = words(&["dotnet", "build", word]);
     let facts = FakeFacts {
@@ -7154,7 +7087,7 @@ fn a_pair_run_where_only_a_sibling_carries_inputs_steers_off_the_mac() {
         ..pair_probe_with(&[".tmp/probe/probe.targets"])
     };
     let run = routed(decide(&heavy(&command), &facts));
-    assert_eq!(run.builder.alias, "win-2", "a sibling's carried input leaves the Mac");
+    assert_eq!(run.builder.alias, "mac-1", "the Mac takes a sibling's carried input");
     assert!(run.inputs.is_empty(), "{:?}", run.inputs);
     assert_eq!(sibling_inputs(&run), [marked(&[".tmp/probe/probe.targets"])]);
 }

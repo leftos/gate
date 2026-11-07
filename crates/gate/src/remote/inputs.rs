@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use gate_inputs::manifest::{refused_path, tree_split};
 use gate_inputs::names::{is_git_s, is_plain_path};
-use gate_router::{BuilderOs, CARRIED_INPUT, PAIR_CAPS, escaped, work_folder_key};
+use gate_router::{CARRIED_INPUT, PAIR_CAPS, escaped, work_folder_key};
 use gate_state::{FallbackReason, v1};
 use gate_win32::Interrupt;
 use gate_wire::layout_text;
@@ -1043,19 +1043,12 @@ pub(super) fn run_refused(attempt: &mut Attempt<'_, '_>) -> End {
 /// The inputs manifest of `attempt`'s run, its lines logged: its globs' files and its initialized submodules' files
 /// ([`single`]). A run with no input globs and no submodule file carried sends the empty manifest when an earlier run's
 /// carried copies are to be removed ([`emptied`]), else none. A sibling pair's run sends each repo's inputs and its
-/// initialized submodules' files in its own tree ([`pair_sent`]), on a Windows builder only ([`pair_inputs`]): a pair
-/// any of whose trees has globs or an initialized submodule ([`pair_declared`]) refuses another builder. A manifest that cannot
-/// be built or is past a cap refuses the route `inputs` before anything is sent.
+/// initialized submodules' files in its own tree ([`pair_sent`]), to a Windows or a macOS builder alike. A manifest
+/// that cannot be built or is past a cap refuses the route `inputs` before anything is sent.
 pub(super) fn sent(attempt: &mut Attempt<'_, '_>) -> Result<Option<Built>, End> {
     let call = attempt.call;
     if !call.siblings.is_empty() {
-        let trees = std::iter::once((Path::new(call.root), call.inputs))
-            .chain(call.siblings.iter().map(|sibling| (Path::new(sibling.root()), sibling.inputs())));
-        return match pair_inputs(call.builder.os, pair_declared(trees, attempt.git, call.interrupt)) {
-            PairInputs::Sent => pair_sent(attempt),
-            PairInputs::None => Ok(None),
-            PairInputs::Refused(why) => Err(refused(attempt, why)),
-        };
+        return pair_sent(attempt);
     }
     let cache = v1::inputs_hashes_path(call.state_dir, call.builder.id.as_deref(), call.key);
     let asked = Asked {
@@ -1109,66 +1102,6 @@ fn empty_built(manifest: Manifest, marking: Marking, trees: Vec<Tree>) -> Result
         marking,
         trees,
     })
-}
-
-/// Why a sibling pair's run on a macOS builder sends no inputs: its box refuses a pair's inputs request.
-const MACOS_PAIR: &str = "the macOS builder does not take a sibling pair's inputs yet";
-
-/// What a sibling pair's run does with its inputs.
-#[derive(Debug, PartialEq, Eq)]
-enum PairInputs {
-    /// Builds and sends them ([`pair_sent`]).
-    Sent,
-    /// Makes no inputs call: no sweep, its hash caches untouched.
-    None,
-    /// Refuses the route `inputs` before any inputs call, for the reason it holds.
-    Refused(&'static str),
-}
-
-/// Whether a sibling pair's `trees`, each its root and its repo's input globs, may send inputs: any tree has globs or
-/// an initialized submodule ([`initialized_submodule`]), git called bounded by `bounds` and stopped by `interrupt`, so
-/// a builder that does not take a pair's inputs refuses rather than run without a submodule's files. A tree whose
-/// `.gitmodules` lists only uninitialized submodules declares nothing.
-fn pair_declared<'a>(trees: impl IntoIterator<Item = (&'a Path, &'a [String])>, bounds: GitBounds, interrupt: Option<Interrupt>) -> bool {
-    trees
-        .into_iter()
-        .any(|(root, globs)| !globs.is_empty() || initialized_submodule(root, bounds, interrupt))
-}
-
-/// Whether `root` may hold an initialized submodule: false, and no git process started, when its `.gitmodules` is not a
-/// regular file ([`gitmodules_at`]); else whether any path `git config` lists there, of a form the gate carries
-/// ([`carried_form`]), is a real folder holding a `.git` entry ([`Placed::Ready`]). Uncertainty counts as one: a
-/// `.gitmodules` that cannot be read, git that cannot be found, `git config` failing or interrupted, or a folder that
-/// cannot be read or is refused ([`submodule_folder`]).
-fn initialized_submodule(root: &Path, bounds: GitBounds, interrupt: Option<Interrupt>) -> bool {
-    match gitmodules_at(root) {
-        Ok(false) => return false,
-        Ok(true) => {}
-        Err(_) => return true,
-    }
-    let Ok(git) = Git::find(root) else {
-        return true;
-    };
-    let Ok(paths) = submodule_paths(&git, root, bounds, interrupt) else {
-        return true;
-    };
-    paths
-        .iter()
-        .filter(|path| carried_form(path))
-        .any(|path| !matches!(submodule_folder(root, path), Ok(Placed::Absent)))
-}
-
-/// What a sibling pair's run on a builder of `os` does with its inputs, `declared` when any of its trees declares
-/// some: a Windows builder takes them ([`PairInputs::Sent`]); any other, whose box refuses a pair's inputs request, makes
-/// no inputs call when none is declared, and refuses ([`MACOS_PAIR`]) when one is, decided before any tree is hashed.
-fn pair_inputs(os: BuilderOs, declared: bool) -> PairInputs {
-    if os == BuilderOs::Windows {
-        PairInputs::Sent
-    } else if declared {
-        PairInputs::Refused(MACOS_PAIR)
-    } else {
-        PairInputs::None
-    }
 }
 
 /// The inputs manifest of a sibling pair's run ([`built_pair`]): the main repo's tree, its paths prefixed with the leaf
@@ -1983,12 +1916,12 @@ mod tests {
     use std::process::Command;
     use std::time::{Duration, SystemTime};
 
-    use gate_router::{BuilderOs, CARRIED_INPUT, PAIR_CAPS};
+    use gate_router::{CARRIED_INPUT, PAIR_CAPS};
     use serde_json::Value;
 
     use super::{
-        Asked, Built, Caps, End, Marking, PAST_THE_CAP, Pack, PairAsked, PairInputs, PairTree, Single, Unsent, built_pair, carried_form,
-        gitmodules_at, installed_all, made_in_tmp, needed, packed, pair_declared, pair_inputs, relative, single,
+        Asked, Built, Caps, End, Marking, PAST_THE_CAP, Pack, PairAsked, PairTree, Single, Unsent, built_pair, carried_form, gitmodules_at,
+        installed_all, made_in_tmp, needed, packed, relative, single,
     };
     use crate::outputs::hash::sha256_of;
     use crate::outputs::walk::Found;
@@ -2212,50 +2145,6 @@ mod tests {
             "the sibling alone passes the member cap"
         );
         assert_eq!(manifest, format!("{repo}: {PAST_THE_CAP}"), "the sibling alone passes the manifest's cap");
-    }
-
-    #[test]
-    fn a_pair_with_inputs_on_a_macos_builder_falls_back_before_any_inputs_call() {
-        assert_eq!(
-            pair_inputs(BuilderOs::Macos, true),
-            PairInputs::Refused("the macOS builder does not take a sibling pair's inputs yet")
-        );
-        assert_eq!(pair_inputs(BuilderOs::Windows, true), PairInputs::Sent, "a Windows builder takes them");
-    }
-
-    #[test]
-    fn a_pair_tree_declares_inputs_by_its_globs_or_an_initialized_submodule() {
-        let root = worktree("pair-declared", "");
-        let globs = ["secrets/**".to_owned()];
-        assert!(
-            !pair_declared([(&*root, &[][..])], GIT_BOUNDS, None),
-            "no globs and no .gitmodules declare nothing"
-        );
-        assert!(pair_declared([(&*root, &globs[..])], GIT_BOUNDS, None), "globs declare inputs");
-        put(&root, ".gitmodules", &gitmodules(&["tools/shared"]));
-        assert!(
-            !pair_declared([(&*root, &[][..])], GIT_BOUNDS, None),
-            "a .gitmodules whose submodule is not initialized carries no file"
-        );
-        with_submodule(&root);
-        assert!(
-            pair_declared([(&*root, &[][..])], GIT_BOUNDS, None),
-            "an initialized submodule carries its files"
-        );
-    }
-
-    #[test]
-    fn a_macos_pair_without_inputs_asks_for_no_inputs_call() {
-        assert_eq!(
-            pair_inputs(BuilderOs::Macos, false),
-            PairInputs::None,
-            "decided before any cache is looked at, so no sweep is sent"
-        );
-        assert_eq!(
-            pair_inputs(BuilderOs::Windows, false),
-            PairInputs::Sent,
-            "a Windows builder's caches decide the sweep"
-        );
     }
 
     #[test]

@@ -6778,112 +6778,91 @@ mod tests {
         }
     }
 
-    /// A sibling pair's run carrying a path a command named, in its main tree or its sibling's, falls back `inputs` on
-    /// a macOS builder with the macOS pair line: the carried entries count as declared inputs.
-    #[test]
-    fn a_macos_pair_run_carrying_a_command_named_path_falls_back_with_the_macos_line() {
-        let pair = Pair::new("client-macos-pair-carried", &["lib"]);
-        let mut run = pair.run(&pair.root, &["lib"]);
-        let log = pair.top.join("out.log");
-        let state = pair.top.join("state");
-        let mac = gate_router::Builder {
+    /// The macOS builder `mac-1`.
+    fn mac_builder() -> gate_router::Builder {
+        gate_router::Builder {
             alias: "mac-1".to_owned(),
             os: BuilderOs::Macos,
             root: Some("/Users/b/gate-remote".to_owned()),
             slots: 1,
             id: None,
             data: None,
-        };
-        let transport = nowhere();
-        let main = [format!("{}.tmp/p.targets", gate_router::CARRIED_INPUT)];
-        for in_sibling in [false, true] {
-            if in_sibling {
-                run.siblings[0].inputs = vec![format!("{}.tmp/q.props", gate_router::CARRIED_INPUT)];
-            }
-            let siblings = carried(&run.root, &run.siblings).expect("the run's siblings check");
-            let call = RemoteCall {
-                builder: &mac,
-                inputs: if in_sibling { &[] } else { &main },
-                user_tools: &[],
-                state_dir: &state,
-                ..pair_call(&run, siblings, &log)
-            };
-            let mut on_mac = attempt(&call, &transport);
-
-            let refused = super::super::inputs::sent(&mut on_mac);
-
-            assert!(
-                matches!(refused, Err(End::Refused(FallbackReason::Inputs))),
-                "in the sibling: {in_sibling}"
-            );
-            assert_eq!(
-                on_mac.lines,
-                ["gate: remote inputs not sent: the macOS builder does not take a sibling pair's inputs yet"],
-                "in the sibling: {in_sibling}"
-            );
         }
     }
 
-    /// A sibling pair's run decides its inputs by its builder before any tree is picked (`inputs::pair_inputs`): on a
-    /// macOS builder, declared globs refuse the route `inputs` with the macOS line rather than any tree's failure, and
-    /// with none declared, the pair inputs marker that makes a Windows builder's run sweep makes no manifest at all.
+    /// A sibling pair's run with inputs in both trees builds the same manifest for a macOS builder as for a Windows
+    /// one: each tree's files under its own prefix, and the pair's `layout` key.
     #[test]
-    fn a_macos_pair_run_decides_its_inputs_before_any_tree_is_picked() {
+    fn a_macos_pair_run_builds_the_manifest_a_windows_one_does() {
         let pair = Pair::new("client-macos-pair-inputs", &["lib"]);
+        let mut run = pair.run(&pair.root, &["lib"]);
+        let log = pair.top.join("out.log");
+        for name in ["app", "lib"] {
+            let folder = pair.folder(name);
+            git_at(&folder, &["init", "--quiet"]);
+            fs::write(folder.join(".gitignore"), "secrets/\n").expect("the .gitignore can be written");
+            fs::create_dir_all(folder.join("secrets")).expect("the folder can be made");
+            fs::write(folder.join("secrets").join("a.txt"), name).expect("the input can be written");
+        }
+        let globs = ["secrets/**".to_owned()];
+        run.siblings[0].inputs = globs.to_vec();
+        let mac = mac_builder();
+        let transport = nowhere();
+        // Each call keeps its own state folder, so neither manifest is built from the hash cache the other wrote.
+        let sent_for = |builder: &gate_router::Builder, state: &Path| {
+            let siblings = carried(&run.root, &run.siblings).expect("the run's siblings check");
+            let call = RemoteCall {
+                builder,
+                inputs: &globs,
+                user_tools: &[],
+                state_dir: state,
+                ..pair_call(&run, siblings, &log)
+            };
+            match super::super::inputs::sent(&mut attempt(&call, &transport)) {
+                Ok(Some(built)) => built.line,
+                Ok(None) => unreachable!("the run sends its inputs, but it sent none"),
+                Err(end) => unreachable!("the run sends its inputs, but it ended: {end:?}"),
+            }
+        };
+
+        let on_mac = sent_for(&mac, &pair.top.join("state-mac"));
+        let on_windows = sent_for(&crate::test_support::HOST, &pair.top.join("state-windows"));
+
+        assert_eq!(on_mac, on_windows, "the same manifest for either builder");
+        assert!(on_mac.contains("\"layout\":"), "{on_mac}");
+        assert!(on_mac.contains("app/secrets/a.txt") && on_mac.contains("lib/secrets/a.txt"), "{on_mac}");
+    }
+
+    /// A sibling pair's run on a macOS builder with no inputs declared sends the pair's empty manifest, its `layout`
+    /// key alone, when the pair inputs marker shows an earlier pair run sent inputs: the sweep a Windows builder's
+    /// run sends.
+    #[test]
+    fn a_macos_pair_run_with_the_pair_marker_sends_the_sweep() {
+        let pair = Pair::new("client-macos-pair-sweep", &["lib"]);
         let run = pair.run(&pair.root, &["lib"]);
         let log = pair.top.join("out.log");
         let state = pair.top.join("state");
-        let mac = gate_router::Builder {
-            alias: "mac-1".to_owned(),
-            os: BuilderOs::Macos,
-            root: Some("/Users/b/gate-remote".to_owned()),
-            slots: 1,
-            id: None,
-            data: None,
-        };
-        let globs = ["secrets/**".to_owned()];
-        let siblings = || carried(&run.root, &run.siblings).expect("the run's siblings check");
+        let mac = mac_builder();
         let transport = nowhere();
-        let declared = RemoteCall {
+        let siblings = carried(&run.root, &run.siblings).expect("the run's siblings check");
+        let call = RemoteCall {
             builder: &mac,
-            inputs: &globs,
-            user_tools: &[],
             state_dir: &state,
-            ..pair_call(&run, siblings(), &log)
+            ..pair_call(&run, siblings, &log)
         };
-        let mut on_mac = attempt(&declared, &transport);
-
-        let refused = super::super::inputs::sent(&mut on_mac);
-
-        assert!(
-            matches!(refused, Err(End::Refused(FallbackReason::Inputs))),
-            "the route is refused `inputs`"
-        );
-        assert_eq!(
-            on_mac.lines,
-            ["gate: remote inputs not sent: the macOS builder does not take a sibling pair's inputs yet"],
-            "for the macOS builder, before any tree is walked"
-        );
-        drop(on_mac);
-
-        let marker = v1::pair_inputs_path(&state, None, declared.key);
+        let marker = v1::pair_inputs_path(&state, None, call.key);
         fs::create_dir_all(marker.parent().expect("the marker has a folder")).expect("the marker's folder can be made");
         fs::write(&marker, "").expect("the marker can be written");
-        let none = RemoteCall {
-            builder: &mac,
-            state_dir: &state,
-            ..pair_call(&run, siblings(), &log)
-        };
-        let on_windows = RemoteCall {
-            builder: &crate::test_support::HOST,
-            state_dir: &state,
-            ..pair_call(&run, siblings(), &log)
-        };
-        let mac_sent = super::super::inputs::sent(&mut attempt(&none, &transport));
-        let windows_sent = super::super::inputs::sent(&mut attempt(&on_windows, &transport));
 
-        assert!(matches!(mac_sent, Ok(None)), "the macOS builder's run makes no inputs call");
-        assert!(matches!(windows_sent, Ok(Some(_))), "where a Windows builder's run sends the sweep");
+        let sweep = match super::super::inputs::sent(&mut attempt(&call, &transport)) {
+            Ok(Some(sweep)) => sweep,
+            Ok(None) => unreachable!("the macOS builder's run sends the sweep, but it sent none"),
+            Err(end) => unreachable!("the macOS builder's run sends the sweep, but it ended: {end:?}"),
+        };
+
+        assert!(sweep.found.is_empty(), "the sweep names no file");
+        assert!(sweep.line.contains("\"layout\":"), "{}", sweep.line);
+        assert!(sweep.line.contains("\"files\":{}"), "{}", sweep.line);
     }
 
     /// The outputs-pending marker says the PC's outputs may be wrong, whichever builder ran: one a `mac-1` run leaves

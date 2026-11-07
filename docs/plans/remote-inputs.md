@@ -12,4 +12,4 @@ A routed run sends a repo's declared ignored inputs to the builder's work folder
 
 **I15. Pairs** (GATE-332). Each repo's own `inputs` list applies to its own tree; the manifest's paths are prefixed with the tree's folder name (`{leaf}/…`, `{sibling}/…`). Built for the Windows box: a pair's manifest also carries a top-level `layout` key, and each tree gets its own exclude, hash cache and read boundary ([design.md](../design.md), Inputs).
 
-The macOS box still refuses a pair's inputs, so the router steers a pair whose repos declare inputs off a macOS builder to a Windows one (GATE-1141), the client's `inputs` fallback before any inputs call staying as a backstop; its port is GATE-1089. A pair also carries command-named gitignored files, in either tree, on the Windows box (GATE-1093); a carried pair is steered off a macOS builder the same way.
+Both boxes take a pair's inputs: GATE-1089 ported them to the macOS box and removed the router's steer-off (GATE-1141) and the client's macOS refusal. A pair also carries command-named gitignored files, in either tree (GATE-1093), on either builder.
