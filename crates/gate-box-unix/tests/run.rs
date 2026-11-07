@@ -1227,7 +1227,12 @@ mod unix {
 
     /// [`inputs_answered`], with `extra` keys set over the request.
     fn inputs_answered_with(case: &Case, step: &str, files: &[(&str, &[u8])], extra: &Value) -> Ended {
-        let mut input = format!("{}\n{}", case.inputs_request_with(step, extra), manifest_of(files).line()).into_bytes();
+        inputs_answered_of(case, step, &manifest_of(files), files, extra)
+    }
+
+    /// [`inputs_answered_with`], the manifest sent being `manifest`.
+    fn inputs_answered_of(case: &Case, step: &str, manifest: &Manifest, files: &[(&str, &[u8])], extra: &Value) -> Ended {
+        let mut input = format!("{}\n{}", case.inputs_request_with(step, extra), manifest.line()).into_bytes();
         if step == "put" {
             input.extend(archive_of(files));
         }
@@ -1301,6 +1306,100 @@ mod unix {
         assert_eq!(texts(&ended.out), ["input", "cached"]);
         assert!(ended.err_has(&started_line(NONCE)), "the start marker on standard error: {:?}", ended.err);
         case.ended_clean();
+    }
+
+    /// A pair's inputs: the sibling's and the leaf's, each path prefixed with its tree.
+    const PAIR_INPUTS: [(&str, &[u8]); 2] = [("lib/x.txt", b"sibling input\n"), ("repo/in.txt", b"input\n")];
+    /// The layout of the pair of [`Case::pair_with_lib`].
+    const PAIR_LAYOUT: &str = "pair repo lib";
+
+    /// The PC's inputs manifest of a pair's `files`, naming the pair's layout.
+    fn pair_manifest_of(files: &[(&str, &[u8])]) -> Manifest {
+        manifest_of(files).with_layout(PAIR_LAYOUT.to_owned())
+    }
+
+    /// [`PAIR_INPUTS`] diffed and put into the work folder of `case` as the pair of `keys`, each step checked.
+    fn pair_inputs_installed(case: &Case, keys: &Value) {
+        let manifest = pair_manifest_of(&PAIR_INPUTS);
+        let diff = inputs_answered_of(case, "diff", &manifest, &PAIR_INPUTS, keys);
+        assert_eq!(diff.status, Some(0), "{:?}", diff.err);
+        assert_eq!(
+            diff.out,
+            [
+                "gate-remote-inputs: need 2",
+                "gate-remote-inputs: path lib/x.txt",
+                "gate-remote-inputs: path repo/in.txt"
+            ]
+        );
+        let put = inputs_answered_of(case, "put", &manifest, &PAIR_INPUTS, keys);
+        assert_eq!(put.status, Some(0), "{:?}", put.err);
+        assert_eq!(put.out, ["gate-remote-inputs: installed 2"]);
+    }
+
+    /// The run of `commit` as the pair of `keys` running `script` in `sh`, with the digest of [`PAIR_INPUTS`].
+    fn ran_with_pair_inputs(case: &Case, commit: &str, keys: &Value, script: &str) -> Ended {
+        let digest = read_sent(pair_manifest_of(&PAIR_INPUTS).line().into_bytes())
+            .expect("the manifest reads")
+            .1;
+        let mut extra = keys.clone();
+        extra["Command"] = json!(["/bin/sh", "-c", script]);
+        extra["InputsDigest"] = json!(digest);
+        ran(&[], &case.request(commit, &extra), Reading::All, &case.base.join("beaten"))
+    }
+
+    #[test]
+    fn pair_inputs_diffed_and_put_let_a_run_with_their_digest_read_them() {
+        let case = Case::new("pair-inputs");
+        let commit = case.snapshot();
+        let keys = case.pair_with_lib();
+        pair_inputs_installed(&case, &keys);
+
+        let ended = ran_with_pair_inputs(&case, &commit, &keys, "cat in.txt ../lib/x.txt");
+
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(texts(&ended.out), ["input", "sibling input"]);
+        assert!(ended.err_has(&started_line(NONCE)), "the start marker on standard error: {:?}", ended.err);
+        case.ended_clean();
+    }
+
+    #[test]
+    fn a_sibling_input_survives_its_tree_s_checkout_clean() {
+        let case = Case::new("pair-inputs-clean");
+        let commit = case.snapshot();
+        let keys = case.pair_with_lib();
+        pair_inputs_installed(&case, &keys);
+
+        let ended = ran_with_pair_inputs(&case, &commit, &keys, "echo made > ../lib/made.txt; echo ran");
+
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(texts(&ended.out), ["ran"]);
+        let work = case.work();
+        assert_eq!(
+            fs::read(format!("{work}/lib/x.txt")).expect("the sibling's input is read"),
+            b"sibling input\n",
+            "the clean keeps the input"
+        );
+        assert_eq!(fs::read(format!("{work}/repo/in.txt")).expect("the leaf's input is read"), b"input\n");
+        let lib_bare = format!("--git-dir={}/lib.git", case.root());
+        let committed = git(&[&lib_bare, "ls-tree", "-r", "--name-only", &format!("refs/gate-back/{KEY}")]);
+        assert!(
+            committed.lines().any(|path| path == "made.txt"),
+            "the sibling's back commit holds the run's change: {committed}"
+        );
+        assert!(!committed.lines().any(|path| path == "x.txt"), "no input is committed back: {committed}");
+    }
+
+    #[test]
+    fn a_changed_sibling_input_refuses_the_run_inputs() {
+        let case = Case::new("pair-inputs-changed");
+        let commit = case.snapshot();
+        let keys = case.pair_with_lib();
+        pair_inputs_installed(&case, &keys);
+        fs::write(format!("{}/lib/x.txt", case.work()), "changed\n").expect("the box changes the sibling's copy");
+
+        let ended = ran_with_pair_inputs(&case, &commit, &keys, "true");
+
+        assert_inputs_refused(&ended, "the input lib/x.txt is not the copy installed");
     }
 
     /// The inputs verb takes `SpareFolders` too and does nothing with it: a diff and a put carrying it are answered as

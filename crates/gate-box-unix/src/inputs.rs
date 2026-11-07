@@ -3,8 +3,9 @@
 //! files the work folder lacks or holds otherwise, and `put` reads the manifest and then an archive of those files, in
 //! the outputs archive's format, to the end of stdin, and installs them. A put unpacks its archive into a stage of its
 //! own before it takes any lock; then both take the work folder's lock as a run does, refuse `busy` while an earlier
-//! run's recorded group still runs, and lay the work folder out as a run of one repo does, so a later run finds the
-//! layout unchanged and clears nothing.
+//! run's recorded group still runs, and lay the work folder out as a run of its repos does, one repo or a sibling pair,
+//! so a later run finds the layout unchanged and clears nothing. A pair's manifest names the pair's layout and prefixes
+//! each path with its tree's folder name, the leaf's or a sibling's, byte for byte; each tree keeps its own exclude.
 //!
 //! What a put installed is kept in the inputs record `{Work}.inputs`, beside the layout record: the manifest's digest,
 //! and per file its path, size, SHA-256, and the mtime in nanoseconds and `{dev}-{ino}` the box left it with. A diff
@@ -37,10 +38,10 @@ use gate_inputs::archive::{
     CopyFrom, Entry, FolderBudget, Limits, MEMBER_LIMIT, Place, UnpackError, copy_mismatch, extract, no_pc_file, outside_destination,
 };
 use gate_inputs::hash::{Hashing, sha256_of};
-use gate_inputs::manifest::{Held, HeldBy, MANIFEST_LIMIT, Manifest, read_sent, refused_path};
+use gate_inputs::manifest::{Held, HeldBy, MANIFEST_LIMIT, Manifest, read_sent, refused_path, tree_split};
 use gate_wire::{
-    OUTPUTS_NONCE_DIGITS, PathForm, Payload, Refusal, SHA256_DIGITS, busy_line, escaped, is_lower_hex, layout_line, ordinal_upper, refused_line,
-    trees,
+    OUTPUTS_NONCE_DIGITS, Pair, PairSibling, Payload, Refusal, SHA256_DIGITS, busy_line, escaped, is_lower_hex, layout_line, layout_text_for,
+    ordinal_upper, refused_line,
 };
 use serde_json::{Map, Value, json};
 
@@ -52,7 +53,7 @@ use crate::git::Git;
 use crate::lines::{FAILED_STATUS, USAGE_STATUS, channel_refusal};
 use crate::preflight::checked_root;
 use crate::request::{Unread, bounded_line};
-use crate::run::{self, Laying, NotLaidOut, REFUSED_STATUS, Repo, Unbuilt};
+use crate::run::{self, Laying, NotLaidOut, REFUSED_STATUS, Unbuilt};
 use crate::stop::{records_folder, unusable_refusal};
 
 /// The bytes in one gibibyte.
@@ -63,8 +64,6 @@ const INPUTS_BUDGET: u64 = 4 * GIB;
 const STAGES: &str = "inputs-stage";
 /// How old a stage's lock file is, in seconds, before a put removes the stage when no live put holds it: a day.
 const STAGE_AGE_SECONDS: i64 = 24 * 60 * 60;
-/// The line refusing a request that names a sibling pair.
-const PAIR_REFUSED: &str = "gate box: inputs for a sibling pair are not taken yet";
 /// The most bytes the inputs record may hold, read or written: twice the manifest's limit, 128 MiB.
 const RECORD_CAP: u64 = 2 * MANIFEST_LIMIT as u64;
 /// The most names `{name}.gate-moved-{n}` a folder at the exclude file's name is tried at.
@@ -109,16 +108,19 @@ struct Asked<'a> {
     parent: &'a Path,
     /// Whether the payload sets `SentBin`, the PC's build of one project, which this builder does not take.
     sent_bin: bool,
+    /// The sibling pair whose inputs these are, each path of its manifest prefixed with its tree; `None` for one repo.
+    pair: Option<Pair>,
+    /// The trees of the pair's layout below the work folder, the leaf's first, then each sibling's in the pair's order
+    /// ([`Pair::trees`]); empty for one repo.
+    trees: Vec<String>,
 }
 
 impl<'a> Asked<'a> {
-    /// The request `payload` holds, read in the Windows box's order; else the usage line. A request naming a sibling
-    /// pair is refused first; the work root and `Bare` are judged as a run's are ([`checked_root`]); `SentBin` is
-    /// noted last, where the Windows box reads it.
+    /// The request `payload` holds, read in this order: the work folder and its key, `Bare`, `Lock`, `Nonce`, `Step`,
+    /// `Pair`, then the work root and `Bare` judged as a run's are ([`checked_root`]); `SentBin` is only noted, and
+    /// refused later. Else the usage line of the first that fails, a pair the payload reader refuses ([`Payload::pair`])
+    /// with its line.
     fn read(payload: &'a Payload) -> Result<Asked<'a>, String> {
-        if payload.sets("Pair") {
-            return Err(PAIR_REFUSED.to_owned());
-        }
         let (key, work) = payload.work_folder()?;
         let bare = payload.path("Bare")?;
         let lock = payload.beside_work("Lock", work, "lock")?;
@@ -128,7 +130,11 @@ impl<'a> Asked<'a> {
             "put" => Step::Put,
             other => return Err(format!("gate: box payload Step is not diff or put: {}", escaped(other))),
         };
-        let (root, parent) = checked_root(work, bare, false)?;
+        let pair = payload.pair()?;
+        let (root, parent) = checked_root(work, bare, pair.is_some())?;
+        let trees = pair
+            .as_ref()
+            .map_or_else(Vec::new, |pair| pair.trees().into_iter().map(str::to_owned).collect());
         Ok(Asked {
             key,
             work,
@@ -139,7 +145,45 @@ impl<'a> Asked<'a> {
             root,
             parent,
             sent_bin: payload.sets("SentBin"),
+            pair,
+            trees,
         })
+    }
+
+    /// The trees of the work folder's layout, as the steps that walk them take them; empty for one repo.
+    fn trees(&self) -> Vec<&str> {
+        self.trees.iter().map(String::as_str).collect()
+    }
+
+    /// The line refusing a manifest whose paths or layout the request does not take, before any lock is taken or
+    /// anything written: a pair's inputs manifest naming no layout or another than the pair's, or a path below no
+    /// tree of the pair, its first part byte-equal to none ([`tree_split`]); one repo's manifest naming a layout.
+    /// `None` when it takes it.
+    fn convention_refused(&self, manifest: &Manifest) -> Option<String> {
+        if self.pair.is_none() {
+            return manifest.layout().map(|theirs| {
+                format!(
+                    "gate box: the inputs manifest names the layout {}, but the request is not a pair's inputs",
+                    escaped(theirs)
+                )
+            });
+        }
+        let ours = layout_text_for(self.pair.as_ref());
+        match manifest.layout() {
+            None => return Some("gate box: a pair's inputs manifest names no layout".to_owned()),
+            Some(theirs) if theirs != ours => {
+                return Some(format!(
+                    "gate box: a pair's inputs manifest is for the layout {}, not {ours}",
+                    escaped(theirs)
+                ));
+            }
+            Some(_) => {}
+        }
+        let trees = self.trees();
+        manifest
+            .files()
+            .find(|(path, _)| tree_split(path, &trees).is_none())
+            .map(|(path, _)| format!("gate box: the inputs path {} names no tree of the pair", escaped(path)))
     }
 
     /// The line saying the step failed for `why`.
@@ -184,7 +228,8 @@ fn read_manifest(input: &mut impl BufRead) -> Result<Sent, String> {
 /// judges them ([`root_checked`]), making nothing, before the drain beneath the root is touched; the call passed through
 /// the drain ([`drain::passed`]), refused `drain` (75) for a session the drain does not admit; then the manifest from
 /// stdin, before any lock is taken, so a client that stalls holds nothing; then the step. A payload refused is a usage
-/// error (2), a `SentBin` the builder does not take, a held lock, a live earlier group or a layout refusal is refused
+/// error (2), as is a manifest whose layout or tree prefix the request does not take ([`Asked::convention_refused`]),
+/// nothing laid out or staged; a `SentBin` the builder does not take, a held lock, a live earlier group or a layout refusal is refused
 /// (75), a manifest that cannot be read fails the step (1), and a root or folder the box does not use says the run's
 /// line and status.
 #[must_use]
@@ -237,6 +282,11 @@ fn answered(payload: &Payload, seams: &BoxSeams, input: &mut impl BufRead, conso
         Ok(sent) => sent,
         Err(why) => return failed(&asked, &why, console),
     };
+    // Before the lock: a manifest the request does not take lays nothing out and stages nothing.
+    if let Some(line) = asked.convention_refused(&sent.manifest) {
+        console.err(&line);
+        return USAGE_STATUS;
+    }
     match asked.step {
         Step::Diff => match locked(&asked, console, |work, lock, console| diff(&asked, &sent, work, lock, console)) {
             Ok(Ok(())) => 0,
@@ -248,11 +298,16 @@ fn answered(payload: &Payload, seams: &BoxSeams, input: &mut impl BufRead, conso
 }
 
 /// Checks, making nothing and before the lock, what the step lies in, as a run's `root_checked` does: the work root
-/// trusted and `<root>/work` the box user's own folder when they are there ([`records_folder`]), and the bare
-/// repository the box user's own folder when it is there ([`files::unusable_folder`]). Else the line and the status.
+/// trusted and `<root>/work` the box user's own folder when they are there ([`records_folder`]), and every repo's bare
+/// repository, a pair's siblings' too, the box user's own folder when it is there ([`files::unusable_folder`]). Else
+/// the line and the status.
 fn root_checked(asked: &Asked<'_>) -> Result<(), (String, u8)> {
     records_folder(&asked.root, asked.parent)?;
-    files::unusable_folder(Path::new(asked.bare), false).map_or(Ok(()), |flaw| Err(unusable_refusal(flaw, false)))
+    let siblings = asked.pair.iter().flat_map(Pair::siblings).map(PairSibling::bare);
+    std::iter::once(asked.bare)
+        .chain(siblings)
+        .find_map(|bare| files::unusable_folder(Path::new(bare), false))
+        .map_or(Ok(()), |flaw| Err(unusable_refusal(flaw, false)))
 }
 
 /// Says the step failed for `why`; 1.
@@ -269,7 +324,7 @@ fn busy(asked: &Asked<'_>, console: &mut Console) -> u8 {
 }
 
 /// `step` run on the work folder, held, under its lock: the lock taken as a run takes it, a held lock refused `busy`
-/// (75), and the work folder laid out as a run of one repo lays it out ([`laid_out`]) and held through the step. `Err`
+/// (75), and the work folder laid out as a run of its repos lays it out ([`laid_out`]) and held through the step. `Err`
 /// with the status to answer when the step never ran, its lines said.
 fn locked<T>(
     asked: &Asked<'_>,
@@ -285,31 +340,28 @@ fn locked<T>(
     Ok(step(&work, &lock, console))
 }
 
-/// Lays the work folder of `asked` out as a run of one repo does, under its lock: an earlier run's live group refused
-/// `busy` before git's lock files are swept ([`run::earlier_group_cleared`], [`run::swept`]), the layout checked and
-/// the tree laid out with the preflight's plain git ([`run::layout_checked`], [`run::trees_laid_out`]); then the work
-/// folder held beneath its judged root ([`Work::held`]). Else why not.
+/// Lays the work folder of `asked` out as a run of its repos does, under its lock: one repo's tree in the work folder
+/// itself, or a pair's leaf and each sibling in `<work>/<name>`, each sibling from its own bare repository
+/// ([`gate_wire::trees`]); an earlier run's live group refused `busy` before git's lock files are swept
+/// ([`run::earlier_group_cleared`], [`run::swept`]), the layout checked and the trees laid out with the preflight's
+/// plain git ([`run::layout_checked`], [`run::trees_laid_out`]); then the work folder held beneath its judged root, and
+/// each of a pair's trees with it ([`Work::held`]). No back ref is cleared: as on the Windows box, only a run does.
+/// Else why not.
 fn laid_out(asked: &Asked<'_>) -> Result<Work, NotLaidOut> {
-    let (tree, _) = trees(asked.work, None, PathForm::Unix);
-    let main = Repo {
-        name: None,
-        tree,
-        bare: asked.bare.to_owned(),
-        snapshot: "",
-        base: None,
-    };
+    // Nothing is checked out: no commit and no default branch for any repo.
+    let (main, siblings) = run::layout_repos(asked.work, asked.bare, asked.pair.as_ref(), ("", None), std::iter::repeat(("", None)));
     let laying = Laying {
         work: asked.work,
         parent: asked.parent,
         key: asked.key,
         main: &main,
-        siblings: &[],
+        siblings: &siblings,
     };
     run::earlier_group_cleared(&laying)?;
     run::swept(&laying)?;
     let checked = run::layout_checked(&laying)?;
     run::trees_laid_out(&laying, &Git::of(&asked.root, asked.parent), &checked)?;
-    Work::held(asked.work).map_err(|error| NotLaidOut::Refused(format!("cannot open {}: {error}", asked.work)))
+    Work::held(asked.work, &asked.trees()).map_err(|error| NotLaidOut::Refused(format!("cannot open {}: {error}", asked.work)))
 }
 
 /// Says why the work folder of `asked` could not be laid out: `busy`, or `layout` with the layout line naming the repo,
@@ -335,30 +387,103 @@ fn not_laid_out(asked: &Asked<'_>, not: NotLaidOut, console: &mut Console) -> u8
 type Id = (libc::dev_t, libc::ino_t);
 
 /// The work folder, held: `{root}/work` and the work folder reached beneath the judged root, the work folder's path,
-/// and the identity of its `.git` folder, which no put's walk may pass through.
+/// each tree of a pair's layout held ([`Tree`]), none for one repo, and what no walk below the work folder may pass
+/// through ([`Avoid`]).
 struct Work {
     parent: Folder,
     folder: Folder,
     path: String,
-    git: Option<Id>,
+    trees: Vec<Tree>,
+    avoid: Avoid,
+}
+
+/// One tree of a pair's layout, held through the step: its folder name, `Work/{name}` opened beneath the work folder
+/// as itself, and that folder's `.git`, opened beneath it as itself.
+struct Tree {
+    name: String,
+    folder: Folder,
+    git: Folder,
+}
+
+/// The folders no walk below the work folder passes through, by identity, however spelt: every `.git` of the work
+/// folder (its own for one repo, each tree's on a pair). Another tree of a pair needs no entry: a walk starts inside
+/// its own held tree, and reaches another only through a link, which no walk follows, or a folder's hard link, which
+/// the Mac's volumes do not make.
+#[derive(Default)]
+struct Avoid {
+    gits: Vec<Id>,
+}
+
+impl Avoid {
+    /// Why a walk may not pass through the folder `facts` say, reached at `prefix`; `None` when it may.
+    fn refusal(&self, facts: &Facts, prefix: &str) -> Option<io::Error> {
+        self.gits
+            .contains(&(facts.dev, facts.ino))
+            .then(|| io::Error::other(format!("'{prefix}' is the work folder's .git")))
+    }
 }
 
 impl Work {
     /// The work folder at `path`, held and judged beneath its judged root and `<root>/work`
-    /// ([`beneath::work_and_parent_beneath_root`]), and its `.git` looked at as itself.
-    fn held(path: &str) -> io::Result<Work> {
+    /// ([`beneath::work_and_parent_beneath_root`]). With no `trees`, one repo's, its `.git` looked at as itself; else
+    /// each of a pair's `trees`, the leaf's first, opened as itself beneath it, never through a link, and its `.git`
+    /// beneath that, its identity recorded, so a step reaches every path below a tree through the folder held here
+    /// and never by its name again. Else the system's error, a tree or its `.git` missing, a link or no folder among
+    /// them.
+    fn held(path: &str, trees: &[&str]) -> io::Result<Work> {
         let (parent, folder) = beneath::work_and_parent_beneath_root(Path::new(path))?;
-        let git = match folder.stat_child(OsStr::new(".git")) {
-            Ok(stat) => Some(Facts::of(&stat)).filter(Facts::is_folder).map(|facts| (facts.dev, facts.ino)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
+        let mut avoid = Avoid::default();
+        let mut held = Vec::with_capacity(trees.len());
+        if trees.is_empty() {
+            match folder.stat_child(OsStr::new(".git")) {
+                Ok(stat) => avoid
+                    .gits
+                    .extend(Some(Facts::of(&stat)).filter(Facts::is_folder).map(|facts| (facts.dev, facts.ino))),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        for name in trees {
+            let in_tree = |error: io::Error, what: &str| io::Error::new(error.kind(), format!("{path}/{name}{what}: {error}"));
+            let tree = folder.open_child(OsStr::new(name)).map_err(|error| in_tree(error, ""))?;
+            let git = tree.open_child(OsStr::new(".git")).map_err(|error| in_tree(error, "/.git"))?;
+            let git_facts = Facts::of(&git.stat()?);
+            avoid.gits.push((git_facts.dev, git_facts.ino));
+            held.push(Tree {
+                name: (*name).to_owned(),
+                folder: tree,
+                git,
+            });
+        }
         Ok(Work {
             parent,
             folder,
             path: path.to_owned(),
-            git,
+            trees: held,
+            avoid,
         })
+    }
+
+    /// The held folder the `/`-separated `path` below the work folder is walked from, and where in `path` the walk
+    /// starts: the work folder itself for one repo; on a pair, the held tree its first part names byte for byte
+    /// ([`tree_split`]), so the tree's name is never walked again. Else why not: a path below no tree.
+    fn start(&self, path: &str) -> io::Result<(&Folder, usize)> {
+        if self.trees.is_empty() {
+            return Ok((&self.folder, 0));
+        }
+        // As [`tree_split`] splits it: two parts at least, the first byte-equal to a held tree's name.
+        path.split_once('/')
+            .filter(|(_, rest)| !rest.is_empty())
+            .and_then(|(first, rest)| Some((&self.trees.iter().find(|tree| tree.name == first)?.folder, path.len() - rest.len())))
+            .ok_or_else(|| io::Error::other(format!("'{path}' names no tree of the work folder")))
+    }
+
+    /// Walks the folders of the `/`-separated `path` below the work folder from where it starts ([`Work::start`]),
+    /// each made when missing when `make`, never the tree itself, passing through nothing [`Work::avoid`] names
+    /// ([`walk_from`]).
+    fn walk<'p>(&self, path: &'p str, make: bool) -> io::Result<Walked<'p>> {
+        let (top, from) = self.start(path)?;
+        walk_from(top, path, from, make, &self.avoid)
     }
 }
 
@@ -447,8 +572,9 @@ struct Record {
 }
 
 impl Record {
-    /// The record `text` holds; else what is wrong with it, a path that is not a plain relative path among them.
-    fn parse(text: &str) -> Result<Record, String> {
+    /// The record `text` holds for a work folder laid out as `trees` (empty for one repo); else what is wrong with it,
+    /// a path that is not a plain relative path, or on a pair one below no tree of it ([`tree_split`]), among them.
+    fn parse(text: &str, trees: &[&str]) -> Result<Record, String> {
         let not_a_record = || "is not an inputs record".to_owned();
         let value: Value = serde_json::from_str(text).map_err(|_| not_a_record())?;
         let digest = value.get("digest").and_then(Value::as_str).ok_or_else(not_a_record)?;
@@ -458,7 +584,7 @@ impl Record {
             ..Record::default()
         };
         for (path, file) in files {
-            if refused_path(path).is_some() {
+            if refused_path(path).is_some() || (!trees.is_empty() && tree_split(path, trees).is_none()) {
                 return Err(not_a_record());
             }
             if file.get("kept") == Some(&Value::Bool(true)) {
@@ -515,15 +641,16 @@ fn recorded_copy(path: &str, file: &Value) -> Option<Copy> {
     })
 }
 
-/// The work folder's inputs record of `asked`, read whole ([`files::read_whole`]). One that is not a record is taken as
-/// empty, and one that cannot be read (a link, a folder, a file of more than one name, one past [`RECORD_CAP`], one
-/// that is not UTF-8) is removed as itself beneath the held `{root}/work`, never followed, once the lock `lock` is shown
-/// still held, and taken as empty, each said; else why such a record could not be removed.
+/// The work folder's inputs record of `asked`, read whole ([`files::read_whole`]). One that is not a record of the
+/// request's trees ([`Record::parse`]) is taken as empty, and one that cannot be read (a link, a folder, a file of more
+/// than one name, one past [`RECORD_CAP`], one that is not UTF-8) is removed as itself beneath the held `{root}/work`,
+/// never followed, once the lock `lock` is shown still held, and taken as empty, each said; else why such a record
+/// could not be removed.
 fn recorded(asked: &Asked<'_>, work: &Work, lock: &HeldLock, console: &mut Console) -> Result<Record, String> {
     let path = &asked.record();
     match read_record(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Record::default()),
-        Ok(text) => Ok(Record::parse(&text).unwrap_or_else(|why| {
+        Ok(text) => Ok(Record::parse(&text, &asked.trees()).unwrap_or_else(|why| {
             console.err(&format!("gate: remote inputs record {path} {why}; every copy is hashed"));
             Record::default()
         })),
@@ -594,26 +721,29 @@ enum Walked<'p> {
 }
 
 /// Walks the folders of the `/`-separated `path` below the held folder `top`, each opened as itself beneath the one
-/// before, never through a link, each made when missing when `make`; a folder on the way whose identity is `avoid`
-/// (the work folder's `.git`, however spelt) refused. Else the system's error.
-fn walk<'p>(top: &Folder, path: &'p str, make: bool, avoid: Option<Id>) -> io::Result<Walked<'p>> {
+/// before, never through a link, each made when missing when `make`. Else the system's error.
+fn walk<'p>(top: &Folder, path: &'p str, make: bool) -> io::Result<Walked<'p>> {
+    walk_from(top, path, 0, make, &Avoid::default())
+}
+
+/// [`walk`], `top` being the folder of the part of `path` before the byte `from` (the tree's name and its `/` on a
+/// pair, none for one repo or below a stage), which is never walked; a folder on the way that `avoid` names (a `.git`
+/// of the work folder, however spelt) refused. A prefix said names the whole path's.
+fn walk_from<'p>(top: &Folder, path: &'p str, from: usize, make: bool, avoid: &Avoid) -> io::Result<Walked<'p>> {
     let (parents, leaf) = path.rsplit_once('/').unwrap_or(("", path));
     let mut folder = top.duplicate()?;
-    let mut end = 0;
-    for part in parents.split('/').filter(|part| !part.is_empty()) {
+    let mut end = from;
+    for part in parents.get(from..).unwrap_or_default().split('/').filter(|part| !part.is_empty()) {
         end += part.len() + 1;
+        let prefix = path.get(..end - 1).unwrap_or(path);
         let opened = match child_folder(&folder, OsStr::new(part), make) {
             Ok(opened) => opened,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Walked::Missing),
-            Err(error) if is_not_folder(&error) => {
-                let prefix = &path[..end - 1];
-                return Ok(Walked::Blocked { prefix, folder, name: part });
-            }
+            Err(error) if is_not_folder(&error) => return Ok(Walked::Blocked { prefix, folder, name: part }),
             Err(error) => return Err(error),
         };
-        let facts = Facts::of(&opened.stat()?);
-        if avoid == Some((facts.dev, facts.ino)) {
-            return Err(io::Error::other(format!("'{}' is the work folder's .git", &path[..end - 1])));
+        if let Some(refused) = avoid.refusal(&Facts::of(&opened.stat()?), prefix) {
+            return Err(refused);
         }
         folder = opened;
     }
@@ -662,7 +792,7 @@ struct Opened {
 /// folders ([`walk`]): a plain file of one name ([`plain_copy`]). `None` when nothing is at its path; else why it is no
 /// such file.
 fn opened_copy(work: &Work, path: &str) -> io::Result<Option<Opened>> {
-    let (folder, leaf) = match walk(&work.folder, path, false, work.git)? {
+    let (folder, leaf) = match work.walk(path, false)? {
         Walked::Missing => return Ok(None),
         Walked::Blocked { prefix, .. } => return Err(not_a_folder(prefix)),
         Walked::Reached(folder, leaf) => (folder, leaf),
@@ -1073,7 +1203,7 @@ impl Place for Staging<'_> {
         let CopyFrom::Member(member) = from else {
             return Err(no_pc_file(entry, &[]));
         };
-        let source = match walk(self.stage, member, false, None)? {
+        let source = match walk(self.stage, member, false)? {
             Walked::Reached(folder, leaf) => folder.open_file(OsStr::new(leaf)).map_err(|error| self.in_context(member, &error))?,
             Walked::Missing | Walked::Blocked { .. } => return Err(self.in_context(member, &io::ErrorKind::NotFound.into()).into()),
         };
@@ -1170,7 +1300,7 @@ fn in_manifest(entry: &Entry, manifest: &Manifest, spelled: &HashSet<&str>) -> R
 /// refusal naming the path.
 fn free_target(work: &Work, path: &str, record: &Record, manifest: &Manifest) -> Result<(), String> {
     let refused = |why: String| format!("cannot install '{}': {why}", escaped(path));
-    match walk(&work.folder, path, false, work.git).map_err(|error| refused(error.to_string()))? {
+    match work.walk(path, false).map_err(|error| refused(error.to_string()))? {
         Walked::Missing => Ok(()),
         Walked::Blocked { prefix, folder, name } => match is_stale_unchanged(&folder, name, prefix, record, manifest) {
             Ok(true) => Ok(()),
@@ -1208,13 +1338,13 @@ fn is_stale_unchanged(folder: &Folder, name: &str, path: &str, record: &Record, 
 /// moved file's stamp, read then; else why not.
 fn moved_in(staged: &Staged<'_>, work: &Work, path: &str) -> Result<Stamp, String> {
     let failed = |why: &str| format!("cannot install '{}': {why}", escaped(path));
-    let (folder, leaf) = match walk(&work.folder, path, true, work.git).map_err(|error| failed(&error.to_string()))? {
+    let (folder, leaf) = match work.walk(path, true).map_err(|error| failed(&error.to_string()))? {
         Walked::Reached(folder, leaf) => (folder, leaf),
         Walked::Blocked { prefix, .. } => return Err(failed(&not_a_folder(prefix).to_string())),
         Walked::Missing => return Err(failed("a folder on its way could not be made")),
     };
     let not_staged = || failed("its staged copy is not in the stage");
-    let Walked::Reached(source, source_leaf) = walk(staged.folder, path, false, None).map_err(|_| not_staged())? else {
+    let Walked::Reached(source, source_leaf) = walk(staged.folder, path, false).map_err(|_| not_staged())? else {
         return Err(not_staged());
     };
     let left = staged.left.get(&ordinal_upper(path)).ok_or_else(not_staged)?;
@@ -1318,7 +1448,7 @@ fn present(work: &Work, manifest: &Manifest, record: &Record, now: &mut Record) 
 /// manifest the held work folder `work` holds as the manifest says ([`present`]), and keeps every copy `record` kept
 /// that no file of `now` replaces and that is still there; fails, the record written with no digest once the lock
 /// `lock` is shown still held, when a file of the manifest is still missing; else rewrites the exclude file from the
-/// record ([`write_exclude`]), checks the lock still held and every file of `now` still the copy its stamp names
+/// record, each tree's on a pair ([`write_excludes`]), checks the lock still held and every file of `now` still the copy its stamp names
 /// ([`changed_before_seal`]), failing the same way when one is not, and, last, writes the record with the manifest's
 /// digest. The lines to say: where a folder at the exclude file's name was moved aside, when one was. Else why not.
 fn finished(job: Job<'_>, work: &Work, record: &Record, mut now: Record, lock: &HeldLock) -> Result<Vec<String>, String> {
@@ -1337,7 +1467,7 @@ fn finished(job: Job<'_>, work: &Work, record: &Record, mut now: Record, lock: &
         };
         return Err(left_unsealed(job, record, now, lock).err().unwrap_or(why));
     }
-    let lines: Vec<String> = write_exclude(work, &now)?.into_iter().collect();
+    let lines = write_excludes(work, &now)?;
     lock_held(asked, lock)?;
     if let Some(why) = changed_before_seal(work, &now) {
         return Err(left_unsealed(job, record, now, lock).err().unwrap_or(why));
@@ -1377,19 +1507,21 @@ fn changed_before_seal(work: &Work, now: &Record) -> Option<String> {
 /// as the Windows box's check says it: its record `{work}.inputs` missing, unreadable ([`read_record`]), not a record
 /// or of another digest, an unsealed one's empty digest among them; a recorded copy gone, not a plain file of one name,
 /// or not the copy installed ([`still_installed`]), each reached beneath the work folder held through its judged root
-/// ([`Work::held`]); or a tree whose exclude file cannot be written from the record ([`write_exclude`]), each
-/// [`Unmatched::Inputs`]. The exclude file is written only while the run's work lock `lock` is shown still held, as the
-/// run's other record writes are; else [`Unmatched::LockLost`]. `Ok` when it holds them, the exclude file written, with
-/// the line saying where a folder at the exclude file's name was moved aside, when one was, for the caller to say.
-pub(crate) fn unmatched(work: &str, sent: &str, lock: &HeldLock) -> Result<Option<String>, Unmatched> {
-    let record = matching_record(&format!("{work}.inputs"), sent).map_err(Unmatched::Inputs)?;
-    let held = Work::held(work).map_err(|error| Unmatched::Inputs(format!("cannot open {work}: {error}")))?;
+/// ([`Work::held`]); or a tree whose exclude file cannot be written from the record ([`write_excludes`]), each
+/// [`Unmatched::Inputs`]. `trees` are the trees of a sibling pair's run, the leaf's first, empty for one repo: each
+/// tree is held, a record naming a path below no tree is no record, and each tree's exclude file is written. The
+/// exclude files are written only while the run's work lock `lock` is shown still held, as the run's other record
+/// writes are; else [`Unmatched::LockLost`]. `Ok` when it holds them, the exclude files written, with the lines saying
+/// where a folder at an exclude file's name was moved aside, for the caller to say.
+pub(crate) fn unmatched(work: &str, trees: &[&str], sent: &str, lock: &HeldLock) -> Result<Vec<String>, Unmatched> {
+    let record = matching_record(&format!("{work}.inputs"), sent, trees).map_err(Unmatched::Inputs)?;
+    let held = Work::held(work, trees).map_err(|error| Unmatched::Inputs(format!("cannot open {work}: {error}")))?;
     if let Some(why) = changed_copy(&held, &record) {
         return Err(Unmatched::Inputs(why));
     }
     let shown = lock.path().display();
     match lock.still_held() {
-        Ok(true) => write_exclude(&held, &record).map_err(Unmatched::Inputs),
+        Ok(true) => write_excludes(&held, &record).map_err(Unmatched::Inputs),
         Ok(false) => Err(Unmatched::LockLost(format!("the work folder lock {shown} is no longer held"))),
         Err(error) => Err(Unmatched::LockLost(format!(
             "the work folder lock {shown} could not be looked at: {error}"
@@ -1407,11 +1539,12 @@ pub(crate) enum Unmatched {
     LockLost(String),
 }
 
-/// The record at `path` when it holds the digest `sent`; else why not.
-fn matching_record(path: &str, sent: &str) -> Result<Record, String> {
+/// The record at `path` when it is one of the work folder's `trees` ([`Record::parse`]) and holds the digest `sent`;
+/// else why not.
+fn matching_record(path: &str, sent: &str, trees: &[&str]) -> Result<Record, String> {
     match read_record(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Err(format!("{path} does not exist")),
-        Ok(text) => match Record::parse(&text) {
+        Ok(text) => match Record::parse(&text, trees) {
             Ok(record) if record.digest == sent => Ok(record),
             Ok(_) => Err(format!("{path} holds another manifest's digest")),
             Err(why) => Err(format!("{path} {why}")),
@@ -1440,21 +1573,50 @@ fn still_installed(opened: &Opened, copy: &Copy) -> bool {
     stamp == copy.stamp && sha256_of(&opened.file).is_ok_and(|(sha256, _)| sha256 == copy.sha256)
 }
 
-/// Rewrites the tree's `.git/info/exclude` from `record`: one line per path it names, installed or kept, as a literal
-/// pattern ([`literal_pattern`]), in the order of their keys. The `.git` must be a folder of its own, opened beneath the
-/// held work folder `work`; `.git/info` is made a folder of its own beneath it ([`info_folder`]), and the file written
+/// Rewrites the exclude file of every tree of the held work folder `work` from `record` ([`write_exclude`]): the work
+/// folder's own for one repo, else each held tree's, the leaf's first, each naming only the paths below its own tree,
+/// so a sibling's input is neither cleaned by its checkout nor committed back. A tree whose exclude file cannot be
+/// written fails the whole, never skipped. The lines saying where a folder at an exclude file's name was moved aside;
+/// else why not.
+fn write_excludes(work: &Work, record: &Record) -> Result<Vec<String>, String> {
+    if work.trees.is_empty() {
+        return Ok(write_exclude(work, None, record)?.into_iter().collect());
+    }
+    let mut lines = Vec::new();
+    for tree in &work.trees {
+        lines.extend(write_exclude(work, Some(tree), record)?);
+    }
+    Ok(lines)
+}
+
+/// Rewrites one tree's `.git/info/exclude` from `record`: one line per path it names, installed or kept, as a literal
+/// pattern ([`literal_pattern`]), in the order of their keys. With no `tree`, one repo's: the work folder's own `.git`,
+/// which must be a folder of its own, opened beneath the held work folder `work`, naming every path. With one, a
+/// pair's: the `.git` held with the tree ([`Work::held`]), naming each path below `{tree}/`, that prefix cut byte for
+/// byte, and no other. `.git/info` is made a folder of its own beneath it ([`info_folder`]), and the file written
 /// beneath that ([`written_beneath`]), so no link there is followed; the line saying where a folder at the file's name
 /// was moved aside, when one was. Else why not.
-fn write_exclude(work: &Work, record: &Record) -> Result<Option<String>, String> {
-    let git_path = Path::new(&work.path).join(".git");
-    let git = work
-        .folder
-        .open_child(OsStr::new(".git"))
-        .map_err(|_| format!("{} is not a folder of its own", git_path.display()))?;
+fn write_exclude(work: &Work, tree: Option<&Tree>, record: &Record) -> Result<Option<String>, String> {
+    let tree_path = tree.map_or_else(|| PathBuf::from(&work.path), |tree| Path::new(&work.path).join(&tree.name));
+    let git_path = tree_path.join(".git");
+    let opened;
+    let git = if let Some(tree) = tree {
+        &tree.git
+    } else {
+        opened = work
+            .folder
+            .open_child(OsStr::new(".git"))
+            .map_err(|_| format!("{} is not a folder of its own", git_path.display()))?;
+        &opened
+    };
     let info_path = git_path.join("info");
-    let info = info_folder(&git, &info_path)?;
+    let info = info_folder(git, &info_path)?;
+    let prefix = tree.map(|tree| format!("{}/", tree.name));
     let mut text = String::new();
     for path in record.paths() {
+        let Some(path) = prefix.as_deref().map_or(Some(path), |prefix| path.strip_prefix(prefix)) else {
+            continue;
+        };
         text.push_str(&literal_pattern(path));
         text.push('\n');
     }
@@ -1591,18 +1753,20 @@ mod tests {
     use gate_inputs::hash::sha256_of;
     use gate_inputs::manifest::{Held, Manifest, Stamp as HeldStamp, Wrote, read_sent};
     use gate_inputs::pack::Packer;
-    use gate_wire::{PathForm, Payload, ROOT_STATUS, Refusal, busy_line, ordinal_upper, refused_line, root_unsafe_line};
+    use gate_wire::{
+        PathForm, Payload, ROOT_STATUS, Refusal, busy_line, escaped, layout_line, layout_text, ordinal_upper, refused_line, root_unsafe_line,
+    };
     use serde_json::{Map, Value, json};
 
     use super::{
-        Asked, Copy as Installed, Facts, Job, PAIR_REFUSED, RECORD_CAP, Record, Sent, Staged, Staging, Stamp, Unmatched, Work, answered, finished,
-        flock_taken, free_target, installed, made_stage, matched_copy, moved_in, opened_copy, pruned, recorded, unmatched, volume_checked,
-        write_exclude, write_record_capped,
+        Asked, Copy as Installed, Facts, Job, RECORD_CAP, Record, Sent, Staged, Staging, Stamp, Unmatched, Work, answered, finished, flock_taken,
+        free_target, installed, made_stage, matched_copy, moved_in, opened_copy, pruned, recorded, unmatched, volume_checked, write_exclude,
+        write_record_capped,
     };
     use crate::beneath::Folder;
     use crate::console::Console;
     use crate::files;
-    use crate::lines::{FAILED_STATUS, USAGE_STATUS, WORK_ROOT_STEP, folder_failure, job_record_text};
+    use crate::lines::{FAILED_STATUS, USAGE_STATUS, WORK_ROOT_STEP, folder_failure, folder_unsafe_line, job_record_text};
     use crate::pid_info::start_of;
     use crate::run::REFUSED_STATUS;
 
@@ -1620,15 +1784,27 @@ mod tests {
     /// `name`, private to this process and removed when the case ends.
     struct Case {
         base: PathBuf,
+        /// The sibling of a pair's request, its leaf `repo`; `None` for one repo.
+        sibling: Option<&'static str>,
     }
 
     impl Case {
         fn new(name: &str) -> Case {
+            Case::made(name, None)
+        }
+
+        /// A case whose requests are a sibling pair's inputs: the leaf `repo` and the sibling `sibling`, whose bare
+        /// repository is `<root>/<sibling>.git`, each manifest naming the pair's layout.
+        fn pair(name: &str, sibling: &'static str) -> Case {
+            Case::made(name, Some(sibling))
+        }
+
+        fn made(name: &str, sibling: Option<&'static str>) -> Case {
             let base = std::env::temp_dir().join(format!("gate-box-unix-inputs-{}-{name}", std::process::id()));
             if base.exists() {
                 fs::remove_dir_all(&base).expect("a stale case folder is removed");
             }
-            let case = Case { base };
+            let case = Case { base, sibling };
             // Mode 0700 as the box demands of a root and its `<root>/work`, whatever the umask.
             std::os::unix::fs::DirBuilderExt::mode(fs::DirBuilder::new().recursive(true), 0o700)
                 .create(case.root().join("work"))
@@ -1651,7 +1827,7 @@ mod tests {
         fn json(&self, step: &str) -> Value {
             let root = self.root().to_str().expect("the temp folder is UTF-8").to_owned();
             let work = self.work();
-            json!({
+            let mut json = json!({
                 "Key": KEY,
                 "Bare": format!("{root}/repo.git"),
                 "Work": work,
@@ -1661,21 +1837,38 @@ mod tests {
                 "Job": format!("gate-remote-{KEY}-0123456789ab"),
                 "Nonce": NONCE,
                 "Step": step,
-            })
+            });
+            if let Some(sibling) = self.sibling {
+                json["Pair"] = json!({ "Leaf": "repo", "Siblings": [sibling] });
+            }
+            json
         }
 
         fn payload(&self, step: &str) -> Payload {
             decoded(&self.json(step))
         }
 
+        /// The manifest of `files` as this case's requests send it: naming the pair's layout on a pair's.
+        fn manifest(&self, files: &Files<'_>) -> Manifest {
+            match self.sibling {
+                None => manifest_of(files),
+                Some(sibling) => manifest_of(files).with_layout(layout_text(Some("repo"), vec![sibling])),
+            }
+        }
+
+        /// The digest of [`Case::manifest`] of `files`, as a run's `InputsDigest` names it.
+        fn digest(&self, files: &Files<'_>) -> String {
+            read_sent(self.manifest(files).line().into_bytes()).expect("the manifest reads").1
+        }
+
         /// The diff of the manifest of `files`: its status and what it said.
         fn diff(&self, files: &Files<'_>) -> (u8, Console) {
-            answer(&self.json("diff"), manifest_of(files).line().as_bytes())
+            answer(&self.json("diff"), self.manifest(files).line().as_bytes())
         }
 
         /// The put of the manifest of `files` with an archive of `members` and `copies`: its status and what it said.
         fn put(&self, files: &Files<'_>, members: &Files<'_>, copies: &Files<'_>) -> (u8, Console) {
-            let mut input = manifest_of(files).line().into_bytes();
+            let mut input = self.manifest(files).line().into_bytes();
             input.extend(archive(members, copies));
             answer(&self.json("put"), &input)
         }
@@ -1707,10 +1900,20 @@ mod tests {
             fs::read_to_string(format!("{}/.git/info/exclude", self.work())).expect("the exclude file is read")
         }
 
+        /// The exclude file of the pair's tree `tree`.
+        fn tree_exclude(&self, tree: &str) -> String {
+            fs::read_to_string(format!("{}/{tree}/.git/info/exclude", self.work())).expect("the tree's exclude file is read")
+        }
+
+        /// Whether a stages folder was ever made, which every put makes before its lock.
+        fn staged(&self) -> bool {
+            self.root().join("inputs-stage").exists()
+        }
+
         /// The work folder, made by hand with a `.git/info`, held as a step under the lock holds it.
         fn work_held(&self) -> Work {
             fs::create_dir_all(format!("{}/.git/info", self.work())).expect("the work folder is made");
-            Work::held(&self.work()).expect("the work folder is held")
+            Work::held(&self.work(), &[]).expect("the work folder is held")
         }
 
         /// A folder `stage` beside the root holding `files`, held, and what each was left as.
@@ -1859,17 +2062,228 @@ mod tests {
         assert_eq!(console.err, ["gate: box payload Channel PcProof is not 32 lower-case hex digits"]);
     }
 
+    /// A pair's inputs: the sibling's and the leaf's, each path prefixed with its tree.
+    const PAIR_FILES: [(&str, &[u8]); 2] = [("lib/x.txt", b"sibling input\n"), ("repo/data/b.txt", b"leaf input\n")];
+
     #[test]
-    fn a_sibling_pair_is_refused_as_usage_before_the_manifest_is_read() {
-        let case = Case::new("pair");
-        let mut json = case.json("diff");
-        json["Pair"] = json!({ "Leaf": "app" });
+    fn a_pair_inputs_request_lays_each_prefixed_path_into_its_tree() {
+        let case = Case::pair("pair-trees", "lib");
+
+        let (status, console) = case.diff(&PAIR_FILES);
+        assert_eq!(status, 0, "{:?}", console.err);
+        assert_eq!(
+            console.out,
+            [
+                "gate-remote-inputs: need 2",
+                "gate-remote-inputs: path lib/x.txt",
+                "gate-remote-inputs: path repo/data/b.txt"
+            ],
+            "the diff names the PC's prefixed paths"
+        );
+
+        let (status, console) = case.put(&PAIR_FILES, &PAIR_FILES, &[]);
+        assert_eq!(status, 0, "{:?}", console.err);
+        assert_eq!(console.out, ["gate-remote-inputs: installed 2"]);
+        assert_eq!(case.read("lib/x.txt"), b"sibling input\n", "each input lands in its own tree");
+        assert_eq!(case.read("repo/data/b.txt"), b"leaf input\n");
+        assert!(!case.has("repo/lib"), "nothing lands below the leaf for the sibling");
+        let record = case.record();
+        let paths: Vec<&String> = record["files"].as_object().expect("the record has files").keys().collect();
+        assert_eq!(paths, ["lib/x.txt", "repo/data/b.txt"], "the record names prefixed paths");
+        assert_eq!(record["digest"], case.digest(&PAIR_FILES));
+
+        let (status, console) = case.diff(&PAIR_FILES);
+        assert_eq!(status, 0, "{:?}", console.err);
+        assert_eq!(console.out, ["gate-remote-inputs: need 0"], "a second diff needs nothing");
+    }
+
+    #[test]
+    fn a_pair_path_that_names_no_tree_is_refused_before_anything_is_written() {
+        let case = Case::pair("pair-no-tree", "lib");
+
+        for path in ["other/x.txt", "Lib/x.txt", "Repo/x.txt", "x.txt"] {
+            let files: [(&str, &[u8]); 1] = [(path, b"x")];
+
+            let (status, console) = case.put(&files, &files, &[]);
+
+            assert_eq!(status, USAGE_STATUS, "{path}: {:?}", console.err);
+            assert_eq!(
+                console.err,
+                [format!("gate box: the inputs path {path} names no tree of the pair")],
+                "{path}"
+            );
+            assert!(!case.has("repo") && !case.has("lib"), "{path}: nothing is laid out");
+            assert!(!case.staged(), "{path}: no stage is made");
+        }
+    }
+
+    /// A default Mac volume is case-insensitive: `App/x.txt` would reach the tree `app`. The byte-exact tree name keeps
+    /// it out.
+    #[test]
+    fn a_path_naming_a_tree_in_another_case_names_no_tree_though_the_volume_would_find_it() {
+        let case = Case::pair("pair-case", "app");
+        let first: [(&str, &[u8]); 1] = [("app/y.txt", b"y\n")];
+        let (status, console) = case.put(&first, &first, &[]);
+        assert_eq!(status, 0, "{:?}", console.err);
+        let files: [(&str, &[u8]); 1] = [("App/x.txt", b"x\n")];
+
+        let (status, console) = case.put(&files, &files, &[]);
+
+        assert_eq!(status, USAGE_STATUS, "{:?}", console.err);
+        assert_eq!(console.err, ["gate box: the inputs path App/x.txt names no tree of the pair"]);
+        assert!(!case.has("app/x.txt"), "nothing lands in the tree the volume finds");
+        assert_eq!(case.read("app/y.txt"), b"y\n", "the tree's own input is left");
+    }
+
+    #[test]
+    fn a_pair_path_climbing_out_of_its_tree_fails_the_step_before_the_lock() {
+        let case = Case::pair("pair-climb", "lib");
+        let files: [(&str, &[u8]); 1] = [("lib/../repo/x.txt", b"x\n")];
+
+        let (status, console) = answer(&case.json("put"), case.manifest(&files).line().as_bytes());
+
+        assert_eq!(status, FAILED_STATUS, "{:?}", console.err);
+        assert!(!case.has("repo") && !case.has("lib"), "nothing is laid out");
+        assert!(!case.staged(), "no stage is made");
+    }
+
+    #[test]
+    fn a_pair_manifest_without_its_layout_is_refused() {
+        let case = Case::pair("pair-no-layout", "lib");
+
+        let (status, console) = answer(&case.json("diff"), manifest_of(&PAIR_FILES[..1]).line().as_bytes());
+
+        assert_eq!(status, USAGE_STATUS, "{:?}", console.err);
+        assert_eq!(console.err, ["gate box: a pair's inputs manifest names no layout"]);
+        assert!(!case.has("repo"), "nothing is laid out");
+    }
+
+    #[test]
+    fn a_pair_manifest_for_another_layout_is_refused() {
+        let case = Case::pair("pair-other-layout", "lib");
+        let line = manifest_of(&PAIR_FILES[..1]).with_layout("pair repo other".to_owned()).line();
+
+        let (status, console) = answer(&case.json("put"), line.as_bytes());
+
+        assert_eq!(status, USAGE_STATUS, "{:?}", console.err);
+        assert_eq!(
+            console.err,
+            ["gate box: a pair's inputs manifest is for the layout pair repo other, not pair repo lib"]
+        );
+        assert!(!case.has("repo"), "nothing is laid out");
+        assert!(!case.staged(), "no stage is made");
+    }
+
+    #[test]
+    fn a_request_of_one_repo_whose_manifest_names_a_layout_is_refused() {
+        let case = Case::new("single-layout");
+        let line = manifest_of(&[("a.txt", b"a\n")]).with_layout("pair repo lib".to_owned()).line();
+
+        let (status, console) = answer(&case.json("diff"), line.as_bytes());
+
+        assert_eq!(status, USAGE_STATUS, "{:?}", console.err);
+        assert_eq!(
+            console.err,
+            ["gate box: the inputs manifest names the layout pair repo lib, but the request is not a pair's inputs"]
+        );
+        assert!(!case.has(".git"), "nothing is laid out");
+    }
+
+    #[test]
+    fn each_tree_s_exclude_lists_only_its_own_inputs() {
+        let case = Case::pair("pair-excludes", "lib");
+
+        let (status, console) = case.put(&PAIR_FILES, &PAIR_FILES, &[]);
+
+        assert_eq!(status, 0, "{:?}", console.err);
+        assert_eq!(case.tree_exclude("repo"), "/data/b.txt\n", "the leaf's lists only its own");
+        assert_eq!(case.tree_exclude("lib"), "/x.txt\n", "the sibling's lists only its own");
+    }
+
+    /// The PC's sweep of a pair is an empty manifest naming the pair's layout: every unchanged copy of either tree is
+    /// deleted, one changed on the box is kept and stays in its tree's exclude file.
+    #[test]
+    fn an_empty_pair_manifest_with_its_layout_sweeps_the_copies_of_both_trees() {
+        let case = Case::pair("pair-sweep", "lib");
+        let (status, console) = case.put(&PAIR_FILES, &PAIR_FILES, &[]);
+        assert_eq!(status, 0, "{:?}", console.err);
+        fs::write(format!("{}/lib/x.txt", case.work()), "changed\n").expect("the box changes a copy");
+
+        let (status, console) = case.diff(&[]);
+
+        assert_eq!(status, 0, "{:?}", console.err);
+        assert_eq!(console.out, ["gate-remote-inputs: need 0"]);
+        assert!(!case.has("repo/data/b.txt"), "the unchanged copy is deleted");
+        assert_eq!(case.read("lib/x.txt"), b"changed\n", "the changed one is kept");
+        let record = case.record();
+        assert_eq!(record["files"]["lib/x.txt"], json!({ "kept": true }), "{record}");
+        assert_eq!(record["digest"], case.digest(&[]));
+        assert_eq!(case.tree_exclude("lib"), "/x.txt\n");
+        assert_eq!(case.tree_exclude("repo"), "");
+    }
+
+    #[test]
+    fn a_sibling_pair_s_sent_build_is_refused_as_not_built_before_the_manifest_is_read() {
+        let case = Case::pair("pair-sent-bin", "lib");
+        let mut json = case.json("put");
+        json["SentBin"] = json!("repo/bin/Debug");
 
         let (status, console) = answer(&json, b"not a manifest\n");
 
-        assert_eq!(status, USAGE_STATUS);
-        assert_eq!(console.err, [PAIR_REFUSED]);
-        assert_eq!(PAIR_REFUSED, "gate box: inputs for a sibling pair are not taken yet");
+        assert_eq!(status, REFUSED_STATUS, "{:?}", console.err);
+        assert_eq!(
+            console.err,
+            [
+                refused_line(NONCE, Refusal::Sent),
+                "gate: remote SentBin is not built on this builder".to_owned()
+            ]
+        );
+        assert!(!case.has("repo"), "nothing is laid out");
+    }
+
+    #[test]
+    fn a_link_at_a_tree_s_name_is_never_followed() {
+        let case = Case::pair("pair-tree-link", "lib");
+        case.laid_out();
+        let outside = case.base.join("outside");
+        fs::create_dir(&outside).expect("the outside folder is made");
+        let lib = format!("{}/lib", case.work());
+        fs::remove_dir_all(&lib)
+            .and_then(|()| symlink(&outside, &lib))
+            .expect("a link takes the tree's name");
+
+        let (status, console) = case.put(&PAIR_FILES, &PAIR_FILES, &[]);
+
+        assert_eq!(status, REFUSED_STATUS, "{:?}", console.err);
+        assert_eq!(
+            console.err,
+            [
+                refused_line(NONCE, Refusal::Layout),
+                layout_line("repo", &escaped(&format!("{lib} is a link or not a folder")))
+            ]
+        );
+        assert_eq!(fs::read_link(&lib).ok(), Some(outside.clone()), "the link still leads where it led");
+        assert!(names_in(&outside).is_empty(), "nothing is written where the link leads");
+    }
+
+    /// A sibling's bare repository is judged as the main one's: one other accounts may write in refuses the step before
+    /// anything is laid out or staged, though the main one is usable.
+    #[test]
+    fn a_pair_whose_sibling_bare_others_may_write_is_refused_before_anything_is_laid_out() {
+        let case = Case::pair("pair-sibling-bare", "lib");
+        let root = case.root().display().to_string();
+        let bare = format!("{root}/lib.git");
+        fs::create_dir(format!("{root}/repo.git")).expect("the main bare repository is made");
+        fs::set_permissions(format!("{root}/repo.git"), fs::Permissions::from_mode(0o700)).expect("its mode is set");
+        fs::create_dir(&bare).expect("the sibling's bare repository is made");
+        fs::set_permissions(&bare, fs::Permissions::from_mode(0o770)).expect("its group may write");
+
+        let (status, console) = case.put(&PAIR_FILES, &PAIR_FILES, &[]);
+
+        assert_eq!(status, ROOT_STATUS, "{:?}", console.err);
+        assert_eq!(console.err, [folder_unsafe_line(&format!("{bare} is writable by others"), &bare)]);
+        assert!(!case.has("repo") && !case.has("lib"), "nothing is laid out");
+        assert!(!case.staged(), "no stage is made");
     }
 
     #[test]
@@ -2074,7 +2488,7 @@ mod tests {
         fs::create_dir(format!("{}/sub", case.work())).expect("a folder is made");
         // A folder standing for `.git` reached by another spelling: the walk knows `.git` by its identity alone.
         let sub = Facts::of(&work.folder.stat_child(OsStr::new("sub")).expect("the folder is looked at"));
-        work.git = Some((sub.dev, sub.ino));
+        work.avoid.gits = vec![(sub.dev, sub.ino)];
         let (path, folder, left) = case.stage(&[]);
         let staged = Staged {
             folder: &folder,
@@ -2220,13 +2634,81 @@ mod tests {
         let record_of = |path: &str| {
             let mut files = Map::new();
             files.insert(path.to_owned(), entry.clone());
-            Record::parse(&json!({ "digest": "", "files": files }).to_string()).err()
+            Record::parse(&json!({ "digest": "", "files": files }).to_string(), &[]).err()
         };
 
         for path in ["../x", "a/../b", "/abs", ".git/config"] {
             assert_eq!(record_of(path), Some("is not an inputs record".to_owned()), "{path}");
         }
         assert_eq!(record_of("a/b.txt"), None);
+    }
+
+    #[test]
+    fn a_pair_s_record_naming_a_path_below_no_tree_is_not_a_record() {
+        let entry = json!({ "size": 1, "sha256": "0".repeat(64), "modified": 1, "id": "1-2" });
+        let record_of = |path: &str, trees: &[&str]| {
+            let mut files = Map::new();
+            files.insert(path.to_owned(), entry.clone());
+            Record::parse(&json!({ "digest": "", "files": files }).to_string(), trees).err()
+        };
+        let pair = ["repo", "lib"];
+
+        for path in ["other/x.txt", "Lib/x.txt", "x.txt", "lib"] {
+            assert_eq!(record_of(path, &pair), Some("is not an inputs record".to_owned()), "{path}");
+        }
+        assert_eq!(record_of("lib/x.txt", &pair), None);
+        assert_eq!(record_of("repo/d/x.txt", &pair), None);
+        assert_eq!(record_of("x.txt", &[]), None, "one repo's record names no tree");
+    }
+
+    /// The work folder of a pair, made by hand: each tree with a `.git/info`.
+    fn pair_work(case: &Case) {
+        for tree in ["repo", "lib"] {
+            fs::create_dir_all(format!("{}/{tree}/.git/info", case.work())).expect("the tree is made");
+        }
+    }
+
+    #[test]
+    fn a_way_through_a_tree_s_git_by_another_name_is_refused() {
+        let case = Case::pair("tree-git-by-id", "lib");
+        pair_work(&case);
+        fs::create_dir_all(format!("{}/lib/sub", case.work())).expect("a folder is made");
+        let mut work = Work::held(&case.work(), &["repo", "lib"]).expect("the pair's work folder is held");
+        let lib = work.trees.get(1).expect("the sibling is held");
+        let sub = Facts::of(&lib.folder.stat_child(OsStr::new("sub")).expect("the folder is looked at"));
+        let lib_git = Facts::of(&lib.git.stat().expect("the sibling's .git is looked at"));
+        assert!(work.avoid.gits.contains(&(lib_git.dev, lib_git.ino)), "each tree's .git is avoided");
+
+        work.avoid.gits.push((sub.dev, sub.ino));
+        let freed = free_target(&work, "lib/sub/x.txt", &Record::default(), &Manifest::default());
+        assert_eq!(
+            freed,
+            Err("cannot install 'lib/sub/x.txt': 'lib/sub' is the work folder's .git".to_owned())
+        );
+
+        let below_none = free_target(&work, "other/x.txt", &Record::default(), &Manifest::default());
+        assert_eq!(
+            below_none,
+            Err("cannot install 'other/x.txt': 'other/x.txt' names no tree of the work folder".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_pair_s_tree_that_is_a_link_is_not_held() {
+        let case = Case::pair("tree-link", "lib");
+        pair_work(&case);
+        let outside = case.base.join("outside");
+        fs::create_dir_all(outside.join(".git")).expect("the outside folder is made");
+        let lib = format!("{}/lib", case.work());
+        fs::remove_dir_all(&lib)
+            .and_then(|()| symlink(&outside, &lib))
+            .expect("a link takes the tree's name");
+
+        let refused = Work::held(&case.work(), &["repo", "lib"])
+            .map(drop)
+            .expect_err("a linked tree is not held");
+
+        assert!(refused.to_string().starts_with(&format!("{lib}: ")), "{refused}");
     }
 
     #[test]
@@ -2461,7 +2943,7 @@ mod tests {
         let leftover = format!("{info}/exclude.gate-new-{}-0", std::process::id());
         fs::write(&leftover, "left\n").expect("a leftover temp file is planted");
 
-        let moved = write_exclude(&work, &Record::default()).expect("the exclude file is written");
+        let moved = write_exclude(&work, None, &Record::default()).expect("the exclude file is written");
 
         assert_eq!(moved, None);
         assert!(!Path::new(&leftover).exists(), "the leftover is gone");
@@ -2582,7 +3064,7 @@ mod tests {
         }
         record.kept.insert(ordinal_upper("k*.txt"), "k*.txt".to_owned());
 
-        let moved = write_exclude(&work, &record).expect("the exclude file is written");
+        let moved = write_exclude(&work, None, &record).expect("the exclude file is written");
 
         assert_eq!(
             moved,
@@ -2665,11 +3147,64 @@ mod tests {
     /// The run's check of the work folder `work` for the digest `sent`, its work lock held: why the run is refused, or a
     /// lost lock's line marked as such.
     fn checked(work: &str, sent: &str) -> Result<Option<String>, String> {
+        // One repo has one exclude file; a second line would show joined to the first.
+        checked_trees(work, &[], sent).map(|lines| lines.into_iter().reduce(|first, more| format!("{first}; {more}")))
+    }
+
+    /// [`checked`] for the work folder of a pair laid out as `trees`: the lines saying where a folder was moved aside.
+    fn checked_trees(work: &str, trees: &[&str], sent: &str) -> Result<Vec<String>, String> {
         let lock = files::held_for_test(Path::new(&format!("{work}.lock")));
-        unmatched(work, sent, &lock).map_err(|unmatched| match unmatched {
+        unmatched(work, trees, sent, &lock).map_err(|unmatched| match unmatched {
             Unmatched::Inputs(why) => why,
             Unmatched::LockLost(why) => format!("lock lost: {why}"),
         })
+    }
+
+    #[test]
+    fn a_pair_s_sealed_record_passes_and_writes_each_tree_s_exclude_file() {
+        let case = Case::pair("unmatched-pair", "lib");
+        let (status, console) = case.put(&PAIR_FILES, &PAIR_FILES, &[]);
+        assert_eq!(status, 0, "{:?}", console.err);
+        let digest = case.digest(&PAIR_FILES);
+        for tree in ["repo", "lib"] {
+            fs::write(format!("{}/{tree}/.git/info/exclude", case.work()), "").expect("the exclude file is emptied");
+        }
+
+        assert_eq!(checked_trees(&case.work(), &["repo", "lib"], &digest), Ok(Vec::new()));
+        assert_eq!(case.tree_exclude("repo"), "/data/b.txt\n");
+        assert_eq!(case.tree_exclude("lib"), "/x.txt\n");
+
+        fs::write(format!("{}/lib/x.txt", case.work()), "changed\n").expect("the box changes the sibling's copy");
+        assert_eq!(
+            checked_trees(&case.work(), &["repo", "lib"], &digest),
+            Err("the input lib/x.txt is not the copy installed".to_owned())
+        );
+        let path = case.record_path();
+        assert_eq!(
+            checked_trees(&case.work(), &["repo", "other"], &digest),
+            Err(format!("{path} is not an inputs record")),
+            "a record naming a path below no tree of the run is no record"
+        );
+    }
+
+    /// A tree whose exclude file cannot be written fails the run's whole check, whatever the other tree's: no tree is
+    /// ever skipped.
+    #[test]
+    fn a_pair_whose_sibling_exclude_cannot_be_written_refuses_the_run() {
+        let case = Case::pair("unmatched-pair-exclude", "lib");
+        let (status, console) = case.put(&PAIR_FILES, &PAIR_FILES, &[]);
+        assert_eq!(status, 0, "{:?}", console.err);
+        let digest = case.digest(&PAIR_FILES);
+        let git = format!("{}/lib/.git", case.work());
+        fs::remove_dir_all(format!("{git}/info")).expect("the sibling's .git/info is removed");
+        fs::write(format!("{git}/info"), "").expect("a file takes .git/info's name");
+        fs::set_permissions(&git, fs::Permissions::from_mode(0o500)).expect("the sibling's .git is made read-only");
+
+        let checked = checked_trees(&case.work(), &["repo", "lib"], &digest);
+
+        fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).expect("the sibling's .git is writable again");
+        let refused = checked.expect_err("a tree whose exclude cannot be written refuses the run");
+        assert!(refused.starts_with(&format!("cannot ready {git}/info: ")), "{refused}");
     }
 
     /// The run's check of a case `name` whose sealed [`TWO`] had its `a.txt` changed by `change`.
@@ -2787,7 +3322,7 @@ mod tests {
                 .expect("the copy is written before 1970");
         };
         let stamp = || {
-            let work = Work::held(&case.work()).expect("the work folder is held");
+            let work = Work::held(&case.work(), &[]).expect("the work folder is held");
             opened_copy(&work, "a.txt")
                 .expect("the copy opens")
                 .expect("the copy is there")
@@ -2830,7 +3365,7 @@ mod tests {
         fs::create_dir(case.work()).expect("the work folder is made");
         fs::set_permissions(case.work(), fs::Permissions::from_mode(0o775)).expect("the work folder is opened to the group");
 
-        let refused = Work::held(&case.work()).map(drop).expect_err("an open work folder is not held");
+        let refused = Work::held(&case.work(), &[]).map(drop).expect_err("an open work folder is not held");
 
         assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied, "{refused}");
         let user = files::user_name(files::effective_uid());

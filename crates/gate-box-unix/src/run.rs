@@ -19,7 +19,7 @@ use gate_inputs::failure::Caps;
 use gate_inputs::manifest::{Listing, Manifest};
 use gate_wire::drain::refused_lines;
 use gate_wire::{
-    BACK_COMMIT_NONE, BACK_COMMITS_FAILED, BoxKill, CROSS_STEP_START, CrossBuild, EngineKind, LAYOUT_CHANGING, PairSibling, PathForm, Payload,
+    BACK_COMMIT_NONE, BACK_COMMITS_FAILED, BoxKill, CROSS_STEP_START, CrossBuild, EngineKind, LAYOUT_CHANGING, Pair, PairSibling, PathForm, Payload,
     Refusal, back_commits_line, bare_stem, busy_line, checkout_done_line, checkout_start_line, escaped, layout_line, layout_text,
     names_another_layout, refused_line, trees,
 };
@@ -114,7 +114,32 @@ impl Repo<'_> {
 /// Each repo's default branch is the main repo's `Base` or the sibling's from `SiblingBases`. Else the usage line.
 fn repos<'p>(payload: &'p Payload, work: &str, bare: &str, snapshot: &'p str) -> Result<(Repo<'p>, Vec<Repo<'p>>), String> {
     let base = payload.base()?;
-    let Some(pair) = payload.pair()? else {
+    let pair = payload.pair()?;
+    let checkouts = match &pair {
+        Some(pair) => {
+            let commits = payload.sibling_snapshots(pair)?;
+            let bases = payload.sibling_bases(pair)?;
+            commits.into_iter().zip(bases).collect()
+        }
+        None => Vec::new(),
+    };
+    Ok(layout_repos(work, bare, pair.as_ref(), (snapshot, base), checkouts))
+}
+
+/// The repos of the work folder `work` laid out as a run lays it out, the one place a run ([`repos`]) and the inputs
+/// verb build them, so the verb lays out exactly the run's layout: with no `pair`, the one repo of `bare` in `work`
+/// itself; with one, the main repo in `<work>/<leaf>` and each sibling in `<work>/<name>` with its own bare repository
+/// ([`gate_wire::trees`]). The main repo checks out `main`'s commit with its default branch, and each sibling, in the
+/// pair's order, the commit and default branch `siblings` gives it.
+pub(crate) fn layout_repos<'p>(
+    work: &str,
+    bare: &str,
+    pair: Option<&Pair>,
+    main: (&'p str, Option<&'p str>),
+    siblings: impl IntoIterator<Item = (&'p str, Option<&'p str>)>,
+) -> (Repo<'p>, Vec<Repo<'p>>) {
+    let (snapshot, base) = main;
+    let Some(pair) = pair else {
         let (tree, _) = trees(work, None, PathForm::Unix);
         let main = Repo {
             name: None,
@@ -123,10 +148,8 @@ fn repos<'p>(payload: &'p Payload, work: &str, bare: &str, snapshot: &'p str) ->
             snapshot,
             base,
         };
-        return Ok((main, Vec::new()));
+        return (main, Vec::new());
     };
-    let commits = payload.sibling_snapshots(&pair)?;
-    let bases = payload.sibling_bases(&pair)?;
     let names: Vec<&str> = pair.siblings().iter().map(PairSibling::name).collect();
     let (main_tree, sibling_trees) = trees(work, Some((pair.leaf(), &names)), PathForm::Unix);
     let main = Repo {
@@ -139,10 +162,9 @@ fn repos<'p>(payload: &'p Payload, work: &str, bare: &str, snapshot: &'p str) ->
     let siblings = pair
         .siblings()
         .iter()
-        .zip(commits)
-        .zip(bases)
+        .zip(siblings)
         .zip(sibling_trees)
-        .map(|(((sibling, commit), base), tree)| Repo {
+        .map(|((sibling, (commit, base)), tree)| Repo {
             name: Some(sibling.name().to_owned()),
             tree,
             bare: sibling.bare().to_owned(),
@@ -150,7 +172,7 @@ fn repos<'p>(payload: &'p Payload, work: &str, bare: &str, snapshot: &'p str) ->
             base,
         })
         .collect();
-    Ok((main, siblings))
+    (main, siblings)
 }
 
 /// What a run reads of its payload.
@@ -210,9 +232,9 @@ pub struct Request<'p> {
 impl<'p> Request<'p> {
     /// Reads `payload` in the order the Windows box reads it, each key checked as it does, the outputs asked for
     /// ([`Asked::new`]) read once the output folder is; then notes the first thing asking for what this builder does not
-    /// build: `Desktop`, `CommitStage`, a warm-up's `WarmCommands`, an unreal `EngineEnv` name, `UnrealVersion`, `SentDigest`,
-    /// `LfsDigest` or `SiblingLfsDigests`; then, last, the repos ([`repos`]), a sibling pair as `gate-wire` checks it. A work root holding a `:` is refused just
-    /// after the work folder is read ([`work_layout`]).
+    /// build: `Desktop`, `CommitStage`, a warm-up's `WarmCommands`, an unreal `EngineEnv` name, `UnrealVersion`,
+    /// `SentDigest`, `LfsDigest` or `SiblingLfsDigests`; then, last, the repos ([`repos`]), a sibling pair as
+    /// `gate-wire` checks it. A work root holding a `:` is refused just after the work folder is read ([`work_layout`]).
     ///
     /// # Errors
     ///
@@ -1580,19 +1602,21 @@ fn failure<S: LineSink>(output: &Output<S>, failed: &Failed) -> u8 {
 }
 
 /// Checks the run's `InputsDigest`, when it has one, against the work folder's inputs record and the copies it holds,
-/// and rewrites the tree's exclude file from it ([`inputs::unmatched`]), once the work folder is laid out and before
-/// the checkout: a record missing, unreadable or of another digest, a copy changed or gone, or an exclude file that
-/// cannot be written refuses the run `inputs`, its tag and line said together, so the PC runs the command itself. The
-/// exclude file is written only while the work lock `lock` is shown still held; else the run fails with status 1, its
-/// line said, as its other record writes do. A folder moved aside from the exclude file's name is said and the run
-/// goes on.
+/// and rewrites each tree's exclude file from it ([`inputs::unmatched`]), once the work folder is laid out and before
+/// the checkout: the work folder's own for one repo, each of a pair's trees', the main repo's first, for a pair. A
+/// record missing, unreadable, of another digest or naming a path below no tree, a copy changed or gone, or an exclude
+/// file that cannot be written refuses the run `inputs`, its tag and line said together, so the PC runs the command
+/// itself. The exclude files are written only while the work lock `lock` is shown still held; else the run fails with
+/// status 1, its line said, as its other record writes do. A folder moved aside from an exclude file's name is said and
+/// the run goes on.
 fn inputs_matched<S: LineSink>(request: &Request<'_>, lock: &HeldLock, output: &Output<S>) -> Result<(), Unready> {
     let Some(sent) = request.inputs_digest else {
         return Ok(());
     };
-    match inputs::unmatched(request.work, sent, lock) {
+    let trees: Vec<&str> = request.repos().filter_map(|repo| repo.name.as_deref()).collect();
+    match inputs::unmatched(request.work, &trees, sent, lock) {
         Ok(moved_aside) => {
-            if let Some(line) = moved_aside {
+            for line in moved_aside {
                 // A note: the run goes on, and a client gone finds out at the next line.
                 let _ = output.say(Stream::Err, GAT, &line);
             }
@@ -1608,7 +1632,14 @@ fn inputs_matched<S: LineSink>(request: &Request<'_>, lock: &HeldLock, output: &
             Err(Unready::Refused)
         }
         Err(Unmatched::LockLost(why)) => {
-            let line = format!("gate: remote could not write {}/.git/info/exclude: {why}", request.work);
+            let line = if trees.is_empty() {
+                format!("gate: remote could not write {}/.git/info/exclude: {why}", request.work)
+            } else {
+                format!(
+                    "gate: remote could not write the exclude files of the pair's trees in {}: {why}",
+                    request.work
+                )
+            };
             Err(Unready::Ended(said(output, &[&line], FAILED_STATUS)))
         }
     }
@@ -4499,6 +4530,23 @@ mod tests {
         );
         assert_eq!(after_checkout(said.get(1..).unwrap_or_default()), Vec::<String>::new());
         assert_eq!(case.exclude_text().as_deref(), Some("/in.txt\n"));
+    }
+
+    #[test]
+    fn a_pair_s_matching_inputs_record_writes_each_tree_s_exclude_file_and_lets_the_run_start() {
+        let case = Case::new("inputs-pair-matched");
+        let main = case.snapshot(&[("a.txt", "a\n")]);
+        let lib = case.lib_snapshot(&[("b.txt", "b\n")]);
+        let (status, said) = ran(&case.pair_json(&main, &lib, &json!({})));
+        assert_eq!(status, 0, "{said:?}");
+        case.inputs_installed(&[("lib/x.txt", "sibling input\n"), ("repo/in.txt", "input\n")]);
+
+        let (status, said) = ran(&case.pair_json(&main, &lib, &json!({ "InputsDigest": DIGEST })));
+
+        assert_eq!(status, 0, "{said:?}");
+        let exclude = |tree: &str| fs::read_to_string(format!("{}/.git/info/exclude", case.tree(tree))).ok();
+        assert_eq!(exclude("repo").as_deref(), Some("/in.txt\n"), "the leaf's lists only its own");
+        assert_eq!(exclude("lib").as_deref(), Some("/x.txt\n"), "the sibling's lists only its own");
     }
 
     #[test]
