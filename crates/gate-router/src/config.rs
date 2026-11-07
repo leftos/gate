@@ -2,7 +2,8 @@
 //! entry's), the optional `hosts` (further builders,
 //! which `gate push` reaches and routing neither reads nor refuses), the remote pool's `slots` (a whole
 //! number 1 to 16, 1 when missing), `repos` (each repo name's list of `-like` patterns for the commands that route) and
-//! the optional `outputs` (each repo name's globs for the files a routed run brings back), the optional `inputs` (each
+//! the optional `first` (each repo name's list of the patterns whose commands rank the builder before every other while
+//! it has a free slot) and the optional `outputs` (each repo name's globs for the files a routed run brings back), the optional `inputs` (each
 //! repo name's globs for the ignored files a routed run sends) and the optional `siblings` (each repo name's list of
 //! the sibling folder names a routed run of it may carry) and the optional `warmup` (the repo names whose
 //! `.gate/warmup.toml` may warm their builder work folders) and the optional `desktop` (each repo name's list of the
@@ -13,7 +14,7 @@
 //! declared siblings must all be beside the worktree for a run to route) and the optional `sendBuild` (the repo names whose routed
 //! `dotnet test --no-build` may send the PC's build) and the optional `declarations` (each repo name's folder
 //! holding the `.gate` files the repo has none of) and the optional `builders` (further builders a routed run may go
-//! to, each with its own `host`, `os`, `root`, `slots`, `repos` and `outputs`, and an optional `data`, the builder's
+//! to, each with its own `host`, `os`, `root`, `slots`, `repos`, `first` and `outputs`, and an optional `data`, the builder's
 //! tailnet IPv4 address a data channel dials). Keys match in any letter case and
 //! unknown keys are ignored.
 //! The text may hold `//` and `/* */` comments and trailing commas, as the
@@ -73,6 +74,8 @@ pub struct Builder {
 struct BuilderEntry {
     builder: Builder,
     repos: RepoTable,
+    /// Each repo name's patterns whose commands rank this builder first while it is free ([`Config::first_patterns`]).
+    first: RepoTable,
     outputs: RepoTable,
     failure_outputs: RepoTable,
     routed: bool,
@@ -93,6 +96,8 @@ pub struct Config {
     /// The `builders` entries, in file order.
     entries: Vec<BuilderEntry>,
     repos: Vec<(String, Vec<Pattern>)>,
+    /// Each repo name's patterns whose commands rank `host` first while it is free ([`Config::first_patterns`]).
+    first: RepoTable,
     outputs: Vec<(String, Vec<Pattern>)>,
     /// Each repo name's globs for the files a failed routed run brings back beside its test reports.
     failure_outputs: Vec<(String, Vec<Pattern>)>,
@@ -155,11 +160,11 @@ impl Config {
     ///
     /// The reason the file is unusable, worded as the PowerShell gate words it: text that is not JSON, two keys of one
     /// object differing only in letter case, a value that is not a JSON object, a missing or empty `host`, a `slots`
-    /// that is not a whole number 1 to 16, a missing `repos`, a `repos`, `outputs` or `inputs` that is not an object of
+    /// that is not a whole number 1 to 16, a missing `repos`, a `repos`, `first`, `outputs` or `inputs` that is not an object of
     /// arrays of non-empty valid patterns, or an output or input glob holding `[` or `]`.
     ///
-    /// A `builders` that is not an array of objects, or an entry with a bad `host`, `os`, `root`, `slots`, `repos` or
-    /// `outputs`, or whose `host` repeats the top-level `host`, a `hosts` entry or an earlier entry's in any ASCII letter
+    /// A `builders` that is not an array of objects, or an entry with a bad `host`, `os`, `root`, `slots`, `repos`,
+    /// `first` or `outputs`, or whose `host` repeats the top-level `host`, a `hosts` entry or an earlier entry's in any ASCII letter
     /// case, is refused
     /// with a reason of the gate's own naming the entry (`builders[0].root must be an absolute path for a macos
     /// builder`): it changes where commands go.
@@ -196,6 +201,7 @@ impl Config {
         let host = read_host(&data)?;
         let slots = read_slots(&data, "")?;
         let repos = read_table(&data, "repos", true, "")?;
+        let first = read_table(&data, "first", false, "")?;
         let outputs = read_table(&data, "outputs", false, "")?;
         let failure_outputs = read_table(&data, "failureOutputs", false, "")?;
         let inputs = read_table(&data, "inputs", false, "")?;
@@ -218,6 +224,7 @@ impl Config {
             },
             entries,
             repos,
+            first,
             outputs,
             failure_outputs,
             inputs,
@@ -531,6 +538,19 @@ impl Config {
         match self.entries.iter().find(|entry| entry.builder == *builder) {
             Some(entry) => find(&entry.repos, repo),
             None if *builder == self.host => self.patterns(repo),
+            None => None,
+        }
+    }
+
+    /// The patterns `builder`'s own `first` gives `repo`: its `builders` entry's `first`, routed or not, or the top-level
+    /// `first` for `host`; `None` when that listing does not name the repo, and for a `hosts` entry, which lists none. A
+    /// command one of them matches ranks the builder before every other while its queue wait is zero; it never makes the
+    /// builder a candidate, which only `repos` does.
+    #[must_use]
+    pub fn first_patterns(&self, builder: &Builder, repo: &str) -> Option<&[Pattern]> {
+        match self.entries.iter().find(|entry| entry.builder == *builder) {
+            Some(entry) => find(&entry.first, repo),
+            None if *builder == self.host => find(&self.first, repo),
             None => None,
         }
     }
@@ -930,7 +950,7 @@ fn named_already(alias: &str, host: &str, hosts: &[(usize, &str)], entries: &[Bu
 /// One `builders` entry, its reasons starting with `prefix` (`builders[0].`): `host` checked as the top-level one is,
 /// `os` `windows` or `macos` in any ASCII letter case, `root` ([`read_builder_root`]), `slots` as the top-level one,
 /// `routed` `true` (the default) or `false`, `repos` an object naming at least one repo, which a not-routed entry may
-/// leave empty or missing, and `outputs` as the top-level one.
+/// leave empty or missing, and `first`, `outputs` and `failureOutputs` as the top-level ones.
 fn read_builder_entry(object: &Map<String, Value>, prefix: &str) -> Result<BuilderEntry, String> {
     let host = property(object, "host").ok_or_else(|| format!("{prefix}host is missing"))?;
     let alias = checked_host(host, &HOST_REFUSALS).map_err(|reason| format!("{prefix}{reason}"))?;
@@ -951,6 +971,7 @@ fn read_builder_entry(object: &Map<String, Value>, prefix: &str) -> Result<Build
     if routed && repos.is_empty() {
         return Err(format!("{prefix}repos must name at least one repo"));
     }
+    let first = read_table(object, "first", false, prefix)?;
     let outputs = read_table(object, "outputs", false, prefix)?;
     let failure_outputs = read_table(object, "failureOutputs", false, prefix)?;
     let cross_build = read_cross_build(object, os, &outputs, prefix);
@@ -966,6 +987,7 @@ fn read_builder_entry(object: &Map<String, Value>, prefix: &str) -> Result<Build
             data,
         },
         repos,
+        first,
         outputs,
         failure_outputs,
         routed,

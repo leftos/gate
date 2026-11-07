@@ -1,6 +1,8 @@
 //! The order a routed run tries its capable builders in: by the earliest expected finish of each, read from the figures
 //! the caller gives for it ([`BuilderFigures`]), a held work folder and then file order breaking an exact tie
-//! ([`order`], [`ranked`]); and the compare that keeps a light run here when its learned local p50 is under
+//! ([`order`], [`ranked`]), a builder `first` for the command with a free slot going before all of them
+//! ([`ranked_with_first`]);
+//! and the compare that keeps a light run here when its learned local p50 is under
 //! [`FASTER_HERE_SHARE`] of the expected finish of the builder it would go to ([`faster_here`]).
 
 /// What the PC knows of one builder for one command, each time in seconds.
@@ -64,6 +66,17 @@ pub struct Ranking {
 /// The builders of `figures`, best first, each with its score: the order [`order`] gives, by the same rule.
 #[must_use]
 pub fn ranked(figures: &[BuilderFigures]) -> Ranking {
+    ranked_with_first(figures, &[])
+}
+
+/// The builders of `figures`, best first, each with its score, as [`ranked`] gives them but for the builders `first`
+/// marks (one flag per figure, in their order; a figure past the flags is not first): a first builder with a free slot
+/// (`free_slots` above 0) ranks before every other builder, whatever their scores or warmth, and among several such
+/// builders the chain of [`ranked`] (expected finish, a held work folder, then the given order) decides. A first
+/// builder with no free slot ranks by that chain like any other, even when its queue wait reads 0, as it does for a
+/// full pool whose holder has overrun its usual time. Each score stays the builder's own.
+#[must_use]
+pub fn ranked_with_first(figures: &[BuilderFigures], first: &[bool]) -> Ranking {
     let usable = |seconds: f64| seconds.is_finite() && seconds >= 0.0;
     debug_assert!(
         figures
@@ -74,10 +87,12 @@ pub fn ranked(figures: &[BuilderFigures]) -> Ranking {
     let known: Vec<f64> = figures.iter().filter_map(|builder| builder.duration).collect();
     let fill = median(known);
     let scores: Vec<f64> = figures.iter().map(|builder| expected_finish(builder, fill)).collect();
+    let free_first = |index: usize| first.get(index).copied().unwrap_or(false) && figures[index].free_slots > 0;
     let mut indexes: Vec<usize> = (0..figures.len()).collect();
     indexes.sort_by(|&left, &right| {
+        let first_ahead = free_first(right).cmp(&free_first(left));
         let warm_first = figures[right].holds_folder.cmp(&figures[left].holds_folder);
-        scores[left].total_cmp(&scores[right]).then(warm_first)
+        first_ahead.then(scores[left].total_cmp(&scores[right])).then(warm_first)
     });
     let ranks = indexes
         .into_iter()
@@ -96,7 +111,8 @@ pub fn ranked(figures: &[BuilderFigures]) -> Ranking {
 /// line and its journal's `balanced` field tell them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Balanced {
-    /// The builder the run goes to first, then every other in score order.
+    /// The builder the run goes to first, then every other in rank order: a builder first for the command with a free
+    /// slot ahead ([`ranked_with_first`]), then score order.
     pub entries: Vec<BalancedEntry>,
     /// Whether the scores include a duration ([`Ranking::has_duration`]); the same for every builder of a decision.
     pub has_duration: bool,
@@ -220,7 +236,7 @@ pub fn median(mut durations: Vec<f64>) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BuilderFigures, Rank, faster_here, order, ranked};
+    use super::{BuilderFigures, Rank, faster_here, order, ranked, ranked_with_first};
 
     fn figures(queue_wait: f64, duration: Option<f64>, holds_folder: bool) -> BuilderFigures {
         BuilderFigures {
@@ -338,6 +354,55 @@ mod tests {
             figures(100.0, Some(100.0), true),
         ];
         assert_eq!(order(&given), [2, 1, 3, 0], "all but the third tie at 200 s; the warm ones go first");
+    }
+
+    fn first_order(figures: &[BuilderFigures], first: &[bool]) -> Vec<usize> {
+        ranked_with_first(figures, first).ranks.into_iter().map(|rank| rank.index).collect()
+    }
+
+    #[test]
+    fn a_free_first_builder_ranks_before_a_warm_faster_one() {
+        let given = [figures(0.0, Some(100.0), true), figures(0.0, Some(300.0), false)];
+        assert_eq!(first_order(&given, &[false, true]), [1, 0], "first and free beats 100 s warm");
+        let ranking = ranked_with_first(&given, &[false, true]);
+        assert_eq!(ranking.ranks[0], Rank { index: 1, seconds: 600.0 }, "it keeps its own score");
+    }
+
+    #[test]
+    fn a_waiting_first_builder_ranks_by_its_score() {
+        let given = [figures(30.0, Some(100.0), true), figures(0.0, Some(60.0), true)];
+        assert_eq!(first_order(&given, &[true, false]), [1, 0], "130 s waiting against 60 s free");
+        let given = [figures(10.0, Some(30.0), true), figures(0.0, Some(60.0), true)];
+        assert_eq!(first_order(&given, &[true, false]), [0, 1], "40 s waiting is still the best score");
+    }
+
+    #[test]
+    fn two_free_first_builders_keep_the_chain_between_them() {
+        let given = [
+            figures(0.0, Some(10.0), true),
+            figures(0.0, Some(300.0), true),
+            figures(0.0, Some(200.0), true),
+            figures(0.0, Some(200.0), false),
+        ];
+        assert_eq!(
+            first_order(&given, &[false, true, true, false]),
+            [2, 1, 0, 3],
+            "the two first ones by score, then the rest"
+        );
+        let given = [figures(0.0, None, false), figures(0.0, None, true), figures(0.0, None, false)];
+        assert_eq!(first_order(&given, &[true, true, true]), [1, 0, 2], "warmth, then file order");
+    }
+
+    #[test]
+    fn no_builder_first_ranks_as_ranked_does() {
+        let given = [
+            figures(0.0, Some(100.0), false),
+            figures(0.0, Some(200.0), true),
+            figures(0.0, Some(50.0), true),
+            figures(100.0, Some(100.0), true),
+        ];
+        assert_eq!(first_order(&given, &[false; 4]), order(&given));
+        assert_eq!(first_order(&given, &[]), order(&given), "a builder past the flags is not first");
     }
 
     #[test]

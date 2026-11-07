@@ -819,11 +819,11 @@ Test-seams builds accept hidden options on `prune` and no `--test-print-request`
 
 A missing or unusable `remote.json` prints one `remote: ` line on stderr (the refusal texts below for the file) and exits 1. It takes no `--builder`, `--tag` or `--dry-run`. The local-run watcher asks it in place of a matcher of its own.
 
-`<section>` is one of `repos`, `outputs`, `failureOutputs`, `inputs`, `desktop`, `desktopSession`, `siblings` or `carriedFolders`, and `<repo>` a key of that section.
+`<section>` is one of `repos`, `first`, `outputs`, `failureOutputs`, `inputs`, `desktop`, `desktopSession`, `siblings` or `carriedFolders`, and `<repo>` a key of that section.
 
 A section's entries are the patterns of a command-matching list, the folder names of `siblings` or the folder globs of `carriedFolders`; the word `<pattern>` stands for any of them.
 
-With `--builder <host>` (a `builders` entry matched by host in ASCII case) the list is the entry's own, and only `repos`, `outputs` and `failureOutputs` exist there. The flat lists (`warmup`, `hooks`, `commits`, `sendBuild`) are not edited by it. A repo key matches in ASCII case and keeps its spelling; a missing repo or section is appended at the end. Removing the last pattern leaves `[]` and never deletes the key (an empty `outputs` list brings nothing back).
+With `--builder <host>` (a `builders` entry matched by host in ASCII case) the list is the entry's own, and only `repos`, `first`, `outputs` and `failureOutputs` exist there. The flat lists (`warmup`, `hooks`, `commits`, `sendBuild`) are not edited by it. A repo key matches in ASCII case and keeps its spelling; a missing repo or section is appended at the end. Removing the last pattern leaves `[]` and never deletes the key (an empty `outputs` list brings nothing back).
 
 The file is rewritten as it stood: key order, indent (spaces or tabs), line ending, byte order mark and final newline are kept, and a file holding comments or trailing commas is refused, since a rewrite would drop them. Before it writes, the command checks that the result passes the router's parse, changes nothing outside the one list and adds no problem the file did not have, then re-reads the file and compares its bytes with what it edited. The write is `gate_state::write_text_replacing`, an atomic replace.
 
@@ -835,7 +835,7 @@ Exit 0 on success, 1 on a refusal and 2 on usage.
 
 Usage errors print their `gate: ` line before the usage: `gate: remote: missing the verb add, remove or match` (likewise a missing section, repo, pattern or, for `match`, `the text`), `unknown verb <v>; add, remove or match`, `<option> is for add and remove only; match changes nothing`, `match takes a repo and one text, and not <word>`.
 
-Others are `unknown section <s>; one of repos, outputs, failureOutputs, inputs, desktop, desktopSession, siblings, carriedFolders`, `a builder has no section <s>; with --builder, one of repos, outputs, failureOutputs`, `--tag is for add only; remove makes no backup to name` and `--tag must be 1 to 40 ASCII letters, digits, '_' and '-', got '<v>'`.
+Others are `unknown section <s>; one of repos, first, outputs, failureOutputs, inputs, desktop, desktopSession, siblings, carriedFolders`, `a builder has no section <s>; with --builder, one of repos, first, outputs, failureOutputs`, `--tag is for add only; remove makes no backup to name` and `--tag must be 1 to 40 ASCII letters, digits, '_' and '-', got '<v>'`.
 
 The shared `--<opt> is given twice`, `unknown option <w>` and `--<opt> needs a value` are also said (an option word or `--` after `--tag` or `--builder` is never its value).
 
@@ -1716,7 +1716,7 @@ Two rolls within one second collide on the archive name: the second archive fail
 
 ### remote.json
 
-`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos`, the optional `data`, the optional `ssh`, the optional `hosts`, the optional `builders` and the optional per-repo `outputs`, `failureOutputs`, `inputs`, `siblings` and `desktop` and the optional `warmup`, `hooks`, `commits`, `sendBuild` and `declarations`, read afresh by each routed gate and ignored as a whole with one line when unusable. [`gate remote`](#gate-remote) edits the pattern lists.
+`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos`, the optional `first`, the optional `data`, the optional `ssh`, the optional `hosts`, the optional `builders` and the optional per-repo `outputs`, `failureOutputs`, `inputs`, `siblings` and `desktop` and the optional `warmup`, `hooks`, `commits`, `sendBuild` and `declarations`, read afresh by each routed gate and ignored as a whole with one line when unusable. [`gate remote`](#gate-remote) edits the pattern lists.
 
 A minimal file, at `%LOCALAPPDATA%\gate\remote.json`, routes one repo's builds and tests to one Windows builder:
 
@@ -1745,7 +1745,7 @@ The optional `hosts` is an array of strings naming further builders, which `gate
 
 The push order is `host`, then `hosts` in file order, an entry equal to an earlier one in any letter case skipped. A `hosts` that is not an array of strings, or holds a bad entry, never affects routing: `gate push` alone refuses the file with `push: ignored <path>: <reason>`.
 
-The optional `builders` is an array of further builders that a routed run can go to, each `{"host", "os", "root", "slots", "data", "routed", "repos", "outputs", "failureOutputs", "crossBuild"}`:
+The optional `builders` is an array of further builders that a routed run can go to, each `{"host", "os", "root", "slots", "data", "routed", "repos", "first", "outputs", "failureOutputs", "crossBuild"}`:
 - `host` is the builder's ssh alias, passing the checks the top-level `host` does (`Builder::alias`).
 - `os` is `windows` or `macos` in any letter case.
 - `root` is the builder's work root. It is required for `macos`: an absolute path rooted at `/`, each name made of ASCII letters, digits, `.`, `_` and `-`, none empty, `.` or `..`. For `windows` it defaults to `D:\gate-remote` and must be `X:\` followed by names joined by `\`, each made of ASCII letters, digits, `.`, `_` and `-`, none starting or ending with `.` or a reserved device name; `/` is refused (`builders[N].root must be an absolute drive path for a windows builder`).
@@ -1755,6 +1755,7 @@ The optional `builders` is an array of further builders that a routed run can go
   A builder with no `data`, and every `hosts` entry, send every byte over ssh, exactly as before. Only a `windows` entry's `data` is used: a `macos` entry with one still gets no channel.
 - `routed` is an optional boolean, default `true`; a value that is not `true` or `false` makes the file unusable (`builders[N].routed must be true or false`). With `false` the entry is a not-routed builder: `repos` may be empty or missing and no unpinned run picks or tries it, while `gate push`, `gate check --builder` and `gate run --builder` reach it like any `builders` entry.
 - `repos`, `outputs` and `failureOutputs` are the entry's own, shaped like the top-level ones.
+- `first` is an optional object of repo name to an array of patterns, the top-level `first`'s shape: the patterns for which this builder is ranked first ([Routing](#routing), Which builder). It never makes the builder a candidate, which only `repos` does; a bad `first` makes the file unusable with the wording a bad `repos` gets.
 
 A bad entry, an alias that repeats the top-level `host`, an earlier `builders` entry or a `hosts` entry in any ASCII letter case, or a `builders` that is not an array makes the whole file unusable: `gate: ignored <path>: builders[N]...; running locally`. The top-level `outputs` apply to `host` alone; a `builders` entry with no `outputs` brings nothing back when it is `macos` and uses the default output globs when it is `windows`.
 
@@ -2483,6 +2484,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   **Which builder.** The builders that can take the run are the routed `builders` entries, in file order, whose own `repos.<repo>` patterns match the Windows-form rewritten words, then `host` when the top-level patterns match. One match takes the run; with two or more, the run goes to the one with the earliest expected finish, and a tie goes to the builder the worktree record lists, then to file order. A warm-up always goes to `host`.
 
+  **First builder.** The optional `first` section, `{"<repo>": ["<pattern>", ...]}`, at the top level (for `host`) and in each `builders` entry, ranks a matching builder ahead of the others for the commands its patterns match. A matching builder that is first for the run's words and has a free slot ranks before every other builder; among several such, the usual chain decides (expected finish, then the builder that holds the work folder, then file order). A first builder with no free slot ranks by its score like any other, and with no figures read the first builders come first, file order kept within each group. `first` never makes a builder a candidate; only `repos` does. A pinned run, a light run proven faster here, the macOS and backslash steer-offs and the commit stage are unchanged by it.
+
   The score of a builder adds this PC's queue wait for its remote pool, the run's learned duration on it, and, for a builder the worktree record's `builders` list does not name, its cold gap when one is learned, else the duration once more. A builder the record names pays nothing.
 
   The cold gap is the median of the key's passing cold runs in the 14-day window minus the warm mean the score uses for that builder, at least 0, and needs 3 such cold runs; it comes from the same key as the warm figure (exact, else family), cold runs with no warm estimate give none, and failed cold runs never count ([gate-durations](design/gate-durations.md)).
@@ -2549,7 +2552,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   **The next builder.** A builder that sends a routed run back for `full`, `busy` (its own refusal), `unreachable`, `version`, `parity`, `install` or `tools` is followed by the next capable builder before the run goes to the PC.
 
-  The candidates are, held by alias, each `builders` entry listing the repo whose own patterns match the command, and `host` when its patterns match, minus the pick, walked in the order the pick scored them (the best expected finish first; file order when nothing is known). The order is scored once, at the decision: a later candidate is rebuilt at the failover without reading figures again.
+  The candidates are, held by alias, each `builders` entry listing the repo whose own patterns match the command, and `host` when its patterns match, minus the pick, walked in the order the pick ranked them (a free first builder ahead, then the best expected finish; file order, first builders ahead, when nothing is known). A first builder that is down, full or lacks a pinned tool hands the run to the next in that order. The order is scored once, at the decision: a later candidate is rebuilt at the failover without reading figures again.
 
   Each is tried at most once, and a `sent` rerun stays inside its builder's attempt. A builder whose slot a several-pool wait took is tried, and every builder such a wait listed that ran out counts as tried ([Slots](#slots), Taking a slot).
 

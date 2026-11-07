@@ -7045,6 +7045,35 @@ fn with_nothing_known_the_first_builder_in_file_order_takes_the_run() {
     assert_eq!(call["host"], SLOT_FIRST, "{call}");
 }
 
+#[test]
+fn a_free_builder_first_for_the_pattern_takes_the_run_over_a_faster_earlier_one() {
+    let case = balance_case("routing-balance-first");
+    seed_both(&case, 40.0, 100.0);
+    plant_worktree_record(&case, &[SLOT_FIRST, HOST]);
+    let routing = json!({
+        "host": HOST,
+        "repos": { repo(&case): ["*tool*"] },
+        "first": { repo(&case): ["*tool*"] },
+        "builders": [{ "host": SLOT_FIRST, "os": "windows", "repos": { repo(&case): ["*tool*"] } }],
+    });
+    write_remote_json(&case, &routing.to_string());
+
+    let (pid, outcome, call) = balanced_run(&case, "out.log");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        took_on(&case, pid),
+        [HOST],
+        "host is first and free, though {SLOT_FIRST} scores 40 s: {outcome:?}"
+    );
+    assert_eq!(call["host"], HOST, "{call}");
+    assert_eq!(
+        balanced_lines(&outcome),
+        [format!("gate: balanced to {HOST}: about 2 min, 1 free ({SLOT_FIRST} about 40 s, 1 free)")],
+        "{outcome:?}"
+    );
+}
+
 /// The lines of `outcome`'s stderr that say a balanced pick.
 fn balanced_lines(outcome: &Outcome) -> Vec<&str> {
     outcome.stderr.lines().filter(|line| line.starts_with("gate: balanced to ")).collect()

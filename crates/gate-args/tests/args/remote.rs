@@ -122,7 +122,10 @@ fn remote_unknown_verbs_sections_and_options_are_usage_errors() {
     );
     assert_eq!(
         problems(&["remote", "add", "warmup", "gate", "x"]),
-        ["gate: remote: unknown section warmup; one of repos, outputs, failureOutputs, inputs, desktop, desktopSession, siblings, carriedFolders"]
+        [concat!(
+            "gate: remote: unknown section warmup; one of repos, first, outputs, failureOutputs, inputs, desktop, ",
+            "desktopSession, siblings, carriedFolders"
+        )]
     );
     assert_eq!(
         problems(&["remote", "add", "repos", "gate", "x", "--force"]),
@@ -138,11 +141,26 @@ fn remote_unknown_verbs_sections_and_options_are_usage_errors() {
 fn remote_builder_takes_only_a_section_a_builder_has() {
     assert_eq!(
         problems(&["remote", "add", "siblings", "gate", "b", "--builder", "one@example"]),
-        ["gate: remote: a builder has no section siblings; with --builder, one of repos, outputs, failureOutputs"]
+        ["gate: remote: a builder has no section siblings; with --builder, one of repos, first, outputs, failureOutputs"]
     );
     assert_eq!(
         problems(&["remote", "add", "repos", "gate", "x", "--builder"]),
         ["gate: --builder needs a value"]
+    );
+}
+
+#[test]
+fn remote_add_and_remove_take_the_first_section_with_and_without_a_builder() {
+    assert_eq!(
+        invocation(&["remote", "add", "first", "gate", "pwsh *"]),
+        Invocation::Remote(remote(RemoteVerb::Add, "first", "gate", &["pwsh *"]))
+    );
+    assert_eq!(
+        invocation(&["remote", "remove", "first", "gate", "pwsh *", "--builder", "mac@example"]),
+        Invocation::Remote(RemoteRequest {
+            builder: Some("mac@example".to_owned()),
+            ..remote(RemoteVerb::Remove, "first", "gate", &["pwsh *"])
+        })
     );
 }
 

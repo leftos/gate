@@ -80,6 +80,52 @@ fn an_unusable_failure_outputs_entry_is_refused_as_an_outputs_entry_is() {
 }
 
 #[test]
+fn a_first_entry_is_read_at_the_top_level_and_per_builder() {
+    let config = Config::parse(
+        r#"{"host": "builder-1", "repos": {"gate": ["x*"]}, "first": {"Gate": ["x 1*"]},
+            "builders": [{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"gate": ["x*"]},
+                          "first": {"gate": ["x 2*", "x 3*"]}},
+                         {"host": "win-2", "os": "windows", "repos": {"gate": ["x*"]}}]}"#,
+    )
+    .expect("usable");
+    let texts = |alias: &str, repo: &str| {
+        let builder = config.builder(alias).expect("a builder of the file");
+        config
+            .first_patterns(builder, repo)
+            .map(|patterns| patterns.iter().map(Pattern::as_str).collect::<Vec<_>>())
+    };
+    assert_eq!(texts("builder-1", "gate"), Some(vec!["x 1*"]), "the top-level first is host's");
+    assert_eq!(texts("mac-1", "GATE"), Some(vec!["x 2*", "x 3*"]), "an entry's own, its repo in any case");
+    assert_eq!(texts("win-2", "gate"), None, "an entry without first has none");
+    assert_eq!(texts("builder-1", "other"), None);
+}
+
+#[test]
+fn an_unusable_first_entry_is_refused_as_a_repos_entry_is() {
+    let cases = [
+        (r#"{"host": "bx", "repos": {"g": ["x"]}, "first": []}"#, "first must be a JSON object"),
+        (
+            r#"{"host": "bx", "repos": {"g": ["x"]}, "first": {"g": "x"}}"#,
+            "first.g is not an array of strings",
+        ),
+        (
+            r#"{"host": "bx", "repos": {"g": ["x"]}, "first": {"g": ["x", 3]}}"#,
+            "first.g[1] is not a non-empty string",
+        ),
+        (
+            r#"{"host": "bx", "repos": {"g": ["x"]},
+                "builders": [{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"g": ["x"]}, "first": {"g": [""]}}]}"#,
+            "builders[0].first.g[0] is not a non-empty string",
+        ),
+    ];
+    for (text, expected) in cases {
+        assert_eq!(reason(text), expected, "{text}");
+    }
+    let repos_reason = reason(r#"{"host": "bx", "repos": {"g": "x"}}"#);
+    assert_eq!(repos_reason, "repos.g is not an array of strings", "the same words as a bad repos");
+}
+
+#[test]
 fn an_inputs_entry_is_read_and_a_repo_it_does_not_name_has_none() {
     let config = Config::parse(
         r#"{"host": "builder-1", "repos": {"gate": [], "other": []},

@@ -4738,6 +4738,143 @@ fn the_later_candidates_follow_the_score_order() {
     );
 }
 
+/// `mac-1`, a macOS builder running `yaat`'s `dotnet` commands and first for them, under a `host` running them too.
+const MAC_FIRST: &str = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["dotnet *"]}, "first": {"yaat": ["dotnet *"]}}]"#;
+
+/// Figures of a builder holding no work folder, with `queue_wait` seconds to wait and its learned `duration`.
+fn cold_figures(queue_wait: f64, duration: Option<f64>) -> BuilderFigures {
+    BuilderFigures {
+        holds_folder: false,
+        ..figures(queue_wait, duration)
+    }
+}
+
+#[test]
+fn a_free_first_builder_is_picked_over_a_warm_faster_one() {
+    let facts = FakeFacts::with_config(with_builders(r#"{"yaat": ["dotnet *"]}"#, MAC_FIRST))
+        .with_figures("mac-1", cold_figures(0.0, Some(300.0)))
+        .with_figures("builder-1", figures(0.0, Some(100.0)));
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(run.builder.alias, "mac-1", "first and free beats 100 s warm against 600 s cold");
+    assert_eq!(later_aliases(&run), ["builder-1"]);
+    let balanced: Vec<&str> = run
+        .balanced
+        .as_ref()
+        .expect("scored")
+        .entries
+        .iter()
+        .map(|entry| entry.alias.as_str())
+        .collect();
+    assert_eq!(balanced, ["mac-1", "builder-1"], "the balanced value follows the same order");
+}
+
+#[test]
+fn a_waiting_first_builder_loses_to_a_free_faster_one() {
+    let facts = FakeFacts::with_config(with_builders(r#"{"yaat": ["dotnet *"]}"#, MAC_FIRST))
+        .with_figures("mac-1", figures(60.0, Some(100.0)))
+        .with_figures("builder-1", figures(0.0, Some(100.0)));
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(run.builder.alias, "builder-1", "a first builder with a queue wait ranks by its score");
+    assert_eq!(later_aliases(&run), ["mac-1"]);
+}
+
+#[test]
+fn a_full_first_builder_whose_wait_reads_zero_is_not_free() {
+    // A full pool whose holder overran its usual time reads a queue wait of 0.
+    let full = BuilderFigures {
+        free_slots: 0,
+        ..figures(0.0, Some(300.0))
+    };
+    let facts = FakeFacts::with_config(with_builders(r#"{"yaat": ["dotnet *"]}"#, MAC_FIRST))
+        .with_figures("mac-1", full)
+        .with_figures("builder-1", figures(0.0, Some(100.0)));
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(run.builder.alias, "builder-1", "a first builder with no free slot ranks by its score");
+    assert_eq!(later_aliases(&run), ["mac-1"]);
+}
+
+#[test]
+fn a_waiting_first_builder_with_the_best_score_is_picked_by_its_score() {
+    let facts = FakeFacts::with_config(with_builders(r#"{"yaat": ["dotnet *"]}"#, MAC_FIRST))
+        .with_figures("mac-1", figures(10.0, Some(30.0)))
+        .with_figures("builder-1", figures(0.0, Some(100.0)));
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(run.builder.alias, "mac-1", "40 s against 100 s");
+    assert_eq!(later_aliases(&run), ["builder-1"]);
+}
+
+#[test]
+fn with_no_figures_a_first_host_beats_an_earlier_builders_entry() {
+    let config = with_builders(r#"{"yaat": ["dotnet *"]}, "first": {"yaat": ["dotnet build*"]}"#, MAC_BUILD);
+    let facts = FakeFacts::with_config(config);
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(run.builder.alias, "builder-1", "first beats file order");
+    assert_eq!(later_aliases(&run), ["mac-1"]);
+    assert!(run.balanced.is_none(), "nothing was scored");
+}
+
+#[test]
+fn a_first_pattern_the_command_does_not_match_leaves_the_pick_as_it_was() {
+    let config = with_builders(r#"{"yaat": ["dotnet *"]}, "first": {"yaat": ["cargo *"]}"#, MAC_BUILD);
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &FakeFacts::with_config(config)));
+    assert_eq!(run.builder.alias, "mac-1", "file order, as without first");
+    assert_eq!(later_aliases(&run), ["builder-1"]);
+}
+
+#[test]
+fn a_first_pattern_on_a_builder_whose_repos_do_not_match_makes_it_no_candidate() {
+    let config = with_builders(r#"{"yaat": ["cargo *"]}, "first": {"yaat": ["dotnet *"]}"#, MAC_BUILD);
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &FakeFacts::with_config(config)));
+    assert_eq!(run.builder.alias, "mac-1");
+    assert!(run.later.is_empty(), "host is no candidate: {:?}", later_aliases(&run));
+}
+
+#[test]
+fn between_two_free_first_builders_the_score_decides() {
+    let builders = r#"[{"host": "win-2", "os": "windows", "repos": {"yaat": ["*"]}, "first": {"yaat": ["dotnet *"]}},
+        {"host": "win-3", "os": "windows", "repos": {"yaat": ["*"]}, "first": {"yaat": ["dotnet *"]}}]"#;
+    let facts = FakeFacts::with_config(with_builders(r#"{"yaat": ["dotnet *"]}"#, builders))
+        .with_figures("win-2", figures(0.0, Some(300.0)))
+        .with_figures("win-3", figures(0.0, Some(100.0)))
+        .with_figures("builder-1", figures(0.0, Some(50.0)));
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(run.builder.alias, "win-3", "the faster of the two first builders");
+    assert_eq!(later_aliases(&run), ["win-2", "builder-1"], "the other first one, then the rest");
+}
+
+#[test]
+fn a_single_matching_first_builder_is_the_same_single_pick() {
+    let facts = FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, MAC_FIRST));
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(run.builder.alias, "mac-1");
+    assert!(run.later.is_empty(), "{:?}", later_aliases(&run));
+    assert_eq!(facts.figures_asked.get(), 0, "one builder is not scored");
+}
+
+#[test]
+fn a_pin_to_the_builder_that_is_not_first_stands() {
+    let command = words(&["dotnet", "build"]);
+    let facts = FakeFacts::with_config(with_builders(r#"{"yaat": ["dotnet *"]}"#, MAC_FIRST));
+    let run = routed(decide(&pinned_to(&command, "builder-1"), &facts));
+    assert_eq!(run.builder.alias, "builder-1");
+    assert!(run.later.is_empty(), "{:?}", later_aliases(&run));
+}
+
+#[test]
+fn a_first_mac_is_still_steered_off_a_windows_only_test() {
+    let builders = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["dotnet test*"]}, "first": {"yaat": ["dotnet test*"]}},
+        {"host": "win-2", "os": "windows", "repos": {"yaat": ["dotnet test*"]}}]"#;
+    let facts = windows_only_facts(r#"{"other": ["*"]}"#, builders, true)
+        .with_figures("mac-1", figures(0.0, Some(300.0)))
+        .with_figures("win-2", figures(0.0, Some(60.0)));
+    let run = routed(decide(&heavy(&words(&["dotnet", "test", "tests/X"])), &facts));
+    assert_eq!(
+        run.builder.alias, "win-2",
+        "the steer-off moves the Mac, ranked first only by first, off as before"
+    );
+    assert_eq!(later_aliases(&run), ["mac-1"]);
+}
+
 /// A macOS builder `mac-1`, then Windows builders `win-2` and `win-3`, each running `yaat`'s `dotnet` commands, under a
 /// `host` that does not list `yaat`; `mac-1` scores best, `win-3` next and `win-2` last.
 fn mac_best_win_3_next(builders_pattern: &str, windows_only: bool) -> FakeFacts {

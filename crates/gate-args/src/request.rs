@@ -848,9 +848,10 @@ pub enum RemoteVerb {
     Remove,
 }
 
-/// The sections `gate remote` edits.
-pub const REMOTE_SECTIONS: [&str; 8] = [
+/// The sections `gate remote` edits; `first` ranks a builder first for its patterns, edited as `repos` is.
+pub const REMOTE_SECTIONS: [&str; 9] = [
     "repos",
+    "first",
     "outputs",
     "failureOutputs",
     "inputs",
@@ -860,5 +861,5 @@ pub const REMOTE_SECTIONS: [&str; 8] = [
     "carriedFolders",
 ];
 
-/// The sections `gate remote --builder` edits, the ones a `builders` entry has.
-pub const REMOTE_BUILDER_SECTIONS: [&str; 3] = ["repos", "outputs", "failureOutputs"];
+/// The sections `gate remote --builder` edits, the ones a `builders` entry has, `first` among them.
+pub const REMOTE_BUILDER_SECTIONS: [&str; 4] = ["repos", "first", "outputs", "failureOutputs"];

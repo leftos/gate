@@ -140,7 +140,7 @@ fn an_unknown_section_is_refused() {
     let refusal = add(BASE, "nonsense", "gate", &["x"]).expect_err("refused");
     assert_eq!(
         refusal.to_string(),
-        "unknown section nonsense; one of repos, outputs, failureOutputs, inputs, desktop, desktopSession, siblings, carriedFolders"
+        "unknown section nonsense; one of repos, first, outputs, failureOutputs, inputs, desktop, desktopSession, siblings, carriedFolders"
     );
 }
 
@@ -258,6 +258,97 @@ fn a_builder_s_list_is_addressed_by_its_host_and_an_unknown_builder_refused() {
 
     let refusal = edit(BUILDERS, EditVerb::Add, "siblings", Some("one@example"), "gate", &["b"]).expect_err("refused");
     assert_eq!(refusal, EditRefusal::NotABuilderSection("siblings".to_owned()));
+}
+
+/// [`BASE`] with `first.gate` holding `pwsh *`, in 2 spaces.
+const BASE_FIRST: &str = r#"{
+  "host": "builder@example",
+  "repos": {
+    "gate": [
+      "cargo test*"
+    ],
+    "other": [
+      "dotnet test*"
+    ]
+  },
+  "outputs": {
+    "gate": [
+      "target/**"
+    ]
+  },
+  "slots": 2,
+  "first": {
+    "gate": [
+      "pwsh *"
+    ]
+  }
+}
+"#;
+
+#[test]
+fn a_first_pattern_is_added_and_removed_at_the_top_level_in_the_file_s_own_indent() {
+    let two_space = laid_out(BASE, "  ", "\n");
+    let edited = add(&two_space, "first", "gate", &["pwsh *"]).expect("the edit is made");
+    assert_eq!(edited.lines, ["remote: first.gate: + pwsh *"]);
+    assert_eq!(edited.text, BASE_FIRST);
+
+    let widened = add(BASE_FIRST, "first", "gate", &["cargo test*"]).expect("the edit is made");
+    let edited = remove(&widened.text, "first", "gate", &["cargo test*"]).expect("the edit is made");
+    assert_eq!(edited.lines, ["remote: first.gate: - cargo test*"]);
+    assert_eq!(edited.text, BASE_FIRST, "only that pattern goes");
+}
+
+/// Two `builders` entries laid out as the rewrite lays them out, in 2 spaces, the second one's `first` listing
+/// `{first}` for `gate` (no `first` key when `None`).
+fn builders_laid_out(first: Option<&str>) -> String {
+    let first = first.map_or_else(String::new, |list| format!(",\n      \"first\": {{\n        \"gate\": {list}\n      }}"));
+    format!(
+        r#"{{
+  "host": "builder@example",
+  "repos": {{
+    "gate": [
+      "cargo test*"
+    ]
+  }},
+  "builders": [
+    {{
+      "host": "one@example",
+      "os": "windows",
+      "repos": {{
+        "gate": [
+          "x*"
+        ]
+      }}
+    }},
+    {{
+      "host": "two@example",
+      "os": "windows",
+      "repos": {{
+        "gate": [
+          "y*"
+        ]
+      }}{first}
+    }}
+  ]
+}}
+"#
+    )
+}
+
+#[test]
+fn a_first_pattern_is_added_and_removed_in_a_builder_entry() {
+    let base = builders_laid_out(None);
+    let edited = edit(&base, EditVerb::Add, "first", Some("two@example"), "gate", &["y*"]).expect("the edit is made");
+    assert_eq!(edited.lines, ["remote: builders[1].first.gate: + y*"]);
+    assert_eq!(
+        edited.text,
+        builders_laid_out(Some("[\n          \"y*\"\n        ]")),
+        "only the entry's new list, in the file's own indent"
+    );
+
+    let removed = edit(&edited.text, EditVerb::Remove, "first", Some("two@example"), "gate", &["y*"]).expect("the edit is made");
+    assert_eq!(removed.lines, ["remote: builders[1].first.gate: - y*"]);
+    assert_eq!(removed.text, builders_laid_out(Some("[]")), "the list is left empty");
 }
 
 /// A file holding every kind of JSON value outside the list an edit touches, laid out as the rewrite lays it out.

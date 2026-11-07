@@ -411,6 +411,7 @@ Blender is not on the builder's `PATH`: each builder holds its installs side by 
 - **The path.** Name an `[env]` variable the job's wrapper reads, `BLENDER_EXE = "blender"`, in place of a Windows path: the box sets it to the chosen install's executable (`blender.exe` on Windows, `Blender.app/Contents/MacOS/Blender` on the Mac), so one tracked wrapper runs on both. A PC path passed with `--env` is not rewritten for the builder.
 - **The config.** Copy the PC's Blender config to each builder as the Builder setup steps say. A job run with `--factory-startup` reads none of it.
 - **The GPU.** A Mac job that wants the GPU lists `METAL` among its Cycles devices.
+- **Mac first.** List the job's pattern on both builders with `gate remote add repos <repo> "<pattern>" --builder <host>` (and the Windows builder's own `repos`), then rank the Mac first with `gate remote add first <repo> "<pattern>" --builder <host>`, `<host>` being the Mac's alias. A free Mac then takes the job ahead of a warmer or faster Windows builder, and Windows takes it when the Mac is down, full or lacks the pinned Blender. A Mac with no free slot ranks by score like any builder.
 
 ## Build files that read back as zeros
 

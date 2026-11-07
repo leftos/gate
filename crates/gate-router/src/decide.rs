@@ -527,8 +527,9 @@ pub trait Facts {
     fn checkout_of(&self, tree: &Path) -> Option<String>;
 
     /// What the PC knows of each of `builders` for the command `words`, rewritten for Windows, of the worktree at
-    /// `place` ([`BuilderFigures`]): one entry per builder, in the order given, which [`balance::ranked`] scores; `None`
-    /// when these facts read no figures, which keeps the builders in file order and the run without a balanced pick
+    /// `place` ([`BuilderFigures`]): one entry per builder, in the order given, which [`balance::ranked_with_first`]
+    /// ranks, a builder first for the command with a free slot ahead, then score order; `None` when these facts read no
+    /// figures, which keeps the builders in file order, those first for the command ahead, and the run without a balanced pick
     /// ([`RemoteRun::balanced`]). Asked once per decision, with every builder one of whose own patterns matches the
     /// command, of a matched command whose worktree opened and that its `.gate/local.toml` does not keep here, only when
     /// two or more builders match, or when a light run has a learned local p50 ([`Facts::local_p50`]), then even of one
@@ -880,8 +881,8 @@ fn not_allowed_reason(names: &[String], problem: Option<&str>) -> String {
 )]
 pub struct RemoteRun {
     /// The builder this run goes to: the command's pick, the first builder listing the repo with a pattern that matches
-    /// (each `builders` entry, then `host`), in score order ([`balance::order`]), a held work folder and then file
-    /// order breaking ties.
+    /// (each `builders` entry, then `host`), a builder first for the command with a free slot ahead, then in score
+    /// order ([`balance::ranked_with_first`]), a held work folder and then file order breaking ties.
     pub builder: Builder,
     /// The worktree root as git gives it.
     pub root: String,
@@ -955,14 +956,16 @@ pub struct RemoteRun {
     /// read it.
     pub source_revision: Option<String>,
     /// The builders the run may try next when it falls back, in the order it would try them: each `builders` entry
-    /// listing the repo, then `host`, in score order ([`balance::order`]), a held work folder and then file order
-    /// breaking ties, minus the builder this run goes to, each one a pattern of whose own list the command matched, held
+    /// listing the repo, then `host`, a builder first for the command with a free slot ahead, then in score order
+    /// ([`balance::ranked_with_first`]), a held work folder and then file order breaking ties, minus the builder this
+    /// run goes to, each one a pattern of whose own list the command matched, held
     /// by its alias alone. A caller that falls back builds a candidate's run when it tries it ([`later_run`]); nothing is
     /// built here.
     pub later: Vec<LaterCandidate>,
     /// Every builder the decision scored, when it scored two or more from figures the facts read
-    /// ([`Facts::builder_figures`], [`balance::ranked`]): the builder this run goes to first, then every other in score
-    /// order, each with its score and figures. `None` for a run pinned with `--builder`, a command only one builder may
+    /// ([`Facts::builder_figures`], [`balance::ranked_with_first`]): the builder this run goes to first, then every other
+    /// in rank order, a builder first for the command with a free slot ahead, then score order, each with its score and
+    /// figures. `None` for a run pinned with `--builder`, a command only one builder may
     /// run, a decision whose facts read no figures (a light run's reroute by a critical request, `gate warm`), and a
     /// later candidate's run ([`later_run`]).
     pub balanced: Option<Balanced>,
@@ -1255,7 +1258,8 @@ fn commit_stage(config: &Config, inputs: &Inputs<'_>, facts: &dyn Facts) -> Opti
     let place = facts.place().ok().flatten()?;
     let words = stage_words();
     let windows = windows_builders(config, &repo_name(&place.checkout));
-    let Scored { order, balanced, .. } = scored(windows, &place, &words, facts, None);
+    let candidates = windows.into_iter().map(Candidate::plain).collect();
+    let Scored { order, balanced, .. } = scored(candidates, &place, &words, facts, None);
     let (builder, _) = order.first()?.clone();
     let later = later_candidates(&order, &builder);
     let balanced = balanced.map(|balanced| picked_first(balanced, &builder));
@@ -2065,7 +2069,8 @@ fn matched(config: &Config, inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Ma
         let local_p50 = (inputs.slot == Slot::Light && !desktop_run)
             .then(|| facts.local_p50(&opened.place, &sent.words))
             .flatten();
-        let Scored { order, balanced, scores } = scored(matching, &opened.place, &sent.words, facts, local_p50);
+        let candidates = candidates(config, &opened.repo, &sent.words, matching);
+        let Scored { order, balanced, scores } = scored(candidates, &opened.place, &sent.words, facts, local_p50);
         let first = pick(&order, |_| true).ok_or(None)?;
         let (builder, pattern) = steer_off_macos((config, &order), &opened, &sent.words, facts, (first, &found))?;
         let unix = slashed(&builder, &opened, words, &drives, facts);
@@ -3135,7 +3140,8 @@ fn kept_here(here: Here) -> String {
 }
 
 /// The builders the run may try next after the `chosen` one, in the order it would try them: the decision's score
-/// `order` ([`scored`]), ties broken as [`balance::order`] breaks them, minus the chosen builder. No fact is asked.
+/// `order` ([`scored`]), a free first builder ahead and ties broken as [`balance::ranked_with_first`] ranks them, minus
+/// the chosen builder. No fact is asked.
 fn later_candidates(order: &[(Builder, String)], chosen: &Builder) -> Vec<LaterCandidate> {
     order
         .iter()
@@ -3754,6 +3760,36 @@ fn matching(config: &Config, repo: &str, words: &[String]) -> Vec<(Builder, Stri
         .collect()
 }
 
+/// A builder that may run the command, with the pattern that chose it, and whether it is first for the command.
+struct Candidate {
+    /// The builder and the first of its own patterns the command matches.
+    route: (Builder, String),
+    /// Whether one of the builder's own `first` patterns ([`Config::first_patterns`]) matches the command.
+    first: bool,
+}
+
+impl Candidate {
+    /// A candidate that is first for no command, as every builder of a commit stage is.
+    fn plain(route: (Builder, String)) -> Self {
+        Self { route, first: false }
+    }
+}
+
+/// The `matching` builders of `repo`'s command `words`, each marked first for it when one of its own `first` patterns
+/// ([`Config::first_patterns`]) matches the words, by the match [`matching`] reads `repos` with; in their order.
+fn candidates(config: &Config, repo: &str, words: &[String], matching: Vec<(Builder, String)>) -> Vec<Candidate> {
+    let command = words.join(" ");
+    matching
+        .into_iter()
+        .map(|route| {
+            let first = config
+                .first_patterns(&route.0, repo)
+                .is_some_and(|patterns| first_match_text(patterns, &command).is_some());
+            Candidate { route, first }
+        })
+        .collect()
+}
+
 /// The pattern a command of `repo` whose words, joined by single spaces, are `text` would match first: what the first
 /// entry of [`matching`] holds, from the same lists by the same match. `None` when no pattern of the repo matches it.
 #[must_use]
@@ -3761,22 +3797,29 @@ pub fn pattern_for(config: &Config, repo: &str, text: &str) -> Option<String> {
     config.routes(repo).into_iter().find_map(|(_, patterns)| first_match_text(patterns, text))
 }
 
-/// The `matching` builders of the command `words` of the worktree at `place`, best first, and what their scores were
+/// The `candidates` for the command `words` of the worktree at `place`, best first, and what their scores were
 /// ([`Scored`]). Two or more are ordered by the figures the facts read for them ([`Facts::builder_figures`], asked
-/// once) as [`balance::ranked`] scores them, each scored builder kept in that order with its score, free slots and
-/// warmth ([`Scored::balanced`]); when the facts read none, they keep their file order and nothing is kept. Fewer than
-/// two are not scored, and nothing is asked; they keep their file order. A light run's learned local p50, `local_p50`,
-/// has the figures asked even of one builder, whose scores ([`Scored::scores`]) the p50 is compared with once the
-/// steer-offs have chosen the builder ([`proven_faster_here`]); one builder alone is still never kept as balanced.
+/// once) as [`balance::ranked_with_first`] ranks them with the ones first for the command ([`Candidate::first`]), each
+/// scored builder kept in that order with its score, free slots and warmth ([`Scored::balanced`]); when the facts read
+/// none, the same rank over figures alike for every builder ([`balance::ALIKE`]) puts the first ones before the
+/// others, each group in file order, and nothing is kept. Fewer than two are not scored, and nothing is asked; they
+/// keep their file order. A light run's learned local p50, `local_p50`, has the figures asked even of one builder,
+/// whose scores ([`Scored::scores`]) the p50 is compared with once the steer-offs have chosen the builder
+/// ([`proven_faster_here`]); one builder alone is still never kept as balanced.
 ///
 /// # Panics
 ///
 /// When the facts give a figure count other than one per builder, which breaks [`Facts::builder_figures`]'s contract.
-fn scored(matching: Vec<(Builder, String)>, place: &Place, words: &[String], facts: &dyn Facts, local_p50: Option<f64>) -> Scored {
-    let unscored = |order| Scored {
-        order,
-        balanced: None,
-        scores: None,
+fn scored(candidates: Vec<Candidate>, place: &Place, words: &[String], facts: &dyn Facts, local_p50: Option<f64>) -> Scored {
+    let first: Vec<bool> = candidates.iter().map(|candidate| candidate.first).collect();
+    let matching: Vec<(Builder, String)> = candidates.into_iter().map(|candidate| candidate.route).collect();
+    let unscored = |order: Vec<(Builder, String)>| {
+        let alike = balance::ranked_with_first(&vec![balance::ALIKE; order.len()], &first);
+        Scored {
+            order: in_rank_order(order, &alike),
+            balanced: None,
+            scores: None,
+        }
     };
     if matching.len() < 2 && local_p50.is_none() {
         return unscored(matching);
@@ -3786,7 +3829,7 @@ fn scored(matching: Vec<(Builder, String)>, place: &Place, words: &[String], fac
         return unscored(matching);
     };
     assert_eq!(figures.len(), builders.len(), "the facts give one figure per builder");
-    let ranking = balance::ranked(&figures);
+    let ranking = balance::ranked_with_first(&figures, &first);
     let aliases: Vec<String> = builders.iter().map(|builder| builder.alias.clone()).collect();
     if matching.len() < 2 {
         return Scored {
@@ -3808,13 +3851,18 @@ fn scored(matching: Vec<(Builder, String)>, place: &Place, words: &[String], fac
         entries,
         has_duration: ranking.has_duration,
     };
-    let mut unplaced: Vec<Option<(Builder, String)>> = matching.into_iter().map(Some).collect();
-    let order = ranking.ranks.iter().filter_map(|rank| unplaced[rank.index].take()).collect();
+    let order = in_rank_order(matching, &ranking);
     Scored {
         order,
         balanced: Some(balanced),
         scores: Some(Scores { aliases, ranking }),
     }
+}
+
+/// The `routes` in the order `ranking`, ranked from one figure per route in their order, puts them.
+fn in_rank_order(routes: Vec<(Builder, String)>, ranking: &balance::Ranking) -> Vec<(Builder, String)> {
+    let mut unplaced: Vec<Option<(Builder, String)>> = routes.into_iter().map(Some).collect();
+    ranking.ranks.iter().filter_map(|rank| unplaced[rank.index].take()).collect()
 }
 
 /// The `matching` builders as [`scored`] ordered them.

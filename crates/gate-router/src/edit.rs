@@ -11,8 +11,9 @@ use crate::config::Config;
 use crate::escape::escaped;
 
 /// The sections `gate remote` edits: each an object of repo names to lists of strings.
-pub const EDIT_SECTIONS: [&str; 8] = [
+pub const EDIT_SECTIONS: [&str; 9] = [
     "repos",
+    "first",
     "outputs",
     "failureOutputs",
     "inputs",
@@ -23,7 +24,7 @@ pub const EDIT_SECTIONS: [&str; 8] = [
 ];
 
 /// The sections a `builders` entry has, which `gate remote --builder` edits.
-pub const BUILDER_SECTIONS: [&str; 3] = ["repos", "outputs", "failureOutputs"];
+pub const BUILDER_SECTIONS: [&str; 4] = ["repos", "first", "outputs", "failureOutputs"];
 
 /// The indent of a file with no indented line.
 const DEFAULT_INDENT: &str = "    ";
