@@ -381,10 +381,13 @@ impl<'a> Laying<'a> {
 pub struct Ready<'p> {
     /// What the run read of its payload.
     pub request: Request<'p>,
+    /// What the run's packs leave for its last step ([`cut_ended`]). Declared first, so on an unwind too the kept pack
+    /// and its shared lock go before the slot and the work lock, in [`run_reading`]'s order.
+    packs: Packs,
     /// The session's builder slot, let go once the run is done ([`slots::Release`]); `None` when it holds none.
-    /// Declared before [`Ready::lock`] and [`Ready::admitted`], so it is dropped first, an unwind's drop included: the
-    /// slot goes while the work lock and the session are still held, so no call of the session waiting on the lock
-    /// takes it while this run's claim is still to go.
+    /// Declared after [`Ready::packs`] and before [`Ready::lock`] and [`Ready::admitted`], so it is dropped after the
+    /// kept pack and before the lock, an unwind's drop included: the slot goes while the work lock and the session are
+    /// still held, so no call of the session waiting on the lock takes it while this run's claim is still to go.
     pub(crate) slot: Option<slots::Release>,
     /// The work lock, held.
     pub lock: HeldLock,
@@ -410,8 +413,6 @@ pub struct Ready<'p> {
     /// The PC's outputs manifest and the listing taken before the command, for a run with output globs; `None`
     /// without.
     pub outputs: Option<RunOutputs>,
-    /// What the run's packs leave for its last step ([`cut_ended`]).
-    packs: Packs,
     /// The run's hold of its drain session, its end stamped once the run is done ([`drain::passed`]).
     #[expect(dead_code, reason = "a guard, held for its drop, which stamps the session's end")]
     pub(crate) admitted: drain::Admitted,
@@ -770,6 +771,10 @@ pub struct Watches {
     /// `--test-box-park-outputs`: the path a run parks on right after its command ends, before its back commit and
     /// every pack decision ([`parked`]).
     pub park_outputs: Option<PathBuf>,
+    /// The path a run's own pack parks on once its archive is written, before its trim ([`brought_back`], [`parked`]):
+    /// a unit test's, set by no flag; `None` from [`Watches::of`]. Only in a build with the test seams.
+    #[cfg(feature = "test-seams")]
+    pub park_trim: Option<PathBuf>,
 }
 
 /// When the run verb started, taken as it starts: shifted by `--test-box-start-shift-ms` when `seams` give it, earlier
@@ -849,6 +854,8 @@ impl Watches {
             started: started_at(seams),
             pack_delay: seams.pack_delay_ms.map(Duration::from_millis),
             park_outputs: seams.park_outputs.clone(),
+            #[cfg(feature = "test-seams")]
+            park_trim: None,
         }
     }
 }
@@ -870,7 +877,11 @@ fn run_along<S: LineSink + 'static>(payload: &Payload, output: &Arc<Output<S>>, 
 /// order: the run readied ([`prepared`]), the heartbeat beating from the subfolder's check; the command run
 /// ([`run_command`]); the back commit made and pushed when the command reached an end of its own, then, after a
 /// passing command, its outputs brought back ([`synced_back`]); then the run's temp folder removed
-/// ([`temp_removed`]), the heartbeat stopped ([`heartbeat::stop`]), and the work lock let go.
+/// ([`temp_removed`]) and the heartbeat stopped ([`heartbeat::stop`]), the pack kept to the run's end
+/// ([`Packs::kept`]) still held; then the client probed ([`Output::client_gone_probe`]) and a client found gone by
+/// then ruled once more ([`cut_ended`]), so a full pack whose client went after the command's own ruling, a write
+/// failed or its pipes hung up, is replaced by the failed run's set before an `outputs` call can take it (a client
+/// lost after that probe cannot be seen); then the kept pack, the slot and the work lock let go, in that order.
 fn run_reading<S: LineSink + 'static>(
     payload: &Payload,
     output: &Arc<Output<S>>,
@@ -884,35 +895,43 @@ fn run_reading<S: LineSink + 'static>(
         input,
         drain: watches.drain,
     };
-    let ready = match prepared(payload, output, watches.periods, sources) {
+    let mut ready = match prepared(payload, output, watches.periods, sources) {
         Ok(ready) => ready,
         Err(status) => return status,
     };
-    let status = commanded(&ready, output, watches);
-    let Ready { pump, lock, temp, slot, .. } = ready;
-    if let Some(temp) = temp {
+    let (end, status) = commanded(&ready, output, watches);
+    if let Some(temp) = ready.temp.take() {
         temp_removed(temp, output);
     }
-    if let Some(pump) = pump {
+    if let Some(pump) = ready.pump.take() {
         heartbeat::stop(pump);
     }
-    // The slot goes while the work lock is still held, as the Windows box lets it go: a second call of the session
-    // that takes the lock next keeps a claim no end of this run removes.
+    // The pump's stop writes no last beat, so the client is probed here, after it: a client whose pipes hung up with
+    // no write since is seen gone. Then the same rule as the command's own end, run once more, with the kept pack
+    // still held under its shared lock. A cut there is made once ([`Packs::cut`]).
+    let _ = output.client_gone_probe();
+    let status = cut_ended(&ready, output, watches, end, status);
+    let Ready { packs, slot, lock, .. } = ready;
+    // The kept pack goes first, its shared lock with it, once nothing more can replace it. The slot goes while the
+    // work lock is still held, as the Windows box lets it go: a second call of the session that takes the lock next
+    // keeps a claim no end of this run removes. The rest of the run goes with `ready`, after the lock.
+    drop(packs);
     drop(slot);
     drop(lock);
     status
 }
 
-/// The status of the run `ready` once its command has run, sampled from `watches`' sampler: the command's own
-/// ([`command_status`]), the back commit made only after an end of its own ([`of_its_own`]) and the outputs trimmed to
-/// `watches`' budget; a command the box killed at its ceiling early enough has its failure outputs packed after its
-/// kill line and tag ([`killed_brought_back`]) and still ends killed, and any other kill packs nothing
-/// ([`pack_after_kill`]). Whatever path the run took, a client gone is ruled last, in one place ([`cut_ended`]). A run
+/// How the command of the run `ready` ended, and the status the run gives once it has run, sampled from `watches`'
+/// sampler: the command's own ([`command_status`]), the back commit made only after an end of its own
+/// ([`of_its_own`]) and the outputs trimmed to `watches`' budget; a command the box killed at its ceiling early enough
+/// has its failure outputs packed after its kill line and tag ([`killed_brought_back`]) and still ends killed, and any
+/// other kill packs nothing ([`pack_after_kill`]). Whatever path the run took, a client gone is ruled last, in one
+/// place ([`cut_ended`]), which the run's end applies once more with the end returned here ([`run_reading`]). A run
 /// with a chosen Godot version runs with the install of it under the login shell's `GATE_GODOT_ROOT`
 /// ([`probe::installed_godot`]), or with Godot missing when there is no root or no such install. A run with a chosen
 /// Blender version runs with the install [`locked`] resolved it to ([`resolved_blender`]), or, when it did not
 /// resolve, ends 127 before its command saying why.
-fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, watches: &Watches) -> u8 {
+fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, watches: &Watches) -> (CommandEnd, u8) {
     let request = &ready.request;
     let login_path = ready.login_path.as_deref();
     let installed;
@@ -965,7 +984,7 @@ fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, 
         }
         status
     };
-    cut_ended(ready, output, watches, end, status)
+    (end, cut_ended(ready, output, watches, end, status))
 }
 
 /// The program of the Blender install a run whose chosen version is `blender` uses, resolved once for the run: the
@@ -992,9 +1011,10 @@ fn resolved_blender(blender: Option<&str>, login: Result<&Login, &str>) -> Resul
 struct Packs {
     /// Whether the failed run's set of a cut run was packed, or its pack tried ([`cut_brought_back`]): it is made once.
     cut: Cell<bool>,
-    /// The last of the run's own packs that wrote an archive, held under its pack's shared lock until the run's last
-    /// step, so one whose client went after it is replaced by the failed run's set before an `outputs` call can send it
-    /// ([`brought_back`], [`cut_once`]).
+    /// The last pack that did not fail, whether or not it wrote an archive, held under its pack's shared lock until the
+    /// run's end, so one whose client went after it is replaced by the failed run's set before an `outputs` call can
+    /// send it ([`brought_back`], [`cut_once`], [`run_reading`]). A pack whose archive is gone after its trim, removed
+    /// over the budget among them, is not kept; one whose trim failed with its archive still there is.
     kept: RefCell<Option<outputs::Brought>>,
 }
 
@@ -1004,26 +1024,27 @@ struct Packs {
 /// (GATE-827), and a command that never started keeps its own; a runner failure, or a kill whose client went before
 /// its lines, packs nothing, as its group may still be there or the work lock lost, and ends closed; any other end has
 /// its failed run's set packed once ([`cut_once`]), for the PC's later `outputs` call and with no time margin, as the
-/// PC has already cut the call, and ends closed, [`CLOSED_STATUS`]. The pack kept to here ([`Packs::kept`]) is let go.
+/// PC has already cut the call, and ends closed, [`CLOSED_STATUS`]. The pack kept to here ([`Packs::kept`]) stays held
+/// unless a cut replaced it: the run's end rules again with it held, then lets it go ([`run_reading`]).
 fn cut_ended<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, watches: &Watches, end: CommandEnd, status: u8) -> u8 {
-    let kept = ready.packs.kept.take();
     if !output.client_gone() && end != CommandEnd::Cut {
         return status;
     }
     match end {
         CommandEnd::Killed(_) | CommandEnd::NotStarted => status,
         CommandEnd::Failed | CommandEnd::Gone => CLOSED_STATUS,
-        CommandEnd::Exited(_) | CommandEnd::Signalled(_) | CommandEnd::Cut => cut_once(ready, kept, output, watches),
+        CommandEnd::Exited(_) | CommandEnd::Signalled(_) | CommandEnd::Cut => cut_once(ready, output, watches),
     }
 }
 
-/// The failed run's set of the cut run `ready` packed, unless it was already ([`Packs::cut`]): the run's own pack
-/// `kept` removed first and the set packed in its place ([`discarded_for_cut`]), else the set packed
-/// ([`cut_brought_back`]); the closed status.
-fn cut_once<S: LineSink + 'static>(ready: &Ready<'_>, kept: Option<outputs::Brought>, output: &Arc<Output<S>>, watches: &Watches) -> u8 {
+/// The failed run's set of the cut run `ready` packed, unless it was already ([`Packs::cut`]): the run's kept pack
+/// ([`Packs::kept`]) removed first and the set packed in its place ([`discarded_for_cut`]), else, with none kept, one
+/// the trim already removed among them, the set packed ([`cut_brought_back`]); the closed status.
+fn cut_once<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, watches: &Watches) -> u8 {
     if ready.packs.cut.get() {
         return CLOSED_STATUS;
     }
+    let kept = ready.packs.kept.take();
     match (kept, &ready.request.outputs) {
         (Some(brought), Some(asked)) => discarded_for_cut(ready, (asked, brought), output, watches),
         _ => cut_brought_back(ready, output, watches),
@@ -1035,8 +1056,9 @@ const PARK_STEP: Duration = Duration::from_millis(20);
 /// The longest a parked run waits ([`parked`]).
 const PARK_LIMIT: Duration = Duration::from_secs(600);
 
-/// Parks the run on `path` (`--test-box-park-outputs`) right after its command ends, before its back commit and every
-/// pack decision: makes `<path>.parked`, its failure said, then waits until `path` exists, at most [`PARK_LIMIT`].
+/// Parks the run on `path`: with `--test-box-park-outputs`, right after its command ends, before its back commit and
+/// every pack decision; with [`Watches::park_trim`], once its own pack is written, before its trim. Makes
+/// `<path>.parked`, its failure said, then waits until `path` exists, at most [`PARK_LIMIT`].
 fn parked<S: LineSink>(path: &Path, output: &Output<S>) {
     let mut parked = path.as_os_str().to_owned();
     parked.push(".parked");
@@ -1111,13 +1133,12 @@ fn of_its_own(end: CommandEnd) -> bool {
 /// The status of the run `ready`, whose command ended with `status`, once its back commits were made and pushed
 /// ([`back::back_commit`]): `status`, a pair run saying each repo's commit on one line ([`back_commits_line`]); a back
 /// commit that failed says, on a pair run, [`BACK_COMMITS_FAILED`], then `gate: remote sync-back failed: <why>`, and
-/// gives [`FAILED_STATUS`] for a command that exited 0, else `status`; a client gone gives the closed status. Once the
-/// back commits are pushed, a command that exited 0 with output globs has its cross build run, when the payload asks
-/// for one, as `launch` started the command ([`cross_built`]), then its outputs brought back ([`brought_back`]), which
-/// gives its status; a failed command has only its test reports and failure outputs brought back
-/// ([`Asked::failed_run`] under [`Caps::BUILT_IN`]), with no cross
-/// build, and ends on its own status whatever the pack gives, and one with no glob naming a `TestResults` folder, a
-/// failed sync-back or a cross build that did not pass packs nothing. A command the box killed never reaches here: its
+/// gives [`FAILED_STATUS`] for a command that exited 0, else `status`. Once the back commits are pushed, a command
+/// that exited 0 with output globs has its cross build run, when the payload asks for one, as `launch` started the
+/// command ([`cross_built`]), then its outputs brought back ([`brought_back`]), which gives its status; a failed
+/// command has only its test reports and failure outputs brought back ([`Asked::failed_run`] under
+/// [`Caps::BUILT_IN`]), with no cross build, and ends on its own status whatever the pack gives, and one with no glob
+/// naming a `TestResults` folder, a failed sync-back or a cross build that did not pass packs nothing. A command the box killed never reaches here: its
 /// failure outputs are packed with no back commit ([`killed_brought_back`]). A client gone at a pack is ruled there
 /// ([`brought_back`]); one gone at any other point, during the back commit or the cross build among them, has the
 /// failed run's set packed, after the line of a back commit that failed, and the run's status set, by the run's last
@@ -1273,9 +1294,22 @@ fn brought_back<S: LineSink + 'static>(
     let packed = packed_said(ready, (asked, read), skip, output, watches);
     match (gone_pack(packing, output), packed) {
         (None, Ok(brought)) => {
+            #[cfg(feature = "test-seams")]
+            if let Some(park) = watches.park_trim.as_deref() {
+                parked(park, output);
+            }
             let status = trimmed(asked, &brought, output, watches);
-            // Held to the run's last step, which puts the failed run's set in its place for a client gone meanwhile.
-            *ready.packs.kept.borrow_mut() = Some(brought);
+            // Held to the run's end, which puts the failed run's set in its place for a client gone meanwhile, while
+            // its archive may still be at its name, whatever the trim gave. One whose archive is gone (`NotFound`),
+            // removed by the trim over the budget or gone any other way, is not held: a cut packs the failed run's set
+            // with nothing to discard. Any other error of the look keeps it held. A plain look at the name: the box
+            // owns the output folder.
+            let gone = brought.wrote_archive()
+                && matches!(
+                    fs::symlink_metadata(Path::new(asked.folder).join(&asked.archive)),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound
+                );
+            *ready.packs.kept.borrow_mut() = (!gone).then_some(brought);
             status
         }
         (None, Err(status)) => status,
@@ -2215,8 +2249,8 @@ mod tests {
     use gate_watchdog::Pump;
 
     use super::{
-        DrainSeams, NotLaidOut, REFUSED_STATUS, Ready, Request, Sources, Unready, Watches, inputs_matched, login_read, place_of, prepare, prepared,
-        run_along, run_reading, slot_taken, temp_made, test_template, work_cleared,
+        DrainSeams, NotLaidOut, Packing, REFUSED_STATUS, Ready, Request, Sources, Unready, Watches, brought_back, cut_ended, inputs_matched,
+        login_read, place_of, prepare, prepared, run_along, run_reading, slot_taken, temp_made, test_template, work_cleared,
     };
     #[cfg(target_os = "macos")]
     use crate::beneath::ANOTHER_VOLUME;
@@ -2227,7 +2261,7 @@ mod tests {
     use crate::git::test_program::{self, real_git};
     use crate::git::{CLOSED_STATUS, GitClass, test_limit};
     use crate::heartbeat::{self, Periods};
-    use crate::lines::{Godot, Login, command_status, job_record_text, login_path_line, recorded_group};
+    use crate::lines::{CommandEnd, FAILED_STATUS, Godot, Login, command_status, job_record_text, login_path_line, recorded_group};
     use crate::outputs::OUTPUTS_BUDGET;
     use crate::outputs::tests::read_archive;
     use crate::pid_info::start_of;
@@ -2610,6 +2644,8 @@ mod tests {
             started: Instant::now(),
             pack_delay: None,
             park_outputs: None,
+            #[cfg(feature = "test-seams")]
+            park_trim: None,
         }
     }
 
@@ -5218,6 +5254,194 @@ mod tests {
         let status = run_gone_from(&case.json(&commit, &dump_keys(script)), "gate-remote-started:", &free_watches());
         assert_eq!(status, CLOSED_STATUS, "a client gone before the start ends closed");
         assert!(!case.archive().exists(), "a command that never started packs nothing");
+    }
+
+    #[test]
+    fn a_client_gone_after_the_run_s_own_ruling_has_the_full_pack_replaced_and_ends_closed() {
+        let (case, commit) = outputs_case("outputs-gone-late");
+        let seen = case.base.with_file_name("seen");
+        // The temp folder replaced: the line its removal says, after the command's own ruling, finds the client gone.
+        let script = format!(
+            "printf %s \"$TMPDIR\" > '{}'; rm -rf \"$TMPDIR\"; mkdir \"$TMPDIR\"; \
+             mkdir -p bin .tmp/dumps && echo new > bin/new.txt && echo dmp > .tmp/dumps/new.dmp",
+            seen.display()
+        );
+        let status = run_gone_from(&case.json(&commit, &dump_keys(&script)), "gate: remote did not remove", &free_watches());
+        let tmpdir = tmpdir_seen(&seen);
+        fs::remove_dir_all(tmpdir.trim_end_matches('/')).expect("the case removes the folder left");
+        assert_eq!(status, CLOSED_STATUS, "a client gone after the command's own ruling ends closed");
+        assert_eq!(
+            members_of(&case.archive()),
+            [".tmp/dumps/new.dmp"],
+            "the full pack, held to the run's end, is replaced by the failed run's set"
+        );
+    }
+
+    /// A sink that takes every line, and whose reader has hung up from the first line starting with `from` on: no
+    /// write fails, so only a probe ([`Output::client_gone_probe`]) sees the client gone.
+    struct HangsUpFrom {
+        from: &'static str,
+        hung: AtomicBool,
+    }
+
+    impl LineSink for HangsUpFrom {
+        fn write_line(&self, _stream: Stream, line: &str) -> std::io::Result<()> {
+            if gate_wire::stamp::unstamped(line).text.starts_with(self.from) {
+                self.hung.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+
+        fn hung_up(&self) -> bool {
+            self.hung.load(Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn a_client_that_hangs_up_with_no_write_after_its_pack_is_ruled_gone_at_the_run_s_end() {
+        let (case, commit) = outputs_case("outputs-hung-up-late");
+        let script = "mkdir -p bin .tmp/dumps && echo new > bin/new.txt && echo dmp > .tmp/dumps/new.dmp";
+        let payload = decoded(&case.json(&commit, &dump_keys(script)));
+        let output = Arc::new(Output::new(HangsUpFrom {
+            from: "gate-remote-outputs:",
+            hung: AtomicBool::new(false),
+        }));
+        let status = run_reading(&payload, &output, &free_watches(), own_path, &mut fed(NO_FILES));
+        assert_eq!(status, CLOSED_STATUS, "a client hung up after the outputs line ends the run closed");
+        assert_eq!(
+            members_of(&case.archive()),
+            [".tmp/dumps/new.dmp"],
+            "the full pack is replaced by the failed run's set"
+        );
+    }
+
+    #[test]
+    fn a_full_pack_whose_client_stays_is_kept_and_unlocked_once_the_run_ends() {
+        use std::os::fd::AsRawFd;
+
+        let (case, commit) = outputs_case("outputs-kept-unlocked");
+        let script = "mkdir -p bin .tmp/dumps && echo new > bin/new.txt && echo dmp > .tmp/dumps/new.dmp";
+        let (status, said) = run_fed(&case.json(&commit, &dump_keys(script)), &mut fed(NO_FILES), &free_watches());
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(members_of(&case.archive()), ["bin/new.txt"], "the full pack stays");
+        let archive = fs::File::open(case.archive()).expect("the archive opens");
+        // SAFETY: the descriptor is `archive`'s, open for the whole call; `flock` touches no memory.
+        let locked = unsafe { libc::flock(archive.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(locked, 0, "the run's end lets the pack's shared lock go");
+    }
+
+    #[test]
+    fn a_pack_the_trim_removed_over_the_budget_is_not_kept_and_a_cut_packs_the_failed_set() {
+        let (case, commit) = outputs_case("outputs-trimmed-cut");
+        let payload = decoded(&case.json(&commit, &dump_keys("true")));
+        let output = Arc::new(Output::new(RecordingSink::default()));
+        let mut input = fed(NO_FILES);
+        let sources = Sources {
+            login: own_path,
+            start: heartbeat::start,
+            input: &mut input,
+            drain: DrainSeams::default(),
+        };
+        let mut ready = prepared(&payload, &output, quiet_periods(), sources).expect("the run is ready");
+        tmp_cleared(&mut ready);
+        // Written after the listing, as a command would: noise the archive cannot shrink below the budget, and a dump.
+        let work = Path::new(ready.request.tree());
+        let mut seed: u32 = 1;
+        let noise: Vec<u8> = (0..64 * 1024)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                seed.to_le_bytes()[2]
+            })
+            .collect();
+        fs::create_dir_all(work.join("bin")).expect("bin is made");
+        fs::write(work.join("bin/big.bin"), noise).expect("the noise is written");
+        fs::create_dir_all(work.join(".tmp/dumps")).expect("the dump folder is made");
+        fs::write(work.join(".tmp/dumps/new.dmp"), "dmp\n").expect("the dump is written");
+        let watches = Watches {
+            budget: 16 * 1024,
+            ..free_watches()
+        };
+        let asked = ready.request.outputs.as_ref().expect("outputs are asked");
+        let read = ready.outputs.as_ref().expect("the outputs were read");
+        let status = brought_back(&ready, (asked, read), None, &output, &watches, Packing::Passed);
+        assert_eq!(status, FAILED_STATUS, "{:?}", output.sink().said());
+        assert!(!case.archive().exists(), "the trim removed the full pack over the budget");
+        assert!(ready.packs.kept.borrow().is_none(), "a pack the trim removed is not kept");
+
+        output.mark_gone();
+        let status = cut_ended(&ready, &output, &watches, CommandEnd::Exited(0), status);
+        assert_eq!(status, CLOSED_STATUS, "a cut run ends closed");
+        assert_eq!(members_of(&case.archive()), [".tmp/dumps/new.dmp"], "the failed run's set is packed");
+        let Ready { pump, .. } = ready;
+        if let Some(pump) = pump {
+            heartbeat::stop(pump);
+        }
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[test]
+    fn a_pack_whose_trim_fails_with_its_archive_still_there_is_kept_and_a_cut_replaces_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (case, commit) = outputs_case("outputs-trim-fails-cut");
+        let payload = decoded(&case.json(&commit, &dump_keys("true")));
+        let output = Arc::new(Output::new(RecordingSink::default()));
+        let mut input = fed(NO_FILES);
+        let sources = Sources {
+            login: own_path,
+            start: heartbeat::start,
+            input: &mut input,
+            drain: DrainSeams::default(),
+        };
+        let mut ready = prepared(&payload, &output, quiet_periods(), sources).expect("the run is ready");
+        tmp_cleared(&mut ready);
+        let work = Path::new(ready.request.tree());
+        fs::create_dir_all(work.join("bin")).expect("bin is made");
+        fs::write(work.join("bin/new.txt"), "new\n").expect("the output is written");
+        fs::create_dir_all(work.join(".tmp/dumps")).expect("the dump folder is made");
+        fs::write(work.join(".tmp/dumps/new.dmp"), "dmp\n").expect("the dump is written");
+        let release = case.base.with_file_name("trim-release");
+        let watches = Watches {
+            park_trim: Some(release.clone()),
+            ..free_watches()
+        };
+        // While the run is parked between its pack and its trim, a group bit on the output folder: the trim cannot
+        // adopt it, and the archive stays. Then the run is let go.
+        let folder = case.archive().parent().expect("the archive is in the output folder").to_owned();
+        let opened = folder.clone();
+        let opener = thread::spawn(move || {
+            let mut parked = release.as_os_str().to_owned();
+            parked.push(".parked");
+            // A hang guard only: a run that never parks is hung, and this case fails as such.
+            let began = Instant::now();
+            while !Path::new(&parked).exists() {
+                assert!(began.elapsed() < Duration::from_secs(600), "hung: the run never parked before its trim");
+                thread::sleep(Duration::from_millis(20));
+            }
+            fs::set_permissions(&opened, fs::Permissions::from_mode(0o750)).expect("the folder's mode is set");
+            fs::File::create(&release).expect("the run is let go");
+        });
+        let asked = ready.request.outputs.as_ref().expect("outputs are asked");
+        let read = ready.outputs.as_ref().expect("the outputs were read");
+        let status = brought_back(&ready, (asked, read), None, &output, &watches, Packing::Passed);
+        opener.join().expect("the run parked and was let go");
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).expect("the folder is made private again");
+        assert_eq!(status, FAILED_STATUS, "the trim failed: {:?}", output.sink().said());
+        assert_eq!(members_of(&case.archive()), ["bin/new.txt"], "the full pack is still there");
+        assert!(ready.packs.kept.borrow().is_some(), "a pack whose archive is still there is kept");
+
+        output.mark_gone();
+        let status = cut_ended(&ready, &output, &watches, CommandEnd::Exited(0), status);
+        assert_eq!(status, CLOSED_STATUS, "a cut run ends closed");
+        assert_eq!(
+            members_of(&case.archive()),
+            [".tmp/dumps/new.dmp"],
+            "the kept pack is discarded and the failed run's set packed in its place"
+        );
+        let Ready { pump, .. } = ready;
+        if let Some(pump) = pump {
+            heartbeat::stop(pump);
+        }
     }
 
     #[test]
