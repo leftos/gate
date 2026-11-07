@@ -78,7 +78,9 @@
 //! `x` raw on standard output, then does as `hold <path>`; `away` runs the call as `ok` does, but outside this
 //! process's job (`CREATE_BREAKAWAY_FROM_JOB`, which the job must allow), its three standard streams pipes this process
 //! relays, so a gate killed with its call's job leaves the call running with its streams closed, as sshd closes a
-//! box's streams once the connection drops.
+//! box's streams once the connection drops; `away-then-drop <path>` runs the call as `away` does until the path
+//! exists, then, once everything the call wrote before it is passed on, exits 255 without waiting for the call or the
+//! end of its output, so the call runs on with its streams closed, as a connection lost mid-call leaves a box.
 
 #![expect(clippy::disallowed_methods, reason = "a test helper standing in for ssh, which holds no launch's handles")]
 
@@ -86,7 +88,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::windows::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -222,6 +226,7 @@ fn run() -> Result<i32, String> {
             call.ok()
         }
         Some(("fed-hold", path)) => fed_call(call.command()?, call.steps, Some(Path::new(path))),
+        Some(("away-then-drop", path)) => call.away_then_drop(Path::new(path)),
         Some(("version", version)) => call.rewritten(VERSION, Some(version)),
         Some(("boot", time)) => call.rewritten(BOOT, Some(time)),
         Some(("exit", status)) => status.parse().map_err(|_| format!("the step '{step}' names no status")),
@@ -389,7 +394,8 @@ fn variable(name: &str) -> Result<String, String> {
 }
 
 /// The box seams a call's gate is given before its verb: the words of the variable `name`, `GATE_FAKE_SSH_BOX_SEAMS`
-/// for a `run`, `lfs`, `inputs` or `drain` call and `GATE_FAKE_SSH_PREFLIGHT_SEAMS` for a preflight, none when it is unset.
+/// for a `run`, `lfs`, `inputs`, `drain`, `outputs` or `channel-check` call and `GATE_FAKE_SSH_PREFLIGHT_SEAMS` for a
+/// preflight, none when it is unset.
 fn seams_of(name: &str) -> Result<String, String> {
     match std::env::var(name) {
         Err(std::env::VarError::NotPresent) => Ok(String::new()),
@@ -535,6 +541,30 @@ fn fed_with(mut command: Command, input: &[u8]) -> Result<i32, String> {
     status.code().ok_or_else(|| "the call ended with no status".to_owned())
 }
 
+/// Makes this process's own three standard streams handles no process it starts inherits, so a call it leaves running
+/// holds none of them and the client sees this process's streams end when it exits, as ssh's do when the connection
+/// drops; a stream with no handle is left alone.
+fn own_streams_not_inherited() -> Result<(), String> {
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+
+    for stream in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: reads this process's standard handle; it is not closed.
+        let handle = unsafe { GetStdHandle(stream) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        // SAFETY: the handle is this process's open standard handle; only its inherit flag changes.
+        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err(format!(
+                "cannot keep this process's streams from the call: {}",
+                io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Puts `child`, just started outside this process's jobs, in a new job that lets a process in it start one outside it,
 /// as a box run's command is started: breaking away left it in the first job above that refuses it. The job does not
 /// end its processes when its handle closes, so the call outlives this process; its handle is left open for this
@@ -566,6 +596,75 @@ fn allow_breakaway(child: &std::process::Child) -> Result<(), String> {
         return Err(format!("cannot put the call in its job: {}", io::Error::last_os_error()));
     }
     Ok(())
+}
+
+/// Passes what the pipe `from` holds on to `to` as it comes, each chunk written whole and flushed, reading only the
+/// bytes the pipe says it holds ([`pipe_holds`]), so the relay never blocks in a read; between looks it sleeps a hold
+/// step. It ends when the pipe has ended, or when it finds the pipe empty at a look begun once `dropping` was set: the
+/// writer wrote everything it is waited for before `dropping` was set, so every such byte was then passed on.
+fn drained(mut from: impl Read + std::os::windows::io::AsRawHandle, mut to: impl Write, dropping: &AtomicBool) -> Result<(), String> {
+    let mut buffer = [0; 8192];
+    loop {
+        let draining = dropping.load(Ordering::SeqCst);
+        let Some(held) = pipe_holds(&from)? else {
+            return Ok(());
+        };
+        if held == 0 {
+            if draining {
+                return Ok(());
+            }
+            thread::sleep(HOLD_STEP);
+            continue;
+        }
+        let wanted = usize::try_from(held).map_or(buffer.len(), |held| held.min(buffer.len()));
+        let part = buffer.get_mut(..wanted).ok_or("the relay's buffer is too short")?;
+        let read = from.read(part).map_err(|error| format!("cannot read the call: {error}"))?;
+        let chunk = part.get(..read).ok_or("the call read past the relay's buffer")?;
+        to.write_all(chunk)
+            .and_then(|()| to.flush())
+            .map_err(|error| format!("cannot pass the call's output on: {error}"))?;
+    }
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    /// Win32's `PeekNamedPipe`, declared here as the package's `windows-sys` features leave `Win32_System_Pipes` to
+    /// its tests.
+    fn PeekNamedPipe(
+        pipe: *mut std::ffi::c_void,
+        buffer: *mut std::ffi::c_void,
+        size: u32,
+        read: *mut u32,
+        available: *mut u32,
+        left_this_message: *mut u32,
+    ) -> i32;
+}
+
+/// How many unread bytes the pipe `from` holds; `None` once it has ended, its writer gone and every byte read
+/// (`ERROR_BROKEN_PIPE`); any other failure to look, as an error.
+fn pipe_holds(from: &impl std::os::windows::io::AsRawHandle) -> Result<Option<u32>, String> {
+    use windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE;
+
+    let mut available = 0;
+    // SAFETY: the pipe's handle is open while `from` lives; no buffer is given, and only `available` is written.
+    let peeked = unsafe {
+        PeekNamedPipe(
+            from.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &raw mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    if peeked != 0 {
+        return Ok(Some(available));
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error().and_then(|code| u32::try_from(code).ok()) == Some(ERROR_BROKEN_PIPE) {
+        return Ok(None);
+    }
+    Err(format!("cannot look into the call's pipe: {error}"))
 }
 
 /// Passes what `from` gives on to `to` until it ends, each chunk written whole and flushed as it comes.
@@ -852,6 +951,59 @@ impl<'a> BoxCall<'a> {
     /// error passed on raw to this process's as they come, each chunk flushed; its status once it and its output have
     /// ended. The feeding thread is not waited for: it ends with this process.
     fn away(&self) -> Result<i32, String> {
+        let (mut child, mut stdout, mut stderr) = self.spawned_away()?;
+        let errors = thread::spawn(move || relayed(&mut stderr, &mut io::stderr()));
+        relayed(&mut stdout, &mut io::stdout())?;
+        errors.join().map_err(|_| "the error relay panicked".to_owned())??;
+        let status = child.wait().map_err(|error| format!("cannot wait for the call: {error}"))?;
+        status.code().ok_or_else(|| "the call ended with no status".to_owned())
+    }
+
+    /// `away-then-drop <path>`: runs the call as [`BoxCall::away`] does, both its output streams relayed as they come
+    /// ([`drained`]), until `path` exists, for at most the hold's hang guard ([`HOLD_LIMIT`]), failing at once when the
+    /// call's output ends first, as a call that ended before it parked; then, once each relay has
+    /// found its pipe empty after the path appeared, so every byte the call wrote before it is passed on, ssh's own
+    /// failure status. A relay that never finds its pipe empty by the hang guard fails the step as hung. The call is
+    /// not waited for: it runs on outside this process's job, its streams closed once this process ends, as a
+    /// connection lost mid-call leaves a box.
+    fn away_then_drop(&self, path: &Path) -> Result<i32, String> {
+        own_streams_not_inherited()?;
+        let (_child, stdout, stderr) = self.spawned_away()?;
+        let dropping = Arc::new(AtomicBool::new(false));
+        let (done, relays) = mpsc::channel();
+        let (errors_dropping, errors_done) = (Arc::clone(&dropping), done.clone());
+        thread::spawn(move || drop(errors_done.send(drained(stderr, io::stderr(), &errors_dropping))));
+        let outputs_dropping = Arc::clone(&dropping);
+        thread::spawn(move || drop(done.send(drained(stdout, io::stdout(), &outputs_dropping))));
+        let deadline = Instant::now() + HOLD_LIMIT;
+        // A relay ends before the path only when its pipe ended; both ended means the call ended without parking.
+        let mut ended = 0;
+        while !path.exists() {
+            match relays.try_recv() {
+                Ok(relay) => {
+                    relay?;
+                    ended += 1;
+                    if ended == 2 {
+                        return Err("the call ended before it parked".to_owned());
+                    }
+                }
+                Err(_) if Instant::now() >= deadline => return Err(format!("hung: {} did not appear", path.display())),
+                Err(_) => thread::sleep(HOLD_STEP),
+            }
+        }
+        dropping.store(true, Ordering::SeqCst);
+        for _ in ended..2 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            relays
+                .recv_timeout(left)
+                .map_err(|_| "hung: a relay of the dropped call never found its pipe empty".to_owned())??;
+        }
+        Ok(SSH_FAILED)
+    }
+
+    /// The call started outside this process's job (`CREATE_BREAKAWAY_FROM_JOB`), its standard input fed from this
+    /// process's by a thread not waited for, which ends with this process: the call, and its output and error pipes.
+    fn spawned_away(&self) -> Result<(Child, ChildStdout, ChildStderr), String> {
         let mut command = self.command()?;
         let mut child = command
             .stdin(Stdio::piped())
@@ -868,15 +1020,11 @@ impl<'a> BoxCall<'a> {
             return Err(message);
         }
         let mut stdin = child.stdin.take().ok_or("the call has no input pipe")?;
-        let mut stdout = child.stdout.take().ok_or("the call has no output pipe")?;
-        let mut stderr = child.stderr.take().ok_or("the call has no error pipe")?;
+        let stdout = child.stdout.take().ok_or("the call has no output pipe")?;
+        let stderr = child.stderr.take().ok_or("the call has no error pipe")?;
         // Dropping the call's input pipe once this process's input ends tells the call its input ended.
         thread::spawn(move || drop(io::copy(&mut io::stdin().lock(), &mut stdin)));
-        let errors = thread::spawn(move || relayed(&mut stderr, &mut io::stderr()));
-        relayed(&mut stdout, &mut io::stdout())?;
-        errors.join().map_err(|_| "the error relay panicked".to_owned())??;
-        let status = child.wait().map_err(|error| format!("cannot wait for the call: {error}"))?;
-        status.code().ok_or_else(|| "the call ended with no status".to_owned())
+        Ok((child, stdout, stderr))
     }
 
     /// Runs the call with its standard output read, only its first `count` bytes passed on raw and the rest read and

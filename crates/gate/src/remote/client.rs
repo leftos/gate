@@ -1613,6 +1613,14 @@ struct Landed {
     withheld: Option<PathBuf>,
 }
 
+/// Whether a run call `called` whose connection was lost has its disconnected run's narrowed set fetched
+/// ([`Attempt::lost_fetched`]): only when it heard the command's start marker and none of the box's own end, its back
+/// commit lines, its "no back commit" line or its outputs line.
+fn lost_fetches(called: &RunEnd) -> bool {
+    let box_end_heard = called.back_commits.is_some() || called.back_commit_none || called.outputs.is_some();
+    called.started && !box_end_heard
+}
+
 /// How a run call ended ([`Attempt::run_call`]): its end, the last standard error lines of the call that counts that
 /// are the box's outputs line, its outputs size line and its back commits line, whether that call said on standard
 /// error that the run's command left its tree as the snapshot had it or that the box skipped outputs for names this PC
@@ -1774,8 +1782,10 @@ impl Attempt<'_, '_> {
         // kill, a lost connection or a failed call ended the attempt before it, so a box refusal's 75 never syncs back.
         // A command the box's ceiling killed, said so, has its narrowed set brought back when its run call exited 124 of
         // its own, with no sync-back, and stays killed however the call ended; one the PC's own watchdog cut has it
-        // fetched by name after the stop, with no sync-back, and stays killed too. The pending marker stays on every end
-        // but a passing run whose box packed nothing.
+        // fetched by name after the stop, with no sync-back, and stays killed too. A run call whose connection was lost
+        // after the command's start, before the box said its own end, has it fetched by name the same way once the
+        // loss is ruled a lost connection, and stays lost. The pending marker stays on every end but a passing run
+        // whose box packed nothing.
         match called.end {
             End::Status(status) => {
                 let back_commits = called.back_commits.as_deref().and_then(syncback::back_commits);
@@ -1791,9 +1801,30 @@ impl Attempt<'_, '_> {
             }
             End::Killed if self.box_killed.is_some() => Ok(self.box_killed_end(&location, &nonce, &sent, &called)),
             End::Killed if self.pc_cut.is_some() => Ok(self.pc_cut_end(&location, &nonce, &sent, &called)),
-            End::Lost(output) => Ok(self.connection_lost(&location, prepared.boot.as_deref(), output)),
+            End::Lost(ref output) => match self.connection_lost(&location, prepared.boot.as_deref(), output.clone()) {
+                End::Lost(output) => {
+                    self.lost_fetched(&location, &nonce, &sent, &called);
+                    Ok(End::Lost(output))
+                }
+                other => Ok(other),
+            },
             end => Ok(self.refused_end(end, called.last_error.as_deref())),
         }
+    }
+
+    /// After a run call `called` to `location` whose connection was lost, ruled a lost connection rather than a restart
+    /// or an unreachable builder ([`Attempt::connection_lost`]): the disconnected run's narrowed set the box packed for
+    /// the outputs `nonce` once it found its client gone, fetched by name once the box's run ended and installed
+    /// ([`outputs::cut_end`], a transfer that failed said naming the lost connection). Only for a call that heard the
+    /// command's start marker and none of the box's own end, its back commit line or its outputs line: a box that said
+    /// those reached its end with the client there, and packed against a back commit the PC never applied, so nothing
+    /// is fetched, as for a Ctrl+C. The run's end is the loss's whatever this gives.
+    fn lost_fetched(&mut self, location: &Location, nonce: &str, sent: &outputs::Sent<'_>, called: &RunEnd) {
+        if !lost_fetches(called) || self.go_on().is_err() {
+            return;
+        }
+        let (ran, _) = self.outputs_ran(location, nonce, i64::from(SSH_FAILED), called);
+        outputs::cut_end(self, sent, &ran, (outputs::Cause::Disconnected, outputs::CONNECTION_LOST));
     }
 
     /// The end of a run call `called` to `location` whose command the box killed at its ceiling or backstop and said
@@ -1826,8 +1857,8 @@ impl Attempt<'_, '_> {
         }
         // The box's outputs line of a cut call is never read: the fetch goes by the archive's name alone.
         let (ran, _) = self.outputs_ran(location, nonce, i64::from(KILLED), called);
-        let end = outputs::cut_end(self, sent, &ran);
-        self.refused_end(end, called.last_error.as_deref())
+        outputs::cut_end(self, sent, &ran, (outputs::Cause::Killed, outputs::PC_STOPPED));
+        self.refused_end(End::Killed, called.last_error.as_deref())
     }
 
     /// The run the outputs step reads of the run call `called` to `location` for the outputs `nonce`, whose command
@@ -1858,7 +1889,7 @@ impl Attempt<'_, '_> {
     }
 
     /// Says the TRANSFER FAILED line of a transfer after a command that ended as `ended` says (`the command exited <n>`,
-    /// [`outputs::KILLED_AT_ITS_CEILING`] or [`outputs::PC_STOPPED`]) on the builder, which failed every attempt for `why`.
+    /// [`outputs::KILLED_AT_ITS_CEILING`], [`outputs::PC_STOPPED`] or [`outputs::CONNECTION_LOST`]) on the builder, which failed every attempt for `why`.
     pub(super) fn say_transfer_failed(&mut self, ended: &str, why: &str) {
         let host = self.call.host();
         self.say(format!("gate: TRANSFER FAILED: {ended} on {host}; {why}"));
@@ -6545,7 +6576,7 @@ mod tests {
     use super::{CSPROJ_BYTES, CSPROJ_FILES, Entry, csproj_pins, entries_of, manifest_entry, small_blobs_of};
     use super::{Carried, box_slots_kept, created_of, preflight_ended, said_created};
     use super::{DRAIN, KILLED, Received};
-    use super::{KeyHold, RunEnd, Warm, cold_line, hold_key, hold_key_waiting, new_work_tree, status_end, warm_end, warm_of};
+    use super::{KeyHold, RunEnd, Warm, cold_line, hold_key, hold_key_waiting, lost_fetches, new_work_tree, status_end, warm_end, warm_of};
     use crate::boxside::WORK_ROOT_STEP;
     use crate::environment::Variables;
     use crate::remote::drain::Drain;
@@ -10218,6 +10249,51 @@ mod tests {
             started,
             last_error,
         }
+    }
+
+    /// A lost run call that heard the command's start and none of the box's own end fetches.
+    #[test]
+    fn a_lost_run_with_its_start_and_no_box_end_heard_fetches() {
+        assert!(lost_fetches(&ran(End::Lost(0..0), true, None)));
+    }
+
+    /// A lost run call that never heard the command's start fetches nothing.
+    #[test]
+    fn a_lost_run_with_no_start_heard_fetches_nothing() {
+        assert!(!lost_fetches(&ran(End::Lost(0..0), false, None)));
+    }
+
+    /// A lost run call that heard the box's back commit lines fetches nothing.
+    #[test]
+    fn a_lost_run_after_its_back_commit_lines_fetches_nothing() {
+        let back_commits = RunEnd {
+            back_commits: Some("gate-remote-back-commits: abc".to_owned()),
+            ..ran(End::Lost(0..0), true, None)
+        };
+        assert!(!lost_fetches(&back_commits));
+    }
+
+    /// A lost run call that heard the box's "no back commit" line fetches nothing.
+    #[test]
+    fn a_lost_run_after_its_no_back_commit_line_fetches_nothing() {
+        let none = RunEnd {
+            back_commit_none: true,
+            ..ran(End::Lost(0..0), true, None)
+        };
+        assert!(!lost_fetches(&none));
+    }
+
+    /// A lost run call that heard the box's outputs line fetches nothing.
+    #[test]
+    fn a_lost_run_after_its_outputs_line_fetches_nothing() {
+        let outputs = RunEnd {
+            outputs: Some(outputs::OutputsLines {
+                line: "gate-remote-outputs: 1".to_owned(),
+                size: None,
+            }),
+            ..ran(End::Lost(0..0), true, None)
+        };
+        assert!(!lost_fetches(&outputs));
     }
 
     #[test]

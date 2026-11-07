@@ -8983,6 +8983,172 @@ fn a_pc_cut_fetch_whose_retry_finds_nothing_says_transfer_failed_and_stays_stall
     assert!(!case.folder().join("dumps").join("a.dmp").exists(), "nothing is installed: {outcome:?}");
 }
 
+/// A command that changes the tree, so its box makes a back commit and says nothing of it before its pack, writes the
+/// dump `dumps\a.dmp` and fails with 3.
+const CHANGING_WITH_A_DUMP: [&str; 9] = [r".\tool.exe", "write", "new.txt", "x", "write", r"dumps\a.dmp", "dump", "exit", "3"];
+
+/// How the box of a run whose connection is lost goes on once it parked before its pack.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Parked {
+    /// It finds its client gone, which lets it go, and packs the failed run's set.
+    UntilGone,
+    /// It stays parked until the case creates [`let_go_path`], so the outputs call after the loss finds its run going.
+    UntilLetGo,
+}
+
+/// A [`failure_case`] routed run with the failure output globs `failure`, whose `command` runs on the real box, outside
+/// the stand-in's job, until the box parks before its pack (`--test-box-park-outputs` at [`let_go_path`]); the run
+/// call's connection is then lost (`away-then-drop`), the box running on as `parked` says. The preflight and the boot
+/// query after the loss say the same boot time, so the loss is a lost connection, not a restart; the stand-in passes
+/// the stop and the calls after it. The client is also given the words `extra`. Its case, steps file and outcome.
+fn lost_after_its_start(name: &str, failure: &[&str], command: &[&str], parked: Parked, extra: &[&str]) -> (Case, PathBuf, Outcome) {
+    lost_and_booted(name, (failure, command), parked, extra, BOOTED)
+}
+
+/// As [`lost_after_its_start`], but the boot query after the loss says the boot time `after`: [`REBOOTED`] for a
+/// builder that restarted.
+fn lost_and_booted(name: &str, (failure, command): (&[&str], &[&str]), parked: Parked, extra: &[&str], after: &str) -> (Case, PathBuf, Outcome) {
+    let case = failure_case(name, &BIN, failure);
+    let booted_after = format!("boot {after}");
+    let park = shown(&let_go_path(&case));
+    let booted = format!("boot {BOOTED}");
+    let dropped = format!("away-then-drop {park}.parked");
+    let steps = ssh_steps(&case, "ssh", &[&booted, &dropped, "ok", &booted_after, "ok", "ok", "ok"]);
+    let mut words = HANG_GUARD_BOUND.to_vec();
+    words.extend_from_slice(extra);
+    let tuned = Tuned {
+        extra: &words,
+        ..Tuned::default()
+    };
+    let seams = match parked {
+        Parked::UntilGone => format!("--test-heartbeat-ms 200 --test-box-gone-reached {park} --test-box-park-outputs {park}"),
+        Parked::UntilLetGo => format!("--test-heartbeat-ms 200 --test-box-park-outputs {park}"),
+    };
+    let mut gate = client_gate_tuned(&case, "out.log", &steps, &tuned, command);
+    gate.env(BOX_SEAMS_VARIABLE, seams);
+    let outcome = finish(gate);
+    (case, steps, outcome)
+}
+
+/// The run call's connection is lost after the command started and failed, before the box said its own end: the run
+/// stays lost, and the PC, after the stop and the boot query, fetches the disconnected run's narrowed set by name, which
+/// the box packed once it found its client gone, and installs the dump, the marker kept.
+#[test]
+fn a_run_whose_connection_is_lost_after_its_start_brings_its_failure_set_back_and_stays_lost() {
+    let (case, steps, outcome) = lost_after_its_start("client-lost-dump", &["dumps/*.dmp"], &CHANGING_WITH_A_DUMP, Parked::UntilGone, &[]);
+
+    assert_eq!(outcome.code, Some(255), "{outcome:?}");
+    assert!(outcome.stderr.contains(LOST_LINE), "{outcome:?}");
+    assert_eq!(
+        calls(&steps),
+        ["preflight", "run", "stop", "boot", "outputs"],
+        "a stop, a boot query, then the fetch: {outcome:?}"
+    );
+    assert_eq!(worktree_text(&case, r"dumps\a.dmp"), "dump", "the dump is installed: {outcome:?}");
+    assert!(!case.folder().join("new.txt").exists(), "nothing is synced back: {outcome:?}");
+    let pulling = "gate: pulling the disconnected run's outputs from ";
+    let line = outcome
+        .stderr
+        .lines()
+        .find(|line| line.starts_with(pulling))
+        .expect("the pull line is said");
+    assert!(!line.contains("file(s)"), "the pull names no count: {line}");
+    assert!(pending_marker(&case).exists(), "a lost run leaves the marker: {outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+/// A lost run whose failure output glob matches nothing the command wrote: the box packs nothing, which the log alone
+/// says once, and the run stays lost.
+#[test]
+fn a_lost_run_whose_box_packed_nothing_says_one_log_note() {
+    let (case, steps, outcome) = lost_after_its_start("client-lost-none", &["dumps/*.none"], &CHANGING_WITH_A_DUMP, Parked::UntilGone, &[]);
+
+    assert_eq!(outcome.code, Some(255), "{outcome:?}");
+    assert!(outcome.stderr.contains(LOST_LINE), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "stop", "boot", "outputs"], "{outcome:?}");
+    let note = "gate: the builder packed none of the disconnected run's outputs";
+    let log = out_log(&case);
+    assert_eq!(log.matches(note).count(), 1, "said once in the log: {log}");
+    assert!(!outcome.stderr.contains(note), "not on the console: {outcome:?}");
+    assert!(!case.folder().join("dumps").join("a.dmp").exists(), "nothing is installed: {outcome:?}");
+}
+
+/// A lost run whose box's run outlasts the short wait the fetch asks for: the box says the archive is not finished,
+/// which the TRANSFER FAILED line naming the lost connection says, and the run stays lost.
+#[test]
+fn a_lost_run_whose_pack_outlasts_the_cut_wait_says_transfer_failed_and_stays_lost() {
+    let (case, _steps, outcome) = lost_after_its_start(
+        "client-lost-unfinished",
+        &["dumps/*.dmp"],
+        &CHANGING_WITH_A_DUMP,
+        Parked::UntilLetGo,
+        &["--test-remote-cut-wait-ms", "500"],
+    );
+    let _let_go = LetGo(&case);
+
+    assert_eq!(outcome.code, Some(255), "{outcome:?}");
+    assert!(outcome.stderr.contains(LOST_LINE), "{outcome:?}");
+    let start = "gate: TRANSFER FAILED: the connection was lost on builder; ";
+    assert!(
+        outcome
+            .stderr
+            .lines()
+            .any(|line| line.starts_with(start) && line.contains("the disconnected run's outputs not brought back: ")),
+        "the line names the lost connection and the disconnected run's outputs: {outcome:?}"
+    );
+    assert!(!case.folder().join("dumps").join("a.dmp").exists(), "nothing is installed: {outcome:?}");
+}
+
+/// A run whose connection is lost after the box said its back commit line, its own end with the client still there:
+/// the box's pack is one against a back commit the PC never applied, so nothing is fetched, as before.
+#[test]
+fn a_run_lost_after_the_box_said_its_back_commit_fetches_nothing() {
+    let command = [r".\tool.exe", "write", r"dumps\a.dmp", "dump", "exit", "3"];
+    let (case, steps, outcome) = lost_after_its_start("client-lost-after-end", &["dumps/*.dmp"], &command, Parked::UntilGone, &[]);
+
+    assert_eq!(outcome.code, Some(255), "{outcome:?}");
+    assert!(outcome.stderr.contains(LOST_LINE), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "stop", "boot"], "no fetch: {outcome:?}");
+    assert!(!case.folder().join("dumps").join("a.dmp").exists(), "nothing is installed: {outcome:?}");
+}
+
+/// A Ctrl+C raised once the run call whose connection was lost has returned, before the stop and the fetch, ends the
+/// run as an interrupt: nothing is fetched.
+#[test]
+fn a_ctrl_c_after_a_lost_connection_fetches_nothing() {
+    let (case, steps, outcome) = lost_after_its_start(
+        "client-lost-ctrl-c",
+        &["dumps/*.dmp"],
+        &CHANGING_WITH_A_DUMP,
+        Parked::UntilGone,
+        &["--test-remote-interrupt-at", "after-run"],
+    );
+
+    assert_ne!(outcome.code, Some(0), "{outcome:?}");
+    let made = calls(&steps);
+    assert!(!made.contains(&"outputs".to_owned()), "no fetch: {made:?} {outcome:?}");
+    assert!(!case.folder().join("dumps").join("a.dmp").exists(), "nothing is installed: {outcome:?}");
+}
+
+/// A failed run whose connection is lost after its start on a builder that then restarted falls back, and fetches
+/// nothing from the builder.
+#[test]
+fn a_lost_run_whose_builder_restarted_fetches_nothing() {
+    let (_case, steps, outcome) = lost_and_booted(
+        "client-lost-rebooted",
+        (&["dumps/*.dmp"], &CHANGING_WITH_A_DUMP),
+        Parked::UntilGone,
+        &[],
+        REBOOTED,
+    );
+
+    let made = calls(&steps);
+    let before: Vec<String> = ["preflight", "run", "stop", "boot"].map(str::to_owned).to_vec();
+    assert!(made.starts_with(&before), "a stop and a boot query: {made:?} {outcome:?}");
+    assert!(!made.contains(&"outputs".to_owned()), "no fetch: {made:?} {outcome:?}");
+    assert!(!outcome.stderr.contains(LOST_LINE), "a restart, not a lost connection: {outcome:?}");
+}
+
 /// The PC stalls a run call that never said the box's start marker, a call cut during the box's setup: the command never
 /// started, so nothing is fetched and nothing is said of the killed run's set, and the run stays stalled.
 #[test]

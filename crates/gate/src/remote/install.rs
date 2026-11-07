@@ -2985,6 +2985,19 @@ mod tests {
         );
     }
 
+    /// A disconnected run's install start line names its set the disconnected run's.
+    #[test]
+    fn a_disconnected_run_s_install_start_line_names_the_disconnected_run_s_set() {
+        assert_eq!(
+            install_start_line(Bringing::Reports(Narrowed::TestReports, Cause::Disconnected), 2),
+            "gate: installing the disconnected run's test reports: 2 file(s)"
+        );
+        assert_eq!(
+            install_start_line(Bringing::Reports(Narrowed::Outputs, Cause::Disconnected), 1),
+            "gate: installing the disconnected run's outputs: 1 file(s)"
+        );
+    }
+
     #[test]
     fn the_checks_refuse_in_their_order_across_members() {
         let root = scratch("check-order");
@@ -3132,6 +3145,19 @@ mod tests {
         assert_eq!(
             lines,
             ["gate: the killed run's outputs not brought back: dumps/a.dmp changed during the run"]
+        );
+    }
+
+    /// A disconnected run's set refused for the PC's changes is said not brought back as the disconnected run's.
+    #[test]
+    fn a_disconnected_run_s_set_refused_for_pc_changes_names_the_disconnected_run_s() {
+        let refused = Refused::changed(vec!["dumps/a.dmp changed during the run".to_owned()], RefusalKind::PcChanged);
+
+        let (_, lines) = ending(Bringing::Reports(Narrowed::Outputs, Cause::Disconnected), Unmet::Refused(refused));
+
+        assert_eq!(
+            lines,
+            ["gate: the disconnected run's outputs not brought back: dumps/a.dmp changed during the run"]
         );
     }
 

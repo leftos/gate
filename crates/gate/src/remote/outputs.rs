@@ -532,24 +532,29 @@ pub(super) fn killed_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &R
 /// How the TRANSFER FAILED line of a fetch after the PC's own cut of the run call says its command ended ([`cut_end`]).
 pub(super) const PC_STOPPED: &str = "the PC stopped the command";
 
-/// The end of the outputs step of a run whose run call the PC's own watchdog cut, for a stall or its backstop, and
-/// whose command it stopped, its run `ran` ending with the kill's status: for a run with an outputs step
-/// ([`Sent::stepped`]) whose narrowed set holds globs, that set fetched by its name alone, with no count, no size and
-/// no data channel, the outputs call asking the box to wait for the run's pack ([`Attempt::cut_wait`]), and installed
-/// as [`killed_end`] installs a box-killed run's, its lines naming the killed run's outputs or test reports. A box that
-/// packed nothing says so in the log alone. A pull that failed every attempt, or one the box could not wait for, says
-/// the TRANSFER FAILED line naming the PC's stop ([`PC_STOPPED`]). Always [`End::Killed`], whatever the fetch, the
-/// install, the watchdog's stop or a Ctrl+C during them gives. It never clears the pending marker, never touches the
-/// outputs cap record, makes no sync-back and never marks the outputs brought back.
-pub(super) fn cut_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>) -> End {
+/// How the TRANSFER FAILED line of a fetch after the run call's connection was lost says its command ended
+/// ([`cut_end`]).
+pub(super) const CONNECTION_LOST: &str = "the connection was lost";
+
+/// The outputs step of a run whose run call ended before the box said its own end, its run `ran` ending with the cut's
+/// status, as `cause` says it ended: the PC's own watchdog cut it, for a stall or its backstop, and stopped its command
+/// ([`Cause::Killed`]), or its connection was lost after the command's start ([`Cause::Disconnected`]). For a run with
+/// an outputs step ([`Sent::stepped`]) whose narrowed set holds globs, that set fetched by its name alone, with no
+/// count, no size and no data channel, the outputs call asking the box to wait for the run's pack
+/// ([`Attempt::cut_wait`]), and installed as [`killed_end`] installs a box-killed run's, its lines naming the set for
+/// `cause`. A box that packed nothing says so in the log alone. A pull that failed every attempt, or one the box could
+/// not wait for, says the TRANSFER FAILED line naming how the command ended, `ended` ([`PC_STOPPED`],
+/// [`CONNECTION_LOST`]). The caller keeps the cut's own end whatever the fetch, the install, the watchdog's stop or a
+/// Ctrl+C during them gives. It never clears the pending marker, never touches the outputs cap record, makes no
+/// sync-back and never marks the outputs brought back.
+pub(super) fn cut_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, (cause, ended): (Cause, &str)) {
     if sent.stepped() {
         let marker = sent.marker.as_deref();
         let packed = Packed::Cut(attempt.cut_wait);
-        if let Some(End::TransferFailed(why)) = narrowed_fetched(attempt, (sent, ran), (marker, ran.status, Cause::Killed), Some(packed)) {
-            attempt.say_transfer_failed(PC_STOPPED, &why);
+        if let Some(End::TransferFailed(why)) = narrowed_fetched(attempt, (sent, ran), (marker, ran.status, cause), Some(packed)) {
+            attempt.say_transfer_failed(ended, &why);
         }
     }
-    End::Killed
 }
 
 /// What an outputs pull knows of the archive it fetches ([`Kept`]).
@@ -557,13 +562,14 @@ pub(super) fn cut_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<
 enum Packed {
     /// The archive the box said it packed: its file count and, when it said one, its size in bytes.
     Archive { count: u64, size: Option<u64> },
-    /// A fetch after the PC's own cut of the run call, whose box said nothing of what it packed: its count and size are
-    /// unknown, and its outputs call asks the box to wait this long for the run's pack, with no data channel.
+    /// A fetch after the PC's own cut of the run call or after its lost connection ([`cut_end`]), whose box said nothing
+    /// of what it packed: its count and size are unknown, and its outputs call asks the box to wait this long for the
+    /// run's pack, with no data channel.
     Cut(Duration),
 }
 
 impl Packed {
-    /// The files the box said the archive holds; `None` for a fetch after the PC's own cut.
+    /// The files the box said the archive holds; `None` for a fetch after a cut or a lost connection.
     fn count(self) -> Option<u64> {
         match self {
             Packed::Archive { count, .. } => Some(count),
@@ -571,7 +577,7 @@ impl Packed {
         }
     }
 
-    /// The archive's size in bytes, when the box said it; `None` for a fetch after the PC's own cut.
+    /// The archive's size in bytes, when the box said it; `None` for a fetch after a cut or a lost connection.
     fn size(self) -> Option<u64> {
         match self {
             Packed::Archive { size, .. } => size,
@@ -579,7 +585,8 @@ impl Packed {
         }
     }
 
-    /// How long the outputs call asks the box to wait for the run's pack: only for a fetch after the PC's own cut.
+    /// How long the outputs call asks the box to wait for the run's pack: only for a fetch after a cut or a lost
+    /// connection.
     fn cut_wait(self) -> Option<Duration> {
         match self {
             Packed::Archive { .. } => None,
@@ -601,7 +608,8 @@ fn archive_of(brought: Option<&Brought>) -> Option<Packed> {
 /// fetch, the PC's manifest was built and one of the run's output globs names a `TestResults` folder or the run has
 /// failure output globs; else the narrowed set ([`failure::failed_run_set`]) fetched and installed as [`fetched`] says
 /// for [`Bringing::Reports`], its lines naming the run's outputs when the set holds a failure output glob, else its
-/// test reports. A fetch after the PC's own cut ([`Packed::Cut`]) asks the box to wait for the run's pack.
+/// test reports. A fetch after the PC's own cut or after a lost connection ([`Packed::Cut`]) asks the box to wait for
+/// the run's pack.
 fn narrowed_fetched(
     attempt: &mut Attempt<'_, '_>,
     (sent, ran): (&Sent<'_>, &Ran<'_>),
@@ -638,14 +646,14 @@ fn narrowed_fetched(
 pub(super) enum Bringing {
     /// A passing run's outputs, under every output glob of the run.
     Outputs,
-    /// A failed or killed run's narrowed set: its outputs under the globs that name a `TestResults` folder
+    /// A failed, killed or disconnected run's narrowed set: its outputs under the globs that name a `TestResults` folder
     /// ([`Globs::test_results_only`]) and under its failure output globs, which the lines name as [`Narrowed`] and
     /// [`Cause`] say. Their pull and install keep the run's end, leave the outputs cap record and never clear the
     /// pending marker.
     Reports(Narrowed, Cause),
 }
 
-/// What a failed or box-killed run's narrowed set holds, which the lines of its pull and install name.
+/// What a failed, killed or disconnected run's narrowed set holds, which the lines of its pull and install name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Narrowed {
     /// The globs that name a `TestResults` folder alone: the run's test reports.
@@ -662,10 +670,14 @@ pub(super) enum Cause {
     /// The box killed its command at its ceiling, or the PC's own watchdog cut its run call for a stall or its backstop
     /// and stopped it: the killed run's.
     Killed,
+    /// The run call's connection was lost after the command's start, before the box said its own end: the disconnected
+    /// run's.
+    Disconnected,
 }
 
 impl Bringing {
-    /// What the pull's lines and the install's success line say they bring: `outputs`, or the failed or killed run's
+    /// What the pull's lines and the install's success line say they bring: `outputs`, or the failed, killed or
+    /// disconnected run's
     /// ([`Bringing::narrowed`]).
     pub(super) fn pulled(self) -> &'static str {
         match self {
@@ -674,7 +686,8 @@ impl Bringing {
         }
     }
 
-    /// What the lines saying what was not brought back name: `remote outputs`, or the failed or killed run's
+    /// What the lines saying what was not brought back name: `remote outputs`, or the failed, killed or disconnected
+    /// run's
     /// ([`Bringing::narrowed`]).
     pub(super) fn unbrought(self) -> &'static str {
         match self {
@@ -689,7 +702,8 @@ impl Bringing {
         format!("pulling {} from", self.pulled())
     }
 
-    /// What the watchdog's line says a fetch it stopped was doing: fetching the outputs, or the failed or killed run's
+    /// What the watchdog's line says a fetch it stopped was doing: fetching the outputs, or the failed, killed or
+    /// disconnected run's
     /// ([`Bringing::narrowed`]).
     fn fetching(self) -> String {
         match self {
@@ -698,7 +712,7 @@ impl Bringing {
         }
     }
 
-    /// What the lines of a failed or killed run's pull and install call what they bring back: its test reports, or
+    /// What the lines of a failed, killed or disconnected run's pull and install call what they bring back: its test reports, or
     /// its outputs when its narrowed set holds a failure output glob, named for how the run ended (`cause`).
     fn narrowed(narrowed: Narrowed, cause: Cause) -> &'static str {
         match (narrowed, cause) {
@@ -706,6 +720,8 @@ impl Bringing {
             (Narrowed::Outputs, Cause::Failed) => "the failed run's outputs",
             (Narrowed::TestReports, Cause::Killed) => "the killed run's test reports",
             (Narrowed::Outputs, Cause::Killed) => "the killed run's outputs",
+            (Narrowed::TestReports, Cause::Disconnected) => "the disconnected run's test reports",
+            (Narrowed::Outputs, Cause::Disconnected) => "the disconnected run's outputs",
         }
     }
 }
@@ -713,8 +729,8 @@ impl Bringing {
 /// What the outputs step of a run whose box packed an archive keeps for its pull and install: the run's output globs,
 /// the PC's manifest and the pending marker, `None` for a run whose outputs the route withheld, whose marker no end
 /// clears; what it knows of the archive ([`Packed`]): the files the box said it packed and the archive's size in bytes
-/// when it said one, or, for a fetch after the PC's own cut, whose box said nothing, how long its outputs call asks the
-/// box to wait for the run's pack; and, for a failed or killed run, its narrowed set ([`narrowed_fetched`]), which the
+/// when it said one, or, for a fetch after the PC's own cut or a lost connection, whose box said nothing, how long its
+/// outputs call asks the box to wait for the run's pack; and, for a failed, killed or disconnected run, its narrowed set ([`narrowed_fetched`]), which the
 /// install is held to, what the set holds and how the run ended.
 struct Kept<'k> {
     globs: &'k [String],
@@ -725,7 +741,7 @@ struct Kept<'k> {
 }
 
 impl Kept<'_> {
-    /// What the pull brings: a failed or killed run's narrowed set when it carries one, else outputs.
+    /// What the pull brings: a failed, killed or disconnected run's narrowed set when it carries one, else outputs.
     fn bringing(&self) -> Bringing {
         self.reports
             .map_or(Bringing::Outputs, |(_, narrowed, cause)| Bringing::Reports(narrowed, cause))
@@ -795,12 +811,13 @@ pub(super) fn trees_of<'a>(
 /// run are handed back as they are, and [`reports_end`] turns them to the command's status, while [`killed_end`] turns
 /// every one of them to [`End::Killed`].
 ///
-/// The narrowed set of a run whose run call the PC's own watchdog cut (a `kept` with a cut wait, [`Packed::Cut`]) is
-/// fetched the same way, by the same name, with no count or size said, its outputs call asking the box to wait for the
-/// run's pack and dialling no data channel. A box that says it packed nothing on the call's first attempt installs
-/// nothing and is said in the log alone; one that says so on a retry, or that the run was still going when its wait ran
-/// out, fails the pull as a transfer that failed every attempt ([`retried_call`]), which [`cut_end`] says; every end of
-/// it is turned to [`End::Killed`].
+/// The narrowed set of a run whose run call the PC's own watchdog cut, or whose connection was lost after its command
+/// started (a `kept` with a cut wait, [`Packed::Cut`]), is fetched the same way, by the same name, with no count or size
+/// said, its outputs call asking the box to wait for the run's pack and dialling no data channel. A box that says it
+/// packed nothing on the call's first attempt installs nothing and is said in the log alone; one that says so on a
+/// retry, or that the run was still going when its wait ran out, fails the pull as a transfer that failed every attempt
+/// ([`retried_call`]), which [`cut_end`] says; its caller keeps the run's own end whatever this gives, [`End::Killed`]
+/// for a cut and [`End::Lost`] for a lost connection.
 fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced: End) -> (End, bool) {
     // The install stamps each file the run wrote with the snapshot time; an attempt past its run without one is a bug of
     // the client's, which pulls nothing rather than stamp the outputs with another time.
@@ -1565,6 +1582,42 @@ mod tests {
         assert_eq!(
             Bringing::Reports(Narrowed::TestReports, Cause::Killed).fetching(),
             "fetching the killed run's test reports"
+        );
+    }
+
+    /// A disconnected run's narrowed set of test reports alone, and of outputs.
+    const DISCONNECTED_SETS: [(Bringing, &str); 2] = [
+        (
+            Bringing::Reports(Narrowed::TestReports, Cause::Disconnected),
+            "the disconnected run's test reports",
+        ),
+        (
+            Bringing::Reports(Narrowed::Outputs, Cause::Disconnected),
+            "the disconnected run's outputs",
+        ),
+    ];
+
+    /// Every phrase the pull of a run whose connection was lost names its set with names it the disconnected run's.
+    #[test]
+    fn a_disconnected_run_s_pull_names_its_set_the_disconnected_run_s() {
+        for (bringing, set) in DISCONNECTED_SETS {
+            assert_eq!(bringing.pulled(), set);
+            assert_eq!(bringing.unbrought(), set);
+            assert_eq!(bringing.pulling_from(), format!("pulling {set} from"));
+            assert_eq!(bringing.fetching(), format!("fetching {set}"));
+        }
+    }
+
+    /// A disconnected run's set not brought back is said as the disconnected run's.
+    #[test]
+    fn a_disconnected_run_s_set_not_brought_back_names_the_disconnected_run_s() {
+        assert_eq!(
+            not_brought_back(Bringing::Reports(Narrowed::Outputs, Cause::Disconnected), "why"),
+            "gate: the disconnected run's outputs not brought back: why"
+        );
+        assert_eq!(
+            not_brought_back(Bringing::Reports(Narrowed::TestReports, Cause::Disconnected), "why"),
+            "gate: the disconnected run's test reports not brought back: why"
         );
     }
 
