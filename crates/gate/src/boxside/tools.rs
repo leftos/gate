@@ -6,6 +6,12 @@
 //! a write to the box's own output fails, the client's connection gone; its job is terminated however it ends. A
 //! restore that fails refuses the run with status 75, as the PowerShell wrapper's `Update-ToolRestore` does, so the
 //! gate falls back to a local run.
+//!
+//! A run of a sent build also restores each project of that build the work folder holds, the same way but in a job of its
+//! own ([`sent_restore_job_name`]) and with the command's token and environment, as it evaluates the repo's `MSBuild`:
+//! the restore files a send leaves in a cold folder name the PC's package folder, so `dotnet test` would find no test
+//! project ([`update_sent`]). It runs on every such run, `NuGet`'s own no-op check being the test of whether it has work
+//! to do. One that fails refuses the run `sent` instead, so the PC runs it again without its `--no-build`.
 
 use std::convert::Infallible;
 use std::ffi::OsString;
@@ -19,25 +25,30 @@ use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
-use gate_win32::{Job, PipedConsole, PipedLaunch, PipedSuspended};
-use gate_wire::{EngineKind, ordinal_upper};
+use gate_router::{build_settings, escaped};
+use gate_win32::{Job, PipedConsole, PipedLaunch, PipedSuspended, RestrictedToken};
+use gate_wire::ordinal_upper;
 
 use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
+use crate::boxside::inputs;
 use crate::boxside::preflight::locate;
 use crate::boxside::run::{
     Beat, FAILED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, REFUSED_STATUS, Request, Stopper, WaitEnd, Watched, Watching, before_the_job, box_variables,
-    end_job, said_stopped,
+    command_base_variables, end_job, refused_sent, said_stopped,
 };
 use crate::boxside::stamping;
-use crate::boxside::stop::{restore_job_name, terminate_and_wait};
+use crate::boxside::stop::{restore_job_name, sent_restore_job_name, terminate_and_wait};
 use crate::console::Console;
+use crate::environment::Variables;
 use crate::remote::{Refusal, refused_line};
 use crate::run::{ERROR_FILE_NOT_FOUND, Written, written};
 
 /// The manifest names `dotnet` reads in one folder, the one under `.config` first, as `dotnet` looks for them.
 const MANIFEST_NAMES: [&str; 2] = [r".config\dotnet-tools.json", "dotnet-tools.json"];
-/// The words of the restore the box runs, after the `dotnet` it found.
+/// The words of the tool restore the box runs, after the `dotnet` it found.
 const RESTORE_WORDS: [&str; 2] = ["tool", "restore"];
+/// What the line after a tool restore calls it.
+const TOOL_RESTORE: &str = "dotnet tool restore";
 /// The hex digit of each hash byte's high nibble, the low nibble reading from the same table.
 const HEX: &[u8; 16] = b"0123456789abcdef";
 /// What follows the work folder's path in its tools record's, `{Work}.tools`; the interrupted-command clear removes the
@@ -173,42 +184,73 @@ enum Restored {
     Ended(u32),
 }
 
-/// The launch of `dotnet tool restore` in `place`, the `dotnet` found on the box's `PATH` and the box's own environment
-/// as a run's processes get it, less the run's `EngineEnv` names `engine_env` ([`box_variables`]), given; else why it
-/// cannot be launched.
-fn restore_launch(place: &Path, engine_env: &[(String, EngineKind)]) -> Result<PipedLaunch, String> {
+/// The context a restore starts in.
+#[derive(Clone, Copy)]
+enum RestoreContext {
+    /// The box's own token and environment, as a run's processes get it, for the tool restore.
+    OfTheBox,
+    /// The restricted token and the environment the command gets, for a restore that evaluates the repo's `MSBuild`.
+    OfTheCommand,
+}
+
+/// One restore [`restore`] runs.
+struct OneRestore<'a> {
+    /// The words after the `dotnet` the box found.
+    words: &'a [OsString],
+    /// What the line after it calls it.
+    called: &'a str,
+    /// The name of the job of its own it runs in.
+    job: String,
+    /// The context it starts in.
+    context: RestoreContext,
+}
+
+/// The environment and the token a restore of `context` starts with, in the job named `job`; else why they cannot be made.
+/// The token of [`RestoreContext::OfTheCommand`] has no fallback to the box's own, as a run with LFS content never runs
+/// with that.
+fn restore_context(context: RestoreContext, request: &Request<'_>, job: &str) -> Result<(Variables, Option<RestrictedToken>), String> {
+    match context {
+        RestoreContext::OfTheBox => Ok((box_variables(&request.engine_env), None)),
+        RestoreContext::OfTheCommand => {
+            let token = RestrictedToken::of_this_process().map_err(|error| format!("cannot make its restricted token: {error}"))?;
+            Ok((command_base_variables(request, job)?, Some(token)))
+        }
+    }
+}
+
+/// The launch of `one`'s `dotnet` in `place`, the `dotnet` found on the box's `PATH`, in its context
+/// ([`restore_context`]); else why it cannot be launched.
+fn restore_launch(request: &Request<'_>, place: &Path, one: &OneRestore<'_>) -> Result<PipedLaunch, String> {
     let dotnet = locate("dotnet")?.ok_or_else(|| gate_win32::win32_message(ERROR_FILE_NOT_FOUND))?;
-    let variables = box_variables(engine_env);
+    let (variables, token) = restore_context(one.context, request, &one.job)?;
     let environment = variables.block().map_err(|error| format!("cannot build its environment: {error}"))?;
-    let words: Vec<OsString> = RESTORE_WORDS.into_iter().map(OsString::from).collect();
-    match written(&dotnet, &words, &variables) {
+    match written(&dotnet, one.words, &variables) {
         Written::Line(application, command_line) => Ok(PipedLaunch {
             application,
             command_line,
             directory: place.to_owned(),
             environment,
             console: PipedConsole::Hidden,
-            token: None,
+            token,
         }),
         Written::Refused(line) | Written::NoShell(line) => Err(line),
     }
 }
 
-/// Runs `dotnet tool restore` in `place`, in a job of its own named after the run's job ([`restore_job_name`]), its two
-/// streams forwarded through the box's output lock as the command's are, and sees it to its end: [`Restored::Status`]
-/// with the status it exited with, after a line saying how long it ran, or [`Restored::Ended`] when a stop set the run's
-/// signal before or while it ran, when the box could not wait for it, or when a write to the box's own output failed,
-/// the client's connection gone. `Err` carries the message of a restore that could not be started. Its job kills on
-/// close, so a box that dies or is killed ends it, and is terminated on every way out of here, so nothing dotnet
-/// started outlives the restore.
-fn restore(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<Restored, String> {
+/// Runs `one`'s `dotnet` in `place`, in the job of its own it names, its two streams forwarded through the box's output
+/// lock as the command's are, and sees it to its end: [`Restored::Status`] with the status it exited with, after a line
+/// saying how long it ran, or [`Restored::Ended`] when a stop set the run's signal before or while it ran, when the box
+/// could not wait for it, or when a write to the box's own output failed, the client's connection gone. `Err` carries the
+/// message of a restore that could not be started. Its job kills on close, so a box that dies or is killed ends it, and
+/// is terminated on every way out of here, so nothing dotnet started outlives the restore.
+fn restore(request: &Request<'_>, place: &Path, one: &OneRestore<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<Restored, String> {
     // A stop that came while the snapshot was checked out ends the run here, before dotnet is even looked for.
     if let Err(status) = before_the_job(beat.stop.look(STARTING_RESTORE), request.job, beat.lock, console) {
         return Ok(Restored::Ended(status));
     }
-    let launch = restore_launch(place, &request.engine_env)?;
-    let name = restore_job_name(request.job);
-    let job = Job::create_kill_on_close(&name).map_err(|error| format!("cannot create its job {name}: {error}"))?;
+    let launch = restore_launch(request, place, one)?;
+    let name = &one.job;
+    let job = Job::create_kill_on_close(name).map_err(|error| format!("cannot create its job {name}: {error}"))?;
     let _stopper = Stopper { job: &job, armed: true };
     let started = Instant::now();
     let PipedSuspended { suspended, stdout, stderr } = launch.start_suspended(&job).map_err(|error| error.to_string())?;
@@ -248,7 +290,7 @@ fn restore(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
             match drained {
                 Ok(()) => {
                     // Said after the restore's own output and before any line saying it failed.
-                    stamping::err(console, &format!("gate: dotnet tool restore took {:.1} s", took.as_secs_f64()));
+                    stamping::err(console, &format!("gate: {} took {:.1} s", one.called, took.as_secs_f64()));
                     Restored::Status(code.cast_signed())
                 }
                 Err(status) => Restored::Ended(status),
@@ -292,7 +334,14 @@ pub(crate) fn update(request: &Request<'_>, work: &Path, place: &Path, beat: &Be
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => stamping::err(console, &format!("gate: remote could not read {record}: {error}; restoring the tools")),
     }
-    let status = match restore(request, place, beat, console) {
+    let words: Vec<OsString> = RESTORE_WORDS.into_iter().map(OsString::from).collect();
+    let one = OneRestore {
+        words: &words,
+        called: TOOL_RESTORE,
+        job: restore_job_name(request.job),
+        context: RestoreContext::OfTheBox,
+    };
+    let status = match restore(request, place, &one, beat, console) {
         Ok(Restored::Status(status)) => status,
         Ok(Restored::Ended(status)) => return Err(status),
         Err(message) => {
@@ -313,13 +362,124 @@ pub(crate) fn update(request: &Request<'_>, work: &Path, place: &Path, beat: &Be
     Err(REFUSED_STATUS)
 }
 
+/// Restores the projects of the run's sent build before its command, when it has a `SentDigest`: each project the
+/// sent-build record names ([`inputs::sent_projects`]) that the work folder holds, with `dotnet restore <project file>` and
+/// the run's own settings ([`project_restore_words`]) in `place`, whose `global.json` so picks the SDK the command's does.
+/// A project file the folder does not hold is skipped
+/// silently: the record takes every restore file of an `obj` folder, so a renamed project's stale props would otherwise
+/// refuse every send of that folder, and a run naming an absent project fails loudly by itself. `Ok` when nothing ran or
+/// every restore passed; else `Err` with the status the run ends on, its lines already said: 75 with the `sent` tag when a
+/// restore failed or could not start or the record could not be read, so the PC runs it again without its `--no-build`;
+/// 1 when a stop came before or during a restore or the box could not wait for it; 255 when the client closed the
+/// connection during it.
+pub(crate) fn update_sent(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
+    let Some(sent) = request.sent_digest else {
+        return Ok(());
+    };
+    let projects = match inputs::sent_projects(request.work, sent, &request.trees()) {
+        Ok(projects) => projects,
+        Err(why) => {
+            stamping::err(console, &format!("gate: remote could not read the sent-build record: {}", escaped(&why)));
+            let line = format!(
+                "gate: remote build sent to work folder {} cannot run: its sent-build record cannot be read",
+                request.key
+            );
+            return Err(refused_sent(request, &line, beat, console));
+        }
+    };
+    for project in projects {
+        // Below the work folder itself: on a pair the record's paths carry their tree.
+        let file = Path::new(request.work).join(project.replace('/', "\\"));
+        if file.is_file() {
+            restore_project(request, place, (&project, &file), beat, console)?;
+        }
+    }
+    Ok(())
+}
+
+/// The words after `dotnet` of the restore of the project at `file` for the run whose first command's words are
+/// `command`: quiet, as a real restore's chatter would reach a caller's captured output on every sent run, and with the
+/// command's configuration and runtime, as a bare restore evaluates as Debug and would lose a Release-conditional
+/// package, and rewriting a warm folder's assets without the runtime target can break a later `--no-build -r <rid>`.
+/// The framework is not passed, as a restore covers every target framework.
+fn project_restore_words(file: &Path, command: &[String]) -> Vec<OsString> {
+    let settings = build_settings(command);
+    let mut words = vec![
+        OsString::from("restore"),
+        file.as_os_str().to_owned(),
+        OsString::from("--verbosity"),
+        OsString::from("quiet"),
+    ];
+    if let Some(configuration) = settings.configuration {
+        words.push(OsString::from(format!("-p:Configuration={configuration}")));
+    }
+    if let Some(runtime) = settings.runtime {
+        words.extend([OsString::from("-r"), OsString::from(runtime)]);
+    }
+    words
+}
+
+/// Restores the project at `file`, the `/`-separated `project` below the work folder, as [`update_sent`] says.
+fn restore_project(request: &Request<'_>, place: &Path, (project, file): (&str, &Path), beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
+    let shown = escaped(project);
+    stamping::err(console, &format!("gate: restoring {shown} on the builder for the sent build"));
+    let command = request.commands.first().map_or(&[][..], Vec::as_slice);
+    let words = project_restore_words(file, command);
+    let one = OneRestore {
+        words: &words,
+        called: &format!("dotnet restore of {shown}"),
+        job: sent_restore_job_name(request.job),
+        context: RestoreContext::OfTheCommand,
+    };
+    match restore(request, place, &one, beat, console) {
+        Ok(Restored::Status(0)) => return Ok(()),
+        Ok(Restored::Status(status)) => stamping::err(console, &format!("gate: remote restore of {shown} failed (status {status})")),
+        Ok(Restored::Ended(status)) => return Err(status),
+        Err(message) => stamping::err(console, &format!("gate: remote could not start the dotnet restore of {shown}: {message}")),
+    }
+    let line = format!(
+        "gate: remote build sent to work folder {} cannot run: the builder could not restore {shown}",
+        request.key
+    );
+    Err(refused_sent(request, &line, beat, console))
+}
+
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test that cannot make its folders or files must fail loudly")]
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use super::{hash, manifests, tools_line};
+    use super::{hash, manifests, project_restore_words, tools_line};
+
+    /// [`project_restore_words`] of the file `F` for a run of `command`, as text.
+    fn words_for(command: &[&str]) -> Vec<String> {
+        let command: Vec<String> = command.iter().map(|word| (*word).to_owned()).collect();
+        project_restore_words(Path::new("F"), &command)
+            .into_iter()
+            .map(|word| word.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn project_restore_words_follow_the_run_s_configuration_and_runtime() {
+        const QUIET: [&str; 4] = ["restore", "F", "--verbosity", "quiet"];
+        const RELEASE: &str = "-p:Configuration=Release";
+        let cases: [(&[&str], &[&str]); 8] = [
+            (&["dotnet", "test", "F"], &[]),
+            (&["dotnet", "test", "-c", "Release"], &[RELEASE]),
+            (&["dotnet", "test", "--configuration=Release"], &[RELEASE]),
+            (&["dotnet", "test", "-r", "win-x64"], &["-r", "win-x64"]),
+            (&["dotnet", "test", "-c", "Release", "-r", "win-x64"], &[RELEASE, "-r", "win-x64"]),
+            (&["dotnet", "test", "-f", "net10.0"], &[]),
+            (&["fake-tool", "-c", "Release", "-r", "win-x64"], &[]),
+            (&[], &[]),
+        ];
+        for (command, extra) in cases {
+            let expected: Vec<&str> = QUIET.iter().chain(extra).copied().collect();
+            assert_eq!(words_for(command), expected, "{command:?}");
+        }
+    }
 
     /// A folder for one test, removed when it ends.
     struct Scratch(PathBuf);

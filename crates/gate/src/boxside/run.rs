@@ -166,7 +166,7 @@ pub(super) struct Request<'a> {
     index: &'a str,
     pub(super) job: &'a str,
     /// Each command's words, its program first: the one command of a run, or each of a warm-up's in order.
-    commands: Vec<Vec<String>>,
+    pub(super) commands: Vec<Vec<String>>,
     /// The warm-up file's hash a warm-up records in `{Work}.warm` once every command passed; `None` for a run.
     warm_hash: Option<&'a str>,
     subfolder: &'a str,
@@ -210,7 +210,7 @@ pub(super) struct Request<'a> {
     inputs_digest: Option<&'a str>,
     /// The digest of the manifest of the PC's build the client sent the work folder, `SentDigest`, `None` when it sent
     /// none.
-    sent_digest: Option<&'a str>,
+    pub(super) sent_digest: Option<&'a str>,
     /// The folders below the main repo's tree whose files the clear after an interrupted command leaves alone,
     /// `SpareFolders`; none when the payload gives none.
     spare: Vec<String>,
@@ -342,7 +342,7 @@ impl Request<'_> {
 
     /// The trees of a sibling pair's run below the work folder, the main repo's folder first, then each sibling's;
     /// empty for one repo, whose tree is the work folder itself.
-    fn trees(&self) -> Vec<&str> {
+    pub(super) fn trees(&self) -> Vec<&str> {
         self.trees.iter().map(String::as_str).collect()
     }
 
@@ -600,17 +600,21 @@ fn sent_matched(request: &Request<'_>, held: &File, beat: &Beat<'_>, console: &m
         }
         Err(why) => why,
     };
+    let line = format!(
+        "gate: remote build sent to work folder {} is not the one there: {}",
+        request.key,
+        escaped(&why)
+    );
+    Err(refused_sent(request, &line, beat, console))
+}
+
+/// Refuses the run `sent`: its tag and `line` said under the box's output lock, so no heartbeat lands between them, and
+/// the PC runs it again without its `--no-build`; 75.
+pub(super) fn refused_sent(request: &Request<'_>, line: &str, beat: &Beat<'_>, console: &mut Console) -> u32 {
     let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
     stamping::protocol(console, &refused_line(request.nonce, Refusal::Sent));
-    stamping::err(
-        console,
-        &format!(
-            "gate: remote build sent to work folder {} is not the one there: {}",
-            request.key,
-            escaped(&why)
-        ),
-    );
-    Err(REFUSED_STATUS)
+    stamping::err(console, line);
+    REFUSED_STATUS
 }
 
 /// The main repo and the siblings of a run in the work folder `work`: with no `Pair`, the one repo of `bare` checked out
@@ -1937,9 +1941,9 @@ fn no_head(repo: &Repo<'_>, head: &str) -> String {
     }
 }
 
-/// The run after its checkout and up to its command: the subfolder found, the repo's dotnet tools restored, for a pnpm
-/// or bun command its packages installed and, on a commit stage, the repo's stage preparation run; else `Err` with the
-/// status the run ends on, its lines said, as [`ready`] gives it.
+/// The run after its checkout and up to its command: the subfolder found, the repo's dotnet tools restored, a sent build's
+/// projects restored ([`tools::update_sent`]), for a pnpm or bun command its packages installed and, on a commit stage,
+/// the repo's stage preparation run; else `Err` with the status the run ends on, its lines said, as [`ready`] gives it.
 fn restored(
     request: &Request<'_>,
     (git, lfs): (&WorkGit, &RunLfs),
@@ -1955,10 +1959,12 @@ fn restored(
         return Err(ended_before(u32::from(USAGE_STATUS), request, beat, console));
     }
     let restored = tools::update(request, folders.work, folders.place, beat, console)
+        .and_then(|()| tools::update_sent(request, folders.place, beat, console))
         .and_then(|()| packages::update(request, git, folders, beat, console))
         .and_then(|()| stage_prep::update(request, (git, lfs), folders.place, beat, console));
     match restored {
-        // The tools' refusal, its tag said: the PC runs the command itself and syncs nothing back.
+        // A refusal, its tag said, syncs nothing back: after the tools' the PC runs the command itself, after a `sent` one
+        // it runs the command again on the builder without its `--no-build`.
         Err(REFUSED_STATUS) => Err(REFUSED_STATUS),
         Err(status) => Err(ended_before(status, request, beat, console)),
         Ok(()) => Ok(()),
@@ -2362,13 +2368,10 @@ struct Prepared<'w> {
 /// ([`CEILING_FILE_VARIABLE`]); with `None` that variable is removed, so neither the caller's pairs nor the box's own
 /// environment hand it one.
 fn prepared<'w>(request: &Request<'_>, one: &One<'w>, ceiling_file: Option<&Path>, console: &mut Console) -> Result<Prepared<'w>, Result<Ran, u32>> {
-    let run = format!("gate-box-{}", request.nonce);
     let Some((word, rest)) = one.words.split_first() else {
         return Err(Err(failed(console, "the run has no command")));
     };
-    let exe = std::env::current_exe().map_err(|error| Err(failed(console, &format!("the box's own path cannot be read: {error}"))))?;
-    let job = handed_job(request.job, gate_win32::own_session());
-    let variables = command_variables(&request.env, &request.engine_env, &run, &job, &exe);
+    let variables = command_base_variables(request, request.job).map_err(|why| Err(failed(console, &why)))?;
     let variables = match ceiling_file {
         Some(path) => variables.with(CEILING_FILE_VARIABLE, &path.to_string_lossy()),
         None => variables.without(CEILING_FILE_VARIABLE),
@@ -2407,6 +2410,15 @@ fn prepared<'w>(request: &Request<'_>, one: &One<'w>, ceiling_file: Option<&Path
             environment,
         }),
     }
+}
+
+/// The environment [`command_variables`] composes for `request`'s run, with `job` the job the process runs in, handed as
+/// the process reaches it ([`handed_job`]); else why the box's own path cannot be read.
+pub(super) fn command_base_variables(request: &Request<'_>, job: &str) -> Result<Variables, String> {
+    let run = format!("gate-box-{}", request.nonce);
+    let exe = std::env::current_exe().map_err(|error| format!("the box's own path cannot be read: {error}"))?;
+    let job = handed_job(job, gate_win32::own_session());
+    Ok(command_variables(&request.env, &request.engine_env, &run, &job, &exe))
 }
 
 /// The environment the payload's command is started with: the box's own less the `EngineEnv` names `engine_env`

@@ -227,6 +227,7 @@ A trial runs the repo's full command routed, once, and assumes a local run passe
 
 - **A step that fails locally too** is the repo's own failure. The pattern stays routed, since routed and local agree, and the failure goes to the repo as an inbox note.
 - **A step that passes locally but fails routed** is a routing failure. It is fixed in the builder's setup and that step alone is retried routed, once. If it still fails, the repo's patterns come back out of `remote.json` and the failure is booked as a GATE issue.
+- **A routed `dotnet test` that finds no test project** (`No test projects were found.`): `dotnet test` in Microsoft.Testing.Platform mode classifies a project by `IsTestingPlatformApplication`, not `IsTestProject`, so read that property first. It evaluates empty when the project's restore files name a package folder the builder does not have, as a sent build's do until the box restores the project.
 
 A first routed run in a new work folder is cold, as is the first run after the builder cleared what a killed or lost run left in it, and a pair's first routed run (the folder has no pair layout yet). The gate raises its ceiling to `min(2 x ceiling, ceiling + 1800 s)` and says so. The trial still wants a `--timeout` near what a cold build takes, since the raise is at most half an hour more; the repo's ordinary routed runs keep their usual ceilings. Run one heavy trial at a time.
 

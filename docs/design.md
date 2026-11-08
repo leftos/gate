@@ -2681,6 +2681,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A send that lands runs the kept words with the run payload's `SentDigest`, and writes neither the outputs-pending marker nor the nothing-back record.
 
+  The two restore files name the PC's package folder, so on a work folder the builder has never restored every package import is skipped by its `Exists` condition, `IsTestingPlatformApplication` evaluates empty, and `dotnet test` in Microsoft.Testing.Platform mode says `No test projects were found.` The box therefore restores each sent project before the command (the box side, below); a restore that fails refuses the run `sent`, and the client takes the drop.
+
   No send is made while the last build's outputs are not back: when the worktree's `remote\<key>.nothing-back` record stands (one that cannot be read counts as standing) and names no configuration or the run's own `-c`, in any letter case, the PC's `bin` may be older than the builder's build, so the run takes the drop, its log saying `gate: remote build not sent: the last build's outputs are not back: <record> stands`. A record of another configuration does not stop the send.
 
   A send planned from the built-here record is exempt from that veto only while its entry still matches: the client reads the record again under the key lock, for the project key the route matched (`SendPlan`'s `project_key`, which is empty for a send planned because `sendBuild` lists the repo) and the settings of the send plan's words. Every routed build clears the record, so a standing entry says a build here came after the last routed one; an entry gone by then leaves the veto to apply.
@@ -4712,7 +4714,7 @@ Built verbs:
 
   Otherwise the line is git's own `gate: remote checkout failed (status <n>)`.
 
-  The steps are the layout, fetch, the commit probe, checkout, clean and the back ref reset (each of the three git steps once per repo on a pair run, the main repo first), the dotnet tool restore, the package restore (pnpm, bun or npm), a commit stage's preparation (below), then the command, then the sync-back. A failing step prints `gate: remote <fetch|checkout|clean|back ref reset|reset|head ref delete> failed (status <n>)` and exits `n`.
+  The steps are the layout, fetch, the commit probe, checkout, clean and the back ref reset (each of the three git steps once per repo on a pair run, the main repo first), the dotnet tool restore, the sent project restore of a run with a `SentDigest`, the package restore (pnpm, bun or npm), a commit stage's preparation (below), then the command, then the sync-back. A failing step prints `gate: remote <fetch|checkout|clean|back ref reset|reset|head ref delete> failed (status <n>)` and exits `n`.
 
   The clean is `git clean -fdq`, with no `-x`, so a work folder keeps its ignored files between runs; a Godot project's `.godot` folder is one, so it persists from one routed run to the next.
 
@@ -4892,7 +4894,7 @@ Built verbs:
 
   The ssh logon's NETWORK group (S-1-5-2) is made deny-only in it, so WMI does not treat the command's calls as remote and `taskkill`, `tasklist` and `Get-CimInstance` work from the command (with NETWORK enabled they fail with `ERROR: Access denied`). `gate_win32::NetworkGroup` (`Absent`, `Enabled`, `DenyOnly`, `Disabled`) and `TokenFacts::network` report the group's state.
 
-  The console donor and console keeper `cmd.exe` run with the same restricted token, so no elevated process shares the command's console. The box itself, its git calls and its tool restore keep the box's own token; the pnpm, bun and npm installs run with the command's restricted token, with no fallback to the box's own.
+  The console donor and console keeper `cmd.exe` run with the same restricted token, so no elevated process shares the command's console. The box itself, its git calls and its tool restore keep the box's own token; the sent project restore and the pnpm, bun and npm installs run with the command's restricted token, with no fallback to the box's own.
 
   The restriction makes the command's token non-elevated with NETWORK deny-only, but it is still a network logon's token and lacks INTERACTIVE, so it is not the token a local run's command has; it is not a boundary against the command, whose code is trusted, since the box's elevated git and tool restore later read what the command wrote.
 
@@ -5065,7 +5067,7 @@ Built verbs:
 
   A terminate after the first that fails is not a failure of the stop: it is said once, `gate: remote could not terminate job <name> again: <error>`, after the other lines. An event that cannot be set prints `gate: remote could not signal the stop of job <name>: <error>` on stderr, and the job is terminated all the same. A stopped job prints `gate: remote stopped job <name>` on stdout and exits 0; no such job exits 0 with no output.
 
-  The stop also ends the run's tool restore job `<name>-tools` and its package install job `<name>-packages` when they exist: it opens each before it sets the event and terminates it after the payload's job, with the same lines and rules for `<name>-tools` and `<name>-packages`. It exits 1 when any job is left with processes or cannot be stopped, else 0.
+  The stop also ends the run's tool restore job `<name>-tools`, its sent project restore job `<name>-sent-restore` and its package install job `<name>-packages` when they exist: it opens each before it sets the event and terminates it after the payload's job, with the same lines and rules for `<name>-tools`, `<name>-sent-restore` and `<name>-packages`. It exits 1 when any job is left with processes or cannot be stopped, else 0.
 
   Processes still alive 10 s after the termination print `gate: remote job <name> still has <n> process(es) 10 s after it was terminated` and exit 1, and a job that cannot be terminated prints `gate: remote could not stop job <name>: <error>` and exits 1.
 
@@ -5178,6 +5180,14 @@ Built verbs:
   Its diff also fails on a needed path a put could not install to, as a file of a second name, and on a path of its manifest the repo's inputs record holds (`the repo's inputs hold <path>, which the sent build names too`), before anything is uploaded; the client then takes the drop, its log saying `gate: remote build not sent:` with the reason.
 
   A restore file is a file of an `obj` folder whose name ends `.nuget.g.props` or `.nuget.g.targets`, in either step: one on the box counts as matched whatever it holds, recorded with the manifest's hash; one at a member's target refuses the put (`the builder's own restore file is there`); and a put never deletes one. A diff that finds one restore file of a folder on the box without the other the manifest names fails (`the restore file '<path>' is on the box without '<path>'`).
+
+  Because a box copy counts as matched whatever it holds, a work folder the builder never restored keeps the PC's restore files, so every run with a `SentDigest` restores (the sent project restore, below).
+
+  The sent project restore runs, in the folder the command runs in, for each project the sent-build record names whose project file the work folder holds, `dotnet restore <file> --verbosity quiet`, then `-p:Configuration=<c>` when the run's first command sets a configuration, then `-r <rid>` when it sets a runtime; the framework is not passed. A project comes from a recorded `<project>/obj/<file>.nuget.g.props`, naming `<project>/<file>`; a project file the folder does not hold is skipped silently, since the record takes every restore file of an `obj` folder.
+
+  It runs on every such run, warm folders included, NuGet's own no-op check deciding whether there is work. It runs after the dotnet tool restore and before any package install and the start marker, in a job of its own named `{job}-sent-restore`, with the command's restricted token (the box's own is never the fallback) and the command's base environment: the caller's `Env`, the build-server settings, `safe.directory`, Event Log off, and the box run's job and exe names.
+
+  It prints `gate: restoring {project} on the builder for the sent build` before and `gate: dotnet restore of {project} took {n} s` after. A restore that fails prints `gate: remote restore of {project} failed (status {status})`, one that cannot start `gate: remote could not start the dotnet restore of {project}: {message}`, and either then the `sent` refusal tag and `gate: remote build sent to work folder {key} cannot run: the builder could not restore {project}`. A record that cannot be read prints `gate: remote could not read the sent-build record: {why}`, then the tag and `gate: remote build sent to work folder {key} cannot run: its sent-build record cannot be read`. The client says the dropped line and runs the dropped words on the builder; it never falls back to a run here.
 
   Once a sent build's put has every file of its manifest, it deletes each plain file of one name below `<project>/bin/<configuration>/` that neither record holds, reached through handles as above; folders, links and junctions stay, and a file that cannot be deleted says `gate: remote could not remove the leftover build file <path>: <error>`. Both records' paths go into the one exclude file, whichever record an install or a run's check writes it from.
 

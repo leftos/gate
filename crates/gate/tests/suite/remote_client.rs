@@ -555,7 +555,19 @@ pub(super) fn client_gate_tuned(case: &Case, log: &str, steps: &Path, tuned: &Tu
         .env(GATE_VARIABLE, GATE)
         .env(PREFLIGHT_SEAMS_VARIABLE, tuned.preflight_seams)
         .env(crate::support::ROOT_WALK_STOP_VARIABLE, case.folder());
+    let box_dotnet = box_dotnet_folder(case);
+    if box_dotnet.is_dir() {
+        let own = std::env::var_os("PATH").expect("PATH is set");
+        let folders = std::iter::once(box_dotnet).chain(std::env::split_paths(&own));
+        gate.env("PATH", std::env::join_paths(folders).expect("the folders join into a PATH"));
+    }
     gate
+}
+
+/// The folder of the stand-in `dotnet` a sent build's run finds on the box, first on the gate's `PATH` when the case has
+/// it ([`sent_build_case`]). It is inside the worktree, where this PC's gate never looks for its own dotnet.
+fn box_dotnet_folder(case: &Case) -> PathBuf {
+    case.folder().join("box-dotnet")
 }
 
 /// The journal lines of the gate `pid`.
@@ -11661,13 +11673,15 @@ fn sent_routing(case: &Case, listed: bool) {
 
 /// An [`outputs_case`] bringing back `**/bin/**` whose repo `sendBuild` lists, whose project `App.csproj` at the root the
 /// PC built in Release: its `bin\Release` and the two restore files of its `obj` folder, but the one named `missing`,
-/// both folders ignored by git.
+/// both folders ignored by git. The box restores the project on every sent run, so the case holds a quiet `dotnet` for it
+/// that passes, in place of this machine's, whose restore of this project would fail.
 pub(super) fn sent_build_case(name: &str, missing: Option<&str>) -> Case {
     let case = outputs_case(name, &BIN);
     sent_routing(&case, true);
     copy_tool(&case, "dotnet.exe");
-    write(&case, ".gitignore", &format!("{CLIENT_IGNORED}bin/\nobj/\n"));
+    write(&case, ".gitignore", &format!("{CLIENT_IGNORED}bin/\nobj/\nbox-dotnet/\n"));
     write(&case, "App.csproj", "<Project />\n");
+    box_dotnet(&case, 0);
     write(&case, SENT_DLL, "the PC's build");
     for restore in ["App.csproj.nuget.g.props", "App.csproj.nuget.g.targets"] {
         if missing != Some(restore) {
@@ -11675,6 +11689,26 @@ pub(super) fn sent_build_case(name: &str, missing: Option<&str>) -> Case {
         }
     }
     case
+}
+
+/// Writes the case's [`box_dotnet_folder`] `dotnet.cmd`: quiet, and exiting `restore_exit` on `restore` and 0 on anything
+/// else, but for `--list-sdks`, which it hands to this machine's own dotnet, the one this PC's gate lists its SDKs with,
+/// so the builder's list stays the PC's and a preflight passes as it does without the stub.
+fn box_dotnet(case: &Case, restore_exit: i32) {
+    let own = std::env::var_os("PATH").expect("PATH is set");
+    let real = std::env::split_paths(&own)
+        .map(|folder| folder.join("dotnet.exe"))
+        .find(|dotnet| dotnet.is_file());
+    let list = real.map_or_else(String::new, |dotnet| {
+        format!("if /i \"%~1\"==\"--list-sdks\" \"{}\" --list-sdks & exit /b\r\n", shown(&dotnet))
+    });
+    let folder = box_dotnet_folder(case);
+    fs::create_dir_all(&folder).expect("the stub's folder can be made");
+    fs::write(
+        folder.join("dotnet.cmd"),
+        format!("@echo off\r\n{list}if /i \"%~1\"==\"restore\" exit /b {restore_exit}\r\nexit /b 0\r\n"),
+    )
+    .expect("the stub dotnet can be written");
 }
 
 /// Whether the case's log `log` holds a line saying the PC's build was not sent, naming `why` in its reason.
@@ -11882,6 +11916,33 @@ fn a_run_the_box_refuses_for_its_sent_build_runs_again_with_the_drop() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(calls(&steps), ["preflight", "inputs", "inputs", "run", "run"], "one run again");
+    assert!(outcome.stderr.contains(DROPPED_NO_BUILD_LINE), "{outcome:?}");
+    assert!(
+        outcome.stdout.lines().any(|line| line == "-c"),
+        "the run again ran the command: {outcome:?}"
+    );
+    assert!(
+        !outcome.stdout.lines().any(|line| line == "--no-build"),
+        "with --no-build dropped: {outcome:?}"
+    );
+    assert!(nothing_back(&case).is_some(), "the drop built on the builder: {outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "never a local run");
+}
+
+/// The box's restore of the project a send left there fails, so the box refuses the run for its sent build, which runs
+/// again with the drop, on the builder.
+#[test]
+fn a_sent_build_whose_restore_fails_on_the_box_runs_the_dropped_words() {
+    let case = sent_build_case("client-sent-build-restore-fails", None);
+    box_dotnet(&case, 1);
+    let steps = ssh_steps(&case, "ssh", &["ok"; 5]);
+
+    let outcome = finish(dotnet_gate(&case, "out.log", &steps, &SENT_TEST));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "inputs", "inputs", "run", "run"], "one run again");
+    let said = log_texts(&case.folder().join("out.log"));
+    assert!(said.contains("gate: remote restore of App.csproj failed (status 1)"), "{said}");
     assert!(outcome.stderr.contains(DROPPED_NO_BUILD_LINE), "{outcome:?}");
     assert!(
         outcome.stdout.lines().any(|line| line == "-c"),

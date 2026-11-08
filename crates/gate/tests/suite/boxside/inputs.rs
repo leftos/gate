@@ -21,7 +21,8 @@ use super::channel_pc::{
     BOX_PROOF, PC_PROOF, assert_no_proof, channel_line, free_port, has_line, listening, not_completed, pc_connected, proved, with_windows,
 };
 use super::{
-    PAIR_KEY, box_call, field, gate_box, git, lines, pair_payload, pair_snapshot, passed, payload, refused_line, run_box, sibling_bare, snapshot,
+    PAIR_KEY, box_call, field, gate_box, git, lines, pair_payload, pair_snapshot, passed, path_for_run, payload, refused_line, restore_lines,
+    run_box, run_box_with_path, sibling_bare, snapshot, stub_dotnet_running, stub_dotnet_words, stub_dotnet_words_doing,
 };
 use crate::support::{Case, FAKE_TOOL, Outcome, Running, box_payload, junction, shown};
 
@@ -414,6 +415,18 @@ fn digested(payload: &Value, line: &str) -> Value {
 fn snapshot_payload(case: &Case) -> Value {
     let mut payload = inputs_payload(case, "put");
     snapshot(case, &mut payload, &[("tracked.txt", "tracked\n")]);
+    payload
+}
+
+/// The project file a sent build's project case tracks, its bytes in the snapshot and the `.gitignore` a real repo keeps
+/// its build's folders out of git with.
+const SENT_PROJECT: (&str, &str) = ("app/app.csproj", "<Project />\n");
+const SENT_PROJECT_IGNORE: (&str, &str) = (".gitignore", "bin/\nobj/\n");
+
+/// [`snapshot_payload`] whose snapshot also tracks the project file of a sent build of `app` ([`SENT_PROJECT`]).
+fn snapshot_payload_with_project(case: &Case) -> Value {
+    let mut payload = inputs_payload(case, "put");
+    snapshot(case, &mut payload, &[("tracked.txt", "tracked\n"), SENT_PROJECT, SENT_PROJECT_IGNORE]);
     payload
 }
 
@@ -1198,6 +1211,212 @@ fn sent_build_run_with_its_digest_runs_and_a_changed_bin_file_is_refused_sent() 
     assert!(changed.stderr.contains(BUILT_DLL.0), "the line names the file: {changed:?}");
 }
 
+/// The files of a sent build of the project `app`: its built file and the two restore files, which name the PC's
+/// package folder.
+const SENT_FILES: [Input; 3] = [BUILT_DLL, RESTORE_PROPS, RESTORE_TARGETS];
+
+/// The run payload of a sent build in a cold folder: the project tracked, the PC's files installed, and no restore of
+/// the builder's there.
+pub(super) fn cold_sent_run(case: &Case) -> Value {
+    let payload = snapshot_payload_with_project(case);
+    sent_all(case, &payload, &SENT_FILES);
+    sent_digested(&payload, &manifest_line(&SENT_FILES))
+}
+
+/// The line that says the run's sent build cannot run in the work folder `k`, because the builder could not restore `what`.
+fn cannot_restore_line(what: &str) -> String {
+    format!("gate: remote build sent to work folder k cannot run: the builder could not restore {what}")
+}
+
+/// Whether the lines of `stdout` hold the command's `ran`.
+fn ran(stdout: &str) -> bool {
+    stdout.lines().any(|line| line == "ran")
+}
+
+/// A send into a cold folder leaves the PC's restore files, so the box restores the project before the kept words.
+#[test]
+fn sent_build_run_in_a_cold_folder_restores_the_project_before_its_words() {
+    let case = Case::new("box_sent_run_cold");
+    let digested = cold_sent_run(&case);
+    let stub = stub_dotnet_words(&case, 0, false);
+
+    let run = run_box_with_path(&case, &digested, Some(&path_for_run(&[stub])));
+
+    assert_eq!(run.code, Some(0), "{run:?}");
+    let restores = restore_lines(&case);
+    assert_eq!(restores.len(), 1, "{run:?}");
+    assert!(
+        restores[0].ends_with(r"\app\app.csproj --verbosity quiet"),
+        "the absolute project file, quiet: {restores:?}"
+    );
+    let said = lines(&run.stdout);
+    let restored = said.iter().position(|line| *line == "restore: out");
+    let ran_at = said.iter().position(|line| *line == "ran");
+    assert!(
+        matches!((restored, ran_at), (Some(restored), Some(ran_at)) if restored < ran_at),
+        "the restore's output comes before the command's: {run:?}"
+    );
+    let told = lines(&run.stderr);
+    assert!(
+        told.contains(&"gate: restoring app/app.csproj on the builder for the sent build"),
+        "{run:?}"
+    );
+    assert!(
+        told.iter()
+            .any(|line| line.starts_with("gate: dotnet restore of app/app.csproj took ") && line.ends_with(" s")),
+        "{run:?}"
+    );
+}
+
+#[test]
+fn sent_build_run_with_the_builder_s_own_restore_state_restores_again() {
+    let case = Case::new("box_sent_run_warm");
+    let digested = cold_sent_run(&case);
+    written(&digested, "app/obj/project.assets.json", b"{}");
+    let stub = stub_dotnet_words(&case, 0, false);
+
+    let run = run_box_with_path(&case, &digested, Some(&path_for_run(&[stub])));
+
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert!(ran(&run.stdout), "{run:?}");
+    assert_eq!(restore_lines(&case).len(), 1, "{run:?}");
+}
+
+/// A failed restore leaves its assets file too, so that file says nothing: the next run of the same digest restores again.
+#[test]
+fn a_sent_run_restores_again_after_a_restore_that_failed_and_left_its_assets_file() {
+    let case = Case::new("box_sent_run_failed_assets");
+    let digested = cold_sent_run(&case);
+    let failing = stub_dotnet_words_doing(&case, 1, ">\"app\\obj\\project.assets.json\" echo {}\r\n");
+
+    let first = run_box_with_path(&case, &digested, Some(&path_for_run(&[failing])));
+
+    assert_eq!(first.code, Some(75), "{first:?}");
+    assert!(lines(&first.stderr).contains(&refused_line(&digested, "sent").as_str()), "{first:?}");
+    assert!(work(&digested).join(r"app\obj\project.assets.json").is_file(), "{first:?}");
+
+    let passing = stub_dotnet_words(&case, 0, false);
+    let second = run_box_with_path(&case, &digested, Some(&path_for_run(&[passing])));
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert!(ran(&second.stdout), "{second:?}");
+    assert_eq!(restore_lines(&case).len(), 2, "a restore in each run: {second:?}");
+}
+
+/// The project's restore evaluates the repo's `MSBuild`, so it sees the caller's `Env`, as the command does.
+#[test]
+fn a_sent_project_restore_gets_the_caller_s_env() {
+    let case = Case::new("box_sent_run_restore_env");
+    let mut digested = cold_sent_run(&case);
+    digested["Env"] = json!({"GATE1174_PROBE": "from the caller"});
+    let told = case.folder().join("told.txt");
+    let stub = stub_dotnet_running(&case, 0, &format!("echo %GATE1174_PROBE%>\"{}\"\r\n", shown(&told)));
+
+    let run = run_box_with_path(&case, &digested, Some(&path_for_run(&[stub])));
+
+    assert_eq!(run.code, Some(0), "{run:?}");
+    let said = fs::read_to_string(&told).expect("the restore wrote what it was told");
+    assert_eq!(said.trim_end(), "from the caller", "{run:?}");
+}
+
+#[test]
+fn a_run_without_a_sent_digest_runs_no_project_restore() {
+    let case = Case::new("box_sent_run_no_digest");
+    let payload = snapshot_payload_with_project(&case);
+    sent_all(&case, &payload, &SENT_FILES);
+    let stub = stub_dotnet_words(&case, 0, false);
+
+    let run = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert!(ran(&run.stdout), "{run:?}");
+    assert_eq!(restore_lines(&case), Vec::<String>::new(), "{run:?}");
+}
+
+#[test]
+fn sent_build_run_whose_project_file_is_absent_runs_no_restore() {
+    let case = Case::new("box_sent_run_no_project");
+    let payload = snapshot_payload(&case);
+    sent_all(&case, &payload, &SENT_FILES);
+    let digested = sent_digested(&payload, &manifest_line(&SENT_FILES));
+    let stub = stub_dotnet_words(&case, 0, false);
+
+    let run = run_box_with_path(&case, &digested, Some(&path_for_run(&[stub])));
+
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert!(ran(&run.stdout), "{run:?}");
+    assert_eq!(restore_lines(&case), Vec::<String>::new(), "{run:?}");
+}
+
+#[test]
+fn sent_build_run_whose_restore_fails_is_refused_sent() {
+    let case = Case::new("box_sent_run_restore_fails");
+    let digested = cold_sent_run(&case);
+    let stub = stub_dotnet_words(&case, 1, false);
+
+    let run = run_box_with_path(&case, &digested, Some(&path_for_run(&[stub])));
+
+    assert_eq!(run.code, Some(75), "{run:?}");
+    let told = lines(&run.stderr);
+    let tag = refused_line(&digested, "sent");
+    let failed = told
+        .iter()
+        .position(|line| *line == "gate: remote restore of app/app.csproj failed (status 1)");
+    let refused = told.iter().position(|line| *line == tag);
+    let cannot = told.iter().position(|line| *line == cannot_restore_line("app/app.csproj"));
+    assert!(
+        matches!((failed, refused, cannot), (Some(failed), Some(refused), Some(cannot)) if failed < refused && refused < cannot),
+        "the status, then the tag and its line: {run:?}"
+    );
+    assert!(!ran(&run.stdout), "the command never ran: {run:?}");
+}
+
+#[test]
+fn sent_build_run_whose_restore_cannot_start_is_refused_sent() {
+    let case = Case::new("box_sent_run_no_dotnet");
+    let digested = cold_sent_run(&case);
+
+    let run = run_box_with_path(&case, &digested, Some(&path_for_run(&[])));
+
+    assert_eq!(run.code, Some(75), "{run:?}");
+    let told = lines(&run.stderr);
+    assert!(
+        told.iter()
+            .any(|line| line.starts_with("gate: remote could not start the dotnet restore of app/app.csproj: ")),
+        "{run:?}"
+    );
+    assert!(told.contains(&refused_line(&digested, "sent").as_str()), "{run:?}");
+    assert!(told.contains(&cannot_restore_line("app/app.csproj").as_str()), "{run:?}");
+    assert!(!ran(&run.stdout), "the command never ran: {run:?}");
+}
+
+/// The box's restore rewrites a restore file the record holds. A next send's diff, which needs nothing as a restore file
+/// there counts as matched, takes the rewritten copy into the record, so its run has the same digest and passes the
+/// digest check, and restores again as every sent run does. No put follows such a diff: one carrying the restore file
+/// would be refused, as a restore file there is the builder's own.
+#[test]
+fn the_next_send_after_the_box_s_restore_passes_its_digest_check() {
+    let case = Case::new("box_sent_run_next_send");
+    let payload = snapshot_payload_with_project(&case);
+    sent_all(&case, &payload, &SENT_FILES);
+    let digested = sent_digested(&payload, &manifest_line(&SENT_FILES));
+    let stub = stub_dotnet_words(&case, 0, true);
+    let path = path_for_run(&[stub]);
+
+    let first = run_box_with_path(&case, &digested, Some(&path));
+    assert_eq!(first.code, Some(0), "{first:?}");
+
+    let again = diff(&case, &sent(&payload), &SENT_FILES);
+    assert_eq!(again.code, Some(0), "{again:?}");
+    assert_eq!(again.stdout, needs(&[]), "the rewritten restore file counts as matched: {again:?}");
+
+    let second = run_box_with_path(&case, &digested, Some(&path));
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert!(ran(&second.stdout), "{second:?}");
+    assert!(!second.stderr.contains("cannot run"), "no refusal: {second:?}");
+    assert_eq!(restore_lines(&case).len(), 2, "a restore in each run: {second:?}");
+}
+
 /// The leaf of the sibling pair [`pair_inputs_payload`] lays out: the main repo's tree is `{Work}\app`.
 const LEAF: &str = "app";
 
@@ -1438,6 +1657,38 @@ fn sent_bin_of_a_pair_that_climbs_out_is_a_usage_error() {
 
     assert_malformed_sent_bin("a parent part", &sent_bin_diff(&case, &payload, "../x/bin/Debug"));
     assert!(!work(&payload).join(LEAF).exists(), "nothing is laid out");
+}
+
+#[test]
+fn a_pair_s_sent_build_restores_the_project_below_its_tree() {
+    let case = Case::new("box_sent_pair_restore");
+    let mut payload = pair_inputs_payload(&case, "put");
+    pair_snapshot(
+        &case,
+        &mut payload,
+        &[("tracked.txt", "tracked\n"), SENT_PROJECT, SENT_PROJECT_IGNORE],
+        &[("lib", &[("lib.txt", "lib\n")])],
+    );
+    sent_all(&case, &payload, &SENT_FILES);
+    let digested = sent_digested(&payload, &manifest_line(&SENT_FILES));
+    let stub = stub_dotnet_words(&case, 0, false);
+
+    let run = run_box_with_path(&case, &digested, Some(&path_for_run(&[stub])));
+
+    assert_eq!(run.code, Some(0), "{run:?}");
+    let restores = restore_lines(&case);
+    assert_eq!(restores.len(), 1, "{run:?}");
+    let project = in_leaf(SENT_PROJECT.0);
+    assert!(
+        restores[0].ends_with(&format!("\\{} --verbosity quiet", project.replace('/', "\\"))),
+        "the project below the leaf, quiet: {restores:?}"
+    );
+    assert!(
+        lines(&run.stderr)
+            .iter()
+            .any(|line| line.starts_with(&format!("gate: dotnet restore of {project} took "))),
+        "{run:?}"
+    );
 }
 
 #[test]

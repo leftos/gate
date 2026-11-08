@@ -2666,6 +2666,50 @@ fn stub_dotnet_running(case: &Case, exit: i32, before: &str) -> PathBuf {
     stub
 }
 
+/// The file a [`stub_dotnet_words`] appends its words to, one line per call.
+fn dotnet_words(case: &Case) -> PathBuf {
+    case.folder().join("dotnet-words.txt")
+}
+
+/// The lines of the case's words file that are a `restore`, none when no stub ran one.
+fn restore_lines(case: &Case) -> Vec<String> {
+    fs::read_to_string(dotnet_words(case))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.starts_with("restore"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A folder on the case's `PATH` holding a `dotnet.cmd` that appends its words to [`dotnet_words`] and, on `restore`,
+/// prints `restore: out` on stdout and `restore: note` on stderr and exits with `restore_exit`; any other words exit 0.
+/// When `rewrites`, its `restore` does as a real one does in its working folder, the work folder of a sent build of the
+/// project `app`: rewrites `app/obj/app.csproj.nuget.g.props` and writes `app/obj/project.assets.json`.
+fn stub_dotnet_words(case: &Case, restore_exit: i32, rewrites: bool) -> PathBuf {
+    let rewrite = if rewrites {
+        ">\"app\\obj\\app.csproj.nuget.g.props\" echo ^<Project^>the builder's^</Project^>\r\n>\"app\\obj\\project.assets.json\" echo {}\r\n"
+    } else {
+        ""
+    };
+    stub_dotnet_words_doing(case, restore_exit, rewrite)
+}
+
+/// [`stub_dotnet_words`] whose `restore` runs the batch script `rewrite` in its working folder before it exits.
+fn stub_dotnet_words_doing(case: &Case, restore_exit: i32, rewrite: &str) -> PathBuf {
+    let stub = case.folder().join("stub-dotnet-words");
+    fs::create_dir_all(&stub).expect("the stub folder can be made");
+    fs::write(
+        stub.join("dotnet.cmd"),
+        format!(
+            "@echo off\r\necho %*>>\"{}\"\r\nif /i not \"%~1\"==\"restore\" exit /b 0\r\n\
+             echo restore: out\r\necho restore: note 1>&2\r\n{rewrite}exit /b {restore_exit}\r\n",
+            shown(&dotnet_words(case))
+        ),
+    )
+    .expect("the dotnet stub can be written");
+    stub
+}
+
 /// Puts a `git.cmd` in the stub folder `stub` that holds the run's back ref reset, its `update-ref -d` in the bare
 /// repository just after the checkout and before the restore, until `go` exists ([`Does::WaitFor`]), `<go>.parked`
 /// made as it starts waiting. A case can so order a stop between the work folder's lock and the restore: it waits for
@@ -8424,6 +8468,32 @@ fn box_run_a_stop_during_the_restore_ends_it_and_runs_no_command() {
 }
 
 #[test]
+fn a_stop_during_the_sent_project_restore_ends_it_and_runs_no_command() {
+    let case = Case::new("box_sent_run_stop_restore");
+    let payload = inputs::cold_sent_run(&case);
+    let stub = stub_dotnet_running(&case, 0, &held_restore(&case.folder().join("never")));
+    let running = start_box_with_path(&case, &payload, Some(&path_for_run(std::slice::from_ref(&stub))));
+    let helper = spawned_pid(&running.wait_for_stdout("\n"));
+
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+    let outcome = running.finish_read();
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_eq!(
+        stopped.stdout,
+        format!("gate: remote stopped job {}-sent-restore\n", field(&payload, "Job")),
+        "{stopped:?}"
+    );
+    assert_eq!(stopped.stderr, "", "{stopped:?}");
+    assert_eq!(outcome.code, Some(1), "a stop during the restore fails the run: {outcome:?}");
+    let said = stopped_line_for(&format!("{}-sent-restore", field(&payload, "Job")));
+    assert!(outcome.stderr.lines().any(|line| line == said), "{said:?} in {outcome:?}");
+    assert!(!outcome.stdout.lines().any(|line| line == "ran"), "the command never ran: {outcome:?}");
+    wait_until_gone(helper);
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
 fn box_run_a_killed_box_takes_its_restore_with_it() {
     let case = Case::new("box_run_tools_killed_box");
     let marker = case.folder().join("marker");
@@ -9035,6 +9105,40 @@ fn box_run_runs_the_pnpm_install_with_the_restricted_token() {
     assert!(lines.contains(&"not-elevated"), "{lines:?}");
     assert!(lines.contains(&"owner user"), "{lines:?}");
     assert!(lines.contains(&restricted_dacl_line().as_str()), "the restricted token's DACL: {lines:?}");
+}
+
+#[test]
+fn a_sent_project_restore_runs_with_the_restricted_token() {
+    let case = Case::new("box_sent_run_restore_token");
+    let payload = inputs::cold_sent_run(&case);
+    let token = case.folder().join("token.txt");
+    let stub = stub_dotnet_running(&case, 0, &format!("\"{FAKE_TOOL}\" token >\"{}\"\r\n", shown(&token)));
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said = fs::read_to_string(&token).expect("the restore wrote its token's facts");
+    let lines: Vec<&str> = said.lines().collect();
+    assert!(lines.contains(&"not-elevated"), "{lines:?}");
+    assert!(lines.contains(&"owner user"), "{lines:?}");
+    assert!(lines.contains(&restricted_dacl_line().as_str()), "the restricted token's DACL: {lines:?}");
+}
+
+#[test]
+fn a_tool_restore_keeps_the_box_s_token() {
+    let case = Case::new("box_run_tools_restore_token");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    snapshot(&case, &mut payload, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
+    let token = case.folder().join("token.txt");
+    let stub = stub_dotnet_running(&case, 0, &format!("\"{FAKE_TOOL}\" token >\"{}\"\r\n", shown(&token)));
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said = fs::read_to_string(&token).expect("the restore wrote its token's facts");
+    // The facts of a child of this suite, whose token the box's is: a suite a builder runs holds the restricted token itself.
+    let own = Command::new(FAKE_TOOL).arg("token").output().expect("the tool can be run");
+    assert_eq!(said, String::from_utf8_lossy(&own.stdout), "the box's own token: {outcome:?}");
 }
 
 #[test]

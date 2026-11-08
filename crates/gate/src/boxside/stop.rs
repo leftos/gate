@@ -1,8 +1,9 @@
 //! `gate box stop`: ends every process of the run whose job the payload names, as the PowerShell wrapper's
 //! `Invoke-Stop` does. It sets the run's stop signal first, so a run whose job does not exist yet never starts its
-//! command, then ends the run's job, the job its dotnet tool restore runs in ([`restore_job_name`]) and the job its
-//! package install runs in ([`packages_job_name`]). The job name carries the run's nonce, so a stop that arrives late
-//! finds no job, and never another run's. It takes no lock.
+//! command, then ends the run's job, the job its dotnet tool restore runs in ([`restore_job_name`]), the job its sent
+//! build's project restore runs in ([`sent_restore_job_name`]) and the job its package install runs in
+//! ([`packages_job_name`]). The job name carries the run's nonce, so a stop that arrives late finds no job, and never
+//! another run's. It takes no lock.
 
 use std::io;
 use std::thread;
@@ -24,9 +25,9 @@ const POLL: Duration = Duration::from_millis(100);
 /// The status of a stop that left processes behind or failed.
 const FAILED_STATUS: u32 = 1;
 
-/// Terminates the payload's job, its restore's job and its install's job, and waits for their processes to be gone;
+/// Terminates the payload's job, its restores' jobs and its install's job, and waits for their processes to be gone;
 /// returns the status: 0 when every job is gone or there were none, 1 when processes are left or a job could not be
-/// stopped, 2 for a payload without a work-folder key or a job name of that work folder. The restore's and the
+/// stopped, 2 for a payload without a work-folder key or a job name of that work folder. The restores' and the
 /// install's jobs are opened before the run's stop signal is set, so a run that ends one on seeing the signal cannot
 /// close its job before the stop finds it; each is terminated only after the signal is set, so the run reads its end
 /// as the stop's.
@@ -39,12 +40,15 @@ pub(crate) fn stop(payload: &Payload, console: &mut Console) -> u32 {
         }
     };
     let restore_name = restore_job_name(name);
+    let sent_restore_name = sent_restore_job_name(name);
     let packages_name = packages_job_name(name);
     let restore = OpenedJob::open(&restore_name);
+    let sent_restore = OpenedJob::open(&sent_restore_name);
     let packages = OpenedJob::open(&packages_name);
     let command = said(name, stopped(name, console), console);
     let restore = said_opened(restore, &restore_name, console);
-    command.max(restore).max(said_opened(packages, &packages_name, console))
+    let sent_restore = said_opened(sent_restore, &sent_restore_name, console);
+    command.max(restore).max(sent_restore).max(said_opened(packages, &packages_name, console))
 }
 
 /// Ends the job `name` opened before the stop signal was set, `opened` as [`OpenedJob::open`] gave it, and says how it
@@ -124,6 +128,12 @@ pub(crate) fn stop_event_name(job: &str) -> String {
 /// run's own.
 pub(crate) fn restore_job_name(job: &str) -> String {
     format!("{job}-tools")
+}
+
+/// The name of the job the restore of a sent build's project in the run whose job is `job` runs in, which a stop ends
+/// beside the run's own.
+pub(crate) fn sent_restore_job_name(job: &str) -> String {
+    format!("{job}-sent-restore")
 }
 
 /// The name of the job the package install of the run whose job is `job` runs in, which a stop ends beside the run's own.

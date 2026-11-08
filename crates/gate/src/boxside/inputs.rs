@@ -141,6 +141,34 @@ pub(super) fn unmatched(book: Book, work: &str, trees: &[&str], held: &File, sen
     write_excludes(held, work, trees, [&record, &other_record(work, book, trees)])
 }
 
+/// The project files of the sent build the work folder `work`, laid out as `trees`, holds, as `/`-separated paths below
+/// the work folder, a pair's with their tree: one for each restore props file its sent-build record holds as installed
+/// ([`project_of_props`]), a kept stale copy being no part of that build. Else why the record cannot be read or does not
+/// hold the run's digest `sent` ([`matching_record`]).
+pub(super) fn sent_projects(work: &str, sent: &str, trees: &[&str]) -> Result<Vec<String>, String> {
+    let record = matching_record(&Book::SentBuild.path(work), sent, trees)?;
+    Ok(record.files.values().filter_map(|copy| project_of_props(&copy.path)).collect())
+}
+
+/// The project file the restore file at the `/`-separated `path` belongs to, when it is the props one of an `obj` folder:
+/// `<project>/obj/<file>.nuget.g.props`, its suffix in any letter case, names `<project>/<file>`, and
+/// `obj/<file>.nuget.g.props` names `<file>`.
+fn project_of_props(path: &str) -> Option<String> {
+    const PROPS: &str = ".nuget.g.props";
+    if !is_restore_file(path) {
+        return None;
+    }
+    let (folder, name) = path.rsplit_once('/')?;
+    let (file, suffix) = name.split_at_checked(name.len().checked_sub(PROPS.len())?)?;
+    if file.is_empty() || !suffix.eq_ignore_ascii_case(PROPS) {
+        return None;
+    }
+    Some(match folder.rsplit_once('/') {
+        Some((project, _)) => format!("{project}/{file}"),
+        None => file.to_owned(),
+    })
+}
+
 /// The work folder's record other than `book`'s, for the exclude files both share; empty when it is missing or cannot
 /// be read as a record of the work folder's `trees` ([`Record::parse`]), as no run then trusts a copy it would name.
 fn other_record(work: &str, book: Book, trees: &[&str]) -> Record {
@@ -1890,13 +1918,53 @@ mod tests {
 
     use super::{
         Asked, Beneath, Book, Convention, Copy, Leftover, Record, STAGES_ACCESS, Stage, Stamp, Step, Unadopted, adopted, adopted_again,
-        leftovers_removed, made_stage, moved_in, not_the_box_s, protected_folder, removed_stage, same_stage, stages_name, swept,
+        leftovers_removed, made_stage, moved_in, not_the_box_s, project_of_props, protected_folder, removed_stage, same_stage, sent_projects,
+        stages_name, swept,
     };
     use crate::boxside::preflight::written_beneath;
     use crate::console::Console;
     use crate::outputs::manifest::Manifest;
     use crate::test_support::junction;
     use gate_wire::ordinal_upper;
+
+    /// The rule that reads a project from a recorded path.
+    #[test]
+    fn a_restore_props_path_names_its_project_and_no_other_path_names_one() {
+        assert_eq!(project_of_props("obj/App.csproj.nuget.g.props").as_deref(), Some("App.csproj"));
+        assert_eq!(project_of_props("a/b/obj/X.fsproj.NUGET.G.PROPS").as_deref(), Some("a/b/X.fsproj"));
+        assert_eq!(project_of_props("a/obj/App.csproj.nuget.g.targets"), None);
+        assert_eq!(project_of_props("a/bin/Release/App.csproj.nuget.g.props"), None);
+        assert_eq!(project_of_props("a/bin/Release/App.dll"), None);
+        assert_eq!(project_of_props("a/obj/.nuget.g.props"), None);
+    }
+
+    #[test]
+    fn sent_projects_reads_the_record_and_an_unreadable_one_is_an_error() {
+        let scratch = folder("sent-projects");
+        let work = scratch.join("k").to_string_lossy().into_owned();
+        let record_path = format!("{work}.sent-build");
+        let sha256 = "a".repeat(64);
+        let stamp = format!(r#"{{"size": 1, "sha256": "{sha256}", "modified": 1, "id": "1"}}"#);
+        let record = format!(
+            concat!(
+                r#"{{"digest": "d", "files": {{"a/obj/App.csproj.nuget.g.props": {stamp}, "#,
+                r#""a/obj/App.csproj.nuget.g.targets": {stamp}, "a/bin/App.dll": {stamp}, "#,
+                r#""b/obj/Old.csproj.nuget.g.props": {{"kept": true}}}}}}"#
+            ),
+            stamp = stamp
+        );
+
+        assert!(sent_projects(&work, "d", &[]).is_err(), "no record");
+        fs::write(&record_path, record).expect("the record can be written");
+        assert_eq!(
+            sent_projects(&work, "d", &[]),
+            Ok(vec!["a/App.csproj".to_owned()]),
+            "an installed copy's project, no kept one's"
+        );
+        assert!(sent_projects(&work, "another", &[]).is_err(), "a record of another digest");
+        fs::write(&record_path, "not a record").expect("the record can be written");
+        assert!(sent_projects(&work, "d", &[]).is_err(), "not a record");
+    }
 
     /// A new, empty folder of the test `name`'s own.
     fn folder(name: &str) -> PathBuf {
