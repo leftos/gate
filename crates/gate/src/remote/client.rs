@@ -1709,7 +1709,6 @@ impl Attempt<'_, '_> {
         let (sibling_snapshots, sibling_bases) = sibling_fields(&repos, siblings);
         let trees = self.trees(&repos, &snapshots)?;
         let lfs = self.lfs_sending(&repos, &snapshots, &trees)?;
-        self.macos_takes_no_lfs(&repos, &lfs)?;
         let mut needs = trees
             .first()
             .and_then(Option::as_ref)
@@ -2415,27 +2414,6 @@ impl Attempt<'_, '_> {
             sending.push(repo_sending.map_err(|why| lfs::refused(self, &why))?);
         }
         Ok(sending)
-    }
-
-    /// Refuses the run `parity` when the snapshot holds LFS pointers and the attempt's builder is a macOS one, before its
-    /// preflight: the Unix box's `run` takes no LFS content yet, so an attempt there would be refused `lfs` after its
-    /// preflight and push and run the command here, while a `parity` refusal hands the run to the next builder. The line names the
-    /// repository's routing name (`repos`), as every toolchain mismatch line does. `Ok` when the snapshot holds no
-    /// pointers, or the builder takes it.
-    fn macos_takes_no_lfs(&mut self, repos: &[Repo], lfs: &[lfs::Sending]) -> Result<(), End> {
-        let Some(sending) = lfs.first() else {
-            return Ok(());
-        };
-        if self.call.builder.os != BuilderOs::Macos {
-            return Ok(());
-        }
-        let repo = &repos[sending.at].on_builder;
-        let line = format!(
-            "gate: remote toolchain mismatch: {repo} holds LFS pointers; {} is a macOS builder, which takes no LFS content",
-            self.call.host()
-        );
-        self.say(line);
-        Err(End::Refused(FallbackReason::Parity))
     }
 
     /// The pointers of `repo`'s `snapshot`: for the main repository (`main` given), those among the blobs of its tree's

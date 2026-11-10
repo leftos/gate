@@ -184,36 +184,33 @@ fn a_routed_run_brings_its_lfs_content_to_the_command() {
     assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
 }
 
-/// A macOS builder takes no LFS content, so the PC refuses it `parity` before any call to it and the walk hands the run
-/// to the next builder, which gets the diff, the put and the run.
+/// An LFS run whose first pick is a macOS builder is not refused before its preflight: the Mac gets the first call.
+/// The suite's stand-in box reads Windows paths only, so it refuses the Mac's preflight `version` and the next builder
+/// runs the LFS run.
 #[test]
-fn a_macos_first_builder_is_refused_parity_before_any_call_and_the_next_builder_runs_the_lfs_run() {
+fn an_lfs_run_whose_first_pick_is_the_macos_builder_sends_its_preflight_there() {
     let case = client_case("client-lfs-macos-first");
     with_lfs_file(&case);
     two_builder_routed(&case);
-    let steps = run_kept(&case, 4);
+    let steps = run_kept(&case, 5);
 
     let outcome = finish(client_gate(&case, "out.log", &steps, &PRINT));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(
         calls(&steps),
-        ["preflight", "lfs", "lfs", "run"],
-        "the Mac gets no call; the builder gets the diff, the put and the run"
+        ["preflight", "preflight", "lfs", "lfs", "run"],
+        "the Mac's preflight first, then the builder's diff, put and run"
     );
     assert!(outcome.stdout.contains(CONTENT.trim_end()), "the object's bytes: {outcome:?}");
     let said = fs::read_to_string(beside(&steps, ".lines")).expect("the stand-in's calls can be read");
     let hosts: Vec<&str> = said.lines().filter_map(|line| line.split_once(' ').map(|(host, _)| host)).collect();
-    assert_eq!(hosts, ["builder"; 4], "{outcome:?}");
-    assert_eq!(fallbacks(&events(&case)), ["parity"]);
-    let line = format!(
-        "gate: remote toolchain mismatch: {} holds LFS pointers; mac-1 is a macOS builder, which takes no LFS content",
-        repo_name(&leaf(&case))
-    );
-    let log = log_of(&case, "out.log");
-    assert!(has_line(&log, &line), "{line} not in {log}");
-    assert!(has_line(&outcome.stderr, "gate: remote mac-1 parity; trying builder"), "{outcome:?}");
-    assert!(!outcome.stderr.contains("running here"), "{outcome:?}");
+    assert_eq!(hosts, ["mac-1", "builder", "builder", "builder", "builder"], "{outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), ["version"]);
+    let digest = sha256(format!("{} {}", sha256(CONTENT.as_bytes()), CONTENT.len()).as_bytes());
+    assert_eq!(kept_request(&steps)["LfsDigest"], json!(digest));
+    assert!(!outcome.stderr.contains("toolchain mismatch"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("parity"), "{outcome:?}");
 }
 
 /// A put of the LFS objects says it as it starts, once, before the end line that counts them.

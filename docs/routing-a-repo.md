@@ -167,7 +167,7 @@ A build whose outputs are launched on the PC and that is not opted in stays off 
 
 The words a macOS builder is sent are spelled for the Mac: the recognised paths use `/`, and a relative word written with `\` (`src\Duel.sln`) is sent with `/` when the snapshot carries that file or folder, in its exact letter case.
 
-A macOS builder takes no LFS content: a run whose snapshot holds LFS pointers is refused `parity` there by the PC before any call, saying `gate: remote toolchain mismatch: <repo> holds LFS pointers; <host> is a macOS builder, which takes no LFS content`, and the next builder gets it: a Windows builder when one matches, else the run runs here, and a run pinned to the Mac with `--builder` ends failed.
+A macOS builder takes LFS content like a Windows one: a run whose snapshot holds LFS pointers goes there when it is the first pick, with the same objects sent and checked out.
 
 A word that still holds a `\` (a regex, a list, script text after `bash -c` or `pwsh -Command`, a path the repo does not carry) keeps the command off the Mac: it runs on a Windows builder or here, silently. A Windows builder is sent the words as written. Details: [design.md, Routing](design.md#routing).
 
@@ -404,7 +404,7 @@ The engine is not in the worktree and not on the builder's `PATH`: the builder h
 - **What stays local:** commandlets that write into ignored content, a packaged-game run that needs a GPU when the builder has none, and the editor.
 - **Git LFS.** A repo with LFS-tracked files routes with them: the PC sends the objects the snapshot's pointers name to the builder's per-repo LFS store, and the box checks them out with no download.
 
-  Only a Windows builder takes LFS content: a macOS builder is skipped with `parity` and the run goes to the next builder.
+  A Windows and a macOS builder both take LFS content.
 
   The builder needs git-lfs 3.1.3 or later whenever a tracked `.gitattributes` names the LFS filter (a builder without it keeps the run here, `parity`), and the PC must hold the objects: run `git lfs fetch` first, else the run falls back `lfs` with a log line naming the missing object. See [design.md, Routing](design.md#routing) (Git LFS).
 

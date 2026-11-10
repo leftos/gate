@@ -239,7 +239,7 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | remote/inputs.rs | `-E 'binary(suite) and test(/^(remote_inputs\|remote_client\|routing\|checkout)::/) or (U and test(/^remote::/))'`; add `boxside::inputs` for a change to the request or the diff and put lines the box reads |
 | suite module `remote_inputs` (tests/suite/remote_inputs.rs) | `-E 'binary(suite) and test(/^(remote_inputs\|checkout)::/)'`; its machine-alone case is `#[ignore]`, run with `--run-ignored only` and `-Slot critical -Reason "<why>"` |
 | remote/lfs.rs (the pure LFS logic it once held is `gate-inputs`'s `lfs`: the gate-inputs `lfs` row) | `-E 'binary(suite) and test(/^(remote_lfs\|remote_client\|routing\|check\|checkout)::/) or (U and test(/^remote::/))'`; add `boxside::lfs` for a change to the request or the diff and put lines the box reads |
-| suite module `remote_lfs` (tests/suite/remote_lfs.rs; `a_macos_first_builder_is_refused_parity_before_any_call_and_the_next_builder_runs_the_lfs_run` pins the macOS `parity` refusal) | `-E 'binary(suite) and test(/^(remote_lfs\|checkout)::/)'` |
+| suite module `remote_lfs` (tests/suite/remote_lfs.rs; `an_lfs_run_whose_first_pick_is_the_macos_builder_sends_its_preflight_there` pins that the Mac is tried first) | `-E 'binary(suite) and test(/^(remote_lfs\|checkout)::/)'` |
 | remote/toolchain.rs | `-E 'binary(suite) and test(/^(check\|remote_client)::/) or (U and test(/^(remote::toolchain\|check)::/))'` |
 | remote/siblings.rs | `-E 'binary(suite) and test(/^routing::/) or (U and test(/^(remote::siblings\|route)::/))'` |
 | test_support.rs | `-E 'U and test(/^(route\|outputs::archive)::/)'` |
