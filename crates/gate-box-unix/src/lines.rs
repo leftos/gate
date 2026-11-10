@@ -313,6 +313,26 @@ pub fn lfs_store_flaw(flaw: OwnerFlaw, path: &str, user: &str) -> String {
     }
 }
 
+/// The line after a run's `lfs` refusal tag when its LFS content is not what the snapshot of the work folder `key`
+/// needs, for `why`, as the Windows box says it: `gate: remote lfs of work folder <key> is not the snapshot's: <why>`
+/// ([`gate_wire::LFS_NOT_THE_SNAPSHOTS_START`]).
+#[must_use]
+pub fn lfs_not_the_snapshots(key: &str, why: &str) -> String {
+    format!(
+        "{}{key}{}{}",
+        gate_wire::LFS_NOT_THE_SNAPSHOTS_START,
+        gate_wire::LFS_NOT_THE_SNAPSHOTS,
+        escaped(why)
+    )
+}
+
+/// The line after a run's `lfs` refusal tag when its LFS scratch folder could not be made, for `why`, as the Windows
+/// box says it ([`gate_wire::LFS_NO_SCRATCH`]).
+#[must_use]
+pub fn lfs_no_scratch(why: &str) -> String {
+    format!("{}{}", gate_wire::LFS_NO_SCRATCH, escaped(why))
+}
+
 /// `gate: remote could not create the folder <path>: <why>`, both escaped.
 #[must_use]
 pub fn folder_failure(path: &str, why: &str) -> String {

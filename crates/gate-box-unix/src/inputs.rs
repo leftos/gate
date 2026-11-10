@@ -955,17 +955,26 @@ fn made_stage(asked: &Asked<'_>, now: SystemTime, console: &mut Console) -> Resu
 
 /// [`made_stage`], the stage made in the stages folder `{root}/{folder}` rather than `inputs-stage`, swept the same way.
 pub(crate) fn made_stage_in(asked: &Asked<'_>, folder: &str, now: SystemTime, console: &mut Console) -> Result<Stage, String> {
-    let root = Folder::open_root(Path::new(&asked.root)).map_err(|error| format!("cannot open {}: {error}", asked.root))?;
-    let stages_path = Path::new(&asked.root).join(folder);
-    let stages = match root.make_child(OsStr::new(folder)) {
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => root.open_private_child(OsStr::new(folder)),
+    let name = format!("{}-{}", asked.key, asked.nonce);
+    made_stage_named((&asked.root, folder), &name, now, &mut |line| console.err(line))
+}
+
+/// [`made_stage_in`], the stage named `name` in the stages folder `{root}/{folder}` of the work root `root`:
+/// `{key}-{nonce}`, or a run's LFS scratch folder's `{key}-{nonce}-{random}` ([`STAGE_SUFFIX_DIGITS`]), swept the
+/// same way.
+/// Each line of the sweep is said through `say`.
+pub(crate) fn made_stage_named((root, folder): (&str, &str), name: &str, now: SystemTime, say: &mut dyn FnMut(&str)) -> Result<Stage, String> {
+    let held_root = Folder::open_root(Path::new(root)).map_err(|error| format!("cannot open {root}: {error}"))?;
+    let stages_path = Path::new(root).join(folder);
+    let stages = match held_root.make_child(OsStr::new(folder)) {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => held_root.open_private_child(OsStr::new(folder)),
         made => made,
     }
     .map_err(|error| stages_refusal(&stages_path, &error))?;
     for line in pruned(&stages, &stages_path, now) {
-        console.err(&line);
+        say(&line);
     }
-    let name = format!("{}-{}", asked.key, asked.nonce);
+    let name = name.to_owned();
     let path = stages_path.join(&name);
     let cannot = |error: io::Error| format!("cannot make the stage {}: {error}", path.display());
     let lock = stages.create_file(OsStr::new(&lock_name(&name))).map_err(cannot)?;
@@ -1133,11 +1142,16 @@ fn old_lock(stages: &Folder, lock: &str, now: SystemTime) -> Result<Option<OldLo
     }
 }
 
-/// Whether `name` is a stage's name: `{key}-{nonce}`, a key and an outputs nonce of lower-case hex.
+/// Whether `name` is a stage's name: `{key}-{nonce}`, a key and an outputs nonce of lower-case hex, or a run's LFS
+/// scratch folder's `{key}-{nonce}-{random}`, the random suffix [`STAGE_SUFFIX_DIGITS`] lower-case hex digits.
 fn is_stage_name(name: &str) -> bool {
-    name.rsplit_once('-')
-        .is_some_and(|(key, nonce)| !key.is_empty() && is_lower_hex(nonce, OUTPUTS_NONCE_DIGITS))
+    name.rsplit_once('-').is_some_and(|(rest, last)| {
+        (!rest.is_empty() && is_lower_hex(last, OUTPUTS_NONCE_DIGITS)) || (is_lower_hex(last, STAGE_SUFFIX_DIGITS) && is_stage_name(rest))
+    })
 }
+
+/// The lower-case hex digits of the random suffix a run's LFS scratch folder's name ends with: a 64-bit value.
+pub(crate) const STAGE_SUFFIX_DIGITS: usize = 16;
 
 /// The Unix box's [`Place`]: each member and copy written into the held stage `stage`, at `path`, as a new 0600 file
 /// beneath the folders it makes there, which `budget` counts, and stamped with its last write; `left` holds what each

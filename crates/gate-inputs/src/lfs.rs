@@ -521,6 +521,25 @@ pub fn no_storage(lock: &str) -> String {
     format!("lfs.storage={lock}{}lfs", std::path::MAIN_SEPARATOR)
 }
 
+/// What a run with no scratch folder says when its back commit's `add -A` fails and its tree's attributes name the LFS
+/// filter: a git-lfs clean found no storage it could make ([`no_storage`]). Both boxes say it.
+pub const NO_STORAGE_ADD: &str =
+    "the command added a file under the LFS filter, which a run without LFS content cannot bring back; run it with --local";
+
+/// What a run with no scratch folder says when a checkout fails and its tree's attributes name the LFS filter: a
+/// git-lfs smudge found no storage it could make ([`no_storage`]), for a file the snapshot's listing did not see. Both
+/// boxes say it.
+pub const NO_STORAGE_CHECKOUT: &str =
+    "a file under the LFS filter was found that the run's snapshot does not declare in a tracked .gitattributes; run it with --local";
+
+/// The most bytes of standard output a run's LFS post-check may let its quiet re-checkout of the files still wrong
+/// print. Both boxes allow it.
+pub const RECHECKOUT_OUTPUT: usize = 64 * 1024;
+
+/// The pathspec of every `.gitattributes` file at any depth, whatever the case of its name (NTFS opens a file named
+/// `.GitAttributes` as a folder's attributes file), which both boxes grep for the LFS filter.
+pub const ATTRIBUTES_FILES: &str = ":(glob,icase)**/.gitattributes";
+
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test that cannot make its fixture must fail loudly")]
 mod tests {

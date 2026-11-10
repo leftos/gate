@@ -28,8 +28,10 @@ mod unix {
     use base64::engine::general_purpose::STANDARD;
     use gate_inputs::archive::{UnpackError, read_members};
     use gate_inputs::hash::sha256_of;
+    use gate_inputs::lfs::{NO_STORAGE_ADD, NO_STORAGE_CHECKOUT};
     use gate_inputs::manifest::{Held, Manifest, Stamp, Wrote, read_sent};
     use gate_inputs::pack::Packer;
+    use gate_wire::LFS_NO_SCRATCH;
     use gate_wire::stamp::{Tag, unstamped};
     use gate_wire::{BACK_COMMIT_NONE, BoxKill, Refusal, adjusted_prefix, busy_line, escaped, killed_line, refused_line, started_line};
     use serde_json::{Value, json};
@@ -109,12 +111,7 @@ mod unix {
             let source = source.to_str().expect("the temp folder is UTF-8");
             git(&["init", "-q", source]);
             fs::write(Path::new(source).join("a.txt"), "a\n").expect("the file is written");
-            for (name, text) in files {
-                let path = Path::new(source).join(name);
-                fs::create_dir_all(path.parent().expect("a file has a folder")).expect("the file's folder is made");
-                fs::write(path, text).expect("the file is written");
-            }
-            git(&["-C", source, "add", "-A"]);
+            written_raw(source, files);
             git(&[
                 "-C",
                 source,
@@ -191,13 +188,18 @@ mod unix {
         /// The keys of a pair of the leaf `repo` and the sibling `lib`, whose bare repository `<root>/lib.git` is made
         /// holding a commit of `b.txt`, pushed as `refs/gate/<key>`.
         fn pair_with_lib(&self) -> Value {
+            self.pair_with_lib_holding(&[])
+        }
+
+        /// [`Case::pair_with_lib`], the sibling's commit also holding `files`, each a path and its text.
+        fn pair_with_lib_holding(&self, files: &[(&str, &str)]) -> Value {
             let lib_bare = format!("{}/lib.git", self.root());
             git(&["init", "--bare", "-q", &lib_bare]);
             let lib_source = self.base.join("lib-source");
             let lib_source = lib_source.to_str().expect("the temp folder is UTF-8");
             git(&["init", "-q", lib_source]);
             fs::write(Path::new(lib_source).join("b.txt"), "b\n").expect("the sibling's file is written");
-            git(&["-C", lib_source, "add", "-A"]);
+            written_raw(lib_source, files);
             git(&[
                 "-C",
                 lib_source,
@@ -256,6 +258,491 @@ mod unix {
             // Best effort: a folder left behind is in the temp folder and named for this process.
             let _ = fs::remove_dir_all(&self.base);
         }
+    }
+
+    /// Writes `files`, each a path and its text, into the repository `source` and adds every file, each as its own
+    /// bytes: the repository's own attributes, which outrank every `.gitattributes`, unset every filter, so an LFS
+    /// pointer is committed as its text whatever filter the builder's config names.
+    fn written_raw(source: &str, files: &[(&str, &str)]) {
+        for (name, text) in files {
+            let path = Path::new(source).join(name);
+            fs::create_dir_all(path.parent().expect("a file has a folder")).expect("the file's folder is made");
+            fs::write(path, text).expect("the file is written");
+        }
+        let info = Path::new(source).join(".git/info");
+        fs::create_dir_all(&info).expect("the repository's info folder is made");
+        fs::write(info.join("attributes"), "* -filter\n").expect("the repository's attributes are written");
+        git(&["-C", source, "add", "-A"]);
+    }
+
+    /// The attributes of a repo whose `.bin` files are LFS content.
+    const LFS_ATTRIBUTES: &str = "*.bin filter=lfs diff=lfs merge=lfs -text\n";
+    /// The content of the main repo's LFS file.
+    const LFS_CONTENT: &[u8] = b"the real LFS content\n";
+    /// The content of the sibling's LFS file.
+    const LIB_CONTENT: &[u8] = b"the sibling's LFS content\n";
+
+    /// The spec-v1 pointer text of the LFS object `content`, and its oid.
+    fn pointer_of(content: &[u8]) -> (String, String) {
+        let (oid, _) = sha256_of(content).expect("the content is hashed");
+        let text = format!("version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {}\n", content.len());
+        (text, oid)
+    }
+
+    /// The `LfsDigest` of a snapshot whose pointers name `contents`, in order: the SHA-256 of its manifest line.
+    fn lfs_digest_of(contents: &[&[u8]]) -> String {
+        let entries: Vec<String> = contents
+            .iter()
+            .map(|content| format!("{} {}", pointer_of(content).1, content.len()))
+            .collect();
+        sha256_of(entries.join(" ").as_bytes()).expect("the manifest is hashed").0
+    }
+
+    /// The object `content` put into the LFS store of the bare repository `bare` as a put leaves it:
+    /// `lfs/objects/<aa>/<bb>/<oid>`, folders 0700 and the object 0600.
+    fn stored(bare: &str, content: &[u8]) {
+        let (_, oid) = pointer_of(content);
+        let folder = format!("{bare}/lfs/objects/{}/{}", &oid[..2], &oid[2..4]);
+        std::os::unix::fs::DirBuilderExt::mode(fs::DirBuilder::new().recursive(true), 0o700)
+            .create(&folder)
+            .expect("the store's folders are made");
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(format!("{folder}/{oid}"))
+            .and_then(|mut file| file.write_all(content))
+            .expect("the object is stored");
+    }
+
+    /// A case's snapshot holding `big.bin` as the LFS pointer of [`LFS_CONTENT`] under [`LFS_ATTRIBUTES`].
+    fn lfs_snapshot(case: &Case) -> String {
+        let (pointer, _) = pointer_of(LFS_CONTENT);
+        case.snapshot_holding(&[(".gitattributes", LFS_ATTRIBUTES), ("big.bin", &pointer)])
+    }
+
+    /// The names left in the work root's `lfs-run`, where each run makes its scratch folder; none when no run made it.
+    fn scratch_left(case: &Case) -> Vec<String> {
+        match fs::read_dir(format!("{}/lfs-run", case.root())) {
+            Ok(entries) => entries
+                .map(|entry| entry.expect("an lfs-run entry is read").file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "lfs-run cannot be read: {error}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// The mode bits and link count of the object `content` in the store of the bare repository `bare`.
+    fn stored_mode(bare: &str, content: &[u8]) -> (u32, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let (_, oid) = pointer_of(content);
+        let meta = fs::symlink_metadata(format!("{bare}/lfs/objects/{}/{}/{oid}", &oid[..2], &oid[2..4])).expect("the object is there");
+        (meta.mode() & 0o7777, meta.nlink())
+    }
+
+    /// A run of `case` checking out `commit` with `extra` keys, read to its end.
+    fn lfs_ran(case: &Case, commit: &str, extra: &Value) -> Ended {
+        ran(&[], &case.request(commit, extra), Reading::All, &case.base.join("beaten"))
+    }
+
+    /// The case's run was refused `lfs` before its command, saying `why` of the work folder's LFS content.
+    fn refused_lfs(case: &Case, ended: &Ended, why: &str) {
+        assert_eq!(ended.status, Some(75), "{:?}", ended.err);
+        assert!(ended.err_has(&refused_line(NONCE, Refusal::Lfs)), "the lfs tag: {:?}", ended.err);
+        let line = format!("gate: remote lfs of work folder {KEY} is not the snapshot's: {why}");
+        assert!(ended.err_texts().contains(&line.as_str()), "{line}: {:?}", ended.err);
+        assert!(!ended.err_has(&started_line(NONCE)), "no command started: {:?}", ended.err);
+        assert!(scratch_left(case).is_empty(), "no scratch folder is left: {:?}", scratch_left(case));
+        case.ended_clean();
+    }
+
+    #[test]
+    fn a_run_whose_digest_the_store_covers_checks_out_its_lfs_content() {
+        let case = Case::new("lfs-covered");
+        let commit = lfs_snapshot(&case);
+        stored(&case.bare(), LFS_CONTENT);
+        let command = json!(["/bin/sh", "-c", "cat big.bin; shasum -a 256 big.bin | cut -d ' ' -f 1"]);
+        let extra = json!({ "Command": command, "LfsDigest": lfs_digest_of(&[LFS_CONTENT]) });
+        let ended = lfs_ran(&case, &commit, &extra);
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        let (_, oid) = pointer_of(LFS_CONTENT);
+        assert_eq!(
+            texts(&ended.out),
+            ["the real LFS content", oid.as_str()],
+            "the command read the object's bytes"
+        );
+        assert_eq!(scratch_left(&case), Vec::<String>::new(), "the scratch folder is gone after the run");
+        assert_eq!(case.back(), None, "the checked-out content is the snapshot's: no back commit");
+        // git-lfs links the store's object into the scratch folder; the store keeps it as a put left it.
+        assert_eq!(stored_mode(&case.bare(), LFS_CONTENT), (0o600, 1), "the store's object is untouched");
+        case.ended_clean();
+    }
+
+    #[test]
+    fn a_run_whose_digest_is_not_the_snapshot_s_is_refused_lfs() {
+        let case = Case::new("lfs-other-digest");
+        let commit = lfs_snapshot(&case);
+        stored(&case.bare(), LFS_CONTENT);
+        let sent = lfs_digest_of(&[b"other content\n"]);
+        let ended = lfs_ran(&case, &commit, &json!({ "LfsDigest": sent }));
+        let digest = lfs_digest_of(&[LFS_CONTENT]);
+        refused_lfs(
+            &case,
+            &ended,
+            &format!("the snapshot's LFS manifest has the digest {digest}, not the run's {sent}"),
+        );
+    }
+
+    #[test]
+    fn a_run_with_a_digest_and_no_pointer_in_its_snapshot_is_refused_lfs() {
+        let case = Case::new("lfs-no-pointer");
+        let commit = case.snapshot();
+        let ended = lfs_ran(&case, &commit, &json!({ "LfsDigest": lfs_digest_of(&[LFS_CONTENT]) }));
+        refused_lfs(&case, &ended, "the run sent an LfsDigest, and its snapshot holds no LFS pointer");
+    }
+
+    #[test]
+    fn a_run_whose_store_lacks_an_object_is_refused_lfs() {
+        let case = Case::new("lfs-lacking");
+        let commit = lfs_snapshot(&case);
+        let ended = lfs_ran(&case, &commit, &json!({ "LfsDigest": lfs_digest_of(&[LFS_CONTENT]) }));
+        let (_, oid) = pointer_of(LFS_CONTENT);
+        refused_lfs(&case, &ended, &format!("the LFS store holds no object {oid} for big.bin"));
+    }
+
+    /// A case's snapshot whose tracked attributes name the filter over `raw.bin`, committed as its own bytes: no
+    /// pointer, so the PC sends no digest.
+    fn raw_snapshot(case: &Case) -> String {
+        case.snapshot_holding(&[(".gitattributes", LFS_ATTRIBUTES), ("raw.bin", "raw bytes\n")])
+    }
+
+    /// As the Windows box's `lfs_scratch`: a repo with no digest whose snapshot names the filter gets a scratch folder
+    /// of its own, so a file committed as its own bytes under the filter checks out as those bytes.
+    #[test]
+    fn a_run_with_no_digest_over_a_snapshot_naming_the_filter_checks_out_its_raw_bytes() {
+        let case = Case::new("lfs-raw");
+        let commit = raw_snapshot(&case);
+        let script = format!("cat raw.bin; ls {}/lfs-run", case.root());
+        let ended = lfs_ran(&case, &commit, &json!({ "Command": ["/bin/sh", "-c", script] }));
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        let out = texts(&ended.out);
+        assert_eq!(out.first(), Some(&"raw bytes"), "the file's own bytes: {out:?}");
+        // The repo's own scratch folder, there while the command runs, and its lock.
+        assert_eq!(out.len(), 3, "one scratch folder and its lock: {out:?}");
+        let (folder, lock) = (out[1], out[2]);
+        let suffix = folder.strip_prefix(&format!("{KEY}-{NONCE}-")).unwrap_or_default();
+        assert!(
+            suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{folder} ends in 16 hex digits"
+        );
+        assert_eq!(lock, format!("{folder}.lock"), "the folder's lock");
+        assert_eq!(scratch_left(&case), Vec::<String>::new(), "the scratch folder is gone after the run");
+        case.ended_clean();
+    }
+
+    /// A no-digest sibling whose snapshot names the filter is judged by its own snapshot: it gets a scratch folder of
+    /// its own, and a file the command adds under its filter comes back in its back commit as a pointer.
+    #[test]
+    fn a_no_digest_sibling_naming_the_filter_brings_a_new_file_back_as_a_pointer() {
+        let case = Case::new("lfs-pair-declared");
+        let commit = lfs_snapshot(&case);
+        stored(&case.bare(), LFS_CONTENT);
+        let mut extra = case.pair_with_lib_holding(&[(".gitattributes", LFS_ATTRIBUTES), ("raw.bin", "raw bytes\n")]);
+        extra["LfsDigest"] = json!(lfs_digest_of(&[LFS_CONTENT]));
+        extra["Command"] = json!(["/bin/sh", "-c", "printf 'new content\\n' > ../lib/new.bin"]);
+        let ended = lfs_ran(&case, &commit, &extra);
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        let lib = format!("--git-dir={}/lib.git", case.root());
+        let (pointer, _) = pointer_of(b"new content\n");
+        assert_eq!(
+            git(&[&lib, "show", &format!("refs/gate-back/{KEY}:new.bin")]),
+            pointer.trim_end(),
+            "the sibling's back commit holds its pointer"
+        );
+        assert_eq!(scratch_left(&case), Vec::<String>::new(), "each scratch folder is gone after the run");
+        case.ended_clean();
+    }
+
+    /// A file the command adds under the snapshot's filter is cleaned into the repo's scratch folder and comes back
+    /// in the back commit as its pointer, as on the Windows box.
+    #[test]
+    fn a_run_with_no_digest_over_a_snapshot_naming_the_filter_brings_a_new_file_back_as_a_pointer() {
+        let case = Case::new("lfs-raw-new");
+        let commit = raw_snapshot(&case);
+        let command = json!(["/bin/sh", "-c", "printf 'new content\\n' > new.bin"]);
+        let ended = lfs_ran(&case, &commit, &json!({ "Command": command }));
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        let back = case.back().expect("a back commit is pushed");
+        let (pointer, _) = pointer_of(b"new content\n");
+        assert_eq!(
+            git(&[&case.bare_dir(), "show", &format!("{back}:new.bin")]),
+            pointer.trim_end(),
+            "its pointer"
+        );
+        assert_eq!(scratch_left(&case), Vec::<String>::new(), "the scratch folder is gone after the run");
+        case.ended_clean();
+    }
+
+    /// A file under attributes the snapshot does not hold, an untracked `.gitattributes` left in the work folder, finds
+    /// no storage it can make: the checkout fails closed with the Windows box's line, though the store holds the object.
+    #[test]
+    fn a_run_with_no_digest_over_untracked_attributes_naming_the_filter_fails_closed() {
+        let case = Case::new("lfs-untracked");
+        let first = case.snapshot();
+        let ended = lfs_ran(&case, &first, &json!({}));
+        assert_eq!(ended.status, Some(0), "the work folder is made: {:?}", ended.err);
+        let (pointer, _) = pointer_of(LFS_CONTENT);
+        let commit = case.snapshot_holding(&[("big.bin", &pointer)]);
+        // Stored, so only the storage the run pins can fail the smudge.
+        stored(&case.bare(), LFS_CONTENT);
+        fs::write(format!("{}/.gitattributes", case.work()), LFS_ATTRIBUTES).expect("the untracked attributes are planted");
+        let ended = lfs_ran(&case, &commit, &json!({}));
+        assert_eq!(ended.status, Some(128), "{:?}", ended.err);
+        let line = format!("gate: remote checkout failed: {NO_STORAGE_CHECKOUT}");
+        assert!(ended.err_texts().contains(&line.as_str()), "{line}: {:?}", ended.err);
+        assert!(!ended.err_has(&started_line(NONCE)), "no command started: {:?}", ended.err);
+        assert!(
+            !Path::new(&format!("{}/.git/lfs/objects", case.work())).exists(),
+            "no LFS storage made in the work folder"
+        );
+        assert_eq!(
+            scratch_left(&case),
+            Vec::<String>::new(),
+            "the snapshot names no filter: no scratch folder"
+        );
+        case.ended_clean();
+    }
+
+    /// A scratch folder that cannot be made, `lfs-run` being a plain file, refuses the run `lfs` with the Windows box's
+    /// line.
+    #[test]
+    fn a_run_whose_scratch_folder_cannot_be_made_is_refused_lfs() {
+        let case = Case::new("lfs-no-scratch");
+        let commit = lfs_snapshot(&case);
+        stored(&case.bare(), LFS_CONTENT);
+        fs::write(format!("{}/lfs-run", case.root()), "").expect("a file is planted at lfs-run");
+        let ended = lfs_ran(&case, &commit, &json!({ "LfsDigest": lfs_digest_of(&[LFS_CONTENT]) }));
+        refused_no_scratch(&case, &ended);
+    }
+
+    /// A repo with no digest whose snapshot names the filter is refused as a covered one when its scratch folder cannot
+    /// be made.
+    #[test]
+    fn a_no_digest_run_whose_scratch_folder_cannot_be_made_is_refused_lfs() {
+        let case = Case::new("lfs-raw-no-scratch");
+        let commit = raw_snapshot(&case);
+        fs::write(format!("{}/lfs-run", case.root()), "").expect("a file is planted at lfs-run");
+        let ended = lfs_ran(&case, &commit, &json!({}));
+        refused_no_scratch(&case, &ended);
+    }
+
+    /// The case's run was refused `lfs` before its command, its scratch folder not made over the plain file `lfs-run`.
+    fn refused_no_scratch(case: &Case, ended: &Ended) {
+        assert_eq!(ended.status, Some(75), "{:?}", ended.err);
+        assert!(ended.err_has(&refused_line(NONCE, Refusal::Lfs)), "the lfs tag: {:?}", ended.err);
+        let line = format!("{LFS_NO_SCRATCH}{}/lfs-run is a link or not a folder", case.root());
+        assert!(ended.err_texts().contains(&line.as_str()), "{line}: {:?}", ended.err);
+        assert!(!ended.err_has(&started_line(NONCE)), "no command started: {:?}", ended.err);
+        case.ended_clean();
+    }
+
+    /// The pair's main repo covered; its sibling's case with `files` in its snapshot and `digest` sent for it.
+    fn sibling_ran(case: &Case, files: &[(&str, &str)], digest: &str) -> Ended {
+        let commit = lfs_snapshot(case);
+        stored(&case.bare(), LFS_CONTENT);
+        let mut extra = case.pair_with_lib_holding(files);
+        extra["LfsDigest"] = json!(lfs_digest_of(&[LFS_CONTENT]));
+        extra["SiblingLfsDigests"] = json!({ "lib": digest });
+        lfs_ran(case, &commit, &extra)
+    }
+
+    /// A sibling whose digest is not its snapshot's is refused, its name before the reason.
+    #[test]
+    fn a_sibling_whose_digest_is_not_its_snapshot_s_is_refused_lfs_by_name() {
+        let case = Case::new("lfs-sibling-digest");
+        let (lib_pointer, _) = pointer_of(LIB_CONTENT);
+        let sent = lfs_digest_of(&[b"other content\n"]);
+        let ended = sibling_ran(&case, &[(".gitattributes", LFS_ATTRIBUTES), ("lib.bin", &lib_pointer)], &sent);
+        let digest = lfs_digest_of(&[LIB_CONTENT]);
+        refused_lfs(
+            &case,
+            &ended,
+            &format!("lib: the snapshot's LFS manifest has the digest {digest}, not the run's {sent}"),
+        );
+    }
+
+    /// A sibling sent a digest over a snapshot with no pointer is refused naming the key it came in.
+    #[test]
+    fn a_sibling_digest_over_a_snapshot_with_no_pointer_is_refused_lfs() {
+        let case = Case::new("lfs-sibling-none");
+        let ended = sibling_ran(&case, &[], &lfs_digest_of(&[LIB_CONTENT]));
+        refused_lfs(
+            &case,
+            &ended,
+            "lib: the run sent a SiblingLfsDigests entry, and its snapshot holds no LFS pointer",
+        );
+    }
+
+    /// A command that adds a file under attributes of its own, with no scratch folder, fails its sync-back with the
+    /// Windows box's line.
+    #[test]
+    fn a_file_added_under_untracked_attributes_with_no_scratch_fails_the_sync_back() {
+        let case = Case::new("lfs-no-storage-add");
+        let commit = case.snapshot();
+        let script = format!("printf '{}' > .gitattributes; printf 'new\\n' > new.bin", LFS_ATTRIBUTES.trim_end());
+        let ended = lfs_ran(&case, &commit, &json!({ "Command": ["/bin/sh", "-c", script] }));
+        // A command that exited 0 whose sync-back failed ends 1, as on the Windows box.
+        assert_eq!(ended.status, Some(1), "{:?}", ended.err);
+        let line = format!("gate: remote sync-back failed: {NO_STORAGE_ADD}");
+        assert!(ended.err_texts().contains(&line.as_str()), "{line}: {:?}", ended.err);
+        assert_eq!(case.back(), None, "nothing is brought back");
+        case.ended_clean();
+    }
+
+    /// A store folder above the object open to others is refused, not followed, though the object is there.
+    #[test]
+    fn a_run_whose_store_folder_is_open_to_others_is_refused_lfs() {
+        use std::os::unix::fs::PermissionsExt;
+        let case = Case::new("lfs-open-folder");
+        let commit = lfs_snapshot(&case);
+        stored(&case.bare(), LFS_CONTENT);
+        let (_, oid) = pointer_of(LFS_CONTENT);
+        let folder = format!("{}/lfs/objects/{}", case.bare(), &oid[..2]);
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o770)).expect("the folder is opened to the group");
+        let ended = lfs_ran(&case, &commit, &json!({ "LfsDigest": lfs_digest_of(&[LFS_CONTENT]) }));
+        refused_lfs(&case, &ended, &format!("{folder} is open to others"));
+    }
+
+    /// An object held wrongly, open to others, is not the object: the run is refused as for a missing one.
+    #[test]
+    fn a_run_whose_store_object_is_held_wrongly_is_refused_lfs() {
+        use std::os::unix::fs::PermissionsExt;
+        let case = Case::new("lfs-wrong-mode");
+        let commit = lfs_snapshot(&case);
+        stored(&case.bare(), LFS_CONTENT);
+        let (_, oid) = pointer_of(LFS_CONTENT);
+        let object = format!("{}/lfs/objects/{}/{}/{oid}", case.bare(), &oid[..2], &oid[2..4]);
+        fs::set_permissions(&object, fs::Permissions::from_mode(0o644)).expect("the object's mode is changed");
+        let ended = lfs_ran(&case, &commit, &json!({ "LfsDigest": lfs_digest_of(&[LFS_CONTENT]) }));
+        refused_lfs(&case, &ended, &format!("the LFS store holds no object {oid} for big.bin"));
+    }
+
+    /// A snapshot whose tree names a path that is not UTF-8, made with git's plumbing, so no file system has to hold it:
+    /// the listing cannot read it and fails the run with the Windows box's line.
+    #[test]
+    fn a_run_whose_snapshot_cannot_be_listed_fails_the_lfs_listing() {
+        let case = Case::new("lfs-listing-failed");
+        // The listing reads blobs only where a `.gitattributes` is in the tree.
+        let script = "id=$(printf 'x\\n' | git hash-object -w --stdin) && \
+             attrs=$(printf '*.bin filter=lfs\\n' | git hash-object -w --stdin) && \
+             tree=$(printf '100644 blob %s\\t\\377.bin\\n100644 blob %s\\t.gitattributes\\n' \"$id\" \"$attrs\" | git mktree) && \
+             commit=$(git -c user.name=gate -c user.email=gate@example.com commit-tree -m snapshot \"$tree\") && \
+             git update-ref refs/gate/\"$1\" \"$commit\" && echo \"$commit\"";
+        let made = Command::new("/bin/sh")
+            .args(["-c", script, "sh", KEY])
+            .env("GIT_DIR", case.bare())
+            .stdin(Stdio::null())
+            .output()
+            .expect("sh starts");
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+        let commit = String::from_utf8_lossy(&made.stdout).trim().to_owned();
+        let ended = lfs_ran(&case, &commit, &json!({ "LfsDigest": lfs_digest_of(&[LFS_CONTENT]) }));
+        assert_eq!(ended.status, Some(1), "{:?}", ended.err);
+        let prefix = "gate: remote lfs listing failed: the tree holds a path that is not UTF-8: ";
+        assert!(ended.err_texts().iter().any(|line| line.starts_with(prefix)), "{prefix}: {:?}", ended.err);
+        assert!(!ended.err_has(&started_line(NONCE)), "no command started: {:?}", ended.err);
+        assert!(scratch_left(&case).is_empty(), "no scratch folder is left");
+        case.ended_clean();
+    }
+
+    /// A `GIT_LFS_*` variable in the box's own environment reaches no git step: the checkout still smudges.
+    #[test]
+    fn a_covered_run_ignores_a_git_lfs_variable_in_the_box_s_environment() {
+        let case = Case::new("lfs-scrubbed");
+        let commit = lfs_snapshot(&case);
+        stored(&case.bare(), LFS_CONTENT);
+        let extra = json!({ "Command": ["/bin/cat", "big.bin"], "LfsDigest": lfs_digest_of(&[LFS_CONTENT]) });
+        let request = case.request(&commit, &extra);
+        let env = [("GIT_LFS_SKIP_SMUDGE", "1")];
+        let ended = ran_in_env(&[], &request, Reading::All, &case.base.join("beaten"), None, &env);
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(texts(&ended.out), ["the real LFS content"], "the content, not its pointer");
+        case.ended_clean();
+    }
+
+    /// The command of a covered run, `perl` trying the store's lock exclusively, without waiting.
+    fn store_lock_tried(case: &Case) -> Value {
+        let perl = concat!(
+            "use Fcntl \":flock\"; open my $f, \"<\", shift or die; ",
+            "print flock($f, LOCK_EX|LOCK_NB) ? \"got\\n\" : \"held\\n\""
+        );
+        let script = format!("perl -e '{perl}' {}/lfs.lock", case.bare());
+        json!(["/bin/sh", "-c", script])
+    }
+
+    /// The run holds its store's lock through its command, so a deleter taking it exclusively waits, and lets it go
+    /// once the run ends.
+    #[test]
+    fn a_covered_run_holds_its_store_lock_through_its_command_and_lets_it_go_after() {
+        let case = Case::new("lfs-store-lock");
+        let commit = lfs_snapshot(&case);
+        stored(&case.bare(), LFS_CONTENT);
+        let extra = json!({ "Command": store_lock_tried(&case), "LfsDigest": lfs_digest_of(&[LFS_CONTENT]) });
+        let ended = lfs_ran(&case, &commit, &extra);
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(texts(&ended.out), ["held"], "the run holds the store's lock while its command runs");
+        let file = fs::File::open(format!("{}/lfs.lock", case.bare())).expect("the store lock opens");
+        // SAFETY: `file` is open for the call; a lock taken is let go when it closes.
+        let free = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 };
+        assert!(free, "the run let the store's lock go");
+        case.ended_clean();
+    }
+
+    /// A covered file the command rewrites is cleaned into the run's scratch folder and comes back as the pointer of
+    /// its new content, which is in neither the store nor a scratch folder left behind.
+    #[test]
+    fn a_covered_file_the_command_rewrites_comes_back_as_its_new_pointer() {
+        let case = Case::new("lfs-rewritten");
+        let commit = lfs_snapshot(&case);
+        stored(&case.bare(), LFS_CONTENT);
+        let command = json!(["/bin/sh", "-c", "printf 'rewritten content\\n' > big.bin"]);
+        let ended = lfs_ran(&case, &commit, &json!({ "Command": command, "LfsDigest": lfs_digest_of(&[LFS_CONTENT]) }));
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        let back = case.back().expect("a back commit is pushed");
+        let (pointer, oid) = pointer_of(b"rewritten content\n");
+        assert_eq!(
+            git(&[&case.bare_dir(), "show", &format!("{back}:big.bin")]),
+            pointer.trim_end(),
+            "its new pointer"
+        );
+        assert_eq!(scratch_left(&case), Vec::<String>::new(), "the scratch folder is gone after the run");
+        let object = format!("{}/lfs/objects/{}/{}/{oid}", case.bare(), &oid[..2], &oid[2..4]);
+        assert!(!Path::new(&object).exists(), "the new object is not put into the store");
+        case.ended_clean();
+    }
+
+    #[test]
+    fn a_sibling_pair_s_run_checks_out_both_repos_lfs_content() {
+        let case = Case::new("lfs-pair");
+        let commit = lfs_snapshot(&case);
+        stored(&case.bare(), LFS_CONTENT);
+        let (lib_pointer, _) = pointer_of(LIB_CONTENT);
+        let mut extra = case.pair_with_lib_holding(&[(".gitattributes", LFS_ATTRIBUTES), ("lib.bin", &lib_pointer)]);
+        stored(&format!("{}/lib.git", case.root()), LIB_CONTENT);
+        extra["Command"] = json!(["/bin/sh", "-c", "cat big.bin ../lib/lib.bin"]);
+        extra["LfsDigest"] = json!(lfs_digest_of(&[LFS_CONTENT]));
+        extra["SiblingLfsDigests"] = json!({ "lib": lfs_digest_of(&[LIB_CONTENT]) });
+        let ended = lfs_ran(&case, &commit, &extra);
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(
+            texts(&ended.out),
+            ["the real LFS content", "the sibling's LFS content"],
+            "both repos' content checked out"
+        );
+        assert_eq!(scratch_left(&case), Vec::<String>::new(), "each scratch folder is gone after the run");
+        case.ended_clean();
     }
 
     /// How a case reads the box's output.

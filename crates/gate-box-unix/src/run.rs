@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gate_args::BoxSeams;
 use gate_inputs::failure::Caps;
+use gate_inputs::lfs::{ATTRIBUTES_FILES, NO_STORAGE_CHECKOUT, RECHECKOUT_OUTPUT, pointers_of};
 use gate_inputs::manifest::{Listing, Manifest};
 use gate_wire::drain::refused_lines;
 use gate_wire::{
@@ -38,15 +39,16 @@ use crate::git::{
 };
 use crate::heartbeat::{self, Periods};
 use crate::inputs::{self, Unmatched};
+use crate::lfs::{NotCheckedOut, RunLfs, post_checked};
 use crate::lines::{
     Along, CommandEnd, FAILED_STATUS, FolderFlaw, Godot, Login, OwnerFlaw, Translation, USAGE_STATUS, WRITABLE_BY_OTHERS, command_status,
-    login_path_line, owner_flaw, recorded_group, rosetta_lines, signal_guard, translation, work_layout,
+    lfs_no_scratch, lfs_not_the_snapshots, login_path_line, owner_flaw, recorded_group, rosetta_lines, signal_guard, translation, work_layout,
 };
 use crate::outputs::{self, Asked};
 use crate::packages;
 use crate::preflight::{checked_root, layout_record};
 use crate::probe;
-use crate::process::{self, GroupRecord};
+use crate::process::{self, GroupRecord, Ran};
 use crate::slots::{self, Untaken};
 use crate::stop::{Record, own_group, record_current, records_folder, unusable_refusal};
 use crate::tools;
@@ -90,6 +92,9 @@ pub struct Repo<'p> {
     /// The PC's default branch, whose `refs/gate-base/<key>` the fetch names `refs/remotes/origin/<base>` in the tree;
     /// `None` for a repo the PC sent none of.
     pub base: Option<&'p str>,
+    /// The digest of the LFS manifest the PC sent for this repo, `LfsDigest` for the main repo and its
+    /// `SiblingLfsDigests` entry for a sibling; `None` for a repo with no LFS content.
+    pub lfs_digest: Option<&'p str>,
 }
 
 impl Repo<'_> {
@@ -111,8 +116,14 @@ impl Repo<'_> {
 /// The main repo and the siblings of a run in the work folder `work`, as the Windows box reads them: with no `Pair`, the
 /// one repo of `bare` checked out at `snapshot` in `work` itself; with one, the main repo in `<work>/<leaf>` and each
 /// sibling in `<work>/<name>` with its own bare repository and its commit from `SiblingSnapshots` ([`gate_wire::trees`]).
-/// Each repo's default branch is the main repo's `Base` or the sibling's from `SiblingBases`. Else the usage line.
-fn repos<'p>(payload: &'p Payload, work: &str, bare: &str, snapshot: &'p str) -> Result<(Repo<'p>, Vec<Repo<'p>>), String> {
+/// Each repo's default branch is the main repo's `Base` or the sibling's from `SiblingBases`, and its LFS digest the
+/// main repo's `lfs_digest` or the sibling's `SiblingLfsDigests` entry. Else the usage line.
+fn repos<'p>(
+    payload: &'p Payload,
+    work: &str,
+    bare: &str,
+    (snapshot, lfs_digest): (&'p str, Option<&'p str>),
+) -> Result<(Repo<'p>, Vec<Repo<'p>>), String> {
     let base = payload.base()?;
     let pair = payload.pair()?;
     let checkouts = match &pair {
@@ -123,7 +134,13 @@ fn repos<'p>(payload: &'p Payload, work: &str, bare: &str, snapshot: &'p str) ->
         }
         None => Vec::new(),
     };
-    Ok(layout_repos(work, bare, pair.as_ref(), (snapshot, base), checkouts))
+    let sibling_digests = payload.sibling_lfs_digests(pair.as_ref())?;
+    let (mut main, mut siblings) = layout_repos(work, bare, pair.as_ref(), (snapshot, base), checkouts);
+    main.lfs_digest = lfs_digest;
+    for (sibling, digest) in siblings.iter_mut().zip(sibling_digests) {
+        sibling.lfs_digest = digest;
+    }
+    Ok((main, siblings))
 }
 
 /// The repos of the work folder `work` laid out as a run lays it out, the one place a run ([`repos`]) and the inputs
@@ -147,6 +164,7 @@ pub(crate) fn layout_repos<'p>(
             bare: bare.to_owned(),
             snapshot,
             base,
+            lfs_digest: None,
         };
         return (main, Vec::new());
     };
@@ -158,6 +176,7 @@ pub(crate) fn layout_repos<'p>(
         bare: bare.to_owned(),
         snapshot,
         base,
+        lfs_digest: None,
     };
     let siblings = pair
         .siblings()
@@ -170,6 +189,7 @@ pub(crate) fn layout_repos<'p>(
             bare: sibling.bare().to_owned(),
             snapshot: commit,
             base,
+            lfs_digest: None,
         })
         .collect();
     (main, siblings)
@@ -232,9 +252,9 @@ pub struct Request<'p> {
 impl<'p> Request<'p> {
     /// Reads `payload` in the order the Windows box reads it, each key checked as it does, the outputs asked for
     /// ([`Asked::new`]) read once the output folder is; then notes the first thing asking for what this builder does not
-    /// build: `Desktop`, `CommitStage`, a warm-up's `WarmCommands`, an unreal `EngineEnv` name, `UnrealVersion`,
-    /// `SentDigest`, `LfsDigest` or `SiblingLfsDigests`; then, last, the repos ([`repos`]), a sibling pair as
-    /// `gate-wire` checks it. A work root holding a `:` is refused just after the work folder is read ([`work_layout`]).
+    /// build: `Desktop`, `CommitStage`, a warm-up's `WarmCommands`, an unreal `EngineEnv` name, `UnrealVersion` or
+    /// `SentDigest`; then, last, the repos ([`repos`]), a sibling pair and its `SiblingLfsDigests` as `gate-wire` checks
+    /// them. A work root holding a `:` is refused just after the work folder is read ([`work_layout`]).
     ///
     /// # Errors
     ///
@@ -279,13 +299,11 @@ impl<'p> Request<'p> {
         let blender = payload.blender_version()?;
         let inputs_digest = payload.inputs_digest()?;
         let sent = payload.sent_digest()?.is_some();
-        let lfs = payload.lfs_digest()?.is_some();
-        // Whatever its entries say, as this builder takes no LFS content of any repo.
-        let sibling_lfs = payload.sets("SiblingLfsDigests");
+        let lfs_digest = payload.lfs_digest()?;
         // Just before the repos, where the Windows box reads it beside the repos' default branch.
         let commit_stage = payload.commit_stage_head()?.is_some();
         // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
-        let (main, siblings) = repos(payload, work, bare, snapshot)?;
+        let (main, siblings) = repos(payload, work, bare, (snapshot, lfs_digest))?;
         let unbuilt = [
             (desktop, Refusal::Desktop, "Desktop"),
             (commit_stage, Refusal::Layout, "CommitStage"),
@@ -293,8 +311,6 @@ impl<'p> Request<'p> {
             (unreal_env, Refusal::Layout, "EngineEnv"),
             (unreal, Refusal::Layout, "UnrealVersion"),
             (sent, Refusal::Sent, "SentDigest"),
-            (lfs, Refusal::Lfs, "LfsDigest"),
-            (sibling_lfs, Refusal::Lfs, "SiblingLfsDigests"),
         ]
         .into_iter()
         .find_map(|(asked, refusal, key)| asked.then_some(Unbuilt { refusal, key }));
@@ -389,6 +405,11 @@ pub struct Ready<'p> {
     /// kept pack and before the lock, an unwind's drop included: the slot goes while the work lock and the session are
     /// still held, so no call of the session waiting on the lock takes it while this run's claim is still to go.
     pub(crate) slot: Option<slots::Release>,
+    /// The run's LFS content, covered by the checkout and held through the back commit: each covered repo's store lock
+    /// and its scratch folder, which every step of that repo's git is pinned to ([`RunLfs::storage_of`]); closed at
+    /// the run's end ([`run_reading`]). Declared before [`Ready::lock`], so on an unwind too the scratch folders go
+    /// and the store locks are let go before the work lock, in [`run_reading`]'s order.
+    pub(crate) lfs: RunLfs,
     /// The work lock, held.
     pub lock: HeldLock,
     /// The folder the command runs in: the work folder, or its subfolder.
@@ -677,6 +698,7 @@ fn prepared<'p, S: LineSink + 'static>(
             blender,
             temp,
             outputs,
+            lfs,
         }) => Ok(Ready {
             request,
             slot,
@@ -691,6 +713,7 @@ fn prepared<'p, S: LineSink + 'static>(
             outputs,
             packs: Packs::default(),
             admitted,
+            lfs,
         }),
         // A refusal sends the PC to run the command itself; any other end, whatever its status, is a pair run's back
         // commits never made.
@@ -911,6 +934,8 @@ fn run_reading<S: LineSink + 'static>(
     // still held under its shared lock. A cut there is made once ([`Packs::cut`]).
     let _ = output.client_gone_probe();
     let status = cut_ended(&ready, output, watches, end, status);
+    // After the back commit: each LFS scratch folder removed, then each store's lock let go.
+    ready.lfs.close(&mut |line| noted(output, GAT, line));
     let Ready { packs, slot, lock, .. } = ready;
     // The kept pack goes first, its shared lock with it, once nothing more can replace it. The slot goes while the
     // work lock is still held, as the Windows box lets it go: a second call of the session that takes the lock next
@@ -1138,11 +1163,11 @@ fn of_its_own(end: CommandEnd) -> bool {
 /// command ([`cross_built`]), then its outputs brought back ([`brought_back`]), which gives its status; a failed
 /// command has only its test reports and failure outputs brought back ([`Asked::failed_run`] under
 /// [`Caps::BUILT_IN`]), with no cross build, and ends on its own status whatever the pack gives, and one with no glob
-/// naming a `TestResults` folder, a failed sync-back or a cross build that did not pass packs nothing. A command the box killed never reaches here: its
-/// failure outputs are packed with no back commit ([`killed_brought_back`]). A client gone at a pack is ruled there
-/// ([`brought_back`]); one gone at any other point, during the back commit or the cross build among them, has the
-/// failed run's set packed, after the line of a back commit that failed, and the run's status set, by the run's last
-/// step ([`cut_ended`]).
+/// naming a `TestResults` folder, a failed sync-back or a cross build that did not pass packs nothing. A command the
+/// box killed never reaches here: its failure outputs are packed with no back commit ([`killed_brought_back`]). A
+/// client gone at a pack is ruled there ([`brought_back`]); one gone at any other point, during the back commit or the
+/// cross build among them, has the failed run's set packed, after the line of a back commit that failed, and the run's
+/// status set, by the run's last step ([`cut_ended`]).
 fn synced_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, status: u8, watches: &Watches, launch: &Launch<'_>) -> u8 {
     let commits = match back_committed(ready, output, status) {
         Ok(commits) => commits,
@@ -1160,7 +1185,7 @@ fn synced_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>
 /// these lines, by the run's last step ([`cut_ended`]).
 fn back_committed<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, status: u8) -> Result<Vec<Option<String>>, u8> {
     let request = &ready.request;
-    match back::back_commit(request, &ready.lock, ready.login_path.as_deref(), output) {
+    match back::back_commit(ready, output) {
         Ok(commits) => Ok(commits),
         // Said to no one: the client is gone.
         Err(BackFailed::Gone(failed)) => Err(failure(output, &failed)),
@@ -1352,7 +1377,7 @@ fn skip_read<S: LineSink + 'static>(ready: &Ready<'_>, main: Option<&str>, outpu
         _ => return Ok(Vec::new()),
     };
     // Read after the push and only for outputs, so failing to read them fails the outputs, never the sync-back.
-    match back::back_paths(&ready.request, &ready.lock, ready.login_path.as_deref(), output, commit) {
+    match back::back_paths(ready, output, commit) {
         Ok(paths) => Ok(paths),
         Err(BackFailed::Gone(failed)) => {
             // Said to no one: the client is gone, and the pack is cut.
@@ -1537,22 +1562,26 @@ fn locked<S: LineSink + 'static>(
     // A note for the client's checkout lines: the run goes on, and a client gone finds out at the next line.
     let _ = output.say(Stream::Err, Stamp::Bare, &checkout_start_line(request.nonce));
     let checking_out = Instant::now();
-    checked_out(request, &git).map_err(|failed| Unready::Ended(failure(output, &failed)))?;
+    let mut lfs = checked_out_said(request, &git, output)?;
     // A note as the start line is: the run goes on, and a client gone finds out at the next line.
     let _ = output.say(
         Stream::Err,
         Stamp::Bare,
         &checkout_done_line(request.nonce, checking_out.elapsed().as_secs_f64()),
     );
+    // From here every way out lets the run's LFS state go first, as the checkout's failures do, a removal that fails
+    // said; `Drop` is only the unwind's backstop.
     if !place.is_dir() {
+        lfs_let_go(&mut lfs, output);
         let line = format!("gate: remote subfolder {} does not exist in the snapshot", escaped(request.subfolder));
         return Err(Unready::Ended(said(output, &[&line], USAGE_STATUS)));
     }
     // A link the snapshot holds may lead the place out of the work folder, which only the checkout shows.
     if !inside_work(request.tree(), &place) {
+        lfs_let_go(&mut lfs, output);
         return Err(Unready::Ended(said(output, &[&not_inside(request.subfolder)], USAGE_STATUS)));
     }
-    let temp = temp_for(request, output)?;
+    let temp = temp_for(request, output).inspect_err(|_| lfs_let_go(&mut lfs, output))?;
     // No Blender for a restore: each restore removes every blender name from what it inherits.
     let along = Along {
         path: login_path.as_deref(),
@@ -1572,6 +1601,7 @@ fn locked<S: LineSink + 'static>(
         if let Some(temp) = temp {
             temp_removed(temp, output);
         }
+        lfs_let_go(&mut lfs, output);
         return Err(unready);
     }
     if let (Some(asked), Some(outputs)) = (&request.outputs, outputs.as_mut()) {
@@ -1585,12 +1615,19 @@ fn locked<S: LineSink + 'static>(
         blender,
         temp,
         outputs,
+        lfs,
     })
 }
 
+/// The run's LFS state `lfs` closed ([`RunLfs::close`]) on a way out of [`locked`] after its checkout, as
+/// [`checked_out`] closes it on its own failures: each scratch folder removed, a removal that fails noted.
+fn lfs_let_go<S: LineSink>(lfs: &mut RunLfs, output: &Output<S>) {
+    lfs.close(&mut |line| noted(output, GAT, line));
+}
+
 /// What [`locked`] readies for the command: its place, the heartbeat's pump, the login shell's `PATH` and
-/// `GATE_GODOT_ROOT`, the run's Blender as it resolved ([`resolved_blender`]), the run's temp folder, and its outputs as
-/// they stand before the command.
+/// `GATE_GODOT_ROOT`, the run's Blender as it resolved ([`resolved_blender`]), the run's temp folder, its outputs as
+/// they stand before the command, and its LFS content.
 struct Placed {
     place: PathBuf,
     pump: Option<Pump>,
@@ -1599,6 +1636,7 @@ struct Placed {
     blender: Result<Option<String>, String>,
     temp: Option<RunTemp>,
     outputs: Option<RunOutputs>,
+    lfs: RunLfs,
 }
 
 /// On a pair run of `request`, says [`BACK_COMMITS_FAILED`] after the lines of a run that ends with `status` without
@@ -2148,12 +2186,44 @@ fn plain_or_missing(path: &Path, folder: bool) -> Result<(), NotLaidOut> {
     }
 }
 
-/// Each repo of `request`'s snapshot fetched and checked out, the main one first ([`repo_checked_out`]); then, on a run
-/// of one repo, the earlier run's back ref deleted ([`back_ref_cleared`]). A pair run deleted every repo's as it laid
-/// the work folder out ([`laid_out`]).
-fn checked_out<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>) -> Result<(), Failed> {
+/// The run's checkout ([`checked_out`]) as [`locked`] takes it: its LFS state; else how the run ends, its lines said: a
+/// git step's failure, or the run refused `lfs` with the Windows box's line, its content not the snapshot's
+/// ([`lfs_not_the_snapshots`]) or its scratch folder not made ([`lfs_no_scratch`]).
+fn checked_out_said<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>, output: &Output<S>) -> Result<RunLfs, Unready> {
+    checked_out(request, git, output).map_err(|not| match not {
+        NotCheckedOut::Failed(failed) => Unready::Ended(failure(output, &failed)),
+        NotCheckedOut::Refused(why) => {
+            refused(output, request, Refusal::Lfs, &lfs_not_the_snapshots(request.key, &why));
+            Unready::Refused
+        }
+        NotCheckedOut::NoScratch(why) => {
+            refused(output, request, Refusal::Lfs, &lfs_no_scratch(&why));
+            Unready::Refused
+        }
+    })
+}
+
+/// Each repo of `request`'s snapshot fetched ([`repo_fetched`]), its LFS content covered ([`lfs_covered`]) and checked
+/// out ([`repo_checked_out`]), one repo after another, the main one first, so the stores' locks are taken in repo order;
+/// then, on a run of one repo, the earlier run's back ref deleted ([`back_ref_cleared`]). A pair run deleted every
+/// repo's as it laid the work folder out ([`laid_out`]). The run's LFS state, held; on a failure it is let go, each
+/// scratch folder removed.
+fn checked_out<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>, output: &Output<S>) -> Result<RunLfs, NotCheckedOut> {
+    let mut lfs = RunLfs::without_content();
+    if let Err(not) = repos_checked_out(request, git, &mut lfs, output) {
+        // As the Windows box's checkout closes its LFS state on a failure: a removal that fails is said.
+        lfs_let_go(&mut lfs, output);
+        return Err(not);
+    }
+    Ok(lfs)
+}
+
+/// [`checked_out`]'s steps, the run's LFS state `lfs` filled as each repo is covered.
+fn repos_checked_out<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>, lfs: &mut RunLfs, output: &Output<S>) -> Result<(), NotCheckedOut> {
     for repo in request.repos() {
-        repo_checked_out(git, request.key, repo)?;
+        repo_fetched(git, request.key, repo)?;
+        lfs_covered(request, repo, git, lfs, output)?;
+        repo_checked_out(git, repo, lfs, output)?;
     }
     if request.siblings.is_empty() {
         back_ref_cleared(git, request.key, &request.main)?;
@@ -2161,12 +2231,178 @@ fn checked_out<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>) -> Resul
     Ok(())
 }
 
-/// The snapshot of `repo` fetched from its bare repository at `refs/gate/<key>`, its commit found, and checked out by
-/// its commit over whatever the last run left, untracked files removed and ignored ones (build output) kept. The commit,
-/// never the ref's tip, is what is checked out, so a later push of the key changes nothing this run runs. Each step is
+/// The LFS content of `repo`'s fetched snapshot added to the run's LFS state `lfs`, when the repo carries an LFS digest
+/// ([`Repo::lfs_digest`]), as the Windows box's `lfs_covered` adds it: its pointers listed from the snapshot itself
+/// before any checkout, as the PC lists them ([`pointers_of`]), each git call a `lfs listing` step fed its input
+/// ([`RunGit::fed`]); the listing checked against the digest and the repo's store ([`RunLfs::covered`]), its lock taken
+/// shared; then the repo's scratch folder made ([`RunLfs::with_scratch`]), each line of its stages' sweep noted. A repo
+/// with no digest lists nothing; it has a scratch folder when its snapshot names the filter ([`snapshot_names_lfs`],
+/// [`RunLfs::declared`]). Else the git step's failure, or why the run is refused `lfs`: the
+/// repo's content, a pair repo's name before it, or a scratch folder that cannot be made.
+fn lfs_covered<S: LineSink>(
+    request: &Request<'_>,
+    repo: &Repo<'_>,
+    git: &RunGit<'_, S>,
+    lfs: &mut RunLfs,
+    output: &Output<S>,
+) -> Result<(), NotCheckedOut> {
+    match repo.lfs_digest {
+        Some(digest) => lfs_listed_covered(request, repo, git, lfs, digest)?,
+        // As the Windows box's `lfs_scratch`: a repo with no digest whose snapshot names the filter gets a scratch.
+        None if snapshot_names_lfs(git, repo)? => lfs.declared(&repo.tree),
+        None => return Ok(()),
+    }
+    lfs.with_scratch(&request.root, (request.key, request.nonce), &mut |line| noted(output, GAT, line))
+        .map_err(NotCheckedOut::NoScratch)
+}
+
+/// The LFS content of `repo`, which sent the LFS digest `digest`, listed from its snapshot ([`pointers_of`]) and
+/// covered into `lfs` ([`RunLfs::covered`]); else the listing's failure, or the refusal, a pair repo's name before it.
+fn lfs_listed_covered<S: LineSink>(
+    request: &Request<'_>,
+    repo: &Repo<'_>,
+    git: &RunGit<'_, S>,
+    lfs: &mut RunLfs,
+    digest: &str,
+) -> Result<(), NotCheckedOut> {
+    let (tree, step) = (repo.git_tree(), repo.step("lfs listing"));
+    let listed = pointers_of(
+        repo.snapshot,
+        &mut |args, feed, cap| git.fed(&step, &tree.args(args), (feed, cap), GitClass::Short),
+        |why| Failed::line(format!("gate: remote lfs listing failed: {why}")),
+    )?;
+    // Each repo of a pair has a tree of its own.
+    let sibling = repo.tree != request.main.tree;
+    lfs.covered(&request.root, (&repo.tree, &repo.bare), (digest, sibling), &listed)
+        .map_err(|why| {
+            NotCheckedOut::Refused(match &repo.name {
+                Some(name) => format!("{name}: {why}"),
+                None => why,
+            })
+        })
+}
+
+/// Whether a `.gitattributes` file of `repo`'s snapshot, at any depth and whatever the case of its name, holds the
+/// text `filter=lfs` (`git grep`), as the Windows box's `lfs_scratch` asks it of a repo with no LFS digest; a comment
+/// naming it counts, which costs only a scratch folder. Else the step's failure, its line ending in the first line
+/// git said.
+fn snapshot_names_lfs<S: LineSink>(git: &RunGit<'_, S>, repo: &Repo<'_>) -> Result<bool, Failed> {
+    let step = repo.step("lfs listing");
+    let words = ["grep", "-q", "-F", "-e", "filter=lfs", repo.snapshot, "--", ATTRIBUTES_FILES];
+    let ran = git.quiet(&step, &repo.git_tree().args(&words), GitClass::Short)?;
+    match ran.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => {
+            let mut failed = git.failed(&step, &ran);
+            let said = String::from_utf8_lossy(&ran.stderr);
+            if let (Some(line), Some(first)) = (failed.lines.first_mut(), said.lines().find(|line| !line.trim().is_empty())) {
+                *line = format!("{line}: {}", escaped(first));
+            }
+            Err(failed)
+        }
+    }
+}
+
+/// The fetched snapshot of `repo` checked out by its commit over whatever the last run left, every step pinned to the
+/// repo's LFS scratch folder when it has one, else to the storage below the lock ([`RunGit::storing_in`]); each LFS
+/// file then checked ([`lfs_post_check`]), and untracked files removed, ignored ones (build output) kept. The commit,
+/// never the ref's tip, is what is checked out, so a later push of the key changes nothing this run runs. A checkout
+/// that fails says why as the Windows box says it ([`checkout_failed`]). Each step is named for the repo on a pair run
+/// ([`Repo::step`]).
+fn repo_checked_out<S: LineSink>(git: &RunGit<'_, S>, repo: &Repo<'_>, lfs: &RunLfs, output: &Output<S>) -> Result<(), NotCheckedOut> {
+    let storage = lfs.storage_of(&repo.tree);
+    let git = git.storing_in(storage);
+    let tree = repo.git_tree();
+    let step = repo.step("checkout");
+    let ran = git.tree_ran(
+        &step,
+        &tree.args(&["checkout", "-q", "--force", "--detach", repo.snapshot]),
+        GitClass::Long,
+    )?;
+    if !ran.status.success() {
+        return Err(checkout_failed(&git, (repo, storage.is_some()), (&step, &ran), output).into());
+    }
+    lfs_post_check(&git, repo, lfs)?;
+    git.tree_step(&repo.step("clean"), &tree.args(&["clean", "-fdq"]), GitClass::Long)?;
+    Ok(())
+}
+
+/// The failure of `repo`'s checkout `step`, which `ran` to a non-zero exit, as the Windows box's `checkout_failed`
+/// says it: on a repo with no scratch folder whose attributes name the LFS filter ([`names_lfs`]), the line saying a
+/// file under it was found that the snapshot does not declare ([`NO_STORAGE_CHECKOUT`]), with git's status, once the
+/// tree's untracked files are cleaned (`clean -fdq`); a clean that fails is noted and leaves that line as it is, and a
+/// client gone during it is the failure the run ends on. Else git's own ([`Steps::failed`]).
+fn checkout_failed<S: LineSink>(git: &RunGit<'_, S>, (repo, scratch): (&Repo<'_>, bool), (step, ran): (&str, &Ran), output: &Output<S>) -> Failed {
+    let failed = git.failed(step, ran);
+    if scratch {
+        return failed;
+    }
+    match names_lfs(git, repo, output) {
+        Ok(true) => {}
+        Ok(false) => return failed,
+        Err(gone) => return gone,
+    }
+    if let Err(unclean) = git.tree_step(&repo.step("clean"), &repo.git_tree().args(&["clean", "-fdq"]), GitClass::Long) {
+        if output.client_gone() {
+            return unclean;
+        }
+        for line in &unclean.lines {
+            noted(output, GAT, line);
+        }
+    }
+    Failed {
+        lines: vec![format!("gate: remote {step} failed: {NO_STORAGE_CHECKOUT}")],
+        status: failed.status,
+    }
+}
+
+/// Whether a `.gitattributes` file of `repo`, at any depth and whatever the case of its name, holds the text
+/// `filter=lfs` (`git grep`) in its tree, tracked or untracked, as the Windows box's `names_lfs_in_tree` searches it.
+/// The snapshot is not searched: a repo whose snapshot names the filter has a scratch folder ([`lfs_covered`]), so
+/// only attributes the snapshot does not hold get here. A `git grep` that cannot run notes why, as the Windows box
+/// says it, and answers no, so the caller keeps git's own failure; a client gone during it is the failure itself.
+pub(crate) fn names_lfs<S: LineSink>(git: &RunGit<'_, S>, repo: &Repo<'_>, output: &Output<S>) -> Result<bool, Failed> {
+    let step = repo.step("grep");
+    let words = ["grep", "-q", "-F", "-e", "filter=lfs", "--untracked", "--", ATTRIBUTES_FILES];
+    match git.quiet(&step, &repo.git_tree().args(&words), GitClass::Short) {
+        Ok(ran) => Ok(ran.status.success()),
+        // A client gone during it is the failure the run ends on, as on the Windows box.
+        Err(failed) if output.client_gone() => Err(failed),
+        Err(failed) => {
+            for line in &failed.lines {
+                let why = line.strip_prefix("gate: remote ").unwrap_or(line);
+                noted(output, GAT, &format!("gate: remote leftover-LFS check could not run: {why}"));
+            }
+            Ok(false)
+        }
+    }
+}
+
+/// Every LFS pointer's path in `repo`'s tree checked after its checkout ([`post_checked`]): the wrong ones checked out
+/// again once, by the Windows box's `lfs checkout` step, `git checkout` of those paths fed on its standard input with
+/// the repo's pins ([`RunGit::tree_fed`]), and checked again. Nothing for a repo with no LFS content.
+fn lfs_post_check<S: LineSink>(git: &RunGit<'_, S>, repo: &Repo<'_>, lfs: &RunLfs) -> Result<(), NotCheckedOut> {
+    let (tree, step) = (repo.git_tree(), repo.step("lfs checkout"));
+    post_checked(&repo.tree, lfs.pointers_in(&repo.tree), |feed| {
+        let words = [
+            "--literal-pathspecs",
+            "checkout",
+            "-q",
+            "--force",
+            repo.snapshot,
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ];
+        git.tree_fed(&step, &tree.args(&words), (Some(feed), RECHECKOUT_OUTPUT), GitClass::Long)
+            .map(drop)
+    })
+}
+
+/// The snapshot of `repo` fetched from its bare repository at `refs/gate/<key>` and its commit found. Each step is
 /// named for the repo on a pair run ([`Repo::step`]). A repo with a default branch has `refs/gate-base/<key>` fetched
 /// in the same call as `refs/remotes/origin/<base>`, so the tree's `origin/<base>` names the PC's.
-fn repo_checked_out<S: LineSink>(git: &RunGit<'_, S>, key: &str, repo: &Repo<'_>) -> Result<(), Failed> {
+fn repo_fetched<S: LineSink>(git: &RunGit<'_, S>, key: &str, repo: &Repo<'_>) -> Result<(), Failed> {
     let tree = repo.git_tree();
     let refname = format!("refs/gate/{key}");
     let base = repo.base.map(|name| format!("+refs/gate-base/{key}:refs/remotes/origin/{name}"));
@@ -2188,13 +2424,7 @@ fn repo_checked_out<S: LineSink>(git: &RunGit<'_, S>, key: &str, repo: &Repo<'_>
     {
         return Err(Failed::line(missing_snapshot(repo)));
     }
-    git.tree_step(
-        &repo.step("checkout"),
-        &tree.args(&["checkout", "-q", "--force", "--detach", repo.snapshot]),
-        GitClass::Long,
-    )?;
-    git.tree_step(&repo.step("clean"), &tree.args(&["clean", "-fdq"]), GitClass::Long)
-        .map(drop)
+    Ok(())
 }
 
 /// The line of a snapshot of `repo` its repository lacks after the fetch, as the Windows box says it.
@@ -2250,7 +2480,7 @@ mod tests {
 
     use super::{
         DrainSeams, NotLaidOut, Packing, REFUSED_STATUS, Ready, Request, Sources, Unready, Watches, brought_back, cut_ended, inputs_matched,
-        login_read, place_of, prepare, prepared, run_along, run_reading, slot_taken, temp_made, test_template, work_cleared,
+        lfs_post_check, login_read, place_of, prepare, prepared, run_along, run_git, run_reading, slot_taken, temp_made, test_template, work_cleared,
     };
     #[cfg(target_os = "macos")]
     use crate::beneath::ANOTHER_VOLUME;
@@ -2261,6 +2491,7 @@ mod tests {
     use crate::git::test_program::{self, real_git};
     use crate::git::{CLOSED_STATUS, GitClass, test_limit};
     use crate::heartbeat::{self, Periods};
+    use crate::lfs::NotCheckedOut;
     use crate::lines::{CommandEnd, FAILED_STATUS, Godot, Login, command_status, job_record_text, login_path_line, recorded_group};
     use crate::outputs::OUTPUTS_BUDGET;
     use crate::outputs::tests::read_archive;
@@ -2488,6 +2719,102 @@ mod tests {
         if let Some(temp) = ready.temp.take() {
             fs::remove_dir_all(temp.path()).expect("the run's temp folder is removed");
         }
+    }
+
+    /// The content of the LFS file of [`lfs_ready`]'s snapshot.
+    const LFS_CONTENT: &[u8] = b"the real LFS content\n";
+
+    /// A case whose snapshot commits `big.bin` as the pointer of [`LFS_CONTENT`] under a tracked `*.bin filter=lfs`,
+    /// the object in the bare's store as a put leaves it, the source's own attributes unsetting every filter so the
+    /// pointer is committed as its text; the snapshot, the pointer text and the object's path in the store.
+    fn lfs_case(case: &Case) -> (String, String, PathBuf) {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let (oid, _) = sha256_of(LFS_CONTENT).expect("the content is hashed");
+        let pointer = format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {}\n",
+            LFS_CONTENT.len()
+        );
+        let source = case.source();
+        git(&["init", "-q", source.to_str().expect("the temp folder is UTF-8")]);
+        fs::create_dir_all(source.join(".git/info")).expect("the info folder is made");
+        fs::write(source.join(".git/info/attributes"), "* -filter\n").expect("the source's attributes are written");
+        let attributes = "*.bin filter=lfs diff=lfs merge=lfs -text\n";
+        let commit = case.snapshot(&[(".gitattributes", attributes), ("big.bin", &pointer)]);
+        let folder = PathBuf::from(format!("{}/lfs/objects/{}/{}", case.bare(), &oid[..2], &oid[2..4]));
+        std::os::unix::fs::DirBuilderExt::mode(fs::DirBuilder::new().recursive(true), 0o700)
+            .create(&folder)
+            .expect("the store's folders are made");
+        let object = folder.join(&oid);
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&object)
+            .and_then(|mut file| file.write_all(LFS_CONTENT))
+            .expect("the object is stored");
+        (commit, pointer, object)
+    }
+
+    /// The run of `case`'s LFS snapshot `commit`, readied with its digest; then `big.bin` in its tree overwritten with
+    /// `pointer`, `before` called with the run's scratch folder, and the post-check run with the run's own git
+    /// ([`lfs_post_check`]); its result, and `big.bin`'s bytes after it.
+    fn post_checked_after(case: &Case, (commit, pointer): (&str, &str), before: impl FnOnce(&Path)) -> (Result<(), String>, Vec<u8>) {
+        let (oid, _) = sha256_of(LFS_CONTENT).expect("the content is hashed");
+        let (digest, _) = sha256_of(format!("{oid} {}", LFS_CONTENT.len()).as_bytes()).expect("the manifest is hashed");
+        let payload = decoded(&case.json(commit, &json!({ "LfsDigest": digest })));
+        let output = Arc::new(Output::new(RecordingSink::default()));
+        let mut ready = prepare(&payload, &output, quiet_periods(), own_path)
+            .map_err(|status| (status, stderr_of(&output)))
+            .expect("the run is ready");
+        let big = Path::new(&ready.request.main.tree).join("big.bin");
+        assert_eq!(fs::read(&big).expect("big.bin is read"), LFS_CONTENT, "the checkout smudged it");
+        fs::write(&big, pointer).expect("the pointer text is written over it");
+        let storage = ready.lfs.storage_of(&ready.request.main.tree).expect("the run has a scratch folder");
+        before(Path::new(storage.strip_prefix("lfs.storage=").expect("a storage pin")));
+        let git = run_git(&ready.request, &ready.lock, None, &output).storing_in(Some(storage));
+        let checked = lfs_post_check(&git, &ready.request.main, &ready.lfs).map_err(|not| match not {
+            NotCheckedOut::Failed(failed) => format!("failed {}: {:?}", failed.status, failed.lines),
+            NotCheckedOut::Refused(why) | NotCheckedOut::NoScratch(why) => why,
+        });
+        let after = match fs::read(&big) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "big.bin cannot be read: {error}");
+                Vec::new()
+            }
+        };
+        tmp_cleared(&mut ready);
+        (checked, after)
+    }
+
+    /// The post-check's re-checkout, the real `git checkout` of the wrong paths fed on its input with the run's pins,
+    /// repairs a file left as its pointer text from the store through the run's scratch folder.
+    #[test]
+    fn the_post_check_s_re_checkout_repairs_a_pointer_left_in_the_tree() {
+        let case = Case::new("lfs-recheckout");
+        let (commit, pointer, _) = lfs_case(&case);
+        let (checked, after) = post_checked_after(&case, (&commit, &pointer), |_| {});
+        assert_eq!(checked, Ok(()), "the post-check passes");
+        assert_eq!(after, LFS_CONTENT, "big.bin is its content again");
+    }
+
+    /// With its object gone from both the store and the scratch folder, the re-checkout cannot smudge the file: the
+    /// run ends on git's own failure.
+    #[test]
+    fn the_post_check_s_re_checkout_with_no_object_left_fails() {
+        let case = Case::new("lfs-recheckout-gone");
+        let (commit, pointer, object) = lfs_case(&case);
+        let (checked, _) = post_checked_after(&case, (&commit, &pointer), |scratch| {
+            fs::remove_file(&object).expect("the store's object is removed");
+            let name = object.file_name().expect("the object has a name").to_string_lossy().into_owned();
+            let linked = scratch.join("objects").join(&name[..2]).join(&name[2..4]).join(&name);
+            if linked.exists() {
+                fs::remove_file(&linked).expect("the scratch folder's link is removed");
+            }
+        });
+        let why = checked.expect_err("the re-checkout cannot repair it");
+        assert!(why.starts_with("failed 128: [\"gate: remote lfs checkout failed (status 128)"), "{why}");
     }
 
     /// Periods whose heartbeat never beats within a case, so a case's lines are exactly the run's own.
@@ -2930,6 +3257,34 @@ mod tests {
         fs::write(&shim, script).expect("the shim is written");
         fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o700)).expect("the shim is made runnable");
         test_program::set(&shim);
+    }
+
+    /// The snapshot grep of a repo with no digest that git cannot run (a shim answers it 128, as git does over a blob
+    /// it cannot read) fails the run with git's status and first line, rather than answering no and checking out with
+    /// no scratch folder.
+    #[test]
+    fn a_snapshot_grep_that_fails_says_the_lfs_listing_failed() {
+        let case = Case::new("lfs-grep-failed");
+        // The source's own attributes unset every filter, so the case needs no git-lfs to commit under one.
+        let source = case.source();
+        git(&["init", "-q", source.to_str().expect("the temp folder is UTF-8")]);
+        fs::create_dir_all(source.join(".git/info")).expect("the info folder is made");
+        fs::write(source.join(".git/info/attributes"), "* -filter\n").expect("the source's attributes are written");
+        let commit = case.snapshot(&[(".gitattributes", "*.bin filter=lfs\n"), ("raw.bin", "raw\n")]);
+        let shim = case.base.with_file_name("git-shim");
+        let script = format!(
+            "#!/bin/sh\ncase \" $* \" in\n*\" --untracked \"*) ;;\n\
+             *\" grep -q -F -e filter=lfs \"*) echo 'fatal: the shim cannot grep' >&2; exit 128;;\nesac\nexec '{git}' \"$@\"\n",
+            git = real_git().display()
+        );
+        fs::write(&shim, script).expect("the shim is written");
+        fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o700)).expect("the shim is made runnable");
+        test_program::set(&shim);
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+        assert_eq!(status, 128, "{said:?}");
+        let line = "gate: remote lfs listing failed (status 128): fatal: the shim cannot grep";
+        assert!(said.iter().any(|said| said == line), "{line}: {said:?}");
+        assert!(!Path::new(&format!("{}/lfs-run", case.root())).exists(), "no scratch folder was made");
     }
 
     /// A login shell whose `GATE_GODOT_ROOT` is set but whose `PATH` holds no absolute folder.
@@ -4608,21 +4963,6 @@ mod tests {
     }
 
     #[test]
-    fn an_lfs_digest_is_refused_lfs() {
-        let case = Case::new("lfs");
-        let lfs = json!({ "LfsDigest": DIGEST });
-        assert_refused(&case, &lfs, Refusal::Lfs, "gate: remote LfsDigest is not built on this builder");
-        let case = Case::new("sibling-lfs");
-        let sibling = json!({ "SiblingLfsDigests": { "lib": DIGEST } });
-        assert_refused(
-            &case,
-            &sibling,
-            Refusal::Lfs,
-            "gate: remote SiblingLfsDigests is not built on this builder",
-        );
-    }
-
-    #[test]
     fn a_command_named_like_a_package_manager_but_not_one_restores_nothing() {
         for (name, command) in [("pnpm-helper", ["pnpm-helper"]), ("npmrc-check", ["./npmrc-check"])] {
             let case = Case::new(&format!("not-packages-{name}"));
@@ -5807,6 +6147,7 @@ mod tests {
                 "git config core.autocrlf",
                 "git config core.eol",
                 "cat-file",
+                "lfs listing",
                 "back ref reset"
             ]
         );

@@ -11,12 +11,13 @@ use std::process::{Command, ExitStatus};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use gate_inputs::lfs::{CHECKOUT_PINS, no_storage};
 use gate_wire::escaped;
 
 use crate::console::{Forwarding, LineSink, Output, Stamp, Stream};
 use crate::files::{self, ReplaceFailure};
 use crate::lines::{FAILED_STATUS, is_git_variable, step_unran};
-use crate::process::{Ending, Forward, GroupRecord, NotRan, Ran, Watch, run_bounded, run_watched, status_text};
+use crate::process::{Ending, Forward, GroupRecord, NotRan, Ran, Watch, run_bounded, run_fed, status_text};
 
 /// How long one preflight git step may take.
 const GIT_LIMIT: Duration = Duration::from_secs(120);
@@ -93,6 +94,7 @@ impl Failed {
 /// work root, which git never searches up into, so that search ends at `<root>/work` (git ignores a ceiling that is
 /// the starting folder itself). The tree's steps name their repository besides ([`Tree`]). A run's git is found along,
 /// and runs with, the login shell's `PATH` ([`Git::along`]).
+#[derive(Clone, Copy)]
 pub struct Git<'a> {
     folder: &'a Path,
     ceiling: &'a str,
@@ -412,7 +414,9 @@ pub fn alternates_written(info: &Path, bare: &str) -> Result<(), AlternatesFailu
 
 /// How a run runs git ([`Git`]), with the Windows box's safety options before every step's words: its hooks read from
 /// `<Lock>/hooks`, which cannot exist as the lock is a file; no file-system monitor; no attributes file but the tree's
-/// own, nor the system's; and an LFS store below the lock, which cannot be made. Its standard error is forwarded to the
+/// own, nor the system's; the LFS filter's pins ([`CHECKOUT_PINS`]), whatever the builder's or the work folder's
+/// config says of it; and an LFS store below the lock, which cannot be made ([`no_storage`]), or, for every step of a
+/// repo with LFS content, that repo's scratch folder ([`RunGit::storing_in`]). Its standard error is forwarded to the
 /// client line by line as git says it, from the readers' own threads, and its standard output kept for the caller, up
 /// to [`GIT_OUTPUT_CAP`]. A step is bounded by the [`GitClass`] its caller gives it ([`step_limit`]); past its bound, or
 /// once the client is gone, its group is asked to end with `SIGTERM` and killed after [`END_GRACE`], unless the step
@@ -420,7 +424,10 @@ pub fn alternates_written(info: &Path, bare: &str) -> Result<(), AlternatesFailu
 /// run gives one, so `box stop` ends it.
 pub struct RunGit<'a, S: LineSink + 'static> {
     git: Git<'a>,
-    options: [String; 8],
+    /// The safety options and the LFS pins, each step's first words.
+    options: Vec<String>,
+    /// `lfs.storage=<path>`, pinned after [`RunGit::options`].
+    storage: String,
     output: &'a Arc<Output<S>>,
     record: Option<GroupRecord<'a>>,
     /// How the steps' forwarded lines and the runner's own lines about them are stamped: `gat` in `box run`.
@@ -429,7 +436,7 @@ pub struct RunGit<'a, S: LineSink + 'static> {
 
 /// What a run's git step does with git's standard error and with a client gone.
 #[derive(Clone, Copy)]
-struct Mode {
+struct Mode<'f> {
     /// Whether git's standard error is forwarded; else it is read and dropped.
     forward: bool,
     /// Whether a failed forward ends git, and a client already gone keeps it from starting.
@@ -438,6 +445,20 @@ struct Mode {
     cap: usize,
     /// Whether git runs with the usual umask 022 in place of the box's 077 ([`shared_umask`]).
     shared: bool,
+    /// What git is fed on its standard input ([`run_fed`]); `None` for null.
+    feed: Option<&'f [u8]>,
+}
+
+impl Mode<'_> {
+    /// A step's usual mode: its standard error forwarded, a client gone ending it, its standard output kept up to
+    /// [`GIT_OUTPUT_CAP`], the box's umask, and no input.
+    const FORWARDED: Mode<'static> = Mode {
+        forward: true,
+        ends_on_gone: true,
+        cap: GIT_OUTPUT_CAP,
+        shared: false,
+        feed: None,
+    };
 }
 
 /// Sets the umask to 022, in a git step's child before its exec, so the files a checkout writes in the tree are moded
@@ -454,28 +475,48 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
     /// written to `record` while it runs when one is given.
     #[must_use]
     pub fn new(git: Git<'a>, lock: &str, output: &'a Arc<Output<S>>, record: Option<GroupRecord<'a>>, stamp: Stamp) -> RunGit<'a, S> {
-        let options = [
+        let mut options = vec![
             "-c".to_owned(),
             format!("core.hooksPath={lock}/hooks"),
             "-c".to_owned(),
             "core.fsmonitor=false".to_owned(),
             "-c".to_owned(),
             "core.attributesFile=".to_owned(),
-            "-c".to_owned(),
-            format!("lfs.storage={lock}/lfs"),
         ];
+        options.extend(CHECKOUT_PINS.iter().map(|word| (*word).to_owned()));
         RunGit {
             git,
             options,
+            storage: no_storage(lock),
             output,
             record,
             stamp,
         }
     }
 
-    /// The safety options, then `args`.
+    /// This run's git, every step of it pinned to the LFS storage `storage`, `lfs.storage=<a repo's scratch folder>`,
+    /// as every step of a repo with LFS content is; `None` keeps this git's own, the run's storage below its lock,
+    /// which cannot be made.
+    #[must_use]
+    pub fn storing_in(&self, storage: Option<&str>) -> RunGit<'a, S> {
+        RunGit {
+            git: self.git,
+            options: self.options.clone(),
+            storage: storage.map_or_else(|| self.storage.clone(), str::to_owned),
+            output: self.output,
+            record: self.record.clone(),
+            stamp: self.stamp,
+        }
+    }
+
+    /// The safety options and the LFS pins, then `args`.
     fn args<'s>(&'s self, args: &[&'s str]) -> Vec<&'s str> {
-        self.options.iter().map(String::as_str).chain(args.iter().copied()).collect()
+        self.options
+            .iter()
+            .map(String::as_str)
+            .chain(["-c", self.storage.as_str()])
+            .chain(args.iter().copied())
+            .collect()
     }
 
     /// Runs the step `step` of the class `class` with `args`, its standard error forwarded.
@@ -484,11 +525,52 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
     ///
     /// The failure of a git that did not run to an exit, or a client gone.
     pub fn forwarded(&self, step: &str, args: &[&str], class: GitClass) -> Result<Ran, Failed> {
+        self.ran_as(step, args, Mode::FORWARDED, class, &[])
+    }
+
+    /// Runs the step `step` of the class `class` with `args`, fed `feed` on its standard input when given, as the
+    /// Windows box's LFS listing feeds `git check-attr --stdin` and `git cat-file --batch`: its standard output, up to
+    /// `cap` bytes, when it exits 0, else its failure. An answer past `cap` fails the step, never cut short.
+    ///
+    /// # Errors
+    ///
+    /// The failure of a git that did not run to an exit, wrote past `cap` or exited non-zero, or a client gone.
+    pub fn fed(&self, step: &str, args: &[&str], (feed, cap): (Option<&[u8]>, usize), class: GitClass) -> Result<Vec<u8>, Failed> {
         let mode = Mode {
-            forward: true,
-            ends_on_gone: true,
-            cap: GIT_OUTPUT_CAP,
-            shared: false,
+            cap,
+            feed,
+            ..Mode::FORWARDED
+        };
+        let ran = self.ran_as(step, args, mode, class, &[])?;
+        self.passed(step, ran)
+    }
+
+    /// [`RunGit::fed`] for a step that writes the tree's files, git run with the umask 022 ([`shared_umask`]), as
+    /// [`RunGit::tree_step`] runs one.
+    ///
+    /// # Errors
+    ///
+    /// The failure of a git that did not run to an exit, wrote past `cap` or exited non-zero, or a client gone.
+    pub fn tree_fed(&self, step: &str, args: &[&str], (feed, cap): (Option<&[u8]>, usize), class: GitClass) -> Result<Vec<u8>, Failed> {
+        let mode = Mode {
+            cap,
+            feed,
+            shared: true,
+            ..Mode::FORWARDED
+        };
+        let ran = self.ran_as(step, args, mode, class, &[])?;
+        self.passed(step, ran)
+    }
+
+    /// [`RunGit::tree_step`], the step's run given back whatever its exit, so its caller reads the status.
+    ///
+    /// # Errors
+    ///
+    /// The failure of a git that did not run to an exit, or a client gone.
+    pub fn tree_ran(&self, step: &str, args: &[&str], class: GitClass) -> Result<Ran, Failed> {
+        let mode = Mode {
+            shared: true,
+            ..Mode::FORWARDED
         };
         self.ran_as(step, args, mode, class, &[])
     }
@@ -508,13 +590,7 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
     ///
     /// The failure of a git that did not run to an exit or exited non-zero, or a client gone.
     pub fn step_with(&self, step: &str, args: &[&str], class: GitClass, env: &[(&str, &str)]) -> Result<Vec<u8>, Failed> {
-        let mode = Mode {
-            forward: true,
-            ends_on_gone: true,
-            cap: GIT_OUTPUT_CAP,
-            shared: false,
-        };
-        let ran = self.ran_as(step, args, mode, class, env)?;
+        let ran = self.ran_as(step, args, Mode::FORWARDED, class, env)?;
         self.passed(step, ran)
     }
 
@@ -525,13 +601,7 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
     ///
     /// The failure of a git that did not run to an exit or exited non-zero, or a client gone.
     pub fn tree_step(&self, step: &str, args: &[&str], class: GitClass) -> Result<Vec<u8>, Failed> {
-        let mode = Mode {
-            forward: true,
-            ends_on_gone: true,
-            cap: GIT_OUTPUT_CAP,
-            shared: true,
-        };
-        let ran = self.ran_as(step, args, mode, class, &[])?;
+        let ran = self.tree_ran(step, args, class)?;
         self.passed(step, ran)
     }
 
@@ -543,10 +613,8 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
     /// The failure of a git that did not run to an exit or exited non-zero, or a client gone.
     pub fn step_whole(&self, step: &str, args: &[&str], class: GitClass) -> Result<Vec<u8>, Failed> {
         let mode = Mode {
-            forward: true,
-            ends_on_gone: true,
             cap: usize::MAX,
-            shared: false,
+            ..Mode::FORWARDED
         };
         let ran = self.ran_as(step, args, mode, class, &[])?;
         self.passed(step, ran)
@@ -561,9 +629,7 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
     pub fn quiet(&self, step: &str, args: &[&str], class: GitClass) -> Result<Ran, Failed> {
         let mode = Mode {
             forward: false,
-            ends_on_gone: true,
-            cap: GIT_OUTPUT_CAP,
-            shared: false,
+            ..Mode::FORWARDED
         };
         self.ran_as(step, args, mode, class, &[])
     }
@@ -577,10 +643,8 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
     /// The failure of a git that did not run to an exit or exited non-zero, or a client gone.
     pub fn bare_step(&self, step: &str, args: &[&str], class: GitClass) -> Result<(), Failed> {
         let mode = Mode {
-            forward: true,
             ends_on_gone: false,
-            cap: GIT_OUTPUT_CAP,
-            shared: false,
+            ..Mode::FORWARDED
         };
         let ran = self.ran_as(step, args, mode, class, &[])?;
         self.passed(step, ran).map(drop)
@@ -589,7 +653,7 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
     /// Runs the step `step` with `args` as `mode` says, to its exit or the bound of `class`, git given the variables
     /// `env` besides. A client gone, seen by a failed write of any kind or by a probe of the box's output, fails the step
     /// with [`client_gone`].
-    fn ran_as(&self, step: &str, args: &[&str], mode: Mode, class: GitClass, env: &[(&str, &str)]) -> Result<Ran, Failed> {
+    fn ran_as(&self, step: &str, args: &[&str], mode: Mode<'_>, class: GitClass, env: &[(&str, &str)]) -> Result<Ran, Failed> {
         if mode.ends_on_gone && self.output.client_gone_probe() {
             return Err(client_gone(step));
         }
@@ -620,7 +684,7 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
             on_leader_exit: None,
             processes: None,
         };
-        let ran = run_watched(command, &watch);
+        let ran = run_fed(command, &watch, mode.feed);
         if self.output.client_gone() {
             return Err(client_gone(step));
         }
@@ -1241,6 +1305,121 @@ mod tests {
             }
             let said = git.step("x", &words(&alias("printf %s \"$GIT_ATTR_NOSYSTEM\""))).expect("the alias runs");
             assert_eq!(said, b"1");
+        });
+    }
+
+    /// A step of a repo with no LFS scratch folder carries the checkout pins and the storage below the lock, which
+    /// cannot be made; one of a repo with a scratch folder carries that folder in its place.
+    #[test]
+    fn a_run_with_no_digest_keeps_the_no_storage_pin() {
+        let case = Case::new("no-digest");
+        let output = recording();
+        let lock = case.lock();
+        case.with_git(&output, |git| {
+            let config = |git: &RunGit<'_, RecordingSink>, key: &str| {
+                let said = git.step("git config", &["config", key]).expect("the option is set");
+                String::from_utf8_lossy(&said).trim_end().to_owned()
+            };
+            for (key, value) in [
+                ("lfs.storage", format!("{lock}/lfs")),
+                ("lfs.url", "http://127.0.0.1:0/".to_owned()),
+                ("filter.lfs.process", "git-lfs filter-process".to_owned()),
+                ("filter.lfs.required", "true".to_owned()),
+                ("core.hooksPath", format!("{lock}/hooks")),
+            ] {
+                assert_eq!(config(git, key), value, "{key}");
+            }
+            assert_eq!(config(&git.storing_in(None), "lfs.storage"), format!("{lock}/lfs"));
+            let scratch = git.storing_in(Some("lfs.storage=/scratch/k"));
+            assert_eq!(config(&scratch, "lfs.storage"), "/scratch/k");
+            assert_eq!(config(&scratch, "filter.lfs.required"), "true");
+            assert_eq!(config(&scratch, "core.hooksPath"), format!("{lock}/hooks"));
+        });
+    }
+
+    /// Every `GIT_LFS_*` variable starts with `GIT_`, so no git step inherits one: a smudge is never skipped, nor a
+    /// download error, whatever the box's own environment says.
+    #[test]
+    fn the_git_environment_has_no_git_lfs_variable() {
+        for name in ["GIT_LFS_SKIP_SMUDGE", "GIT_LFS_SKIP_DOWNLOAD_ERRORS", "GIT_LFS_PROGRESS"] {
+            assert!(crate::lines::is_git_variable(std::ffi::OsStr::new(name)), "{name}");
+        }
+    }
+
+    /// A step fed its standard input reads an answer past the 1 MiB other steps keep, up to the cap its caller gives,
+    /// and fails past that cap; a feed of 2 MiB, more than a pipe holds, is written whole.
+    #[test]
+    fn a_fed_git_step_reads_an_answer_larger_than_a_mebibyte() {
+        let case = Case::new("fed");
+        let output = recording();
+        let bare = case.parent().join("fed.git");
+        let bare = bare.to_str().expect("the temp folder is UTF-8");
+        let blob = vec![b'x'; 2 * 1024 * 1024];
+        case.with_git(&output, |git| {
+            git.step("init", &["init", "--bare", "-q", bare]).expect("the repository is made");
+            let dir = format!("--git-dir={bare}");
+            let id = git
+                .fed(
+                    "hash-object",
+                    &[&dir, "hash-object", "-w", "--stdin"],
+                    (Some(blob.as_slice()), 1024),
+                    GitClass::Short,
+                )
+                .expect("the blob is written");
+            let id = String::from_utf8_lossy(&id).trim_end().to_owned();
+            let feed = format!("{id}\n");
+            let batch = [dir.as_str(), "cat-file", "--batch"];
+            let said = git
+                .fed("cat-file", &batch, (Some(feed.as_bytes()), gate_inputs::OUTPUT_CAP), GitClass::Short)
+                .expect("the answer fits the cap");
+            let header = format!("{id} blob {}\n", blob.len());
+            assert_eq!(said.len(), header.len() + blob.len() + 1);
+            assert!(said.starts_with(header.as_bytes()), "the header first");
+            let failed = git
+                .fed("cat-file", &batch, (Some(feed.as_bytes()), blob.len()), GitClass::Short)
+                .expect_err("an answer past the cap fails");
+            assert_eq!(
+                failed.lines,
+                [format!("gate: remote cat-file failed: it printed more than {} bytes", blob.len())]
+            );
+        });
+    }
+
+    /// A feed and an answer both far past a pipe's size: `cat-file --batch` answers each id as it reads it, so a feed
+    /// written before the readers start would wait on an answer nobody reads. Such a deadlock blocks before the step's
+    /// watch starts, so nextest's slow-timeout is what catches it; the step bound only bounds a slow `cat-file`.
+    #[test]
+    fn a_fed_git_step_whose_feed_and_answer_both_pass_a_pipe_does_not_deadlock() {
+        let case = Case::new("fed-both");
+        let output = recording();
+        let bare = case.parent().join("fed-both.git");
+        let bare = bare.to_str().expect("the temp folder is UTF-8");
+        test_limit::set(Duration::from_secs(60));
+        case.with_git(&output, |git| {
+            git.step("init", &["init", "--bare", "-q", bare]).expect("the repository is made");
+            let dir = format!("--git-dir={bare}");
+            let blob = vec![b'y'; 1024];
+            let id = git
+                .fed(
+                    "hash-object",
+                    &[&dir, "hash-object", "-w", "--stdin"],
+                    (Some(blob.as_slice()), 1024),
+                    GitClass::Short,
+                )
+                .expect("the blob is written");
+            let line = format!("{}\n", String::from_utf8_lossy(&id).trim_end());
+            let ids = 5000;
+            let feed = line.repeat(ids);
+            let said = git
+                .fed(
+                    "cat-file",
+                    &[&dir, "cat-file", "--batch"],
+                    (Some(feed.as_bytes()), gate_inputs::OUTPUT_CAP),
+                    GitClass::Short,
+                )
+                .expect("the step answers every id");
+            let header = format!("{} blob {}\n", line.trim_end(), blob.len());
+            assert_eq!(said.len(), ids * (header.len() + blob.len() + 1), "every id answered");
         });
     }
 }

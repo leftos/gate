@@ -1,7 +1,8 @@
 //! A run's back commits, as the Windows box makes them: each repo's tree the command left committed on its snapshot's
 //! `HEAD` with the payload's identity and pushed to its bare repository's `refs/gate-back/<key>`, which the PC fetches,
-//! all or none; nothing for a tree the command left unchanged. Every git step is the run's own ([`run_git`]), with the attribute and LFS storage
-//! pins its checkout ran with, its group recorded in `<work>.pgid`.
+//! all or none; nothing for a tree the command left unchanged. Every git step is the run's own ([`run_git`]), with the
+//! attribute and LFS pins its checkout ran with: each repo's LFS scratch folder for a repo with LFS content, else the
+//! storage below the lock, which cannot be made ([`RunGit::storing_in`]); its group recorded in `<work>.pgid`.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -9,11 +10,13 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
+use gate_inputs::lfs::NO_STORAGE_ADD;
+
 use crate::command::removed_if_held;
 use crate::console::{GAT, LineSink, Output, Stream};
 use crate::files::{self, HeldLock};
 use crate::git::{Failed, GitClass, RunGit};
-use crate::run::{Repo, Request, back_ref_cleared, run_git};
+use crate::run::{Ready, Repo, Request, back_ref_cleared, names_lfs, run_git};
 
 /// The back commit's message, as the Windows box writes it.
 const MESSAGE: &str = "gate-remote back";
@@ -32,22 +35,21 @@ pub enum BackFailed {
 /// ([`repo_back_commit`]), then each pushed, and a failed push deleting every back ref this run pushed and, on a pair
 /// run, the failing repo's own ([`undone`]), so the PC finds a back commit of every changed repo or of none; a work
 /// lock found lost before or after a push deletes nothing, as another run may hold the back refs then. All under
-/// the work lock `lock`, git found along `login_path` (the box's own `PATH` for `None`), its lines said through
-/// `output`. Each repo's commit in the order of [`Request::repos`], `None` for a repo whose tree is unchanged.
+/// the run `ready`'s work lock, git found along its login `PATH` (the box's own for `None`), each repo's steps pinned to
+/// its LFS storage ([`crate::lfs::RunLfs::storage_of`]), its lines said through `output`. Each repo's commit in the
+/// order of [`Request::repos`], `None` for a repo whose tree is unchanged.
 ///
 /// # Errors
 ///
 /// Why a commit was not made or pushed.
-pub fn back_commit<S: LineSink + 'static>(
-    request: &Request<'_>,
-    lock: &HeldLock,
-    login_path: Option<&str>,
-    output: &Arc<Output<S>>,
-) -> Result<Vec<Option<String>>, BackFailed> {
-    let git = run_git(request, lock, login_path, output);
+pub fn back_commit<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>) -> Result<Vec<Option<String>>, BackFailed> {
+    let (request, lock) = (&ready.request, &ready.lock);
+    let git = run_git(request, lock, ready.login_path.as_deref(), output);
     let mut commits = Vec::with_capacity(1 + request.siblings.len());
     for repo in request.repos() {
-        commits.push(repo_back_commit(request, repo, lock, &git, output)?);
+        let storage = ready.lfs.storage_of(&repo.tree);
+        let pinned = git.storing_in(storage);
+        commits.push(repo_back_commit(request, (repo, storage.is_some()), lock, &pinned, output)?);
     }
     let mut pushed = Vec::with_capacity(commits.len());
     for (repo, commit) in request.repos().zip(&commits) {
@@ -84,21 +86,17 @@ pub fn back_commit<S: LineSink + 'static>(
 }
 
 /// The `/`-separated paths the main repo's back commit `commit` changes against `HEAD`, as the Windows box's
-/// `back_paths` reads them: `git diff-tree --name-only -r -z` in the main repo's tree, a step of the run's own git
-/// ([`run_git`]) under the work lock `lock`, found along `login_path`, its group recorded so `box stop` ends it.
+/// `back_paths` reads them: `git diff-tree --name-only -r -z` in the main repo's tree, a step of the run `ready`'s own
+/// git ([`run_git`]) under its work lock, found along its login `PATH`, pinned to the main repo's LFS storage, its group
+/// recorded so `box stop` ends it.
 ///
 /// # Errors
 ///
 /// Why they could not be read: the step's failure, or a path that is not UTF-8.
-pub fn back_paths<S: LineSink + 'static>(
-    request: &Request<'_>,
-    lock: &HeldLock,
-    login_path: Option<&str>,
-    output: &Arc<Output<S>>,
-    commit: &str,
-) -> Result<Vec<String>, BackFailed> {
-    let git = run_git(request, lock, login_path, output);
+pub fn back_paths<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, commit: &str) -> Result<Vec<String>, BackFailed> {
+    let request = &ready.request;
     let repo = &request.main;
+    let git = run_git(request, &ready.lock, ready.login_path.as_deref(), output).storing_in(ready.lfs.storage_of(&repo.tree));
     let tree = repo.git_tree();
     let args = tree.args(&["diff-tree", "--name-only", "-r", "-z", "HEAD", commit]);
     let said = git
@@ -134,10 +132,13 @@ fn undone<S: LineSink + 'static>(request: &Request<'_>, pushed: &[&Repo<'_>], gi
 /// there and the lock held, so a vanished copy never commits an empty tree. The copy is removed after while the lock is
 /// held ([`removed_if_held`]), a removal that fails said and failing nothing; the run's one copy is used by each repo
 /// in turn. A tree equal to `HEAD^{tree}` is no commit; else `commit-tree -p HEAD`, the lock looked at before it. Else
-/// why the commit was not made.
+/// why the commit was not made: on a repo with no LFS scratch folder (`scratch` false) whose attributes name the LFS
+/// filter ([`names_lfs`]), a failed `add -A` says the Windows box's [`NO_STORAGE_ADD`], as git-lfs's clean found no
+/// storage it could make. With a scratch folder, git-lfs's clean of a file the command changed writes its object into
+/// that folder, which the run's end removes: the back commit carries the file's pointer, as on the Windows box.
 fn repo_back_commit<S: LineSink + 'static>(
     request: &Request<'_>,
-    repo: &Repo<'_>,
+    (repo, scratch): (&Repo<'_>, bool),
     lock: &HeldLock,
     git: &RunGit<'_, S>,
     output: &Arc<Output<S>>,
@@ -149,6 +150,16 @@ fn repo_back_commit<S: LineSink + 'static>(
     let (add, write_tree) = (repo.step("add"), repo.step("write-tree"));
     let written = git
         .step_with(&add, &tree.args(&["add", "-A"]), GitClass::Long, &index)
+        .map_err(|unadded| {
+            if scratch || output.client_gone() {
+                return unadded;
+            }
+            match names_lfs(git, repo, output) {
+                Ok(true) => Failed::line(NO_STORAGE_ADD.to_owned()),
+                Ok(false) => unadded,
+                Err(gone) => gone,
+            }
+        })
         .and_then(|_| copy_still_there(request, lock, &write_tree))
         .and_then(|()| git.step_with(&write_tree, &tree.args(&["write-tree"]), GitClass::Short, &index))
         .and_then(|said| first_line(&write_tree, &said));

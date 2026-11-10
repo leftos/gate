@@ -28,7 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use gate_args::{BoxSeams, is_godot_console};
-use gate_inputs::lfs::{no_storage, pointers_of};
+use gate_inputs::lfs::{ATTRIBUTES_FILES, RECHECKOUT_OUTPUT, no_storage, pointers_of};
 use gate_router::{GATE_FOLDER_MARK, escaped};
 use gate_watchdog::{Kill, Pump, is_wsl_command};
 use gate_win32::{
@@ -85,13 +85,8 @@ pub(super) const CLOSED_STATUS: u32 = 255;
 
 /// The git step that deletes a repo's back ref ([`WorkGit::clear_back_ref`]).
 const BACK_REF_RESET: &str = "back ref reset";
-/// The most bytes of standard output the LFS post-check's quiet checkout may print.
-const RECHECKOUT_OUTPUT: usize = 64 * 1024;
 /// The most a listing of a tree's changed paths may print ([`WorkGit::tree_changes`]).
 const TREE_LISTING: usize = 1024 * 1024;
-/// The pathspec of every `.gitattributes` file at any depth, whatever the case of its name, as NTFS opens a file named
-/// `.GitAttributes` as a folder's attributes file.
-const ATTRIBUTES_FILES: &str = ":(glob,icase)**/.gitattributes";
 
 /// Why a run's checkout did not end with its snapshot checked out.
 enum NotCheckedOut {

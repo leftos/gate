@@ -112,7 +112,7 @@ pub enum Ending {
 /// name, the group, then the group's session in decimal, written from the child before its exec, then rewritten once
 /// the child started with its start as well ([`crate::lines::job_record`]). It is written and removed only while the
 /// run's work lock is held.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct GroupRecord<'a> {
     path: PathBuf,
     job: String,
@@ -232,14 +232,27 @@ pub fn run_bounded(command: Command, cap: usize, deadline: Instant) -> Result<Ra
 ///
 /// [`NotRan`], as [`run_bounded`] gives it, or a group record that could not be written or removed.
 pub fn run_watched(command: Command, watch: &Watch<'_>) -> Result<Ran, NotRan> {
+    run_fed(command, watch, None)
+}
+
+/// [`run_watched`], the program's standard input fed `feed` when one is given, in place of null: written whole by a
+/// thread of its own, `git-feed` ([`feed_started`]), while the readers' threads read the program's output, so a feed
+/// larger than a pipe holds never waits on output nobody reads, and the pipe closed after it, so the program reads its
+/// end. Its standard output is still kept up to `watch.cap` and no more: a larger answer is [`NotRan::OverCap`].
+///
+/// # Errors
+///
+/// [`NotRan`], as [`run_watched`] gives it.
+pub fn run_fed(command: Command, watch: &Watch<'_>, feed: Option<&[u8]>) -> Result<Ran, NotRan> {
     let image = image_of(Path::new(command.get_program()));
-    let mut child = spawned_recorded(command, watch)?;
+    let mut child = spawned_recorded(command, watch, feed.is_some())?;
     let Ok(group) = i32::try_from(child.id()) else {
         // A pid that is no pid_t cannot be signalled as a group; the child alone is ended.
         let _ = child.kill();
         let _ = child.wait();
         return Err(NotRan::Failed(format!("the process id {} is no pid_t", child.id())));
     };
+    let fed = feed.map_or(Ok(()), |feed| feed_started(&mut child, feed));
     // Before its readers start, so no line of its own comes before its spawn.
     if let Some(processes) = watch.processes {
         processes.leader_started(group, image.as_deref());
@@ -247,7 +260,10 @@ pub fn run_watched(command: Command, watch: &Watch<'_>) -> Result<Ran, NotRan> {
     let mut readers = Readers::default();
     let started = readers_started(&mut readers, &mut child, watch);
     let leader = Leader { child, group };
-    let why = stopped_watching(&leader, group, started, watch);
+    let why = match fed {
+        Ok(()) => stopped_watching(&leader, group, started, watch),
+        Err(error) => unfed(&error, watch),
+    };
     let settled = settled(&leader, &why, watch.ending, KILL_WAIT);
     if let Some(processes) = watch.processes {
         processes.group_ended();
@@ -294,7 +310,9 @@ pub fn run_watched(command: Command, watch: &Watch<'_>) -> Result<Ran, NotRan> {
     let unread = |error: io::Error| NotRan::Failed(format!("its output could not be read: {error}"));
     let (stdout, over) = kept.next().unwrap_or(Ok((Vec::new(), false))).map_err(unread)?;
     let (stderr, _) = kept.next().unwrap_or(Ok((Vec::new(), false))).map_err(unread)?;
-    if over {
+    // A fed step is judged by its exit first, as the Windows box's fed git steps are: one that exits non-zero fails
+    // with its status, its output past the cap or not.
+    if over && (feed.is_none() || status.success()) {
         return Err(NotRan::OverCap);
     }
     Ok(Ran {
@@ -347,16 +365,45 @@ fn stopped_watching(leader: &impl Group, group: i32, started: io::Result<()>, wa
     why
 }
 
-/// Starts `command` as the leader of a process group of its own, standard input null, its output piped, its group
-/// written to `watch.record` from the child before the program runs, the work lock checked first.
+/// Writes `feed` whole to `child`'s piped standard input from a thread of its own, `git-feed`, then closes the pipe.
+/// The thread is not joined: a program that exits or closes its input early ends the write with a broken pipe, which
+/// ends the thread, and the run's reading of the program's exit and output decides the step. Else why the thread could
+/// not start: the pipe is then closed at once, and the caller ends the program's group ([`unfed`]).
+fn feed_started(child: &mut Child, feed: &[u8]) -> io::Result<()> {
+    let Some(mut stdin) = child.stdin.take() else {
+        return Ok(());
+    };
+    let bytes = feed.to_vec();
+    thread::Builder::new()
+        .name("git-feed".to_owned())
+        .spawn(move || {
+            // A broken pipe is the program's own choice to stop reading; its exit and output decide the step.
+            let _ = io::Write::write_all(&mut stdin, &bytes);
+        })
+        .map(drop)
+}
+
+/// Why a fed run whose feeding thread could not start, with `error`, stops at once, as a run whose readers did not
+/// start stops ([`stopped_watching`]): `watch.on_leader_exit` called once, `watch.on_started` never, and the group
+/// then ended as a failure, so the step fails rather than judging an answer to an empty input.
+fn unfed(error: &io::Error, watch: &Watch<'_>) -> Why {
+    if let Some(hook) = watch.on_leader_exit {
+        hook();
+    }
+    Why::Failed(format!("its input could not be fed: {error}"))
+}
+
+/// Starts `command` as the leader of a process group of its own, standard input null, or piped when it is `fed`, its
+/// output piped, its group written to `watch.record` from the child before the program runs, the work lock checked
+/// first.
 ///
 /// # Errors
 ///
 /// The work lock no longer held, the record's temp file not made, or the start failing ([`NotRan::Start`]), the
 /// record and its temp file then removed.
-fn spawned_recorded(mut command: Command, watch: &Watch<'_>) -> Result<Child, NotRan> {
+fn spawned_recorded(mut command: Command, watch: &Watch<'_>, fed: bool) -> Result<Child, NotRan> {
     command
-        .stdin(Stdio::null())
+        .stdin(if fed { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);

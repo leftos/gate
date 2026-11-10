@@ -10,8 +10,10 @@
 //! followed, the box user's own, of mode 0600 and of the manifest's size. Every folder of the store (`lfs`, `objects`
 //! and the two below it) is made 0700, or adopted only when it is the box user's own and open to no other account;
 //! one that is not is refused, never moved aside. Both steps take the store's lock, `{Bare}/lfs.lock`, a plain file
-//! made 0600 beneath the bare repository, shared (`flock(LOCK_SH)`, waiting), for their whole body, so a prune that
-//! takes it alone waits for them all. The diff holds the work folder's lock for its whole body; the put readies the
+//! made 0600 beneath the bare repository, shared (`flock(LOCK_SH)`, waiting), for their whole body. A put only adds
+//! objects, never replacing or deleting one, so puts, diffs and runs need not exclude each other; the lock exists so
+//! that a future deleter of store objects that takes it exclusively waits for every run, put and diff. No prune or
+//! sweep of the store exists today. The diff holds the work folder's lock for its whole body; the put readies the
 //! store and unpacks its archive into a stage of its own, `{root}/lfs-stage/{key}-{nonce}`, before it takes the work
 //! folder's lock, refuses the whole archive when a member is not an object the manifest names, once, hashing to its
 //! name and of its size, and installs each object under the work folder's lock by a hard link that never replaces:
@@ -23,22 +25,25 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::fs::File;
-use std::io::{self, BufRead};
+use std::fs::{self as std_fs, File, OpenOptions};
+use std::hash::{BuildHasher, RandomState};
+use std::io::{self, BufRead, Read};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use gate_args::BoxSeams;
 use gate_inputs::archive::{Entry, Limits, MEMBER_LIMIT, extract};
-use gate_inputs::lfs::{LFS_BUDGET, Wanted, checked, parsed_manifest};
+use gate_inputs::lfs::{LFS_BUDGET, Listed, Object, POINTER_MOST, Pointer, Wanted, checked, is_wrong_file, manifest_digest, parsed_manifest};
 use gate_inputs::manifest::{HeldBy, MANIFEST_LIMIT};
-use gate_wire::{LFS_INSTALLED, LFS_NEED, LFS_OID, Payload, Refusal, ordinal_upper, refused_line};
+use gate_wire::{LFS_INSTALLED, LFS_NEED, LFS_OID, Payload, Refusal, escaped, ordinal_upper, refused_line};
 
 use crate::beneath::{self, Folder};
 use crate::console::Console;
 use crate::drain;
 use crate::files;
-use crate::inputs::{Asked, Facts, Stage, Staging, Step, locked, made_stage_in, root_checked};
+use crate::git::Failed;
+use crate::inputs::{Asked, Facts, STAGE_SUFFIX_DIGITS, Stage, Staging, Step, locked, made_stage_in, made_stage_named, root_checked};
 use crate::lines::{FAILED_STATUS, OPEN_TO_OTHERS, USAGE_STATUS, channel_refusal, lfs_failed_line, lfs_not_the_object, lfs_store_flaw, owner_flaw};
 use crate::request::{Unread, bounded_line};
 use crate::run::REFUSED_STATUS;
@@ -178,17 +183,25 @@ impl Store {
     /// lock taken shared ([`store_lock`]), then `lfs` and `lfs/objects` each made or adopted ([`store_folder`]). Else
     /// why not.
     fn opened(root: &str, bare: &str) -> Result<Store, String> {
-        let bare_path = Path::new(bare);
-        let name = bare_path.file_name().ok_or_else(|| format!("{bare} names no folder"))?;
-        let held = Folder::open_root(Path::new(root))
-            .and_then(|root| root.open_child(name))
-            .map_err(|error| format!("cannot open {bare}: {error}"))?;
-        let lock = store_lock(&held, &bare_path.join(STORE_LOCK))?;
-        let lfs_path = bare_path.join("lfs");
+        let (held, lock) = bare_locked(root, bare)?;
+        let lfs_path = Path::new(bare).join("lfs");
         let lfs = store_folder(&held, &lfs_path)?;
         let path = lfs_path.join("objects");
         let objects = store_folder(&lfs, &path)?;
         Ok(Store { _lock: lock, objects, path })
+    }
+
+    /// [`Store::opened`] for a run, which writes nothing of the store: `lfs` and `lfs/objects` found beneath the bare
+    /// repository, each the box user's own and private, a link never followed ([`found_folder`]), never made; `None`
+    /// when either is missing, so the store holds no object. Else why not.
+    fn found(root: &str, bare: &str) -> Result<Option<Store>, String> {
+        let (held, lock) = bare_locked(root, bare)?;
+        let lfs_path = Path::new(bare).join("lfs");
+        let Some(lfs) = found_folder(&held, &lfs_path)? else {
+            return Ok(None);
+        };
+        let path = lfs_path.join("objects");
+        Ok(found_folder(&lfs, &path)?.map(|objects| Store { _lock: lock, objects, path }))
     }
 
     /// The folder `{oid[0..2]}/{oid[2..4]}` the object `oid` lives in, each made or adopted ([`store_folder`]); else
@@ -210,6 +223,18 @@ impl Store {
         }
         Ok(lacking)
     }
+}
+
+/// The bare repository `bare`, `<root>/<name>.git`, held beneath the judged work root `root`, and its store's lock taken
+/// shared ([`store_lock`]). Else why not.
+fn bare_locked(root: &str, bare: &str) -> Result<(Folder, File), String> {
+    let bare_path = Path::new(bare);
+    let name = bare_path.file_name().ok_or_else(|| format!("{bare} names no folder"))?;
+    let held = Folder::open_root(Path::new(root))
+        .and_then(|root| root.open_child(name))
+        .map_err(|error| format!("cannot open {bare}: {error}"))?;
+    let lock = store_lock(&held, &bare_path.join(STORE_LOCK))?;
+    Ok((held, lock))
 }
 
 /// Why the file or folder `stat` says, at `path`, is not the box user's own and open to no other account
@@ -238,7 +263,8 @@ fn store_folder(parent: &Folder, path: &Path) -> Result<Folder, String> {
 
 /// The store's lock at `path`, `{bare}/lfs.lock`, beneath the held bare repository `bare`: made new, 0600, else the
 /// plain file there opened as itself, a link never followed, and adopted only when it is the box user's own and open
-/// to no other account; then locked shared ([`files::flock_shared`]), waiting while a prune holds it alone. Else why not.
+/// to no other account; then locked shared ([`files::flock_shared`]), waiting while an exclusive holder has it. Else
+/// why not.
 fn store_lock(bare: &Folder, path: &Path) -> Result<File, String> {
     let cannot = |error: io::Error| format!("cannot open the LFS store lock {}: {error}", path.display());
     let name = OsStr::new(STORE_LOCK);
@@ -411,6 +437,266 @@ fn installed_one(store: &Store, files: &Folder, left: &BTreeMap<String, Facts>, 
     files
         .remove_child(name, false)
         .map_err(|error| format!("cannot remove the staged copy of the LFS object {}: {error}", wanted.oid))
+}
+
+/// The folder below the box's root that holds each run's LFS scratch folder and its lock file,
+/// `{root}/lfs-run/{key}-{nonce}-{random}`, as the Windows box names it.
+const RUN_STAGES: &str = "lfs-run";
+
+/// Why a run's checkout did not end with its trees checked out, as the Windows box tells them apart.
+#[derive(Debug)]
+pub(crate) enum NotCheckedOut {
+    /// A git step failed, said as these lines and with this status.
+    Failed(Failed),
+    /// The run is refused `lfs`: its LFS content is not what the snapshot needs, for this reason.
+    Refused(String),
+    /// The run is refused `lfs`: its LFS scratch folder could not be made, for this reason.
+    NoScratch(String),
+}
+
+impl From<Failed> for NotCheckedOut {
+    fn from(failed: Failed) -> NotCheckedOut {
+        NotCheckedOut::Failed(failed)
+    }
+}
+
+/// One repo's covered LFS content: its tree, its snapshot's pointers, its store held under its lock, shared, when it
+/// has a digest, and its scratch folder once made, with the `lfs.storage` pin naming it.
+struct Covered {
+    tree: String,
+    pointers: Vec<Pointer>,
+    /// The repo's store, its lock held shared; `None` for a repo with no digest whose snapshot names the filter
+    /// ([`RunLfs::declared`]), which reads no store object.
+    _store: Option<Store>,
+    scratch: Option<(Stage, String)>,
+}
+
+/// A run's LFS content, as the Windows box's `RunLfs` holds it from each repo's cover check through the back commit:
+/// each covered repo's store lock taken shared, in repo order, the main repo's first, and held, as are its pointers
+/// and its own scratch folder. Unlike the Windows box, no object is held open: an open file keeps no other process of
+/// the box user from deleting it, so the objects are checked once, by the cover check. That single look stays true
+/// because no box code replaces or deletes a store object: a put only adds objects, by a link that never replaces. The
+/// shared store lock excludes no put; it exists so that a future deleter (a prune or sweep of the store, none of which
+/// exists today) that takes it exclusively waits for every run, put and diff. A repo with no LFS digest covers nothing;
+/// it has a scratch folder only when its snapshot names the filter ([`RunLfs::declared`]), else each of its steps keeps
+/// the storage below the lock ([`crate::git::RunGit::storing_in`]).
+pub(crate) struct RunLfs {
+    covered: Vec<Covered>,
+}
+
+impl RunLfs {
+    /// The LFS state of a run before any repo's snapshot is read: nothing covered.
+    pub(crate) fn without_content() -> RunLfs {
+        RunLfs { covered: Vec::new() }
+    }
+
+    /// The `lfs.storage` pin of the repo whose tree is `tree`: its scratch folder; `None` for a repo with no scratch
+    /// folder.
+    pub(crate) fn storage_of(&self, tree: &str) -> Option<&str> {
+        self.covered
+            .iter()
+            .find(|covered| covered.tree == tree)
+            .and_then(|covered| covered.scratch.as_ref())
+            .map(|(_, storage)| storage.as_str())
+    }
+
+    /// The pointers of the covered repo whose tree is `tree`; none for a repo with no LFS digest.
+    pub(crate) fn pointers_in(&self, tree: &str) -> &[Pointer] {
+        self.covered
+            .iter()
+            .find(|covered| covered.tree == tree)
+            .map_or(&[], |covered| covered.pointers.as_slice())
+    }
+
+    /// The LFS content of the repo whose tree is `tree`, which sent the LFS digest `sent`, checked against its
+    /// snapshot's pointers `listed` as the Windows box's cover check checks it and added to the run's: the digest must
+    /// be that of the manifest of the objects the pointers name ([`manifest_digest`]); then the store of the bare
+    /// repository `bare`, beneath the work root `root`, found under its lock, taken shared and held to the run's end,
+    /// none of its folders made ([`Store::found`]), must hold each object ([`Store::holds_object`]). `sibling` says the digest came from
+    /// `SiblingLfsDigests`, which the refusal of a digest with no pointers names. Else why the run is refused `lfs`.
+    pub(crate) fn covered(&mut self, root: &str, (tree, bare): (&str, &str), (sent, sibling): (&str, bool), listed: &Listed) -> Result<(), String> {
+        if listed.pointers.is_empty() {
+            let key = if sibling { "a SiblingLfsDigests entry" } else { "an LfsDigest" };
+            return Err(format!("the run sent {key}, and its snapshot holds no LFS pointer"));
+        }
+        let digest = manifest_digest(&listed.objects)?;
+        if digest != sent {
+            return Err(format!("the snapshot's LFS manifest has the digest {digest}, not the run's {sent}"));
+        }
+        // Found, never made: a run writes nothing of the store, and a store with no folders holds no object.
+        let store = Store::found(root, bare)?;
+        for object in &listed.objects {
+            if !store.as_ref().map_or(Ok(false), |store| store.holds_object(object))? {
+                return Err(format!("the LFS store holds no object {} for {}", object.oid, escaped(&object.path)));
+            }
+        }
+        self.covered.push(Covered {
+            tree: tree.to_owned(),
+            pointers: listed.pointers.clone(),
+            _store: store,
+            scratch: None,
+        });
+        Ok(())
+    }
+
+    /// The repo whose tree is `tree`, which sent no LFS digest and whose snapshot's attributes name the LFS filter,
+    /// added as the Windows box's `lfs_scratch` takes it: no pointer to cover and no store lock, only the scratch
+    /// folder made next ([`RunLfs::with_scratch`]), so a file committed as its own bytes under the filter checks out as
+    /// those bytes and a file the command adds under it is cleaned into that folder.
+    pub(crate) fn declared(&mut self, tree: &str) {
+        self.covered.push(Covered {
+            tree: tree.to_owned(),
+            pointers: Vec::new(),
+            _store: None,
+            scratch: None,
+        });
+    }
+
+    /// The scratch folder of the repo covered last, made for the run of `key` and `nonce` beneath the work root `root`:
+    /// `{root}/lfs-run/{key}-{nonce}-{random}`, a random 64-bit value last in [`STAGE_SUFFIX_DIGITS`] lower-case hex
+    /// digits, so a run that reuses a killed run's nonce makes its own; made new, 0700, beneath the root's descriptor and
+    /// locked as a put's stage is ([`made_stage_named`]), so the stages' sweep removes it only once a day old and its
+    /// lock free, each line of that sweep said through `say`. git-lfs keeps the repo's objects for the run there, hard
+    /// links into the store. Else why it cannot be made.
+    pub(crate) fn with_scratch(&mut self, root: &str, (key, nonce): (&str, &str), say: &mut dyn FnMut(&str)) -> Result<(), String> {
+        let Some(last) = self.covered.last_mut() else {
+            return Ok(());
+        };
+        let now = SystemTime::now();
+        // Drawn from the process's randomly seeded hasher, the time and the process id, as the Windows box draws it.
+        let random = RandomState::new().hash_one((now.duration_since(UNIX_EPOCH).map_or(0, |since| since.as_nanos()), std::process::id()));
+        let width = STAGE_SUFFIX_DIGITS;
+        let stage = made_stage_named((root, RUN_STAGES), &format!("{key}-{nonce}-{random:0width$x}"), now, say)?;
+        let storage = format!("lfs.storage={}", stage.path.display());
+        last.scratch = Some((stage, storage));
+        Ok(())
+    }
+
+    /// Removes each scratch folder, which holds only links into the store, so the objects stay, then lets each store's
+    /// lock go; a removal that fails is said through `say`, as the Windows box says it.
+    pub(crate) fn close(&mut self, say: &mut dyn FnMut(&str)) {
+        for covered in self.covered.drain(..) {
+            if let Some((stage, _)) = covered.scratch
+                && let Err(why) = stage.removed()
+            {
+                say(&format!("gate: remote could not remove the LFS scratch folder: {}", escaped(&why)));
+            }
+        }
+    }
+}
+
+impl Drop for RunLfs {
+    /// The unwind backstop: every way out of a run closes its LFS state with the run's output first, so a failed
+    /// removal is said; only an unwind reaches here with a scratch folder left, and with no output to say it on, a
+    /// removal that fails is silent and leaves the folder to the stages' sweep.
+    fn drop(&mut self) {
+        self.close(&mut |_| {});
+    }
+}
+
+impl Store {
+    /// Whether the store holds `object` ([`holds`]): its folders `{oid[0..2]}/{oid[2..4]}` found beneath the held
+    /// `lfs/objects`, never made, each the box user's own and private, a link never followed. Else why it cannot be
+    /// looked at.
+    fn holds_object(&self, object: &Object) -> Result<bool, String> {
+        let (first, second) = (object.oid.get(..2).unwrap_or_default(), object.oid.get(2..4).unwrap_or_default());
+        let first_path = self.path.join(first);
+        let Some(outer) = found_folder(&self.objects, &first_path)? else {
+            return Ok(false);
+        };
+        let Some(inner) = found_folder(&outer, &first_path.join(second))? else {
+            return Ok(false);
+        };
+        let wanted = Wanted {
+            oid: object.oid.clone(),
+            size: object.size,
+        };
+        holds(&inner, &wanted)
+    }
+}
+
+/// The store folder at `path`, named by its last part in the held folder `parent`, opened as itself, a link never
+/// followed, when it is the box user's own and open to no other account ([`owned_private`]); `None` when nothing has
+/// its name. Else why not.
+fn found_folder(parent: &Folder, path: &Path) -> Result<Option<Folder>, String> {
+    let cannot = |error: io::Error| format!("cannot open the LFS store folder {}: {error}", path.display());
+    let found = match parent.open_child(path.file_name().unwrap_or_default()) {
+        Ok(found) => found,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(cannot(error)),
+    };
+    owned_private(&found.stat().map_err(cannot)?, path)?;
+    Ok(Some(found))
+}
+
+/// The post-check of the tree `tree` after its checkout, as the Windows box's `lfs_post_check` runs it: every pointer
+/// of `pointers` must be a plain file of its object's size and not its own pointer text ([`wrong_files`]); the wrong
+/// ones are deleted, `recheckout` is called once with their `/`-separated paths, each ended by a NUL, to check them out
+/// again, and each is checked again, judged by that check alone, never by the checkout's status nor by `git status`:
+/// the re-checkout is `git checkout` of those paths, which fails over a missing object, but attributes the snapshot's
+/// listing did not see (an untracked `sub/.gitattributes` saying `-filter`, left by the last command: a checkout falls
+/// back to the tree's attributes where the index has none, and the clean runs only after the post-check) leave pointer
+/// text with exit 0. Else the checkout's
+/// failure, or the refusal naming the first file still wrong.
+pub(crate) fn post_checked(tree: &str, pointers: &[Pointer], recheckout: impl FnOnce(&[u8]) -> Result<(), Failed>) -> Result<(), NotCheckedOut> {
+    let wrong = wrong_files(tree, pointers);
+    if wrong.is_empty() {
+        return Ok(());
+    }
+    deleted_files(tree, &wrong).map_err(NotCheckedOut::Refused)?;
+    let feed: Vec<u8> = wrong.iter().flat_map(|pointer| pointer.path.bytes().chain([0])).collect();
+    recheckout(&feed)?;
+    let still = wrong_files(tree, pointers);
+    match still.first() {
+        None => Ok(()),
+        Some(first) => Err(NotCheckedOut::Refused(format!(
+            "{} LFS file(s) are not their content after the checkout, {} among them",
+            still.len(),
+            escaped(&first.path)
+        ))),
+    }
+}
+
+/// The pointers of `pointers` whose path in the tree `tree` is not a plain file of the pointer's size, or is one of at
+/// most [`POINTER_MOST`] bytes holding that very pointer ([`is_wrong_file`]), in their order: a missing file, an
+/// unreadable one or a link among them.
+fn wrong_files<'p>(tree: &str, pointers: &'p [Pointer]) -> Vec<&'p Pointer> {
+    pointers
+        .iter()
+        .filter(|pointer| {
+            let path = Path::new(tree).join(&pointer.path);
+            let size = std_fs::symlink_metadata(&path)
+                .ok()
+                .filter(std_fs::Metadata::is_file)
+                .map(|metadata| metadata.len());
+            is_wrong_file(size, pointer, || head_of(&path))
+        })
+        .collect()
+}
+
+/// At most [`POINTER_MOST`] + 1 bytes of the file `path`, from its start, opened with no link followed and without
+/// waiting on a FIFO; else why it cannot be read.
+fn head_of(path: &Path) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .and_then(|file| file.take(POINTER_MOST + 1).read_to_end(&mut bytes))?;
+    Ok(bytes)
+}
+
+/// Deletes the file of each of `wrong` in the tree `tree`, one already gone taken; else why one could not be deleted.
+fn deleted_files(tree: &str, wrong: &[&Pointer]) -> Result<(), String> {
+    for pointer in wrong {
+        match std_fs::remove_file(Path::new(tree).join(&pointer.path)) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                return Err(format!("cannot delete {} to check it out again: {error}", escaped(&pointer.path)));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1165,5 +1451,84 @@ mod tests {
         );
         assert!(console.out.is_empty(), "{:?}", console.out);
         assert_eq!(mode_of(&objects), 0o755, "the folder is left as it is");
+    }
+
+    /// The content of the post-check's one LFS file.
+    const CONTENT: &[u8] = b"the real LFS content\n";
+
+    /// A tree of the case `case` holding `big.bin` as its pointer's own text, as a checkout whose stat found it clean
+    /// leaves it; the tree and that pointer.
+    fn tree_with_a_pointer(case: &Case) -> (String, super::Pointer) {
+        let (oid, _) = sha256_of(CONTENT).expect("the content is hashed");
+        let tree = case.work();
+        fs::create_dir_all(&tree).expect("the tree is made");
+        let text = format!("version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {}\n", CONTENT.len());
+        fs::write(format!("{tree}/big.bin"), text).expect("the pointer is written");
+        let pointer = super::Pointer {
+            path: "big.bin".to_owned(),
+            oid,
+            size: u64::try_from(CONTENT.len()).expect("the size fits"),
+        };
+        (tree, pointer)
+    }
+
+    #[test]
+    fn a_pointer_left_after_the_checkout_is_fixed_by_one_lfs_checkout() {
+        let case = Case::new("post-fixed");
+        let (tree, pointer) = tree_with_a_pointer(&case);
+        let mut fed = Vec::new();
+        let checked = super::post_checked(&tree, std::slice::from_ref(&pointer), |feed| {
+            fed.push(feed.to_vec());
+            fs::write(format!("{tree}/big.bin"), CONTENT).expect("the content is checked out");
+            Ok(())
+        });
+        assert!(checked.is_ok(), "{checked:?}");
+        assert_eq!(fed, [b"big.bin\0".to_vec()], "one checkout, of the wrong file alone");
+        assert_eq!(fs::read(format!("{tree}/big.bin")).expect("the file is read"), CONTENT);
+    }
+
+    #[test]
+    fn a_pointer_one_lfs_checkout_cannot_fix_refuses_lfs() {
+        let case = Case::new("post-left");
+        let (tree, pointer) = tree_with_a_pointer(&case);
+        let text = fs::read(format!("{tree}/big.bin")).expect("the pointer is read");
+        let mut fed = 0;
+        // As a re-checkout under attributes the listing did not see (an untracked `sub/.gitattributes` saying
+        // `-filter`): exit 0, the pointer text left.
+        let checked = super::post_checked(&tree, std::slice::from_ref(&pointer), |_| {
+            fed += 1;
+            fs::write(format!("{tree}/big.bin"), &text).expect("the pointer is left");
+            Ok(())
+        });
+        assert_eq!(fed, 1, "one checkout");
+        assert!(
+            matches!(&checked, Err(super::NotCheckedOut::Refused(why))
+                if why == "1 LFS file(s) are not their content after the checkout, big.bin among them"),
+            "{checked:?}"
+        );
+    }
+
+    #[test]
+    fn a_left_lfs_run_scratch_is_swept_after_a_day() {
+        let case = Case::new("run-sweep");
+        let root = case.root_text();
+        let mut said = Vec::new();
+        let mut say = |line: &str| said.push(line.to_owned());
+        let now = std::time::SystemTime::now();
+        let made = |name: &str, at, say: &mut dyn FnMut(&str)| {
+            crate::inputs::made_stage_named((&root, "lfs-run"), &format!("{KEY}-{NONCE}-{name}"), at, say).expect("the scratch is made")
+        };
+        let left = made("0123456789abcdef", now, &mut say);
+        let left_path = left.path.clone();
+        // A killed run's: its lock let go, its folder left.
+        drop(left);
+        let live = made("1111222233334444", now, &mut say);
+        let later = now + std::time::Duration::from_hours(48);
+        let next = made("fedcba9876543210", later, &mut say);
+        assert!(!left_path.exists(), "the left scratch is swept");
+        assert!(!Path::new(&format!("{}.lock", left_path.display())).exists(), "and its lock file");
+        assert!(live.path.exists(), "a live run's scratch is kept");
+        assert!(next.path.exists());
+        assert!(said.is_empty(), "{said:?}");
     }
 }

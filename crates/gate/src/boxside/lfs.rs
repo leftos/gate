@@ -727,16 +727,10 @@ impl RunLfs {
     }
 }
 
-/// What a run with no scratch folder says when its back commit's `add -A` fails and its tree's attributes name the LFS
-/// filter: a git-lfs clean found no storage it could make ([`gate_inputs::lfs::no_storage`]).
-pub(super) const NO_STORAGE_ADD: &str =
-    "the command added a file under the LFS filter, which a run without LFS content cannot bring back; run it with --local";
-
-/// What a run with no scratch folder says when a checkout fails and its tree's attributes name the LFS filter: a
-/// git-lfs smudge found no storage it could make ([`gate_inputs::lfs::no_storage`]), for a file the snapshot's
-/// listing did not see.
-pub(super) const NO_STORAGE_CHECKOUT: &str =
-    "a file under the LFS filter was found that the run's snapshot does not declare in a tracked .gitattributes; run it with --local";
+/// What a run with no scratch folder says when its back commit's `add -A` fails, or a checkout fails, and its tree's
+/// attributes name the LFS filter: the one text both boxes say ([`gate_inputs::lfs::NO_STORAGE_ADD`],
+/// [`gate_inputs::lfs::NO_STORAGE_CHECKOUT`]).
+pub(super) use gate_inputs::lfs::{NO_STORAGE_ADD, NO_STORAGE_CHECKOUT};
 
 /// Each object of `objects` in the store of the bare repository `bare` opened beneath its held store folder to read its
 /// data (`FILE_READ_DATA`) and shared without delete ([`Share::NoDelete`]), with every store folder on its way held
