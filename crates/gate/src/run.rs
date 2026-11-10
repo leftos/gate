@@ -1065,7 +1065,8 @@ struct Streams {
 }
 
 /// How long the run's end waits for the members of the command's job still running to end, so each gets its exit
-/// line: the rest get a `left` line.
+/// line: the rest get a `left` line, but for those a kill took off the job, which are waited for until they end (the
+/// job's hang guard bounds it).
 const EVENTS_WAIT: Duration = Duration::from_secs(2);
 
 /// Starts the thread that writes each of `events` to `writer` as a process line, until the job drops its sender.
@@ -4858,7 +4859,8 @@ impl Run<'_> {
 
     /// Ends what writes the command's lines to the log, then seals it: the readers get [`DRAIN`] to reach the end of
     /// their pipes, longer while one is only behind; the job's members still running get [`EVENTS_WAIT`] to end, so
-    /// their exit lines are written (`job`, `None` once the job is gone); the consumer is joined. After the seal no
+    /// their exit lines are written (`job`, `None` once the job is gone), and those a kill took off the job but which
+    /// have not run their end yet are noted and waited for until they end; the consumer is joined. After the seal no
     /// line of the command and no process line reaches the log. Nothing is waited for twice.
     fn end_streams(&mut self, job: Option<&Job>, console: &mut Console) {
         if let Some(Streams { forwarders, consumer }) = self.streams.take() {
@@ -4871,7 +4873,14 @@ impl Run<'_> {
                 ));
             }
             if let Some(job) = job {
-                job.finish_events(EVENTS_WAIT);
+                job.finish_events(EVENTS_WAIT, |pids| {
+                    let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
+                    console.note(&format!(
+                        "gate: waiting for {} ending process(es) of the command's job: {}",
+                        pids.len(),
+                        pids.join(", ")
+                    ));
+                });
             }
             if consumer.join().is_err() {
                 console.err("gate: the thread writing the job's process lines failed");

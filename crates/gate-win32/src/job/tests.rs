@@ -4,13 +4,20 @@ use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use proc_table::win32::OwnedHandle;
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, ERROR_ACCESS_DENIED, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    CREATE_PROCESS_DEBUG_EVENT, ContinueDebugEvent, DEBUG_EVENT, DebugActiveProcess, DebugActiveProcessStop, DebugSetProcessKillOnExit,
+    EXCEPTION_DEBUG_EVENT, LOAD_DLL_DEBUG_EVENT, WaitForDebugEvent,
+};
 use windows_sys::Win32::System::Diagnostics::ProcessSnapshotting::{
     HPSS, PSS_CAPTURE_VA_CLONE, PSS_QUERY_VA_CLONE_INFORMATION, PSS_VA_CLONE_INFORMATION, PssCaptureSnapshot, PssFreeSnapshot, PssQuerySnapshot,
 };
 use windows_sys::Win32::System::IO::{CreateIoCompletionPort, PostQueuedCompletionStatus};
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessId, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+    GetCurrentProcess, GetProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
+    WaitForSingleObject,
 };
 
 use super::{
@@ -716,7 +723,7 @@ fn each_member_of_a_tree_is_spawned_before_it_exits_and_names_its_parent() {
 
     drop(release);
     assert!(root.wait(HANG_GUARD).expect("the wait answers").is_some(), "the tree ended");
-    job.finish_events(HANG_GUARD);
+    job.finish_events(HANG_GUARD, |_| {});
     seen.extend(all_events(&events));
 
     let child = cmd_started_by(&seen, root.pid()).expect("the root started the child");
@@ -745,7 +752,7 @@ fn a_member_s_exit_carries_its_code_its_exit_time_and_its_run_time() {
     assert_eq!(ended.wait(HANG_GUARD).expect("the wait answers"), Some(3), "the member ended");
     wait_until("the job remembers the member", || job.remembers(ended.pid()));
 
-    job.finish_events(HANG_GUARD);
+    job.finish_events(HANG_GUARD, |_| {});
     let mine: Vec<JobEvent> = all_events(&events)
         .into_iter()
         .filter(|event| pid_of(event) == Some(ended.pid()))
@@ -795,7 +802,7 @@ fn a_member_the_drain_thread_has_not_taken_by_the_finish_still_gets_its_spawn_an
     drop(held);
     // The drain thread itself drops the sink, so the caller's own finish below is not what sends the events.
     wait_until("the drain thread drops the sink", || memory.shared.lock().events.is_none());
-    job.finish_events(HANG_GUARD);
+    job.finish_events(HANG_GUARD, |_| {});
     let mine: Vec<JobEvent> = all_events(&events).into_iter().filter(|event| pid_of(event) == Some(child)).collect();
     drop(kept_open);
 
@@ -817,7 +824,7 @@ fn a_member_put_in_the_job_that_ended_before_the_drain_thread_took_it_is_spawned
     assert!(job.post_finish(), "the finish is posted behind the member's messages");
     drop(held);
     wait_until("the drain thread drops the sink", || memory.shared.lock().events.is_none());
-    job.finish_events(HANG_GUARD);
+    job.finish_events(HANG_GUARD, |_| {});
     let mine: Vec<JobEvent> = all_events(&events)
         .into_iter()
         .filter(|event| pid_of(event) == Some(late.pid()))
@@ -842,7 +849,7 @@ fn a_member_put_in_the_job_is_spawned_and_exits_though_the_drain_thread_never_ra
     assert_eq!(late.wait(HANG_GUARD).expect("the wait answers"), Some(0), "the member ended");
 
     // The drain thread is held through the whole budget, as a starved thread is: the caller runs the finish itself.
-    job.finish_events(Duration::from_millis(1));
+    job.finish_events(Duration::from_millis(1), |_| {});
     let mine: Vec<JobEvent> = all_events(&events)
         .into_iter()
         .filter(|event| pid_of(event) == Some(late.pid()))
@@ -869,7 +876,7 @@ fn a_child_of_a_member_put_in_the_job_is_spawned_once_by_the_drain_thread_and_th
 
     drop(release);
     assert!(root.wait(HANG_GUARD).expect("the wait answers").is_some(), "the tree ended");
-    job.finish_events(HANG_GUARD);
+    job.finish_events(HANG_GUARD, |_| {});
     seen.extend(all_events(&events));
 
     let child = cmd_started_by(&seen, root.pid()).expect("the root started the child");
@@ -910,7 +917,7 @@ fn the_join_message_of_a_member_put_in_the_job_that_is_gone_by_then_says_nothing
     });
 
     drop(held);
-    job.finish_events(HANG_GUARD);
+    job.finish_events(HANG_GUARD, |_| {});
     let mine: Vec<JobEvent> = all_events(&events).into_iter().filter(|event| pid_of(event) == Some(pid)).collect();
 
     assert!(
@@ -931,7 +938,7 @@ fn a_mark_with_another_start_does_not_silence_the_process_that_joins_under_its_p
     let joined = joining.resume().expect("the process is resumed");
     assert_eq!(joined.wait(HANG_GUARD).expect("the wait answers"), Some(0), "the process ended");
 
-    job.finish_events(HANG_GUARD);
+    job.finish_events(HANG_GUARD, |_| {});
     let mine: Vec<JobEvent> = all_events(&events)
         .into_iter()
         .filter(|event| pid_of(event) == Some(joined.pid()))
@@ -989,7 +996,7 @@ fn a_failed_recording_while_the_mark_is_there_says_nothing_and_leaves_the_report
         "the failed recording remembers nothing of its own while the drain thread has not run"
     );
     drop(held);
-    job.finish_events(HANG_GUARD);
+    job.finish_events(HANG_GUARD, |_| {});
     let mine: Vec<JobEvent> = all_events(&events)
         .into_iter()
         .filter(|event| pid_of(event) == Some(joined.pid()))
@@ -1014,7 +1021,7 @@ fn a_failed_recording_after_the_drain_thread_passed_the_process_by_reads_it_itse
     memory.record(joined.pid(), Err(io::Error::other("no copy")), job.created_at);
     assert!(job.remembers(joined.pid()), "the recording's own read remembers the member");
     drop(held);
-    job.finish_events(HANG_GUARD);
+    job.finish_events(HANG_GUARD, |_| {});
     let mine: Vec<JobEvent> = all_events(&events)
         .into_iter()
         .filter(|event| pid_of(event) == Some(joined.pid()))
@@ -1056,10 +1063,13 @@ fn a_member_still_running_at_the_finish_is_left_and_the_events_end_once() {
     let waiting = waiting.assign_and_resume(&job).expect("the member is assigned and resumed");
     wait_until("the job remembers the member", || job.remembers(waiting.pid()));
 
-    job.finish_events(Duration::from_millis(1));
+    // `waiting` is only ever told a non-empty list, so the assertion fails whenever it is called.
+    job.finish_events(Duration::from_millis(1), |pids| {
+        assert!(pids.is_empty(), "a still-listed member is no ending one: {pids:?}");
+    });
     let all = all_events(&events);
     let mine: Vec<&JobEvent> = all.iter().filter(|event| pid_of(event) == Some(waiting.pid())).collect();
-    job.finish_events(HANG_GUARD);
+    job.finish_events(HANG_GUARD, |_| {});
 
     assert!(
         matches!(mine.as_slice(), [JobEvent::Spawned { .. }, JobEvent::Left { .. }]),
@@ -1078,6 +1088,133 @@ fn a_member_still_running_at_the_finish_is_left_and_the_events_end_once() {
     assert!(
         waiting.wait(HANG_GUARD).expect("the wait answers").is_some(),
         "the member ended at its stdin's end"
+    );
+}
+
+/// The exception code of a breakpoint (`STATUS_BREAKPOINT`).
+const STATUS_BREAKPOINT: u32 = 0x8000_0003;
+
+/// A process kept from running as a starved one is: the test, as its debugger, holds its attach breakpoint, so none of
+/// its threads runs, a terminate's included; one ended meanwhile has no exit time and an unsignalled handle until this
+/// is dropped, which continues the breakpoint and detaches.
+struct BreakpointHeld {
+    release: Option<mpsc::Sender<()>>,
+    debugger: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BreakpointHeld {
+    /// Attaches to `pid` and holds its attach breakpoint, failing at the hang guard.
+    fn hold(pid: u32) -> BreakpointHeld {
+        let (held_tx, held) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let debugger = std::thread::spawn(move || hold_breakpoint(pid, &held_tx, &released));
+        held.recv_timeout(HANG_GUARD).expect("the attach breakpoint is held");
+        BreakpointHeld {
+            release: Some(release),
+            debugger: Some(debugger),
+        }
+    }
+}
+
+impl Drop for BreakpointHeld {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        if let Some(debugger) = self.debugger.take() {
+            let _ = debugger.join();
+        }
+    }
+}
+
+/// Debugs `pid` until its attach breakpoint, says so on `held`, and keeps it there until `released` lets it go.
+fn hold_breakpoint(pid: u32, held: &mpsc::Sender<()>, released: &mpsc::Receiver<()>) {
+    // SAFETY: takes no pointers; this thread is the debugger.
+    assert_ne!(unsafe { DebugActiveProcess(pid) }, 0, "attach to {pid}");
+    // SAFETY: takes no pointers; a detach never kills.
+    unsafe { DebugSetProcessKillOnExit(0) };
+    let guard = u32::try_from(HANG_GUARD.as_millis()).expect("the guard fits a u32");
+    loop {
+        let mut event = DEBUG_EVENT::default();
+        // SAFETY: `event` is a writable DEBUG_EVENT that outlives the call.
+        assert_ne!(
+            unsafe { WaitForDebugEvent(&raw mut event, guard) },
+            0,
+            "no debug event from {pid} within the hang guard"
+        );
+        // SAFETY: the union member read is the one the event code names; the file handles are the debugger's to close.
+        unsafe {
+            match event.dwDebugEventCode {
+                CREATE_PROCESS_DEBUG_EVENT => CloseHandle(event.u.CreateProcessInfo.hFile),
+                LOAD_DLL_DEBUG_EVENT => CloseHandle(event.u.LoadDll.hFile),
+                _ => 0,
+            };
+        }
+        // SAFETY: the exception member is the one an exception event carries.
+        let code =
+            (event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT).then(|| unsafe { event.u.Exception.ExceptionRecord.ExceptionCode }.cast_unsigned());
+        if code == Some(STATUS_BREAKPOINT) {
+            held.send(()).expect("the test waits for the hold");
+            // A release, or a test that failed and dropped its sender, lets it go.
+            let _ = released.recv_timeout(HANG_GUARD);
+            // SAFETY: continues the event this thread received, then detaches from the process it attached to.
+            unsafe { ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE) };
+            // SAFETY: takes no pointers; this thread attached to `pid`.
+            unsafe { DebugActiveProcessStop(pid) };
+            return;
+        }
+        let status = if code.is_some() { DBG_EXCEPTION_NOT_HANDLED } else { DBG_CONTINUE };
+        // SAFETY: continues the event this thread received.
+        unsafe { ContinueDebugEvent(event.dwProcessId, event.dwThreadId, status) };
+    }
+}
+
+#[test]
+fn a_member_a_termination_took_off_the_job_is_waited_for_and_exits_however_late_its_end_runs() {
+    let (job, events) = telling_job();
+    // It says it is ready, then waits on stdin, a pipe whose write end the test holds, so it runs until the termination.
+    // The debugger attaches only once it has said so: a process still starting may never reach its attach breakpoint.
+    let mut waiting = suspended("echo ready& set /p line=");
+    let mut pipes = waiting.take_pipes().expect("a piped launch has pipes");
+    let waiting = waiting.assign_and_resume(&job).expect("the member is assigned and resumed");
+    let pid = waiting.pid();
+    let mut said = Vec::new();
+    while !String::from_utf8_lossy(&said).contains("ready") {
+        let mut chunk = [0_u8; 256];
+        let read = std::io::Read::read(&mut pipes.stdout, &mut chunk).expect("the member's stdout is read");
+        assert_ne!(read, 0, "the member ended before it said it was ready: {said:?}");
+        said.extend_from_slice(&chunk[..read]);
+    }
+    wait_until("the job remembers the member", || job.remembers(pid));
+    // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
+    let handle = unsafe { own_handle(OpenProcess(PROCESS_SYNCHRONIZE, 0, pid)) }.expect("the member is opened");
+    let held = BreakpointHeld::hold(pid);
+
+    job.terminate(124).expect("the job is terminated");
+    wait_until("the termination takes the member off the job's list", || {
+        !job.process_ids().expect("the job's list is read").contains(&pid)
+    });
+    // SAFETY: the handle is open with `SYNCHRONIZE` access for the whole call, which takes no pointers.
+    let signalled = unsafe { WaitForSingleObject(handle.raw(), 0) };
+    assert_eq!(signalled, WAIT_TIMEOUT, "the held member has not run its end yet");
+    let named = std::thread::scope(|scope| {
+        let (told, named) = mpsc::channel();
+        let finisher = scope.spawn(|| job.finish_events(Duration::from_millis(1), move |pids| drop(told.send(pids.to_vec()))));
+        let named = named
+            .recv_timeout(HANG_GUARD)
+            .expect("the finish names the ending member before it waits");
+        drop(held);
+        finisher.join().expect("the finish ends");
+        named
+    });
+    let mine: Vec<JobEvent> = all_events(&events).into_iter().filter(|event| pid_of(event) == Some(pid)).collect();
+
+    assert_eq!(named, vec![pid], "the finish waits for the ending member alone");
+    assert!(
+        matches!(mine.last(), Some(JobEvent::Exited { code: Some(124), .. })),
+        "the member exits with the termination's code: {mine:?}"
+    );
+    assert!(
+        !mine.iter().any(|event| matches!(event, JobEvent::Left { .. })),
+        "an ending member is never left: {mine:?}"
     );
 }
 

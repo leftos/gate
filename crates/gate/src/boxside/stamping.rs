@@ -100,7 +100,8 @@ fn parent_pid() -> Option<u32> {
 }
 
 /// How long the end of the command's watch waits for the members of its job still running to end, so each gets its
-/// exit line: the rest get a `left` line.
+/// exit line: the rest get a `left` line, but for those a kill took off the job, which are waited for until they end
+/// (the job's hang guard bounds it).
 const EVENTS_WAIT: Duration = Duration::from_secs(2);
 
 /// The process lines of the command's job: the thread writing them under the run's lock, and the flag that stops it,
@@ -133,9 +134,10 @@ impl ProcessLines {
     }
 
     /// Ends `job`'s process lines once the command's watch is over: its members still running get [`EVENTS_WAIT`] to
-    /// end, so their exit lines are written, the rest a `left` line; the writer is joined, then stopped.
+    /// end, so their exit lines are written, the rest a `left` line, but for those a kill took off the job, which are
+    /// waited for until they end; the writer is joined, then stopped.
     pub(crate) fn finish(&mut self, job: &Job) {
-        job.finish_events(EVENTS_WAIT);
+        job.finish_events(EVENTS_WAIT, |_| {});
         if let Some(writer) = self.writer.take()
             && writer.join().is_err()
         {

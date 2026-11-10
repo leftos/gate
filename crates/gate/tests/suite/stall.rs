@@ -7,13 +7,18 @@ use std::io::Read as _;
 use std::os::windows::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use gate_win32::{EnvironmentBlock, Job, Launch, LaunchOutput, StoppableProcess};
 use regex::Regex;
 use serde_json::Value;
+use windows_sys::Win32::Foundation::{CloseHandle, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED};
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    CREATE_PROCESS_DEBUG_EVENT, ContinueDebugEvent, DEBUG_EVENT, DebugActiveProcess, DebugActiveProcessStop, DebugSetProcessKillOnExit,
+    EXCEPTION_DEBUG_EVENT, LOAD_DLL_DEBUG_EVENT, WaitForDebugEvent,
+};
 
 use crate::harness::pin_to_one_core_at_normal;
 use crate::support::{
@@ -236,6 +241,127 @@ fn a_stall_kill_ends_a_child_in_a_job_of_its_own() {
         "the child {pid} in a job of its own was ended by the kill with the kill's status: {outcome:?}"
     );
     let log_path = case.folder().join("out.log");
+    wait_until_closed(&log_path);
+    let lines = process_lines(&log_path);
+    let ended = format!("exit pid={pid} code=124 ");
+    assert!(
+        lines.iter().any(|line| line.starts_with(&ended)),
+        "the log has the child's {ended:?} line: {lines:#?}"
+    );
+}
+
+/// The longest the case waits for the attach breakpoint, for a debug event, or for its release.
+const BREAKPOINT_HOLD_GUARD: Duration = Duration::from_secs(600);
+
+/// The exception code of a breakpoint (`STATUS_BREAKPOINT`).
+const STATUS_BREAKPOINT: u32 = 0x8000_0003;
+
+/// A process kept from running as a starved one is: this case, as its debugger, holds its attach breakpoint, so none
+/// of its threads runs, a terminate's included; one ended meanwhile has no exit time and an unsignalled handle until
+/// this is dropped, which continues the breakpoint and detaches.
+struct BreakpointHeld {
+    release: Option<mpsc::Sender<()>>,
+    debugger: Option<thread::JoinHandle<()>>,
+}
+
+impl BreakpointHeld {
+    /// Attaches to `pid` and holds its attach breakpoint, failing at the hang guard.
+    fn hold(pid: u32) -> BreakpointHeld {
+        let (held_tx, held) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let debugger = thread::spawn(move || hold_breakpoint(pid, &held_tx, &released));
+        held.recv_timeout(BREAKPOINT_HOLD_GUARD).expect("the attach breakpoint is held");
+        BreakpointHeld {
+            release: Some(release),
+            debugger: Some(debugger),
+        }
+    }
+}
+
+impl Drop for BreakpointHeld {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        if let Some(debugger) = self.debugger.take() {
+            let _ = debugger.join();
+        }
+    }
+}
+
+/// Debugs `pid` until its attach breakpoint, says so on `held`, and keeps it there until `released` lets it go.
+fn hold_breakpoint(pid: u32, held: &mpsc::Sender<()>, released: &mpsc::Receiver<()>) {
+    // SAFETY: takes no pointers; this thread is the debugger.
+    assert_ne!(unsafe { DebugActiveProcess(pid) }, 0, "attach to {pid}");
+    // SAFETY: takes no pointers; a detach never kills.
+    unsafe { DebugSetProcessKillOnExit(0) };
+    let guard = u32::try_from(BREAKPOINT_HOLD_GUARD.as_millis()).expect("the guard fits a u32");
+    loop {
+        let mut event = DEBUG_EVENT::default();
+        // SAFETY: `event` is a writable DEBUG_EVENT that outlives the call.
+        assert_ne!(
+            unsafe { WaitForDebugEvent(&raw mut event, guard) },
+            0,
+            "no debug event from {pid} within the hang guard"
+        );
+        // SAFETY: the union member read is the one the event code names; the file handles are the debugger's to close.
+        unsafe {
+            match event.dwDebugEventCode {
+                CREATE_PROCESS_DEBUG_EVENT => CloseHandle(event.u.CreateProcessInfo.hFile),
+                LOAD_DLL_DEBUG_EVENT => CloseHandle(event.u.LoadDll.hFile),
+                _ => 0,
+            };
+        }
+        // SAFETY: the exception member is the one an exception event carries.
+        let code =
+            (event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT).then(|| unsafe { event.u.Exception.ExceptionRecord.ExceptionCode }.cast_unsigned());
+        if code == Some(STATUS_BREAKPOINT) {
+            held.send(()).expect("the case waits for the hold");
+            // A release, or a case that failed and dropped its sender, lets it go.
+            let _ = released.recv_timeout(BREAKPOINT_HOLD_GUARD);
+            // SAFETY: continues the event this thread received, then detaches from the process it attached to.
+            unsafe { ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE) };
+            // SAFETY: takes no pointers; this thread attached to `pid`.
+            unsafe { DebugActiveProcessStop(pid) };
+            return;
+        }
+        let status = if code.is_some() { DBG_EXCEPTION_NOT_HANDLED } else { DBG_CONTINUE };
+        // SAFETY: continues the event this thread received.
+        unsafe { ContinueDebugEvent(event.dwProcessId, event.dwThreadId, status) };
+    }
+}
+
+#[test]
+fn a_stall_kill_writes_the_exit_line_of_a_child_in_a_job_of_its_own_that_ends_late() {
+    let case = Case::new("a_stall_kill_writes_the_exit_line_of_a_child_in_a_job_of_its_own_that_ends_late");
+    // GATE-1185: the kill ends the child with the command's job, but a child starved of a processor runs its end late; the
+    // run's end waits for it, so the log has its exit line, never a `left` line. Its attach breakpoint, held, starves it.
+    // The child spins, so the stall clock waits while the case attaches: its CPU is progress until the hold freezes it,
+    // and under load its waiting threads count as starved, so a busy case never loses the attach to the kill.
+    let child = InJob::new(&case);
+    let command = child.command("1");
+    let words: Vec<&str> = command.iter().map(String::as_str).collect();
+    let log_path = case.folder().join("out.log");
+
+    let mut running = case.start(&run_words("out.log", &IN_JOB_SEAMS, &words));
+    let (pid, process) = child.open(|| !running.is_running());
+    let held = BreakpointHeld::hold(pid);
+    let left = format!("left pid={pid} ");
+    let pid_text = pid.to_string();
+    wait_until(&format!("the gate waiting for the ending child {pid}, giving it up, or ending"), || {
+        let waiting = log_texts(&log_path)
+            .lines()
+            .any(|line| line.starts_with("gate: waiting for ") && line.split(|c: char| !c.is_ascii_digit()).any(|word| word == pid_text));
+        waiting || process_lines(&log_path).iter().any(|line| line.starts_with(&left)) || !running.is_running()
+    });
+    drop(held);
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: STALLED: "), "{outcome:?}");
+    assert_eq!(
+        Escapee::exit_code_once_ended(&process),
+        Some(124),
+        "the child {pid} was ended by the kill: {outcome:?}"
+    );
     wait_until_closed(&log_path);
     let lines = process_lines(&log_path);
     let ended = format!("exit pid={pid} code=124 ");
@@ -952,7 +1078,8 @@ fn a_quiet_command_that_ran_a_short_child_is_still_stalled_and_its_process_lines
         .collect();
     assert!(
         child.is_some_and(ran_to_its_end) || (child.is_none() && missed.len() == 1),
-        "a spawn and an exit line of the command's child, which ran to its end, or its one missed spawn line when it ended before it could be opened: {lines:#?}"
+        "a spawn and an exit line of the command's child, which ran to its end, \
+         or its one missed spawn line when it ended before it could be opened: {lines:#?}"
     );
     // The command's own bytes are its `pid` line on stdout, and it wrote nothing on stderr: every sample counts those,
     // or none yet when it came before the reader had the line, and never the process lines the log holds.

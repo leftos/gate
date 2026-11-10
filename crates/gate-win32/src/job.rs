@@ -64,6 +64,10 @@ const PROCESS_ID_READS: usize = 8;
 /// The most handles one `WaitForMultipleObjects` call waits on (`MAXIMUM_WAIT_OBJECTS`).
 const WAIT_CHUNK: usize = 64;
 
+/// How long [`Job::finish_events`] waits for the members a job termination took off the job's list to run their end: a
+/// hang guard a passing run never reaches; a member a kill took off the job ends whatever the load.
+const ENDING_GUARD: Duration = Duration::from_secs(120);
+
 /// A member's identity: its pid and its start.
 type Key = (u32, Timestamp);
 
@@ -748,7 +752,13 @@ impl Job {
     /// The finish is run by the drain thread, after every message the job posted before it, so a member the drain
     /// thread had not taken yet still gets its [`JobEvent::Spawned`]; what is left of `wait` bounds the wait for it.
     /// A drain thread that has ended, or has not run the finish by then, leaves the finish to this call.
-    pub fn finish_events(&self, wait: Duration) {
+    ///
+    /// A member still running after `wait` that the job no longer lists has begun to end: a job termination took it off
+    /// the list, though a member starved of a processor runs its end seconds later. Those are waited for up to
+    /// [`ENDING_GUARD`], `waiting` told their pids first, once, so each gets its [`JobEvent::Exited`]; `waiting` is not
+    /// called when there are none. A member the job still lists, or every member when the list cannot be read, gets
+    /// its [`JobEvent::Left`] after `wait` alone.
+    pub fn finish_events(&self, wait: Duration, waiting: impl FnOnce(&[u32])) {
         let Some(memory) = &self.memory else {
             return;
         };
@@ -761,6 +771,7 @@ impl Job {
             remembered.waitable()
         };
         wait_for_all(&waitable, wait);
+        self.wait_for_ending(memory, waiting);
         let draining = !memory.drainer.as_ref().is_some_and(JoinHandle::is_finished);
         let mut remembered = if self.post_finish() && draining {
             let left = wait.saturating_sub(begun.elapsed());
@@ -773,6 +784,35 @@ impl Job {
             memory.shared.lock()
         };
         remembered.finish();
+    }
+
+    /// Waits up to [`ENDING_GUARD`] for the running members the job no longer lists whose handle is not signalled yet,
+    /// telling `waiting` their pids first; nothing when there are none, the sink is gone, or the job's list cannot be
+    /// read.
+    fn wait_for_ending(&self, memory: &Memory, waiting: impl FnOnce(&[u32])) {
+        // The running members are copied before the list is read: each was on the list when it was recorded, so one
+        // missing from the later read was taken off it, and a process that joins between the two is not in the copy.
+        let running = {
+            let remembered = memory.shared.lock();
+            if remembered.events.is_none() {
+                return;
+            }
+            remembered.waitable_by_pid()
+        };
+        let Ok(listed) = self.process_ids() else {
+            return;
+        };
+        let (pids, handles): (Vec<u32>, Vec<OwnedHandle>) = running
+            .into_iter()
+            .filter(|(pid, _)| !listed.contains(pid))
+            // SAFETY: the handle is open with `SYNCHRONIZE` access for the whole call, which takes no pointers.
+            .filter(|(_, process)| unsafe { WaitForSingleObject(process.raw(), 0) } != WAIT_OBJECT_0)
+            .unzip();
+        if pids.is_empty() {
+            return;
+        }
+        waiting(&pids);
+        wait_for_all(&handles, ENDING_GUARD);
     }
 
     /// Posts the finish to the drain thread, once, behind every message the job has posted; nothing for a job whose
@@ -1022,6 +1062,11 @@ impl Remembered {
     /// `SYNCHRONIZE` is opened by its pid instead, which the member's open handle keeps its own. A member neither gives
     /// a handle for is not waited on.
     fn waitable(&self) -> Vec<OwnedHandle> {
+        self.waitable_by_pid().into_iter().map(|(_, process)| process).collect()
+    }
+
+    /// The pid and a handle to wait on, as [`Remembered::waitable`] gives it, of each running member.
+    fn waitable_by_pid(&self) -> Vec<(u32, OwnedHandle)> {
         self.members
             .iter()
             .filter_map(|member| {
@@ -1032,6 +1077,7 @@ impl Remembered {
                     // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
                     .or_else(|_| unsafe { own_handle(OpenProcess(PROCESS_SYNCHRONIZE, 0, member.pid)) })
                     .ok()
+                    .map(|process| (member.pid, process))
             })
             .collect()
     }

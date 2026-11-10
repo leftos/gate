@@ -141,6 +141,12 @@ A stall case whose first output byte opens the window (`--test-stall-from-output
 
 Holding a process's exit-process debug event does not hold the exit time `GetProcessTimes` reports, so the job memory counts it ended; to model a killed process a starved thread keeps from ending, hold its attach breakpoint instead. GATE-814 and GATE-815 were settled that way.
 
+After `TerminateJobObject` the job's pid list and `ActiveProcesses` empty at once, while a starved member's exit time and handle signal come seconds later; after a single `TerminateProcess` the member stays listed until it exits. So an empty `process_ids()` after a job kill does not mean its processes have ended.
+
+A load-free rig for a starved, killed process pins it to the last logical processor beside a TIME_CRITICAL spinner thread: a killed BelowNormal process then took about 5-10 s to end.
+
+An attach-breakpoint hold that continues the breakpoint and detaches on release ends the killed process with its kill status at once (the GATE-1185 suite case's `BreakpointHeld`), while holding the exit-process event does not delay the exit time a reader sees. Holding a case's `out.log` open deadlocks a case that calls `wait_until_closed`.
+
 The rig needs the case's gate.exe on this PC, but the launcher routes nextest to the builder: build once with `-Local -Reason "the rig needs this PC's gate.exe"` and `--no-run`, then run the suite binary directly under the rig. A fault in a parent gate's timing shows by freezing the child gate it waits on, not the parent (GATE-480). A rig that reads the case folder opens its files with delete sharing, or it causes the case's `os error 32` on folder removal itself.
 
 A builder run over plain ssh has only a pseudo-console, so a fault that needs a real console (as the box gives a routed command) never shows there. Start such a repro with `CREATE_NEW_CONSOLE`, or route it.
