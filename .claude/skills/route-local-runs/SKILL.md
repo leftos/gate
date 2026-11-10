@@ -67,7 +67,7 @@ Routing is opt-out: a repo routes a whole verb, and keeps what must stay here in
 
 1. A test, lint, check or format command gets the verb's wildcard (`cargo nextest run *`, `cargo test *`, `cargo clippy *`, `cargo check *`, `dotnet test *`, `dotnet format *`), not one shape. A variation that cannot route is an opt-out, never a narrower pattern.
 2. A build gets the verb's wildcard when the repo's `outputs` bring back everything this PC uses from it. Otherwise write the shape's words, each `#` as `*` and each path separator as `?`, since a run may spell it either way.
-3. Run `pwsh -NoProfile -File tools/gate.ps1 remote add repos <repo> "<pattern>" --dry-run`, read the line, then run it without `--dry-run`. The tool writes its own backup.
+3. Run `pwsh -NoProfile -File tools/gate.ps1 remote add repos <key> "<pattern>" --dry-run`, read the line, then run it without `--dry-run`. The tool writes its own backup. `<key>` is the gate's routing key: the report's repo, except `claude-config`, whose key is `claude` (`GATE_KEYS` in `watch_local.py`); a pattern under `claude-config` is never read. `gate remote match <key> "<command>"` confirms it.
 4. Mark the shape `routed`, the pattern as the note. If the command runs here again, the report flags it `STILL-LOCAL-AFTER-FIX`.
 
 ## Report
