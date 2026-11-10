@@ -208,6 +208,21 @@ impl Folder {
         if renamed == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
     }
 
+    /// Gives what is at `name` in this folder, as itself, the second name `to_name` in the folder `to`, each name
+    /// reached beneath its folder's descriptor: a link at `name` is linked as itself, never followed, and nothing at
+    /// `to_name` is ever replaced.
+    ///
+    /// # Errors
+    ///
+    /// The link: `name` missing, or anything at `to_name` already (`AlreadyExists`), a link included.
+    pub fn link_child(&self, name: &OsStr, to: &Folder, to_name: &OsStr) -> io::Result<()> {
+        let (from_name, to_name) = (c_name(name)?, c_name(to_name)?);
+        // SAFETY: both descriptors are open folders' for the whole call; both names are NUL-terminated strings that
+        // live across it, which `linkat` only reads; no flag, so a link at `name` is not followed.
+        let linked = unsafe { libc::linkat(self.fd.as_raw_fd(), from_name.as_ptr(), to.fd.as_raw_fd(), to_name.as_ptr(), 0) };
+        if linked == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    }
+
     /// What `name` in this folder is, looked at as itself: a link is never followed.
     ///
     /// # Errors

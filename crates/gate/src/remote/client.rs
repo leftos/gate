@@ -293,7 +293,7 @@ impl RustClient {
             apply_cap: seams.remote_apply_cap_bytes.unwrap_or(watchdog::APPLY_CAP),
             outputs_budget: seams.remote_outputs_budget_bytes.unwrap_or(OUTPUTS_BUDGET),
             inputs_budget: seams.remote_inputs_budget_bytes.unwrap_or(inputs::INPUTS_BUDGET),
-            lfs_budget: seams.remote_lfs_budget_bytes.unwrap_or(lfs::LFS_BUDGET),
+            lfs_budget: seams.remote_lfs_budget_bytes.unwrap_or(gate_inputs::lfs::LFS_BUDGET),
             log_cap: seams.remote_log_cap_bytes.unwrap_or(watchdog::LOG_CAP),
             own_start_fails: seams.own_start_fails,
             hint_from_pull: seams.remote_hint_from_pull,
@@ -2418,8 +2418,8 @@ impl Attempt<'_, '_> {
     }
 
     /// Refuses the run `parity` when the snapshot holds LFS pointers and the attempt's builder is a macOS one, before its
-    /// preflight: the Unix box runs no `lfs` verb, so an attempt there would be refused `lfs` after its preflight and
-    /// push and run the command here, while a `parity` refusal hands the run to the next builder. The line names the
+    /// preflight: the Unix box's `run` takes no LFS content yet, so an attempt there would be refused `lfs` after its
+    /// preflight and push and run the command here, while a `parity` refusal hands the run to the next builder. The line names the
     /// repository's routing name (`repos`), as every toolchain mismatch line does. `Ok` when the snapshot holds no
     /// pointers, or the builder takes it.
     fn macos_takes_no_lfs(&mut self, repos: &[Repo], lfs: &[lfs::Sending]) -> Result<(), End> {
@@ -4329,7 +4329,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             apply_cap: watchdog::APPLY_CAP,
             outputs_budget: OUTPUTS_BUDGET,
             inputs_budget: inputs::INPUTS_BUDGET,
-            lfs_budget: lfs::LFS_BUDGET,
+            lfs_budget: gate_inputs::lfs::LFS_BUDGET,
             log_cap: watchdog::LOG_CAP,
             own_start_fails: false,
             hint_from_pull: false,
@@ -6784,7 +6784,7 @@ mod tests {
             hint_from_pull: false,
             tamper: None,
             inputs_budget: super::inputs::INPUTS_BUDGET,
-            lfs_budget: super::lfs::LFS_BUDGET,
+            lfs_budget: gate_inputs::lfs::LFS_BUDGET,
             brought_back: None,
             dropped_no_build: call.dropped_no_build,
             split: Split::default(),

@@ -346,6 +346,25 @@ pub fn held_for_test(path: &Path) -> HeldLock {
     }
 }
 
+/// Takes `flock(LOCK_SH)` on `file`, waiting while another open holds it alone: held, shared with every other shared
+/// holder, until `file` is closed. A wait cut short by a signal waits again.
+///
+/// # Errors
+///
+/// The `flock`, other than one a signal cut short.
+pub fn flock_shared(file: &File) -> io::Result<()> {
+    loop {
+        // SAFETY: the descriptor is `file`'s, open for the whole call; `flock` reads nothing else.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 /// What taking a work lock found.
 #[derive(Debug)]
 pub enum Locked {

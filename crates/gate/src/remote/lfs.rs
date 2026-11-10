@@ -366,8 +366,6 @@ pub(super) fn needed<'o>(said: &str, objects: &'o [Object]) -> Result<Vec<&'o Ob
     Ok(needed)
 }
 
-/// The most bytes one put of LFS objects carries: 16 GiB, unless `--test-remote-lfs-budget-bytes` says otherwise.
-pub(super) const LFS_BUDGET: u64 = 16 * 1024 * 1024 * 1024;
 /// Why a run the box refused `lfs` falls back.
 const NOT_HELD: &str = "the builder's LFS store does not hold the content the snapshot's pointers name";
 /// Why a run the box refused `lfs` for its scratch folder falls back.

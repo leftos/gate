@@ -25,7 +25,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gate_args::BoxSeams;
 use gate_inputs::archive::sent_limit;
-use gate_inputs::lfs::{CHECKOUT_PINS, Listed, Object, POINTER_MOST, Pointer, Wanted, checked, is_wrong_file, manifest_digest, parsed_manifest};
+use gate_inputs::lfs::{
+    CHECKOUT_PINS, LFS_BUDGET, Listed, Object, POINTER_MOST, Pointer, Wanted, checked, is_wrong_file, manifest_digest, parsed_manifest,
+};
 use gate_router::escaped;
 use gate_win32::{Descriptor, Make, Share};
 use gate_wire::{
@@ -52,10 +54,6 @@ use crate::outputs::archive::{Entry, PcFiles, unpack};
 use crate::outputs::manifest::{MANIFEST_LIMIT, Manifest};
 use crate::remote::{Refusal, refused_line as tagged_line};
 
-/// The bytes in one gibibyte.
-const GIB: u64 = 1024 * 1024 * 1024;
-/// The most bytes one put unpacks: 16 GiB, unless the `--test-lfs-budget-bytes` seam says otherwise.
-const LFS_BUDGET: u64 = 16 * GIB;
 /// The folder below the box's root that holds each put's stage, `{root}\lfs-stage\{key}-{nonce}`.
 const STAGES: &str = "lfs-stage";
 /// The folder in a stage the archive is unpacked into.

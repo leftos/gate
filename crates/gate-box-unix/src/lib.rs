@@ -33,6 +33,8 @@ pub mod git;
 #[cfg(unix)]
 pub mod inputs;
 #[cfg(unix)]
+pub mod lfs;
+#[cfg(unix)]
 pub mod outputs;
 #[cfg(unix)]
 mod pid_info;

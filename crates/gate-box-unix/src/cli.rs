@@ -45,8 +45,9 @@ pub fn unbuilt(verb: BoxVerb) -> Option<String> {
         | BoxVerb::Inputs
         | BoxVerb::Outputs
         | BoxVerb::Drain
-        | BoxVerb::Hold => None,
-        BoxVerb::Inflight | BoxVerb::Lfs | BoxVerb::RegisterDesktop | BoxVerb::ChannelCheck => {
+        | BoxVerb::Hold
+        | BoxVerb::Lfs => None,
+        BoxVerb::Inflight | BoxVerb::RegisterDesktop | BoxVerb::ChannelCheck => {
             Some(format!("gate: box {} is not built on this builder", verb.as_str()))
         }
     }
@@ -128,6 +129,7 @@ fn answer(action: Action, console: &mut crate::console::Console) -> u8 {
         BoxVerb::Boot => crate::boot::status(crate::boot::say(console)),
         BoxVerb::Inputs => crate::inputs::inputs(&payload, &request.seams, console),
         BoxVerb::Outputs => crate::outputs::outputs(&payload, &request.seams, console),
+        BoxVerb::Lfs => crate::lfs::lfs(&payload, &request.seams, console),
         BoxVerb::Drain => crate::drain::drain(&payload, &request.seams, console),
         BoxVerb::Run => {
             // The run says its lines through an output its threads share; the console says nothing more.
@@ -178,6 +180,7 @@ mod tests {
         assert_eq!(action(words("box run --stdin")), verb(BoxVerb::Run));
         assert_eq!(action(words("box inputs --stdin")), verb(BoxVerb::Inputs));
         assert_eq!(action(words("box outputs --stdin")), verb(BoxVerb::Outputs));
+        assert_eq!(action(words("box lfs --stdin")), verb(BoxVerb::Lfs));
     }
 
     #[cfg(feature = "test-seams")]
@@ -240,10 +243,11 @@ mod tests {
             BoxVerb::Prune,
             BoxVerb::Inputs,
             BoxVerb::Outputs,
+            BoxVerb::Lfs,
         ] {
             assert_eq!(unbuilt(verb), None, "{verb:?}");
         }
-        for verb in [BoxVerb::Lfs, BoxVerb::Inflight, BoxVerb::RegisterDesktop, BoxVerb::ChannelCheck] {
+        for verb in [BoxVerb::Inflight, BoxVerb::RegisterDesktop, BoxVerb::ChannelCheck] {
             assert_eq!(
                 unbuilt(verb),
                 Some(format!("gate: box {} is not built on this builder", verb.as_str())),

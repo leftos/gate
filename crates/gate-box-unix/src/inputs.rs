@@ -78,15 +78,15 @@ const NOT_PLAIN_COPY: &str = "it is a link or not a plain file of one name";
 /// How many temp files this process has made for the exclude file, so two writes never pick one name.
 static TEMPS: AtomicU64 = AtomicU64::new(0);
 
-/// The step a request asks for.
+/// The step a request asks for, an `inputs` or an `lfs` one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Step {
+pub(crate) enum Step {
     Diff,
     Put,
 }
 
 impl Step {
-    fn word(self) -> &'static str {
+    pub(crate) fn word(self) -> &'static str {
         match self {
             Step::Diff => "diff",
             Step::Put => "put",
@@ -94,22 +94,22 @@ impl Step {
     }
 }
 
-/// What an inputs request reads of its payload.
-struct Asked<'a> {
+/// What an inputs request reads of its payload, and an `lfs` request too, which reads the same keys.
+pub(crate) struct Asked<'a> {
     key: &'a str,
     work: &'a str,
-    bare: &'a str,
+    pub(crate) bare: &'a str,
     lock: &'a str,
-    nonce: &'a str,
-    step: Step,
+    pub(crate) nonce: &'a str,
+    pub(crate) step: Step,
     /// The box's root, `{root}/work/{key}` being the work folder, which the stages folder sits in.
-    root: String,
+    pub(crate) root: String,
     /// The folder holding the work folders, `{root}/work`.
     parent: &'a Path,
     /// Whether the payload sets `SentBin`, the PC's build of one project, which this builder does not take.
     sent_bin: bool,
     /// The sibling pair whose inputs these are, each path of its manifest prefixed with its tree; `None` for one repo.
-    pair: Option<Pair>,
+    pub(crate) pair: Option<Pair>,
     /// The trees of the pair's layout below the work folder, the leaf's first, then each sibling's in the pair's order
     /// ([`Pair::trees`]); empty for one repo.
     trees: Vec<String>,
@@ -120,7 +120,7 @@ impl<'a> Asked<'a> {
     /// `Pair`, then the work root and `Bare` judged as a run's are ([`checked_root`]); `SentBin` is only noted, and
     /// refused later. Else the usage line of the first that fails, a pair the payload reader refuses ([`Payload::pair`])
     /// with its line.
-    fn read(payload: &'a Payload) -> Result<Asked<'a>, String> {
+    pub(crate) fn read(payload: &'a Payload) -> Result<Asked<'a>, String> {
         let (key, work) = payload.work_folder()?;
         let bare = payload.path("Bare")?;
         let lock = payload.beside_work("Lock", work, "lock")?;
@@ -301,7 +301,7 @@ fn answered(payload: &Payload, seams: &BoxSeams, input: &mut impl BufRead, conso
 /// trusted and `<root>/work` the box user's own folder when they are there ([`records_folder`]), and every repo's bare
 /// repository, a pair's siblings' too, the box user's own folder when it is there ([`files::unusable_folder`]). Else
 /// the line and the status.
-fn root_checked(asked: &Asked<'_>) -> Result<(), (String, u8)> {
+pub(crate) fn root_checked(asked: &Asked<'_>) -> Result<(), (String, u8)> {
     records_folder(&asked.root, asked.parent)?;
     let siblings = asked.pair.iter().flat_map(Pair::siblings).map(PairSibling::bare);
     std::iter::once(asked.bare)
@@ -326,7 +326,7 @@ fn busy(asked: &Asked<'_>, console: &mut Console) -> u8 {
 /// `step` run on the work folder, held, under its lock: the lock taken as a run takes it, a held lock refused `busy`
 /// (75), and the work folder laid out as a run of its repos lays it out ([`laid_out`]) and held through the step. `Err`
 /// with the status to answer when the step never ran, its lines said.
-fn locked<T>(
+pub(crate) fn locked<T>(
     asked: &Asked<'_>,
     console: &mut Console,
     step: impl FnOnce(&Work, &HeldLock, &mut Console) -> Result<T, String>,
@@ -389,7 +389,7 @@ type Id = (libc::dev_t, libc::ino_t);
 /// The work folder, held: `{root}/work` and the work folder reached beneath the judged root, the work folder's path,
 /// each tree of a pair's layout held ([`Tree`]), none for one repo, and what no walk below the work folder may pass
 /// through ([`Avoid`]).
-struct Work {
+pub(crate) struct Work {
     parent: Folder,
     folder: Folder,
     path: String,
@@ -489,7 +489,7 @@ impl Work {
 
 /// What a file is, as a look at it said: its identity, size, mtime, names and kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Facts {
+pub(crate) struct Facts {
     dev: libc::dev_t,
     ino: libc::ino_t,
     size: libc::off_t,
@@ -500,7 +500,7 @@ struct Facts {
 }
 
 impl Facts {
-    fn of(stat: &libc::stat) -> Facts {
+    pub(crate) fn of(stat: &libc::stat) -> Facts {
         Facts {
             dev: stat.st_dev,
             ino: stat.st_ino,
@@ -517,7 +517,7 @@ impl Facts {
     }
 
     /// Whether it is a plain file of one name.
-    fn is_plain(&self) -> bool {
+    pub(crate) fn is_plain(&self) -> bool {
         self.kind == libc::S_IFREG && self.nlink == 1
     }
 
@@ -916,21 +916,21 @@ fn staged(job: Job<'_>, seams: &BoxSeams, input: &mut impl BufRead, stage: &Stag
     locked(job.asked, console, |work, lock, console| installed(job, &staged, work, lock, console))
 }
 
-/// A put's stage, made and held: the stages folder `{root}/inputs-stage`, the stage's lock file beside the stage,
-/// `{key}-{nonce}.lock`, held with `flock` for the put's whole life, and the stage `{key}-{nonce}` itself, with its
-/// name and path.
-struct Stage {
+/// A put's stage, made and held: the stages folder (`{root}/inputs-stage` for an inputs put, `{root}/lfs-stage` for
+/// an `lfs` one), the stage's lock file beside the stage, `{key}-{nonce}.lock`, held with `flock` for the put's whole
+/// life, and the stage `{key}-{nonce}` itself, with its name and path.
+pub(crate) struct Stage {
     stages: Folder,
     #[expect(dead_code, reason = "held, never read: its flock tells the old-stage sweep this stage is live")]
     lock: File,
     name: String,
-    folder: Folder,
-    path: PathBuf,
+    pub(crate) folder: Folder,
+    pub(crate) path: PathBuf,
 }
 
 impl Stage {
     /// Removes the stage beneath the held stages folder, everything in it as itself, then its lock file. Else why not.
-    fn removed(&self) -> Result<(), String> {
+    pub(crate) fn removed(&self) -> Result<(), String> {
         let lock = lock_name(&self.name);
         self.stages
             .remove_child_tree(OsStr::new(&self.name))
@@ -950,10 +950,15 @@ fn lock_name(name: &str) -> String {
 /// at `now`); then the stage's lock file made new and locked, and the stage made new beside it, never adopted. Else
 /// why not.
 fn made_stage(asked: &Asked<'_>, now: SystemTime, console: &mut Console) -> Result<Stage, String> {
+    made_stage_in(asked, STAGES, now, console)
+}
+
+/// [`made_stage`], the stage made in the stages folder `{root}/{folder}` rather than `inputs-stage`, swept the same way.
+pub(crate) fn made_stage_in(asked: &Asked<'_>, folder: &str, now: SystemTime, console: &mut Console) -> Result<Stage, String> {
     let root = Folder::open_root(Path::new(&asked.root)).map_err(|error| format!("cannot open {}: {error}", asked.root))?;
-    let stages_path = Path::new(&asked.root).join(STAGES);
-    let stages = match root.make_child(OsStr::new(STAGES)) {
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => root.open_private_child(OsStr::new(STAGES)),
+    let stages_path = Path::new(&asked.root).join(folder);
+    let stages = match root.make_child(OsStr::new(folder)) {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => root.open_private_child(OsStr::new(folder)),
         made => made,
     }
     .map_err(|error| stages_refusal(&stages_path, &error))?;
@@ -1137,15 +1142,15 @@ fn is_stage_name(name: &str) -> bool {
 /// The Unix box's [`Place`]: each member and copy written into the held stage `stage`, at `path`, as a new 0600 file
 /// beneath the folders it makes there, which `budget` counts, and stamped with its last write; `left` holds what each
 /// staged file is once written, by its path's simple uppercase, which the install checks before it moves it.
-struct Staging<'s> {
+pub(crate) struct Staging<'s> {
     stage: &'s Folder,
     path: &'s Path,
     budget: FolderBudget,
-    left: BTreeMap<String, Facts>,
+    pub(crate) left: BTreeMap<String, Facts>,
 }
 
 impl<'s> Staging<'s> {
-    fn new(stage: &'s Folder, path: &'s Path) -> Staging<'s> {
+    pub(crate) fn new(stage: &'s Folder, path: &'s Path) -> Staging<'s> {
         Staging {
             stage,
             path,

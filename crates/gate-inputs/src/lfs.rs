@@ -36,6 +36,9 @@ pub const POINTER_MOST: u64 = 1024;
 const VERSION_LINE: &str = "version https://git-lfs.github.com/spec/v1\n";
 /// The most objects one manifest names.
 pub const OBJECTS: usize = 50_000;
+/// The most bytes one put of LFS objects carries or unpacks: 16 GiB, unless a test seam says otherwise (the PC's
+/// `--test-remote-lfs-budget-bytes`, a box's `--test-lfs-budget-bytes`).
+pub const LFS_BUDGET: u64 = 16 * 1024 * 1024 * 1024;
 /// The room `git cat-file --batch` is allowed per object beside its bytes: its header line and the newline after it.
 const HEADER_ROOM: usize = 128;
 

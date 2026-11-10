@@ -288,6 +288,31 @@ pub fn folder_unsafe_line(why: &str, path: &str) -> String {
     )
 }
 
+/// `gate: remote lfs <step> failed: <why>`, `why` escaped: the line after the `lfs` refusal tag of a failed `lfs` step,
+/// as the Windows box says it.
+#[must_use]
+pub fn lfs_failed_line(step: &str, why: &str) -> String {
+    format!("gate: remote lfs {step} failed: {}", escaped(why))
+}
+
+/// Why a put refuses an object whose name in the store, `lfs/objects/<aa>/<bb>/<oid>`, holds a file that is not the
+/// object: `<that path> is in the store but is not the object`.
+#[must_use]
+pub fn lfs_not_the_object(oid: &str) -> String {
+    let (first, second) = (oid.get(..2).unwrap_or_default(), oid.get(2..4).unwrap_or_default());
+    format!("lfs/objects/{first}/{second}/{oid} is in the store but is not the object")
+}
+
+/// Why a folder or the lock of the LFS store at `path` is not the box's, as [`owner_flaw`] found it, the box's user
+/// named `user`: `<path> is not owned by <user>`, or `<path> is open to others`.
+#[must_use]
+pub fn lfs_store_flaw(flaw: OwnerFlaw, path: &str, user: &str) -> String {
+    match flaw {
+        OwnerFlaw::Owner => format!("{path} is not owned by {user}"),
+        OwnerFlaw::Open => format!("{path} is open to others"),
+    }
+}
+
 /// `gate: remote could not create the folder <path>: <why>`, both escaped.
 #[must_use]
 pub fn folder_failure(path: &str, why: &str) -> String {
