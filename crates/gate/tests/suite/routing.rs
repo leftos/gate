@@ -21,8 +21,8 @@ use crate::nesting::{LOOK_OFTEN, end_parent, first_event, marked, orphaned_as, s
 use crate::remote_client::{PREK_SHIM, STAGE_COMMIT, Tuned, client_case, client_gate, client_gate_tuned, fallbacks};
 use crate::support::{
     Case, DenyEntry, FAKE_TOOL, GATE, Go, Junction, LOCAL_REASON, Outcome, Running, UNTIL_KILLED, assert_in_order, beside, calls, copy_tool,
-    critical_words, events, finish, git, git_init, heavy_words, log_texts, nothing_back, powershell_folder, record_path, release, run_words, shown,
-    ssh_steps, start, wait_for_journal_line, wait_until, write_counts, write_remote_json,
+    critical_words, events, finish, git, git_init, heavy_words, latest_run_of, log_texts, nothing_back, powershell_folder, record_path, release,
+    run_words, shown, ssh_steps, start, wait_for_journal_line, wait_until, write_counts, write_remote_json,
 };
 
 pub(crate) const HOST: &str = "builder";
@@ -91,9 +91,9 @@ fn recorded_words(call: &Value) -> Vec<&str> {
         .collect()
 }
 
-/// The journal lines of the gate `pid`.
+/// The journal lines of the latest gate `pid` ([`latest_run_of`]).
 pub(crate) fn own(case: &Case, pid: u32) -> Vec<Value> {
-    events(case).into_iter().filter(|event| event["pid"] == pid).collect()
+    latest_run_of(case, pid)
 }
 
 pub(crate) fn has_remote_tag(event: &Value) -> bool {

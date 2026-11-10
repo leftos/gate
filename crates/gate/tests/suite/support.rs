@@ -1112,20 +1112,30 @@ pub fn events(case: &Case) -> Vec<Value> {
         .collect()
 }
 
-/// The journal's events of the gate `pid`, in order.
+/// The journal lines of the latest gate process with `pid`, in order: the lines of the pid whose `processStart` is that
+/// of its last line. A pid the OS gave again to a later gate of the same case root names that later run only, so a case
+/// that runs gates one after another reads the run it just finished.
+pub fn latest_run_of(case: &Case, pid: u32) -> Vec<Value> {
+    let lines: Vec<Value> = events(case).into_iter().filter(|event| event["pid"] == pid).collect();
+    let Some(start) = lines.last().map(|line| line["processStart"].clone()) else {
+        return Vec::new();
+    };
+    lines.into_iter().filter(|line| line["processStart"] == start).collect()
+}
+
+/// The journal's events of the latest gate `pid` ([`latest_run_of`]), in order.
 pub fn events_of(case: &Case, pid: u32) -> Vec<String> {
-    events(case)
+    latest_run_of(case, pid)
         .into_iter()
-        .filter(|event| event["pid"] == pid)
         .map(|event| event["event"].as_str().expect("a line names its event").to_owned())
         .collect()
 }
 
-/// The `take` line of the gate `pid`.
+/// The `take` line of the latest gate `pid` ([`latest_run_of`]).
 pub fn take_of(case: &Case, pid: u32) -> Value {
-    events(case)
+    latest_run_of(case, pid)
         .into_iter()
-        .find(|event| event["event"] == "take" && event["pid"] == pid)
+        .find(|event| event["event"] == "take")
         .expect("the gate journalled its take")
 }
 

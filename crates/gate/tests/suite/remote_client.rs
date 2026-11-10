@@ -30,8 +30,8 @@ use crate::remote_inputs::inputs_case;
 use crate::support::{
     ANSWERING, Case, FAKE_GATE, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, GIT_REDIRECTS, Go, Junction, LOCAL_REASON, NetfxKey, Outcome,
     PREFLIGHT_SEAMS_VARIABLE, Running, STEPS_VARIABLE, allow_breakaway, assert_in_order, beside, build_version, calls, copy_tool, events, finish,
-    git, git_init, heavy_words, log_texts, nothing_back, refuse_breakaway, release, run_words, shown, ssh_steps, start, wait_for_journal_line,
-    wait_until, wait_until_closed, write_remote_json,
+    git, git_init, heavy_words, latest_run_of, log_texts, nothing_back, refuse_breakaway, release, run_words, shown, ssh_steps, start,
+    wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
 };
 
 pub(super) const HOST: &str = "builder";
@@ -570,9 +570,9 @@ fn box_dotnet_folder(case: &Case) -> PathBuf {
     case.folder().join("box-dotnet")
 }
 
-/// The journal lines of the gate `pid`.
+/// The journal lines of the latest gate `pid` ([`latest_run_of`]).
 fn own(case: &Case, pid: u32) -> Vec<Value> {
-    events(case).into_iter().filter(|event| event["pid"] == pid).collect()
+    latest_run_of(case, pid)
 }
 
 /// The reasons of the `fallback` lines among `events`.
