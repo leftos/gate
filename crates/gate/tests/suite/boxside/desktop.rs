@@ -136,12 +136,18 @@ fn unfetched_payload(case: &Case) -> Value {
 /// Checks `outcome` is the box's desktop refusal of `payload` saying `line`: exit 75, the `desktop` tag once and
 /// `line` right after it, no start marker and no back commits line.
 fn refused_with(outcome: &Outcome, payload: &Value, line: &str) {
+    refused_tagged(outcome, payload, "desktop", line);
+}
+
+/// Checks `outcome` is the box's refusal of `payload` with the tag `word` saying `line`: exit 75, the tag once and
+/// `line` right after it, no start marker and no back commits line.
+fn refused_tagged(outcome: &Outcome, payload: &Value, word: &str, line: &str) {
     assert_eq!(outcome.code, Some(75), "{outcome:?}");
-    let tag = refused_line(payload, "desktop");
+    let tag = refused_line(payload, word);
     assert_eq!(
         lines_starting(outcome, "gate-remote-refused:"),
         [tag.as_str()],
-        "one desktop tag: {outcome:?}"
+        "one {word} tag: {outcome:?}"
     );
     let lines: Vec<&str> = outcome.stderr.lines().collect();
     let at = lines.iter().position(|said| *said == tag).expect("the tag is said");
@@ -665,11 +671,39 @@ fn a_helper_of_another_build_refuses_desktop_naming_both_versions() {
     let outcome = handed_off(&case, &payload, "wrong-version");
 
     let ours = build_version(&case);
-    refused_with(
+    refused_tagged(
         &outcome,
         &payload,
+        "replaced",
         &format!("{NO_DESKTOP}the desktop helper runs gate 0.0.0+fault, the box {ours}"),
     );
+}
+
+/// A helper of another build refuses the first box's run once, as one a push replaced while the box waited does, and
+/// the box marks the case's file; the next box's run, the PC's retry, finds the file and runs the command.
+#[test]
+fn a_helper_replaced_while_the_box_waited_runs_on_the_retry() {
+    let case = Case::new("desktop_wrong_version_once");
+    let payload = ready_payload(&case, COMMAND);
+    let once = case.folder().join("replaced-once");
+    let mode = format!("wrong-version-once {}", shown(&once));
+
+    let first = handed_off(&case, &payload, &mode);
+
+    let ours = build_version(&case);
+    refused_tagged(
+        &first,
+        &payload,
+        "replaced",
+        &format!("{NO_DESKTOP}the desktop helper runs gate 0.0.0+fault, the box {ours}"),
+    );
+    assert!(once.exists(), "the first run marks the case's file: {first:?}");
+
+    let second = handed_off(&case, &payload, &mode);
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    ran_its_command(&second, &payload);
+    assert_eq!(second.stdout, "ran\n", "the retry ran the command: {second:?}");
 }
 
 #[test]

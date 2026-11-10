@@ -238,7 +238,7 @@ impl fmt::Display for Problem {
                 write!(
                     f,
                     "gate: {option} must be {}, got '{value}'",
-                    one_of(DESKTOP_MODES.iter().map(|(word, _)| *word))
+                    one_of(DESKTOP_MODES.iter().map(|(word, _)| *word).chain(["wrong-version-once <path>"]))
                 )
             }
             #[cfg(feature = "test-seams")]

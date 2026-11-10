@@ -2048,6 +2048,11 @@ struct Walk {
     built: Vec<RemoteRun>,
     /// The run of the builder the walk is on; `None` for the routed run's first builder.
     current: Option<Box<RemoteRun>>,
+    /// The aliases of the builders a `replaced` refusal had the run try once more, each at most once.
+    replaced: HashSet<String>,
+    /// The figures of the remote slot the latest attempt took, which a `replaced` refusal's retry calls the builder
+    /// under again, its slot kept; `None` before any attempt took one.
+    figures: Option<Figures>,
 }
 
 impl Walk {
@@ -2061,7 +2066,18 @@ impl Walk {
             tried: HashSet::new(),
             built: Vec::new(),
             current: None,
+            replaced: HashSet::new(),
+            figures: None,
         }
+    }
+
+    /// The figures a `refusal` of the builder `current` has the run call that builder once more under, its remote slot
+    /// kept: a `replaced` refusal before the command started that kept the slot it took, from a builder no `replaced`
+    /// refusal had the run try again yet, which this counts; `None` for any other refusal.
+    fn tries_again(&mut self, current: &RemoteRun, refusal: &Refusal) -> Option<Figures> {
+        let again = refusal.reason == FallbackReason::Replaced && !refusal.outcome.lost_mid_run && refusal.held.is_some();
+        let figures = self.figures.filter(|_| again)?;
+        self.replaced.insert(current.builder.alias.clone()).then_some(figures)
     }
 }
 
@@ -3035,7 +3051,7 @@ impl Run<'_> {
                 let reason = FallbackReason::Inputs;
                 return (self.fell_back(goes, reason, &RemoteOutcome::not_started(line), console), Some(reason));
             }
-            let refusal = match self.attempt(remote, &mut walk, hold, console) {
+            let refusal = match self.attempt_once_more(remote, &mut walk, hold, console) {
                 Attempt::Done(remotely) => return (remotely, None),
                 Attempt::Refused(refusal) => refusal,
             };
@@ -3131,6 +3147,54 @@ impl Run<'_> {
             critical_pid: self.rerouted_for,
         });
         Ok(next)
+    }
+
+    /// One attempt of the routed run `first` on the builder the `walk` goes to ([`Run::attempt`]), and, when the builder
+    /// refused it `replaced` ([`Walk::tries_again`]), as a helper of another build that a push left while the box waited
+    /// refuses, one more call of that same builder, pinned or not, under the slot the attempt took, which the run keeps,
+    /// so no waiter takes it and the retry reaches no other builder: the new box runs the installed build
+    /// ([`Run::try_again`]). A Ctrl+C raised by then ends the run as an interrupt before the command started, after
+    /// the attempt is given up and the fallback head said, as [`Run::after_refusal`] ends it.
+    fn attempt_once_more(&mut self, first: &RemoteRun, walk: &mut Walk, hold: &mut Hold, console: &mut Console) -> Attempt {
+        let attempt = self.attempt(first, walk, hold, console);
+        let current = walk.current.as_deref().unwrap_or(first).clone();
+        let (refusal, figures) = match attempt {
+            Attempt::Refused(refusal) => match walk.tries_again(&current, &refusal) {
+                Some(figures) => (refusal, figures),
+                None => return Attempt::Refused(refusal),
+            },
+            done @ Attempt::Done(_) => return done,
+        };
+        if self.host.interrupt.is_some_and(Interrupt::is_raised) {
+            let Refusal { reason, outcome, held } = refusal;
+            hold.took = None;
+            let host = self.give_up(reason, &outcome, held, console);
+            console.err(&fallback_head(&host, reason, outcome.detail.as_deref()));
+            return Attempt::Done(Remotely::Ended(self.interrupted_before_start(console)));
+        }
+        self.try_again(refusal, &current, hold, console);
+        self.call_builder(&current, hold, (figures, &walk.session, &mut walk.waited), console)
+    }
+
+    /// Ends the attempt on `current` that a `replaced` refusal ended before the run calls the same builder once more
+    /// under the remote slot the attempt took, which it keeps in `hold`: its claim stands, no waiter is woken and no
+    /// ticket queued. Journals the fallback, then a take of that slot under the same tag with no wait, so a journal
+    /// reader sees the run holding the builder's slot again; gathers the attempt's lines into the log's notes
+    /// ([`Run::note_attempt`]), and says `gate: remote <host> replaced; trying <host> again`. Its route lines, said at
+    /// its first attempt, are not said again.
+    fn try_again(&mut self, refusal: Refusal, current: &RemoteRun, hold: &mut Hold, console: &mut Console) {
+        let Refusal { reason, outcome, held } = refusal;
+        self.routing.fell_back.push(reason);
+        self.journal.write(&JournalEvent::Fallback { reason }, self.tag.as_ref(), console);
+        if let Some(taken) = &held {
+            let take = take_event(vec![taken.held.name().to_owned()], 0.0, Vec::new(), self.routing.parent_pid);
+            self.journal.write(&take, self.tag.as_ref(), console);
+        }
+        hold.taken = held;
+        self.note_attempt(&outcome, console);
+        let host = self.tag.as_ref().map_or_else(String::new, |tag| tag.host.clone());
+        let again = format!("{} again", current.builder.alias);
+        console.err(&fallback_line(&host, reason, outcome.detail.as_deref(), Some(&again)));
     }
 
     /// Where the routed run `first` goes after a fallback for `reason`: the first builder in score order the `walk` has
@@ -3247,8 +3311,9 @@ impl Run<'_> {
         if self.host.interrupt.is_some_and(Interrupt::is_raised) {
             return Attempt::Done(Remotely::Ended(self.interrupted_before_start(console)));
         }
-        // A commit's stage runs within the commit's own ceiling, not one of the builder's.
+        // A commit's stage runs within the commit's own ceiling, not one of the builder's, and is never tried again.
         let figures = self.staging.unwrap_or(figures);
+        walk.figures = self.staging.is_none().then_some(figures);
         self.call_builder(run, hold, (figures, &walk.session, &mut walk.waited), console)
     }
 
@@ -3893,6 +3958,14 @@ impl Run<'_> {
             drop(taken);
             slots::wake_waiters(self.root, &mut self.survey, console);
         }
+        self.note_attempt(outcome, console);
+        tag.map_or_else(String::new, |tag| tag.host)
+    }
+
+    /// Removes the log of an attempt given up, so the client's own bytes do not stand beside the notes that say them,
+    /// and gathers the attempt's `outcome` lines into the log's notes unsaid, all but the cold note of an attempt whose
+    /// ceiling was raised ([`Run::give_up`]).
+    fn note_attempt(&mut self, outcome: &RemoteOutcome, console: &mut Console) {
         // A run here starts from a log holding none of what the client wrote: the notes below say its lines again.
         if let Err(error) = self.log.discard() {
             console.err(&format!(
@@ -3907,7 +3980,6 @@ impl Run<'_> {
             }
             console.note(line);
         }
-        tag.map_or_else(String::new, |tag| tag.host)
     }
 
     /// Gives up a commit stage's attempt ([`Run::give_up`]), which is no remote run of the commit's: lets the remote

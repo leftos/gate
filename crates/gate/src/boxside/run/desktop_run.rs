@@ -176,7 +176,9 @@ fn locked(
     let guard = match wait_for_desktop(&mutex, turns, &record, beat, console) {
         Ok(guard) => guard,
         Err(Unheld::Ended(status)) => return Err(DesktopEnd::Ended(status)),
-        Err(Unheld::Busy) => return Err(said_refused(request, &[busy_timeout_line(turns.total)], beat, console)),
+        Err(Unheld::Busy) => {
+            return Err(said_refused(request, Refusal::Desktop, &[busy_timeout_line(turns.total)], beat, console));
+        }
         Err(Unheld::Failed(error)) => {
             let refusal = DesktopRefusal::Machinery(format!("the builder's desktop lock cannot be waited for: {error}"));
             return Err(desktop_refused(request, &refusal.into(), beat, console));
@@ -382,16 +384,17 @@ fn waited<G>(
     }
 }
 
-/// Refuses the run for the builder's desktop as `refused` says.
+/// Refuses the run for the builder's desktop as `refused` says, with the refusal's own tag ([`DesktopRefusal::tag`]).
 fn desktop_refused(request: &Request<'_>, refused: &ConsoleRefused, beat: &Beat<'_>, console: &mut Console) -> DesktopEnd {
-    said_refused(request, &refused.lines(), beat, console)
+    said_refused(request, refused.refusal.tag(), &refused.lines(), beat, console)
 }
 
-/// Refuses the run for the builder's desktop: the `desktop` refusal tag, then `lines`, said together under the box's
-/// output lock, so the PC ends the run with the reason, never running a desktop command itself.
-fn said_refused(request: &Request<'_>, lines: &[String], beat: &Beat<'_>, console: &mut Console) -> DesktopEnd {
+/// Refuses the run for the builder's desktop: the refusal tag `tag`, `desktop` or `replaced`, then `lines`, said
+/// together under the box's output lock, so the PC ends the run with the reason, or tries the builder once more for
+/// `replaced`, never running a desktop command itself.
+fn said_refused(request: &Request<'_>, tag: Refusal, lines: &[String], beat: &Beat<'_>, console: &mut Console) -> DesktopEnd {
     let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
-    stamping::protocol(console, &refused_line(request.nonce, Refusal::Desktop));
+    stamping::protocol(console, &refused_line(request.nonce, tag));
     for line in lines {
         stamping::err(console, line);
     }
@@ -424,7 +427,7 @@ fn read_console(read: impl FnOnce() -> Result<Option<SessionState>, Unread>, acc
 /// The session attached to the console, `None` when none is; under the session seam, or the desktop seam alone, the
 /// state the seam names, made of the box's own session and `account`.
 fn console_session(seams: &BoxSeams, account: &Account) -> Result<Option<SessionState>, Unread> {
-    let seamed = seams.desktop_session.or(seams.desktop.map(|_| DesktopSession::Active));
+    let seamed = seams.desktop_session.or(seams.desktop.as_ref().map(|_| DesktopSession::Active));
     match seamed {
         Some(state) => seam_session(state, account).map(Some).map_err(Unread::Failed),
         None => match gate_win32::active_console_session() {

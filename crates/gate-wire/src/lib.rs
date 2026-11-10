@@ -1856,6 +1856,9 @@ pub enum Refusal {
     /// The run asked for the builder's desktop and could not have it: nobody is logged on at the console or it is
     /// locked, another user holds it, or another run held the desktop for the whole wait the run gave.
     Desktop,
+    /// The run had the builder's desktop, but the desktop helper runs another build than the box: a push may have
+    /// replaced the box's gate while it waited for the desktop, so a new box may run it.
+    Replaced,
     /// The desktop helper the run would hand its command to is not installed where only administrators can change it.
     Install,
     /// The repo's LFS store does not hold what the run's snapshot's pointers name as its `LfsDigest` says.
@@ -1881,6 +1884,7 @@ impl Refusal {
             Refusal::Inputs => "inputs",
             Refusal::Sent => "sent",
             Refusal::Desktop => "desktop",
+            Refusal::Replaced => "replaced",
             Refusal::Install => "install",
             Refusal::Lfs => "lfs",
             Refusal::Drain => "drain",
@@ -2566,6 +2570,7 @@ mod tests {
                 (Refusal::Inputs, "inputs"),
                 (Refusal::Sent, "sent"),
                 (Refusal::Desktop, "desktop"),
+                (Refusal::Replaced, "replaced"),
                 (Refusal::Install, "install"),
                 (Refusal::Lfs, "lfs"),
                 (Refusal::Drain, "drain"),

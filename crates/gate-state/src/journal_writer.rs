@@ -347,6 +347,9 @@ pub enum FallbackReason {
     Cold,
     /// The builder could not give the run its desktop.
     Desktop,
+    /// The builder's desktop helper ran another build than its box, as when a push replaced the box's gate while it
+    /// waited for the desktop: the builder is tried once more.
+    Replaced,
     /// The builder's gate is not installed where only administrators can change it.
     Install,
     /// The run's Git LFS content could not be sent to the builder, or the builder's store did not hold it at the run.
@@ -374,6 +377,7 @@ impl FallbackReason {
             FallbackReason::Inputs => "inputs",
             FallbackReason::Cold => "cold",
             FallbackReason::Desktop => "desktop",
+            FallbackReason::Replaced => "replaced",
             FallbackReason::Install => "install",
             FallbackReason::Lfs => "lfs",
             FallbackReason::Root => "root",

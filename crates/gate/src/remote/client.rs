@@ -6439,7 +6439,7 @@ impl CheckoutSaid {
 /// What starts the box's line saying what it sent over a data channel ([`gate_wire::channel_sent_line`]).
 const CHANNEL_SENT: &str = "gate: data channel sent ";
 
-/// The start marker, the eleven refusal tags, the two kill tags and the adjusted line's prefix of one call, made once for
+/// The start marker, the twelve refusal tags, the two kill tags and the adjusted line's prefix of one call, made once for
 /// its readers, and the run call's checkout lines.
 struct ProtocolLines {
     drain: String,
@@ -6450,6 +6450,7 @@ struct ProtocolLines {
     inputs: String,
     sent: String,
     desktop: String,
+    replaced: String,
     install: String,
     lfs: String,
     full: String,
@@ -6485,6 +6486,7 @@ impl ProtocolLines {
             inputs: refused_line(nonce, Refusal::Inputs),
             sent: refused_line(nonce, Refusal::Sent),
             desktop: refused_line(nonce, Refusal::Desktop),
+            replaced: refused_line(nonce, Refusal::Replaced),
             install: refused_line(nonce, Refusal::Install),
             lfs: refused_line(nonce, Refusal::Lfs),
             full: refused_line(nonce, Refusal::Full),
@@ -6524,6 +6526,7 @@ impl ProtocolLines {
             (&self.inputs, Protocol::Refused(FallbackReason::Inputs)),
             (&self.sent, Protocol::SentRefused),
             (&self.desktop, Protocol::Refused(FallbackReason::Desktop)),
+            (&self.replaced, Protocol::Refused(FallbackReason::Replaced)),
             (&self.install, Protocol::Refused(FallbackReason::Install)),
             (&self.lfs, Protocol::Refused(FallbackReason::Lfs)),
             (&self.full, Protocol::Refused(FallbackReason::Full)),

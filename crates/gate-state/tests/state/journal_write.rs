@@ -557,6 +557,7 @@ fn a_fallback_line_names_each_reason_by_its_word() {
         (FallbackReason::Inputs, "inputs"),
         (FallbackReason::Cold, "cold"),
         (FallbackReason::Desktop, "desktop"),
+        (FallbackReason::Replaced, "replaced"),
         (FallbackReason::Install, "install"),
         (FallbackReason::Lfs, "lfs"),
         (FallbackReason::Root, "root"),

@@ -2284,7 +2284,7 @@ fn desktop_mutex_takes_the_longest_name(longest: &str) {
 fn desktop_seam_refusals_hold(too_long: &str) {
     // The faults and the states a refusal line lists, as the seams' own words give them.
     let modes = "ok, exit-before-hello, hang, wrong-version, lie-handle, exit-after-create, task-not-registered, \
-                 task-set-up-wrong, task-failed or task-no-pid";
+                 task-set-up-wrong, task-failed, task-no-pid or wrong-version-once <path>";
     let sessions = "active, none, locked, other-user or disconnected";
     let mutex = "1 to 64 ASCII letters, digits and '-'";
     let refused = |words: &[&str], want: String| assert_eq!(problems(words), [want], "{words:?}");
@@ -2338,6 +2338,22 @@ fn box_run(seams: gate_args::BoxSeams) -> gate_args::Invocation {
     })
 }
 
+/// The box's desktop seam `wrong-version-once <path>`: the rest of its one value, after the space, is the path.
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_wrong_version_once_desktop_seam_takes_the_rest_of_its_value_as_its_path() {
+    use gate_args::{BoxSeams, DesktopMode};
+
+    use crate::support::invocation;
+
+    let word = r"wrong-version-once C:\case folder\once";
+    let taking = box_run(BoxSeams {
+        desktop: Some(DesktopMode::WrongVersionOnce(std::path::PathBuf::from(r"C:\case folder\once"))),
+        ..BoxSeams::default()
+    });
+    assert_eq!(invocation(&["box", "--test-box-desktop", word, "run", "--stdin"]), taking);
+}
+
 /// The box's desktop seams: the fault its desktop run takes, the state it finds the console's session in, the unique
 /// part of the private namespace and mutex it takes, how long its waits may take, and its message limit.
 #[cfg(feature = "test-seams")]
@@ -2367,7 +2383,7 @@ fn the_desktop_seams_parse_and_refuse_bad_values() {
     ] {
         assert_eq!(
             invocation(&["box", "--test-box-desktop", word, "run", "--stdin"]),
-            taking(desktop),
+            taking(desktop.clone()),
             "{word}"
         );
         let joined = format!("--test-box-desktop={word}");

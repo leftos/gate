@@ -211,7 +211,7 @@ pub struct HoldRequest {
 }
 
 /// A fault `--test-box-desktop` makes the box's desktop run take, in place of the real task start and helper.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DesktopMode {
     /// No fault: the task starts and the real helper serves.
     Ok,
@@ -221,6 +221,9 @@ pub enum DesktopMode {
     Hang,
     /// The helper says another build's version.
     WrongVersion,
+    /// `wrong-version-once <path>`: the helper says another build's version, as [`DesktopMode::WrongVersion`], and the
+    /// box creates the file at the path, when it does not exist; when it does, no fault, as [`DesktopMode::Ok`].
+    WrongVersionOnce(PathBuf),
     /// The helper reports a process value that is not the child it made.
     LieHandle,
     /// The helper exits right after it created the child.

@@ -13,6 +13,7 @@ use jiff::Timestamp;
 use serde_json::{Value, json};
 
 use crate::boxside::desktop::verify::{Unproved, WrongFact};
+use crate::remote::Refusal;
 
 /// The box's line refusing a run it cannot hand to the builder's desktop: the box's own prefix, then why.
 const NO_DESKTOP: &str = "gate: not routed: the builder has no desktop session: ";
@@ -127,6 +128,34 @@ impl DesktopRefusal {
             DesktopRefusal::SessionUnreadable => "the console session cannot be read".to_owned(),
             DesktopRefusal::SessionMoved => "the console session changed while the box read it".to_owned(),
             DesktopRefusal::Machinery(why) => why.clone(),
+        }
+    }
+
+    /// The refusal tag the box says before the refusal's line: `replaced` for a helper of another build, which a push
+    /// that replaced the box's gate while the box waited for the desktop leaves, so the PC tries the builder once more
+    /// with a new box; `desktop` for every other refusal.
+    #[must_use]
+    pub(crate) fn tag(&self) -> Refusal {
+        match self {
+            DesktopRefusal::HelperOtherVersion { .. } => Refusal::Replaced,
+            DesktopRefusal::NobodyLoggedOn
+            | DesktopRefusal::AnotherUser
+            | DesktopRefusal::Disconnected
+            | DesktopRefusal::Locked
+            | DesktopRefusal::LockUnknown
+            | DesktopRefusal::TaskNotRegistered
+            | DesktopRefusal::TaskSetUpWrong(_)
+            | DesktopRefusal::HelperDidNotStart(_)
+            | DesktopRefusal::HelperNotOnDesktop
+            | DesktopRefusal::HelperFailed(_)
+            | DesktopRefusal::WrongCommand(_)
+            | DesktopRefusal::WrongCommandFor(..)
+            | DesktopRefusal::CommandUnread { .. }
+            | DesktopRefusal::NotPutInTheJob(_)
+            | DesktopRefusal::DesktopLock(_)
+            | DesktopRefusal::SessionUnreadable
+            | DesktopRefusal::SessionMoved
+            | DesktopRefusal::Machinery(_) => Refusal::Desktop,
         }
     }
 

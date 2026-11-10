@@ -13907,6 +13907,155 @@ fn a_desktop_run_hops_to_the_next_builder_before_it_fails() {
     );
 }
 
+/// The line a desktop run says when its builder's helper was replaced, before it tries that builder once more.
+fn trying_again() -> String {
+    format!("gate: remote {HOST} replaced; trying {HOST} again")
+}
+
+#[test]
+fn a_replaced_desktop_refusal_is_retried_once_on_the_same_builder_and_runs() {
+    let case = desktop_case("client-desktop-replaced-once", false);
+
+    let (pid, outcome, _) = run_marking(&case, &["refuse-at 1 replaced", "out ran there", "status 0"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran there"), "the retry ran the command: {outcome:?}");
+    assert_eq!(outcome.stderr.matches(&trying_again()).count(), 1, "{outcome:?}");
+    assert!(!outcome.stderr.contains(DESKTOP_NOT_HERE), "{outcome:?}");
+    let own = own(&case, pid);
+    let names: Vec<&str> = own.iter().map(|event| event["event"].as_str().expect("an event's name")).collect();
+    assert_eq!(names, ["queue", "take", "fallback", "take", "release"], "{own:#?}");
+    assert_eq!((&own[2]["reason"], &own[2]["host"]), (&json!("replaced"), &json!(HOST)), "{own:#?}");
+    assert_eq!(own[3]["host"], HOST, "{own:#?}");
+}
+
+#[test]
+fn a_second_replaced_desktop_refusal_ends_the_run_as_a_desktop_refusal_does() {
+    let case = desktop_case("client-desktop-replaced-twice", false);
+
+    let ran = run_marking(&case, &["refuse replaced"]);
+
+    let outcome = &ran.1;
+    assert_eq!(outcome.stderr.matches(&trying_again()).count(), 1, "{outcome:?}");
+    let ended = format!("gate: remote {HOST} replaced{DESKTOP_NOT_HERE}");
+    assert!(outcome.stderr.lines().any(|said| said == ended), "{outcome:?}");
+    assert_in_order(&outcome.stderr, &[&trying_again(), &ended]);
+    assert_desktop_ended(&case, (ran.0, outcome, &ran.2), &format!("gate: remote {HOST} replaced"), &["replaced"]);
+    let own = own(&case, ran.0);
+    let names: Vec<&str> = own.iter().map(|event| event["event"].as_str().expect("an event's name")).collect();
+    assert_eq!(names, ["queue", "take", "fallback", "take", "release"], "{own:#?}");
+    assert_eq!((&own[2]["reason"], &own[2]["host"]), (&json!("replaced"), &json!(HOST)), "{own:#?}");
+}
+
+/// The names and hosts of the journal lines `own`.
+fn names_and_hosts(own: &[Value]) -> Vec<(&str, Option<&str>)> {
+    own.iter()
+        .map(|event| (event["event"].as_str().expect("an event's name"), event["host"].as_str()))
+        .collect()
+}
+
+#[test]
+fn a_replaced_desktop_refusal_never_moves_to_the_next_builder() {
+    let case = desktop_case("client-desktop-replaced-stays", true);
+    let (called_a, called_host) = (case.folder().join("a.json"), case.folder().join("host.json"));
+    let (record_a, record_host) = (format!("record {}", shown(&called_a)), format!("record {}", shown(&called_host)));
+    let (on_a, on_host) = (format!("on {FIRST_BUILDER}"), format!("on {HOST}"));
+    // Call 1 goes to whichever builder the route tries first, so each refuses its first call and runs its second.
+    let steps = [
+        on_a.as_str(),
+        "refuse-at 1 replaced",
+        record_a.as_str(),
+        "out ran there",
+        "status 0",
+        on_host.as_str(),
+        "refuse-at 1 replaced",
+        record_host.as_str(),
+        "out ran there",
+        "status 0",
+    ];
+
+    let (pid, outcome, _) = run_marking(&case, &steps);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let own = own(&case, pid);
+    let first = own[1]["host"].as_str().expect("the take names its builder").to_owned();
+    let (ran, other) = if first == HOST {
+        (&called_host, &called_a)
+    } else {
+        (&called_a, &called_host)
+    };
+    assert!(ran.exists() && !other.exists(), "only the first builder is called: {outcome:?}");
+    let again = format!("gate: remote {first} replaced; trying {first} again");
+    assert_eq!(outcome.stderr.matches(&again).count(), 1, "{outcome:?}");
+    assert_eq!(outcome.stderr.matches("; trying ").count(), 1, "{outcome:?}");
+    let host = Some(first.as_str());
+    assert_eq!(
+        names_and_hosts(&own),
+        [("queue", host), ("take", host), ("fallback", host), ("take", host), ("release", host)],
+        "{own:#?}"
+    );
+    assert_eq!(own[2]["reason"], "replaced", "{own:#?}");
+    let second = if first == HOST { FIRST_BUILDER } else { HOST };
+    refused_twice_stays(&case, &first, second);
+}
+
+/// Checks a desktop run of the two-builder `case` whose builder `first`, the one the route tries first, refuses every
+/// call `replaced` ends on `first` after its one retry, never calling the builder `second`.
+fn refused_twice_stays(case: &Case, first: &str, second: &str) {
+    let called = case.folder().join("second.json");
+    let record = format!("record {}", shown(&called));
+    let (on_first, on_second) = (format!("on {first}"), format!("on {second}"));
+    let steps = [on_first.as_str(), "refuse replaced", on_second.as_str(), record.as_str(), "status 0"];
+
+    let ran = run_marking(case, &steps);
+
+    let outcome = &ran.1;
+    assert!(!called.exists(), "the second builder is never called: {outcome:?}");
+    let again = format!("gate: remote {first} replaced; trying {first} again");
+    assert_eq!(outcome.stderr.matches(&again).count(), 1, "{outcome:?}");
+    assert_eq!(outcome.stderr.matches("; trying ").count(), 1, "{outcome:?}");
+    let ended = format!("gate: remote {first} replaced{DESKTOP_NOT_HERE}");
+    assert!(outcome.stderr.lines().any(|said| said == ended), "{outcome:?}");
+    assert_desktop_ended(case, (ran.0, outcome, &ran.2), &ended, &["replaced"]);
+    let own = own(case, ran.0);
+    let host = Some(first);
+    assert_eq!(
+        names_and_hosts(&own),
+        [("queue", host), ("take", host), ("fallback", host), ("take", host), ("release", host)],
+        "{own:#?}"
+    );
+}
+
+#[test]
+fn a_pinned_desktop_run_refused_replaced_is_retried_once_on_its_builder() {
+    let case = desktop_case("client-desktop-replaced-pinned", false);
+    let marker = case.folder().join("marker.txt");
+    let stub = shown(&crate::routing::stub(&case, &["refuse-at 1 replaced", "out ran there", "status 0"]));
+    let marked = shown(&marker);
+    let words = crate::routing::routed_words(
+        "out.log",
+        &stub,
+        &["--builder", HOST],
+        &[r".\tool.exe", "mark", &marked, "out", "ran here"],
+    );
+    let running = case.start(&words);
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran there"), "the retry ran the command: {outcome:?}");
+    assert!(!marker.exists(), "the command never ran here: {outcome:?}");
+    assert_eq!(outcome.stderr.matches(&trying_again()).count(), 1, "{outcome:?}");
+    let own = own(&case, pid);
+    let host = Some(HOST);
+    assert_eq!(
+        names_and_hosts(&own),
+        [("queue", host), ("take", host), ("fallback", host), ("take", host), ("release", host)],
+        "{own:#?}"
+    );
+    assert_eq!(own[2]["reason"], "replaced", "{own:#?}");
+}
+
 /// The first builder's call spoils the routing file, so the next builder's run cannot be built as the walk reaches it.
 #[test]
 fn a_desktop_run_whose_next_builder_cannot_be_built_fails_and_never_runs_here() {

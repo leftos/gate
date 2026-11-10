@@ -206,12 +206,18 @@ pub(crate) fn port_range(option: &str, value: &str) -> Result<(u16, u16), Proble
     }
 }
 
-/// The fault `--test-box-desktop` names, one of [`DESKTOP_MODES`]; else the problem naming the value.
+/// The fault `--test-box-desktop` names, one of [`DESKTOP_MODES`] or `wrong-version-once <path>` with a path that is
+/// not empty; else the problem naming the value.
 #[cfg(feature = "test-seams")]
 pub(crate) fn desktop_mode(option: &str, value: &str) -> Result<DesktopMode, Problem> {
+    let once = value
+        .strip_prefix("wrong-version-once ")
+        .filter(|path| !path.is_empty())
+        .map(|path| DesktopMode::WrongVersionOnce(std::path::PathBuf::from(path)));
     DESKTOP_MODES
         .iter()
-        .find_map(|(word, mode)| (*word == value).then_some(*mode))
+        .find_map(|(word, mode)| (*word == value).then(|| mode.clone()))
+        .or(once)
         .ok_or_else(|| Problem::BadDesktopMode {
             option: option.to_owned(),
             value: value.to_owned(),

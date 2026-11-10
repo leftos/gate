@@ -1115,10 +1115,11 @@ fn run_helper_task(
 ) -> (Result<StartedTask, TaskError>, Option<Job>) {
     use gate_args::DesktopMode as SeamFault;
 
-    let Some(mode) = seams.desktop else {
+    let Some(mode) = &seams.desktop else {
         return (gate_win32::run_task(task, deadline, wake), None);
     };
     let fault = match mode {
+        SeamFault::WrongVersionOnce(path) => wrong_version_once(path),
         SeamFault::TaskNotRegistered => return (Err(TaskError::NotRegistered), None),
         SeamFault::TaskSetUpWrong => return (Err(TaskError::SetUpWrong("the desktop seam's definition".to_owned())), None),
         SeamFault::TaskFailed => return (Err(TaskError::Failed("the desktop seam's start failed".to_owned())), None),
@@ -1134,6 +1135,18 @@ fn run_helper_task(
         Ok((pid, job)) => (Ok(StartedTask::Process(pid)), job),
         Err(error) => (Err(TaskError::Failed(format!("the stand-in helper cannot be started: {error}"))), None),
     }
+}
+
+/// The stand-in helper's fault of the desktop seam's `wrong-version-once <path>`: no fault when the file at `path`
+/// exists; else `wrong-version`, the file made so the next box finds it and its helper says the box's own build. A file
+/// that cannot be made leaves every box refused, which the case that names the file sees as the file missing.
+#[cfg(feature = "test-seams")]
+fn wrong_version_once(path: &Path) -> &'static str {
+    if path.exists() {
+        return "";
+    }
+    let _ = std::fs::write(path, b"");
+    "wrong-version"
 }
 
 /// The helper's task started as `task` says ([`gate_win32::run_task`]).
