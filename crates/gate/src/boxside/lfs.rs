@@ -16,7 +16,6 @@
 //! name or is not of the manifest's size, and installs each object by a rename that never replaces: an object already
 //! in the store, another put's among them, is kept, and its staged copy deleted.
 
-use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{BuildHasher, RandomState};
 use std::io::{self, BufRead, Read};
@@ -26,9 +25,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gate_args::BoxSeams;
 use gate_inputs::archive::sent_limit;
+use gate_inputs::lfs::{CHECKOUT_PINS, Listed, Object, POINTER_MOST, Pointer, Wanted, checked, is_wrong_file, manifest_digest, parsed_manifest};
 use gate_router::escaped;
 use gate_win32::{Descriptor, Make, Share};
-use gate_wire::{Pair, Payload, PutChannel, SHA256_DIGITS, channel_not_completed_line, grandparent, is_lower_hex};
+use gate_wire::{
+    LFS_INSTALLED, LFS_NEED, LFS_NO_SCRATCH, LFS_NOT_THE_SNAPSHOTS, LFS_NOT_THE_SNAPSHOTS_START, LFS_OID, Pair, Payload, PutChannel,
+    channel_not_completed_line, grandparent,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
     READ_CONTROL,
@@ -47,15 +50,12 @@ use crate::boxside::stamping;
 use crate::console::Console;
 use crate::outputs::archive::{Entry, PcFiles, unpack};
 use crate::outputs::manifest::{MANIFEST_LIMIT, Manifest};
-use crate::remote::lfs::{Listed, NO_SCRATCH, Object, POINTER_MOST, Pointer, manifest_digest, parsed_pointer};
 use crate::remote::{Refusal, refused_line as tagged_line};
 
 /// The bytes in one gibibyte.
 const GIB: u64 = 1024 * 1024 * 1024;
 /// The most bytes one put unpacks: 16 GiB, unless the `--test-lfs-budget-bytes` seam says otherwise.
 const LFS_BUDGET: u64 = 16 * GIB;
-/// The most objects one manifest names.
-const OBJECTS: usize = 50_000;
 /// The folder below the box's root that holds each put's stage, `{root}\lfs-stage\{key}-{nonce}`.
 const STAGES: &str = "lfs-stage";
 /// The folder in a stage the archive is unpacked into.
@@ -97,7 +97,7 @@ struct Asked<'a> {
     /// The sibling pair the work folder is laid out for, `None` for one repo.
     pair: Option<Pair>,
     /// The bare repository whose store the request is for: the sibling's `LfsRepo` names, resolved once as the request
-    /// is read ([`lfs_repo`]), else the main repo's `bare`.
+    /// is read ([`Payload::lfs_repo`]), else the main repo's `bare`.
     store: String,
     /// The data channel a put's archive comes over instead of stdin, `None` for stdin.
     channel: Option<PutChannel>,
@@ -108,8 +108,8 @@ struct Asked<'a> {
 
 impl Asked<'_> {
     /// The request `payload` holds; else the usage line. A pair the payload reader refuses ([`Payload::pair`]) is
-    /// refused with its line, and an `LfsRepo` that names no sibling of the pair ([`lfs_repo`]) with its own. A put's
-    /// `Channel` is read as [`Payload::put_channel`] reads it; a diff's is refused, as the PC never sends one.
+    /// refused with its line, and an `LfsRepo` that names no sibling of the pair ([`Payload::lfs_repo`]) with its own.
+    /// A put's `Channel` is read as [`Payload::put_channel`] reads it; a diff's is refused, as the PC never sends one.
     fn read(payload: &Payload) -> Result<Asked<'_>, String> {
         let (key, work) = payload.work_folder()?;
         let bare = payload.path("Bare")?;
@@ -123,7 +123,7 @@ impl Asked<'_> {
         let root =
             grandparent(work).ok_or_else(|| format!(r"gate: box payload Work must be <root>\work\<key> to stage objects: {}", escaped(work)))?;
         let pair = payload.pair()?;
-        let store = lfs_repo(payload, pair.as_ref())?.unwrap_or_else(|| bare.to_owned());
+        let store = payload.lfs_repo(pair.as_ref())?.unwrap_or_else(|| bare.to_owned());
         let channel = match &step {
             Step::Put => payload.put_channel()?,
             Step::Diff if payload.sets("Channel") => return Err(DIFF_CHANNEL.to_owned()),
@@ -163,31 +163,6 @@ impl Asked<'_> {
             spare: &self.spare,
         }
     }
-}
-
-/// The bare repository, as the box derives it ([`gate_wire::PairSibling::bare`]), of the sibling of `pair` the payload's `LfsRepo`
-/// names, matched exactly; `None` when the key is absent or null, the main repo's store. Else the usage line: a value
-/// that is not a text, an `LfsRepo` without a `Pair`, or a name that is no sibling of the pair.
-fn lfs_repo(payload: &Payload, pair: Option<&Pair>) -> Result<Option<String>, String> {
-    if !payload.sets("LfsRepo") {
-        return Ok(None);
-    }
-    let name = payload.optional_text("LfsRepo")?;
-    let Some(pair) = pair else {
-        return Err("gate: box payload LfsRepo needs a Pair".to_owned());
-    };
-    pair.siblings()
-        .iter()
-        .find(|sibling| sibling.name() == name)
-        .map(|sibling| Some(sibling.bare().to_owned()))
-        .ok_or_else(|| format!("gate: box payload LfsRepo {} is not a sibling of the pair", escaped(name)))
-}
-
-/// One object of the PC's manifest: its oid and its size.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Wanted {
-    oid: String,
-    size: u64,
 }
 
 /// Answers `gate box lfs`: the request read, the call passed through the drain ([`drain::passed`]) or refused `drain`
@@ -257,7 +232,8 @@ fn refuses_unelevated(elevated: bool, seams_build: bool, seam: Option<&str>) -> 
 
 /// The manifest line read from `input`, up to its first newline or the input's end and never more than
 /// [`MANIFEST_LIMIT`] bytes, without its `\n` or `\r\n`: space-separated `<oid> <size>` entries, each oid 64 lower-case
-/// hex digits and each size a decimal, no oid twice and no more than [`OBJECTS`]; else why it is not one.
+/// hex digits and each size a decimal, no oid twice and no more than [`gate_inputs::lfs::OBJECTS`]
+/// ([`parsed_manifest`]); else why it is not one.
 fn read_manifest(input: impl BufRead) -> Result<Vec<Wanted>, String> {
     let mut line = super::bounded_line(input, MANIFEST_LIMIT as u64).map_err(|unread| match unread {
         super::Unread::OverLimit => "the LFS manifest reaches 64 MiB without a newline".to_owned(),
@@ -271,41 +247,6 @@ fn read_manifest(input: impl BufRead) -> Result<Vec<Wanted>, String> {
     }
     let text = String::from_utf8(line).map_err(|_| "the LFS manifest is not UTF-8".to_owned())?;
     parsed_manifest(&text)
-}
-
-/// The objects the manifest line `text` names ([`read_manifest`]); else why it is not one.
-fn parsed_manifest(text: &str) -> Result<Vec<Wanted>, String> {
-    if text.is_empty() {
-        return Ok(Vec::new());
-    }
-    let words: Vec<&str> = text.split(' ').collect();
-    if !words.len().is_multiple_of(2) {
-        return Err("the LFS manifest is not a list of '<oid> <size>' entries".to_owned());
-    }
-    if words.len() / 2 > OBJECTS {
-        return Err(format!("the LFS manifest names more than {OBJECTS} objects"));
-    }
-    let mut seen = HashSet::new();
-    let mut wanted = Vec::with_capacity(words.len() / 2);
-    for &[oid, size] in words.as_chunks::<2>().0 {
-        if !is_lower_hex(oid, SHA256_DIGITS) {
-            return Err(format!("the LFS manifest names '{}', which is not an oid", escaped(oid)));
-        }
-        if size.is_empty() || !size.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(format!(
-                "the LFS manifest gives {oid} the size '{}', which is not a number",
-                escaped(size)
-            ));
-        }
-        let size: u64 = size
-            .parse()
-            .map_err(|_| format!("the LFS manifest gives {oid} a size past what a file holds"))?;
-        if !seen.insert(oid) {
-            return Err(format!("the LFS manifest names {oid} twice"));
-        }
-        wanted.push(Wanted { oid: oid.to_owned(), size });
-    }
-    Ok(wanted)
 }
 
 /// The repo's store, readied and held: its lock taken shared, the bare repository, `lfs` and `lfs\objects`, each held
@@ -454,9 +395,9 @@ fn diff(asked: &Asked<'_>, wanted: &[Wanted], console: &mut Console) -> u32 {
     });
     match lacking {
         Ok(Ok(lacking)) => {
-            stamping::out(console, &format!("gate-remote-lfs: need {}", lacking.len()));
+            stamping::out(console, &format!("{LFS_NEED}{}", lacking.len()));
             for oid in lacking {
-                stamping::out(console, &format!("gate-remote-lfs: oid {oid}"));
+                stamping::out(console, &format!("{LFS_OID}{oid}"));
             }
             0
         }
@@ -490,7 +431,7 @@ fn put(asked: &Asked<'_>, wanted: &[Wanted], seams: &BoxSeams, console: &mut Con
     drop(stage);
     match (done, removal) {
         (Ok(Ok(count)), Ok(())) => {
-            stamping::out(console, &format!("gate-remote-lfs: installed {count}"));
+            stamping::out(console, &format!("{LFS_INSTALLED}{count}"));
             0
         }
         (Err(Unstaged::Said(status)), Ok(())) => unlocked(asked, status, console),
@@ -573,36 +514,6 @@ fn staged(asked: &Asked<'_>, wanted: &[Wanted], seams: &BoxSeams, stage: &Stage,
     .map_err(Unstaged::Said)
 }
 
-/// Whether each member of `entries` is an object of the manifest `wanted`, at most once, whose SHA-256 is its name and
-/// whose size is the manifest's; else the refusal naming the first that is not. A member the store already holds,
-/// another put having installed it since the diff, is checked as any other and kept at its install.
-fn checked(entries: &[Entry], wanted: &[Wanted]) -> Result<(), String> {
-    let mut sizes: HashMap<&str, u64> = wanted.iter().map(|object| (object.oid.as_str(), object.size)).collect();
-    for entry in entries {
-        let Some(size) = sizes.remove(entry.path.as_str()) else {
-            return Err(format!(
-                "the archive's member '{}' is not an object the manifest names",
-                escaped(&entry.path)
-            ));
-        };
-        if entry.sha256 != entry.path {
-            return Err(format!(
-                "the archive's member '{}' has the SHA-256 {}",
-                escaped(&entry.path),
-                entry.sha256
-            ));
-        }
-        if entry.size != size {
-            return Err(format!(
-                "the archive's member '{}' is {} bytes, the manifest's {size}",
-                escaped(&entry.path),
-                entry.size
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Installs each object of `entries`, checked ([`checked`]) and unpacked into the held folder `files`, into the store of
 /// `bare` under its lock: each renamed by its handle into its folder without replacing anything there and given that
 /// folder's security; an object the store already holds at its size is kept and its staged copy deleted. The store's
@@ -642,34 +553,6 @@ const RUN_STAGES: &str = "lfs-run";
 /// The folder below the box's root that holds an unelevated box's run scratch folders, which never shares the
 /// elevated box's [`RUN_STAGES`], as their folders' security differs.
 const RUN_STAGES_MEDIUM: &str = "lfs-run-medium";
-/// The `-c` pins every git call of a run that may run the LFS filter takes, whether or not the run sent LFS content: no
-/// LFS server, a URL on port 0 of the loopback address in place of any a tracked `.lfsconfig` names, which needs no
-/// name lookup, goes through no proxy and nothing can listen on, no other remote searched, no path left out of the
-/// smudge, no download error skipped, no standalone transfer agent, and git-lfs's own filter driver, required, whatever
-/// the work folder's or the builder's config says of it.
-pub(super) const CHECKOUT_PINS: [&str; 20] = [
-    "-c",
-    "lfs.url=http://127.0.0.1:0/",
-    "-c",
-    "lfs.remote.searchall=false",
-    "-c",
-    "lfs.fetchinclude=",
-    "-c",
-    "lfs.fetchexclude=",
-    "-c",
-    "lfs.skipdownloaderrors=false",
-    "-c",
-    "lfs.standalonetransferagent=",
-    "-c",
-    "filter.lfs.process=git-lfs filter-process",
-    "-c",
-    "filter.lfs.smudge=git-lfs smudge -- %f",
-    "-c",
-    "filter.lfs.clean=git-lfs clean -- %f",
-    "-c",
-    "filter.lfs.required=true",
-];
-
 /// The line refusing a run `lfs`, for the run's `nonce`.
 pub(super) fn refused_line(nonce: &str) -> String {
     tagged_line(nonce, Refusal::Lfs)
@@ -678,12 +561,12 @@ pub(super) fn refused_line(nonce: &str) -> String {
 /// The line after [`refused_line`] of a run whose LFS content is not what the snapshot of the work folder `key` needs,
 /// for `why`.
 pub(super) fn not_the_snapshots(key: &str, why: &str) -> String {
-    format!("gate: remote lfs of work folder {key} is not the snapshot's: {}", escaped(why))
+    format!("{LFS_NOT_THE_SNAPSHOTS_START}{key}{LFS_NOT_THE_SNAPSHOTS}{}", escaped(why))
 }
 
-/// The line after [`refused_line`] of a run whose LFS scratch folder could not be made, for `why` ([`NO_SCRATCH`]).
+/// The line after [`refused_line`] of a run whose LFS scratch folder could not be made, for `why` ([`LFS_NO_SCRATCH`]).
 pub(super) fn no_scratch_line(why: &str) -> String {
-    format!("{NO_SCRATCH}{}", escaped(why))
+    format!("{LFS_NO_SCRATCH}{}", escaped(why))
 }
 
 /// A run's protected scratch folder, `{root}\lfs-run\{key}-{nonce}-{random}` (`lfs-run-medium` on an unelevated box),
@@ -826,8 +709,8 @@ impl RunLfs {
 
     /// The `-c` pins of every git call that may run the LFS filter in the run, its checkouts and its back commit's `add
     /// -A`: [`CHECKOUT_PINS`] and `lfs.storage`, the run's scratch folder, or `no_storage`, an `lfs.storage` that cannot
-    /// be made ([`no_storage`]), for a run that has none, so a smudge or a clean there fails rather than reading or
-    /// writing the work folder's `.git\lfs`.
+    /// be made ([`gate_inputs::lfs::no_storage`]), for a run that has none, so a smudge or a clean there fails rather
+    /// than reading or writing the work folder's `.git\lfs`.
     pub(super) fn pins<'a>(&'a self, no_storage: &'a str) -> Vec<&'a str> {
         let mut pins = CHECKOUT_PINS.to_vec();
         pins.extend(["-c", self.scratch.as_ref().map_or(no_storage, Scratch::storage)]);
@@ -846,19 +729,14 @@ impl RunLfs {
     }
 }
 
-/// `lfs.storage=<lock>\lfs`, below the run's held lock file `lock`, a folder git-lfs cannot make: the `lfs.storage` of
-/// a run with no scratch folder ([`RunLfs::pins`]).
-pub(super) fn no_storage(lock: &str) -> String {
-    format!(r"lfs.storage={lock}\lfs")
-}
-
 /// What a run with no scratch folder says when its back commit's `add -A` fails and its tree's attributes name the LFS
-/// filter: a git-lfs clean found no storage it could make ([`no_storage`]).
+/// filter: a git-lfs clean found no storage it could make ([`gate_inputs::lfs::no_storage`]).
 pub(super) const NO_STORAGE_ADD: &str =
     "the command added a file under the LFS filter, which a run without LFS content cannot bring back; run it with --local";
 
 /// What a run with no scratch folder says when a checkout fails and its tree's attributes name the LFS filter: a
-/// git-lfs smudge found no storage it could make ([`no_storage`]), for a file the snapshot's listing did not see.
+/// git-lfs smudge found no storage it could make ([`gate_inputs::lfs::no_storage`]), for a file the snapshot's
+/// listing did not see.
 pub(super) const NO_STORAGE_CHECKOUT: &str =
     "a file under the LFS filter was found that the run's snapshot does not declare in a tracked .gitattributes; run it with --local";
 
@@ -945,25 +823,25 @@ fn held_object(folder: &File, object: &Object) -> Result<Option<File>, String> {
 pub(super) fn wrong_files<'p>(tree: &str, pointers: &'p [Pointer]) -> Vec<&'p Pointer> {
     pointers
         .iter()
-        .filter(|pointer| is_wrong_file(&tree_path(tree, &pointer.path), pointer))
+        .filter(|pointer| {
+            let path = tree_path(tree, &pointer.path);
+            is_wrong_file(plain_size(&path), pointer, || head_of(&path))
+        })
         .collect()
 }
 
-/// Whether the file `path` is not a plain file of `pointer`'s size, or is a small one whose text is `pointer` itself
-/// ([`wrong_files`]).
-fn is_wrong_file(path: &Path, pointer: &Pointer) -> bool {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return true;
-    };
-    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || metadata.len() != pointer.size {
-        return true;
-    }
-    if pointer.size > POINTER_MOST {
-        return false;
-    }
+/// The size of the plain file `path`, read without following a link; `None` when it is missing, unreadable, a link, a
+/// junction or not a file ([`wrong_files`]).
+fn plain_size(path: &Path) -> Option<u64> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    (metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0).then_some(metadata.len())
+}
+
+/// At most [`POINTER_MOST`] + 1 bytes of the file `path`, from its start; else why it cannot be read ([`wrong_files`]).
+fn head_of(path: &Path) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let read = File::open(path).and_then(|file| file.take(POINTER_MOST + 1).read_to_end(&mut bytes));
-    read.is_err() || parsed_pointer(&bytes).is_some_and(|(oid, size)| oid == pointer.oid && size == pointer.size)
+    File::open(path).and_then(|file| file.take(POINTER_MOST + 1).read_to_end(&mut bytes))?;
+    Ok(bytes)
 }
 
 /// Deletes the file of each of `wrong` in the tree `tree`, one already gone taken; else why one could not be deleted.

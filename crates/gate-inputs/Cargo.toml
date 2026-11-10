@@ -11,6 +11,11 @@ doctest = false
 [lints]
 workspace = true
 
+[features]
+# Plans each `git check-attr` slice of the LFS listing for two short paths, so a suite case's few files span slices;
+# forwarded by every crate whose own `test-seams` feature is the gate's.
+test-seams = []
+
 [dependencies]
 gate-router = { path = "../gate-router" }
 gate-wire = { path = "../gate-wire" }

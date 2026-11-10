@@ -33,9 +33,9 @@ pub(crate) const GIT_LIMIT: Duration = Duration::from_secs(60);
 pub(crate) const DOTNET_LIMIT: Duration = Duration::from_secs(30);
 /// How often a git call is looked at while it runs.
 const GIT_POLL: Duration = Duration::from_millis(5);
-/// The most of its standard output a call through [`Git::output`] is read for, as the sync-back's calls read the
-/// builder's file lists: one that writes more fails.
-pub(crate) const OUTPUT_CAP: usize = 16 * 1024 * 1024;
+/// The most of its standard output a call through [`Git::output`] is read for, the LFS listing's cap, which the PC and
+/// each box judge alike.
+pub(crate) use gate_inputs::OUTPUT_CAP;
 /// The most of the end of its standard error a call through [`Git::output`] keeps for its failure line, which carries
 /// at most [`FAILURE_LINES`] and [`FAILURE_BYTES`] of it.
 const ERRORS_KEPT: usize = 64 * 1024;

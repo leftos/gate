@@ -4,8 +4,8 @@
 //! a walk of the outputs finds, [`manifest`] holds the PC's list of its files, the box's check of the paths a sent
 //! manifest names and the rule choosing which of the box's files to pack, [`failure`] holds the caps a failed run's
 //! failure outputs are held to, [`pack`] writes the `.tar.zst` archive the files travel in, and [`archive`] reads it,
-//! handing what it takes to each box's own writer. Nothing here touches the operating system, so it builds for every
-//! box.
+//! handing what it takes to each box's own writer, and [`lfs`] holds the PC's and each box's judgement of a run's Git
+//! LFS content. Nothing here touches the operating system, so it builds for every box.
 #![expect(
     clippy::missing_errors_doc,
     reason = "each reader's own doc names what it refuses and why, as the gate crate's docs always have"
@@ -15,7 +15,12 @@ pub mod archive;
 pub mod failure;
 pub mod glob;
 pub mod hash;
+pub mod lfs;
 pub mod manifest;
 pub mod names;
 pub mod pack;
 pub mod walk;
+
+/// The cap on one git call's output, in bytes, which every gate git call and the LFS pointer listing share: a call
+/// that writes more fails.
+pub const OUTPUT_CAP: usize = 16 * 1024 * 1024;

@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use gate_inputs::lfs::{ATTRIBUTES, SLICE_CAP, attribute_values, slices_asking};
 use gate_router::{FolderId, escaped, repo_name};
 use gate_wire::{BACK_COMMITS_FAILED, BACK_COMMITS_PREFIX};
 
@@ -1920,8 +1921,6 @@ pub(crate) fn listed_paths(listing: &str) -> Vec<&str> {
     entries(listing).into_iter().flat_map(|entry| entry.paths).collect()
 }
 
-/// The attributes `git check-attr` is asked of each listed path, in the order it answers them.
-const ATTRIBUTES: [&str; 6] = ["filter", "ident", "working-tree-encoding", "text", "eol", "crlf"];
 /// The arguments of the `git check-attr` call that reads [`ATTRIBUTES`] of the paths fed on its standard input.
 pub(crate) const CHECK_ATTR_ARGS: [&str; 9] = [
     "check-attr",
@@ -1934,17 +1933,6 @@ pub(crate) const CHECK_ATTR_ARGS: [&str; 9] = [
     ATTRIBUTES[4],
     ATTRIBUTES[5],
 ];
-/// The bytes `git check-attr -z` is allowed per attribute of a path beside the path itself: two NULs, the attribute's
-/// name and its value, with room to spare, so that each slice of paths it is fed answers well under the runner's cap.
-/// An answer that is larger even so fails closed: the runner's over-cap failure ends the run, the back commit kept.
-const ATTRIBUTE_ROOM: usize = 256;
-/// The bytes the answer of each slice of paths fed to `git check-attr` is planned within: the runner's cap.
-#[cfg(not(feature = "test-seams"))]
-pub(super) const SLICE_CAP: usize = git::OUTPUT_CAP;
-/// The bytes the answer of each slice of paths fed to `git check-attr` is planned within, in a `test-seams` build: room
-/// for two paths of up to 32 bytes, so that a suite case's few files span slices.
-#[cfg(feature = "test-seams")]
-pub(super) const SLICE_CAP: usize = 2 * ATTRIBUTES.len() * (32 + ATTRIBUTE_ROOM);
 /// What `git check-attr` says of an attribute no file sets, and of one a file unsets.
 const NOT_GIVEN: [&str; 2] = ["unspecified", "unset"];
 /// What the config keys of a filter driver named as `git check-attr` says of an attribute not given start with: a
@@ -1987,32 +1975,10 @@ fn attributes(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, paths: &[&str]
 }
 
 /// `paths` cut into slices, in order, each holding as many paths as `git check-attr` can answer within `cap` bytes,
-/// [`ATTRIBUTE_ROOM`] allowed for each attribute beside the path; a path that alone needs more is a slice of its own.
+/// [`gate_inputs::lfs::ATTRIBUTE_ROOM`] allowed for each attribute beside the path; a path that alone needs more is a
+/// slice of its own.
 pub(crate) fn attribute_slices<'a>(paths: &'a [&'a str], cap: usize) -> Vec<&'a [&'a str]> {
     slices_asking(paths, ATTRIBUTES.len(), cap)
-}
-
-/// `paths` cut into slices, in order, each holding as many paths as `git check-attr` asked `attributes` attributes of
-/// each path can answer within `cap` bytes, [`ATTRIBUTE_ROOM`] allowed for each attribute beside the path; a path that
-/// alone needs more is a slice of its own.
-pub(super) fn slices_asking<'a>(paths: &'a [&'a str], attributes: usize, cap: usize) -> Vec<&'a [&'a str]> {
-    let mut slices = Vec::new();
-    let mut rest = paths;
-    while !rest.is_empty() {
-        let mut used = 0_usize;
-        let count = rest
-            .iter()
-            .take_while(|path| {
-                used = used.saturating_add(attributes * (path.len() + ATTRIBUTE_ROOM));
-                used <= cap
-            })
-            .count()
-            .max(1);
-        let (slice, after) = rest.split_at(count);
-        slices.push(slice);
-        rest = after;
-    }
-    slices
 }
 
 /// The attributes of each of `paths` from `git check-attr -z`'s `answer`: a `path`, attribute, value triple for each
@@ -2033,27 +1999,6 @@ pub(crate) fn read_attributes(answer: &str, paths: &[&str]) -> Result<Vec<Attrib
             }
         })
         .collect())
-}
-
-/// The values of the attributes `names` of each of `paths` from `git check-attr -z`'s `answer`: a `path`, attribute,
-/// value triple for each of `names` of each path, in their order; else why the answer cannot be read.
-pub(super) fn attribute_values<'a, const N: usize>(answer: &'a str, paths: &[&str], names: [&str; N]) -> Result<Vec<[&'a str; N]>, String> {
-    let mut fields = answer.split('\0');
-    let mut read = Vec::with_capacity(paths.len());
-    for path in paths {
-        let mut values = [""; N];
-        for (value, name) in values.iter_mut().zip(names) {
-            match (fields.next(), fields.next(), fields.next()) {
-                (Some(said), Some(attribute), Some(given)) if said == *path && attribute == name => *value = given,
-                _ => return Err(format!("it did not answer {name} for {path}")),
-            }
-        }
-        read.push(values);
-    }
-    if fields.any(|field| !field.is_empty()) {
-        return Err(format!("it answered more than the {} path(s) it was asked", paths.len()));
-    }
-    Ok(read)
 }
 
 /// Whether an attribute `git check-attr` gave as `value` is set to anything: neither unspecified nor unset.
@@ -2649,9 +2594,8 @@ impl Remote<'_> {
 mod output_cap_slices {
     use std::collections::HashSet;
 
-    #[cfg(not(feature = "test-seams"))]
-    use super::SLICE_CAP;
-    use super::{ATTRIBUTE_ROOM, ATTRIBUTES, attribute_slices, git};
+    use super::{ATTRIBUTES, attribute_slices, git};
+    use gate_inputs::lfs::ATTRIBUTE_ROOM;
 
     /// The UTF-16 units of the longest path Windows opens, each at most three bytes in UTF-8: no worktree path is longer.
     const LONGEST_PATH_UNITS: usize = 32_767;
@@ -2728,12 +2672,6 @@ mod output_cap_slices {
             "the huge path is not kept alone between its neighbours: slices of {sizes:?} path(s)"
         );
     }
-
-    #[cfg(not(feature = "test-seams"))]
-    #[test]
-    fn a_build_without_test_seams_slices_at_the_output_cap() {
-        assert_eq!(SLICE_CAP, git::OUTPUT_CAP);
-    }
 }
 
 /// The box's `back commits` line as the client reads it, run by a test build with or without the `test-seams` feature.
@@ -2791,16 +2729,17 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant, SystemTime};
 
+    use gate_inputs::lfs::ATTRIBUTE_ROOM;
     use gate_state::StateRoot;
     use gate_win32::Interrupt;
     use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_WRITE_ATTRIBUTES};
 
     use super::{
-        ATTRIBUTE_ROOM, ATTRIBUTES, Attributes, AutoCrlf, Back, BackCommit, FETCH_WORDS, Fixes, LineEnds, Quarantine, Remote, Staged, Synced, Target,
-        Worktree, advertised, after_keep, alternates, attribute_slices, auto_crlf, converts_to_crlf, entries, fetch, filtered, forbidden,
-        from_snapshot, has_back, ignored_line, incoming_name, incoming_owner, listed_paths, move_plan, names_odd_driver, not_applied_line,
-        pair_unchanged_line, read_attributes, receive, refused_end, see_diff, swept, sync_back, sync_back_ended_line, synced_line, syncing_line,
-        total, touched_line, tree_removed, unchanged_line, unmoved_line, weight, written_blobs, written_line,
+        ATTRIBUTES, Attributes, AutoCrlf, Back, BackCommit, FETCH_WORDS, Fixes, LineEnds, Quarantine, Remote, Staged, Synced, Target, Worktree,
+        advertised, after_keep, alternates, attribute_slices, auto_crlf, converts_to_crlf, entries, fetch, filtered, forbidden, from_snapshot,
+        has_back, ignored_line, incoming_name, incoming_owner, listed_paths, move_plan, names_odd_driver, not_applied_line, pair_unchanged_line,
+        read_attributes, receive, refused_end, see_diff, swept, sync_back, sync_back_ended_line, synced_line, syncing_line, total, touched_line,
+        tree_removed, unchanged_line, unmoved_line, weight, written_blobs, written_line,
     };
     use crate::commit::forward::Checked;
     use crate::remote::RemoteCall;

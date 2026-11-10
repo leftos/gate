@@ -1,9 +1,7 @@
 //! A routed run's Git LFS objects on the PC: the pointers a snapshot commit's tree holds, the manifest of the objects
 //! they name, where the repository keeps those objects, and the archive of the ones the box says it lacks.
 //!
-//! A pointer is a blob of at most 1024 bytes whose path's `filter` attribute is `lfs` and whose bytes are exactly a
-//! spec-v1 pointer: its version line, its `oid sha256:` line and its `size` line, in that order and nothing else. Any
-//! other blob, a raw file committed under `filter=lfs` included, is left alone. Objects are read from the repository's
+//! What a pointer is, and how the pointers are listed, is `gate_inputs::lfs`'s. Objects are read from the repository's
 //! LFS store, `<common>\lfs\objects` or the `objects` folder of `lfs.storage` when the repository sets it, and each is
 //! hashed and its size checked against its pointer as it is packed.
 
@@ -18,10 +16,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use gate_inputs::lfs::{Listed, Object, Small, manifest_digest, manifest_line, pointers_among, pointers_of};
 use gate_router::escaped;
 use gate_state::FallbackReason;
 use gate_win32::Interrupt;
-use gate_wire::{SHA256_DIGITS, is_lower_hex};
+use gate_wire::{LFS_INSTALLED, LFS_NEED, LFS_NO_SCRATCH, LFS_NOT_THE_SNAPSHOTS, LFS_NOT_THE_SNAPSHOTS_START, LFS_OID};
 use sha2::{Digest, Sha256};
 
 use super::channel;
@@ -31,56 +30,20 @@ use super::inputs::{Asking, MB, Step, TMP, Unsent, judged, tmp_file, unexpected}
 use super::outputs::{Archive, Unbuilt};
 use super::payload::{self, InputsStep, Location};
 use super::snapshot::{self, Bounded};
-use super::syncback::{SLICE_CAP, attribute_values, slices_asking};
 use crate::outputs::archive::pack;
-use crate::outputs::hash::sha256_of;
 use crate::outputs::manifest::{Chosen, HeldBy, Wrote};
 use crate::outputs::walk::{Found, stamp_of};
 
-/// The most bytes a blob read as a pointer may hold.
-pub(crate) const POINTER_MOST: u64 = 1024;
-/// The first line of every spec-v1 pointer.
-const VERSION_LINE: &str = "version https://git-lfs.github.com/spec/v1\n";
-/// The most objects one manifest names.
-pub(super) const OBJECTS: usize = 50_000;
-/// The room `git cat-file --batch` is allowed per object beside its bytes: its header line and the newline after it.
-const HEADER_ROOM: usize = 128;
 /// The most bytes of `git config --get lfs.storage` read.
 const STORAGE_MOST: u64 = 64 * 1024;
 /// What a refusal of an object the store does not hold as its pointer names says to do.
 const FETCH: &str = "run `git lfs fetch` and route again";
-/// The box's diff lines.
-const NEED: &str = "gate-remote-lfs: need ";
-const OID: &str = "gate-remote-lfs: oid ";
 /// The `-c` pin of every git call that reads a tree's attributes, on the PC and on the box: no `core.attributesFile`,
 /// so a path's attributes are those the tree's own `.gitattributes` files give it, as the builder reads them.
 pub(crate) const NO_ATTRIBUTES_FILE: [&str; 2] = ["-c", "core.attributesFile="];
 /// The variable, set to `1`, that has git read no system-wide attributes file, given to every git call that reads a
 /// tree's attributes, on the PC and on the box.
 pub(crate) const NO_SYSTEM_ATTRIBUTES: &str = "GIT_ATTR_NOSYSTEM";
-
-/// One pointer of a commit's tree: its `/`-separated path, and the oid and size of the object it names.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Pointer {
-    pub(crate) path: String,
-    pub(crate) oid: String,
-    pub(crate) size: u64,
-}
-
-/// One object a commit's pointers name: its oid, its size, and the path of the first pointer naming it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Object {
-    pub(crate) oid: String,
-    pub(crate) size: u64,
-    pub(crate) path: String,
-}
-
-/// A commit's pointers, in the tree's order, and the objects they name, each once, in the order of their first pointer.
-#[derive(Debug, Default)]
-pub(crate) struct Listed {
-    pub(crate) pointers: Vec<Pointer>,
-    pub(crate) objects: Vec<Object>,
-}
 
 /// The git calls about one repository: the git found, the repository as its calls ask about it, the bounds of each
 /// and the console interrupt that ends it.
@@ -221,271 +184,6 @@ fn names_lfs_filter(path: &Path) -> bool {
         .lines()
         .filter(|line| !line.trim_start().starts_with('#'))
         .any(|line| line.split_ascii_whitespace().any(|word| word == "filter=lfs"))
-}
-
-/// A tree's blobs the pointer listing reads: each regular file of at most [`POINTER_MOST`] bytes
-/// ([`is_small_blob`]), in the tree's order, and whether the tree holds a `.gitattributes` file at any depth
-/// ([`is_attributes`]).
-#[derive(Debug, Default)]
-pub(crate) struct Small {
-    pub(crate) blobs: Vec<Blob>,
-    pub(crate) attributes: bool,
-}
-
-impl Small {
-    /// Whether git is asked about the blobs at all: there are some, and the tree holds an attributes file, without
-    /// which no path of it has the `lfs` filter as the box reads the snapshot's attributes.
-    fn worth_asking(&self) -> bool {
-        !self.blobs.is_empty() && self.attributes
-    }
-}
-
-/// Whether a tree's entry of `mode` and `kind`, `size` bytes, may be a pointer: a regular file, never a link or a
-/// submodule, of at most [`POINTER_MOST`] bytes.
-pub(crate) fn is_small_blob(mode: &str, kind: &str, size: u64) -> bool {
-    kind == "blob" && mode != "120000" && size <= POINTER_MOST
-}
-
-/// Whether the `/`-separated `path` names a `.gitattributes` file.
-pub(crate) fn is_attributes(path: &str) -> bool {
-    path.rsplit('/').next() == Some(".gitattributes")
-}
-
-/// A git call of the listing: what git wrote on standard output for its arguments, fed its standard input when it has
-/// one, read up to its cap in bytes; else the caller's failure.
-pub(crate) type GitOutput<'a, E> = dyn FnMut(&[&str], Option<&[u8]>, usize) -> Result<Vec<u8>, E> + 'a;
-
-/// The pointers of `commit`'s tree and the objects they name, each git call made through `output`: its blobs of at most
-/// 1024 bytes (`git ls-tree`), then those [`pointers_among`] reads. A tree with no `.gitattributes` holds no pointer,
-/// so nothing more of its listing is read, a path that is not UTF-8 included. The box's checkout reads a tree this way,
-/// and the PC's listing of a sibling's tree.
-pub(crate) fn pointers_of<E>(commit: &str, output: &mut GitOutput<'_, E>, failed: fn(String) -> E) -> Result<Listed, E> {
-    let listing = output(&["ls-tree", "-r", "-l", "-z", commit], None, OUTPUT_CAP)?;
-    if !holds_attributes(&listing) {
-        return Ok(Listed::default());
-    }
-    let small = Small {
-        blobs: small_blobs(&listing).map_err(failed)?,
-        attributes: true,
-    };
-    pointers_among(commit, &small, output, failed)
-}
-
-/// The pointers among `commit`'s blobs `small` and the objects they name, each git call made through `output`: with no
-/// blob, or no `.gitattributes` in the tree, none and no call; else those whose `filter` is `lfs` at that commit (`git
-/// check-attr --source`), read in one `git cat-file --batch` and kept when they parse as a pointer. With no blob whose
-/// `filter` is `lfs`, nothing is read. Two pointers naming one object at two sizes are refused. Else `output`'s
-/// failure, or why git's answer cannot be read, made a failure by `failed`.
-fn pointers_among<E>(commit: &str, small: &Small, output: &mut GitOutput<'_, E>, failed: fn(String) -> E) -> Result<Listed, E> {
-    if !small.worth_asking() {
-        return Ok(Listed::default());
-    }
-    let tracked = filtered_lfs(output, failed, commit, &small.blobs)?;
-    if tracked.is_empty() {
-        return Ok(Listed::default());
-    }
-    let pointers = read_pointers(output, failed, &tracked)?;
-    let objects = objects_of(&pointers).map_err(failed)?;
-    Ok(Listed { pointers, objects })
-}
-
-/// A blob of a tree: its `/`-separated path and its object id.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Blob {
-    pub(crate) path: String,
-    pub(crate) id: String,
-}
-
-/// Whether `git ls-tree -r -z`'s `listing` names a `.gitattributes` file at any depth.
-fn holds_attributes(listing: &[u8]) -> bool {
-    listing
-        .split(|byte| *byte == 0)
-        .filter_map(|record| record.iter().position(|byte| *byte == b'\t').map(|tab| &record[tab + 1..]))
-        .any(|path| std::str::from_utf8(path).is_ok_and(is_attributes))
-}
-
-/// The blobs of at most [`POINTER_MOST`] bytes that `git ls-tree -r -l -z`'s `listing` names, in its order: regular
-/// files only, never a link or a submodule. Else why the listing cannot be read, a path that is not UTF-8 among them.
-fn small_blobs(listing: &[u8]) -> Result<Vec<Blob>, String> {
-    let mut blobs = Vec::new();
-    for record in listing.split(|byte| *byte == 0).filter(|record| !record.is_empty()) {
-        let tab = record
-            .iter()
-            .position(|byte| *byte == b'\t')
-            .ok_or_else(|| "git ls-tree printed an entry with no tab".to_owned())?;
-        let head = std::str::from_utf8(&record[..tab]).map_err(|_| "git ls-tree printed an entry that is not UTF-8".to_owned())?;
-        let words: Vec<&str> = head.split_ascii_whitespace().collect();
-        let [mode, kind, id, size] = words[..] else {
-            return Err(format!("git ls-tree printed '{}'", escaped(head)));
-        };
-        // Only a blob has a size: git prints `-` for a submodule.
-        if kind != "blob" {
-            continue;
-        }
-        let size: u64 = size.parse().map_err(|_| format!("git ls-tree printed '{}'", escaped(head)))?;
-        if !is_small_blob(mode, kind, size) {
-            continue;
-        }
-        let path = std::str::from_utf8(&record[tab + 1..]).map_err(|_| {
-            format!(
-                "the tree holds a path that is not UTF-8: {}",
-                escaped(&String::from_utf8_lossy(&record[tab + 1..]))
-            )
-        })?;
-        blobs.push(Blob {
-            path: path.to_owned(),
-            id: id.to_owned(),
-        });
-    }
-    Ok(blobs)
-}
-
-/// The blobs of `blobs` whose `filter` attribute is `lfs` at `commit`, in their order, asked of `git check-attr
-/// --source <commit> -z --stdin filter` in slices whose answers stay under the runner's cap; else the interrupt, or why
-/// git or its answer failed.
-fn filtered_lfs<'b, E>(output: &mut GitOutput<'_, E>, failed: fn(String) -> E, commit: &str, blobs: &'b [Blob]) -> Result<Vec<&'b Blob>, E> {
-    let args = ["check-attr", "--source", commit, "-z", "--stdin", "filter"];
-    let paths: Vec<&str> = blobs.iter().map(|blob| blob.path.as_str()).collect();
-    let mut lfs = Vec::new();
-    let mut at = 0;
-    for slice in slices_asking(&paths, 1, SLICE_CAP) {
-        let fed: String = slice.iter().flat_map(|path| [*path, "\0"]).collect();
-        let answer = output(&args, Some(fed.as_bytes()), OUTPUT_CAP)?;
-        let unreadable = |why: &str| failed(format!("git check-attr's answer cannot be read: {why}"));
-        let answer = String::from_utf8(answer).map_err(|_| unreadable("it is not UTF-8"))?;
-        let values = attribute_values(&answer, slice, ["filter"]).map_err(|why| unreadable(&why))?;
-        lfs.extend(
-            blobs[at..at + slice.len()]
-                .iter()
-                .zip(values)
-                .filter(|(_, [filter])| *filter == "lfs")
-                .map(|(blob, _)| blob),
-        );
-        at += slice.len();
-    }
-    Ok(lfs)
-}
-
-/// The pointers among `blobs`, in their order, read in one `git cat-file --batch`; else the interrupt, or why git or
-/// its answer failed.
-fn read_pointers<E>(output: &mut GitOutput<'_, E>, failed: fn(String) -> E, blobs: &[&Blob]) -> Result<Vec<Pointer>, E> {
-    let fed: String = blobs.iter().flat_map(|blob| [blob.id.as_str(), "\n"]).collect();
-    let per_blob = usize::try_from(POINTER_MOST).unwrap_or(usize::MAX).saturating_add(HEADER_ROOM);
-    let cap = blobs.len().saturating_mul(per_blob).saturating_add(1);
-    let answer = output(&["cat-file", "--batch"], Some(fed.as_bytes()), cap)?;
-    pointers_in(&answer, blobs).map_err(|why| failed(format!("git cat-file's answer cannot be read: {why}")))
-}
-
-/// The pointers of `blobs` in `git cat-file --batch`'s `answer`: for each blob, in order, its header `<id> blob <size>`,
-/// its bytes and a newline, kept when the bytes parse as a pointer ([`parsed_pointer`]); else why the answer is not one.
-fn pointers_in(answer: &[u8], blobs: &[&Blob]) -> Result<Vec<Pointer>, String> {
-    let mut rest = answer;
-    let mut pointers = Vec::new();
-    for blob in blobs {
-        let end = rest
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .ok_or_else(|| format!("no header for {}", escaped(&blob.path)))?;
-        let size = batch_size(&rest[..end], blob)?;
-        let start = end + 1;
-        let bytes = rest
-            .get(start..start + size)
-            .ok_or_else(|| format!("the bytes of {} are cut short", escaped(&blob.path)))?;
-        if rest.get(start + size) != Some(&b'\n') {
-            return Err(format!("the bytes of {} do not end with a newline", escaped(&blob.path)));
-        }
-        if let Some((oid, size)) = parsed_pointer(bytes) {
-            pointers.push(Pointer {
-                path: blob.path.clone(),
-                oid,
-                size,
-            });
-        }
-        rest = &rest[start + size + 1..];
-    }
-    if !rest.is_empty() {
-        return Err(format!("it answered more than the {} blob(s) it was asked", blobs.len()));
-    }
-    Ok(pointers)
-}
-
-/// The size `git cat-file --batch`'s `header` gives the blob `blob`; else why it is not that blob's header.
-fn batch_size(header: &[u8], blob: &Blob) -> Result<usize, String> {
-    let text = String::from_utf8_lossy(header);
-    let words: Vec<&str> = text.split(' ').collect();
-    match words[..] {
-        [id, "blob", size] if id == blob.id => size.parse().map_err(|_| format!("it answered '{}'", escaped(&text))),
-        _ => Err(format!("it answered '{}' for {}", escaped(&text), escaped(&blob.path))),
-    }
-}
-
-/// The oid and size of the spec-v1 pointer `bytes` holds: exactly its version line, `oid sha256:<64 lower-case hex>`
-/// and `size <decimal>`, each ending with a newline, in that order and nothing more; `None` for any other bytes.
-pub(crate) fn parsed_pointer(bytes: &[u8]) -> Option<(String, u64)> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    let rest = text.strip_prefix(VERSION_LINE)?.strip_prefix("oid sha256:")?;
-    let (oid, rest) = rest.split_once('\n')?;
-    if !is_lower_hex(oid, SHA256_DIGITS) {
-        return None;
-    }
-    let size = rest.strip_prefix("size ")?.strip_suffix('\n')?;
-    if size.is_empty() || !size.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    Some((oid.to_owned(), size.parse().ok()?))
-}
-
-/// The objects `pointers` name, each once, in the order of the first pointer naming it; else the refusal of two
-/// pointers naming one object at two sizes.
-fn objects_of(pointers: &[Pointer]) -> Result<Vec<Object>, String> {
-    let mut objects: Vec<Object> = Vec::new();
-    let mut seen: HashMap<&str, usize> = HashMap::new();
-    for pointer in pointers {
-        if let Some(&at) = seen.get(pointer.oid.as_str()) {
-            let first = &objects[at];
-            if first.size != pointer.size {
-                return Err(format!(
-                    "the LFS pointers {} and {} name the object {} at two sizes, {} and {} bytes",
-                    escaped(&first.path),
-                    escaped(&pointer.path),
-                    pointer.oid,
-                    first.size,
-                    pointer.size
-                ));
-            }
-            continue;
-        }
-        seen.insert(&pointer.oid, objects.len());
-        objects.push(Object {
-            oid: pointer.oid.clone(),
-            size: pointer.size,
-            path: pointer.path.clone(),
-        });
-    }
-    Ok(objects)
-}
-
-/// The manifest line of `objects` the box's diff reads: `<oid> <size>` for each, separated by spaces, with its newline;
-/// else the refusal of more than [`OBJECTS`] objects.
-pub(crate) fn manifest_line(objects: &[Object]) -> Result<String, String> {
-    if objects.len() > OBJECTS {
-        return Err(format!(
-            "the commit's LFS pointers name {} objects, more than one route carries ({OBJECTS})",
-            objects.len()
-        ));
-    }
-    let entries: Vec<String> = objects.iter().map(|object| format!("{} {}", object.oid, object.size)).collect();
-    Ok(format!("{}\n", entries.join(" ")))
-}
-
-/// The run's `LfsDigest` for `objects`: the lower-case hex SHA-256 of their manifest line ([`manifest_line`]) without
-/// its newline, as the inputs' digest is of theirs; else the refusal of more than [`OBJECTS`] objects, or why the line
-/// could not be hashed.
-pub(crate) fn manifest_digest(objects: &[Object]) -> Result<String, String> {
-    let line = manifest_line(objects)?;
-    sha256_of(line.trim_end_matches('\n').as_bytes())
-        .map(|(digest, _)| digest)
-        .map_err(|error| format!("the LFS manifest could not be hashed: {error}"))
 }
 
 /// The folder the repository `repo` keeps its LFS objects in: `objects` below `lfs.storage` when its git config sets
@@ -642,14 +340,16 @@ pub(super) fn needed<'o>(said: &str, objects: &'o [Object]) -> Result<Vec<&'o Ob
     let mut lines = said.lines().filter(|line| !line.trim().is_empty());
     let count: usize = lines
         .next()
-        .and_then(|line| line.strip_prefix(NEED))
+        .and_then(|line| line.strip_prefix(LFS_NEED))
         .and_then(|count| count.trim().parse().ok())
-        .ok_or_else(|| format!("the builder printed no '{NEED}<n>' line"))?;
+        .ok_or_else(|| format!("the builder printed no '{LFS_NEED}<n>' line"))?;
     let by_oid: HashMap<&str, &Object> = objects.iter().map(|object| (object.oid.as_str(), object)).collect();
     let mut seen = std::collections::HashSet::new();
     let needed = lines
         .map(|line| {
-            let oid = line.strip_prefix(OID).ok_or_else(|| format!("the builder printed '{}'", escaped(line)))?;
+            let oid = line
+                .strip_prefix(LFS_OID)
+                .ok_or_else(|| format!("the builder printed '{}'", escaped(line)))?;
             let object = by_oid
                 .get(oid)
                 .copied()
@@ -668,13 +368,8 @@ pub(super) fn needed<'o>(said: &str, objects: &'o [Object]) -> Result<Vec<&'o Ob
 
 /// The most bytes one put of LFS objects carries: 16 GiB, unless `--test-remote-lfs-budget-bytes` says otherwise.
 pub(super) const LFS_BUDGET: u64 = 16 * 1024 * 1024 * 1024;
-/// The box's put line.
-const INSTALLED: &str = "gate-remote-lfs: installed ";
 /// Why a run the box refused `lfs` falls back.
 const NOT_HELD: &str = "the builder's LFS store does not hold the content the snapshot's pointers name";
-/// The start of the box's line for a run it refused `lfs` because it could not make the run's LFS scratch folder, the
-/// reason after it; the PC reads it to say why the run falls back ([`run_refused`]).
-pub(crate) const NO_SCRATCH: &str = "gate: remote cannot make the run's LFS scratch folder: ";
 /// Why a run the box refused `lfs` for its scratch folder falls back.
 const SCRATCH_UNMADE: &str = "the builder could not make the run's LFS scratch folder";
 
@@ -769,25 +464,19 @@ pub(super) fn run_refused(attempt: &mut Attempt<'_, '_>, last_error: Option<&str
     refused(attempt, &run_refused_why(last_error))
 }
 
-/// The start of the box's line for a run whose LFS content is not what the snapshot needs, the work folder's key after
-/// it, then [`NOT_THE_SNAPSHOTS`] and the box's reason (`boxside::lfs::not_the_snapshots`).
-const NOT_THE_SNAPSHOTS_START: &str = "gate: remote lfs of work folder ";
-/// What comes between the key and the box's reason in that line.
-const NOT_THE_SNAPSHOTS: &str = " is not the snapshot's: ";
-
 /// Why a run call the box refused `lfs` falls back, from its last error line `last_error`: it could not make the run's
-/// LFS scratch folder when the line says so ([`NO_SCRATCH`]); else its store does not hold what the snapshot's pointers
-/// name, followed by the box's whole reason, the repo it names in a pair included, when the line gives one.
+/// LFS scratch folder when the line says so ([`LFS_NO_SCRATCH`]); else its store does not hold what the snapshot's
+/// pointers name, followed by the box's whole reason, the repo it names in a pair included, when the line gives one.
 fn run_refused_why(last_error: Option<&str>) -> String {
     let Some(line) = last_error else {
         return NOT_HELD.to_owned();
     };
-    if line.starts_with(NO_SCRATCH) {
+    if line.starts_with(LFS_NO_SCRATCH) {
         return SCRATCH_UNMADE.to_owned();
     }
     match line
-        .strip_prefix(NOT_THE_SNAPSHOTS_START)
-        .and_then(|rest| rest.split_once(NOT_THE_SNAPSHOTS))
+        .strip_prefix(LFS_NOT_THE_SNAPSHOTS_START)
+        .and_then(|rest| rest.split_once(LFS_NOT_THE_SNAPSHOTS))
     {
         Some((_, why)) => format!("{NOT_HELD}: {why}"),
         None => NOT_HELD.to_owned(),
@@ -979,12 +668,12 @@ fn put(attempt: &mut Attempt<'_, '_>, location: &Location, sending: &Sending, se
 fn installed_all(lines: &[String], sent: usize) -> Result<(), String> {
     let said = lines
         .iter()
-        .find_map(|line| line.strip_prefix(INSTALLED))
-        .ok_or_else(|| format!("the builder printed no '{INSTALLED}<n>' line"))?;
+        .find_map(|line| line.strip_prefix(LFS_INSTALLED))
+        .ok_or_else(|| format!("the builder printed no '{LFS_INSTALLED}<n>' line"))?;
     match said.trim().parse::<usize>() {
         Ok(count) if count == sent => Ok(()),
         Ok(count) => Err(format!("the builder installed {count} of the {sent} LFS objects sent")),
-        Err(_) => Err(format!("the builder printed '{}'", escaped(&format!("{INSTALLED}{said}")))),
+        Err(_) => Err(format!("the builder printed '{}'", escaped(&format!("{LFS_INSTALLED}{said}")))),
     }
 }
 
@@ -997,9 +686,11 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ATTRIBUTES_MOST, Blob, Listed, NO_SCRATCH, Object, as_the_builder, installed_all, listed, manifest_line, names_lfs_filter_among, not_sent,
-        object_path, objects_folder, of_repo, packed, pointers_of, present_line, run_refused_why, sending, sending_line, sent_line, small_blobs,
+        ATTRIBUTES_MOST, as_the_builder, installed_all, listed, names_lfs_filter_among, not_sent, object_path, objects_folder, of_repo, packed,
+        present_line, run_refused_why, sending, sending_line, sent_line,
     };
+    use gate_inputs::lfs::{Listed, Object, manifest_line};
+    use gate_wire::LFS_NO_SCRATCH;
 
     /// Every listing call on the PC reads a path's attributes as the builder does: no `core.attributesFile` and no
     /// system-wide attributes file.
@@ -1159,59 +850,9 @@ mod tests {
         );
         assert_eq!(run_refused_why(None), held);
         assert_eq!(
-            run_refused_why(Some(&format!("{NO_SCRATCH}denied"))),
+            run_refused_why(Some(&format!("{LFS_NO_SCRATCH}denied"))),
             "the builder could not make the run's LFS scratch folder"
         );
-    }
-
-    /// The git calls a listing of the tree `listing` makes, by their first word, every other call answering nothing.
-    fn calls_made(listing: &str) -> Vec<String> {
-        let mut called: Vec<String> = Vec::new();
-        {
-            let mut output = |args: &[&str], _: Option<&[u8]>, _: usize| -> Result<Vec<u8>, String> {
-                called.push(args[0].to_owned());
-                Ok(if args[0] == "ls-tree" { listing.as_bytes().to_vec() } else { Vec::new() })
-            };
-            // The empty check-attr answer cannot be read; only the calls made matter here.
-            let _ = pointers_of("HEAD", &mut output, |why| why);
-        }
-        called
-    }
-
-    #[test]
-    fn a_path_that_is_not_utf8_is_refused_only_in_a_tree_with_an_attributes_file() {
-        let id = "a".repeat(40);
-        let listed = |listing: Vec<u8>| {
-            let mut output = |args: &[&str], _: Option<&[u8]>, _: usize| -> Result<Vec<u8>, String> {
-                Ok(if args[0] == "ls-tree" { listing.clone() } else { Vec::new() })
-            };
-            pointers_of("HEAD", &mut output, |why| why)
-        };
-        let mut without = format!("100644 blob {id}       3\t").into_bytes();
-        without.extend_from_slice(b"caf\xe9.txt\x00");
-        let mut with = without.clone();
-        with.extend_from_slice(format!("100644 blob {id}      30\t.gitattributes\x00").as_bytes());
-
-        let plain = listed(without).expect("a tree with no attributes file lists nothing");
-        let refused = listed(with).expect_err("a tree with an attributes file cannot be listed");
-
-        assert!(plain.pointers.is_empty() && plain.objects.is_empty(), "{plain:?}");
-        assert!(refused.contains("not UTF-8"), "{refused}");
-    }
-
-    #[test]
-    fn a_tree_with_small_blobs_and_no_attributes_file_asks_no_check_attr() {
-        let id = "a".repeat(40);
-        let without = format!("100644 blob {id}       3\ta.txt\x00160000 commit {id}       -\tsub\x00");
-        let nested = format!("{without}100644 blob {id}    2000\tdeep/.gitattributes\x00");
-
-        assert_eq!(calls_made(&without), ["ls-tree"]);
-        assert_eq!(
-            calls_made(&nested),
-            ["ls-tree", "check-attr"],
-            "a large attributes file at any depth counts"
-        );
-        assert!(super::is_attributes(".gitattributes") && !super::is_attributes("x.gitattributes"));
     }
 
     #[test]
@@ -1289,22 +930,6 @@ mod tests {
         let listed = list(&root, &folder);
 
         assert!(listed.pointers.is_empty(), "{listed:?}");
-    }
-
-    #[test]
-    fn a_blob_over_1024_bytes_is_not_read_as_a_pointer() {
-        let id = "a".repeat(40);
-        let listing = format!("100644 blob {id}    1024\tat.bin\x00100644 blob {id}    1025\tover.bin\x00");
-
-        let blobs = small_blobs(listing.as_bytes()).expect("the listing is read");
-
-        assert_eq!(
-            blobs,
-            [Blob {
-                path: "at.bin".to_owned(),
-                id
-            }]
-        );
     }
 
     #[test]

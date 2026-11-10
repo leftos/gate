@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 use gate_args::BoxVerb;
 use gate_args::TestSeams;
 use gate_args::is_godot_console;
+use gate_inputs::lfs::{Blob, Listed, Small, is_attributes, is_small_blob};
 use gate_state::v1::{self, WarmFailure};
 use gate_state::{FallbackReason, KernelObject, key_hash};
 use gate_win32::{AcquireError, Interrupt, Job, NamedMutex, OwnedMutexGuard, PipedConsole, Running, Share};
@@ -744,7 +745,7 @@ struct Tree {
     /// One line per project file whose pin could not be read, in the same order.
     godot_skips: Vec<String>,
     /// The main repository's blobs the LFS listing reads, from the same listing; none for a sibling's.
-    small: lfs::Small,
+    small: Small,
     /// The `/`-separated paths of the main repository's `.gitattributes` files, at any depth, from the same listing;
     /// none for a sibling's.
     attributes: Vec<String>,
@@ -791,19 +792,19 @@ fn entries_of(listing: &str) -> Option<Vec<Entry>> {
         .collect()
 }
 
-/// The blobs of the snapshot's tree `entries` the LFS listing reads ([`lfs::is_small_blob`]), and whether the tree
+/// The blobs of the snapshot's tree `entries` the LFS listing reads ([`is_small_blob`]), and whether the tree
 /// holds a `.gitattributes` file at any depth.
-fn small_blobs_of(entries: &[Entry]) -> lfs::Small {
+fn small_blobs_of(entries: &[Entry]) -> Small {
     let blobs = entries
         .iter()
-        .filter(|entry| entry.size.is_some_and(|size| lfs::is_small_blob(&entry.mode, &entry.kind, size)))
-        .map(|entry| lfs::Blob {
+        .filter(|entry| entry.size.is_some_and(|size| is_small_blob(&entry.mode, &entry.kind, size)))
+        .map(|entry| Blob {
             path: entry.path.clone(),
             id: entry.oid.clone(),
         })
         .collect();
-    let attributes = entries.iter().any(|entry| entry.kind == "blob" && lfs::is_attributes(&entry.path));
-    lfs::Small { blobs, attributes }
+    let attributes = entries.iter().any(|entry| entry.kind == "blob" && is_attributes(&entry.path));
+    Small { blobs, attributes }
 }
 
 /// The entry among `entries` that is the repo's manifest, its path matched ignoring ASCII case: the one spelled exactly
@@ -2400,7 +2401,7 @@ impl Attempt<'_, '_> {
             // A tree that could not be listed is a sibling's here (the main's has no LFS phase): its check runs.
             let attributes = match trees.get(at).and_then(Option::as_ref) {
                 Some(tree) if at == 0 => tree.small.attributes,
-                Some(tree) => tree.names.iter().any(|name| lfs::is_attributes(name)),
+                Some(tree) => tree.names.iter().any(|name| is_attributes(name)),
                 None => true,
             };
             let named = paired.then_some(repo.name.as_str());
@@ -2449,9 +2450,9 @@ impl Attempt<'_, '_> {
         &mut self,
         repo: &Repo,
         snapshot: &Snapshot,
-        main: Option<Option<&lfs::Small>>,
+        main: Option<Option<&Small>>,
         (attributes, named): (bool, Option<&str>),
-    ) -> Result<Option<lfs::Listed>, End> {
+    ) -> Result<Option<Listed>, End> {
         let root = Path::new(&repo.root);
         let (bounds, interrupt) = (self.git, self.call.interrupt);
         let small = match main {
@@ -2537,7 +2538,7 @@ impl Attempt<'_, '_> {
             manifest_file: None,
             godot_pins: Vec::new(),
             godot_skips: Vec::new(),
-            small: lfs::Small::default(),
+            small: Small::default(),
             attributes: Vec::new(),
         }))
     }
@@ -2710,7 +2711,7 @@ impl Attempt<'_, '_> {
             small: small_blobs_of(&entries),
             attributes: entries
                 .iter()
-                .filter(|entry| entry.kind == "blob" && lfs::is_attributes(&entry.path))
+                .filter(|entry| entry.kind == "blob" && is_attributes(&entry.path))
                 .map(|entry| entry.path.clone())
                 .collect(),
         }))

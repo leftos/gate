@@ -1092,6 +1092,24 @@ impl Payload {
             })
             .collect()
     }
+
+    /// The bare repository, as the box derives it ([`PairSibling::bare`]), of the sibling of `pair` the payload's
+    /// `LfsRepo` names, matched exactly; `None` when the key is absent or null, the main repo's store. Else the usage
+    /// line: a value that is not a text, an `LfsRepo` without a `Pair`, or a name that is no sibling of the pair.
+    pub fn lfs_repo(&self, pair: Option<&Pair>) -> Result<Option<String>, String> {
+        if !self.sets("LfsRepo") {
+            return Ok(None);
+        }
+        let name = self.optional_text("LfsRepo")?;
+        let Some(pair) = pair else {
+            return Err("gate: box payload LfsRepo needs a Pair".to_owned());
+        };
+        pair.siblings()
+            .iter()
+            .find(|sibling| sibling.name() == name)
+            .map(|sibling| Some(sibling.bare().to_owned()))
+            .ok_or_else(|| format!("gate: box payload LfsRepo {} is not a sibling of the pair", escaped(name)))
+    }
 }
 
 /// The most bytes a default branch's name may hold.
@@ -2166,6 +2184,21 @@ pub fn sdks_failure(message: &str) -> String {
 
 /// The line saying the work folder's tree is new, which the client raises a run's ceiling for.
 pub const NEW_WORK_TREE: &str = "gate: remote new work tree";
+
+/// What the box's `lfs` diff says first, the count of the objects its store lacks after it.
+pub const LFS_NEED: &str = "gate-remote-lfs: need ";
+/// What each line of the box's `lfs` diff naming an object its store lacks starts with, the oid after it.
+pub const LFS_OID: &str = "gate-remote-lfs: oid ";
+/// What the box's `lfs` put says once it installed the objects, the count installed or kept after it.
+pub const LFS_INSTALLED: &str = "gate-remote-lfs: installed ";
+/// The start of the box's line for a run it refused `lfs` because it could not make the run's LFS scratch folder, the
+/// reason after it; the PC reads it to say why the run falls back.
+pub const LFS_NO_SCRATCH: &str = "gate: remote cannot make the run's LFS scratch folder: ";
+/// The start of the box's line for a run whose LFS content is not what the snapshot needs, the work folder's key after
+/// it, then [`LFS_NOT_THE_SNAPSHOTS`] and the box's reason.
+pub const LFS_NOT_THE_SNAPSHOTS_START: &str = "gate: remote lfs of work folder ";
+/// What comes between the key and the box's reason in the line [`LFS_NOT_THE_SNAPSHOTS_START`] starts.
+pub const LFS_NOT_THE_SNAPSHOTS: &str = " is not the snapshot's: ";
 
 /// What a pair run's back commits line starts with.
 pub const BACK_COMMITS_PREFIX: &str = "gate: remote back commits: ";
@@ -4375,6 +4408,41 @@ mod tests {
             sibling_lfs_digests(&json!([good]), true),
             Err("gate: box payload SiblingLfsDigests is not an object".to_owned())
         );
+    }
+
+    /// The bare repository of the sibling a payload of a pair of `lib` and `tools`, or of no pair when `paired` is
+    /// false, names as `LfsRepo` (`None` for no key); else the line refusing it.
+    fn lfs_repo(repo: Option<&str>, paired: bool) -> Result<Option<String>, String> {
+        let mut json = if paired {
+            with_pair(json!({"Leaf": "app", "Siblings": ["lib", "tools"]}))
+        } else {
+            json!({})
+        };
+        if let Some(repo) = repo {
+            json["LfsRepo"] = json!(repo);
+        }
+        let payload = decoded(&json.to_string())?;
+        let pair = payload.pair()?;
+        payload.lfs_repo(pair.as_ref())
+    }
+
+    /// `LfsRepo` names a sibling of the pair exactly, and gives that sibling's bare repository; none is the main
+    /// repo's store, and with no `Pair` it is refused.
+    #[test]
+    fn lfs_repo_names_a_sibling_of_the_pair_exactly() {
+        assert_eq!(lfs_repo(None, true), Ok(None), "no LfsRepo is the main repo's store");
+        assert_eq!(lfs_repo(None, false), Ok(None), "nor with no pair");
+        assert_eq!(lfs_repo(Some("lib"), false), Err("gate: box payload LfsRepo needs a Pair".to_owned()));
+        assert_eq!(
+            lfs_repo(Some("app"), true),
+            Err("gate: box payload LfsRepo app is not a sibling of the pair".to_owned())
+        );
+        assert_eq!(
+            lfs_repo(Some("Lib"), true),
+            Err("gate: box payload LfsRepo Lib is not a sibling of the pair".to_owned()),
+            "a sibling's name exactly"
+        );
+        assert_eq!(lfs_repo(Some("tools"), true), Ok(Some(r"D:\gate-remote\tools.git".to_owned())));
     }
 
     #[test]

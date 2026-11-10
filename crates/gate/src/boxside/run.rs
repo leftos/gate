@@ -28,6 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use gate_args::{BoxSeams, is_godot_console};
+use gate_inputs::lfs::{no_storage, pointers_of};
 use gate_router::{GATE_FOLDER_MARK, escaped};
 use gate_watchdog::{Kill, Pump, is_wsl_command};
 use gate_win32::{
@@ -3936,7 +3937,7 @@ impl WorkGit {
 
     /// The LFS content of `repo`'s fetched snapshot added to the run's LFS state `lfs`, held from before the repo's
     /// checkout through the run's back commit, when the repo carries an LFS digest ([`Repo::lfs_digest`]): its pointers
-    /// read from the snapshot itself as the PC reads them ([`crate::remote::lfs::pointers_of`]) and checked against the
+    /// read from the snapshot itself as the PC reads them ([`pointers_of`]) and checked against the
     /// digest, its store's objects held ([`RunLfs::covered`]); then the run's scratch folder made
     /// ([`RunLfs::with_scratch`]). A repo with none lists nothing: its checkout makes the scratch folder when its
     /// snapshot names the LFS filter ([`WorkGit::lfs_scratch`]). Else the git step's failure, or why the run is refused
@@ -3946,7 +3947,7 @@ impl WorkGit {
             return Ok(());
         };
         let unreadable = |why: String| Failed::without_status(format!("gate: remote lfs listing failed: {why}"));
-        let listed = crate::remote::lfs::pointers_of(
+        let listed = pointers_of(
             repo.snapshot,
             &mut |args, feed, cap| self.output(("lfs listing", GitClass::Short), repo, args, (feed, cap), console),
             unreadable,
@@ -4000,7 +4001,7 @@ impl WorkGit {
     /// reaches, through attributes the snapshot does not hold, fails the checkout, which says so when the tree's
     /// attributes name the filter ([`WorkGit::checkout_failed`]).
     fn checked_out_tree(&self, request: &Request<'_>, repo: &Repo<'_>, lfs: &RunLfs, console: &mut Console) -> Result<(), NotCheckedOut> {
-        let no_storage = lfs::no_storage(request.lock);
+        let no_storage = no_storage(request.lock);
         let pins = lfs.pins(&no_storage);
         let mut args = repo.at().to_vec();
         args.extend_from_slice(&pins);
@@ -4338,7 +4339,7 @@ impl WorkGit {
         let index = Path::new(&repo.tree).join(".git").join("index");
         fs::copy(&index, request.index)
             .map_err(|error| BackFailed::Step(format!("cannot copy {} to {}: {error}", index.display(), request.index)))?;
-        let no_storage = lfs::no_storage(request.lock);
+        let no_storage = no_storage(request.lock);
         let mut add = lfs.pins(&no_storage);
         add.extend(["add", "-A"]);
         let added = match back.status(("add", GitClass::Long), &add, true, console) {
@@ -4379,7 +4380,7 @@ impl WorkGit {
     /// Each git call carries the run's LFS pins ([`RunLfs::pins`]). `Err` with the status of a git step that failed, its
     /// line said.
     pub(super) fn tree_changes(&self, request: &Request<'_>, lfs: &RunLfs, console: &mut Console) -> Result<Vec<String>, u32> {
-        let no_storage = lfs::no_storage(request.lock);
+        let no_storage = no_storage(request.lock);
         let pins = lfs.pins(&no_storage);
         let mut paths = Vec::new();
         for (index, repo) in request.repos().enumerate() {
