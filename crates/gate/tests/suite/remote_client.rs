@@ -8739,6 +8739,10 @@ fn a_killed_run_whose_pull_fails_every_retry_says_transfer_failed_and_stays_time
 /// The stall window, in milliseconds, of a run call the PC cuts once its command is quiet after its dump.
 const CUT_STALL_MS: &str = "2000";
 
+/// The line the command of a run the PC cuts says on stderr right after its dump, which the PC's log holds only when
+/// the PC heard the box's start marker before its cut.
+const DUMPED: &str = "dumped";
+
 /// The box seams of a run the PC cuts: a heartbeat period longer than any case, so the run call says nothing once its
 /// command is quiet, the box does not find its client gone, and the waiting outputs call says nothing either.
 const SILENT_BOX: &str = "--test-heartbeat-ms 600000";
@@ -8817,7 +8821,8 @@ fn let_go_and_see_the_box_end(case: &Case) {
 /// A [`failure_case`] routed run with the failure output globs `failure`, whose command builds `bin\built.txt`, writes
 /// the dump `dumps\a.dmp` on the real box and goes on as `held` says until the PC cuts its run call as `tuned` says. The
 /// box runs outside the stand-in's job (`away`) with [`SILENT_BOX`]. Its case, steps file and outcome, from the first
-/// run whose command wrote its dump before the cut; a command held until let go is let go before a run is made again.
+/// run whose dump line ([`DUMPED`]) the PC logged before its cut; a command held until let go is let go before a run is
+/// made again.
 fn pc_cut_after_its_dump(name: &str, failure: &[&str], tuned: &Tuned<'_>, held: Held) -> (Case, PathBuf, Outcome) {
     let guard = Instant::now() + MARKED_BEFORE_THE_KILL_GUARD;
     let mut attempts = 0;
@@ -8832,13 +8837,23 @@ fn pc_cut_after_its_dump(name: &str, failure: &[&str], tuned: &Tuned<'_>, held: 
         let mut all = vec!["ok", "away"];
         all.extend_from_slice(after);
         let steps = ssh_steps(&case, "ssh", &all);
-        let mut command = vec![r".\tool.exe", "write", r"bin\built.txt", "box", "write", r"dumps\a.dmp", "dump"];
+        let mut command = vec![
+            r".\tool.exe",
+            "write",
+            r"bin\built.txt",
+            "box",
+            "write",
+            r"dumps\a.dmp",
+            "dump",
+            "err",
+            DUMPED,
+        ];
         command.extend(hold.iter().map(String::as_str));
         let mut gate = client_gate_tuned(&case, "out.log", &steps, tuned, &command);
         gate.env(BOX_SEAMS_VARIABLE, SILENT_BOX);
         let outcome = finish(gate);
         let queued = work_folder_if_queued(&case);
-        let dumped = queued.as_ref().is_some_and(|work| work.join("dumps").join("a.dmp").exists());
+        let dumped = out_log(&case).lines().any(|line| line.trim_end() == DUMPED);
         if outcome.code != Some(124) || queued.is_none() || dumped {
             return (case, steps, outcome);
         }
@@ -8847,7 +8862,7 @@ fn pc_cut_after_its_dump(name: &str, failure: &[&str], tuned: &Tuned<'_>, held: 
         }
         assert!(
             Instant::now() < guard,
-            "every one of {attempts} commands was cut before its dump was in its work folder, until the hang guard; last \
+            "every one of {attempts} runs was cut before the PC logged its dump line, until the hang guard; last \
              outcome: {outcome:?}"
         );
     }
