@@ -2616,6 +2616,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   `--builder` naming a `macos` builder for such a run is refused on stderr, exit 2, with `gate: --builder <host> cannot route this run: ` and the same words as the note.
 
+  **LFS content on a `macos` builder.** A macOS builder takes no LFS content, so a routed run whose snapshot holds LFS pointers (the main repo's or a sibling's) that is attempted on a `macos` builder ends on the PC as `parity`, before the preflight and before any call to the builder, with `gate: remote toolchain mismatch: <repo> holds LFS pointers; <host> is a macOS builder, which takes no LFS content` in the log and on stderr. The run is then handed on like any `parity` refusal: `gate: remote <mac> parity; trying <next>`, and the `fallback` journal line says `parity`. A `windows` builder and a run with no pointers are unchanged, and a PC-side `lfs` refusal (above) still runs here at once.
+
   **A sibling pair's inputs.** Both boxes take a pair's inputs, so a sibling pair's run that carries inputs (its repo's `inputs` globs or any sibling's non-empty, the gitignored files its words name carried as `[carried]<path>` included) routes as any other run: a `macos` pick keeps it, a later `macos` candidate takes it, and `--builder` naming a `macos` builder routes it there.
   A pair's sent build is another matter: it stays Windows-only, as every sent build does.
 
@@ -3489,6 +3491,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     Caps: 50,000 objects, a 64 MiB manifest and 16 GiB per put (`--test-remote-lfs-budget-bytes` replaces the 16 GiB). The worktree's `.tmp` is held through the step and the diff's answer (`<key>-<nonce>.lfs-diff`) and the archive (`<key>-<nonce>.lfs.tar.zst`) are made there as the inputs' are; a sibling's are `<key>-<nonce>.lfs<n>-diff` and `<key>-<nonce>.lfs<n>.tar.zst`, `n` the repo's index in the pair.
 
     Both calls are watched as the inputs' are (the diff by its stall window and its own transfer ceiling, the put by the later of the last byte fed and the last byte of output while it is fed, then by its ceiling) and each is made once more when it failed before the banner. `--test-remote-watch-call lfs-diff` names the diff and `lfs` the put; `--test-remote-interrupt-at lfs` raises the interrupt after the first output byte of either call.
+
+    A `macos` builder is refused by the PC before any call, as `parity` rather than `lfs`, with `gate: remote toolchain mismatch: <repo> holds LFS pointers; <host> is a macOS builder, which takes no LFS content`, and the walk hands the run to the next builder ([Routing](#routing), LFS content on a `macos` builder).
 
     Any failure of either call (in a pair the first failed repo's send, the objects already put staying), an object the PC lacks, a listing git fails (the log says `cannot list the LFS pointers of <repo>: <why>`) or a manifest past a cap refuses the route with reason `lfs`: console `gate: remote <host> lfs; running here`, log `gate: remote lfs not sent: <reason>`, the reason a box line without its leading `gate: `, and in a pair naming the repo (`gate: remote lfs not sent: {repo}: {why}`).
 
@@ -5605,7 +5609,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
   A pair run brings back from its main tree only. `OutputsFull` with no globs is taken and does nothing. `--test-outputs-budget-bytes` reaches the run. Every other verb (`inflight`, `lfs`, `register-desktop`) says `gate: box <verb> is not built on this builder` and exits 2.
 
-  The run checks a payload's `InputsDigest` as the Windows box does ([The box side](#the-box-side)), and refuses a `SentDigest`, `LfsDigest` or `SiblingLfsDigests` as not built (`gate-remote-refused: <nonce> <tag>`, then `gate: remote <key> is not built on this builder`, status 75; a `SiblingLfsDigests` is refused `lfs`), so the PC runs such a run itself. A payload with `CommitStage` true is refused `layout` the same way, naming `CommitStage` in the line.
+  The run checks a payload's `InputsDigest` as the Windows box does ([The box side](#the-box-side)), and refuses a `SentDigest`, `LfsDigest` or `SiblingLfsDigests` as not built (`gate-remote-refused: <nonce> <tag>`, then `gate: remote <key> is not built on this builder`, status 75; a `SiblingLfsDigests` is refused `lfs`), so the PC runs such a run itself. The PC sends no LFS run to a macOS builder: it refuses that attempt `parity` itself, before any call, and the next builder gets the run (Routing, LFS content on a `macos` builder). A payload with `CommitStage` true is refused `layout` the same way, naming `CommitStage` in the line.
 
   An `UnrealVersion` is refused `layout` the same way, and so is an `EngineEnv` only when it names an `"unreal"` value; one whose values are all `"blender"` is taken. The box resolves `BlenderVersion` under the login shell's `GATE_BLENDER_ROOT` and sets each blender `EngineEnv` name to `<folder>/Blender.app/Contents/MacOS/Blender`.
 

@@ -167,6 +167,8 @@ A build whose outputs are launched on the PC and that is not opted in stays off 
 
 The words a macOS builder is sent are spelled for the Mac: the recognised paths use `/`, and a relative word written with `\` (`src\Duel.sln`) is sent with `/` when the snapshot carries that file or folder, in its exact letter case.
 
+A macOS builder takes no LFS content: a run whose snapshot holds LFS pointers is refused `parity` there by the PC before any call, saying `gate: remote toolchain mismatch: <repo> holds LFS pointers; <host> is a macOS builder, which takes no LFS content`, and the next builder gets it: a Windows builder when one matches, else the run runs here, and a run pinned to the Mac with `--builder` ends failed.
+
 A word that still holds a `\` (a regex, a list, script text after `bash -c` or `pwsh -Command`, a path the repo does not carry) keeps the command off the Mac: it runs on a Windows builder or here, silently. A Windows builder is sent the words as written. Details: [design.md, Routing](design.md#routing).
 
 - **Private home** runs first, before every toolchain step: it sets the builder's home to mode 700 (logging `<home> had mode <mode>; set to 700` when it changed), since the package restore's caches (`~/.npm`, `~/Library/pnpm/store`, `~/.bun/install/cache`) are made at 755 and 644 and every standard macOS account is in the home's group `staff`. It refuses a home that is a symlink or owned by another account.
@@ -401,6 +403,8 @@ The engine is not in the worktree and not on the builder's `PATH`: the builder h
 - **The archive** goes to a gitignored folder outside `.tmp/`, named in the repo's `outputs`, so it is not left in `.tmp/`, whose files come back only when the run wrote them and a glob names `.tmp`.
 - **What stays local:** commandlets that write into ignored content, a packaged-game run that needs a GPU when the builder has none, and the editor.
 - **Git LFS.** A repo with LFS-tracked files routes with them: the PC sends the objects the snapshot's pointers name to the builder's per-repo LFS store, and the box checks them out with no download.
+
+  Only a Windows builder takes LFS content: a macOS builder is skipped with `parity` and the run goes to the next builder.
 
   The builder needs git-lfs 3.1.3 or later whenever a tracked `.gitattributes` names the LFS filter (a builder without it keeps the run here, `parity`), and the PC must hold the objects: run `git lfs fetch` first, else the run falls back `lfs` with a log line naming the missing object. See [design.md, Routing](design.md#routing) (Git LFS).
 

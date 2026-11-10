@@ -1708,11 +1708,11 @@ impl Attempt<'_, '_> {
         let (sibling_snapshots, sibling_bases) = sibling_fields(&repos, siblings);
         let trees = self.trees(&repos, &snapshots)?;
         let lfs = self.lfs_sending(&repos, &snapshots, &trees)?;
-        let godot_command = self.godot_command();
+        self.macos_takes_no_lfs(&repos, &lfs)?;
         let mut needs = trees
             .first()
             .and_then(Option::as_ref)
-            .map(|tree| tree.needs(godot_command))
+            .map(|tree| tree.needs(self.godot_command()))
             .unwrap_or_default();
         let git_lfs = self.git_lfs_needed(!lfs.is_empty(), &repos, &trees, &mut needs)?;
         let prepared = self.preflighted(&location, &needs)?;
@@ -1889,7 +1889,8 @@ impl Attempt<'_, '_> {
     }
 
     /// Says the TRANSFER FAILED line of a transfer after a command that ended as `ended` says (`the command exited <n>`,
-    /// [`outputs::KILLED_AT_ITS_CEILING`], [`outputs::PC_STOPPED`] or [`outputs::CONNECTION_LOST`]) on the builder, which failed every attempt for `why`.
+    /// [`outputs::KILLED_AT_ITS_CEILING`], [`outputs::PC_STOPPED`] or [`outputs::CONNECTION_LOST`]) on the builder, which
+    /// failed every attempt for `why`.
     pub(super) fn say_transfer_failed(&mut self, ended: &str, why: &str) {
         let host = self.call.host();
         self.say(format!("gate: TRANSFER FAILED: {ended} on {host}; {why}"));
@@ -2413,6 +2414,27 @@ impl Attempt<'_, '_> {
             sending.push(repo_sending.map_err(|why| lfs::refused(self, &why))?);
         }
         Ok(sending)
+    }
+
+    /// Refuses the run `parity` when the snapshot holds LFS pointers and the attempt's builder is a macOS one, before its
+    /// preflight: the Unix box runs no `lfs` verb, so an attempt there would be refused `lfs` after its preflight and
+    /// push and run the command here, while a `parity` refusal hands the run to the next builder. The line names the
+    /// repository's routing name (`repos`), as every toolchain mismatch line does. `Ok` when the snapshot holds no
+    /// pointers, or the builder takes it.
+    fn macos_takes_no_lfs(&mut self, repos: &[Repo], lfs: &[lfs::Sending]) -> Result<(), End> {
+        let Some(sending) = lfs.first() else {
+            return Ok(());
+        };
+        if self.call.builder.os != BuilderOs::Macos {
+            return Ok(());
+        }
+        let repo = &repos[sending.at].on_builder;
+        let line = format!(
+            "gate: remote toolchain mismatch: {repo} holds LFS pointers; {} is a macOS builder, which takes no LFS content",
+            self.call.host()
+        );
+        self.say(line);
+        Err(End::Refused(FallbackReason::Parity))
     }
 
     /// The pointers of `repo`'s `snapshot`: for the main repository (`main` given), those among the blobs of its tree's
