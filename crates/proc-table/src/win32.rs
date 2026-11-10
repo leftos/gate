@@ -272,9 +272,13 @@ fn read_memory(process: &OwnedHandle, address: usize, size: usize) -> Option<Vec
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test that cannot read this process must fail loudly")]
 mod tests {
+    use std::mem::size_of;
     use std::ptr;
 
-    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, GetLastError, INVALID_HANDLE_VALUE, SetLastError};
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, GetLastError, INVALID_HANDLE_VALUE, SetLastError, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{
+        CREATE_SUSPENDED, CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    };
 
     use super::{OwnedHandle, Win32ProcessTable, command_line_of};
     use crate::ProcessTable;
@@ -320,6 +324,50 @@ mod tests {
     fn command_line_of_a_process_that_cannot_be_opened_is_none() {
         // The idle process has no command line, and a read right over it is never granted.
         assert_eq!(command_line_of(0), None);
+    }
+
+    #[test]
+    fn command_line_of_reads_a_process_created_suspended() {
+        let exe = std::env::current_exe().expect("this test binary has a path");
+        let expected = format!("\"{}\" --list --never-run", exe.display());
+        let mut command: Vec<u16> = expected.encode_utf16().chain(std::iter::once(0)).collect();
+        let startup = STARTUPINFOW {
+            cb: u32::try_from(size_of::<STARTUPINFOW>()).expect("a STARTUPINFOW fits in a u32"),
+            ..STARTUPINFOW::default()
+        };
+        let mut info = PROCESS_INFORMATION::default();
+        // SAFETY: the command line is a mutable NUL-terminated UTF-16 buffer outliving the call, `startup` has `cb` set,
+        // `info` is writable, and a null application name, attributes and environment are what the call accepts; the
+        // child is created suspended, so nothing in its command line is acted on.
+        let created = unsafe {
+            CreateProcessW(
+                ptr::null(),
+                command.as_mut_ptr(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                CREATE_SUSPENDED,
+                ptr::null(),
+                ptr::null(),
+                &raw const startup,
+                &raw mut info,
+            )
+        };
+        // SAFETY: GetLastError only reads this thread's last-error code, which CreateProcessW has just set.
+        let error = unsafe { GetLastError() };
+        assert_ne!(created, 0, "CreateProcessW failed with {error}");
+        let read = command_line_of(info.dwProcessId);
+        // SAFETY: the process handle is open and writable to end its process; the return value is unused.
+        unsafe { TerminateProcess(info.hProcess, 1) };
+        // SAFETY: the process handle is open and waitable; the wait is a hang guard on a process just terminated.
+        let waited = unsafe { WaitForSingleObject(info.hProcess, 120_000) };
+        // SAFETY: both handles are the open ones CreateProcessW returned, closed once here and never used again.
+        unsafe {
+            CloseHandle(info.hThread);
+            CloseHandle(info.hProcess);
+        }
+        assert_eq!(waited, WAIT_OBJECT_0, "the terminated child ends");
+        assert_eq!(read, Some(expected));
     }
 
     #[test]

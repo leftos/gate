@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use crate::launcher::{install_gate, lines, refused_words, run_direct, run_launcher};
 use crate::routing::CONTROL_C_EXIT;
 use crate::support::{
-    Case, FAKE_TOOL, Running, USAGE, assert_in_order, finish, powershell_folder, shown, write_powershell_claim, write_powershell_ticket,
+    Case, FAKE_TOOL, Running, USAGE, assert_in_order, finish, powershell_folder, shown, wait_until, write_powershell_claim, write_powershell_ticket,
 };
 
 /// `gate cutover` with a short confirmation window, so a drain with nothing to wait for ends soon; no case asserts how
@@ -76,10 +76,15 @@ struct Holder {
 }
 
 impl Holder {
-    /// Starts a holder whose go file is `<name>.go` in the case folder.
+    /// Starts a holder whose go file is `<name>.go` in the case folder, and returns once it runs its own code: it writes
+    /// `<name>.pid` before it waits, so its start-up is over and its command line can be read: a read made a few
+    /// milliseconds after the spawn, while the process was still starting, was seen to find none.
     fn start(case: &Case, name: &str) -> Holder {
         let go = case.folder().join(format!("{name}.go"));
+        let running = case.folder().join(format!("{name}.pid"));
         let mut child = Command::new(FAKE_TOOL)
+            .arg("pid-to")
+            .arg(&running)
             .arg("wait")
             .arg(&go)
             .stdin(Stdio::null())
@@ -87,6 +92,12 @@ impl Holder {
             .stderr(Stdio::null())
             .spawn()
             .expect("the holder starts");
+        let mut ended = None;
+        wait_until(&format!("the holder {name} writing {}", running.display()), || {
+            ended = child.try_wait().expect("the holder's status can be read");
+            ended.is_some() || running.exists()
+        });
+        assert_eq!(ended, None, "the holder {name} ended before it was let go");
         let read = gate_win32::process_start_of(child.id());
         if !matches!(read, Ok(Some(_))) {
             // Not yet a Holder, so its drop would not end it: end it before the case fails, so it is not left waiting.
