@@ -37,6 +37,8 @@ The owner is asked only about what they know as a user and a developer and the r
 
 The builders' setup is the session's own work, with the owner's standing permission: a session installs the toolchains and tools a routed repo needs and changes a builder's configuration (ACLs, environment variables, installs) directly over ssh, without asking and without a request to claude-config first.
 
+A builder reboot is never part of that permission. A session asks the owner with `AskUserQuestion` before every reboot, of any builder, for any cause (a pending update, a WSL feature, a hang), so the owner can watch the machine through it. It drains the builder first and starts the reboot only once the owner says yes. Setup the session builds (a scheduled task, a prep step, an update policy) never reboots a builder on its own either.
+
 A change to a builder's toolchains, tools, work root or git config is also made in this repo's `tools/builder/install-toolchains.ps1` in the same item, so a new builder gets the same setup. A change to the machine's provisioning (the private half) still goes to claude-config as a repo inbox note with what changed and the exact commands. The repo-is-public rule still holds: no builder host, address or user goes into a commit or an issue.
 
 The primary goal is remote gates working for every caller repo under `X:\dev` as soon as possible. When ordering, splitting or merging work, prefer whatever routes the next repo soonest, and say the choice in one line.
