@@ -282,6 +282,41 @@ function Resolve-BlockExpression {
     return [pscustomobject]@{ Texts = $texts; Variables = $variables }
 }
 
+# The Register-ScheduledTask call in $Block whose -TaskName argument is written $TaskName, as the AST text reads it.
+function Get-RegisterCall {
+    param([Parameter(Mandatory)]$Block, [Parameter(Mandatory)][string]$TaskName)
+    $call = $null
+    foreach ($command in (Get-BlockCommand $Block 'Register-ScheduledTask')) {
+        $argument = Get-ParameterArgument $command 'TaskName'
+        if ($argument -and "$($argument.Extent.Text)" -eq $TaskName) { $call = $command }
+    }
+    return $call
+}
+
+# The literal install-toolchains.ps1 assigns at its top level to $Name, or $null when it assigns none.
+function Get-TopLevelValue([string]$Name) {
+    $assignments = @($sourceAst.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                $node.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                $node.Left.VariablePath.UserPath -eq $Name
+            }.GetNewClosure(), $true))
+    foreach ($assignment in $assignments) {
+        $right = $assignment.Right
+        if ($right -is [System.Management.Automation.Language.CommandExpressionAst]) { $right = $right.Expression }
+        if ($right -is [System.Management.Automation.Language.StringConstantExpressionAst]) { return $right.Value }
+    }
+    return $null
+}
+
+# The text $Block builds for $Call's -$Name parameter, the step's variable assignments followed; '' when it is absent.
+function Get-StepArgumentText {
+    param([Parameter(Mandatory)]$Block, [Parameter(Mandatory)]$Call, [Parameter(Mandatory)][string]$Name)
+    $argument = Get-ParameterArgument $Call $Name
+    if (-not $argument) { return '' }
+    return (Resolve-BlockExpression -Block $Block -Expression $argument).Texts -join ' '
+}
+
 # Runs the Visual C++ Redistributable step's block against stubs in a scratch download folder: Get-VCRedistVersion
 # answers $Versions in turn, Invoke-Installer throws "<file> exited <InstallerExit>" when that is not 0, Get-File records
 # the URL without writing the file, and Write-InstallLog records. -Cached puts a stale vc_redist.x64.exe in the folder
@@ -941,6 +976,174 @@ try {
             }
         }
         return ''
+    }
+
+    Test-Case 'the virtual display step registers a SYSTEM task at startup and every 5 minutes running ensure' {
+        $block = Get-StepBlock 'Virtual display'
+        if (-not $block) { return 'install-toolchains.ps1 has no Virtual display step' }
+        $name = Get-TopLevelValue 'virtualDisplayTaskName'
+        if ($name -ne 'gate-virtual-display') { return "`$virtualDisplayTaskName reads '$name'" }
+        $call = Get-RegisterCall -Block $block -TaskName '$virtualDisplayTaskName'
+        if (-not $call) { return 'no Register-ScheduledTask in the step names $virtualDisplayTaskName' }
+        $path = Get-ParameterArgument $call 'TaskPath'
+        if (-not $path -or "$($path.Extent.Text)" -ne '$sccacheTaskPath') { return "the task path is not `$sccacheTaskPath" }
+        $principal = Get-StepArgumentText -Block $block -Call $call -Name 'Principal'
+        foreach ($wanted in "-UserId 'SYSTEM'", '-LogonType ServiceAccount', '-RunLevel Highest') {
+            if (-not $principal.Contains($wanted)) { return "the principal is $principal, expected $wanted" }
+        }
+        $trigger = Get-StepArgumentText -Block $block -Call $call -Name 'Trigger'
+        foreach ($wanted in '-AtStartup', '-Once', '-RepetitionInterval', 'New-TimeSpan -Minutes 5') {
+            if (-not $trigger.Contains($wanted)) { return "the triggers are $trigger, expected $wanted" }
+        }
+        $installed = Get-TopLevelValue 'virtualDisplayScript'
+        if ($installed -ne 'C:\Program Files\gate-maintenance\virtual-display.ps1') {
+            return "`$virtualDisplayScript reads '$installed'"
+        }
+        $action = Get-StepArgumentText -Block $block -Call $call -Name 'Action'
+        foreach ($wanted in '-Action ensure', '$virtualDisplayScript', '$windowsPowerShell') {
+            if (-not $action.Contains($wanted)) { return "the action is $action, expected $wanted" }
+        }
+        return ''
+    }
+
+    Test-Case 'the virtual display step registers a Limited Interactive logon task for the builder user running mode' {
+        $block = Get-StepBlock 'Virtual display'
+        if (-not $block) { return 'install-toolchains.ps1 has no Virtual display step' }
+        $name = Get-TopLevelValue 'displayModeTaskName'
+        if ($name -ne 'gate-display-mode') { return "`$displayModeTaskName reads '$name'" }
+        $call = Get-RegisterCall -Block $block -TaskName '$displayModeTaskName'
+        if (-not $call) { return 'no Register-ScheduledTask in the step names $displayModeTaskName' }
+        $path = Get-ParameterArgument $call 'TaskPath'
+        if (-not $path -or "$($path.Extent.Text)" -ne '$sccacheTaskPath') { return "the task path is not `$sccacheTaskPath" }
+        $principal = Get-StepArgumentText -Block $block -Call $call -Name 'Principal'
+        foreach ($wanted in '-UserId $User', '-LogonType Interactive', '-RunLevel Limited') {
+            if (-not $principal.Contains($wanted)) { return "the principal is $principal, expected $wanted" }
+        }
+        $trigger = Get-StepArgumentText -Block $block -Call $call -Name 'Trigger'
+        if (-not $trigger.Contains('-AtLogOn')) { return "the trigger is $trigger, expected -AtLogOn" }
+        $installed = Get-TopLevelValue 'virtualDisplayScript'
+        if ($installed -ne 'C:\Program Files\gate-maintenance\virtual-display.ps1') {
+            return "`$virtualDisplayScript reads '$installed'"
+        }
+        $action = Get-StepArgumentText -Block $block -Call $call -Name 'Action'
+        foreach ($wanted in '-Action mode', '$virtualDisplayScript', '$windowsPowerShell') {
+            if (-not $action.Contains($wanted)) { return "the action is $action, expected $wanted" }
+        }
+        return ''
+    }
+
+    Test-Case 'the virtual display step checks the folder and the script in it' {
+        $block = Get-StepBlock 'Virtual display'
+        if (-not $block) { return 'install-toolchains.ps1 has no Virtual display step' }
+        $calls = Get-BlockCommand $block 'Assert-WritableOnlyByAdmins'
+        if ($calls.Count -ne 2) { return "the step checks $($calls.Count) paths, expected 2" }
+        $resolved = @()
+        foreach ($call in $calls) {
+            $argument = Get-ParameterArgument $call 'Path'
+            if (-not $argument) { return "the call $($call.Extent.Text) names no -Path" }
+            $resolved += (Resolve-BlockExpression -Block $block -Expression $argument).Texts -join ' '
+        }
+        foreach ($name in 'maintenanceDir', 'virtualDisplayScript') {
+            $pattern = '\$' + $name + '\b'
+            if (-not @($resolved | Where-Object { $_ -match $pattern }).Count) {
+                return "the step never checks `$${name}: $($resolved -join ' | ')"
+            }
+        }
+        return ''
+    }
+
+    Test-Case 'the virtual display step sets the AC display timeout to never' {
+        $block = Get-StepBlock 'Virtual display'
+        if (-not $block) { return 'install-toolchains.ps1 has no Virtual display step' }
+        $calls = Get-BlockCommand $block 'powercfg.exe'
+        if ($calls.Count -ne 1) { return "the step has $($calls.Count) powercfg.exe calls, expected 1" }
+        $text = $calls[0].Extent.Text
+        if (-not $text.Contains('/change monitor-timeout-ac 0')) { return "the call is $text" }
+        if ("$($block.Extent.Text)" -notmatch 'AC display timeout set to never') {
+            return 'the step logs nothing about the AC display timeout'
+        }
+        return ''
+    }
+
+    Test-Case 'the virtual display step refuses a builder without the usbmmidd driver' {
+        $block = Get-StepBlock 'Virtual display'
+        if (-not $block) { return 'install-toolchains.ps1 has no Virtual display step' }
+        if ("$($block.Extent.Text)" -notmatch '-Class\s+Display') { return 'the step never reads the Display class' }
+        $throws = @($block.FindAll({ param($node) $node -is [System.Management.Automation.Language.ThrowStatementAst] }, $true))
+        $named = @($throws | Where-Object { $_.Extent.Text -match 'usbmmidd' })
+        if (-not $named.Count) {
+            $shown = @($throws | ForEach-Object { $_.Extent.Text }) -join ' | '
+            return "no throw names usbmmidd: $shown"
+        }
+        return ''
+    }
+
+    Test-Case 'the virtual display step starts the ensure task instead of running ensure itself' {
+        $block = Get-StepBlock 'Virtual display'
+        if (-not $block) { return 'install-toolchains.ps1 has no Virtual display step' }
+        $waits = @()
+        foreach ($wait in (Get-BlockCommand $block 'Wait-InstallTaskRun')) {
+            $argument = Get-ParameterArgument $wait 'Name'
+            if ($argument -and "$($argument.Extent.Text)" -eq '$virtualDisplayTaskName') { $waits += $wait }
+        }
+        if ($waits.Count -ne 1) { return "the step waits on `$virtualDisplayTaskName $($waits.Count) time(s), expected 1" }
+        $seconds = Get-StepArgumentText -Block $block -Call $waits[0] -Name 'Seconds'
+        if ($seconds -ne '300') { return "the ensure wait is -Seconds $seconds, expected 300" }
+        if ("$($block.Extent.Text)" -notmatch 'did not run within 300 s') {
+            return 'the step never throws when the ensure task did not run'
+        }
+        $runs = ([regex]::Matches("$($block.Extent.Text)", [regex]::Escape('-Action ensure'))).Count
+        if ($runs -ne 1) { return "the step names -Action ensure $runs time(s), expected only the task's argument" }
+        $helper = Get-InstallerFunctionText 'Wait-InstallTaskRun'
+        foreach ($wanted in 'Start-ScheduledTask', 'LastRunTime', 'LastTaskResult') {
+            if (-not $helper.Contains($wanted)) { return "Wait-InstallTaskRun never reads $wanted" }
+        }
+        return ''
+    }
+
+    Test-Case 'the virtual display step waits for the mode task and fails on its non-zero result' {
+        $block = Get-StepBlock 'Virtual display'
+        if (-not $block) { return 'install-toolchains.ps1 has no Virtual display step' }
+        $waits = @()
+        foreach ($wait in (Get-BlockCommand $block 'Wait-InstallTaskRun')) {
+            $argument = Get-ParameterArgument $wait 'Name'
+            if ($argument -and "$($argument.Extent.Text)" -eq '$displayModeTaskName') { $waits += $wait }
+        }
+        if ($waits.Count -ne 1) { return "the step waits on `$displayModeTaskName $($waits.Count) time(s), expected 1" }
+        $seconds = Get-StepArgumentText -Block $block -Call $waits[0] -Name 'Seconds'
+        if ($seconds -ne '360') { return "the mode wait is -Seconds $seconds, expected 360" }
+        $text = "$($block.Extent.Text)"
+        foreach ($wanted in 'did not run (is the builder user logged on at the console?)',
+            'set the console display to 1920x1080') {
+            if (-not $text.Contains($wanted)) { return "the step never logs '$wanted'" }
+        }
+        $throws = @($block.FindAll({ param($node) $node -is [System.Management.Automation.Language.ThrowStatementAst] }, $true))
+        $named = @($throws | Where-Object { $_.Extent.Text -match 'displayModeTaskName' -and $_.Extent.Text -match 'ended with' })
+        if (-not $named.Count) { return 'no throw names a non-zero display mode result' }
+        return ''
+    }
+
+    Test-Case 'the virtual display step reads back an indefinite 5-minute repetition' {
+        $block = Get-StepBlock 'Virtual display'
+        if (-not $block) { return 'install-toolchains.ps1 has no Virtual display step' }
+        $text = "$($block.Extent.Text)"
+        foreach ($wanted in 'MSFT_TaskBootTrigger', "'PT5M'", '$repetition.Duration') {
+            if (-not $text.Contains($wanted)) { return "the step never reads back $wanted" }
+        }
+        $throws = @($block.FindAll({ param($node) $node -is [System.Management.Automation.Language.ThrowStatementAst] }, $true))
+        if (-not @($throws | Where-Object { $_.Extent.Text -match 'repetition interval' }).Count) {
+            return 'no throw names the repetition interval it read back'
+        }
+        return ''
+    }
+
+    Test-Case '-Only Virtual runs only the virtual display step' {
+        $matched = @(Get-StepName $copy | Where-Object { $_ -like 'Virtual*' })
+        if ($matched.Count -ne 1) { return "-Only Virtual matches $($matched.Count) steps, expected 1: $($matched -join ', ')" }
+        $r = Invoke-Child -Path $copy -ScriptArguments ($userArguments + @('-Only', 'Virtual'))
+        if ($r.ExitCode -ne 0) { return "exit $($r.ExitCode), expected 0; stderr: $($r.StdErr)" }
+        if ($r.StdErr) { return "stderr: $($r.StdErr)" }
+        Get-CreatedProblem
     }
 
     Test-Case 'the Windows Update step makes Administrators the owner of the folder and both files' {

@@ -103,6 +103,35 @@ function Write-InstallLog([string]$Message) {
     Write-Output $line
 }
 
+# Registers the Application log source a task writes its events under, once: a rerun logs that it already is.
+function Register-InstallEventSource([string]$Source) {
+    if ([Diagnostics.EventLog]::SourceExists($Source)) {
+        Write-InstallLog "event source ${Source}: already registered"
+    }
+    else {
+        New-EventLog -LogName Application -Source $Source
+        Write-InstallLog "event source ${Source}: registered in the Application log"
+    }
+}
+
+# Starts a registered task and waits for the run it took: its LastTaskResult, or $null when it did not run within
+# $Seconds. A fresh registration holds 267011 (has not run), so the run is recognised by its LastRunTime, not by the
+# result alone.
+function Wait-InstallTaskRun([string]$Name, [int]$Seconds) {
+    $started = Get-Date
+    Start-ScheduledTask -TaskPath $sccacheTaskPath -TaskName $Name
+    $deadline = $started.AddSeconds($Seconds)
+    while ($true) {
+        $state = (Get-ScheduledTask -TaskPath $sccacheTaskPath -TaskName $Name).State
+        $info = Get-ScheduledTaskInfo -TaskPath $sccacheTaskPath -TaskName $Name
+        if ($state -ne 'Running' -and $state -ne 'Queued' -and $info.LastRunTime -ge $started.AddSeconds(-1)) {
+            return $info.LastTaskResult
+        }
+        if ((Get-Date) -ge $deadline) { return $null }
+        Start-Sleep -Seconds 2
+    }
+}
+
 function Get-File([string]$Url) {
     $path = Join-Path $dl ([IO.Path]::GetFileName(([Uri]$Url).AbsolutePath))
     if (-not (Test-Path $path)) { Invoke-WebRequest -Uri $Url -OutFile $path -UseBasicParsing }
@@ -446,6 +475,10 @@ $sccacheTaskPath = '\build-box\'
 $sccacheTaskName = 'sccache-server'
 $pruneTaskName = 'gate-prune-work'
 $windowsUpdateTaskName = 'gate-windows-update'
+$virtualDisplayTaskName = 'gate-virtual-display'
+$displayModeTaskName = 'gate-display-mode'
+$virtualDisplayScript = 'C:\Program Files\gate-maintenance\virtual-display.ps1'
+$windowsPowerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 $sccacheServerScript = Join-Path $scriptFiles 'sccache-server.ps1'
 $sccacheUserVariables = 'SCCACHE_IGNORE_SERVER_IO_ERROR', 'SCCACHE_CLIENT_SIDE'
 function Get-SccacheServerTask { return Get-ScheduledTask -TaskPath $sccacheTaskPath -TaskName $sccacheTaskName -ErrorAction SilentlyContinue }
@@ -938,13 +971,7 @@ Invoke-Step "Gate work root $GateRoot" {
 # not started here: gate.exe arrives with the gate push that follows this installer.
 Invoke-Step 'Work-folder prune task' {
     $eventSource = 'gate-prune'
-    if ([Diagnostics.EventLog]::SourceExists($eventSource)) {
-        Write-InstallLog "event source ${eventSource}: already registered"
-    }
-    else {
-        New-EventLog -LogName Application -Source $eventSource
-        Write-InstallLog "event source ${eventSource}: registered in the Application log"
-    }
+    Register-InstallEventSource $eventSource
     $gateExe = 'C:\Program Files\gate\bin\gate.exe'
     $drive = Split-Path -Qualifier $GateRoot
     # The closing event is Information on exit 0 and Warning on any other exit, or on none when gate.exe did not run.
@@ -1065,14 +1092,7 @@ function Set-PolicyValues([string]$Key, [System.Collections.IDictionary]$Values)
 # replace, and the work root reaches it through a file beside it rather than the task's command line, which the box's
 # drain judge would count as live work.
 Invoke-Step 'Windows Update drained install' {
-    $eventSource = 'gate-windows-update'
-    if ([Diagnostics.EventLog]::SourceExists($eventSource)) {
-        Write-InstallLog "event source ${eventSource}: already registered"
-    }
-    else {
-        New-EventLog -LogName Application -Source $eventSource
-        Write-InstallLog "event source ${eventSource}: registered in the Application log"
-    }
+    Register-InstallEventSource 'gate-windows-update'
     $maintenanceDir = 'C:\Program Files\gate-maintenance'
     $maintenanceScript = 'C:\Program Files\gate-maintenance\windows-update.ps1'
     $maintenanceRoot = 'C:\Program Files\gate-maintenance\windows-update.root'
@@ -1125,6 +1145,102 @@ Invoke-Step 'Windows Update drained install' {
     }
 }
 
+# The builder has no physical display: its only monitor is the usbmmidd driver's virtual one, which the driver adds
+# only when asked, so after a reboot the console session has no attached display and a capture records a flat frame.
+# A SYSTEM task plugs one in at boot and every 5 minutes. The driver first brings a monitor up at 1024x768; once a task
+# sets 1920x1080 at the builder user's logon, Windows keeps it for that monitor, and a monitor plugged in again comes
+# back at it.
+Invoke-Step 'Virtual display' {
+    Register-InstallEventSource 'gate-virtual-display'
+    $adapters = @(Get-PnpDevice -Class Display -PresentOnly -ErrorAction SilentlyContinue |
+        Where-Object { $_.HardwareID -contains 'usbmmidd' })
+    if (-not $adapters.Count) {
+        throw ("the usbmmidd virtual display driver is not installed; the machine's provisioning installs RustDesk, " +
+            'which brings it')
+    }
+    $maintenanceDir = 'C:\Program Files\gate-maintenance'
+    $source = Join-Path $PSScriptRoot 'virtual-display.ps1'
+    if (-not (Test-Path -LiteralPath $source)) {
+        throw "$source is missing; copy it to the builder beside install-toolchains.ps1"
+    }
+    if (-not (Test-Path -LiteralPath $maintenanceDir)) { New-Item -ItemType Directory -Force $maintenanceDir | Out-Null }
+    Copy-Item -LiteralPath $source -Destination $virtualDisplayScript -Force
+    # The installer runs elevated as the builder user, so it could leave the folder and the script owned by that user,
+    # and an owner holds WRITE_DAC with no ACE at all. Administrators own them instead, as they own the work root.
+    foreach ($path in @($maintenanceDir, $virtualDisplayScript)) {
+        & icacls.exe $path /setowner '*S-1-5-32-544' /q | Out-Null
+        if ($LASTEXITCODE) { throw "icacls $path /setowner exited $LASTEXITCODE" }
+    }
+    Assert-WritableOnlyByAdmins -Path $maintenanceDir
+    Assert-WritableOnlyByAdmins -Path $virtualDisplayScript
+    # A monitor Windows turns off after an idle period has nothing to capture, so the AC timeout goes away entirely.
+    & powercfg.exe /change monitor-timeout-ac 0
+    if ($LASTEXITCODE) { throw "powercfg /change monitor-timeout-ac exited $LASTEXITCODE" }
+    Write-InstallLog 'virtual display: AC display timeout set to never'
+    $ensureArguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$virtualDisplayScript`" -Action ensure"
+    $ensureAction = New-ScheduledTaskAction -Execute $windowsPowerShell -Argument $ensureArguments
+    $ensureTriggers = @(
+        (New-ScheduledTaskTrigger -AtStartup)
+        (New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Minutes 5))
+    )
+    $ensurePrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $ensureSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
+        -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    Register-ScheduledTask -TaskPath $sccacheTaskPath -TaskName $virtualDisplayTaskName -Action $ensureAction `
+        -Trigger $ensureTriggers -Principal $ensurePrincipal -Settings $ensureSettings -Force | Out-Null
+    Write-InstallLog ("task $sccacheTaskPath$virtualDisplayTaskName registered: plugs in a virtual monitor at startup " +
+        'and every 5 minutes, as SYSTEM')
+    $triggers = @((Get-ScheduledTask -TaskPath $sccacheTaskPath -TaskName $virtualDisplayTaskName).Triggers)
+    $boot = @($triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskBootTrigger' })
+    $timed = @($triggers | Where-Object { $_.Repetition -and $_.Repetition.Interval })
+    if ($triggers.Count -ne 2 -or $boot.Count -ne 1 -or $timed.Count -ne 1) {
+        throw ("task $sccacheTaskPath$virtualDisplayTaskName reads back $($triggers.Count) trigger(s), $($boot.Count) at " +
+            "boot and $($timed.Count) timed, expected 2: one at boot and one repeating")
+    }
+    $repetition = $timed[0].Repetition
+    if ($repetition.Interval -ne 'PT5M' -or $repetition.Duration) {
+        throw ("task $sccacheTaskPath$virtualDisplayTaskName reads back with repetition interval '$($repetition.Interval)' " +
+            "and duration '$($repetition.Duration)', expected PT5M and none (indefinite)")
+    }
+    # No repeat trigger on this one: a window flashing on the console desktop every few minutes would land in the
+    # recordings it serves.
+    $modeArguments = ("-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File " +
+        "`"$virtualDisplayScript`" -Action mode")
+    $modeAction = New-ScheduledTaskAction -Execute $windowsPowerShell -Argument $modeArguments
+    $modeTrigger = New-ScheduledTaskTrigger -AtLogOn -User $User
+    $modePrincipal = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Limited
+    $modeSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -MultipleInstances IgnoreNew
+    Register-ScheduledTask -TaskPath $sccacheTaskPath -TaskName $displayModeTaskName -Action $modeAction `
+        -Trigger $modeTrigger -Principal $modePrincipal -Settings $modeSettings -Force | Out-Null
+    Write-InstallLog ("task $sccacheTaskPath$displayModeTaskName registered: sets the virtual monitor to 1920x1080 at " +
+        "the builder user's logon, as $User (Interactive, Limited)")
+    # The task is started rather than ensure being run here: its IgnoreNew setting keeps a second ensure out while one
+    # is running, and two runs that each saw no monitor would each plug one in.
+    $result = Wait-InstallTaskRun -Name $virtualDisplayTaskName -Seconds 300
+    if ($null -eq $result) { throw "task $sccacheTaskPath$virtualDisplayTaskName did not run within 300 s" }
+    if ($result -ne 0) {
+        throw ("task $sccacheTaskPath$virtualDisplayTaskName ended with $result; see the Application log under " +
+            'gate-virtual-display')
+    }
+    # The mode task waits up to 300 s of its own for the monitor to reach this session, so the wait here covers it.
+    # Task Scheduler may refuse to start an interactive task outright when its user has no console logon, which is the
+    # same case as a task that never ran.
+    try { $result = Wait-InstallTaskRun -Name $displayModeTaskName -Seconds 360 }
+    catch {
+        Write-InstallLog "virtual display: the mode task did not start: $($_.Exception.Message)"
+        $result = $null
+    }
+    if ($null -eq $result) {
+        Write-InstallLog ("virtual display: the mode task did not run (is the builder user logged on at the console?); " +
+            'it runs at their next logon')
+    }
+    elseif ($result -ne 0) {
+        throw ("task $sccacheTaskPath$displayModeTaskName ended with $result; see the Application log under " +
+            'gate-virtual-display')
+    }
+    else { Write-InstallLog 'virtual display: the mode task set the console display to 1920x1080' }
+}
+
 Sync-SessionPath
 $env:Path += ';' + (Join-Path $env:USERPROFILE '.cargo\bin')
 Write-InstallLog '--- versions'
@@ -1171,6 +1287,20 @@ catch { "error: $($_.Exception.Message)" }
 Write-InstallLog "sccache --show-stats -> $out"
 $out = try { @(Get-Process sccache -ErrorAction SilentlyContinue | ForEach-Object { $_.Id }) -join ',' } catch { "error: $($_.Exception.Message)" }
 Write-InstallLog "sccache server pid -> $out"
+$out = try {
+    if (-not (Test-Path -LiteralPath $virtualDisplayScript)) { 'not installed' }
+    else {
+        $status = (@(& $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $virtualDisplayScript `
+                -Action status) -join ' | ')
+        if ($LASTEXITCODE -ne 0) {
+            if (-not $status) { $status = '(no output)' }
+            "$status (exit $LASTEXITCODE)"
+        }
+        else { $status }
+    }
+}
+catch { "error: $($_.Exception.Message)" }
+Write-InstallLog "virtual display -> $out"
 foreach ($name in $sccacheUserVariables) {
     $out = try { [Environment]::GetEnvironmentVariable($name, 'User') } catch { "error: $($_.Exception.Message)" }
     Write-InstallLog "user $name -> $out"
