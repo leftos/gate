@@ -101,6 +101,22 @@ function Get-InstallerFunctionText {
     return $texts -join "`n"
 }
 
+# Runs install-toolchains.ps1's Get-WriteGrantProblem on an ACL whose DACL is $Sddl and returns its answer.
+function Get-AclWriteProblem([string]$Sddl) {
+    . ([scriptblock]::Create((Get-InstallerFunctionText 'Get-WriteGrantProblem')))
+    $acl = [System.Security.AccessControl.DirectorySecurity]::new()
+    $acl.SetSecurityDescriptorSddlForm('D:' + $Sddl)
+    return Get-WriteGrantProblem -Acl $acl
+}
+
+# Runs install-toolchains.ps1's Get-OwnerProblem on a security descriptor given as $Sddl and returns its answer.
+function Get-AclOwnerProblem([string]$Sddl) {
+    . ([scriptblock]::Create((Get-InstallerFunctionText 'Get-OwnerProblem')))
+    $acl = [System.Security.AccessControl.DirectorySecurity]::new()
+    $acl.SetSecurityDescriptorSddlForm($Sddl)
+    return Get-OwnerProblem -Acl $acl
+}
+
 # Runs install-toolchains.ps1's Assert-GateRootSecurity and its helpers and returns the message it threw, or '' when it
 # passed.
 function Invoke-GateRootSecurityCheck {
@@ -512,6 +528,15 @@ try {
         Get-CreatedProblem
     }
 
+    Test-Case '-Only Windows runs only the Windows Update step' {
+        $matched = @(Get-StepName $copy | Where-Object { $_ -like 'Windows*' })
+        if ($matched.Count -ne 1) { return "-Only Windows matches $($matched.Count) steps, expected 1: $($matched -join ', ')" }
+        $r = Invoke-Child -Path $copy -ScriptArguments ($userArguments + @('-Only', 'Windows'))
+        if ($r.ExitCode -ne 0) { return "exit $($r.ExitCode), expected 0; stderr: $($r.StdErr)" }
+        if ($r.StdErr) { return "stderr: $($r.StdErr)" }
+        Get-CreatedProblem
+    }
+
     Test-Case '-Only Summary is reserved, runs no step and exits 0' {
         $clash = @(Get-StepName $copy | Where-Object { $_ -like 'Summary*' })
         if ($clash.Count) { return "steps start with the reserved prefix Summary: $($clash -join ', ')" }
@@ -778,6 +803,175 @@ try {
             $text = (Resolve-BlockExpression -Block $block -Expression $write).Texts -join ' '
             if ($text -match '\.ps1\b') { return "the step writes a script file: $($write.Extent.Text)" }
         }
+        return ''
+    }
+
+    Test-Case 'the Windows Update step registers S4U Highest daily at 03:00 running the installed script' {
+        $block = Get-StepBlock 'Windows Update drained install'
+        if (-not $block) { return 'install-toolchains.ps1 has no Windows Update drained install step' }
+        $principals = Get-BlockCommand $block 'New-ScheduledTaskPrincipal'
+        if ($principals.Count -ne 1) { return "the step has $($principals.Count) New-ScheduledTaskPrincipal calls, expected 1" }
+        $logon = Get-ParameterArgument $principals[0] 'LogonType'
+        $level = Get-ParameterArgument $principals[0] 'RunLevel'
+        if ("$($logon.Extent.Text)" -ne 'S4U' -or "$($level.Extent.Text)" -ne 'Highest') {
+            return "the principal is $($principals[0].Extent.Text), expected -LogonType S4U -RunLevel Highest"
+        }
+        $triggers = Get-BlockCommand $block 'New-ScheduledTaskTrigger'
+        if ($triggers.Count -ne 1) { return "the step has $($triggers.Count) New-ScheduledTaskTrigger calls, expected 1" }
+        $daily = @($triggers[0].CommandElements | Where-Object {
+                $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'Daily' })
+        if ($daily.Count -ne 1) { return "the trigger $($triggers[0].Extent.Text) has no -Daily" }
+        $at = Get-ParameterArgument $triggers[0] 'At'
+        if ("$($at.Extent.Text)" -ne '3am') { return "the trigger $($triggers[0].Extent.Text) is not -At 3am" }
+        $settings = Get-BlockCommand $block 'New-ScheduledTaskSettingsSet'
+        if ($settings.Count -ne 1) { return "the step has $($settings.Count) New-ScheduledTaskSettingsSet calls, expected 1" }
+        $instances = Get-ParameterArgument $settings[0] 'MultipleInstances'
+        if ("$($instances.Extent.Text)" -ne 'IgnoreNew') {
+            return "the settings are $($settings[0].Extent.Text), expected -MultipleInstances IgnoreNew"
+        }
+        $limit = Get-ParameterArgument $settings[0] 'ExecutionTimeLimit'
+        if (-not $limit) { return "the settings $($settings[0].Extent.Text) set no -ExecutionTimeLimit" }
+        $limitText = (Resolve-BlockExpression -Block $block -Expression $limit).Texts -join ' '
+        if ($limitText -notmatch 'New-TimeSpan\s+-Hours\s+12\b') {
+            return "the execution time limit is $limitText, not New-TimeSpan -Hours 12"
+        }
+        $actions = Get-BlockCommand $block 'New-ScheduledTaskAction'
+        if ($actions.Count -ne 1) { return "the step has $($actions.Count) New-ScheduledTaskAction calls, expected 1" }
+        $argument = Get-ParameterArgument $actions[0] 'Argument'
+        if (-not $argument) { return "the action $($actions[0].Extent.Text) has no -Argument" }
+        $resolved = Resolve-BlockExpression -Block $block -Expression $argument
+        $text = $resolved.Texts -join ' '
+        foreach ($wanted in 'C:\Program Files\gate-maintenance\windows-update.ps1', '-File') {
+            if (-not $text.Contains($wanted)) { return "the action argument does not name $wanted`: $text" }
+        }
+        if ('GateRoot' -in $resolved.Variables) { return "the action argument builds on `$GateRoot: $text" }
+        return ''
+    }
+
+    Test-Case 'the Windows Update step sets the download-only policy and the active hours' {
+        $block = Get-StepBlock 'Windows Update drained install'
+        if (-not $block) { return 'install-toolchains.ps1 has no Windows Update drained install step' }
+        $text = $block.Extent.Text
+        if (-not $text.Contains('SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate')) {
+            return 'the step does not write the Windows Update policy keys'
+        }
+        foreach ($policy in @(
+                @{ Name = 'NoAutoUpdate'; Value = '0' }
+                @{ Name = 'AUOptions'; Value = '3' }
+                @{ Name = 'NoAutoRebootWithLoggedOnUsers'; Value = '1' }
+                @{ Name = 'SetActiveHours'; Value = '1' }
+                @{ Name = 'ActiveHoursStart'; Value = '3' }
+                @{ Name = 'ActiveHoursEnd'; Value = '21' })) {
+            if ($text -notmatch "\b$($policy.Name)\s*=\s*$($policy.Value)\b") {
+                return "the step does not set $($policy.Name) to $($policy.Value)"
+            }
+        }
+        if (-not $text.Contains('AutoAdminLogon')) { return 'the step does not read AutoAdminLogon' }
+        if ($text -notmatch 'no autologon, so Windows may restart by itself') {
+            return 'the step does not warn when autologon is off'
+        }
+        return ''
+    }
+
+    Test-Case 'the Windows Update folder check refuses only identities that may write it' {
+        $trustedInstaller = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+        $fullAccess = '(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;' + $trustedInstaller + ')'
+        $rows = @(
+            @{ Sddl = '(A;OICI;0x1200a9;;;BU)'; Problem = $false }
+            @{ Sddl = '(A;;0x2;;;BU)'; Problem = $true }
+            @{ Sddl = '(A;;GW;;;BU)'; Problem = $true }
+            @{ Sddl = '(A;OICIIO;GA;;;CO)'; Problem = $false }
+            @{ Sddl = $fullAccess; Problem = $false }
+            @{ Sddl = '(A;;0x1301bf;;;AU)'; Problem = $true }
+        )
+        foreach ($row in $rows) {
+            $problem = Get-AclWriteProblem -Sddl $row.Sddl
+            if ($row.Problem -and -not $problem) { return "it passed $($row.Sddl)" }
+            if (-not $row.Problem -and $problem) { return "it refused $($row.Sddl), naming $problem" }
+        }
+        return ''
+    }
+
+    Test-Case 'the Windows Update folder check refuses an owner that is not SYSTEM, Administrators or TrustedInstaller' {
+        foreach ($sddl in 'O:BA', 'O:SY', 'O:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464') {
+            $problem = Get-AclOwnerProblem -Sddl $sddl
+            if ($problem) { return "it refused $sddl, naming $problem" }
+        }
+        $problem = Get-AclOwnerProblem -Sddl 'O:S-1-5-21-1-2-3-1001'
+        if (-not $problem) { return 'it passed a folder the builder user owns' }
+        if ($problem -notmatch 'S-1-5-21-1-2-3-1001') { return "it named '$problem'" }
+        return ''
+    }
+
+    Test-Case 'the Windows Update folder check names the identity that may write it' {
+        $problem = Get-AclWriteProblem -Sddl '(A;;0x2;;;BU)'
+        if (-not $problem) { return 'it passed a folder Users may write' }
+        if ($problem -notmatch 'BUILTIN\\Users|S-1-5-32-545') { return "it named '$problem'" }
+        return ''
+    }
+
+    Test-Case 'the Windows Update step checks the folder and both files in it' {
+        $block = Get-StepBlock 'Windows Update drained install'
+        if (-not $block) { return 'install-toolchains.ps1 has no Windows Update drained install step' }
+        $calls = Get-BlockCommand $block 'Assert-WritableOnlyByAdmins'
+        if ($calls.Count -ne 3) { return "the step checks $($calls.Count) paths, expected 3" }
+        $resolved = @()
+        foreach ($call in $calls) {
+            $argument = Get-ParameterArgument $call 'Path'
+            if (-not $argument) { return "the call $($call.Extent.Text) names no -Path" }
+            $resolved += (Resolve-BlockExpression -Block $block -Expression $argument).Texts -join ' '
+        }
+        foreach ($name in 'maintenanceDir', 'maintenanceScript', 'maintenanceRoot') {
+            $pattern = '\$' + $name + '\b'
+            if (-not @($resolved | Where-Object { $_ -match $pattern }).Count) {
+                return "the step never checks `$$name`: $($resolved -join ' | ')"
+            }
+        }
+        return ''
+    }
+
+    Test-Case 'the Windows Update step makes Administrators the owner of the folder and both files' {
+        $block = Get-StepBlock 'Windows Update drained install'
+        if (-not $block) { return 'install-toolchains.ps1 has no Windows Update drained install step' }
+        $calls = Get-BlockCommand $block 'icacls.exe'
+        if ($calls.Count -ne 1) { return "the step has $($calls.Count) icacls calls, expected 1 in a loop over the paths" }
+        $text = $calls[0].Extent.Text
+        if (-not $text.Contains('/setowner')) { return "the icacls call sets no owner: $text" }
+        if (-not $text.Contains('*S-1-5-32-544')) { return "the icacls call does not name Administrators: $text" }
+        $loop = $calls[0].Parent
+        while ($loop -and $loop -isnot [System.Management.Automation.Language.ForEachStatementAst]) { $loop = $loop.Parent }
+        if (-not $loop) { return 'the icacls call is outside a foreach over the paths' }
+        $names = @($loop.Condition.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.VariableExpressionAst]
+                }, $true) | ForEach-Object { $_.VariablePath.UserPath })
+        foreach ($name in 'maintenanceDir', 'maintenanceScript', 'maintenanceRoot') {
+            if ($name -notin $names) { return "the owner loop never names `$$name`: $($names -join ', ')" }
+        }
+        return ''
+    }
+
+    Test-Case 'the Windows Update step writes the root file and copies the script from beside the installer' {
+        $block = Get-StepBlock 'Windows Update drained install'
+        if (-not $block) { return 'install-toolchains.ps1 has no Windows Update drained install step' }
+        $copies = Get-BlockCommand $block 'Copy-Item'
+        if ($copies.Count -ne 1) { return "the step has $($copies.Count) Copy-Item calls, expected 1" }
+        $source = Get-ParameterArgument $copies[0] 'LiteralPath'
+        if (-not $source -and $copies[0].CommandElements.Count -ge 2) { $source = $copies[0].CommandElements[1] }
+        if (-not $source) { return "the Copy-Item call names no source: $($copies[0].Extent.Text)" }
+        $resolved = Resolve-BlockExpression -Block $block -Expression $source
+        $text = $resolved.Texts -join ' '
+        if (-not $text.Contains('windows-update.ps1')) { return "the copy source is not the script: $text" }
+        if ('PSScriptRoot' -notin $resolved.Variables) { return "the copy source is not beside the installer: $text" }
+        $writes = @($block.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+                    "$($node.Member.Extent.Text)" -eq 'WriteAllText'
+                }, $true))
+        if ($writes.Count -ne 1) { return "the step has $($writes.Count) WriteAllText calls, expected 1" }
+        $writeText = (Resolve-BlockExpression -Block $block -Expression $writes[0]).Texts -join ' '
+        if (-not $writeText.Contains('windows-update.root')) { return "the write does not name windows-update.root: $writeText" }
+        if (-not $writeText.Contains('$GateRoot')) { return "the write does not write `$GateRoot: $writeText" }
         return ''
     }
 

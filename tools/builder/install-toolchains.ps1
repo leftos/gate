@@ -386,6 +386,31 @@ function Add-CargoBuildLine([hashtable]$At, [int]$Index, [string]$Line, [string]
     if ($At.Wrapper -ge 0) { throw "cargo config.toml sets build.rustc-wrapper twice; line $($Index + 1): $Line" }
     $At.Wrapper = $Index
 }
+# Records a [table] header named $Name in $At, when it is the build table.
+function Add-CargoConfigSection([hashtable]$At, [int]$Index, [string]$Name) {
+    if ($Name -eq 'build') { $At.Table = $true; $At.End = $Index + 1 }
+}
+# Reads one line of a cargo config.toml into $At under section $Section, and returns the section the line opens, or
+# $Section when it opens none. Throws on a build key the merge does not rewrite, naming the line.
+function Add-CargoConfigLine([hashtable]$At, [int]$Index, [string]$Line, [string]$Section) {
+    if ($Line -match '^\s*\[\s*([^\]]*?)\s*\]') {
+        $name = $Matches[1].Trim('"', "'")
+        Add-CargoConfigSection -At $At -Index $Index -Name $name
+        return $name
+    }
+    if ($Section -eq '' -and $Line -match "^\s*$cargoBuildKey\s*=") {
+        throw "cargo config.toml line $($Index + 1) sets build as an inline table, which this step does not rewrite: $Line"
+    }
+    if ($Section -eq '' -and $Line -match "^\s*$cargoBuildKey\s*\.") {
+        $At.Dotted = $true
+        Add-CargoBuildLine $At $Index $Line "^\s*$cargoBuildKey\s*\.\s*$cargoWrapperKey\s*="
+        return $Section
+    }
+    if ($Section -eq 'build' -and $Line -match '^\s*[^#\s]') {
+        Add-CargoBuildLine $At $Index $Line "^\s*$cargoWrapperKey\s*="
+    }
+    return $Section
+}
 # Finds the build table of a cargo config.toml's lines, as a [build] table or as top-level build.<key> dotted keys: the
 # index of its rustc-wrapper line, the index after its last key line (comments and blanks before the next table stay
 # outside it), and which form it has. Throws on a form the merge does not rewrite, naming the line.
@@ -393,19 +418,7 @@ function Find-CargoBuildWrapper([string[]]$Lines) {
     $at = @{ Wrapper = -1; End = -1; Table = $false; Dotted = $false }
     $section = ''
     for ($i = 0; $i -lt $Lines.Count; $i++) {
-        $line = $Lines[$i]
-        if ($line -match '^\s*\[\s*([^\]]*?)\s*\]') {
-            $section = $Matches[1].Trim('"', "'")
-            if ($section -eq 'build') { $at.Table = $true; $at.End = $i + 1 }
-        }
-        elseif ($section -eq '' -and $line -match "^\s*$cargoBuildKey\s*=") {
-            throw "cargo config.toml line $($i + 1) sets build as an inline table, which this step does not rewrite: $line"
-        }
-        elseif ($section -eq '' -and $line -match "^\s*$cargoBuildKey\s*\.") {
-            $at.Dotted = $true
-            Add-CargoBuildLine $at $i $line "^\s*$cargoBuildKey\s*\.\s*$cargoWrapperKey\s*="
-        }
-        elseif ($section -eq 'build' -and $line -match '^\s*[^#\s]') { Add-CargoBuildLine $at $i $line "^\s*$cargoWrapperKey\s*=" }
+        $section = Add-CargoConfigLine -At $at -Index $i -Line $Lines[$i] -Section $section
     }
     if ($at.Table -and $at.Dotted) { throw 'cargo config.toml has both a [build] table and top-level build.<key> keys' }
     return $at
@@ -432,6 +445,7 @@ function Merge-CargoBuildWrapper([string[]]$Lines, [string]$Wrapper) {
 $sccacheTaskPath = '\build-box\'
 $sccacheTaskName = 'sccache-server'
 $pruneTaskName = 'gate-prune-work'
+$windowsUpdateTaskName = 'gate-windows-update'
 $sccacheServerScript = Join-Path $scriptFiles 'sccache-server.ps1'
 $sccacheUserVariables = 'SCCACHE_IGNORE_SERVER_IO_ERROR', 'SCCACHE_CLIENT_SIDE'
 function Get-SccacheServerTask { return Get-ScheduledTask -TaskPath $sccacheTaskPath -TaskName $sccacheTaskName -ErrorAction SilentlyContinue }
@@ -963,6 +977,144 @@ Invoke-Step 'Work-folder prune task' {
     Write-InstallLog "task $sccacheTaskPath$pruneTaskName registered: every 6 h, gate box prune --root $GateRoot as $User (S4U, Limited)"
     if (-not (Test-Path -LiteralPath $gateExe)) {
         Write-InstallLog "task $sccacheTaskPath$pruneTaskName will fail until a gate push installs $gateExe"
+    }
+}
+
+# The identity among an ACL's allow rules that may change or remove what it guards, or $null when only SYSTEM,
+# Administrators and TrustedInstaller can. Only the bits that write, delete or change permissions count, never the read
+# and execute ones a folder under Program Files inherits. An inherit-only rule grants nothing to the folder itself:
+# Program Files' CREATOR OWNER rule is one, and it stays out.
+function Get-WriteGrantProblem([System.Security.AccessControl.FileSystemSecurity]$Acl) {
+    $allowed = @(
+        'S-1-5-18'
+        'S-1-5-32-544'
+        'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+    )
+    # WriteData, AppendData, WriteExtendedAttributes, DeleteSubdirectoriesAndFiles, WriteAttributes, Delete,
+    # ChangePermissions, TakeOwnership, GENERIC_WRITE and GENERIC_ALL.
+    $writeMask = 0x2 -bor 0x4 -bor 0x10 -bor 0x40 -bor 0x100 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor
+        0x40000000 -bor 0x10000000
+    foreach ($rule in $Acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -ne 'Allow') { continue }
+        if ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+        $rights = ([int64][int]$rule.FileSystemRights) -band 0xFFFFFFFFL
+        if (($rights -band $writeMask) -eq 0) { continue }
+        if ($rule.IdentityReference.Value -in $allowed) { continue }
+        try { return $rule.IdentityReference.Translate([Security.Principal.NTAccount]).Value }
+        catch { return $rule.IdentityReference.Value }
+    }
+    return $null
+}
+
+# The owner of an ACL when it is not SYSTEM, Administrators or TrustedInstaller, else $null. An owner holds WRITE_DAC with
+# no ACE at all, and the installer runs elevated as the builder user, so the owner matters as much as the ACEs.
+function Get-OwnerProblem([System.Security.AccessControl.FileSystemSecurity]$Acl) {
+    $allowed = @(
+        'S-1-5-18'
+        'S-1-5-32-544'
+        'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+    )
+    $owner = $Acl.GetOwner([Security.Principal.SecurityIdentifier])
+    if ($null -eq $owner) { return '(no owner)' }
+    if ($owner.Value -in $allowed) { return $null }
+    try { return $owner.Translate([Security.Principal.NTAccount]).Value }
+    catch { return $owner.Value }
+}
+
+# Throws unless only SYSTEM, Administrators and TrustedInstaller own or may write $Path: a routed command runs unelevated
+# as the builder user, and must not be able to replace a script an elevated task runs.
+function Assert-WritableOnlyByAdmins([string]$Path) {
+    $acl = Get-Acl -LiteralPath $Path
+    $owner = Get-OwnerProblem -Acl $acl
+    if ($owner) { throw "$Path is owned by $owner; only SYSTEM, Administrators or TrustedInstaller may own it" }
+    $writer = Get-WriteGrantProblem -Acl $acl
+    if ($writer) {
+        throw "$Path gives $writer write access; only SYSTEM, Administrators and TrustedInstaller may write there"
+    }
+}
+
+# Sets the DWORD policy values that differ under $Key, creating the key when it is missing, then reads every value back
+# and throws on a mismatch. Returns whether anything changed.
+function Set-PolicyValues([string]$Key, [System.Collections.IDictionary]$Values) {
+    if (-not (Test-Path -LiteralPath $Key)) { New-Item -Path $Key -Force | Out-Null }
+    $changed = $false
+    foreach ($name in $Values.Keys) {
+        $current = Get-ItemPropertyValue -LiteralPath $Key -Name $name -ErrorAction SilentlyContinue
+        if ($current -eq $Values[$name]) { continue }
+        New-ItemProperty -LiteralPath $Key -Name $name -PropertyType DWord -Value $Values[$name] -Force | Out-Null
+        $changed = $true
+    }
+    foreach ($name in $Values.Keys) {
+        $current = Get-ItemPropertyValue -LiteralPath $Key -Name $name -ErrorAction SilentlyContinue
+        if ($current -ne $Values[$name]) { throw "Windows Update policy $name reads back '$current', expected $($Values[$name])" }
+    }
+    return $changed
+}
+
+# Windows Update downloads on its own and installs only on request: a policy of AUOptions 3 (download and notify),
+# NoAutoUpdate 0 and NoAutoRebootWithLoggedOnUsers 1. The daily task drains the builder, installs what was downloaded,
+# never restarts the box and lifts the drain. The script sits under C:\Program Files, which a routed command cannot
+# replace, and the work root reaches it through a file beside it rather than the task's command line, which the box's
+# drain judge would count as live work.
+Invoke-Step 'Windows Update drained install' {
+    $eventSource = 'gate-windows-update'
+    if ([Diagnostics.EventLog]::SourceExists($eventSource)) {
+        Write-InstallLog "event source ${eventSource}: already registered"
+    }
+    else {
+        New-EventLog -LogName Application -Source $eventSource
+        Write-InstallLog "event source ${eventSource}: registered in the Application log"
+    }
+    $maintenanceDir = 'C:\Program Files\gate-maintenance'
+    $maintenanceScript = 'C:\Program Files\gate-maintenance\windows-update.ps1'
+    $maintenanceRoot = 'C:\Program Files\gate-maintenance\windows-update.root'
+    $source = Join-Path $PSScriptRoot 'windows-update.ps1'
+    if (-not (Test-Path -LiteralPath $source)) { throw "$source is missing; copy it to the builder beside install-toolchains.ps1" }
+    if (-not (Test-Path -LiteralPath $maintenanceDir)) { New-Item -ItemType Directory -Force $maintenanceDir | Out-Null }
+    Copy-Item -LiteralPath $source -Destination $maintenanceScript -Force
+    [IO.File]::WriteAllText($maintenanceRoot, $GateRoot)
+    # The installer runs elevated as the builder user, so it could leave the folder and files owned by that user, and an
+    # owner holds WRITE_DAC with no ACE at all. Administrators own them instead, as they own the gate work root.
+    foreach ($path in @($maintenanceDir, $maintenanceScript, $maintenanceRoot)) {
+        & icacls.exe $path /setowner '*S-1-5-32-544' /q | Out-Null
+        if ($LASTEXITCODE) { throw "icacls $path /setowner exited $LASTEXITCODE" }
+    }
+    Assert-WritableOnlyByAdmins -Path $maintenanceDir
+    Assert-WritableOnlyByAdmins -Path $maintenanceScript
+    Assert-WritableOnlyByAdmins -Path $maintenanceRoot
+    Write-InstallLog ("windows update script $maintenanceScript for work root ${GateRoot}: writable only by SYSTEM, " +
+        'Administrators and TrustedInstaller')
+    # Download only, and the longest active-hours span Windows allows, 03:00 to 21:00, covering the install window.
+    $policyKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $autoUpdate = [ordered]@{ NoAutoUpdate = 0; AUOptions = 3; NoAutoRebootWithLoggedOnUsers = 1 }
+    $activeHours = [ordered]@{ SetActiveHours = 1; ActiveHoursStart = 3; ActiveHoursEnd = 21 }
+    if (Set-PolicyValues -Key "$policyKey\AU" -Values $autoUpdate) {
+        Write-InstallLog 'Windows Update policy: set download-only (AUOptions 3, no automatic reboot)'
+    }
+    else { Write-InstallLog 'Windows Update policy: already download-only' }
+    if (Set-PolicyValues -Key $policyKey -Values $activeHours) {
+        Write-InstallLog 'Windows Update policy: set active hours 03:00 to 21:00, 18 hours'
+    }
+    else { Write-InstallLog 'Windows Update policy: active hours already 03:00 to 21:00' }
+    # The no-restart policy holds only while a user is logged on, which the prep's autologon step keeps true.
+    $autoLogon = Get-ItemPropertyValue -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' `
+        -Name 'AutoAdminLogon' -ErrorAction SilentlyContinue
+    if ("$autoLogon" -ne '1') {
+        Write-InstallLog ("Windows Update policy: no autologon, so Windows may restart by itself after an install leaves " +
+            "a reboot pending; run the prep's autologon step")
+    }
+    $taskArguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$maintenanceScript`""
+    $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument $taskArguments
+    $trigger = New-ScheduledTaskTrigger -Daily -At 3am
+    $principal = New-ScheduledTaskPrincipal -UserId $User -LogonType S4U -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 12) -MultipleInstances IgnoreNew -StartWhenAvailable
+    Register-ScheduledTask -TaskPath $sccacheTaskPath -TaskName $windowsUpdateTaskName -Action $action -Trigger $trigger `
+        -Principal $principal -Settings $settings -Force | Out-Null
+    Write-InstallLog ("task $sccacheTaskPath$windowsUpdateTaskName registered: daily at 03:00, a drained Windows Update " +
+        "install that never reboots, as $User (S4U, Highest)")
+    $gateExe = 'C:\Program Files\gate\bin\gate.exe'
+    if (-not (Test-Path -LiteralPath $gateExe)) {
+        Write-InstallLog "task $sccacheTaskPath$windowsUpdateTaskName will fail until a gate push installs $gateExe"
     }
 }
 
