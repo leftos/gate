@@ -443,6 +443,9 @@ pub struct TestSeams {
     /// the same thread of the command waited for a processor at it and at the sample before), and the command's CPU
     /// since the last progress in microseconds, so a case waits on samples, not on time.
     pub sample_trace: Option<PathBuf>,
+    /// The image name the gate treats as prek, in place of `prek.exe`, for the job's own prek, another prek running on
+    /// this PC, and the prek whose log a stall capture copies.
+    pub prek_image: Option<String>,
     /// How long the remote client's `dotnet --list-sdks` of this PC may take before it is killed and the SDK list
     /// counts as unreadable, in place of 30 s.
     pub dotnet_limit_ms: Option<u64>,

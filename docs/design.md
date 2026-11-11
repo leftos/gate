@@ -2148,7 +2148,7 @@ All kept, with each knob's default unchanged:
 - The sampler (W1): every 5 s while the command runs, it reads, in order, the pause state, the bytes the command has written to its stdout and stderr (counted by the readers of its pipes), the job's pids, one process snapshot, then the WSL VM, the system times and the job's accounting; nothing goes through WMI.
 
   Each sample carries two stamps: `began`, taken before its reads, and `at`, taken after them, next to the system times and the job's accounting. The `interval`, the load-adjusted clock, the paused time, the free share and the exit use `at`; the PowerShell gate stamps once, before its reads.
-- Stall (W2): no output, no CPU (at least 1% of one core over the window), no new process in the job, no starved sample, no WSL VM CPU, no nested gate paused behind a critical request and no live nested gate in the job, for `--stall` seconds: `gate: STALLED: ...`.
+- Stall (W2): no output, no CPU (at least 1% of one core over the window), no new process in the job, no starved sample, no WSL VM CPU, no nested gate paused behind a critical request and no live nested gate in the job, for `--stall` seconds, and no job prek waiting while another prek runs on this PC (below): `gate: STALLED: ...`.
 
   The quiet time runs from the last progress sample's `at` to the latest sample's `began`, not to the moment the watcher checks: a watcher starved of CPU wakes late, and the time it spends in its reads, and after them up to the check, is not the command's quiet time, so the next sample decides.
 
@@ -2179,6 +2179,14 @@ All kept, with each knob's default unchanged:
   Only the pause stops the load-adjusted clock: a nested gate's time is counted as any other and in the backstop's wall time, so `gate: TIMED OUT after ...` and `gate: BACKSTOP: ...` still end the run. A gate outside the job (an escaped process, or under a packaged or Store pwsh, which runs outside it) does not count.
 
   Worst case, a wedged nested gate, or any process named `gate.exe` left in the job, holds off the stall until the parent's ceiling and backstop. The box side's ceiling runs with no stall window and is unchanged.
+
+  A prek of the job that waits while another prek runs on this PC is not progress, but holds the stall kill off: prek takes one store lock shared by every repo (`$PREK_HOME\.lock`) at the start of every run and waits on it with no CPU and no output.
+
+  The sample finds it when a member of the job is `prek.exe` (matched by pid and start, ignoring ASCII case) that has started no hook (no live child started at or after it), and the same snapshot lists another `prek.exe` that is no member, no ancestor of this gate and not descended from a member (`Sample::prek_waiting`). A prek that runs a hook, hung or not, is never held, so a hung hook still dies at its stall window. A sample whose process snapshot fails keeps the previous sample's value.
+
+  A held sample's interval stops the stall clock as a starved one does (`Watch::held`, reset at progress), so held time is not quiet time: when the hold ends the run gets a fresh window of unheld quiet before it is killed as STALLED, and the STALLED line's quiet leaves the held time out. The ceiling and the backstop still end the run. The stall is held off once the window has passed counting held time (`Watch::stall_held`, `Watch::unheld_quiet`).
+
+  The gate says `gate: no progress for <n> s, but this run's prek is waiting while another prek runs on this PC (most likely on prek's shared store lock); not judged stalled while one runs` once per hold, so a second hold later in the run says it again; `<n>` is the time without progress, held time included and starved time excluded.
 
   The stall clock also resets, for a `wsl` command, when the WSL VM's CPU counts as progress (see WSL below).
 
@@ -2320,7 +2328,12 @@ All kept, with each knob's default unchanged:
   - `gate stall capture: <RFC 3339 UTC>, gate pid <pid>, quiet <n> s`, then for each live process of the run's job (up to 40, then `... and <n> more`) `process <pid> parent <ppid> <image>`, and `  modules unread: <error>` under it when the process's module list could not be read.
   - Under each process, up to 256 threads (then `  ... and <n> more`): `  thread <tid> state <State>[ wait <Reason> waited <ms> ms] start <module>+0x<off>|0x<addr>|?`. The state and wait reason come from the thread entries of SystemProcessInformation (`proc_table::system_list`, `Entry::threads`), the wait part only for a Waiting thread; the start is the Win32 start address (`gate_win32::thread_start_address`) resolved against the process's modules (`process_modules`, `resolve_address`) as `<module>+0x<offset>`, `0x<address>` when no module holds it or the modules are unread, and `?` when the thread could not be opened or its id was reused.
   - `capture cut at <n> ms` ends the file when the 2000 ms budget ran out.
-  - When a process of the job is `prek.exe`, the last 1 MiB of `%LOCALAPPDATA%\prek\prek.log` is copied to `<log>.stall.prek.log`.
+  - When a process of the job is `prek.exe` and prek's log is this run's, the last 1 MiB of `%LOCALAPPDATA%\prek\prek.log` is copied to `<log>.stall.prek.log`.
+
+    Every prek run on the PC truncates that one log, so it is this run's only when the first `DEBUG Git root:` line in its first 64 KiB names the run's working directory, a folder under it or an ancestor of it, so a `git -C repo commit` started from a parent folder counts (compared by whole folder component, ignoring case, `/` read as `\`, a leading `\\?\` ignored).
+
+    A log that ends shorter than it began during the read was truncated by a new prek run: it is another run's and is not copied.
+  - A log whose git root is elsewhere gets `gate: stall capture did not copy prek's log: it belongs to another prek run, not this run's folder`, one that names no git root `gate: stall capture did not copy prek's log: it names no git root, so it cannot be tied to this run`, and neither is copied.
   - stderr and the log get `gate: stall capture written to <path> (<n> processes, <m> threads)`, `gate: stall capture copied prek's log to <path>`, and `gate: stall capture failed: <why>` for a capture, a write or a prek log copy that failed; none changes the kill or the exit status.
   - A run removes its own log's `<log>.stall.txt` and `<log>.stall.prek.log` at start, so the files beside a log belong to its latest run.
 - A command still running 5 s after its job was terminated is reported: `gate: the command was still running 5 s after its job was terminated`. A job that cannot be terminated says `gate: could not terminate the command's job: <error>`. A killed run is not scanned for markers, and its release verdict is `stalled`, `timed-out` or `backstop` by the kill line that ended it.
@@ -6353,6 +6366,8 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   Before it waits it writes the empty file `<file>.reached`, so a case can tell the gate is at the seam; when that cannot be written the gate says `gate: cannot write the seam's arrival <path>: <error>` and waits on. `--test-print-request` does not show the seam.
 
   `--test-sample-trace <file>` (on `gate run` only) makes each sample of the local watch append one line `<at_ms> starved=<0|1> quiet_cpu_us=<n>` to `<file>`: the sample's `at` stamp in milliseconds of the watch, whether the sample was starved, and the command's CPU since the last progress in microseconds, so a case waits on samples, not on time. A file that cannot be written is said once per sample: `gate: cannot write <path>: <error>`. `--test-print-request` does not show it.
+
+  `--test-prek-image <name>` (on `gate run` only) sets the image name the gate treats as prek, in place of `prek.exe`, for the job's own prek, another prek running on this PC and the prek whose log a stall capture copies; each of the suite's prek cases uses a name of its own, so a prek of another case or of this PC is invisible to it.
 
   `--test-remote-snapshot` (a switch, on `gate run` only) sends the run to the Rust remote client's snapshot alone ([The remote client](#routing)); `--test-print-request` shows it as `testSeams.remoteSnapshot`, after `gitDrainMs`.
 

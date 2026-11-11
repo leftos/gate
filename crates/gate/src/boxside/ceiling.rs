@@ -273,6 +273,7 @@ impl<'a> Ceiling<'a> {
             pids: BTreeSet::new(),
             paused: false,
             nested_gate: false,
+            prek_waiting: false,
             escaped: BTreeMap::new(),
             vm_cpu: None,
             waiting: None,

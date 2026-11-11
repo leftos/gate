@@ -53,6 +53,9 @@ pub struct Sample {
     /// Whether the job holds a live gate other than the watching one: a nested gate, whose own watchdog judges its
     /// command, though it may write nothing and use next to no CPU here, as a routed one does.
     pub nested_gate: bool,
+    /// Whether the job's prek waits while another prek runs on this PC, most likely on prek's shared store lock: not
+    /// progress, but it holds off the stall ([`Watch::stall_held`]) while it lasts.
+    pub prek_waiting: bool,
     /// The processes outside the job under the processes it holds, by pid and start (in 100 ns ticks since 1601), with
     /// the CPU time each has used in 100 ns ticks: a packaged app a process of the job starts runs in a job of its own,
     /// and its CPU is the command's own.
@@ -101,6 +104,9 @@ pub struct Watch {
     progress_cpu: Ticks,
     output_size: u64,
     pids: BTreeSet<u32>,
+    /// Whether the last sample found the job's prek waiting while another prek runs on this PC: the stall is held off
+    /// while it is.
+    last_prek_waiting: bool,
     escaped: BTreeMap<(u32, u64), u64>,
     /// The CPU the processes outside the job gained, sample by sample, since the last progress: one that exits takes
     /// none of it with it.
@@ -109,6 +115,10 @@ pub struct Watch {
     /// stamp to its own, clamped to the last progress: the stall clock stops for them, as the command was starved, not
     /// idle.
     starved: Duration,
+    /// The intervals of the samples that found the job's prek waiting while another prek runs, since the last progress,
+    /// each from the last sample's begin stamp to its own, clamped to the last progress: the stall clock stops for them,
+    /// as the command waits on a lock another run holds, not idle.
+    held: Duration,
     /// The CPU of the job and of the processes outside it since the last progress, in 100 ns ticks, under the floor:
     /// what a STALLED line says the command used.
     quiet_cpu: u128,
@@ -173,9 +183,11 @@ impl Watch {
             progress_cpu: job_cpu,
             output_size: 0,
             pids: BTreeSet::new(),
+            last_prek_waiting: false,
             escaped: BTreeMap::new(),
             escaped_busy: 0,
             starved: Duration::ZERO,
+            held: Duration::ZERO,
             quiet_cpu: 0,
             threads: ThreadReads::default(),
             vm_cpu,
@@ -206,7 +218,9 @@ impl Watch {
     /// gate, or the run is paused. Only the pause stops the clock; a nested gate's time is counted as any other. A sample
     /// that is not progress but is starved ([`starved`]: the same thread waited for a processor at it and at the sample
     /// before) stops the stall clock, without resetting it, from the last sample's begin stamp to its own, clamped to the
-    /// last progress: the command was starved, not idle.
+    /// last progress: the command was starved, not idle. A sample's `prek_waiting` is no progress either, and stops the
+    /// stall clock the same way, as held time: the run's prek waits on prek's store lock, which another run holds. An
+    /// interval that is both starved and held counts once, as held.
     pub fn sample(&mut self, sample: &Sample) {
         let interval = sample.at.saturating_sub(self.last_at).max(MIN_INTERVAL);
         let escaped = measure_cpu(&self.escaped, &sample.escaped);
@@ -221,6 +235,7 @@ impl Watch {
             self.escaped_busy = 0;
             self.vm_busy = 0;
             self.starved = Duration::ZERO;
+            self.held = Duration::ZERO;
             self.quiet_cpu = 0;
             self.threads.unread = false;
         } else {
@@ -228,10 +243,14 @@ impl Watch {
             self.threads.unread |= sample.waiting.is_none();
             // A paused sample is progress, so it never gets here: a paused interval is neither quiet nor starved.
             // Counted on the begin timeline, where the quiet time is judged: from the later of the last sample's begin
-            // stamp and the last progress to this sample's begin stamp. Consecutive starved samples tile the window, the
-            // reads' own time included, and the total never leaves it.
-            if starved {
-                self.starved += sample.began.saturating_sub(self.last_began.max(self.last_progress));
+            // stamp and the last progress to this sample's begin stamp. Consecutive starved or held samples tile the
+            // window, the reads' own time included, and the total never leaves it; an interval that is both counts
+            // once, as held.
+            let counted = sample.began.saturating_sub(self.last_began.max(self.last_progress));
+            if sample.prek_waiting {
+                self.held += counted;
+            } else if starved {
+                self.starved += counted;
             }
         }
         self.threads.last_starved = !progressed && starved;
@@ -249,6 +268,7 @@ impl Watch {
         self.sampled = true;
         self.last_at = sample.at;
         self.last_began = sample.began;
+        self.last_prek_waiting = sample.prek_waiting;
         self.system = sample.system;
         self.job_cpu = sample.job_cpu;
         self.output_size = sample.output_size;
@@ -464,7 +484,9 @@ impl Watch {
     /// spent in its reads, and between them and the check, is not the command's quiet time; the ceiling and the
     /// backstop read `now`. Once the sampler has failed only the backstop is read, since the stall and the load-adjusted
     /// clock no longer move. With [`Config::stall_from_output`] the stall waits for the command's first output byte, so
-    /// a quiet start is no stall; the ceiling and the backstop are unaffected.
+    /// a quiet start is no stall; the ceiling and the backstop are unaffected. A held interval is no quiet time, so the
+    /// stall does not fire while this run's prek waits on another ([`Watch::stall_held`]); the ceiling and the backstop
+    /// stand.
     #[must_use]
     #[expect(
         clippy::cast_precision_loss,
@@ -473,14 +495,8 @@ impl Watch {
     pub fn kill_check(&self, now: Duration) -> Option<Kill> {
         let free_percent = self.free_percent();
         if !self.sampler_failed {
-            // The stall is judged at the last sample's begin stamp: a watcher starved of CPU wakes late, and the delay
-            // it spent descheduled between its two stamps is not the command's quiet time.
-            let judged_at = if self.sampled { self.last_began.min(now) } else { now };
-            // The starved samples' intervals stopped the stall clock: the command waited for a processor then.
-            let quiet = judged_at.saturating_sub(self.last_progress).saturating_sub(self.starved);
-            // The seam's quiet start: while the command has written no byte, its window has not begun.
-            let quiet_start = self.config.stall_from_output && self.output_size == 0;
-            if !quiet_start && quiet >= self.config.stall {
+            let quiet = self.quiet_time(now);
+            if self.stall_window_passed(quiet) {
                 return Some(Kill::Stalled {
                     quiet,
                     free_percent,
@@ -506,6 +522,38 @@ impl Watch {
             });
         }
         None
+    }
+
+    /// The command's quiet time at `now`: the time since the last progress, less the intervals the samples found it
+    /// starved or held, judged at the last sample's begin stamp, so a watcher starved of CPU in its reads and between
+    /// them and the check does not count its own delay as the command's quiet time.
+    #[must_use]
+    pub fn quiet_time(&self, now: Duration) -> Duration {
+        self.unheld_quiet(now).saturating_sub(self.held)
+    }
+
+    /// The command's time since the last progress at `now`, less the intervals the samples found it starved and with
+    /// the held intervals still counted: the quiet time the stall would judge but for the hold, which a held stall's
+    /// line also says as the time the run has gone without progress.
+    #[must_use]
+    pub fn unheld_quiet(&self, now: Duration) -> Duration {
+        let judged_at = if self.sampled { self.last_began.min(now) } else { now };
+        judged_at.saturating_sub(self.last_progress).saturating_sub(self.starved)
+    }
+
+    /// Whether the stall window has passed for the quiet time `quiet`: it reached the stall, and the seam's quiet
+    /// start, the command's first output byte, is behind it.
+    fn stall_window_passed(&self, quiet: Duration) -> bool {
+        let quiet_start = self.config.stall_from_output && self.output_size == 0;
+        !quiet_start && quiet >= self.config.stall
+    }
+
+    /// Whether the stall is held off at `now`: the sampler works, the last sample found the job's prek waiting while
+    /// another prek runs on this PC, most likely on prek's shared store lock, and the stall window has passed for the
+    /// quiet time with the held time added back: the run would be stalled but for the hold.
+    #[must_use]
+    pub fn stall_held(&self, now: Duration) -> bool {
+        !self.sampler_failed && self.last_prek_waiting && self.stall_window_passed(self.unheld_quiet(now))
     }
 }
 
@@ -821,6 +869,7 @@ mod tests {
             pids: pids.iter().copied().collect(),
             paused,
             nested_gate: false,
+            prek_waiting: false,
             escaped: BTreeMap::new(),
             vm_cpu: None,
             waiting: Some(BTreeSet::new()),
@@ -845,6 +894,7 @@ mod tests {
             pids: BTreeSet::new(),
             paused,
             nested_gate: false,
+            prek_waiting: false,
             escaped: BTreeMap::new(),
             vm_cpu: None,
             waiting: Some(BTreeSet::new()),
@@ -1313,6 +1363,103 @@ mod tests {
         assert!(
             matches!(watch.kill_check(Duration::from_millis(2700)), Some(Kill::TimedOut { .. })),
             "the ceiling still ends a run whose nested gate lives"
+        );
+    }
+
+    #[test]
+    fn a_waiting_prek_holds_off_the_stall_until_no_other_prek_runs() {
+        // A 1 s stall window and an hour's ceiling; the job's CPU, its log and its pids never move.
+        let mut watch = watching(config(1000, 3600));
+        let waiting = |ms: u64| Sample {
+            prek_waiting: true,
+            ..tick(ms, 0, 0, &[], false)
+        };
+
+        watch.sample(&waiting(900));
+        assert!(watch.kill_check(Duration::from_millis(900)).is_none(), "the stall window has not passed");
+        assert!(!watch.stall_held(Duration::from_millis(900)), "nor is the stall held off");
+
+        watch.sample(&waiting(1800));
+        assert!(
+            watch.kill_check(Duration::from_millis(1800)).is_none(),
+            "1.8 s quiet, but the job's prek waits while another runs"
+        );
+        assert!(watch.stall_held(Duration::from_millis(1800)), "the stall is held off");
+
+        watch.sample(&waiting(2700));
+        assert!(
+            watch.kill_check(Duration::from_millis(2700)).is_none(),
+            "and still held off three samples in"
+        );
+        assert!(watch.stall_held(Duration::from_millis(2700)), "still held off");
+
+        // The hold ends: the 900 ms from the last held sample's begin (2700) is the only unheld quiet, under the 1 s
+        // window, so nothing is stalled yet.
+        watch.sample(&tick(3600, 0, 0, &[], false));
+        assert!(
+            watch.kill_check(Duration::from_millis(3600)).is_none(),
+            "one window of unheld quiet has not passed yet"
+        );
+        assert!(!watch.stall_held(Duration::from_millis(3600)), "and the stall is no longer held off");
+
+        // At 4500 ms the unheld quiet since the hold ended is 1800 ms of the 1 s window, and the held 2700 ms is no
+        // quiet time: the stall's quiet is that 1800 ms.
+        watch.sample(&tick(4500, 0, 0, &[], false));
+        let stalled = watch.kill_check(Duration::from_millis(4500));
+        assert!(
+            matches!(stalled, Some(Kill::Stalled { quiet, .. }) if quiet == Duration::from_millis(1800)),
+            "held time is no quiet time, so the stall carries only the unheld 1800 ms: {stalled:?}"
+        );
+    }
+
+    #[test]
+    fn a_waiting_prek_does_not_hold_off_the_ceiling() {
+        // A 1 s stall window and a 2 s ceiling; the job's prek waits on another throughout.
+        let mut watch = watching(config(1000, 2));
+        let waiting = |ms: u64| Sample {
+            prek_waiting: true,
+            ..tick(ms, 0, 0, &[], false)
+        };
+        watch.sample(&waiting(900));
+        watch.sample(&waiting(1800));
+        watch.sample(&waiting(2700));
+
+        assert!(
+            matches!(watch.kill_check(Duration::from_millis(2700)), Some(Kill::TimedOut { .. })),
+            "a prek that waits on another still ends at the ceiling"
+        );
+    }
+
+    #[test]
+    fn a_waiting_prek_is_not_progress() {
+        // Two watches of the same samples, one whose job's prek waits on another and one whose does not.
+        let samples = |prek_waiting: bool| {
+            [900, 1800].map(|ms| Sample {
+                prek_waiting,
+                ..half_sample(ms)
+            })
+        };
+        let mut quiet = watching(config(1000, 3600));
+        let mut waiting = watching(config(1000, 3600));
+        for (quiet_sample, waiting_sample) in samples(false).into_iter().zip(samples(true)) {
+            quiet.sample(&quiet_sample);
+            waiting.sample(&waiting_sample);
+        }
+
+        assert!(
+            (waiting.adjusted_seconds() - quiet.adjusted_seconds()).abs() < 1e-9,
+            "a waiting prek's samples count as any quiet one: {} against {}",
+            waiting.adjusted_seconds(),
+            quiet.adjusted_seconds()
+        );
+        assert_eq!(waiting.quiet_cpu(), quiet.quiet_cpu(), "and no CPU is counted");
+        assert!(
+            !waiting.stall_held(Duration::from_millis(900)),
+            "the stall window has not passed at 900 ms"
+        );
+        assert!(
+            waiting.stall_held(Duration::from_millis(1800)),
+            "the stall is held off once the window passes"
         );
     }
 

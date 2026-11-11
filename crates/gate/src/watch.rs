@@ -30,7 +30,7 @@ use crate::nesting::Parent;
 use crate::pause::PauseReader;
 use crate::resolve::ResolvedRoot;
 use crate::slots::{Pool, Takes, ThisGate, epoch_ms};
-use crate::stall_capture::{self, Capture, STALL_CAPTURE_BUDGET_MS};
+use crate::stall_capture::{self, Capture, PREK_IMAGE, STALL_CAPTURE_BUDGET_MS};
 use crate::trace;
 
 /// How long the watch waits for the command between two samples.
@@ -66,6 +66,10 @@ pub(crate) enum Watched {
 }
 
 /// What one run's watch reads and counts.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each is a once-said line or a seam this one watch reads, kept flat beside the facts they describe"
+)]
 pub(crate) struct Watcher<'a> {
     job: &'a Job,
     running: &'a Running,
@@ -96,10 +100,17 @@ pub(crate) struct Watcher<'a> {
     /// The file each sample appends its `<at_ms> starved=<0|1> quiet_cpu_us=<n>` line to (`--test-sample-trace`);
     /// `None` unless the suite sets one.
     sample_trace: Option<PathBuf>,
+    /// The image name the gate treats as prek (`--test-prek-image`), [`PREK_IMAGE`] unless the suite names another.
+    prek_image: String,
+    /// Whether the last sample found the job's prek waiting while another prek runs on this PC: kept over a sample
+    /// whose process list could not be read, which says nothing either way.
+    prek_waiting: bool,
     /// Whether a sample has said that the command's thread states could not be read, which a watch says once.
     runnable_said: bool,
     /// Whether a sample has said that a process's threads could not be decoded, which a watch says once.
     undecoded_said: bool,
+    /// Whether a sample has said that this run's prek waits while another prek runs, which a watch says once.
+    prek_held_said: bool,
     /// The milliseconds a gathering of the kill's diagnostics may take before it is cut
     /// (`--test-diagnostics-budget-ms`), the gate's own budget unless the suite sets one.
     diagnostics_budget_ms: u128,
@@ -392,8 +403,11 @@ impl<'a> Watcher<'a> {
                 interrupt_awaits_output: request.test_seams.interrupt_from_output,
             },
             sample_trace: request.test_seams.sample_trace.clone(),
+            prek_image: request.test_seams.prek_image.clone().unwrap_or_else(|| PREK_IMAGE.to_owned()),
+            prek_waiting: false,
             runnable_said: false,
             undecoded_said: false,
+            prek_held_said: false,
             diagnostics_budget_ms: request.test_seams.diagnostics_budget_ms.map_or(DIAGNOSTICS_BUDGET_MS, u128::from),
             samples: 0,
             interrupt_after: request.test_seams.interrupt_after_samples,
@@ -655,10 +669,12 @@ impl<'a> Watcher<'a> {
 
     /// The kill due now, as stalled, timed out or past the backstop, or `None`; a command that exited as the kill was
     /// found keeps its own status, checked again once the diagnostics, and for a stalled kill the stall capture, are
-    /// gathered.
+    /// gathered. While the stall is held off for this run's prek waiting on another prek no kill is due, and the line
+    /// saying so is said once ([`Watcher::say_prek_held`]).
     fn kill(&mut self, console: &mut Console) -> io::Result<Option<Watched>> {
         let now = self.started.elapsed();
         let Some(kill) = self.watch.kill_check(now) else {
+            self.say_prek_held(console, now);
             return Ok(None);
         };
         if let Some(exited) = self.exit_if_ended(console)? {
@@ -666,7 +682,18 @@ impl<'a> Watcher<'a> {
         }
         let diagnostics = self.diagnostics();
         let capture = match &kill {
-            Kill::Stalled { quiet, .. } => Some(stall_capture::capture(&|| self.job.process_ids(), *quiet, STALL_CAPTURE_BUDGET_MS)),
+            Kill::Stalled { quiet, .. } => Some(match std::env::current_dir() {
+                Ok(folder) => stall_capture::capture(
+                    &|| self.job.process_ids(),
+                    *quiet,
+                    STALL_CAPTURE_BUDGET_MS,
+                    stall_capture::PrekLook {
+                        folder: &folder,
+                        image: &self.prek_image,
+                    },
+                ),
+                Err(error) => Err(format!("cannot read the working directory: {error}")),
+            }),
             _ => None,
         };
         if let Some(exited) = self.exit_if_ended(console)? {
@@ -681,6 +708,25 @@ impl<'a> Watcher<'a> {
             diagnostics,
             capture,
         }))
+    }
+
+    /// Says the line that this run's prek waits while another prek runs on this PC, the first time the stall is held off
+    /// after it was not, and clears the flag whenever a check finds it not held, so a later hold is said again.
+    fn say_prek_held(&mut self, console: &mut Console, now: Duration) {
+        if !self.watch.stall_held(now) {
+            self.prek_held_said = false;
+            return;
+        }
+        if self.prek_held_said {
+            return;
+        }
+        self.prek_held_said = true;
+        let quiet = self.watch.unheld_quiet(now);
+        console.err(&format!(
+            "gate: no progress for {} s, but this run's prek is waiting while another prek runs on this PC \
+             (most likely on prek's shared store lock); not judged stalled while one runs",
+            quiet.as_secs()
+        ));
     }
 
     /// The command's own status once it has exited, or `None` while it still runs; the watch is brought to its end.
@@ -794,16 +840,28 @@ impl<'a> Watcher<'a> {
         let looked = escaped::now().ok_or_else(|| io::Error::other(escaped::NO_CLOCK))?;
         let before = self.job.process_ids()?;
         let started = members(before.iter().copied(), self.since, gate_win32::process_times)?;
-        let processes = Win32ProcessTable.snapshot_without_command_lines();
+        let (tree, listed) = match Win32ProcessTable.try_snapshot_without_command_lines() {
+            Ok(processes) => (ProcessTree::new(processes), true),
+            // A list that could not be read leaves this sample with no processes, as `snapshot_without_command_lines`
+            // defaults to, so the job's own reads still judge it; only the hold keeps the last sample's answer, since an
+            // unread list says nothing about another prek on the PC.
+            Err(_) => (ProcessTree::new(Vec::new()), false),
+        };
         // The snapshot takes a while: a process that joined the job meanwhile is a member, not one that left it.
         let after = self.job.process_ids()?;
         let (departed, trouble) = escaped::departed(self.job);
         if let Some(line) = escaped::memory_line(&mut self.memory_said, trouble.as_deref()) {
             console.err(&line);
         }
-        let tree = ProcessTree::new(processes);
-        let nested_gate = holds_nested_gate(&tree, &started, std::process::id());
         let members: HashSet<u32> = before.iter().chain(&after).copied().collect();
+        let nested_gate = holds_nested_gate(&tree, &started, std::process::id());
+        let prek_waiting = if listed {
+            let ancestors: HashSet<u32> = tree.ancestors(std::process::id()).map(|info| info.pid).collect();
+            holds_waiting_prek(&tree, &started, &members, &self.prek_image, &ancestors)
+        } else {
+            self.prek_waiting
+        };
+        self.prek_waiting = prek_waiting;
         // The job's members by pid and start, as the snapshot lists them: a pid a newer process took lends it nothing.
         let mut wanted: HashSet<(u32, Timestamp)> = members
             .iter()
@@ -865,6 +923,7 @@ impl<'a> Watcher<'a> {
             pids: started.into_keys().collect(),
             paused,
             nested_gate,
+            prek_waiting,
             escaped,
             vm_cpu: vm.as_ref().ok().copied().flatten(),
             waiting,
@@ -1104,6 +1163,45 @@ fn holds_nested_gate(tree: &ProcessTree, members: &BTreeMap<u32, u64>, own: u32)
     })
 }
 
+/// Whether the job's prek waits while another prek runs on this PC. The job's prek is one of `members`, each by the
+/// start `started` gave it, which the snapshot `tree` lists as a prek of that same start and which has started no
+/// process of its own at or after that start: a prek that started a hook runs that hook, hung or not, and is never
+/// held. The other prek is one the snapshot lists, in any case, whose pid is no member, no ancestor of this gate
+/// (`ancestors`), and which no member started: another repo's prek, not this run's own, nor the one that started the
+/// gate. Both are matched against the image name `image`; a pid the snapshot does not list, or whose start it cannot
+/// read, counts for neither side.
+fn holds_waiting_prek(tree: &ProcessTree, started: &BTreeMap<u32, u64>, members: &HashSet<u32>, image: &str, ancestors: &HashSet<u32>) -> bool {
+    let waiting = started
+        .iter()
+        .any(|(&pid, &created)| is_started_prek(tree, pid, created, image) && !started_a_process(tree, pid, created));
+    waiting && tree.iter().any(|info| is_other_prek(tree, info, members, image, ancestors))
+}
+
+/// Whether the snapshot `tree` lists `pid` as a prek, in any case, that started at `created` (100 ns ticks since 1601).
+fn is_started_prek(tree: &ProcessTree, pid: u32, created: u64, image: &str) -> bool {
+    tree.get(pid)
+        .is_some_and(|info| info.created.is_some() && info.created == start_instant(created) && escaped::is_image(&info.name, image))
+}
+
+/// Whether the snapshot `tree` lists a live process that started at or after the process `pid`, started at `created`,
+/// and has it as its parent: the prek's hook, which it runs instead of waiting on prek's store lock.
+fn started_a_process(tree: &ProcessTree, pid: u32, created: u64) -> bool {
+    let Some(start) = start_instant(created) else {
+        return false;
+    };
+    tree.iter()
+        .any(|info| info.parent_pid == pid && info.created.is_some_and(|child| child >= start))
+}
+
+/// Whether `info` is another prek: a prek whose pid is no member (`members`), no ancestor of this gate (`ancestors`),
+/// and which no member started, as a prek that escaped the job was.
+fn is_other_prek(tree: &ProcessTree, info: &ProcessInfo, members: &HashSet<u32>, image: &str, ancestors: &HashSet<u32>) -> bool {
+    !members.contains(&info.pid)
+        && !ancestors.contains(&info.pid)
+        && escaped::is_image(&info.name, image)
+        && !tree.ancestors(info.pid).any(|parent| members.contains(&parent.pid))
+}
+
 /// Of the job's process `ids`, those `times` reads as created at or after `since`, each with that creation time in
 /// 100 ns ticks since 1601.
 fn members(
@@ -1163,7 +1261,7 @@ pub(crate) fn system_times() -> io::Result<SystemTimes> {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a sample that cannot be read must fail the test loudly")]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
     use std::ffi::OsString;
     use std::io;
     use std::path::PathBuf;
@@ -1173,11 +1271,13 @@ mod tests {
     use gate_watchdog::wsl_unavailable_line;
     use gate_win32::ProcessTimes;
 
+    use crate::stall_capture::PREK_IMAGE;
+
     use gate_win32::Priority;
 
     use super::{
-        ACCESS_DENIED, Thread, ThreadKey, VmReader, config, holds_nested_gate, is_ssh, lowered, machine, members, own_kind_after_take, sample_due,
-        sample_facts, slice, waiting_of,
+        ACCESS_DENIED, Thread, ThreadKey, VmReader, config, holds_nested_gate, holds_waiting_prek, is_ssh, lowered, machine, members,
+        own_kind_after_take, sample_due, sample_facts, slice, waiting_of,
     };
 
     /// The test moment `second` seconds past 10:00 on the test day.
@@ -1232,6 +1332,60 @@ mod tests {
     }
 
     #[test]
+    fn a_member_prek_beside_a_prek_outside_the_job_is_a_waiting_prek() {
+        // Member 6 started at second 1, ended, and a newer prek took its pid at second 2, before the snapshot; pid 4 is
+        // a prek outside the job.
+        let tree = proc_table::ProcessTree::new(vec![listed(2, "prek.exe", 1), listed(4, "PREK.EXE", 1), listed(6, "prek.exe", 2)]);
+        let holds = |pids: &[u32]| {
+            let started = pids.iter().map(|&pid| (pid, filetime(1))).collect();
+            let members = pids.iter().copied().collect();
+            holds_waiting_prek(&tree, &started, &members, PREK_IMAGE, &HashSet::new())
+        };
+
+        assert!(holds(&[2]), "the member prek waits while pid 4's prek runs outside the job");
+        assert!(!holds(&[2, 4, 6]), "no prek runs outside the job");
+        assert!(!holds(&[5]), "the job holds no prek");
+        assert!(!holds(&[6]), "a newer prek took an ended member's pid, whose start it no longer shares");
+    }
+
+    #[test]
+    fn a_member_prek_that_started_a_hook_is_no_waiting_prek() {
+        // Member 2 is a prek that started process 7 after its own start: it runs a hook, hung or not, so it is not
+        // waiting on prek's store lock, though pid 4's prek runs outside the job.
+        let mut hook = listed(7, "pwsh.exe", 2);
+        hook.parent_pid = 2;
+        let tree = proc_table::ProcessTree::new(vec![listed(2, "prek.exe", 1), listed(4, "prek.exe", 1), hook]);
+        let started = BTreeMap::from([(2, filetime(1))]);
+        let members = HashSet::from([2]);
+
+        assert!(
+            !holds_waiting_prek(&tree, &started, &members, PREK_IMAGE, &HashSet::new()),
+            "a prek running a hook is never held"
+        );
+    }
+
+    #[test]
+    fn a_prek_this_gate_descends_from_or_a_member_started_is_no_waiting_prek() {
+        let started = BTreeMap::from([(2, filetime(1))]);
+
+        // Pid 3 is a prek outside the job that started this gate, and so is no other prek.
+        let ancestor = proc_table::ProcessTree::new(vec![listed(2, "prek.exe", 1), listed(3, "prek.exe", 1)]);
+        assert!(
+            !holds_waiting_prek(&ancestor, &started, &HashSet::from([2]), PREK_IMAGE, &HashSet::from([3])),
+            "a prek above this gate started it, so it is no other prek"
+        );
+
+        // Pid 4 is a prek outside the job that member 5 started and which left it: it escaped the job.
+        let mut escaped = listed(4, "prek.exe", 2);
+        escaped.parent_pid = 5;
+        let escaped = proc_table::ProcessTree::new(vec![listed(2, "prek.exe", 1), listed(5, "pwsh.exe", 1), escaped]);
+        assert!(
+            !holds_waiting_prek(&escaped, &started, &HashSet::from([2, 5]), PREK_IMAGE, &HashSet::new()),
+            "a prek a job member started escaped the job, so it is no other prek"
+        );
+    }
+
+    #[test]
     fn a_sample_s_escaped_cpu_reaches_its_diagnostics_facts() {
         let sample = gate_watchdog::Sample {
             began: std::time::Duration::from_secs(9),
@@ -1242,6 +1396,7 @@ mod tests {
             pids: BTreeSet::from([1]),
             paused: false,
             nested_gate: false,
+            prek_waiting: false,
             escaped: std::collections::BTreeMap::from([((2, 10), 15_000_000), ((3, 20), 10_000_000)]),
             vm_cpu: None,
             waiting: None,

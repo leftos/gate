@@ -434,6 +434,39 @@ impl Drop for Burner {
     }
 }
 
+/// A prek a case starts outside the gate's job, as another repo's is while it holds prek's store lock: killed, and
+/// waited for, when it drops, so a case that fails before its end leaves nothing running.
+struct Peer {
+    child: std::process::Child,
+    ended: bool,
+}
+
+impl Peer {
+    /// A prek at `path` that sleeps until it is killed.
+    fn start(path: &Path) -> Peer {
+        let child = Command::new(path).args(["sleep", UNTIL_KILLED]).spawn().expect("the peer prek starts");
+        Peer { child, ended: false }
+    }
+
+    /// Ends the peer and waits for it, saying a failure to end it; the drop then has nothing left to do.
+    fn end(mut self) {
+        self.child.kill().expect("the peer prek is killed");
+        self.child.wait().expect("the peer prek is waited for");
+        self.ended = true;
+    }
+}
+
+impl Drop for Peer {
+    fn drop(&mut self) {
+        if self.ended {
+            return;
+        }
+        // A case's cleanup: each step fails only when the peer is already gone, which leaves nothing to end.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[test]
 #[expect(clippy::panic, reason = "a wait that failed is said again with the trace read so far")]
 fn a_command_starved_by_a_busier_thread_on_its_core_is_not_stalled() {
@@ -725,13 +758,25 @@ fn a_stalled_run_leaves_a_stall_capture_naming_its_threads() {
 #[test]
 fn a_stalled_prek_leaves_a_copy_of_prek_s_log() {
     let case = Case::new("a_stalled_prek_leaves_a_copy_of_prek_s_log");
-    copy_tool(&case, "prek.exe");
-    let prek = shown(&case.folder().join("prek.exe"));
+    copy_tool(&case, "prek-copies-own-log.exe");
+    let prek = shown(&case.folder().join("prek-copies-own-log.exe"));
     let prek_log = case.local_app_data().join("prek").join("prek.log");
     fs::create_dir_all(prek_log.parent().expect("the log has a folder")).expect("prek's log folder is made");
-    let text = "prek: running hooks\nprek: waiting for the hook to exit\n";
-    fs::write(&prek_log, text).expect("prek's log is written");
-    let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100", "--test-stall-from-output"];
+    let text = format!(
+        "2026-11-11T05:57:00.393465Z DEBUG Git root: {}\nprek: waiting for the hook to exit\n",
+        case.folder().display()
+    );
+    fs::write(&prek_log, &text).expect("prek's log is written");
+    // Its own image name, so prek's of another case, of another suite module, or of this PC are invisible to it.
+    let seams = [
+        "--test-stall-ms",
+        "1500",
+        "--test-sample-ms",
+        "100",
+        "--test-stall-from-output",
+        "--test-prek-image",
+        "prek-copies-own-log.exe",
+    ];
 
     let outcome = case.run(&run_words("out.log", &seams, &[&prek, "out", "hi", "sleep", UNTIL_KILLED]));
 
@@ -750,6 +795,80 @@ fn a_stalled_prek_leaves_a_copy_of_prek_s_log() {
         text,
         "the copy holds prek's log"
     );
+    assert!(
+        !outcome.stderr.contains("this run's prek is waiting while another prek runs on this PC"),
+        "the run's prek waits on no other prek, so no hold line is said: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_stalled_prek_does_not_copy_another_run_s_prek_log() {
+    let case = Case::new("a_stalled_prek_does_not_copy_another_run_s_prek_log");
+    copy_tool(&case, "prek-another-log.exe");
+    let prek = shown(&case.folder().join("prek-another-log.exe"));
+    let prek_log = case.local_app_data().join("prek").join("prek.log");
+    fs::create_dir_all(prek_log.parent().expect("the log has a folder")).expect("prek's log folder is made");
+    let elsewhere = case.folder().with_file_name("another-repo");
+    let text = format!(
+        "2026-11-11T05:57:00.393465Z DEBUG Git root: {}\nprek: waiting for the hook to exit\n",
+        elsewhere.display()
+    );
+    fs::write(&prek_log, &text).expect("prek's log is written");
+    let seams = [
+        "--test-stall-ms",
+        "1500",
+        "--test-sample-ms",
+        "100",
+        "--test-stall-from-output",
+        "--test-prek-image",
+        "prek-another-log.exe",
+    ];
+
+    let outcome = case.run(&run_words("out.log", &seams, &[&prek, "out", "hi", "sleep", UNTIL_KILLED]));
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert_in_order(
+        &outcome.stderr,
+        &[
+            "gate: STALLED: ",
+            "gate: stall capture did not copy prek's log: it belongs to another prek run, not this run's folder",
+            "gate: diagnostics written to ",
+        ],
+    );
+    assert!(
+        !case.folder().join("out.log.stall.prek.log").exists(),
+        "another run's prek log is not copied"
+    );
+}
+
+#[test]
+fn a_prek_waiting_while_another_prek_runs_is_held_until_that_prek_ends() {
+    let case = Case::new("a_prek_waiting_while_another_prek_runs_is_held_until_that_prek_ends");
+    copy_tool(&case, "prek-held.exe");
+    let prek = shown(&case.folder().join("prek-held.exe"));
+    // A prek outside this run's job, as another repo's is while it holds prek's store lock. The name is this case's
+    // own, so only this peer counts as the other prek.
+    let peer = Peer::start(&case.folder().join("prek-held.exe"));
+    let seams = [
+        "--test-stall-ms",
+        "1500",
+        "--test-sample-ms",
+        "100",
+        "--test-stall-from-output",
+        "--test-prek-image",
+        "prek-held.exe",
+    ];
+    let held = "this run's prek is waiting while another prek runs on this PC";
+
+    let running = case.start(&run_words("out.log", &seams, &[&prek, "out", "hi", "sleep", UNTIL_KILLED]));
+    running.wait_for_stderr(held);
+
+    peer.end();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert_in_order(&outcome.stderr, &[held, "gate: STALLED: "]);
+    assert_eq!(outcome.stderr.matches(held).count(), 1, "the hold line is said once: {outcome:?}");
 }
 
 #[test]

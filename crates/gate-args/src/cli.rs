@@ -417,6 +417,7 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-built-here-key-reached" => Some(RunOption::Value(ValueOption::BuiltHereKeyReached)),
         "test-key-waits" => Some(RunOption::Value(ValueOption::KeyWaits)),
         "test-sample-trace" => Some(RunOption::Value(ValueOption::SampleTrace)),
+        "test-prek-image" => Some(RunOption::Value(ValueOption::PrekImage)),
         "test-dotnet-limit-ms" => Some(RunOption::Value(ValueOption::DotnetLimitMs)),
         "test-remote-snapshot" => Some(RunOption::Switch(SwitchOption::RemoteSnapshot)),
         "test-remote-transport" => Some(RunOption::Value(ValueOption::RemoteTransport)),
