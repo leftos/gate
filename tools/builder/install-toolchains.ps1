@@ -1035,17 +1035,25 @@ function Assert-WritableOnlyByAdmins([string]$Path) {
 
 # Sets the DWORD policy values that differ under $Key, creating the key when it is missing, then reads every value back
 # and throws on a mismatch. Returns whether anything changed.
+# A registry value under $Key, or $null when the value is missing. Get-ItemPropertyValue throws on a missing value
+# whatever its -ErrorAction, so this reads it through Get-ItemProperty.
+function Get-RegistryValue([string]$Key, [string]$Name) {
+    $item = Get-ItemProperty -LiteralPath $Key -Name $Name -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return $null }
+    return $item.$Name
+}
+
 function Set-PolicyValues([string]$Key, [System.Collections.IDictionary]$Values) {
     if (-not (Test-Path -LiteralPath $Key)) { New-Item -Path $Key -Force | Out-Null }
     $changed = $false
     foreach ($name in $Values.Keys) {
-        $current = Get-ItemPropertyValue -LiteralPath $Key -Name $name -ErrorAction SilentlyContinue
+        $current = Get-RegistryValue -Key $Key -Name $name
         if ($current -eq $Values[$name]) { continue }
         New-ItemProperty -LiteralPath $Key -Name $name -PropertyType DWord -Value $Values[$name] -Force | Out-Null
         $changed = $true
     }
     foreach ($name in $Values.Keys) {
-        $current = Get-ItemPropertyValue -LiteralPath $Key -Name $name -ErrorAction SilentlyContinue
+        $current = Get-RegistryValue -Key $Key -Name $name
         if ($current -ne $Values[$name]) { throw "Windows Update policy $name reads back '$current', expected $($Values[$name])" }
     }
     return $changed
@@ -1097,8 +1105,7 @@ Invoke-Step 'Windows Update drained install' {
     }
     else { Write-InstallLog 'Windows Update policy: active hours already 03:00 to 21:00' }
     # The no-restart policy holds only while a user is logged on, which the prep's autologon step keeps true.
-    $autoLogon = Get-ItemPropertyValue -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' `
-        -Name 'AutoAdminLogon' -ErrorAction SilentlyContinue
+    $autoLogon = Get-RegistryValue -Key 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -Name 'AutoAdminLogon'
     if ("$autoLogon" -ne '1') {
         Write-InstallLog ("Windows Update policy: no autologon, so Windows may restart by itself after an install leaves " +
             "a reboot pending; run the prep's autologon step")

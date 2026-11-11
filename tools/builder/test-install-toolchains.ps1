@@ -873,6 +873,19 @@ try {
         return ''
     }
 
+    Test-Case 'a registry value that does not exist reads as null, not a throw' {
+        . ([scriptblock]::Create((Get-InstallerFunctionText 'Get-RegistryValue')))
+        $value = Get-RegistryValue -Key 'HKCU:\Software' -Name 'gate-test-no-such-value'
+        if ($null -ne $value) { return "a missing value read back '$value', expected null" }
+        if ($null -eq (Get-RegistryValue -Key 'HKCU:\Console' -Name 'FontSize') -and
+            $null -eq (Get-RegistryValue -Key 'HKCU:\Control Panel\Desktop' -Name 'WallPaper')) {
+            return 'no present value read back; expected HKCU:\Control Panel\Desktop WallPaper to be found'
+        }
+        $steps = Get-StepBlock 'Windows Update drained install'
+        if ($steps.Extent.Text -match 'Get-ItemPropertyValue') { return 'the Windows Update step still calls Get-ItemPropertyValue' }
+        return ''
+    }
+
     Test-Case 'the Windows Update folder check refuses only identities that may write it' {
         $trustedInstaller = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
         $fullAccess = '(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;' + $trustedInstaller + ')'
