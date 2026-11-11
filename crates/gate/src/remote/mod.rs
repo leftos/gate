@@ -41,7 +41,7 @@ pub(crate) mod channel;
 mod client;
 pub(crate) mod drain;
 
-pub(crate) use client::KEY_WAIT_SLICE;
+pub(crate) use client::{KEY_WAIT_SLICE, KeyHold, hold_mutex_waiting};
 pub(crate) mod git;
 mod held;
 pub(crate) mod inputs;

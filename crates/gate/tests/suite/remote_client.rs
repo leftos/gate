@@ -18,6 +18,8 @@ use std::time::{Duration, Instant, SystemTime};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use gate_router::{DROPPED_NO_BUILD_LINE, DROPPED_UNSENT_LINE, repo_name, work_folder_key};
+use gate_state::{KernelObject, StateRoot};
+use gate_win32::{NamedMutex, OwnedMutexGuard};
 use gate_wire::stamp::{Tag, is_process_line, unstamped};
 use proc_table::{ProcessTable as _, ProcessTree, Win32ProcessTable};
 use regex::Regex;
@@ -13905,6 +13907,244 @@ fn a_desktop_run_hops_to_the_next_builder_before_it_fails() {
         outcome.stderr.lines().any(|line| line.ends_with(&format!(" busy{DESKTOP_NOT_HERE}"))),
         "the second builder's refusal ends the run: {outcome:?}"
     );
+}
+
+/// The first line of a locked desktop run waiting in this PC's desktop queue.
+const DESKTOP_QUEUED: &str = "gate: waiting in this PC's desktop queue behind another locked desktop run";
+/// The start of the line a locked desktop run says each heartbeat while it still waits in the desktop queue.
+const DESKTOP_STILL_QUEUED: &str = "gate: still waiting in this PC's desktop queue behind another locked desktop run (";
+/// The line a locked desktop run says when a Ctrl+C ends its wait in the desktop queue.
+const DESKTOP_QUEUE_INTERRUPTED: &str = "gate: interrupted while waiting in this PC's desktop queue behind another locked desktop run";
+/// The seam that bounds a run's wait in the desktop queue at 100 ms: a run that should never queue but does ends
+/// `desktop` at once rather than waiting its ceiling.
+const SHORT_QUEUE_BOUND: [&str; 2] = ["--test-key-wait-ms", "100"];
+/// The `.gate/desktop.toml` session pattern a session case declares and its routing file allows.
+const SESSION_PATTERN: &str = "*tool* session*";
+
+/// Takes the desktop queue of the case's state root, as a locked desktop run of another worktree of this PC holds it
+/// while its builder runs it; dropping the guard lets it go.
+fn hold_desktop_queue(case: &Case) -> OwnedMutexGuard {
+    let name = StateRoot::new(&shown(&case.root()), None).object_name(KernelObject::DesktopQueue);
+    NamedMutex::open(&name)
+        .expect("the desktop queue opens")
+        .acquire_owned(Duration::from_secs(5))
+        .expect("the desktop queue is free")
+}
+
+/// Starts `command` in a [`desktop_case`] as a routed heavy gate logging to `log` whose scripted client takes `steps`,
+/// with `extra` before the command and the ceiling `timeout`.
+fn start_desktop(case: &Case, log: &str, steps: &[&str], (extra, timeout): (&[&str], &str), command: &[&str]) -> Running {
+    let stub = shown(&crate::routing::stub(case, steps));
+    let mut words = crate::routing::routed_words(log, &stub, extra, command);
+    assert_eq!(words[3], "--timeout", "the ceiling's value follows it");
+    words[4] = timeout;
+    case.start(&words)
+}
+
+/// Starts `.\tool.exe mark <marker> out ran here`, the locked desktop command of a [`desktop_case`], as
+/// [`start_desktop`] does: the running gate and its marker file, which exists only once the command ran here.
+fn start_marking(case: &Case, log: &str, steps: &[&str], extra: &[&str], timeout: &str) -> (Running, PathBuf) {
+    let marker = case.folder().join(format!("{log}.marker"));
+    let marked = shown(&marker);
+    let running = start_desktop(case, log, steps, (extra, timeout), &[r".\tool.exe", "mark", &marked, "out", "ran here"]);
+    (running, marker)
+}
+
+/// The events named `name` among `events`.
+fn named<'e>(events: &'e [Value], name: &str) -> Vec<&'e Value> {
+    events.iter().filter(|event| event["event"] == name).collect()
+}
+
+/// Whether a claim under the case's `slots` folder names the gate `pid`.
+fn holds_a_claim(case: &Case, pid: u32) -> bool {
+    let Ok(entries) = fs::read_dir(case.root().join("slots")) else {
+        return false;
+    };
+    let mut claims = entries
+        .map(|entry| entry.expect("a claim entry can be read").path())
+        .filter(|path| path.extension().is_some_and(|kind| kind == "json"));
+    claims.any(|path| {
+        let text = fs::read_to_string(&path).expect("a claim can be read");
+        let claim: Value = serde_json::from_str(&text).expect("a claim is JSON");
+        claim["pid"] == pid
+    })
+}
+
+#[test]
+fn a_second_locked_desktop_run_waits_on_this_pc_and_takes_no_remote_slot() {
+    // The first locked run holds this PC's desktop queue while its builder runs it. The scripted client takes no
+    // work-folder key, so the queue alone holds the second out: the worktree is the same, the second could be any other.
+    let case = desktop_case("client-desktop-queue", false);
+    let go = case.folder().join("go");
+    let (first, first_marker) = start_marking(&case, "first.log", &[&format!("wait {}", shown(&go)), "status 0"], &[], "3600");
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, first.id()));
+    assert!(holds_a_claim(&case, first.id()), "the first run's claim is read as its own");
+    let (second, second_marker) = start_marking(&case, "second.log", &["status 0"], &[], "3600");
+    let pid = second.id();
+
+    let said = second.wait_for_stderr_where("the second run waits", |said| {
+        said.contains(DESKTOP_QUEUED) || said.contains("gate: waiting for a remote slot")
+    });
+
+    assert!(said.contains(DESKTOP_QUEUED), "{said}");
+    let queued = own(&case, pid);
+    assert!(named(&queued, "take").is_empty(), "a queued run takes no remote slot: {queued:#?}");
+    assert!(!holds_a_claim(&case, pid), "a queued run holds no claim");
+    fs::write(&go, "").expect("the go file can be made");
+    let first = first.finish();
+    let second = second.finish();
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(second.code, Some(0), "{second:?}");
+    let ran = own(&case, pid);
+    assert!(
+        named(&ran, "take").iter().any(|take| take["remote"] == true),
+        "once the first ends, the second takes a remote slot: {ran:#?}"
+    );
+    assert!(!first_marker.exists() && !second_marker.exists(), "neither ran here");
+}
+
+/// A [`client_case`] declaring [`DESKTOP_PATTERN`] in its `.gate/desktop.toml`, with a routing file allowing it on the
+/// desktop: its desktop runs go through the Rust client, which takes the work folder's key.
+fn client_desktop_case(name: &str) -> Case {
+    let case = client_case(name);
+    let folder = case.folder();
+    fs::create_dir_all(folder.join(".gate")).expect("the .gate folder can be made");
+    fs::write(folder.join(".gate").join("desktop.toml"), format!("patterns = ['{DESKTOP_PATTERN}']\n")).expect("the declaration can be written");
+    let repo = repo_name(&folder.file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({
+        "host": HOST, "slots": 2, "repos": { &repo: ["*tool*"] }, "outputs": { &repo: [] }, "desktop": { &repo: [DESKTOP_PATTERN] }
+    });
+    write_remote_json(&case, &routing.to_string());
+    case
+}
+
+#[test]
+fn an_ordinary_run_of_a_queued_desktop_run_s_worktree_is_not_refused_busy() {
+    // The case holds the desktop queue as another worktree's locked run would. This worktree's locked run waits in the
+    // queue holding no key, so an ordinary run of the worktree takes the key at once and runs on the builder.
+    let case = client_desktop_case("client-desktop-queue-key");
+    let held = hold_desktop_queue(&case);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let locked_steps = ssh_steps(&case, "locked", &[&format!("hold {}", shown(go.path())), "exit 255"]);
+    let marker = case.folder().join("marker.txt");
+    let marked = shown(&marker);
+    let beating = Tuned {
+        extra: &["--test-heartbeat-ms", "1"],
+        ..Tuned::default()
+    };
+    let locked = start(client_gate_tuned(
+        &case,
+        "locked.log",
+        &locked_steps,
+        &beating,
+        &[r".\tool.exe", "mark", &marked, "out", "ran here"],
+    ));
+    locked.wait_for_stderr(DESKTOP_QUEUED);
+    locked.wait_for_stderr(DESKTOP_STILL_QUEUED);
+    assert!(calls(&locked_steps).is_empty(), "a queued run calls no builder");
+    let ordinary_steps = ssh_steps(&case, "ordinary", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "100"],
+        ..Tuned::default()
+    };
+
+    let (pid, ordinary) = finish_with_pid(client_gate_tuned(
+        &case,
+        "ordinary.log",
+        &ordinary_steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran there"],
+    ));
+
+    assert_eq!(ordinary.code, Some(0), "{ordinary:?}");
+    assert!(!ordinary.stderr.contains(BUSY_LINE), "the key was free: {ordinary:?}");
+    assert!(ordinary.stdout.contains("ran there"), "{ordinary:?}");
+    assert_eq!(calls(&ordinary_steps), ["preflight", "run"]);
+    assert_eq!(fallbacks(&own(&case, pid)), Vec::<&str>::new());
+    drop(held);
+    fs::write(go.path(), "").expect("the go file can be made");
+    let locked = locked.finish();
+    assert!(locked.stderr.contains(DESKTOP_QUEUED), "{locked:?}");
+    assert!(!marker.exists(), "a desktop run never runs here: {locked:?}");
+}
+
+#[test]
+fn a_ctrl_c_in_the_desktop_queue_abandons_with_no_key_and_no_slot() {
+    let case = desktop_case("client-desktop-queue-ctrl-c", false);
+    let held = hold_desktop_queue(&case);
+    let (running, marker) = start_marking(&case, "out.log", &["status 0"], &["--test-interrupt-queued"], "3600");
+    let pid = running.id();
+
+    let outcome = running.finish();
+
+    drop(held);
+    assert_eq!(outcome.code, Some(crate::routing::CONTROL_C_EXIT), "{outcome:?}");
+    assert_in_order(&outcome.stderr, &[DESKTOP_QUEUED, DESKTOP_QUEUE_INTERRUPTED]);
+    let events = own(&case, pid);
+    assert_eq!(named(&events, "abandon").len(), 1, "{events:#?}");
+    assert!(named(&events, "take").is_empty(), "no slot was taken: {events:#?}");
+    assert!(!holds_a_claim(&case, pid), "no claim is left");
+    assert!(!marker.exists(), "{outcome:?}");
+}
+
+#[test]
+fn a_session_and_a_hidden_desktop_run_never_wait_in_the_desktop_queue() {
+    let case = desktop_case("client-desktop-queue-session", false);
+    let folder = case.folder();
+    let declared = format!("patterns = ['{DESKTOP_PATTERN}']\nsession = ['{SESSION_PATTERN}']\n");
+    fs::write(folder.join(".gate").join("desktop.toml"), declared).expect("the declaration can be written");
+    let repo = crate::routing::repo(&case);
+    let routing = json!({
+        "host": HOST, "repos": { &repo: ["*tool*"] }, "desktop": { &repo: [DESKTOP_PATTERN] }, "desktopSession": { &repo: [SESSION_PATTERN] }
+    });
+    write_remote_json(&case, &routing.to_string());
+    let held = hold_desktop_queue(&case);
+
+    let session = start_desktop(
+        &case,
+        "session.log",
+        &["status 0"],
+        (&SHORT_QUEUE_BOUND, "3600"),
+        &[r".\tool.exe", "session", "out", "ran here"],
+    )
+    .finish();
+    let hidden_extra = ["--desktop", "hidden", SHORT_QUEUE_BOUND[0], SHORT_QUEUE_BOUND[1]];
+    let (hidden, marker) = start_marking(&case, "hidden.log", &["status 0"], &hidden_extra, "3600");
+    let hidden = hidden.finish();
+
+    drop(held);
+    for outcome in [&session, &hidden] {
+        assert_eq!(outcome.code, Some(0), "{outcome:?}");
+        assert!(!outcome.stderr.contains(DESKTOP_QUEUED), "{outcome:?}");
+    }
+    let takes = events(&case)
+        .into_iter()
+        .filter(|event| event["event"] == "take" && event["remote"] == true)
+        .count();
+    assert_eq!(takes, 2, "each took a remote slot beside the held queue");
+    assert!(!marker.exists(), "{hidden:?}");
+}
+
+#[test]
+fn a_desktop_queue_wait_past_the_ceiling_ends_the_run_and_never_runs_here() {
+    // A hang guard's shape: the bound is the run's own one-second ceiling, which the queue the case holds outlasts.
+    let case = desktop_case("client-desktop-queue-bound", false);
+    let held = hold_desktop_queue(&case);
+    let (running, marker) = start_marking(&case, "out.log", &["status 0"], &[], "1");
+    let pid = running.id();
+
+    let outcome = running.finish();
+
+    drop(held);
+    let bound = "gate: another locked desktop run held this PC's desktop queue for this run's whole ceiling (1 s); not running here";
+    assert_in_order(&outcome.stderr, &[DESKTOP_QUEUED, bound]);
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let line = format!("gate: remote {HOST} desktop{DESKTOP_NOT_HERE}");
+    assert!(outcome.stderr.lines().any(|said| said == line), "{outcome:?}");
+    assert!(!outcome.stderr.contains("; running here"), "{outcome:?}");
+    assert!(!marker.exists(), "the command never ran here: {outcome:?}");
+    let events = own(&case, pid);
+    assert!(named(&events, "take").iter().all(|take| take["remote"] != true), "{events:#?}");
 }
 
 /// The line a desktop run says when its builder's helper was replaced, before it tries that builder once more.

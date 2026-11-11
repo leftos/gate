@@ -1229,6 +1229,8 @@ A processor count the system will not give is taken as 1, with `gate: cannot rea
 
    A routed run's remote wait is one budget of 60 s (`--test-remote-wait-ms` in a test build), shared by every builder it tries ([Routing](#routing), The next builder): each builder's pool waits only for what the earlier attempts left of it, so the run never waits longer for a remote slot than for one builder.
 
+   A desktop run's budget is its ceiling, and its wait in the PC's desktop queue (a locked one) and its wait for its work folder's key spend from it before its first slot wait. A run waiting in the queue holds no remote slot, so it takes none from other runs.
+
    The wait for a slot on a builder that refused the run `full` ([Routing](#routing)) counts into the same budget. An attempt reached with nothing left takes a free slot and otherwise finds the pool full at once, saying no waiting line.
 
    A routed run that queues with no free remote slot on its scored pick waits on the pools of all its capable builders at once, when it is not pinned and not a light run rerouted by a critical request, and more than one builder can run its command. A pool has room for the run when more of its slots are free than live tickets wait ahead of it in it, probed as the pick scores them.
@@ -1360,6 +1362,7 @@ The temporary sibling is made new, a link or junction at its name opened as itse
 | log's mutex | `Local\gate-log-<l>` | `Local\gate-<h>-log-<l>` |
 | routed lock | `Local\gate-routed-<k>` | `Local\gate-<h>-routed-<k>` |
 | worktree lock | `Local\gate-worktree-<v>-<f>` | `Local\gate-<h>-worktree-<v>-<f>` |
+| desktop queue | `Local\gate-desktop-queue` | `Local\gate-<h>-desktop-queue` |
 
 The critical mutex is taken by a critical gate once no earlier live critical ticket exists, and held for its whole run. An abandoned one counts as taken ([Abandoned slots](#abandoned-slots)).
 
@@ -1374,6 +1377,8 @@ The box command's job name comes from the payload's `Job` (`<key>` is the payloa
 `<l>` is the log hash: 16 lower-case hex digits, the first 8 bytes of the SHA-256 of the lower-cased, normalised absolute log path. Each run takes its log's mutex without waiting, before it readies the log, and holds it until after the slot release and the final append to the log, so two gates never write one log; a second gate fails at once ([Output lines](#output-lines)).
 
 `<k>` is the key hash: 16 lower-case hex digits, the first 8 bytes of the SHA-256 of the lower-cased work-folder key. The Rust remote client takes the routed lock before the remote slot, first at once, then by the run's wait while another run holds it, up to 90 s, or its ceiling for a heavy or desktop run, and holds it for the whole remote attempt ([Routing](#routing)).
+
+The desktop queue (`KernelObject::DesktopQueue`) is one mutex for the whole PC, with no claim file. A routed run of a locked desktop pattern takes it before the routed lock and holds it until its remote attempt ends, waiting for it as for the routed lock, up to its ceiling, with a mutex a killed gate left taken over ([Routing](#routing), The desktop queue).
 
 `<v>` and `<f>` are the worktree lock's folder id: the volume serial number as 16 lower-case hex digits and the 128-bit file id as 32, read from the worktree root opened following links, so two spellings of one folder share one lock.
 
@@ -2967,7 +2972,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A file that cannot be used keeps every routed command of the repo here with `gate: not routed: .gate/desktop.toml: <problem>`, the first problem, on one line and escaped, said ahead of the later reasons (faster here, siblings, an outside word); a copy read from the declarations folder is named by its full path in place of `.gate/desktop.toml`.
 
-  A consented match makes the run a desktop run: `RemoteRun.desktop` is the match's mode, locked, session or hidden, and the run call asks for the desktop (the client's Desktop bullet, below). A session run is a desktop run that needs the builder's console session but not the desktop lock; a hidden run is a session run whose command starts on a desktop of its own that no one sees (The hidden desktop, in The desktop run's design).
+  A consented match makes the run a desktop run: `RemoteRun.desktop` is the match's mode, locked, session or hidden, and the run call asks for the desktop (the client's Desktop bullet, below). A locked desktop run waits its turn in this PC's desktop queue before its work folder's key and any remote slot, so at most one locked desktop run of this PC holds either while it waits for the builder's desktop (the client's Lock bullet, below).
+
+  A session run is a desktop run that needs the builder's console session but not the desktop lock, and never queues; a hidden run is a session run whose command starts on a desktop of its own that no one sees (The hidden desktop, in The desktop run's design).
 
   `gate run --desktop hidden` makes a run whose command matches a declared pattern of any mode, and that `remote.json` allows the repo under that pattern's own mode (a `hidden` pattern in either key), a hidden run, this run only. The run's log shows the proof: the hand-off line names `the hidden desktop gate-<32 hex>`.
 
@@ -3103,7 +3110,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A share or device path at any path start is outside: two separators, or a drive right after `\\?\`, `\\.\`, `//?/` or `//./`. Relative text that climbs out of the worktree (or past the drive-root floor above) is outside at every path start, not only at the word's.
 - **The work folder** on the builder is named `<repo name>-<key>`, the worktree root's last segment cut to letters, digits, `-` and `_` and 8 hex digits of the SHA-256 of the lower-cased root ([Glossary](GLOSSARY.md), work-folder key).
-- **The routed run's life** is kept (T5) and built in `remote/mod.rs` and `run.rs`: its ticket is heavy with `remote: true` and queues apart from the local waiters, which never count it ahead of them, nor it them; before that it waits for its work folder's key while another run holds it, up to 90 s, or its ceiling for a heavy run that is no commit's stage or hook (`--test-key-wait-ms` in a test build), holding no PC slot and journaling only its remote-tagged `queue` line, and falls back `busy` only past that bound or, for a run on the 90 s wait, when a warm-up of the folder holds or takes the key; it then waits up to 60 s in all for a remote slot, across every builder it tries (`--test-remote-wait-ms` in a test build); a desktop run waits for the work folder's key (a warm-up holding it included, not sent `busy`) and for its remote slots out of one budget equal to its ceiling (the floor of an `auto:` ceiling), the key wait spending from it; it takes one with a claim of kind `remote` of its own and calls the remote client with the route, the log and the limits (`--stall` as given, the interrupt).
+- **The routed run's life** is kept (T5) and built in `remote/mod.rs` and `run.rs`: its ticket is heavy with `remote: true` and queues apart from the local waiters, which never count it ahead of them, nor it them; before that it waits for its work folder's key while another run holds it, up to 90 s, or its ceiling for a heavy run that is no commit's stage or hook (`--test-key-wait-ms` in a test build), holding no PC slot and journaling only its remote-tagged `queue` line, and falls back `busy` only past that bound or, for a run on the 90 s wait, when a warm-up of the folder holds or takes the key; it then waits up to 60 s in all for a remote slot, across every builder it tries (`--test-remote-wait-ms` in a test build).
+
+  A desktop run waits for the work folder's key (a warm-up holding it included, not sent `busy`) and for its remote slots out of one budget equal to its ceiling (the floor of an `auto:` ceiling), the key wait spending from it, and a locked one first waits in this PC's desktop queue, holding no key or slot, that wait spending from it too (The phases, Desktop queue). A run takes its remote slot with a claim of kind `remote` of its own and calls the remote client with the route, the log and the limits (`--stall` as given, the interrupt).
 
   A client that runs the command to its end hands back its status, which the gate passes through, and the run releases the slot with the remote tag.
 
@@ -3193,7 +3202,20 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   A repo name that is not `[A-Za-z0-9_-]+` is never sent to the builder: the push and the sync-back fail the run with `cannot push to the repo '<name>': a repo name is letters, digits, '_' and '-'`, as a client failure (`gate: the remote run failed: ...`).
 
   The phases run in this order. Any `gate: the remote run failed` line ends the run with status 1 and no fallback; Ctrl+C at any point after the snapshot ends the run as an interrupt.
-  - **Lock.** The run takes the routed lock, `Local\gate-[<root hash>-]routed-<16 hex>` ([Kernel object names](#kernel-object-names)), before the remote slot, and holds it for the whole remote attempt (for every builder the run tries). A lock held elsewhere is waited for up to 90 s (`--test-key-wait-ms` in a test build; a heavy or desktop run's ceiling) with no PC slot held; the journal shows the run's remote-tagged `queue` line only.
+  - **Desktop queue.** A locked desktop run, and no other (not a session or hidden desktop run, a commit's stage or a rerouted light run), first takes this PC's desktop queue, `Local\gate-[<root hash>-]desktop-queue` ([Kernel object names](#kernel-object-names)), with no claim file, before its worktree's routed lock and any remote slot, and holds it until its remote attempt ends. So at most one locked desktop run of this PC is past the queue at a time.
+
+    A run that waits in it holds no key, slot, ticket or claim: other repos' runs keep the remote slots, and an ordinary run of the same worktree is not refused `busy`. The queue serialises this PC only: a run of another PC still waits at the builder's desktop lock.
+
+    The run at the front holds the queue through its own key and slot waits, so a locked run can wait behind it while the builder's desktop is idle. That is the cost of a single PC-wide queue.
+
+    A run that finds the queue held says `gate: waiting in this PC's desktop queue behind another locked desktop run`, then `gate: still waiting in this PC's desktop queue behind another locked desktop run ({n} s)` every heartbeat, and looks at the interrupt between its slices (`--test-key-wait-ms` bounds the wait in a test build, and `--test-interrupt-queued` raises the interrupt at the first line).
+
+    A Ctrl+C there says `gate: interrupted while waiting in this PC's desktop queue behind another locked desktop run` and journals `abandon`, with no ticket or claim to delete.
+
+    The bound is the run's ceiling, which a live drain marker of any builder holds off, said once as `gate: still waiting in this PC's desktop queue past its bound: a builder's drain marker holds the bound off`. Past it the run says `gate: another locked desktop run held this PC's desktop queue for this run's whole ceiling ({n} s); not running here`, then the desktop line `gate: remote <host> desktop; a desktop run never runs here`, and exits 1, with nothing run here.
+
+    A queue that cannot be opened or taken says `gate: cannot open the mutex <name>: <error>` or `gate: cannot take the mutex <name>: <error>` and ends the run `busy`. The queue wait, the key wait and the remote slot waits spend one budget, the run's ceiling: the key wait's bound is the ceiling less the queue wait.
+  - **Lock.** The run takes the routed lock, `Local\gate-[<root hash>-]routed-<16 hex>` ([Kernel object names](#kernel-object-names)), after the desktop queue, if it queues, and before the remote slot, and holds it for the whole remote attempt (for every builder the run tries). A lock held elsewhere is waited for up to 90 s (`--test-key-wait-ms` in a test build; a heavy or desktop run's ceiling) with no PC slot held; the journal shows the run's remote-tagged `queue` line only.
 
     A lock still held past the bound says `gate: remote <host> busy; running here` and falls back `busy` before any queueing. A warm-up lock on the key, probed before the wait and at each still-waiting heartbeat, that holds or takes the key makes the run fall back `busy` at once instead of waiting it out. A lock that cannot be opened or taken says `gate: cannot open the mutex <name>: <error>` or `gate: cannot take the mutex <name>: <error>`, then the busy line.
   - **Hold.** The run takes the worktree locks of its main root and each carried sibling ([Sync-back](#routing), The worktree lock) and, for a pair, holds its folders ([Sibling worktrees](#routing)); one it cannot hold keeps the run here ([Output lines](#output-lines)).
@@ -3559,11 +3581,11 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     A warm-up that meets the drain says `gate: warm: the builder is drained; this warm-up ends without warming` ([gate warm](#gate-warm)), and `gate check --builder` reports it ([With `--builder`](#with---builder)).
   - **Desktop.** A routed run whose `RemoteRun.desktop` is true (Routing, the desktop paragraphs) sends `Desktop: true` and `DesktopWait` in its run call's payload (`payload::run_word`), with `DesktopSession: true` beside them for a session or hidden run and `DesktopHidden: true` as well for a hidden run, `DesktopWait` being the run's sent `Timeout` (at least 1, at most 2147483647), so the run waits for the desktop as long as it may run there; the call carries no usual p90.
 
-    A desktop run can therefore wait up to its ceiling for the desktop and then run up to its ceiling. Its waits for the PC's remote pool and builder slots and for the work folder's key come out of one budget equal to its ceiling (the floor of an `auto:` ceiling), where other runs keep 60 s for the pool and 90 s for the key; it also waits out a `gate warm` holding the key.
+    A desktop run can therefore wait up to its ceiling for the desktop and then run up to its ceiling. Its waits in the PC's desktop queue, for the PC's remote pool and builder slots and for the work folder's key come out of one budget equal to its ceiling (the floor of an `auto:` ceiling), where other runs keep 60 s for the pool and 90 s for the key; it also waits out a `gate warm` holding the key.
 
     No other call sends either key, a warm-up included; the scripted test client's recorded call has a `desktop` key.
 
-    A desktop run holds a normal remote slot while it waits for the builder's desktop (a session run never waits), so other routed runs of this PC can fall back `full` meanwhile, and the wait counts against the client's backstop.
+    A locked desktop run first waits in this PC's desktop queue, holding no key or slot (Lock, below, the desktop queue), so only the one run past the queue holds a normal remote slot while it waits for the builder's desktop (a session run never waits), and other routed runs of this PC can fall back `full` for that one run only. The wait counts against the client's backstop.
   - **Warm-up call.** A call whose `warmth` is a warm-up (`Warmth::WarmUp` in `remote/mod.rs`) runs the phases above with the run call's payload built by `payload::warm_word`: the run's keys, `Timeout` always among them, with `WarmCommands` and `WarmHash` in place of `Command` and no `Outputs`, `FailureOutputs` or `OutputsFull` key.
 
     Its limits are a run's, from the call's `timeout`. `gate warm` makes such a call. A routed run's call of a repo whose warm-up is set up carries `warmth: {"consented": <hash>}` instead, which only words the cold note.
@@ -5524,7 +5546,9 @@ The rules behind the desktop run (GATE-231) that a later change to the helper, t
 - A session run (`DesktopSession`) takes no desktop lock and writes no holder record: the lock serialises only the commands that need the desktop itself, and a session command promises to leave it alone (no window on the console desktop from any descendant, no UAC prompt, per-run credential and named-object names; [routing-a-repo.md](routing-a-repo.md#a-repo-with-a-command-that-needs-the-builders-desktop)).
 
   The console checks (logged on, unlocked, `Default` input desktop) still apply to it, and the task's `Parallel` instances let several hand-offs run at once.
-- The order is the work-folder lock, then the desktop lock, never the other way round. The desktop lock is taken after the checkout and the restores, so it is held only while the command runs, and on the run's main thread, which also releases it, since a mutex belongs to its thread; it is released once the job is empty and the output drained, before the back commit.
+- The order is the work-folder lock, then the desktop lock, never the other way round.
+
+  On the PC a locked run takes the desktop queue first, then its key lock, then the PC's remote slot, and the box takes its slot and these two locks after; the queue serialises this PC's locked runs only, so runs from another PC still wait at the box's desktop lock. The desktop lock is taken after the checkout and the restores, so it is held only while the command runs, and on the run's main thread, which also releases it, since a mutex belongs to its thread; it is released once the job is empty and the output drained, before the back commit.
 - The holder record `desktop-holder.json`, `{"repo": "<repo>", "since": "<UTC RFC 3339>"}`, sits in the box's work root (the folder of the run's work folder). The run writes it once it holds the lock (staged as `desktop-holder.json.tmp`, then renamed) and removes it just before it lets the lock go, since removing it after would race the next holder's write.
 
   A waiting run reads it for its busy-wait line only, through an open that shares read, write and delete so it never blocks the holder's rename or removal; it decides nothing, and a missing or unreadable record only changes the line.

@@ -71,7 +71,7 @@ use crate::outputs::glob::Globs;
 use crate::outputs::{stale, walk::walk};
 use crate::remote::drain::{self, Drain, utc_clock};
 use crate::remote::syncback::Staged;
-use crate::remote::{self, KEY_WAIT_SLICE, KeyWait, RemoteCall, RemoteClient, RemoteOutcome, Split, git};
+use crate::remote::{self, KEY_WAIT_SLICE, KeyHold, KeyWait, RemoteCall, RemoteClient, RemoteOutcome, Split, git};
 use crate::resolve::{Environment, HANDED_OVER_VARIABLE, ResolvedRoot};
 use crate::restore::{self, NotRestoring, RestorePlan};
 use crate::route::{self, Placed};
@@ -1801,6 +1801,64 @@ impl Beat {
         }
         Some(waited)
     }
+
+    /// The time waited so far.
+    fn waited(&self) -> Duration {
+        self.begun.elapsed()
+    }
+}
+
+/// The bound of a routed run's wait for its work folder's key or for this PC's desktop queue, which a live drain marker
+/// of any builder holds off ([`Run::take_key`], [`Run::wait_in_desktop_queue`]).
+struct Bound {
+    /// How long the wait may last while no marker stands.
+    limit: Duration,
+    /// What the marker probe said of a marker it could not read, said once.
+    marker_said: drain::ProbeSaid,
+    /// What the wait says once a marker holds its bound off: [`KEY_HELD_OFF_LINE`] or [`QUEUE_HELD_OFF_LINE`].
+    held_off: &'static str,
+    /// Whether the wait said `held_off`.
+    held_off_said: bool,
+}
+
+impl Bound {
+    fn new(limit: Duration, held_off: &'static str) -> Bound {
+        Bound {
+            limit,
+            marker_said: drain::ProbeSaid::default(),
+            held_off,
+            held_off_said: false,
+        }
+    }
+
+    /// Whether a wait of `waited` is past the bound with no live drain marker under `state` holding it off: a run
+    /// waiting behind a builder's drain may hold what this one waits for. A marker that holds the bound off is said
+    /// once, in the bound's own held-off line.
+    fn spent(&mut self, waited: Duration, state: &Path, console: &mut Console) -> bool {
+        if waited < self.limit {
+            return false;
+        }
+        if !drain::any_marker_stood(state, console, &mut self.marker_said) {
+            return true;
+        }
+        say_once(console, &mut self.held_off_said, self.held_off);
+        false
+    }
+}
+
+/// What a locked desktop run says as it starts to wait in this PC's desktop queue ([`Run::take_desktop_queue`]).
+const DESKTOP_QUEUE_WAITING_LINE: &str = "gate: waiting in this PC's desktop queue behind another locked desktop run";
+
+/// What a wait in this PC's desktop queue says once its bound passed and a live drain marker holds that bound off.
+const QUEUE_HELD_OFF_LINE: &str = "gate: still waiting in this PC's desktop queue past its bound: a builder's drain marker holds the bound off";
+
+/// The locks a routed run holds for its whole remote attempt ([`Run::take_locks`]). Fields drop in declaration order:
+/// the work folder's key is let go first, then this PC's desktop queue, the reverse of their take.
+struct Locks {
+    /// The work folder's key lock; `None` for a client that takes none.
+    _key: Option<OwnedMutexGuard>,
+    /// This PC's desktop queue; `None` for any run but a locked desktop run.
+    _queue: Option<OwnedMutexGuard>,
 }
 
 /// Sleeps `period` in slices of [`KEY_WAIT_SLICE`], the console `interrupt` looked at before each; whether it slept
@@ -2056,12 +2114,13 @@ struct Walk {
 }
 
 impl Walk {
-    /// The walk of a run that waited `key_waited` for its work folder's key: a `desktop` run's key wait counts as a
-    /// remote wait, so the key wait and the remote slot waits share its one budget, its ceiling; any other run's
-    /// remote budget starts whole. A new drain session, nothing tried yet.
-    fn after_key(key_waited: Duration, desktop: bool) -> Walk {
+    /// The walk of a run that waited `queued` in this PC's desktop queue and `key_waited` for its work folder's key: a
+    /// `desktop` run's queue and key waits count as remote waits, so they and the remote slot waits share its one
+    /// budget, its ceiling; any other run, which never queues, has its remote budget start whole. A new drain session,
+    /// nothing tried yet.
+    fn after_key(queued: Duration, key_waited: Duration, desktop: bool) -> Walk {
         Walk {
-            waited: if desktop { key_waited } else { Duration::ZERO },
+            waited: if desktop { queued + key_waited } else { Duration::ZERO },
             session: remote::payload::run_nonce(),
             tried: HashSet::new(),
             built: Vec::new(),
@@ -2998,11 +3057,13 @@ impl Run<'_> {
     }
 
     /// Runs the routed command on the builder, and on the later builders of the route after a refusal for a reason
-    /// worth another builder ([`RETRIED`]): takes the client's work-folder key lock once, the worktree's on every
-    /// builder, held until the run ends, then tries each builder in turn ([`Run::attempt`]), its remote slot taken into
-    /// `hold` and freed when it falls back. A key lock another run of the worktree holds is waited for up to its bound,
-    /// and one that stays held, like a client not ready, falls back here before any remote slot is taken; a pinned or
-    /// desktop run ends instead ([`Run::pin_ended`]). Each later candidate is built when it is tried
+    /// worth another builder ([`RETRIED`]): a locked desktop run first takes this PC's desktop queue, waiting up to its
+    /// ceiling behind another locked desktop run of this PC and ending `desktop` past it; then the run takes the
+    /// client's work-folder key lock once, the worktree's on every builder, both held until the remote attempt ends
+    /// ([`Run::take_locks`]), then tries each builder in turn ([`Run::attempt`]), its remote slot taken into `hold` and
+    /// freed when it falls back. A key lock another run of the worktree holds is waited for up to its bound, and one
+    /// that stays held, like a client not ready, falls back here before any remote slot is taken; a pinned or desktop
+    /// run ends instead ([`Run::pin_ended`]). Each later candidate is built when it is tried
     /// ([`Run::next_candidate`]) and says its route lines once the fallback line naming it is said; the run's remote tag
     /// names it from its take on. A run whose last attempt fell back runs here, its local take counting from the run's
     /// queue line only when that fallback was the full remote pool; one a Ctrl+C or the client ended ends as it did,
@@ -3017,10 +3078,27 @@ impl Run<'_> {
         remotely
     }
 
+    /// The locks of the routed run `remote`'s remote attempt, taken in order, and the walk its attempts start from: a
+    /// locked desktop run first takes this PC's desktop queue ([`Run::take_desktop_queue`]), so while another locked
+    /// run is ahead of it it waits holding no key and no slot; then every run takes its work folder's key
+    /// ([`Run::take_key`]). The walk's remote budget is already spent by a desktop run's queue and key waits. Else how
+    /// the run goes on, as the take that failed ended it; a queue it could not take holds nothing.
+    fn take_locks(&mut self, remote: &RemoteRun, console: &mut Console) -> Result<(Locks, Walk), Remotely> {
+        let (queue, queued) = self.take_desktop_queue(remote, console)?;
+        // The key lock reads neither figure of the call; no take has resolved them yet. A sibling that fails its check
+        // again sends nothing: the run falls back here before it takes the lock or a slot.
+        let (key, key_waited) = self.take_key(remote, queued, console)?;
+        // Under the key lock, once a run: the key is the same for every builder the run tries.
+        worktree_record::leave(&self.root.path, &remote.root, &remote.repo, &remote.key, console);
+        // One drain session for every attempt and poll of the run.
+        let walk = Walk::after_key(queued, key_waited, self.is_desktop(remote));
+        Ok((Locks { _key: key, _queue: queue }, walk))
+    }
+
     /// The attempts of [`Run::routed`], and the reason of the last builder's fallback when a builder's attempt fell back,
     /// a walk over the later builders a Ctrl+C ended after it included, and `inputs` for a built-here record that cannot
     /// be removed before an attempt ([`Run::clear_built_here`]); `None` when the run fell back before any attempt for
-    /// another reason, or an attempt ended it.
+    /// another reason, its locks not taken ([`Run::take_locks`]), or an attempt ended it.
     fn try_builders(&mut self, remote: &RemoteRun, hold: &mut Hold, console: &mut Console) -> (Remotely, Option<FallbackReason>) {
         // Nothing is held until an attempt takes a remote slot: a pinned run that ends before then counts no time held,
         // and a run that falls back here sets it again at its local take.
@@ -3032,16 +3110,11 @@ impl Run<'_> {
                 None,
             );
         }
-        // The key lock reads neither figure of the call; no take has resolved them yet. A sibling that fails its check
-        // again sends nothing: the run falls back here before it takes the lock or a slot.
-        let (_key, key_waited) = match self.take_key(remote, console) {
-            Ok(key) => key,
+        // The locks are held until the whole remote attempt, every builder it hops to included, has ended.
+        let (_locks, mut walk) = match self.take_locks(remote, console) {
+            Ok(taken) => taken,
             Err(remotely) => return (remotely, None),
         };
-        // Under the key lock, once a run: the key is the same for every builder the run tries.
-        worktree_record::leave(&self.root.path, &remote.root, &remote.repo, &remote.key, console);
-        // One drain session for every attempt and poll of the run, a desktop run's remote budget already spent by its key wait.
-        let mut walk = Walk::after_key(key_waited, self.is_desktop(remote));
         loop {
             // Before each attempt, whose builder may plan another drop, so a run killed on the builder leaves its
             // entries cleared. A record that cannot be removed would outlast the build there: the run falls back here.
@@ -3420,6 +3493,12 @@ impl Run<'_> {
         desktop_run(run.desktop, self.staging.is_some(), self.rerouted_for.is_some())
     }
 
+    /// Whether the routed run `run` is a locked desktop run, which waits in this PC's desktop queue
+    /// ([`locked_desktop_run`]).
+    fn is_locked_desktop(&self, run: &RemoteRun) -> bool {
+        locked_desktop_run(run.desktop, self.staging.is_some(), self.rerouted_for.is_some())
+    }
+
     /// Calls the client for the routed run `remote` under `figures`, the remote slot held in `hold`, and ends the run as
     /// the client ended it. A refusal or a client that cannot start is a refusal, with the slot still held. A Ctrl+C
     /// during the call over a refusal ends the run here, with the remote slot released. A call the builder refused
@@ -3762,7 +3841,9 @@ impl Run<'_> {
     /// how the run goes on: `busy`, when the lock is held past the bound or cannot be opened or taken, which says why,
     /// here or, for a pinned or desktop run, ended ([`Run::fell_back`]); or interrupted during the wait, which says so
     /// and journals the abandon.
-    fn take_key(&mut self, remote: &RemoteRun, console: &mut Console) -> Result<(Option<OwnedMutexGuard>, Duration), Remotely> {
+    ///
+    /// A desktop run's bound is what is left of its ceiling after `queued`, its wait in the desktop queue ([`key_bound`]).
+    fn take_key(&mut self, remote: &RemoteRun, queued: Duration, console: &mut Console) -> Result<(Option<OwnedMutexGuard>, Duration), Remotely> {
         // The key lock reads neither figure of the call; no take has resolved them yet. A sibling that fails its check
         // again sends nothing: the run falls back here before it takes the lock or a slot.
         let env = routed_env(&self.request.env, remote.source_revision.as_deref());
@@ -3811,16 +3892,12 @@ impl Run<'_> {
             return Err(busy(self, console));
         }
         let mut probe_said = false;
-        let mut marker_said = drain::ProbeSaid::default();
-        let mut past_bound_said = false;
         let desktop = self.is_desktop(remote);
         let patient = waits_its_ceiling(self.request, desktop, self.staging.is_some() || self.nesting.hook_of_commit());
         if warm_up_sends_busy(patient, || warm_up_holds(&self.root.path, &remote.key, console, &mut probe_said)) {
             return Err(busy(self, console));
         }
-        let bound = key_limit(self.request, desktop, patient);
-        let heartbeat = self.request.test_seams.heartbeat_ms.map_or(wait::HEARTBEAT, Duration::from_millis);
-        let mut next = heartbeat;
+        let mut bound = Bound::new(key_bound(self.request, desktop, patient, queued), KEY_HELD_OFF_LINE);
         let left = holder_time_left(&mut self.survey, &self.root.path, call.key, console);
         console.err(&key_wait_line(&remote.builder.alias, left));
         // The seam raises the console interrupt once the gate has said it waits, the key wait's line among them.
@@ -3829,11 +3906,11 @@ impl Run<'_> {
         {
             interrupt.raise();
         }
-        let begun = Instant::now();
+        let mut beat = Beat::new(self.request.test_seams.heartbeat_ms.map_or(wait::HEARTBEAT, Duration::from_millis));
         loop {
             match self.client.hold_key_waiting(&call, KEY_WAIT_SLICE) {
-                Ok(KeyWait::Held(held)) => return Ok((held, begun.elapsed())),
-                Ok(KeyWait::Interrupted) => return Err(self.interrupted_key_wait(remote, begun.elapsed(), console)),
+                Ok(KeyWait::Held(held)) => return Ok((held, beat.waited())),
+                Ok(KeyWait::Interrupted) => return Err(self.interrupted_key_wait(remote, beat.waited(), console)),
                 Ok(KeyWait::Busy) => {}
                 Err(line) => {
                     console.err(&line);
@@ -3842,18 +3919,14 @@ impl Run<'_> {
             }
             // Each slice's wait is the slice itself, whose `Busy` comes before the client reads the interrupt.
             if self.host.interrupt.is_some_and(Interrupt::is_raised) {
-                return Err(self.interrupted_key_wait(remote, begun.elapsed(), console));
+                return Err(self.interrupted_key_wait(remote, beat.waited(), console));
             }
-            let waited = begun.elapsed();
             // A run of the worktree waiting behind a builder's drain may hold the key, which is the worktree's on every
             // builder: a live marker of any of them holds the bound off.
-            if waited >= bound {
-                if !drain::any_marker_stood(&self.root.path, console, &mut marker_said) {
-                    return Err(busy(self, console));
-                }
-                say_once(console, &mut past_bound_said, KEY_HELD_OFF_LINE);
+            if bound.spent(beat.waited(), &self.root.path, console) {
+                return Err(busy(self, console));
             }
-            if waited >= next {
+            if let Some(waited) = beat.due() {
                 // A warm-up that took the key during the wait is not waited for either, but by a run that waits its ceiling.
                 if warm_up_sends_busy(patient, || warm_up_holds(&self.root.path, &remote.key, console, &mut probe_said)) {
                     return Err(busy(self, console));
@@ -3863,21 +3936,112 @@ impl Run<'_> {
                     remote.builder.alias,
                     waited.as_secs()
                 ));
-                while next <= waited {
-                    next += heartbeat;
-                }
             }
         }
+    }
+
+    /// Takes this PC's desktop queue for the routed run `remote` when it is a locked desktop run
+    /// ([`locked_desktop_run`]), before its work folder's key and any remote slot, so a run waiting for the builder's
+    /// desktop holds neither: `Ok` with the queue's guard, `None` for any other run, and how long the run waited for it.
+    /// A queue another run holds is waited for ([`Run::wait_in_desktop_queue`]). A queue that cannot be opened or
+    /// taken says why and ends the run `busy`; a Ctrl+C raised before the take ends it as an interrupted wait does.
+    fn take_desktop_queue(&mut self, remote: &RemoteRun, console: &mut Console) -> Result<(Option<OwnedMutexGuard>, Duration), Remotely> {
+        if !self.is_locked_desktop(remote) {
+            return Ok((None, Duration::ZERO));
+        }
+        let name = self.root.root.object_name(KernelObject::DesktopQueue);
+        match remote::hold_mutex_waiting(&name, self.host.interrupt, Duration::ZERO) {
+            Ok(KeyHold::Held(held)) => return Ok((Some(held), Duration::ZERO)),
+            // Another locked desktop run of this PC holds it; the zero wait never reads the interrupt.
+            Ok(KeyHold::Busy | KeyHold::Interrupted) => {}
+            Err(line) => return Err(self.queue_failed(remote, &line, console)),
+        }
+        if self.host.interrupt.is_some_and(Interrupt::is_raised) {
+            return Err(self.interrupted_queue_wait(Duration::ZERO, console));
+        }
+        console.err(DESKTOP_QUEUE_WAITING_LINE);
+        // The seam raises the console interrupt once the gate has said it waits, the queue's line among them.
+        if self.request.test_seams.interrupt_queued
+            && let Some(interrupt) = self.host.interrupt
+        {
+            interrupt.raise();
+        }
+        self.wait_in_desktop_queue(remote, &name, console)
+    }
+
+    /// Waits for this PC's desktop queue, the mutex `name`, for the locked desktop run `remote` in slices of
+    /// [`KEY_WAIT_SLICE`], the console interrupt looked at between them, saying it still waits every heartbeat: `Ok`
+    /// with the queue's guard and how long the wait took. The bound is the run's ceiling ([`key_limit`]), which a live
+    /// drain marker holds off as for the key; past it the run ends as the builder's own desktop wait ends it, `desktop`,
+    /// having said so. A queue that cannot be opened or taken ends it `busy`; a Ctrl+C ends it as an interrupted wait.
+    fn wait_in_desktop_queue(
+        &mut self,
+        remote: &RemoteRun,
+        name: &str,
+        console: &mut Console,
+    ) -> Result<(Option<OwnedMutexGuard>, Duration), Remotely> {
+        let mut bound = Bound::new(key_limit(self.request, true, true), QUEUE_HELD_OFF_LINE);
+        let mut beat = Beat::new(self.request.test_seams.heartbeat_ms.map_or(wait::HEARTBEAT, Duration::from_millis));
+        loop {
+            match remote::hold_mutex_waiting(name, self.host.interrupt, KEY_WAIT_SLICE) {
+                Ok(KeyHold::Held(held)) => return Ok((Some(held), beat.waited())),
+                Ok(KeyHold::Interrupted) => return Err(self.interrupted_queue_wait(beat.waited(), console)),
+                Ok(KeyHold::Busy) => {}
+                Err(line) => return Err(self.queue_failed(remote, &line, console)),
+            }
+            if self.host.interrupt.is_some_and(Interrupt::is_raised) {
+                return Err(self.interrupted_queue_wait(beat.waited(), console));
+            }
+            if bound.spent(beat.waited(), &self.root.path, console) {
+                // The ceiling itself, which `--test-key-wait-ms` may cut the bound below.
+                console.err(&format!(
+                    "gate: another locked desktop run held this PC's desktop queue for this run's whole ceiling ({} s); not running here",
+                    self.request.timeout.floor()
+                ));
+                return Err(self.fell_back(remote, FallbackReason::Desktop, &RemoteOutcome::default(), console));
+            }
+            if let Some(waited) = beat.due() {
+                console.err(&format!(
+                    "gate: still waiting in this PC's desktop queue behind another locked desktop run ({} s)",
+                    waited.as_secs()
+                ));
+            }
+        }
+    }
+
+    /// Ends the locked desktop run `remote` whose desktop queue could not be opened or taken: says `line`, why, and
+    /// ends it `busy`, as a work-folder key that cannot be taken ends a desktop run ([`Run::fell_back`]).
+    fn queue_failed(&mut self, remote: &RemoteRun, line: &str, console: &mut Console) -> Remotely {
+        console.err(line);
+        self.fell_back(remote, FallbackReason::Busy, &RemoteOutcome::default(), console)
+    }
+
+    /// Ends a run whose wait in this PC's desktop queue was interrupted after `waited`, as an interrupted key wait ends
+    /// ([`Run::abandon_wait`]).
+    fn interrupted_queue_wait(&mut self, waited: Duration, console: &mut Console) -> Remotely {
+        self.abandon_wait(
+            "gate: interrupted while waiting in this PC's desktop queue behind another locked desktop run",
+            waited,
+            console,
+        )
     }
 
     /// Ends a run whose wait for its work folder's key was interrupted after `waited`: says so with the builder, journals
     /// the abandon with how long it waited and the run's remote tag, and ends the run as an interrupted wait does, with
     /// no ticket and no claim to delete.
     fn interrupted_key_wait(&mut self, remote: &RemoteRun, waited: Duration, console: &mut Console) -> Remotely {
-        console.err(&format!(
+        let line = format!(
             "gate: interrupted while waiting for this worktree's work folder on {}",
             remote.builder.alias
-        ));
+        );
+        self.abandon_wait(&line, waited, console)
+    }
+
+    /// Ends a run whose wait before any remote slot was interrupted after `waited`: says `line`, journals the abandon
+    /// with how long it waited and the run's remote tag, and ends the run as an interrupted wait does, with no ticket
+    /// and no claim to delete.
+    fn abandon_wait(&mut self, line: &str, waited: Duration, console: &mut Console) -> Remotely {
+        console.err(line);
         // A commit's stage writes no journal lines of its own.
         if self.staging.is_none() {
             self.journal.write(
@@ -6177,6 +6341,14 @@ fn key_limit(request: &RunRequest, desktop: bool, patient: bool) -> Duration {
     request.test_seams.key_wait_ms.map_or(unseamed, Duration::from_millis)
 }
 
+/// The bound of a routed run's wait for its work folder's key ([`Run::take_key`]): its [`key_limit`], less `queued`,
+/// a `desktop` run's wait in this PC's desktop queue, which spent part of the same ceiling; none once the queue wait
+/// spent it all. Any other run never queues and keeps its whole limit.
+fn key_bound(request: &RunRequest, desktop: bool, patient: bool, queued: Duration) -> Duration {
+    let limit = key_limit(request, desktop, patient);
+    if desktop { limit.saturating_sub(queued) } else { limit }
+}
+
 /// Whether a warm-up holding the work folder's key, which `held` probes, sends a routed run `busy` at once: it does for
 /// any run that keeps the short wait, and not for one that `patient` waits its ceiling out within its key limit
 /// ([`waits_its_ceiling`], [`key_limit`]).
@@ -6189,6 +6361,13 @@ fn warm_up_sends_busy(patient: bool, held: impl FnOnce() -> bool) -> bool {
 /// its wait here after a refusal.
 fn desktop_run(desktop: Option<gate_router::desktop::DesktopMode>, staging: bool, rerouted: bool) -> bool {
     desktop.is_some() && !staging && !rerouted
+}
+
+/// Whether a routed run asking for the desktop as `desktop` says is a locked desktop run, which waits in this PC's
+/// desktop queue ([`Run::take_desktop_queue`]): a desktop run ([`desktop_run`]) of a locked pattern, which holds the
+/// builder's desktop lock; never a session or hidden run, which takes no desktop lock.
+fn locked_desktop_run(desktop: Option<gate_router::desktop::DesktopMode>, staging: bool, rerouted: bool) -> bool {
+    desktop == Some(gate_router::desktop::DesktopMode::Locked) && desktop_run(desktop, staging, rerouted)
 }
 
 /// What is left of the remote budget ([`wait::remote_budget`]) of a routed run of `request`, a `desktop` run's its
@@ -6631,6 +6810,60 @@ mod tests {
     }
 
     #[test]
+    fn only_a_locked_desktop_run_waits_in_the_desktop_queue() {
+        use gate_router::desktop::DesktopMode;
+        let locked = Some(DesktopMode::Locked);
+        assert!(super::locked_desktop_run(locked, false, false), "a locked desktop run queues");
+        assert!(
+            !super::locked_desktop_run(Some(DesktopMode::Session), false, false),
+            "a session run never does"
+        );
+        assert!(
+            !super::locked_desktop_run(Some(DesktopMode::Hidden), false, false),
+            "a hidden run never does"
+        );
+        assert!(!super::locked_desktop_run(None, false, false), "a run asking for no desktop never does");
+        assert!(!super::locked_desktop_run(locked, true, false), "a commit's stage never does");
+        assert!(!super::locked_desktop_run(locked, false, true), "a rerouted light run never does");
+    }
+
+    #[test]
+    fn a_desktop_runs_queue_and_key_waits_together_spend_its_remote_budget() {
+        let mut request = crate::wait::scratch::request(Slot::Heavy);
+        request.timeout = gate_args::Ceiling::Given(900);
+        let walk = super::Walk::after_key(Duration::from_secs(300), Duration::from_secs(100), true);
+        assert_eq!(walk.waited, Duration::from_secs(400), "the queue wait and the key wait add up");
+        assert_eq!(
+            super::remote_left(&request, true, false, walk.waited),
+            Duration::from_secs(500),
+            "the queue, key and slot waits share the ceiling"
+        );
+        let other = super::Walk::after_key(Duration::from_secs(300), Duration::from_secs(100), false);
+        assert_eq!(other.waited, Duration::ZERO, "any other run's remote budget starts whole");
+    }
+
+    #[test]
+    fn a_desktop_runs_key_bound_is_what_its_queue_wait_left_of_its_ceiling() {
+        let mut request = crate::wait::scratch::request(Slot::Heavy);
+        request.timeout = gate_args::Ceiling::Given(900);
+        assert_eq!(
+            super::key_bound(&request, true, true, Duration::from_secs(300)),
+            Duration::from_secs(600),
+            "the queue and key waits share the ceiling"
+        );
+        assert_eq!(
+            super::key_bound(&request, true, true, Duration::from_secs(1000)),
+            Duration::ZERO,
+            "a queue wait past the ceiling leaves none"
+        );
+        assert_eq!(
+            super::key_bound(&request, false, true, Duration::from_secs(300)),
+            super::key_limit(&request, false, true),
+            "any other run keeps its whole limit"
+        );
+    }
+
+    #[test]
     fn a_patient_run_waits_out_a_warm_up_holding_its_key_and_any_other_run_goes_busy() {
         assert!(!super::warm_up_sends_busy(true, || true), "a patient run waits the warm-up out");
         assert!(super::warm_up_sends_busy(false, || true), "any other run goes busy at once");
@@ -6641,7 +6874,7 @@ mod tests {
     fn a_desktop_runs_key_wait_spends_its_remote_budget() {
         let mut request = crate::wait::scratch::request(Slot::Heavy);
         request.timeout = gate_args::Ceiling::Given(900);
-        let walk = super::Walk::after_key(Duration::from_secs(100), true);
+        let walk = super::Walk::after_key(Duration::ZERO, Duration::from_secs(100), true);
         assert_eq!(
             super::remote_left(&request, true, false, walk.waited),
             Duration::from_secs(800),
@@ -6657,7 +6890,7 @@ mod tests {
     #[test]
     fn a_non_desktop_runs_key_wait_leaves_its_remote_budget_whole() {
         let request = crate::wait::scratch::request(Slot::Heavy);
-        let walk = super::Walk::after_key(Duration::from_secs(100), false);
+        let walk = super::Walk::after_key(Duration::ZERO, Duration::from_secs(100), false);
         assert_eq!(
             super::remote_left(&request, false, false, walk.waited),
             crate::wait::REMOTE_LIMIT,

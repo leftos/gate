@@ -8,7 +8,7 @@ The Windows builder was out of CPU when the pool was genuinely full of CPU work,
 
 - At 10 active heavy runs the builder leaves a heavy run a median 10% of its cores and runs it 2.5 times slower than its own median. Throughput stops growing at about 7 active runs.
 - On 2026-11-10, when the PC's 10 Windows slots were all held, a mean of 5.0 were held by godot-mcp `run.ps1 itest` runs. These take the builder's single desktop lock, so about 4.0 of them were waiting for the desktop while holding a remote slot.
-- All 26 `busy` fallbacks on 2026-11-10 had another routed run of the same work tree on a builder at the time. That is work-folder lock contention, not capacity. Neither more slots nor a longer wait fixes it.
+- All 26 `busy` fallbacks on 2026-11-10 had another routed run of the same work tree on a builder at the time. That is contention for the work folder's lock, decided mostly in the PC's own key-lock wait (`Run::take_key`), which a queued desktop run held, not capacity. Neither more slots nor a longer wait fixes it.
 - The Mac sat almost idle: on 2026-11-10 it held a mean of 0.64 of its 6 slots.
 
 **Recommendation: option 3. Do not raise `slots`.** Separately, book the desktop-lock queue as its own fix (see the end).
@@ -82,7 +82,7 @@ A burst is a cluster of `full` or `busy` fallbacks less than 10 minutes apart. T
 Notes:
 
 - The free-share column comes from `desktop1181.py`, which leaves desktop runs out. The slowdown column comes from `headroom1181.py`, which includes them. godot-mcp `run.ps1 itest` runs show slowdowns of 5 to 33 times with free shares of 0.01 to 0.1. That is time queued for the desktop, not CPU starvation, so the medians above lean high in desktop-heavy windows.
-- The desktop wait is confirmed from two godot-mcp logs, `X:\dev\godot-mcp\.tmp\rerun-scratchrunner-main.txt` and `X:\dev\godot-mcp\.tmp\rerun-526-1.txt`. Each says `gate: remote waiting for the builder's desktop: held by godot-mcp ...`, and its `command` phase (171 s, 114 s) is well over the inner steps' own times (61 s, 89 s). So a `run.ps1 itest` run holds its PC remote slot and its work-folder lock while it waits for the desktop.
+- The desktop wait is confirmed from two godot-mcp logs, `X:\dev\godot-mcp\.tmp\rerun-scratchrunner-main.txt` and `X:\dev\godot-mcp\.tmp\rerun-526-1.txt`. Each says `gate: remote waiting for the builder's desktop: held by godot-mcp ...`, and its `command` phase (171 s, 114 s) is well over the inner steps' own times (61 s, 89 s). So a `run.ps1 itest` run holds its PC remote slot, the PC's key lock on its work folder and the builder's work lock while it waits for the desktop.
 
 ### Who held the Windows slots
 
@@ -100,7 +100,9 @@ Mean slots held over the window:
 
 - **Genuine CPU saturation.** In three windows the slots were full of CPU work and the box had no headroom: 11-09 18:31 (8.5 non-desktop runs, free share 0.20, builds 3.5 to 9.8 times slower), 11-10 16:02 (7.1 plus one desktop holder, free share 0.24, median slowdown 2.4) and 11-10 21:03 (6.3, free share 0.28, median slowdown 2.35). Raising `slots` there would only have split the same cores more ways.
 - **Slots full of the desktop queue.** The biggest burst was 11-10 16:27–17:21, with 12 of the day's 15 `full` fallbacks and 2,253 s run here. In that window a mean of 6.0 slots (up to 8) were held by `run.ps1 itest` runs, 5.0 of them queued behind the desktop. Only 2.4 other runs were active, and the box left them 0.47 of its cores. Across the whole of 11-10 (06:00–24:00 UTC), in the moments all 10 slots were held, a mean of 5.0 were desktop runs and 4.0 of those were queued.
-- **`busy` is not capacity.** All 26 `busy` fallbacks on 11-10 (833 s run here) had another routed run of the same work tree on a builder at the time (`busy1181.py`). design.md defines `busy` as the work-folder lock held by another run of the same tree. 22 of the 26 were godot-mcp, almost all colliding with that tree's own `run.ps1 itest`, which holds the work lock while it waits for the desktop. Most of them waited 180 to 300 s before running here, against the 60 s remote wait.
+- **`busy` is not capacity.** All 26 `busy` fallbacks on 11-10 (833 s run here) had another routed run of the same work tree on a builder at the time (`busy1181.py`). The `busy` fallbacks are mostly decided on the PC, in the key-lock wait (`Run::take_key`), where a run waits behind another run of the same tree that holds the key; the builder's own work lock is a second guard that a run reaches only once it holds the key.
+
+  22 of the 26 were godot-mcp, almost all colliding with that tree's own `run.ps1 itest`, which holds the key lock, and the work lock, while it waits for the desktop. Most of them waited 180 to 300 s before running here, against the 60 s remote wait.
 
 ## Day counts
 
@@ -160,6 +162,6 @@ Pick **option 3: move more repos' `dotnet test *`, and their `dotnet build *`, t
 
 **Outside the three options, the biggest lever is the desktop queue.**
 
-- Only one locked desktop run can use the builder at a time, but each queued one holds a PC remote slot and its work-folder lock for its whole wait. That was 4 to 5 of 10 slots in the moments the pool was full on 11-10, and it caused most of the 26 `busy` fallbacks.
+- Only one locked desktop run can use the builder at a time, but each queued one holds a PC remote slot and the PC's key lock on its work folder (and the builder's work lock) for its whole wait. That was 4 to 5 of 10 slots in the moments the pool was full on 11-10, and it caused most of the 26 `busy` fallbacks.
 - Two possible fixes, which are a design choice for the issue: the PC holds at most one remote slot for locked desktop runs per builder, and queues the rest locally before taking a slot; or a run waiting for the desktop holds no slot until it gets it.
 - Moving godot-mcp's `run.ps1 itest` to a `hidden` desktop, as its `itest-csharp` already is, would also remove the queue, if its tests allow.

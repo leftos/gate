@@ -340,7 +340,7 @@ pub(crate) fn hold_key(call: &RemoteCall<'_>) -> Result<OwnedMutexGuard, Option<
 /// waits in slices of its own ([`crate::run`]) takes each one as a call's whole wait.
 pub(crate) const KEY_WAIT_SLICE: Duration = Duration::from_millis(100);
 
-/// How a wait for the work-folder key's lock ended.
+/// How a wait for a named mutex (the work-folder key's lock, the desktop queue) ended.
 pub(crate) enum KeyHold {
     /// The lock is held.
     Held(OwnedMutexGuard),
@@ -355,10 +355,17 @@ pub(crate) enum KeyHold {
 /// opened or taken.
 pub(crate) fn hold_key_waiting(call: &RemoteCall<'_>, wait: Duration) -> Result<KeyHold, String> {
     let name = call.state.object_name(KernelObject::Routed { hash: key_hash(call.key) });
+    hold_mutex_waiting(&name, call.interrupt, wait)
+}
+
+/// The named mutex `name`, waited for up to `wait` in slices of [`KEY_WAIT_SLICE`], `interrupt` looked at between
+/// them, as [`hold_key_waiting`] waits for the key: a mutex its last holder left without releasing is taken. `Err`
+/// with the line saying why it could not be opened or taken.
+pub(crate) fn hold_mutex_waiting(name: &str, interrupt: Option<Interrupt>, wait: Duration) -> Result<KeyHold, String> {
     let begun = Instant::now();
     loop {
         // A wait that times out gives its handle up, so each slice waits on one of its own.
-        let mutex = NamedMutex::open(&name).map_err(|error| format!("gate: cannot open the mutex {name}: {error}"))?;
+        let mutex = NamedMutex::open(name).map_err(|error| format!("gate: cannot open the mutex {name}: {error}"))?;
         let left = wait.saturating_sub(begun.elapsed());
         match mutex.acquire_owned(left.min(KEY_WAIT_SLICE)) {
             Ok(held) => return Ok(KeyHold::Held(held)),
@@ -366,7 +373,7 @@ pub(crate) fn hold_key_waiting(call: &RemoteCall<'_>, wait: Duration) -> Result<
             Err(AcquireError::Timeout) => {}
             Err(AcquireError::Failed(error)) => return Err(format!("gate: cannot take the mutex {name}: {error}")),
         }
-        if call.interrupt.is_some_and(Interrupt::is_raised) {
+        if interrupt.is_some_and(Interrupt::is_raised) {
             return Ok(KeyHold::Interrupted);
         }
     }

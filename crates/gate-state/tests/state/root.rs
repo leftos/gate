@@ -218,6 +218,16 @@ fn object_names_match_the_design_table() {
     }
 }
 
+#[test]
+fn the_desktop_queue_mutex_is_named_per_root_and_has_no_claim() {
+    assert_eq!(root(DEFAULT_ROOT).object_name(KernelObject::DesktopQueue), r"Local\gate-desktop-queue");
+    assert_eq!(
+        root(r"C:\gate-test\root").object_name(KernelObject::DesktopQueue),
+        format!(r"Local\gate-{TEST_ROOT_HASH}-desktop-queue")
+    );
+    assert_eq!(KernelObject::DesktopQueue.claim_file_name(), None, "no gate claims the queue");
+}
+
 /// The first 16 hex digits of the SHA-256 of the UTF-8 bytes of `app-1a2b3c4d`, computed with `sha256sum`, not with the
 /// crate under test.
 const KEY_HASH: u64 = 0x4fa4_4c98_cd5b_3bf3;

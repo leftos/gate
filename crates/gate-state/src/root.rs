@@ -123,6 +123,10 @@ pub enum KernelObject {
     /// The mutex a routed run holds around what its sync-back writes in a worktree, the main one's or a sibling's, by
     /// the worktree folder's id: its volume's serial number and its file id, so two spellings of one folder share it.
     Worktree { volume: u64, file: [u8; 16] },
+    /// The mutex a routed run of a locked desktop pattern holds from before its work-folder key until its remote attempt
+    /// ends, so at most one locked desktop run of this PC holds a key or a remote slot at a time while the others wait
+    /// for the builder's desktop holding neither.
+    DesktopQueue,
 }
 
 impl KernelObject {
@@ -140,6 +144,7 @@ impl KernelObject {
             KernelObject::Log { hash } => format!("log-{hash:016x}"),
             KernelObject::Routed { hash } => format!("routed-{hash:016x}"),
             KernelObject::Worktree { volume, file } => format!("worktree-{volume:016x}-{:032x}", u128::from_be_bytes(file)),
+            KernelObject::DesktopQueue => "desktop-queue".to_owned(),
         }
     }
 
@@ -160,7 +165,8 @@ impl KernelObject {
             | KernelObject::Job { .. }
             | KernelObject::Log { .. }
             | KernelObject::Routed { .. }
-            | KernelObject::Worktree { .. } => None,
+            | KernelObject::Worktree { .. }
+            | KernelObject::DesktopQueue => None,
         }
     }
 }
