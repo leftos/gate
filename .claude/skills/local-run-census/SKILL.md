@@ -65,7 +65,7 @@ Read `remote.json` (`%LOCALAPPDATA%\gate\remote.json`) and each repo's `.gate/lo
 |---|---|---|
 | **ready to route** | No `notRouted` reason left, or one a config change removes: a `remote.json` pattern the repo lacks, an `outputs` or `inputs` glob. A family that already routes and whose local runs carry no reason is here too, with no change. | The config change, or "routes already". |
 | **blocked on work** | A reason work can remove: a tool or SDK the builder lacks, a fallback reason that repeats, an outputs list that would need to grow, a `--local` reason showing a routing gap, a window or GL the desktop route can serve. | The blocker in one line, with the run count. |
-| **truly local** | The command names this PC's own state (its WSL state, an install into this PC's folders, a rig or measurement of this PC's own processes, a `git` or `prek` command writing this checkout's refs, a `git commit` with no gate nested in it), or its local median is shorter than what routing adds. | The reason. For the time case: the same repo's routed median minus local median of a comparable family, and which family. |
+| **truly local** | The command names this PC's own state (its WSL state, an install into this PC's folders, a rig or measurement of this PC's own processes, a `git` command, or a `prek` one naming no files, writing this checkout's refs, a `git commit` with no gate nested in it), or its local median is shorter than what routing adds. | The reason. For the time case: the same repo's routed median minus local median of a comparable family, and which family. |
 
 A reason work can remove never makes a family truly local: it is a blocker to book. A one-off scratch command (a `.tmp/` script, a probe project) is sorted like the command it wraps, and needs no booking when nothing in the repo runs it again.
 
@@ -75,7 +75,7 @@ A reason work can remove never makes a family truly local: it is a blocker to bo
 |---|---|
 | ready to route | The `remote.json` change (back the file up first, change only the repo's keys, as routing-a-repo.md says), or an Urgent or High step under GATE-192. |
 | blocked on work | A GATE issue, High, on the gate repo's routing path, citing the runs (repo, family, counts, window). |
-| truly local | The repo's `.gate/local.toml` pattern, or a row in routing-a-repo.md's table, with the reason. `git` and `prek` need neither: they stay local silently. A `git commit (ungated hooks)` row is never truly local: it is booked like any blocked-on-work family, in the repo whose hooks run ungated. |
+| truly local | The repo's `.gate/local.toml` pattern, or a row in routing-a-repo.md's table, with the reason. `git`, and a `prek` that names no files, need neither: they stay local silently. A `prek run --files` or `--all-files` routes on a pattern like any command. A `git commit (ungated hooks)` row is never truly local: it is booked like any blocked-on-work family, in the repo whose hooks run ungated. |
 
 ## The note
 

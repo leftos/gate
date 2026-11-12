@@ -666,6 +666,66 @@ fn no_non_empty_word_or_a_git_or_prek_command_stays_local() {
 }
 
 #[test]
+fn a_prek_run_naming_its_files_routes_on_its_repo_s_pattern() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["prek run *"]}}"#).expect("usable");
+    let commands: [&[&str]; 4] = [
+        &["prek", "run", "--files", "src/a.cs", "src/b.cs"],
+        &["prek", "run", "--all-files"],
+        &["prek", "run", "-a"],
+        &["PREK", "run", "--files=src/a.cs"],
+    ];
+    for command in commands {
+        let command = words(command);
+        let facts = FakeFacts::with_config(config.clone());
+        let run = routed(decide(&heavy(&command), &facts));
+        assert_eq!(run.pattern, "prek run *", "{command:?}");
+        assert_eq!(run.words, command, "{command:?}");
+    }
+    // A `.EXE` first word names `prek` too, so it no longer stays here silently: no pattern matches its text as written.
+    let named = words(&["PREK.EXE", "run", "--files=src/a.cs"]);
+    let facts = FakeFacts::with_config(config);
+    let route = decide(&heavy(&named), &facts);
+    assert_eq!(route, SILENT, "no pattern matches its text as written");
+    assert_eq!(
+        facts.matched_against.into_inner(),
+        Some(("PREK.EXE run --files=src/a.cs".to_owned(), false)),
+        "the patterns are asked about it, so it no longer stays here by name"
+    );
+}
+
+#[test]
+fn a_prek_command_that_names_no_files_stays_local_whatever_the_patterns() {
+    let commands: [&[&str]; 6] = [
+        &["prek", "run"],
+        &["prek", "run", "--hook-stage", "pre-commit"],
+        &["prek", "install"],
+        &["prek", "--files", "x", "run"],
+        &["prek", "autoupdate", "--all-files"],
+        &["prek", "run", "--from-ref", "a", "--to-ref", "b"],
+    ];
+    for command in commands {
+        let command = words(command);
+        let facts = FakeFacts::with_config(routing_all());
+        assert_eq!(decide(&heavy(&command), &facts), SILENT, "{command:?}");
+        assert_eq!(facts.asked(), ["config"], "{command:?}");
+    }
+}
+
+#[test]
+fn a_prek_run_naming_its_files_in_a_git_hook_stays_local() {
+    let command = words(&["prek", "run", "--files", "src/a.cs"]);
+    let inputs = Inputs {
+        git_hook: true,
+        ..heavy(&command)
+    };
+    let facts = hooks_facts(Some(r#"["yaat"]"#));
+    let route = decide(&inputs, &facts);
+    assert_eq!(route, SILENT);
+    assert_eq!(local_line(&route), None, "no line");
+    assert_eq!(facts.asked(), ["config"]);
+}
+
+#[test]
 fn a_covering_parent_keeps_it_here_silently_even_with_local_and_reads_no_routing_file() {
     let command = words(&["dotnet", "test"]);
     let facts = FakeFacts::at_root();
@@ -5335,10 +5395,28 @@ fn a_pin_of_git_is_refused() {
     for command in [words(&["git", "commit"]), words(&[r"C:\Program Files\Git\cmd\prek.exe", "run"])] {
         assert_eq!(
             refused(decide(&pinned_to(&command, "builder-1"), &facts)).line(),
-            "gate: --builder builder-1 cannot route this run: git, prek and an empty command never route",
+            "gate: --builder builder-1 cannot route this run: git, a prek command that names no files, and an empty command never route",
             "{command:?}"
         );
     }
+}
+
+#[test]
+fn a_pinned_prek_run_naming_its_files_in_a_git_hook_is_refused() {
+    let config = Config::parse(&format!(
+        r#"{{"host": "builder-1", "repos": {{"yaat": ["*"]}}, "hooks": ["yaat"], "builders": {MAC_AND_WIN}}}"#
+    ))
+    .expect("usable");
+    let facts = FakeFacts::with_config(config);
+    let command = words(&["prek", "run", "--all-files"]);
+    let hook = Inputs {
+        git_hook: true,
+        ..pinned_to(&command, "builder-1")
+    };
+    assert_eq!(
+        refused(decide(&hook, &facts)).line(),
+        "gate: --builder builder-1 cannot route this run: a prek inside a git hook never routes"
+    );
 }
 
 #[test]

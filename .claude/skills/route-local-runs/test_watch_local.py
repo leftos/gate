@@ -267,14 +267,33 @@ class CountingTests(Case):
     def test_git_and_prek_do_not_count(self) -> None:
         self.write_events(
             release(1, START, command="Git commit -m x"),
-            release(1, START, command="PREK run --all-files"),
+            release(1, START, command="prek run"),
+            release(1, START, command="prek run --hook-stage pre-commit"),
+            release(1, START, command="prek install"),
+            release(1, START, command=r"C:\tools\prek.exe run"),
+            release(1, START, command="git.exe status"),
             release(1, START, command="cargo test --workspace"),
         )
         status, text = self.scan()
         self.assertEqual(status, 0)
         self.assertNotIn("Git commit", text)
-        self.assertNotIn("PREK run", text)
+        self.assertNotIn("prek", text)
+        self.assertNotIn("git.exe", text)
         self.assertIn("cargo test --workspace", text)
+
+    def test_a_prek_run_naming_its_files_counts(self) -> None:
+        self.write_events(
+            release(1, START, command="prek run --files src/a.cs"),
+            release(1, START, command="PREK run --all-files"),
+            release(1, START, command="prek run -a"),
+            release(1, START, command=r".venv\Scripts\prek.exe run --all-files"),
+        )
+        status, text = self.scan()
+        self.assertEqual(status, 0)
+        self.assertIn("prek run --files src/a.cs", text)
+        self.assertIn("PREK run --all-files", text)
+        self.assertIn("prek run -a", text)
+        self.assertIn(".venv/Scripts/prek.exe run --all-files", text)
 
     def test_a_selftest_folder_does_not_count(self) -> None:
         self.write_events(
@@ -341,9 +360,7 @@ class ReportTests(Case):
 
     def test_a_no_pattern_run_shows_no_reason(self) -> None:
         self.write_events(
-            release(
-                1, START, sent_words="cargo build a.txt", notRouted="no pattern"
-            )
+            release(1, START, sent_words="cargo build a.txt", notRouted="no pattern")
         )
         status, text = self.scan(ask=lambda repo, words: False)
         self.assertEqual(status, 0)
@@ -361,9 +378,7 @@ class ReportTests(Case):
         status, text = self.scan(ask=lambda repo, words: False)
         self.assertEqual(status, 0)
         self.assertIn("reason=routable under parent", text)
-        self.assertIn(
-            "\n  routable inside: dotnet csharpier *, dotnet format *", text
-        )
+        self.assertIn("\n  routable inside: dotnet csharpier *, dotnet format *", text)
 
     def test_a_covered_line_outside_the_parents_run_is_not_its(self) -> None:
         self.write_events(

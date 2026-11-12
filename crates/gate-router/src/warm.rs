@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 use toml::{Table, Value};
 
-use crate::decide::stays_local;
+use crate::decide::names_git_or_prek;
 use crate::escape::escaped;
 
 /// The most commands a warm-up file may declare.
@@ -40,8 +40,8 @@ pub struct WarmupFile {
     pub timeout_seconds: Option<u64>,
 }
 
-/// The problem of the command `command` at `at`, from 0, which a routed run never sends ([`stays_local`]), by its first
-/// word as given.
+/// The problem of the command `command` at `at`, from 0, which a routed run never sends ([`names_git_or_prek`]), by its
+/// first word as given.
 #[must_use]
 pub fn never_sent_problem(at: usize, command: &[String]) -> String {
     let first = command.iter().find(|word| !word.is_empty()).map_or("", String::as_str);
@@ -54,7 +54,7 @@ pub fn never_sent_problems(commands: &[Vec<String>]) -> Vec<String> {
     commands
         .iter()
         .enumerate()
-        .filter(|(_, command)| stays_local(command))
+        .filter(|(_, command)| names_git_or_prek(command))
         .map(|(at, command)| never_sent_problem(at, command))
         .collect()
 }

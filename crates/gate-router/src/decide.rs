@@ -1156,10 +1156,10 @@ fn absent_line(names: &[String]) -> Option<String> {
 /// Where a gate's command runs. In order: only a heavy or light gate routes; a covering or lending parent keeps it here; `--local`
 /// keeps it here saying so; then the routing file is read, and no file keeps it here, an unusable one saying it was
 /// ignored; a git hook whose `hooks` names no repo, no non-empty word, or a first word whose file name without extension
-/// is `git` or `prek` keep it here; so does a folder in no git worktree, a repo the routing file does not list, a git
-/// hook whose repo its `hooks` does not name, and words (paths rewritten, joined by single spaces) none of the repo's
-/// patterns match, the first that matches winning. A first word the rewrite sends as a program's name that names `git`
-/// or `prek` keeps it here too. A matched command runs here, saying why, when the worktree's `.gate/local.toml`
+/// is `git` keep it here, and so does one that is `prek` unless it is a `prek run` naming its files; so does a folder in
+/// no git worktree, a repo the routing file does not list, a git hook whose repo its `hooks` does not name, and words
+/// (paths rewritten, joined by single spaces) none of the repo's patterns match, the first that matches winning. A
+/// command whose first word the rewrite sends as a program's name that stays here ([`stays_local`]) stays here too. A matched command runs here, saying why, when the worktree's `.gate/local.toml`
 /// declares a pattern its words match or has a problem, before any sibling or desktop check. It still runs here, saying
 /// why, when the worktree's `.gate/siblings.toml` has a problem or declares a sibling the routing file's `siblings` does
 /// not allow the repo, or declares present siblings from a root folder name the builder cannot lay out, or a sibling
@@ -1665,10 +1665,14 @@ fn desktop_under_parent(words: &[String], facts: &dyn Facts) -> Here {
     Some(LocalReason::DesktopUnderParent { pattern })
 }
 
-/// The routing file `config` once the command is no `git`, `prek` or empty one ([`stays_local`]) and, for a gate in a
-/// git hook, `hooks` names a repo.
+/// The routing file `config` once the command can route ([`stays_local`]) and, for a gate in a git hook, it is no
+/// [`hook_prek`] and `hooks` names a repo.
 fn routable(config: Config, inputs: &Inputs<'_>) -> Result<Config, Here> {
     if stays_local(inputs.words) {
+        return Err(None);
+    }
+    // A hook's own `prek` runs its hooks again, on a builder as here.
+    if hook_prek(inputs) {
         return Err(None);
     }
     if inputs.git_hook && !config.hooks_name_a_repo() {
@@ -1677,15 +1681,49 @@ fn routable(config: Config, inputs: &Inputs<'_>) -> Result<Config, Here> {
     Ok(config)
 }
 
-/// Whether the command can never route: it has no non-empty word, or its first one is `git` or `prek`, however
-/// spelled (`git.exe`, a full path to it). A caller holding words the rewrite has sent ([`Rewritten::words`]) asks the
-/// same of those, so a `git` the rewrite sends a name for stays here too.
+/// Whether the gate is in a git hook whose command's first word names `prek`.
+fn hook_prek(inputs: &Inputs<'_>) -> bool {
+    inputs.git_hook && first_word(inputs.words).is_some_and(|(_, word)| names_program(word, "prek"))
+}
+
+/// Whether the command can never route: one a warm-up or stage-prep file refuses ([`names_git_or_prek`]) unless it is a
+/// `prek run` naming its files ([`names_its_files`]). A caller holding words the rewrite has sent ([`Rewritten::words`])
+/// asks the same of those, so a `git` the rewrite sends a name for stays here too.
 #[must_use]
 pub fn stays_local(words: &[String]) -> bool {
+    if !names_git_or_prek(words) {
+        return false;
+    }
+    let Some((index, word)) = first_word(words) else {
+        return true;
+    };
+    !eq_ignoring_case(file_stem(word), "prek") || !names_its_files(&words[index + 1..])
+}
+
+/// Whether the command is one a warm-up or stage-prep file refuses: it has no non-empty word, or its first one's file
+/// stem is `git` or `prek` in any letter case.
+#[must_use]
+pub fn names_git_or_prek(words: &[String]) -> bool {
     first_word(words).is_none_or(|(_, word)| {
         let stem = file_stem(word);
         eq_ignoring_case(stem, "git") || eq_ignoring_case(stem, "prek")
     })
+}
+
+/// The words of a `prek run` that name the files it runs on, besides `--files=<path>`.
+const FILE_WORDS: [&str; 3] = ["--files", "--all-files", "-a"];
+
+/// Whether a `prek` command's words after the word `prek` name the files it runs on: the next non-empty word is `run`
+/// and a later one is `--files`, starts with `--files=`, or is one of [`FILE_WORDS`].
+fn names_its_files(after: &[String]) -> bool {
+    let mut rest = after.iter().map(String::as_str).filter(|word| !word.is_empty());
+    let Some(run) = rest.next() else {
+        return false;
+    };
+    if run != "run" {
+        return false;
+    }
+    rest.any(|word| FILE_WORDS.contains(&word) || word.starts_with("--files="))
 }
 
 /// Whether the words are a dotnet command: the first non-empty word's file name without extension is `dotnet`, or the
@@ -2031,9 +2069,9 @@ fn file_stem(path: &str) -> &str {
 /// with the siblings it declares, or with none when it has a problem, then matched, the first pattern that matches
 /// winning; only a matched command is kept here for a sibling ([`check_siblings`]). A command whose first word the
 /// rewrite sent as a program's name ([`Rewritten::program_named`]) that stays on this PC by that name ([`stays_local`])
-/// is no match: a `git` or `prek` under a path is read as one however the path is spelled. A gate started inside a git
-/// hook whose repo the routing file's `hooks` does not name stays here silently, before its siblings file is read, and
-/// so does one whose place cannot be read.
+/// is no match: a `git` command, or a `prek` one that is no `prek run` naming its files, under a path is read as one
+/// however the path is spelled. A gate started inside a git hook whose repo the routing file's `hooks` does not name
+/// stays here silently, before its siblings file is read, and so does one whose place cannot be read.
 ///
 /// A macOS pick runs the words rewritten with `/` ([`Separators::Slash`]) and its relative `\` paths the snapshot carries
 /// written with `/` ([`unix_form`]); a pick whose words still hold a `\` goes on, silently, to the next builder that is
@@ -3001,8 +3039,11 @@ fn kept_run(
     ended(config, matched, given, facts).map_err(Unkept::Here)
 }
 
-/// Why a pinned run whose command is `git`, `prek` or empty cannot route.
-const PIN_STAYS_LOCAL: &str = "git, prek and an empty command never route";
+/// Why a pinned run whose command is `git`, a `prek` naming no files or empty cannot route.
+const PIN_STAYS_LOCAL: &str = "git, a prek command that names no files, and an empty command never route";
+
+/// Why a pinned `prek` inside a git hook cannot route.
+const PIN_HOOK_PREK: &str = "a prek inside a git hook never routes";
 
 /// Why a pinned run started inside a git hook cannot route when `hooks` does not name its repo.
 const PIN_HOOK: &str = "a gate started in a git hook routes only for a repo remote.json's hooks names";
@@ -3059,7 +3100,7 @@ fn pinned(inputs: &Inputs<'_>, host: &str, facts: &dyn Facts) -> Result<RemoteRu
 }
 
 /// The routing file and the builder `host` names in it ([`Config::named_builder`]) for a run pinned to it, once the
-/// run may route at all ([`pin_eligible`]) and its command is no `git`, `prek` or empty one.
+/// run may route at all ([`pin_eligible`]) and its command can route ([`stays_local`]).
 fn pinned_builder(inputs: &Inputs<'_>, host: &str, facts: &dyn Facts) -> Result<(Config, Builder), PinRefusal> {
     pin_eligible(inputs, host)?;
     let config = pinned_config(facts)?;
@@ -3072,6 +3113,12 @@ fn pinned_builder(inputs: &Inputs<'_>, host: &str, facts: &dyn Facts) -> Result<
         return Err(PinRefusal::CannotRoute {
             host: host.to_owned(),
             why: PIN_STAYS_LOCAL.to_owned(),
+        });
+    }
+    if hook_prek(inputs) {
+        return Err(PinRefusal::CannotRoute {
+            host: host.to_owned(),
+            why: PIN_HOOK_PREK.to_owned(),
         });
     }
     Ok((config, builder))

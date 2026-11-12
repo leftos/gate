@@ -367,6 +367,10 @@ fn a_warm_up_file_with_a_problem_is_refused_with_no_call() {
             "commands = [[\"prek.exe\", \"run\"]]\n",
             "command 1 starts with prek.exe, which a routed run never sends".to_owned(),
         ),
+        (
+            "commands = [[\"prek\", \"run\", \"--all-files\"]]\n",
+            "command 1 starts with prek, which a routed run never sends".to_owned(),
+        ),
     ] {
         warmup_file(&case, text.as_bytes());
         let outcome = warm(&case, &steps, &[]);

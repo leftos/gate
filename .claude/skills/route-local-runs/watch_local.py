@@ -41,7 +41,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "local-run-censu
 import census
 
 SELFTEST_MARKER = "gate-selftest"
-KEPT_HERE = frozenset({"git", "prek"})
 # A `.tmp` path after the start of a word, up to whitespace or a quote, so a quoted
 # path keeps its closing quote.
 TMP_PATTERN = re.compile(r"(?<![\w./\\:])\.tmp/[^\s\"']+")
@@ -180,12 +179,6 @@ def shape_id(repo: str, shape: str) -> str:
     return hashlib.sha256(f"{repo}\n{shape}".encode()).hexdigest()[:8]
 
 
-def first_word(text: str) -> str:
-    """A command's first whitespace-separated word, or the empty string."""
-    words = text.split()
-    return words[0] if words else ""
-
-
 # ---------------------------------------------------------------- journal
 
 
@@ -318,6 +311,30 @@ def started_at(event: dict[str, Any]) -> datetime | None:
     return end - timedelta(seconds=seconds)
 
 
+def names_files(word: str) -> bool:
+    """Whether a ``prek`` argument names files: ``--files``, ``--files=...``, ``--all-files`` or ``-a``."""
+    return word in ("--files", "--all-files", "-a") or word.startswith("--files=")
+
+
+def kept_here(command: str) -> bool:
+    """Whether a command never routes: a ``git``, or a ``prek`` that runs without naming its files."""
+    words = command.split()
+    if not words:
+        return False
+    name = Path(words[0].replace("\\", "/")).stem.lower()
+    if name == "git":
+        return True
+    if name != "prek":
+        return False
+    words = command.split()
+    named = (
+        len(words) > 2
+        and words[1] == "run"
+        and any(names_files(word) for word in words[2:])
+    )
+    return not named
+
+
 def counts(event: dict[str, Any], cursor: datetime, min_seconds: float) -> bool:
     """Whether a journal line is a heavy local run after the cursor that took long enough."""
     if event.get("event") != "release" or event.get("kind") != "heavy":
@@ -330,7 +347,7 @@ def counts(event: dict[str, Any], cursor: datetime, min_seconds: float) -> bool:
     if seconds is None or seconds < min_seconds:
         return False
     command = str(event.get("command") or "")
-    if first_word(command).lower() in KEPT_HERE:
+    if kept_here(command):
         return False
     return SELFTEST_MARKER not in str(event.get("cwd") or "").lower()
 
@@ -710,7 +727,12 @@ def routable_inside(event: dict[str, Any], routable: Routable) -> list[str]:
     pid = event.get("pid")
     start = started_at(event)
     end = census.parse_time(event.get("time"))
-    if not isinstance(pid, int) or isinstance(pid, bool) or start is None or end is None:
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or start is None
+        or end is None
+    ):
         return []
     patterns: list[str] = []
     for moment, pattern in routable.get(pid, []):

@@ -22,7 +22,7 @@ use gate_args::{DEFAULT_STALL_SECONDS, Spelling, TestSeams, WarmRequest};
 use gate_router::warm::{
     DEFAULT_TIMEOUT_SECONDS, FailureClass, FileRead, Record, RecordRead, RecordState, WarmupFile, never_sent_problem, read_warmup, warmup_hash,
 };
-use gate_router::{Config, Facts, Place, Target, builder_words, escaped, repo_name, stays_local, target};
+use gate_router::{Config, Facts, Place, Target, builder_words, escaped, names_git_or_prek, repo_name, target};
 use gate_state::FallbackReason;
 use gate_state::v1::{self, WarmFailure, WarmRecord, WarmState};
 use gate_win32::{Interrupt, OwnedMutexGuard};
@@ -418,7 +418,7 @@ fn first_problem(problems: &[String]) -> String {
 }
 
 /// The commands of `file` as the builder of `target` runs them, as a routed run's words are made; a command a routed
-/// run keeps on this PC ([`stays_local`]) and a command whose words, as the rewrite leaves them, name a path outside
+/// run keeps on this PC ([`names_git_or_prek`]) and a command whose words, as the rewrite leaves them, name a path outside
 /// the worktree and its siblings are problems of the file. A first word naming a program by such a path is sent as the
 /// program's name, as a routed run sends it, and is no problem unless that name is one this PC keeps too. A problem's
 /// line names the file as `said`.
@@ -427,11 +427,11 @@ fn worded(target: &Target, file: &WarmupFile, machine: &Machine<'_>, said: &str)
         .iter()
         .enumerate()
         .map(|(at, command)| {
-            if stays_local(command) {
+            if names_git_or_prek(command) {
                 return Err(never_sent(said, at, command));
             }
             let sent = builder_words(target, command, machine);
-            if sent.program_named && stays_local(&sent.words) {
+            if sent.program_named && names_git_or_prek(&sent.words) {
                 return Err(never_sent(said, at, command));
             }
             match sent.outside {
@@ -447,7 +447,7 @@ fn worded(target: &Target, file: &WarmupFile, machine: &Machine<'_>, said: &str)
         .collect()
 }
 
-/// The end of a command of the warm-up file a routed run never sends: a command this PC keeps ([`stays_local`]), by its
+/// The end of a command of the warm-up file a routed run never sends: a command this PC keeps ([`names_git_or_prek`]), by its
 /// first word as given or by the program's name the rewrite sends for it; the file named as `said`.
 fn never_sent(said: &str, at: usize, command: &[String]) -> End {
     End::Usage(format!("gate: warm: {} {}", escaped(said), never_sent_problem(at, command)))

@@ -12,7 +12,11 @@ Every repo that runs heavy gates is in scope, and every heavy command family in 
 
   Either it cannot run anywhere but this PC (a command that names this PC's own WSL state, such as a `/mnt/x` path or a distro folder only this PC has, an install into this PC's own folders, or a git operation that writes this checkout's refs), or its run time is measured as shorter than what routing adds: the push, the outputs, the compression and the call overhead, taken from the repo's routed runs in the journal.
 
-  Any command whose first word is `git` or `prek` stays local silently. A `git commit` of a repo that `remote.json` lists in `commits` first routes its pre-commit stage (below) when it is eligible, and then the commit itself runs here. Otherwise the commit stays local, its hooks' gates route by their own patterns (`hooks` in `remote.json`), and a hook command that runs without a gate is never seen by routing.
+  Any command whose first word is `git`, or `prek` unless it is a `prek run` naming its files (`--files`, `--files=<path>`, `--all-files` or `-a`), stays local silently.
+
+  Such a `prek run` is an ordinary command a repo routes with a pattern such as `prek run *`: it reads the working-tree files the snapshot carries and writes no ref, where a bare `prek run` stashes the unstaged changes. A `prek` inside a git hook always stays local.
+
+  A `git commit` of a repo that `remote.json` lists in `commits` first routes its pre-commit stage (below) when it is eligible, and then the commit itself runs here. Otherwise the commit stays local, its hooks' gates route by their own patterns (`hooks` in `remote.json`), and a hook command that runs without a gate is never seen by routing.
 
   A reason that work can remove does not keep a family local. It is a blocker to book. Examples: a tool or SDK the builder lacks, a window or GL the desktop route can serve, a `--local` whose recorded reason shows a routing gap, an outputs list that would need to grow (a routed `dotnet build`'s own project bin needs no entry: it comes back with the repo's list). A command that writes tracked files (a generated cache, a data file, committed screenshots) needs no `outputs` entry either: tracked files come back by the sync-back, and an outputs glob over them only adds manifest cost. Its trial checks that the routed run writes the same bytes as a local one, since a tool that reads this PC's own installs (a config folder, a user profile) can write different ones on the builder.
 
