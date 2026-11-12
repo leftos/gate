@@ -645,10 +645,12 @@ struct Walker<'w> {
 /// files the globs refuse for their names ([`Globs::refuses_name`]), a name that is not Unicode included, named lossily;
 /// each at its PC path, a cross build's file mapped ([`cross::mapped_path`]) before the globs judge it, and ordered by
 /// that path. Each folder is opened beneath the top one name at a time, a link never followed; a link,
-/// a FIFO, a socket or a device is neither followed nor listed. A folder whose name is not plain or not Unicode is
-/// read, when `noting`, only to count the files below it ([`Globs::counts_below`]), which are only ever refused. Else
-/// the first folder that cannot be read, or entry that cannot be looked at, its path in the error; a name gone before
-/// its look is passed over.
+/// a FIFO, a socket or a device is neither followed nor listed. A folder below the top that holds a `pyvenv.cfg` which is
+/// no folder, a Python virtualenv, is not visited at all: nothing in it is listed, whatever the globs. The name is looked
+/// up as it is spelled, so the volume's own case rules decide. A folder whose name is not plain or not Unicode is read,
+/// when `noting`, only to count the files below it ([`Globs::counts_below`]), which are only ever refused. Else the first
+/// folder that cannot be read, or entry that cannot be looked at, its path in the error; a name gone before its look is
+/// passed over.
 fn walk(top: &Folder, top_path: &Path, asked: &Asked<'_>, noting: bool) -> io::Result<Walked> {
     let mut walker = Walker {
         top,
@@ -679,10 +681,13 @@ fn walk(top: &Folder, top_path: &Path, asked: &Asked<'_>, noting: bool) -> io::R
 impl Walker<'_> {
     /// Visits each entry of the folder `queued`; else the error that stopped the read. A folder read only to count goes
     /// on past an entry that cannot be looked at, which is then not counted: the count only names files the run leaves
-    /// out.
+    /// out. A virtualenv below the top is visited not at all, counted or not.
     fn read(&mut self, queued: &Queued) -> io::Result<()> {
         let full = queued.names.iter().fold(self.top_path.to_path_buf(), |full, name| full.join(name));
         let folder = folders_beneath(self.top, queued.names.iter().map(OsString::as_os_str)).map_err(|error| in_context(&full, &error))?;
+        if !queued.relative.is_empty() && is_virtualenv(&folder, &full)? {
+            return Ok(());
+        }
         for name in folder.entries().map_err(|error| in_context(&full, &error))? {
             let visited = self.visit(&folder, &full, queued, name);
             if !queued.counting {
@@ -737,6 +742,18 @@ impl Walker<'_> {
             relative: path,
             counting,
         });
+    }
+}
+
+/// Whether `folder`, at `full`, is a Python virtualenv: it holds `pyvenv.cfg`, which is no folder. The name is looked up
+/// as it is spelled, so the volume's own case rules decide; a name that is gone is no marker, and any other failed look
+/// is the error.
+fn is_virtualenv(folder: &Folder, full: &Path) -> io::Result<bool> {
+    let marker = OsStr::new("pyvenv.cfg");
+    match folder.stat_child(marker) {
+        Ok(stat) => Ok(stat.st_mode & libc::S_IFMT != libc::S_IFDIR),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(in_context(&full.join(marker), &error)),
     }
 }
 
@@ -2284,6 +2301,42 @@ pub(crate) mod tests {
             brought,
             Ok((None, NOTHING_PACKED.to_owned())),
             "a glob that does not name .tmp never reaches below it"
+        );
+    }
+
+    #[test]
+    fn a_file_inside_a_virtualenv_is_never_packed() {
+        let case = Case::new("pack-virtualenv");
+        case.write("bin/a.dll", b"a");
+        case.write(".venv/pyvenv.cfg", b"home");
+        case.write(".venv/lib/python3.13/site-packages/playwright/driver/package/bin/cli.js", b"cli");
+        case.write("odd/pyvenv.cfg/keep.txt", b"keep");
+        case.write("odd/bin/kept.dll", b"kept");
+        let asked = case.asked(&["**/bin/**"], true, '1');
+
+        let brought = bring(&asked, &Ok(Manifest::default()), None, &case.work(), &[]);
+
+        assert_eq!(brought, Ok((None, packed_line(2, '1'))));
+        let (mut members, _) = read_back(&case, &archive('1'), &Manifest::default(), &[]);
+        members.sort();
+        assert_eq!(
+            members,
+            [("bin/a.dll".to_owned(), b"a".to_vec()), ("odd/bin/kept.dll".to_owned(), b"kept".to_vec()),],
+            "a glob that reaches into a virtualenv brings nothing back from it"
+        );
+        let elsewhere = case.asked(&["**"], true, '2');
+        let brought = bring(&elsewhere, &Ok(Manifest::default()), None, &case.work(), &[]);
+        assert_eq!(brought, Ok((None, packed_line(3, '2'))));
+        let (mut members, _) = read_back(&case, &archive('2'), &Manifest::default(), &[]);
+        members.sort();
+        assert_eq!(
+            members,
+            [
+                ("bin/a.dll".to_owned(), b"a".to_vec()),
+                ("odd/bin/kept.dll".to_owned(), b"kept".to_vec()),
+                ("odd/pyvenv.cfg/keep.txt".to_owned(), b"keep".to_vec()),
+            ],
+            "a folder named pyvenv.cfg is no virtualenv, its own file is packed"
         );
     }
 

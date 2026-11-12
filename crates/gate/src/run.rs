@@ -68,7 +68,7 @@ use crate::nesting::{Nesting, Parent, covers, enclosing_of};
 use crate::no_build::{self, NothingBack, Unfound, Worktree};
 use crate::orphan::{self, Orphan};
 use crate::outputs::glob::Globs;
-use crate::outputs::{stale, walk::walk};
+use crate::outputs::{stale, walk::walk_outputs};
 use crate::remote::drain::{self, Drain, utc_clock};
 use crate::remote::syncback::Staged;
 use crate::remote::{self, KEY_WAIT_SLICE, KeyHold, KeyWait, RemoteCall, RemoteClient, RemoteOutcome, Split, git};
@@ -6704,7 +6704,7 @@ fn stale_lines(remote: &RemoteRun, outcome: &RemoteOutcome, words: Option<&[Stri
         .map(|sibling| (sibling.name.as_str(), sibling.root.as_str()))
         .collect();
     stale::stale_lines(&remote.root, &siblings, &judging, &brought_back, |root, globs| {
-        walk(Path::new(root), globs).map(|found| found.into_iter().map(|file| file.path).collect())
+        walk_outputs(Path::new(root), globs).map(|found| found.into_iter().map(|file| file.path).collect())
     })
 }
 

@@ -526,6 +526,35 @@ fn a_glob_naming_tmp_packs_the_file_below_it() {
 }
 
 #[test]
+fn a_glob_reaching_a_virtualenv_packs_nothing_from_it() {
+    let case = Case::new("box_outputs_virtualenv");
+    let command = [
+        FAKE_TOOL,
+        "write",
+        r".venv\pyvenv.cfg",
+        "home",
+        "write",
+        r".venv\Lib\site-packages\playwright\driver\package\bin\cli.js",
+        "cli",
+        "write",
+        r"bin\app.dll",
+        "dll",
+    ];
+    let mut payload = outputs_payload(&case, &command, &["**/bin/**"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\n.venv/\n")]);
+
+    let outcome = run_with_manifest(&case, &payload, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(has_line(&outcome.stderr, &packed_line(&payload, 1)), "{outcome:?}");
+    assert_eq!(
+        archive_files(&archive_path(&payload)),
+        expected(&[("bin/app.dll", "dll")]),
+        "a glob that reaches into a virtualenv brings nothing back from it"
+    );
+}
+
+#[test]
 fn box_run_never_packs_the_gate_s_own_tmp_names() {
     let case = Case::new("box_outputs_gate_tmp");
     let nonce = "0123456789abcdef0123456789abcdef";

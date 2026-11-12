@@ -5435,6 +5435,8 @@ Built verbs:
   The box's pack also takes from it the files the globs would select but for their names, those below such a folder included, to say them.
 
   A link or a junction, to a file or to a folder, is neither followed nor listed. A folder that cannot be read, or an entry whose metadata cannot be, fails the walk; a name that is not Unicode does not.
+
+  The walks of a run's outputs (each box's pack and listing, and the PC's stale-folder report) also pass over a Python virtualenv: a folder below the root holding a `pyvenv.cfg` that is no folder, looked up by name so the volume's own case rules apply. Nothing in it comes back, whatever the glob, and no line says so. A failed look at `pyvenv.cfg` fails the walk. The PC's manifest and the input walks still enter a virtualenv, so a box that does not pass over one packs only the venv files that differ.
 - Manifest: the PC's list of its matching files, sent as one line of JSON and a newline, `{"files":{"<path>":{"size":<bytes>,"modified":<file time>,"sha256":"<hex>"}}}`, paths relative to the worktree root and found without regard to case.
 
   The box's pack takes each file the manifest lacks, and each it holds that the run created or changed (the box's stat listing from just before the command lacks it or holds another size or last write) whose SHA-256 differs from the manifest's, skipping the paths of the run's back commit.

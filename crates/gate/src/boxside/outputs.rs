@@ -41,7 +41,7 @@ use crate::outputs::archive::pack;
 use crate::outputs::glob::Globs;
 use crate::outputs::hash::file_sha256;
 use crate::outputs::manifest::{Listing, Manifest, hash_possible_copies, select};
-use crate::outputs::walk::{Found, in_context, walk, walk_with_refused};
+use crate::outputs::walk::{Found, in_context, walk_outputs, walk_with_refused};
 
 /// How long an outputs archive is kept in the output folder before a run with output globs removes it, as the wrapper's
 /// `$OutputArchiveHours` keeps it.
@@ -370,7 +370,7 @@ pub(super) fn listing(asked: &Asked<'_>, work: &Path) -> (Option<Listing>, Optio
     let found = if globs.is_empty() {
         Vec::new()
     } else {
-        match walk(work, &globs) {
+        match walk_outputs(work, &globs) {
             Ok(found) => found,
             Err(error) => return (None, Some(unlisted_line(&error.to_string()))),
         }

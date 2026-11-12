@@ -175,7 +175,7 @@ mod tests {
 
     use super::{stale_folders, stale_line, stale_lines};
     use crate::outputs::walk::tests::tree;
-    use crate::outputs::walk::walk;
+    use crate::outputs::walk::walk_outputs;
 
     /// The output globs of a repo the routing file's `outputs` key does not name, as the router gives them.
     const DEFAULTS: [&str; 2] = DEFAULT_OUTPUTS;
@@ -196,7 +196,7 @@ mod tests {
         let root = tree("defaults", &["src/App/bin/Debug/x.dll", "src/Game/.godot/mono/temp/bin/Debug/y.dll"]);
 
         let found = stale_folders(
-            |globs| walk(&root, globs).map(|files| files.into_iter().map(|file| file.path).collect()),
+            |globs| walk_outputs(&root, globs).map(|files| files.into_iter().map(|file| file.path).collect()),
             &globs(&DEFAULTS),
             &globs(&[]),
         )

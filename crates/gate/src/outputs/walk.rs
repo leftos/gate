@@ -1,6 +1,8 @@
-//! The walk listing the files below a folder that a run's output globs match, as the PowerShell gate's
-//! `Get-OutputFile` lists them: an excluded folder is not entered, and a link or a junction, to a file or to a folder,
-//! is neither followed nor listed. A file whose name does not fit the outputs archive, or is not Unicode, is not listed,
+//! The walk listing the files below a folder that a run's globs match: an excluded folder is not entered, and a link or
+//! a junction, to a file or to a folder, is neither followed nor listed. [`walk`], which the inputs and the PC manifest
+//! use, lists what the PowerShell gate's `Get-OutputFile` lists. [`walk_outputs`] and [`walk_with_refused`], the walks of
+//! a run's outputs, also pass over a virtualenv below the root, a folder holding a `pyvenv.cfg` that is no folder, which
+//! the PowerShell gate does not. A file whose name does not fit the outputs archive, or is not Unicode, is not listed,
 //! nor is a folder whose name is not plain or not Unicode entered; the box's pack also notes each such file the globs
 //! would otherwise select, a folder's read through a verbatim path, to say it is skipped. What a walk finds, the list a
 //! found file goes on and the relative path of an entry are [`gate_inputs::walk`]'s; of those, only `Found` is
@@ -37,10 +39,12 @@ struct Folder {
     counting: bool,
 }
 
-/// One walk's state: whether it notes the refused files, what it found and the folders left to read.
+/// One walk's state: whether it notes the refused files, whether it passes over a virtualenv, what it found and the
+/// folders left to read.
 struct Walker<'globs> {
     globs: &'globs Globs,
     noting: bool,
+    skip_virtualenvs: bool,
     walked: Walked,
     folders: Vec<Folder>,
 }
@@ -48,21 +52,29 @@ struct Walker<'globs> {
 /// Every file below `root` that `globs` match, ordered by relative path; else the first folder that cannot be read, or
 /// entry whose metadata cannot be, its path in the error. A file or a folder whose name is not Unicode is passed over.
 pub(crate) fn walk(root: &Path, globs: &Globs) -> io::Result<Vec<Found>> {
-    walk_tree(root, globs, false).map(|walked| walked.found)
+    walk_tree(root, globs, false, false).map(|walked| walked.found)
+}
+
+/// [`walk`]'s files below `root` for a run's outputs: a virtualenv below the root, a folder holding a `pyvenv.cfg` that
+/// is no folder, is passed over whole, whatever the globs.
+pub(crate) fn walk_outputs(root: &Path, globs: &Globs) -> io::Result<Vec<Found>> {
+    walk_tree(root, globs, false, true).map(|walked| walked.found)
 }
 
 /// [`walk`]'s files below `root`, and beside them the files `globs` refuse for their names ([`Globs::refuses_name`]),
-/// a name that is not Unicode included, named lossily. A folder whose name is not plain or not Unicode is read through
-/// a verbatim path only to count the files below it ([`Globs::counts_below`]), which are only ever refused.
+/// a name that is not Unicode included, named lossily; a virtualenv below the root is passed over whole as [`walk_outputs`]
+/// passes over it. A folder whose name is not plain or not Unicode is read through a verbatim path only to count the files
+/// below it ([`Globs::counts_below`]), which are only ever refused.
 pub(crate) fn walk_with_refused(root: &Path, globs: &Globs) -> io::Result<Walked> {
-    walk_tree(root, globs, true)
+    walk_tree(root, globs, true, true)
 }
 
-/// The walk below `root`, noting the refused files when `noting`.
-fn walk_tree(root: &Path, globs: &Globs, noting: bool) -> io::Result<Walked> {
+/// The walk below `root`, noting the refused files when `noting` and passing over a virtualenv when `skip_virtualenvs`.
+fn walk_tree(root: &Path, globs: &Globs, noting: bool, skip_virtualenvs: bool) -> io::Result<Walked> {
     let mut walker = Walker {
         globs,
         noting,
+        skip_virtualenvs,
         walked: Walked::default(),
         folders: vec![Folder {
             full: root.to_path_buf(),
@@ -86,7 +98,11 @@ fn walk_tree(root: &Path, globs: &Globs, noting: bool) -> io::Result<Walked> {
 impl Walker<'_> {
     /// Visits each entry of `folder`; else the error that stopped the read. A folder read only to count goes on past an
     /// entry whose metadata cannot be read, which is then not counted: the count only names files the run leaves out.
+    /// A virtualenv below the root is visited not at all, counted or not.
     fn read(&mut self, folder: &Folder) -> io::Result<()> {
+        if self.skip_virtualenvs && !folder.relative.is_empty() && is_virtualenv(&folder.full)? {
+            return Ok(());
+        }
         for entry in fs::read_dir(&folder.full).map_err(|error| in_context(&folder.full, &error))? {
             let entry = entry.map_err(|error| in_context(&folder.full, &error))?;
             let visited = self.visit(&entry, folder);
@@ -141,6 +157,17 @@ impl Walker<'_> {
     }
 }
 
+/// Whether `folder` is a Python virtualenv: it holds `pyvenv.cfg`, which is no folder. The name is matched in any case,
+/// as NTFS and Python match it here; a name that is gone is no marker, and any other failed look is the error.
+fn is_virtualenv(folder: &Path) -> io::Result<bool> {
+    let marker = folder.join("pyvenv.cfg");
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) => Ok(!metadata.is_dir()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(in_context(&marker, &error)),
+    }
+}
+
 /// The entry `name` of `folder` as a verbatim `\\?\` path, which Windows opens under its very name, a trailing dot, a
 /// trailing space or a device name included; a `folder` already verbatim keeps its form.
 fn verbatim(folder: &Path, name: &OsStr) -> io::Result<PathBuf> {
@@ -175,7 +202,7 @@ pub(crate) mod tests {
 
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 
-    use super::{Found, verbatim, walk, walk_with_refused};
+    use super::{Found, verbatim, walk, walk_outputs, walk_with_refused};
     use crate::outputs::glob::Globs;
 
     /// A scratch folder for one test, emptied first, holding a file at each `/`-separated path of `files`, its text
@@ -268,6 +295,58 @@ pub(crate) mod tests {
     fn a_walk_with_no_globs_finds_nothing() {
         let root = tree("none", &["bin/a.dll"]);
         assert_eq!(walk(&root, &globs(&[])).expect("the tree can be walked"), []);
+    }
+
+    #[test]
+    fn a_walk_never_enters_a_virtualenv_whatever_the_glob() {
+        let root = tree(
+            "virtualenv",
+            &[
+                "pyvenv.cfg",
+                "bin/a.dll",
+                ".venv/pyvenv.cfg",
+                ".venv/Lib/site-packages/playwright/driver/package/bin/cli.js",
+                ".venv/Scripts/bin/python.exe",
+                "tools/env/PYVENV.CFG",
+                "tools/env/bin/tool.exe",
+                "odd/pyvenv.cfg/keep.txt",
+                "odd/bin/kept.dll",
+            ],
+        );
+        let bins = walk_outputs(&root, &globs(&["**/bin/**"])).expect("the tree can be walked");
+        assert_eq!(
+            paths_of(&bins),
+            ["bin/a.dll", "odd/bin/kept.dll"],
+            "a glob brings nothing back from a virtualenv"
+        );
+        let all = walk_outputs(&root, &globs(&["**"])).expect("the tree can be walked");
+        assert_eq!(
+            paths_of(&all),
+            ["bin/a.dll", "odd/bin/kept.dll", "odd/pyvenv.cfg/keep.txt", "pyvenv.cfg"],
+            "a folder named pyvenv.cfg is no virtualenv, and the walk's root is never one"
+        );
+        let named = walk_outputs(&root, &globs(&[".venv/**", ".venv/pyvenv.cfg"])).expect("the tree can be walked");
+        assert!(named.is_empty(), "no glob lifts a virtualenv, not even one naming its own path");
+        let walked = walk_with_refused(&root, &globs(&["**"])).expect("the tree can be walked");
+        assert!(walked.refused.is_empty(), "no file inside a virtualenv is noted as refused");
+        assert_eq!(
+            paths_of(&walked.found),
+            paths_of(&all),
+            "the refusing walk finds what the outputs walk does"
+        );
+        let plain_found = walk(&root, &globs(&["**"])).expect("the tree can be walked");
+        let plain = paths_of(&plain_found);
+        for path in [
+            ".venv/pyvenv.cfg",
+            ".venv/Lib/site-packages/playwright/driver/package/bin/cli.js",
+            "tools/env/PYVENV.CFG",
+            "tools/env/bin/tool.exe",
+        ] {
+            assert!(
+                plain.contains(&path),
+                "the plain walk, which inputs and the manifest use, still enters a virtualenv"
+            );
+        }
     }
 
     /// The `/`-separated paths of `files`.
