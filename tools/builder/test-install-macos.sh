@@ -105,6 +105,7 @@ FFmpeg
 Login PATH
 Git config
 Gate work root
+Playwright 1.65.1 Chromium
 System'
 
 case_list() {

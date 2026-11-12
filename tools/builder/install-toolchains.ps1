@@ -235,6 +235,31 @@ function Remove-BuilderWriteDeny {
     if ($LASTEXITCODE) { throw "icacls $Dir /remove:d *$userSid exited $LASTEXITCODE" }
 }
 
+# Installs the browsers one Playwright release pins into the machine-wide folder every user's process finds through
+# PLAYWRIGHT_BROWSERS_PATH, unless its dry run finds them all there already. $Playwright is the command that runs that
+# release's CLI: npx for an npm pin, uv tool run for a Python pin, since the two version lines do not always match.
+function Install-PlaywrightBrowser([string[]]$Playwright, [string[]]$Browsers) {
+    Sync-SessionPath
+    Remove-BuilderWriteDeny $playwrightDir
+    New-Item -ItemType Directory -Force $playwrightDir | Out-Null
+    $env:PLAYWRIGHT_BROWSERS_PATH = $playwrightDir
+    [Environment]::SetEnvironmentVariable('PLAYWRIGHT_BROWSERS_PATH', $playwrightDir, 'Machine')
+    $exe, $rest = $Playwright
+    $cli = $Playwright -join ' '
+    $dryRun = @(& $exe @rest install --dry-run @Browsers)
+    if ($LASTEXITCODE) { throw "$cli install --dry-run exited $LASTEXITCODE" }
+    $locations = @($dryRun | ForEach-Object { if ($_ -match '^\s*Install location:\s+(\S.*?)\s*$') { $Matches[1] } })
+    if (-not $locations) { throw "$cli install --dry-run printed no install location: $($dryRun -join ' | ')" }
+    if (@($locations | Where-Object { -not (Test-Path -LiteralPath $_) })) {
+        & $exe @rest install @Browsers
+        if ($LASTEXITCODE) { throw "$cli install $($Browsers -join ' ') exited $LASTEXITCODE" }
+    }
+    else {
+        Write-InstallLog "$cli browsers found at $($locations -join ', '); install skipped"
+    }
+    Add-BuilderWriteDeny $playwrightDir
+}
+
 $godotRoot = 'C:\godot'
 $playwrightDir = 'C:\ms-playwright'
 Invoke-Step 'Git 2.56.0.2' {
@@ -741,45 +766,13 @@ Invoke-Step 'pnpm 12.5.1' {
     & npm.cmd install -g pnpm@12.5.1
     if ($LASTEXITCODE) { throw "npm install -g pnpm exited $LASTEXITCODE" }
 }
-# A routed repo pins @playwright/test 1.63.0; its browsers live in one machine-wide folder every user's process finds.
-Invoke-Step 'Playwright 1.63.0 browsers' {
-    Sync-SessionPath
-    Remove-BuilderWriteDeny $playwrightDir
-    New-Item -ItemType Directory -Force $playwrightDir | Out-Null
-    $env:PLAYWRIGHT_BROWSERS_PATH = $playwrightDir
-    [Environment]::SetEnvironmentVariable('PLAYWRIGHT_BROWSERS_PATH', $playwrightDir, 'Machine')
-    $dryRun = @(& npx.cmd -y playwright@1.63.0 install --dry-run chromium webkit)
-    if ($LASTEXITCODE) { throw "npx playwright@1.63.0 install --dry-run exited $LASTEXITCODE" }
-    $locations = @($dryRun | ForEach-Object { if ($_ -match '^\s*Install location:\s+(\S.*?)\s*$') { $Matches[1] } })
-    if (-not $locations) { throw "npx playwright@1.63.0 install --dry-run printed no install location: $($dryRun -join ' | ')" }
-    if (@($locations | Where-Object { -not (Test-Path -LiteralPath $_) })) {
-        & npx.cmd -y playwright@1.63.0 install chromium webkit
-        if ($LASTEXITCODE) { throw "npx playwright@1.63.0 install chromium webkit exited $LASTEXITCODE" }
-    }
-    else {
-        Write-InstallLog "Playwright 1.63.0 browsers found at $($locations -join ', '); install skipped"
-    }
-    Add-BuilderWriteDeny $playwrightDir
-}
-# A user tool gate push syncs from claude-config pins playwright 1.64.1; its Chromium joins the same machine-wide folder.
-Invoke-Step 'Playwright 1.64.1 browsers' {
-    Sync-SessionPath
-    Remove-BuilderWriteDeny $playwrightDir
-    New-Item -ItemType Directory -Force $playwrightDir | Out-Null
-    $env:PLAYWRIGHT_BROWSERS_PATH = $playwrightDir
-    [Environment]::SetEnvironmentVariable('PLAYWRIGHT_BROWSERS_PATH', $playwrightDir, 'Machine')
-    $dryRun = @(& npx.cmd -y playwright@1.64.1 install --dry-run chromium)
-    if ($LASTEXITCODE) { throw "npx playwright@1.64.1 install --dry-run exited $LASTEXITCODE" }
-    $locations = @($dryRun | ForEach-Object { if ($_ -match '^\s*Install location:\s+(\S.*?)\s*$') { $Matches[1] } })
-    if (-not $locations) { throw "npx playwright@1.64.1 install --dry-run printed no install location: $($dryRun -join ' | ')" }
-    if (@($locations | Where-Object { -not (Test-Path -LiteralPath $_) })) {
-        & npx.cmd -y playwright@1.64.1 install chromium
-        if ($LASTEXITCODE) { throw "npx playwright@1.64.1 install chromium exited $LASTEXITCODE" }
-    }
-    else {
-        Write-InstallLog "Playwright 1.64.1 browsers found at $($locations -join ', '); install skipped"
-    }
-    Add-BuilderWriteDeny $playwrightDir
+# A routed repo pins @playwright/test 1.63.0.
+Invoke-Step 'Playwright 1.63.0 browsers' { Install-PlaywrightBrowser @('npx.cmd', '-y', 'playwright@1.63.0') @('chromium', 'webkit') }
+# A user tool gate push syncs from claude-config pins playwright 1.64.1.
+Invoke-Step 'Playwright 1.64.1 browsers' { Install-PlaywrightBrowser @('npx.cmd', '-y', 'playwright@1.64.1') @('chromium') }
+# dnd's pytest browser tests pin Python playwright 1.65.1, a release npm does not have, and launch headless Chromium.
+Invoke-Step 'Playwright 1.65.1 browsers' {
+    Install-PlaywrightBrowser @('uv', 'tool', 'run', '--from', 'playwright==1.65.1', 'playwright') @('chromium')
 }
 
 $gitSystemConfig = [ordered]@{ 'core.autocrlf' = 'false'; 'core.longpaths' = 'true'; 'gc.pruneExpire' = 'never' }

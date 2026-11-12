@@ -275,6 +275,10 @@ step_node() {
 
 # npm checks the package against the registry's integrity hash; the global prefix is the user-owned node folder.
 step_pnpm() { "$prefix/node/bin/npm" install -g --prefix "$prefix/node" pnpm@12.5.1; }
+# dnd's pytest browser tests pin Python playwright 1.65.1, a release npm does not have, so its own CLI installs the
+# Chromium it pins, into Playwright's default ~/Library/Caches/ms-playwright, where a routed run of the builder user finds
+# it. uv is the one the uv step put in <prefix>/bin.
+step_playwright_1651() { "$prefix/bin/uv" tool run --from playwright==1.65.1 playwright install chromium; }
 
 step_uv_prek() {
     mkdir -p "$prefix/bin"
@@ -839,6 +843,7 @@ step 'FFmpeg' step_ffmpeg
 step 'Login PATH' step_login_path
 step 'Git config' step_git_config
 step 'Gate work root' step_gate_root
+step 'Playwright 1.65.1 Chromium' step_playwright_1651
 step 'System' step_system
 
 if [ "$list" = 1 ]; then

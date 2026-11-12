@@ -1331,11 +1331,11 @@ try {
         return ''
     }
 
-    Test-Case 'the Playwright 1.64.1 step comes directly after the Playwright 1.63.0 step' {
+    Test-Case 'the Playwright 1.64.1 and 1.65.1 steps come directly after the Playwright 1.63.0 step' {
         $names = @(Get-StepName $sourceScript)
         $index = $names.IndexOf('Playwright 1.63.0 browsers')
         if ($index -lt 0) { return "the Playwright 1.63.0 step is missing from: $($names -join ', ')" }
-        $expected = @('Playwright 1.64.1 browsers')
+        $expected = @('Playwright 1.64.1 browsers', 'Playwright 1.65.1 browsers')
         $after = @($names | Select-Object -Skip ($index + 1) -First $expected.Count)
         if (($after -join ' | ') -ne ($expected -join ' | ')) {
             return "the steps after it are '$($after -join ''', ''')', expected '$($expected -join ''', ''')'"
@@ -1348,6 +1348,17 @@ try {
         if (-not $block) { return 'install-toolchains.ps1 has no Playwright 1.64.1 browsers step' }
         $text = $block.Extent.Text
         foreach ($wanted in 'playwright@1.64.1', 'chromium') {
+            if (-not $text.Contains($wanted)) { return "the step does not name '$wanted'" }
+        }
+        if ($text.Contains('webkit')) { return 'the step names webkit' }
+        return ''
+    }
+
+    Test-Case 'the Playwright 1.65.1 step installs chromium only' {
+        $block = Get-StepBlock 'Playwright 1.65.1 browsers'
+        if (-not $block) { return 'install-toolchains.ps1 has no Playwright 1.65.1 browsers step' }
+        $text = $block.Extent.Text
+        foreach ($wanted in 'playwright==1.65.1', 'chromium') {
             if (-not $text.Contains($wanted)) { return "the step does not name '$wanted'" }
         }
         if ($text.Contains('webkit')) { return 'the step names webkit' }
