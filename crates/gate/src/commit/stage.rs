@@ -52,6 +52,8 @@ pub(crate) enum Ineligible {
     StagedPath(String),
     /// The commit stages this path through this checkout filter.
     FilteredPath(String, String),
+    /// This submodule is checked out at a commit other than the one the index pins, which a hook may stage and a builder cannot see.
+    MovedSubmodule(String),
 }
 
 impl fmt::Display for Ineligible {
@@ -75,6 +77,7 @@ impl fmt::Display for Ineligible {
             Ineligible::FilteredPath(path, attribute) => {
                 write!(f, "the commit stages {} through {}", escaped(path), escaped(attribute))
             }
+            Ineligible::MovedSubmodule(path) => write!(f, "the submodule {} is checked out at a commit the index does not pin", escaped(path)),
         }
     }
 }
@@ -124,6 +127,8 @@ pub(crate) struct StageFacts {
     staged_path: Option<String>,
     /// The first staged path written through a checkout filter, and the filter; `None` for an unborn `HEAD`.
     filtered_path: Option<(String, String)>,
+    /// The first initialized submodule checked out at a commit other than the one the index pins.
+    moved_submodule: Option<String>,
 }
 
 /// The files and folders in the git folder that say a merge, cherry-pick, revert or rebase is in progress.
@@ -228,6 +233,7 @@ fn judge_facts(facts: &StageFacts) -> Result<(), Ineligible> {
             .filtered_path
             .clone()
             .map(|(path, attribute)| Ineligible::FilteredPath(path, attribute)),
+        facts.moved_submodule.clone().map(Ineligible::MovedSubmodule),
     ];
     reasons.into_iter().flatten().next().map_or(Ok(()), Err)
 }
@@ -358,6 +364,8 @@ pub(crate) fn stage_facts(root: &Path, git: &Git, bounds: GitBounds) -> Result<S
     let hook = hook_of(&hook_path(&asked, &places.common)?)?;
     let prek_config = prek_config(&asked)?;
     let (staged_path, filtered_path) = if places.unborn { (None, None) } else { staged(&asked)? };
+    let listing = asked.output(&["diff-files", "-z", "--raw", "--no-abbrev", "--ignore-submodules=dirty"], None)?;
+    let moved = moved_submodule(&listing);
     Ok(StageFacts {
         in_progress: places.in_progress,
         unborn: places.unborn,
@@ -367,6 +375,7 @@ pub(crate) fn stage_facts(root: &Path, git: &Git, bounds: GitBounds) -> Result<S
         prek_config,
         staged_path,
         filtered_path,
+        moved_submodule: moved,
     })
 }
 
@@ -538,6 +547,27 @@ fn staged(asked: &Asked<'_>) -> Result<(Option<String>, Option<Filtered>), GitEr
     Ok((forbidden, filtered))
 }
 
+/// The first initialized submodule checked out at a commit other than the one the index pins, from the raw listing of
+/// the worktree against the index: the first entry whose header's old and new modes are both the gitlink's, `160000`.
+/// The call's `--ignore-submodules=dirty` outranks `diff.ignoreSubmodules` and `.gitmodules`' `ignore`, so an edit
+/// inside a submodule at its pin never counts; a gitlink whose folder is gone has a new mode of `000000`, an
+/// uninitialized submodule, and never counts either. `diff-files` names no rename, so each header is followed by its
+/// one path.
+fn moved_submodule(listing: &str) -> Option<String> {
+    let mut fields = listing.split('\0');
+    while let Some(field) = fields.next() {
+        let Some(meta) = field.strip_prefix(':') else {
+            continue;
+        };
+        let words: Vec<&str> = meta.split(' ').collect();
+        let path = fields.next();
+        if words.first() == Some(&"160000") && words.get(1) == Some(&"160000") {
+            return path.map(str::to_owned);
+        }
+    }
+    None
+}
+
 /// The worktree's checkout attributes of each of `paths`, in its order, read as the sync-back reads them, fed in
 /// slices whose answers stay under git's output cap.
 fn attributes(asked: &Asked<'_>, paths: &[&str]) -> Result<Vec<Attributes>, GitError> {
@@ -582,6 +612,7 @@ mod tests {
             prek_config: None,
             staged_path: None,
             filtered_path: None,
+            moved_submodule: None,
         }
     }
 
@@ -794,6 +825,10 @@ mod tests {
                 Ineligible::FilteredPath("x.bin".to_owned(), "filter=lfs".to_owned()),
                 "the commit stages x.bin through filter=lfs",
             ),
+            (
+                Ineligible::MovedSubmodule("sub".to_owned()),
+                "the submodule sub is checked out at a commit the index does not pin",
+            ),
         ] {
             assert_eq!(reason.to_string(), line);
         }
@@ -820,6 +855,11 @@ mod tests {
     /// Stages every change in `root` and commits it with no hook run.
     fn commit_all(root: &Path, message: &str) {
         git_in(root, &["add", "-A"]);
+        commit_staged(root, message);
+    }
+
+    /// Commits what `root`'s index holds, staging nothing further, with no hook run.
+    fn commit_staged(root: &Path, message: &str) {
         git_in(
             root,
             &[
@@ -836,6 +876,28 @@ mod tests {
                 message,
             ],
         );
+    }
+
+    /// The commit `HEAD` names in `root`.
+    fn head(root: &Path) -> String {
+        git_in(root, &["rev-parse", "HEAD"]).trim().to_owned()
+    }
+
+    /// Pins a nested repository at `root/sub` in `root`'s index at the nested repository's first commit, which `root`
+    /// then commits: both of the nested repository's commits, its pin first, with `sub` left checked out at the other.
+    fn pinned_submodule(root: &Path) -> (String, String) {
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).expect("the submodule's folder can be made");
+        git_in(&sub, &["init", "--quiet"]);
+        fs::write(sub.join("s.txt"), "s\n").expect("a file can be written");
+        commit_all(&sub, "sub first");
+        let pin = head(&sub);
+        fs::write(sub.join("s.txt"), "s2\n").expect("a file can be rewritten");
+        commit_all(&sub, "sub second");
+        let moved = head(&sub);
+        git_in(root, &["update-index", "--add", "--cacheinfo", &format!("160000,{pin},sub")]);
+        commit_staged(root, "pin");
+        (pin, moved)
     }
 
     /// A repository for the test `name` with `a.txt` committed and prek's shim as its pre-commit hook.
@@ -902,6 +964,53 @@ mod tests {
         );
         assert_eq!(judged_in(&root), Err(Ineligible::StagedPath("sub".to_owned())));
         removed(&root);
+    }
+
+    #[test]
+    fn a_submodule_checked_out_at_its_pin_is_eligible() {
+        let root = repository("sub-pin");
+        let (pin, _) = pinned_submodule(&root);
+        git_in(&root.join("sub"), &["checkout", "--quiet", &pin]);
+        assert_eq!(judged_in(&root), Ok(()));
+        removed(&root);
+    }
+
+    #[test]
+    fn a_submodule_checked_out_away_from_its_pin_is_refused_whatever_its_ignore_settings_say() {
+        let root = repository("sub-moved");
+        pinned_submodule(&root);
+        git_in(&root, &["config", "diff.ignoreSubmodules", "all"]);
+        stage(&root, ".gitmodules", "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n\tignore = all\n");
+        commit_staged(&root, "gitmodules");
+        assert_eq!(judged_in(&root), Err(Ineligible::MovedSubmodule("sub".to_owned())));
+        removed(&root);
+    }
+
+    #[test]
+    fn edits_inside_a_submodule_at_its_pin_are_eligible() {
+        let root = repository("sub-edits");
+        let (pin, _) = pinned_submodule(&root);
+        git_in(&root.join("sub"), &["checkout", "--quiet", &pin]);
+        fs::write(root.join("sub").join("s.txt"), "s changed\n").expect("a file can be rewritten");
+        fs::write(root.join("sub").join("u.txt"), "u\n").expect("a file can be written");
+        assert_eq!(judged_in(&root), Ok(()));
+        removed(&root);
+    }
+
+    #[test]
+    fn an_uninitialized_submodule_is_eligible() {
+        let gone = repository("sub-gone");
+        pinned_submodule(&gone);
+        fs::remove_dir_all(gone.join("sub")).expect("the submodule's folder can be removed");
+        assert_eq!(judged_in(&gone), Ok(()), "a gitlink whose folder is gone");
+        removed(&gone);
+
+        let empty = repository("sub-empty");
+        pinned_submodule(&empty);
+        fs::remove_dir_all(empty.join("sub")).expect("the submodule's folder can be removed");
+        fs::create_dir_all(empty.join("sub")).expect("an empty folder can be made");
+        assert_eq!(judged_in(&empty), Ok(()), "a gitlink in an empty folder");
+        removed(&empty);
     }
 
     #[test]

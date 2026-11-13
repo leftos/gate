@@ -1818,8 +1818,9 @@ The router asks it through `Facts::commit_stage` (`Machine` in `route.rs`), only
 - a pre-commit hook that is not prek's shim, found through the repo's own `core.hooksPath` setting (read from git config, never the command line's, which the gate's own git calls set) else `{git-common-dir}/hooks`, or a `pre-commit.legacy` beside it.
 - unstaged or untracked changes to `prek.toml` or `.pre-commit-config.y(a)ml`; a config whose times alone changed counts as changed.
 - a staged path the sync-back never writes (`.git*`, `.lfsconfig`, a gitlink, a symlink) or one through a checkout filter, judged with the sync-back's own functions.
+- an initialized submodule checked out at a commit other than the one the index pins (`the submodule <path> is checked out at a commit the index does not pin`): a hook may stage the new pin, and on a builder the submodule's folder holds no `.git`, so the hook would find nothing to stage there and the passed stage would keep it from running here. It is read with `git diff-files --raw --ignore-submodules=dirty`, whose command-line setting outranks `diff.ignoreSubmodules` and `.gitmodules`' `ignore`; edits inside the submodule never count, nor does a gitlink with no folder.
 
-The staged listing and the prek-config check use plumbing (`diff-index --cached`, `diff-files`), so the user's diff config does not change them and they never write the real index.
+The staged listing, the submodule check and the prek-config check use plumbing (`diff-index --cached`, `diff-files`), so the user's diff config does not change them and they never write the real index.
 
 The key is for check-only hook commands (a build, clippy, a format check): a routed fixer's patch comes back to the worktree under prek's stash. The hook entry calls `gate run ... -- <heavy command>`.
 
