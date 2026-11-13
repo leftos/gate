@@ -416,6 +416,14 @@ A worktree has one work folder on each builder, and its routed runs take turns o
 
 To fan out, loop over the runs inside one gate call (a tracked wrapper script the repo routes), which keeps one warm folder and pays one push. A fan-out of long, independent runs can use one worktree per lane instead, each lane a cold folder on its first run. The gate gives one worktree no second work folder, since each would be a cold build and its own disk on the builder.
 
+## A repo that builds a Godot project
+
+Route the project's `--import` step beside its `--build-solutions` step, and list the import's state in `outputs`: `<project>/.godot/imported/**`, `<project>/.godot/editor/**`, `<project>/.godot/*.cfg` and `<project>/.godot/*.bin`. `.godot/` is gitignored, so the snapshot never sends it: an import run here leaves the builder's work folder with nothing imported, and the routed `--build-solutions` that follows imports every asset again.
+
+Godot's threaded import can corrupt its own heap now and then, on this PC and on a builder alike, and the run ends in a crash status (an access violation or a heap corruption) that a rerun does not repeat. A caller script reruns a Godot step once when it ends that way; clearing the work folder does not help, since the cold import that follows is the step that crashes.
+
+Ignore `*.tmp` and `~RF*.TMP` in the repo's `.gitignore`. Godot saves a file by writing a temporary beside it and swapping it in, so a crash mid-save leaves those names behind, and the sync-back brings back every untracked file a run leaves, as a local run would leave it in the worktree.
+
 ## A repo that builds with Unreal Engine
 
 The engine is not in the worktree and not on the builder's `PATH`: the builder holds its engines side by side under `GATE_UNREAL_ROOT`, one subfolder per version named `x.y.z`, each with `Engine\Build\Build.version` ([design.md, Tool probes](design.md#the-box-side)). The engine install is not part of `tools/builder/install-toolchains.ps1`: a session installs an engine by hand over ssh. `gate check --builder` shows the versions it lists.
