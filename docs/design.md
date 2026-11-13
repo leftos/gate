@@ -239,11 +239,23 @@ With nothing to push or nowhere to push it, `gate push` tries no builder, prints
 
    A user tool is a tool of the PC user's home that a routed command runs from there (the `userTools` key of [remote.json](#remotejson)). Every Windows builder the push reaches gets every tool of the table, the distinct paths of all repos in table order, so a run pinned to any of them finds its copy. The tools travel as a fourth stdin line of the builder call, gzipped JSON holding each path with its files and the PC's fingerprint ([user tool fingerprint](GLOSSARY.md)).
 
+   An installed tool of the godot-mcp layout ships `versions/<name>/` whole, then `godot-mcp.exe`, `VERSION` and `current` last; `<name>` is the first line of `current` (a leading UTF-8 BOM ignored, as the launcher reads it). It never ships `install.lock`, `godot-mcp.exe.old-*` or another version folder. Its fingerprint is the installed one ([user tool fingerprint](GLOSSARY.md)), and `gate push` reads the whole layout.
+
+   A layout that cannot be read says `push: cannot read this PC's <path>: <why>; not synced`.
+
+   The reason is one of `cannot read current: …`, `cannot read VERSION: …`, `current names "<x>", which is not a version folder name`, `current is not UTF-8`, `versions/<name>/godot-mcp.exe is missing`, `versions/<name>/VERSION differs from VERSION`, `<path> is a link` (also for `versions` or `versions/<name>` itself), `… is not a plain file`, `a name in … is not UTF-8` or `VERSION or current changed during the read`.
+
+   A routed run says the same reason after `gate: not routed: cannot read this PC's <path>:` and stays here.
+
    The builder script checks every path and file name first (a path is `~/` and then names, none empty, `.` or `..`, no `\`, `:` or character below U+0020), so a refused tool writes nothing.
 
    Per tool the script deletes only the files the copy's `.installed-files` manifest names that the new list drops (a plain file only, never a link, and the empty folders above it up to but never the copy itself or a `node_modules`), writes the files, writes the new manifest. No delete or write goes through a linked folder: a delete under one is skipped, and a write under one fails the sync.
 
-   Before its first write it writes the manifest as the old and new lists together, so a sync that fails partway leaves no file it wrote unlisted. Each file is deleted before it is written, so a rename that changes only letter case shows on the builder.
+   Before its first write it writes the manifest as the old and new lists together, so a sync that fails partway leaves no file it wrote unlisted.
+
+   A file whose bytes already match (same length and SHA-256) and whose name on disk has the listed case is not rewritten, so an unchanged file held open does not fail the sync; any other file is deleted before it is written, so a rename that changes only letter case shows on the builder. Files are written in the order the PC lists them, which puts an installed tool's `current` last.
+
+   Old version folders of an installed tool go through the manifest like any dropped file. A file a running process holds makes that tool's sync fail, so push between runs.
 
    It then runs `pnpm.cmd install --frozen-lockfile` in the copy when the tool has a lock that differs from the one recorded or the copy has no `node_modules`, and writes `.installed-from` (`<fingerprint> <lock>`) last. A copy with no manifest, such as one the installer made, loses nothing.
 
@@ -3068,15 +3080,25 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   `gate remote add` refuses a bad glob with `the result has a problem the file did not have: carriedFolders."<repo>"[<i>] …`.
 
-  `userTools` is an optional object mapping a repo name, matched in any letter case, to an array of `{"path": "~/...", "commands": ["<pattern>", ...]}` objects (exactly those two keys): the user-level tools, folders below the PC user's home, that the repo's commands run, and the command patterns (as `repos` patterns) that use each. Example: `{"userTools": {"world-of-intrigue": [{"path": "~/.claude/tools/mock-three", "commands": ["pwsh -NoProfile -File tools/mock-shoot.ps1*"]}]}}`.
+  `userTools` is an optional object mapping a repo name, matched in any letter case, to an array of `{"path": "~/...", "commands": ["<pattern>", ...]}` objects, with an optional third key `installed` (below), and no other key: the user-level tools, folders below the PC user's home, that the repo's commands run, and the command patterns (as `repos` patterns) that use each.
+
+  Example: `{"userTools": {"world-of-intrigue": [{"path": "~/.claude/tools/mock-three", "commands": ["pwsh -NoProfile -File tools/mock-shoot.ps1*"]}]}}`.
 
   A routed run whose command matches an entry's pattern checks the builder's copy of that tool, and `gate push` syncs every tool of the table to each Windows builder it reaches ([Routing](#routing), User tools; [`gate push`](#gate-push)). A `path` is `~/` and then `/`-separated names, none empty, `.` or `..`, and no `\` or `:`.
+
+  `installed` names a layout built into the gate, and the only one is `"godot-mcp"`: `{"path": "~/AppData/Local/godot-mcp", "installed": "godot-mcp", "commands": ["<pattern>"]}`, the folder godot-mcp's release installer lays out as `%LOCALAPPDATA%\godot-mcp`. With no `installed` key the path is a git folder.
+
+  A caller's wrapper runs `$env:LOCALAPPDATA\godot-mcp\godot-mcp.exe` on both machines, and a windowed or audible godot-mcp capture is a desktop run (the repo's `.gate/desktop.toml` and the `desktop` consent of `remote.json`).
 
   A `userTools` that cannot be used refuses nothing else: no tool is checked or synced for any repo, and routing uses the rest of the file. A routed run says `gate: remote.json userTools cannot be used: <problem>; no user tool checked`, `gate push` says `push: remote.json userTools cannot be used: <problem>; no user tool synced` and exits 1, and `gate check` lists the problem.
 
   The reasons are `userTools must be a JSON object`, `userTools."<repo>" is not an array`, `userTools."<repo>"[<i>] is not an object with a path and commands`, `userTools."<repo>"[<i>].path is not a home-relative folder (~/...): "<path>"`, `userTools."<repo>"[<i>].commands is not a non-empty array`, `userTools."<repo>"[<i>].commands[<j>] …` for a pattern that is not valid.
 
+  An `installed` that is not a string, or names no layout, says `userTools."<repo>"[<i>].installed names no layout gate knows ("godot-mcp"): <value>`, and any other key makes the entry not an object with a path and commands.
+
   Two paths where one is the other or holds the other make the table unusable, across every repo, compared by name ignoring letter case: `userTools."<repo>"[<i>].path "<path>" holds or is held by userTools."<other>"[<j>].path "<other>"` for two paths where one is the other or holds the other, compared by name ignoring letter case, across every repo (the same path written the same way twice is one tool).
+
+  One path listed as a git folder and as an installed one is a table problem naming both: `… is a git folder and … an installed "godot-mcp" one`.
 
   `desktop` is an optional object mapping a repo name, matched in any letter case, to an array of the `.gate/desktop.toml` patterns the machine lets that repo run on the builder's desktop (`Config::allowed_desktop`); a declared pattern is consented only when listed exactly, letter case included. A repo with no entry is allowed none.
 
@@ -3401,6 +3423,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     **User tools.** A routed run whose command one of a `userTools` entry's `commands` patterns matches (matched against the words the routing pattern matched) checks the builder's copy of that tool, each path once.
 
     Before the preflight the client computes this PC's fingerprint of each such tool ([user tool fingerprint](GLOSSARY.md)): `git ls-files -z` in the tool's folder under the PC user's home, then SHA-256 over each tracked file's path, a NUL, its length, a NUL and its bytes, sorted by path. The preflight's `UserTools` lists the paths.
+
+    An [installed user tool](GLOSSARY.md) has no git folder: its print is SHA-256 over the kind tag `installed godot-mcp` and the raw bytes of `VERSION` and `current`, framed as the git print is, with lock `-`. The run's PC-side print reads only those two files, never the version folder, and the compare and refusals below are the same.
 
     The Windows box answers each with `gate: remote user tool <path> <fingerprint|missing>`, read from `<USERPROFILE>\<path>\.installed-from` (its first token), after the tool lines. A copy that is missing, or records another fingerprint, refuses the route for `tools`, so the next capable builder may take the run: `gate: not routed: <host> has no copy of <path>; run gate push` or `gate: not routed: <host>'s copy of <path> differs from this PC's; run gate push`.
 

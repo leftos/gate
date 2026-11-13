@@ -45,7 +45,7 @@ use gate_wire::{EngineKind, build_version};
 use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
-use gate_router::{BuilderOs, Config, DROPPED_NO_BUILD_LINE, SendPlan, build_settings, escaped, repo_name};
+use gate_router::{BuilderOs, Config, DROPPED_NO_BUILD_LINE, SendPlan, UsedTool, build_settings, escaped, repo_name};
 use gate_wire::{
     BACK_COMMIT_NONE, CREATED_PREFIX, NEW_WORK_TREE, PairRefused, Payload, SDKS_PREFIX, SHA256_DIGITS, USER_TOOL_PREFIX, VERSION_PREFIX, WARM_PREFIX,
     channel_prefix, checkout_prefix, is_cross_not_brought_back, is_lower_hex, warm_line,
@@ -2603,23 +2603,24 @@ impl Attempt<'_, '_> {
     /// it the check that the builder's copy of each is this PC's ([`Attempt::user_tools_current`]).
     fn preflighted(&mut self, location: &Location, needs: &[(String, String)]) -> Result<Prepared, End> {
         let prints = self.user_tool_prints()?;
-        let prepared = self.preflight(location, needs, self.call.user_tools)?;
+        let paths: Vec<String> = prints.iter().map(|(path, _)| path.clone()).collect();
+        let prepared = self.preflight(location, needs, &paths)?;
         self.carried.add(self.call.host(), prepared.new_tree, &prepared.created);
         self.user_tools_current(&prints, &prepared)?;
         Ok(prepared)
     }
 
     /// This PC's fingerprint of each user tool the route matched for the command, with its path, in the route's order
-    /// ([`user_tool::print`]); none when it matched none. A copy that cannot be read keeps the run here, saying why.
+    /// ([`user_tool::fingerprint`]); none when it matched none. A copy that cannot be read keeps the run here, saying why.
     fn user_tool_prints(&mut self) -> Result<Vec<(String, String)>, End> {
-        let paths: &[String] = self.call.user_tools;
-        let mut prints = Vec::with_capacity(paths.len());
-        for path in paths {
-            match self.user_tool_print(path) {
-                Ok(fingerprint) => prints.push((path.clone(), fingerprint)),
+        let tools: &[UsedTool] = self.call.user_tools;
+        let mut prints = Vec::with_capacity(tools.len());
+        for tool in tools {
+            match self.user_tool_print(tool) {
+                Ok(fingerprint) => prints.push((tool.path.clone(), fingerprint)),
                 Err(why) => {
                     // A copy this PC cannot read is the PC's own failure, which no other builder helps with.
-                    self.say(format!("gate: not routed: cannot read this PC's {}: {why}", escaped(path)));
+                    self.say(format!("gate: not routed: cannot read this PC's {}: {why}", escaped(&tool.path)));
                     return Err(End::Refused(FallbackReason::Client));
                 }
             }
@@ -2627,15 +2628,15 @@ impl Attempt<'_, '_> {
         Ok(prints)
     }
 
-    /// The fingerprint of this PC's copy of the user tool at the home-relative `path`: its tracked files, as `git
-    /// ls-files -z` run in its folder lists them, asked with no worktree's variables; else why it cannot be read.
-    fn user_tool_print(&self, path: &str) -> Result<String, String> {
-        let listed = user_tool::read(path, |folder| {
+    /// The fingerprint of this PC's copy of the user tool `tool` by its kind ([`user_tool::fingerprint`]): a git
+    /// folder's tracked files, as `git ls-files -z` run in its folder lists them, asked with no worktree's variables,
+    /// or an installed folder's `VERSION` and `current`; else why it cannot be read.
+    fn user_tool_print(&self, tool: &UsedTool) -> Result<String, String> {
+        user_tool::fingerprint(tool, |folder| {
             Git::find(folder)?
                 .output_bytes_within(&self.git_call(folder, &["ls-files", "-z"], &[], None), git::OUTPUT_CAP)
                 .map_err(String::from)
-        });
-        listed.map(|print| print.fingerprint)
+        })
     }
 
     /// Keeps the run here when the builder's copy of a user tool of `prints`, this PC's fingerprints, is not this

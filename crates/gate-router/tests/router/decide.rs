@@ -9,9 +9,10 @@ use gate_router::desktop::{DesktopDeclaration, DesktopMode};
 use gate_router::windows::WindowsChange;
 use gate_router::{
     BuildSettings, BuildTarget, Builder, BuilderOs, CARRIED_INPUT, Config, ConfigProblem, CrossBlocked, CrossTarget, DROPPED_NO_BUILD_LINE,
-    DotnetTarget, ElsewhereRead, Facts, FolderSends, GitignoredInput, Inputs, LocalReason, NO_OUTPUTS_LINE, Nested, PROJECT_EXTENSIONS, Pattern,
-    PinRefusal, Place, RemoteRun, Route, SiblingFolder, Slot, Target, build_settings, builder_words, decide, dotnet_builds, dotnet_target, is_cargo,
-    is_dotnet, is_usable_host, later_run, named_tree_paths, pattern_for, sdk_build_target, target, without_no_build, work_folder_key,
+    DotnetTarget, ElsewhereRead, Facts, FolderSends, GitignoredInput, Inputs, InstalledLayout, LocalReason, NO_OUTPUTS_LINE, Nested,
+    PROJECT_EXTENSIONS, Pattern, PinRefusal, Place, RemoteRun, Route, SiblingFolder, Slot, Target, UsedTool, UserToolKind, build_settings,
+    builder_words, decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet, is_usable_host, later_run, named_tree_paths, pattern_for,
+    sdk_build_target, target, without_no_build, work_folder_key,
 };
 
 use crate::support::{FakeFacts, HEAD, ROOT, carried, fake_id, heavy, light, place_at, sibling_root, words};
@@ -8097,15 +8098,37 @@ fn using_user_tools(table: Option<&str>) -> FakeFacts {
     FakeFacts::with_config(Config::parse(&text).expect("usable"))
 }
 
+/// The paths of the user tools `run` carries, in its order.
+fn tool_paths(run: &RemoteRun) -> Vec<&str> {
+    run.user_tools.iter().map(|tool| tool.path.as_str()).collect()
+}
+
 #[test]
 fn a_routed_command_a_user_tool_pattern_matches_carries_its_path() {
     let facts = using_user_tools(Some(
         r#"{"YAAT": [{"path": "~/.claude/tools/mock-three", "commands": ["pwsh -NoProfile -File tools?mock-shoot.ps1 *"]}]}"#,
     ));
     let run = routed(decide(&heavy(&words(&MOCK_SHOOT_TOOL)), &facts));
-    assert_eq!(run.user_tools, ["~/.claude/tools/mock-three"]);
+    assert_eq!(tool_paths(&run), ["~/.claude/tools/mock-three"]);
     assert_eq!(run.user_tools_problem, None);
     assert!(!run.lines().iter().any(|said| said.contains("userTools")), "{:?}", run.lines());
+}
+
+#[test]
+fn a_routed_command_an_installed_user_tool_pattern_matches_carries_its_path_and_kind() {
+    let facts = using_user_tools(Some(
+        r#"{"yaat": [{"path": "~/AppData/Local/godot-mcp", "installed": "godot-mcp",
+                      "commands": ["pwsh -NoProfile -File tools?mock-shoot.ps1 *"]}]}"#,
+    ));
+    let run = routed(decide(&heavy(&words(&MOCK_SHOOT_TOOL)), &facts));
+    assert_eq!(
+        run.user_tools,
+        [UsedTool {
+            path: "~/AppData/Local/godot-mcp".to_owned(),
+            kind: UserToolKind::Installed(InstalledLayout::GodotMcp),
+        }]
+    );
+    assert_eq!(run.user_tools_problem, None);
 }
 
 #[test]
@@ -8122,7 +8145,7 @@ fn a_macos_pick_matches_user_tools_on_the_words_the_routing_pattern_matched() {
     let run = routed(decide(&heavy(&command), &facts));
     assert_eq!(run.builder, mac_builder());
     assert_eq!(
-        run.user_tools,
+        tool_paths(&run),
         ["~/.claude/tools/mock-three"],
         "the text before the macOS rewrite: {:?}",
         run.words
@@ -8134,10 +8157,10 @@ fn a_routed_command_no_user_tool_pattern_matches_carries_no_user_tool() {
     let tool = r#"[{"path": "~/.claude/tools/mock-three", "commands": ["pwsh -NoProfile -File tools?mock-shoot.ps1 *"]}]"#;
     let other = words(&["pwsh", "-NoProfile", "-File", "tools/other.ps1", "x"]);
     let routed_one = routed(decide(&heavy(&other), &using_user_tools(Some(&format!(r#"{{"yaat": {tool}}}"#)))));
-    assert_eq!(routed_one.user_tools, Vec::<String>::new(), "a command no pattern matches");
+    assert_eq!(tool_paths(&routed_one), Vec::<&str>::new(), "a command no pattern matches");
     for table in [None, Some(format!(r#"{{"other": {tool}}}"#)), Some(r#"{"yaat": []}"#.to_owned())] {
         let run = routed(decide(&heavy(&words(&MOCK_SHOOT_TOOL)), &using_user_tools(table.as_deref())));
-        assert_eq!(run.user_tools, Vec::<String>::new(), "{table:?}");
+        assert_eq!(tool_paths(&run), Vec::<&str>::new(), "{table:?}");
         assert_eq!(run.user_tools_problem, None, "{table:?}");
     }
 }
@@ -8149,7 +8172,7 @@ fn two_entries_naming_one_path_carry_it_once() {
                      {"path": "~/b", "commands": ["* -Page *"]}, {"path": "~/c", "commands": ["node *"]}]}"#,
     ));
     let run = routed(decide(&heavy(&words(&MOCK_SHOOT_TOOL)), &facts));
-    assert_eq!(run.user_tools, ["~/b", "~/a"], "each path once, in file order");
+    assert_eq!(tool_paths(&run), ["~/b", "~/a"], "each path once, in file order");
 }
 
 #[test]
@@ -8162,7 +8185,7 @@ fn an_unusable_user_tools_table_checks_no_user_tool_and_still_routes() {
         (r#"[{"path": "~/a", "commands": ["pwsh *"]}]"#, "userTools must be a JSON object"),
     ] {
         let run = routed(decide(&heavy(&words(&MOCK_SHOOT_TOOL)), &using_user_tools(Some(table))));
-        assert_eq!(run.user_tools, Vec::<String>::new(), "{table}");
+        assert_eq!(tool_paths(&run), Vec::<&str>::new(), "{table}");
         assert_eq!(run.user_tools_problem.as_deref(), Some(problem), "{table}");
         let line = format!("gate: remote.json userTools cannot be used: {problem}; no user tool checked");
         assert_eq!(

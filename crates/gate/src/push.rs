@@ -33,7 +33,7 @@ use base64::engine::general_purpose::STANDARD;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use gate_args::{PruneRequest, PruneSeams, PushRequest};
-use gate_router::{BuilderOs, Config, UserTool, escaped, is_unix_root};
+use gate_router::{BuilderOs, Config, UsedTool, UserTool, escaped, is_unix_root};
 use gate_win32::{EnvironmentBlock, Job, LaunchError, PipedConsole, PipedFed, PipedLaunch, Running};
 use gate_wire::slots::{MOST_LINE_BYTES, MOST_SLOTS};
 use serde_json::{Value, json};
@@ -188,7 +188,9 @@ const BOOTSTRAP: &str = "$l=[Console]::In.ReadLine();. ([ScriptBlock]::Create([T
 /// each folder above it that this leaves empty, up to but never the copy itself, never a `node_modules` and never a
 /// link; it walks no folder, so a copy with no manifest loses nothing. It then writes the manifest of the old and the
 /// new names together, so a sync that fails partway still lists every file it wrote, and writes each file's bytes as
-/// they came, deleting a plain file there first so the name takes the listed case, making its folders, and failing for
+/// they came, in the order the tool lists them, leaving a plain file there untouched when its name has the listed case
+/// and its bytes already match (the same length, then the same SHA-256), so a file a running process holds is not
+/// rewritten; else deleting a plain file there first so the name takes the listed case, making its folders, and failing for
 /// a file with a link on its way down (`<folder> is a link on the builder`), whose path is a folder there (`<file> is
 /// a folder on the builder`) or whose parent is a file (`<parent> is a file on the builder`); then it writes the new
 /// list as the manifest. Each manifest write goes through `.installed-files.<pid>.tmp` and a move. A name below U+0020
@@ -387,8 +389,14 @@ function Put($tg,$f){$fp=Under $tg $f.path;$s=@("$($f.path)" -split '/');$h=Hop 
 for($j=0;$j -lt $s.Count-1;$j++){$q=[IO.Path]::Combine($q,$s[$j])
 if(Test-Path -LiteralPath $q -PathType Leaf){throw "$($s[0..$j] -join '/') is a file on the builder"}}
 if(Test-Path -LiteralPath $fp -PathType Container){throw "$($f.path) is a folder on the builder"}
-if(Test-Path -LiteralPath $fp -PathType Leaf){[IO.File]::Delete($fp)}
-[void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($fp));[IO.File]::WriteAllBytes($fp,[Convert]::FromBase64String($f.bytes))}
+$b=[Convert]::FromBase64String($f.bytes)
+if(Test-Path -LiteralPath $fp -PathType Leaf){if(Same $fp $b){return};[IO.File]::Delete($fp)}
+[void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($fp));[IO.File]::WriteAllBytes($fp,$b)}
+function Same($fp,$b){$d=[IO.Path]::GetDirectoryName($fp);$n=[IO.Path]::GetFileName($fp)
+if(@([IO.Directory]::GetFiles($d,$n)|%{[IO.Path]::GetFileName($_)}) -cnotcontains $n){return $false}
+if((Get-Item -LiteralPath $fp -Force).Length -ne $b.Length){return $false}
+$o=[Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($fp))
+[Convert]::ToHexString($o) -eq [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($b))}
 function Pn($d){$w='pnpm install --frozen-lockfile'
 try{$x=[Diagnostics.Process]::Start([Diagnostics.ProcessStartInfo]@{FileName='@PNPM@';Arguments='install --frozen-lockfile'
 WorkingDirectory=$d;RedirectStandardOutput=1;RedirectStandardError=1;UseShellExecute=0})}catch{return "could not run pnpm: $($_.Exception.Message)"}
@@ -1025,7 +1033,8 @@ fn pushed_input(slots: &Slots<'_>, payload: &Payload, tools: &str) -> String {
 
 /// The user tools line a builder is fed for `tools`, each a home-relative path and this PC's print of it: the UTF-8 JSON
 /// `{"tools":[{"path","fingerprint","lock","files":[{"path","bytes"}]}]}`, each file's bytes as base64, [`gzipped`].
-/// It always holds `tools`, empty for a builder that syncs none.
+/// Each tool's files keep the print's order, which is the order the builder writes them in, so an installed tool's
+/// `current` lands last. It always holds `tools`, empty for a builder that syncs none.
 fn tools_line(tools: &[(&str, &Print)]) -> String {
     let tools: Vec<Value> = tools
         .iter()
@@ -1079,16 +1088,30 @@ impl<'a> Tools<'a> {
                 return tools;
             }
         }
-        for path in tools.paths() {
-            match tool_print(path) {
-                Ok(print) => tools.prints.push((path.to_owned(), print)),
+        for tool in tools.used() {
+            match tool_print(&tool) {
+                Ok(print) => tools.prints.push((tool.path, print)),
                 Err(why) => {
-                    console.err(&format!("push: cannot read this PC's {}: {why}; not synced", escaped(path)));
+                    console.err(&format!("push: cannot read this PC's {}: {why}; not synced", escaped(&tool.path)));
                     tools.failed = true;
                 }
             }
         }
         tools
+    }
+
+    /// Every distinct path of the table with its kind, in table order ([`Tools::paths`]); a usable table gives one path
+    /// one kind.
+    fn used(&self) -> Vec<UsedTool> {
+        let table = self.table.iter().flat_map(|(_, tools)| tools);
+        self.paths()
+            .into_iter()
+            .filter_map(|path| table.clone().find(|tool| tool.path == path))
+            .map(|tool| UsedTool {
+                path: tool.path.clone(),
+                kind: tool.kind,
+            })
+            .collect()
     }
 
     /// Every distinct path of the table, in table order.
@@ -1110,11 +1133,11 @@ impl<'a> Tools<'a> {
     }
 }
 
-/// This PC's print of the user tool at the home-relative `path` ([`user_tool::read`]): its tracked files as `git
-/// ls-files -z` run in its folder lists them, git found from that folder and bounded at [`VERSION_BOUND`]; else why it
-/// cannot be read.
-fn tool_print(path: &str) -> Result<Print, String> {
-    user_tool::read(path, |folder| {
+/// This PC's print of the user tool `tool` by its kind ([`user_tool::shipped`]): a git folder's tracked files as `git
+/// ls-files -z` run in its folder lists them, git found from that folder and bounded at [`VERSION_BOUND`], or an
+/// installed folder's layout in its shipping order; else why it cannot be read.
+fn tool_print(tool: &UsedTool) -> Result<Print, String> {
+    user_tool::shipped(tool, |folder| {
         git::Git::find(folder)?
             .output_bytes_within(&git::Call::plain(folder, &["ls-files", "-z"], VERSION_BOUND), git::OUTPUT_CAP)
             .map_err(String::from)
@@ -3415,6 +3438,79 @@ mod tests {
     }
 
     #[test]
+    fn the_script_rewrites_no_user_tool_file_whose_bytes_already_match() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let case = ToolCase::new("user-tool-same-bytes");
+        let print = print_of(&[("a.txt", b"one"), (r"sub/b.bin", &[0, 1, 255])], "-");
+        let first = case.run(&[(TOOL, &print)], 0);
+        assert_eq!(first.end, End::Exited(0), "{first:?}");
+        // Held open with no write and no delete sharing, as a running exe holds its image: a rewrite would fail.
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
+            .open(case.target().join("a.txt"))
+            .expect("a.txt opens");
+
+        let second = case.run(&[(TOOL, &print)], 0);
+
+        drop(held);
+        assert_eq!(second.end, End::Exited(0), "{second:?}");
+        assert_eq!(second.marked.last(), Some(&synced_line(false)), "{second:?}");
+        assert_eq!(fs::read(case.target().join("a.txt")).expect("a.txt stays"), b"one");
+        assert_eq!(case.record(), Some(format!("{PRINT} -")));
+    }
+
+    #[test]
+    fn the_script_rewrites_a_user_tool_file_whose_bytes_changed() {
+        let case = ToolCase::new("user-tool-changed-bytes");
+        let first = case.run(&[(TOOL, &print_of(&[("a.txt", b"one"), ("b.txt", b"same")], "-"))], 0);
+        assert_eq!(first.end, End::Exited(0), "{first:?}");
+
+        let second = case.run(&[(TOOL, &print_of(&[("a.txt", b"two"), ("b.txt", b"same")], "-"))], 0);
+
+        assert_eq!(second.end, End::Exited(0), "{second:?}");
+        assert_eq!(fs::read(case.target().join("a.txt")).expect("a.txt was rewritten"), b"two");
+        assert_eq!(fs::read(case.target().join("b.txt")).expect("b.txt stays"), b"same");
+    }
+
+    #[test]
+    fn the_script_s_manifest_keeps_an_installed_user_tool_s_listed_order_and_its_old_version_folder_goes() {
+        let case = ToolCase::new("user-tool-installed-order");
+        case.seed(r"versions\1-a\godot-mcp.exe", b"old server");
+        case.seed(r"versions\1-a\VERSION", b"1+a\n");
+        case.seed("current", b"1-a\n");
+        case.seed(
+            ".installed-files",
+            b"versions/1-a/VERSION\nversions/1-a/godot-mcp.exe\ngodot-mcp.exe\nVERSION\ncurrent\n",
+        );
+        let listed_order = [
+            "versions/2-b/VERSION",
+            "versions/2-b/godot-mcp.exe",
+            "godot-mcp.exe",
+            "VERSION",
+            "current",
+        ];
+        let bytes: [&[u8]; 5] = [b"2+b\n", b"server", b"launcher", b"2+b\n", b"2-b\n"];
+        let files: Vec<(&str, &[u8])> = listed_order.into_iter().zip(bytes).collect();
+
+        let heard = case.run(&[(TOOL, &print_of(&files, "-"))], 0);
+
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        let manifest = fs::read_to_string(case.target().join(".installed-files")).expect("the manifest was written");
+        assert_eq!(
+            manifest.lines().collect::<Vec<&str>>(),
+            listed_order,
+            "the files in their listed order, current last"
+        );
+        assert_eq!(
+            listed(&case.target().join("versions")),
+            ["2-b"],
+            "the old version folder went through the manifest"
+        );
+        assert_eq!(fs::read(case.target().join("current")).expect("current was written"), b"2-b\n");
+    }
+
+    #[test]
     fn the_script_deletes_only_files_its_last_push_wrote() {
         let case = ToolCase::new("user-tool-manifest-deletes");
         case.seed("a.txt", b"old");
@@ -3741,6 +3837,21 @@ mod tests {
         // The names as the folder holds them, in their own case.
         assert_eq!(listed(&case.target()), [".installed-files", ".installed-from", "README.md"], "{heard:?}");
         assert_eq!(fs::read(case.target().join("README.md")).expect("the file was written"), b"new");
+    }
+
+    #[test]
+    fn the_script_mirrors_a_rename_that_changes_only_case_when_the_bytes_match() {
+        let case = ToolCase::new("user-tool-case-rename-same-bytes");
+        case.seed("Readme.md", b"same");
+        case.seed(".installed-files", b"Readme.md\n");
+        let print = print_of(&[("README.md", b"same")], "-");
+
+        let heard = case.run(&[(TOOL, &print)], 0);
+
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        // The names as the folder holds them, in their own case: identical bytes do not keep the old case.
+        assert_eq!(listed(&case.target()), [".installed-files", ".installed-from", "README.md"], "{heard:?}");
+        assert_eq!(fs::read(case.target().join("README.md")).expect("the file was written"), b"same");
     }
 
     #[test]

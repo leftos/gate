@@ -33,14 +33,14 @@ mod watch;
 pub mod windows;
 
 pub use config::{
-    Builder, BuilderOs, CARGO_OUTPUTS, Config, ConfigProblem, DEFAULT_OUTPUTS, UserTool, builder_id, ignored_line, is_home_folder, is_unix_root,
-    is_usable_host,
+    Builder, BuilderOs, CARGO_OUTPUTS, Config, ConfigProblem, DEFAULT_OUTPUTS, InstalledLayout, UserTool, UserToolKind, builder_id, ignored_line,
+    is_home_folder, is_unix_root, is_usable_host,
 };
 pub use decide::{
     BuildSettings, BuildTarget, BuilderWords, CARRIED_INPUT, CONFIGURATION_ELEMENTS, CarriedSibling, CrossBlocked, CrossBuild, CrossTarget,
     DROPPED_NO_BUILD_LINE, DROPPED_UNSENT_LINE, DotnetTarget, ElsewhereRead, Facts, FolderId, FolderSends, GATE_FOLDER_MARK, GitignoredInput, Inputs,
     LaterCandidate, LocalReason, NO_OUTPUTS_LINE, Nested, OUTPUT_PROPERTIES, OtherTree, PAIR_CAPS, PROJECT_EXTENSIONS, PinRefusal, Place, RemoteRun,
-    Route, SendPlan, SiblingFolder, Slot, Target, TreePath, build_settings, builder_words, builds_in_place, decide, dotnet_builds,
+    Route, SendPlan, SiblingFolder, Slot, Target, TreePath, UsedTool, build_settings, builder_words, builds_in_place, decide, dotnet_builds,
     dotnet_takes_solution, dotnet_target, is_cargo, is_dotnet, is_input_file, is_project_or_solution, later_run, later_stage_run, named_tree_paths,
     names_git_or_prek, names_program, pattern_for, positional_target, sdk_build_target, sibling_root, stays_local, target, without_no_build,
 };

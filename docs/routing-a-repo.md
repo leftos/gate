@@ -124,9 +124,17 @@ This repo's `tools/builder/install-toolchains.ps1` does the rest: the toolchains
 
   List it in the PC's `remote.json`: `"userTools": {"<repo>": [{"path": "~/.claude/tools/mock-three", "commands": ["<pattern>"]}]}`, each `path` a folder below the home and each pattern one of the command patterns that use it ([design.md, remote.json](design.md#remotejson)). `gate push` writes the tool's tracked files (`git ls-files` in its folder on the PC) at the same home-relative path in the builder user's profile, so a caller's tracked wrapper that runs it routes.
 
+  A tool that is not a git folder, godot-mcp's `%LOCALAPPDATA%\godot-mcp`, takes a third key: `{"path": "~/AppData/Local/godot-mcp", "installed": "godot-mcp", "commands": ["<pattern>"]}` (`"godot-mcp"` is the only layout the gate knows).
+
+  `gate push` ships `versions/<name>/` whole, then `godot-mcp.exe`, `VERSION` and `current` last, and never `install.lock`, an `old-*` copy of the exe or another version folder.
+
+  The caller's wrapper runs `$env:LOCALAPPDATA\godot-mcp\godot-mcp.exe` on both machines, and a windowed or audible capture is a desktop run (its `.gate/desktop.toml` and the `desktop` consent in `remote.json`). One path cannot be listed as both kinds.
+
   The installer has no step for it, so on a new builder the order is the installer (which installs pnpm and the Playwright pin's Chromium, the `Playwright 1.64.1 browsers` step), then `gate push`.
 
-  A push deletes only the files its last push wrote (the `.installed-files` manifest beside the tool), keeps the copy's `node_modules`, runs `pnpm install --frozen-lockfile` when the lock changed or `node_modules` is missing, and writes `.installed-from` (`<fingerprint> <lock>`) last. A change to the tool on the PC reaches the builders on the next `gate push`.
+  A push deletes only the files its last push wrote (the `.installed-files` manifest beside the tool), keeps the copy's `node_modules`, runs `pnpm install --frozen-lockfile` when the lock changed or `node_modules` is missing, and writes `.installed-from` (`<fingerprint> <lock>`) last.
+
+  A change to the tool on the PC reaches the builders on the next `gate push`. A file whose bytes already match is not rewritten, so an unchanged file a process holds open does not fail the sync; a file a running process holds and the push must change does, so push between runs.
 
   A routed run whose command matches an entry compares this PC's fingerprint of the tool with the builder's `.installed-from`. A copy that is missing or differs refuses that builder for `tools`, saying `run gate push`, and another builder may take the run; a copy this PC cannot read keeps the run here. A macOS builder gets no user tools and is refused the same way. A push that rewrites a tool while a routed run uses it is not barred, so push between runs.
 - **Work-folder prune task:** the step `Work-folder prune task` (`-Only Work-folder`) registers `\build-box\gate-prune-work`, which runs every 6 hours from 00:17 with a 2 h limit, IgnoreNew and StartWhenAvailable. Its command runs inline, with no script file and module auto-loading off: `C:\Program Files\gate\bin\gate.exe box prune --root <GateRoot>` ([design.md, The box side](design.md#the-box-side), `prune`).

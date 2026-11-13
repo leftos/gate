@@ -14453,6 +14453,78 @@ fn a_routed_run_whose_builder_copy_of_a_user_tool_differs_stays_here() {
     assert_eq!(fallbacks(&own(&case, pid)), ["tools"], "{outcome:?}");
 }
 
+/// A [`user_tool_case`] whose user tool [`USER_TOOL`] is an installed godot-mcp folder, written there with no git:
+/// its launcher, `VERSION`, `current` and the version folder `current` names; the fingerprint by the installed rule:
+/// SHA-256 over `installed godot-mcp`, a NUL, then for `VERSION` and `current` its name, a NUL, its length, a NUL and
+/// its bytes.
+fn installed_tool_case(name: &str) -> (Case, PathBuf, String) {
+    let (case, home) = user_tool_case(name, &["*tool*"]);
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({
+        "host": HOST,
+        "slots": 2,
+        "repos": { &repo: ["*tool*"] },
+        "outputs": { &repo: [] },
+        "userTools": { &repo: [{ "path": USER_TOOL, "installed": "godot-mcp", "commands": ["*tool*"] }] },
+    });
+    write_remote_json(&case, &routing.to_string());
+    let tool = home.join("tools").join("t");
+    let (version, current) = ("0.42.0+736e8ee\n", "0.42.0-736e8ee\n");
+    fs::create_dir_all(tool.join("versions").join("0.42.0-736e8ee")).expect("the version folder can be made");
+    for (path, bytes) in [
+        (r"versions\0.42.0-736e8ee\godot-mcp.exe", "server"),
+        (r"versions\0.42.0-736e8ee\VERSION", version),
+        ("godot-mcp.exe", "launcher"),
+        ("VERSION", version),
+        ("current", current),
+    ] {
+        fs::write(tool.join(path), bytes).expect("an install file can be written");
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"installed godot-mcp\0");
+    for (file, bytes) in [("VERSION", version), ("current", current)] {
+        hasher.update(format!("{file}\0{}\0{bytes}", bytes.len()).as_bytes());
+    }
+    let fingerprint = hasher.finalize().iter().fold(String::new(), |mut hex, byte| {
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    });
+    (case, home, fingerprint)
+}
+
+#[test]
+fn a_routed_run_whose_builder_copy_of_an_installed_user_tool_matches_routes() {
+    let (case, home, fingerprint) = installed_tool_case("client-installed-tool-matches");
+    plant_user_tool_record(&home, &fingerprint);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let (pid, outcome) = finish_with_pid(user_tool_gate(&case, &home, &steps));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "{outcome:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), Vec::<&str>::new(), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: not routed:"), "{outcome:?}");
+    assert!(
+        !outcome.stderr.contains("userTools cannot be used"),
+        "the installed entry is a usable one: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_routed_run_whose_builder_copy_of_an_installed_user_tool_differs_stays_here() {
+    let (case, home, _) = installed_tool_case("client-installed-tool-differs");
+    plant_user_tool_record(&home, &"0".repeat(64));
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let (pid, outcome) = finish_with_pid(user_tool_gate(&case, &home, &steps));
+
+    assert_eq!(outcome.code, Some(0), "the run here passed: {outcome:?}");
+    let line = format!("gate: not routed: {HOST}'s copy of {USER_TOOL} differs from this PC's; run gate push");
+    assert!(outcome.stderr.lines().any(|said| said == line), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"], "{outcome:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), ["tools"], "{outcome:?}");
+}
+
 #[test]
 fn a_routed_run_whose_builder_has_no_copy_of_a_user_tool_stays_here() {
     let (case, home) = user_tool_case("client-user-tool-missing", &["*tool*"]);

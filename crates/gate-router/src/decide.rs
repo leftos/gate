@@ -10,7 +10,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use crate::balance::{self, Balanced, BalancedEntry, BuilderFigures};
-use crate::config::{Builder, BuilderOs, CARGO_OUTPUTS, Config, ConfigProblem, DEFAULT_OUTPUTS, FolderGlob, ignored_line};
+use crate::config::{Builder, BuilderOs, CARGO_OUTPUTS, Config, ConfigProblem, DEFAULT_OUTPUTS, FolderGlob, UserToolKind, ignored_line};
 use crate::desktop::{DesktopDeclaration, DesktopMode};
 use crate::escape::escaped;
 use crate::key::{is_layout_name, repo_name, work_folder_key};
@@ -873,6 +873,15 @@ fn not_allowed_reason(names: &[String], problem: Option<&str>) -> String {
     format!("{refused} not allowed in remote.json{problem}")
 }
 
+/// A user tool a routed run checks the builder's copy of: its home-relative folder and how this PC's copy is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsedTool {
+    /// The tool's folder, home-relative, as the routing file writes it.
+    pub path: String,
+    /// How this PC's copy is read.
+    pub kind: UserToolKind,
+}
+
 /// A command routed to the builder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[expect(
@@ -901,8 +910,9 @@ pub struct RemoteRun {
     /// `None` when it can.
     pub carried_folders_problem: Option<String>,
     /// The home-relative folders of the routing file's `userTools` entries for the repo one of whose `commands` patterns
-    /// matches the command, each once, in file order ([`Config::user_tools`]); none when `userTools` cannot be used.
-    pub user_tools: Vec<String>,
+    /// matches the command, each once with its kind, in file order ([`Config::user_tools`]); none when `userTools`
+    /// cannot be used.
+    pub user_tools: Vec<UsedTool>,
     /// Why the routing file's `userTools` cannot be used, which checks no user tool ([`user_tools_line`]); `None` when it
     /// can.
     pub user_tools_problem: Option<String>,
@@ -2246,20 +2256,23 @@ fn ended(config: &Config, matched: Matched, given: &[String], facts: &dyn Facts)
 }
 
 /// The folders of the repo's `userTools` entries one of whose `commands` patterns matches the words the routing pattern
-/// matched ([`Matched::sent`]), each once, in file order, with no problem; or no folder and why `userTools` cannot be
-/// used.
-fn used_user_tools(config: &Config, matched: &Matched) -> (Vec<String>, Option<String>) {
+/// matched ([`Matched::sent`]), each once with its kind, in file order, with no problem; or no folder and why
+/// `userTools` cannot be used.
+fn used_user_tools(config: &Config, matched: &Matched) -> (Vec<UsedTool>, Option<String>) {
     let tools = match config.user_tools(&matched.target.repo) {
         Ok(tools) => tools,
         Err(problem) => return (Vec::new(), Some(problem.to_owned())),
     };
-    let mut paths: Vec<String> = Vec::new();
+    let mut used: Vec<UsedTool> = Vec::new();
     for tool in tools {
-        if tool.commands.iter().any(|pattern| pattern.is_match(&matched.sent)) && !paths.contains(&tool.path) {
-            paths.push(tool.path.clone());
+        if tool.commands.iter().any(|pattern| pattern.is_match(&matched.sent)) && !used.iter().any(|known| known.path == tool.path) {
+            used.push(UsedTool {
+                path: tool.path.clone(),
+                kind: tool.kind,
+            });
         }
     }
-    (paths, None)
+    (used, None)
 }
 
 /// The input entry, `[carried]<folder>/**` ([`CARRIED_INPUT`]), of each folder of the worktree a path of `named` lies in

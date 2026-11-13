@@ -1935,6 +1935,53 @@ fn push_syncs_each_user_tool_to_the_builder_that_routes_its_repo() {
 }
 
 #[test]
+fn push_syncs_an_installed_user_tool_with_current_last_and_no_install_lock() {
+    let case = push_case("push_syncs_an_installed_user_tool_with_current_last_and_no_install_lock");
+    let home = case.folder().join("home");
+    let tool = home.join("AppData").join("Local").join("godot-mcp");
+    let files: [(&str, &[u8]); 9] = [
+        (r"versions\2-b\VERSION", b"2+b\n"),
+        (r"versions\2-b\godot-mcp.exe", b"server"),
+        (r"versions\2-b\lib\a.dll", b"dll"),
+        (r"versions\1-a\godot-mcp.exe", b"old server"),
+        ("godot-mcp.exe", b"launcher"),
+        ("godot-mcp.exe.old-08c96", b"old launcher"),
+        ("install.lock", b""),
+        ("VERSION", b"2+b\n"),
+        ("current", b"2-b\n"),
+    ];
+    for (path, bytes) in files {
+        let file = tool.join(path);
+        fs::create_dir_all(file.parent().expect("a file has a folder")).expect("the install's folder can be made");
+        fs::write(file, bytes).expect("the install's file can be written");
+    }
+    let path = "~/AppData/Local/godot-mcp";
+    tool_routing(&case, &json!({ "app": [{ "path": path, "installed": "godot-mcp", "commands": ["x"] }] }));
+    let steps = steps(&case, &["ok"]);
+
+    let outcome = push_home(&case, &steps, &home);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert!(unix(&outcome.stdout).contains(&format!("push: {HOST}: user tool {path} ")), "{outcome:?}");
+    // The fake builder shares this PC's home, so the manifest it wrote names exactly what was shipped, in order.
+    let manifest = fs::read_to_string(tool.join(".installed-files")).expect("the manifest was written");
+    assert_eq!(
+        manifest.lines().collect::<Vec<&str>>(),
+        [
+            "versions/2-b/VERSION",
+            "versions/2-b/godot-mcp.exe",
+            "versions/2-b/lib/a.dll",
+            "godot-mcp.exe",
+            "VERSION",
+            "current"
+        ]
+    );
+    let record = fs::read_to_string(tool.join(".installed-from")).expect("the record was written");
+    assert!(record.ends_with(" -"), "no lock: {record}");
+}
+
+#[test]
 fn push_with_an_unusable_user_tools_table_still_pushes_gate_and_exits_1() {
     let case = push_case("push_with_an_unusable_user_tools_table_still_pushes_gate_and_exits_1");
     let home = tool_home(&case, &[("cli.ts", b"x")]);

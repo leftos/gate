@@ -1227,6 +1227,42 @@ pub struct UserTool {
     pub path: String,
     /// The patterns of the commands that use the tool, matched as `repos` patterns are, in file order.
     pub commands: Vec<Pattern>,
+    /// How this PC's copy is read and shipped: a git folder, or an installed one of a layout the entry's `installed`
+    /// names.
+    pub kind: UserToolKind,
+}
+
+/// How a user tool's folder on this PC is read: its tracked files, or the files of an installed layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserToolKind {
+    /// A git folder: its tracked files, as `git ls-files` lists them.
+    Git,
+    /// An installed, non-git folder of a layout built into the gate.
+    Installed(InstalledLayout),
+}
+
+/// A layout built into the gate that an `installed` user tool names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstalledLayout {
+    /// godot-mcp's install: the launcher `godot-mcp.exe`, `VERSION`, `current` and the version folder `current` names
+    /// under `versions`; written in `userTools` as `godot-mcp`.
+    GodotMcp,
+}
+
+impl InstalledLayout {
+    /// The layout `name` writes in an `installed` value, compared exactly; `None` for any other.
+    #[must_use]
+    pub fn named(name: &str) -> Option<InstalledLayout> {
+        (name == InstalledLayout::GodotMcp.name()).then_some(InstalledLayout::GodotMcp)
+    }
+
+    /// The name an `installed` value writes for the layout.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            InstalledLayout::GodotMcp => "godot-mcp",
+        }
+    }
 }
 
 /// The `userTools` table: each repo name's tools, in file order, read once ([`UserTool`]); an empty table when the key
@@ -1258,27 +1294,47 @@ fn read_user_tools(data: &Map<String, Value>) -> Result<Vec<(String, Vec<UserToo
 
 /// The problem with `table` when two of its paths, across every repo's entries, name folders one of which holds the
 /// other, or the same folder written in another letter case: compared by their `/`-separated names, ignoring case. The
-/// same path written the same way twice, in one repo or two, is one tool and no problem.
+/// same path written the same way twice, in one repo or two, is one tool and no problem, unless the two entries give it
+/// different kinds ([`pair_problem`]).
 fn nested_tools(table: &[(String, Vec<UserTool>)]) -> Option<String> {
-    let entries: Vec<(&str, usize, &str)> = table
+    let entries: Vec<(&str, usize, &UserTool)> = table
         .iter()
-        .flat_map(|(repo, tools)| {
-            tools
-                .iter()
-                .enumerate()
-                .map(move |(index, tool)| (repo.as_str(), index, tool.path.as_str()))
-        })
+        .flat_map(|(repo, tools)| tools.iter().enumerate().map(move |(index, tool)| (repo.as_str(), index, tool)))
         .collect();
-    for (at, (repo, index, path)) in entries.iter().enumerate() {
-        for (other_repo, other_index, other) in entries.iter().skip(at + 1) {
-            if path != other && nests(path, other) {
-                return Some(format!(
-                    "userTools.{repo:?}[{index}].path {path:?} holds or is held by userTools.{other_repo:?}[{other_index}].path {other:?}"
-                ));
-            }
-        }
+    entries
+        .iter()
+        .enumerate()
+        .find_map(|(at, one)| entries.iter().skip(at + 1).find_map(|two| pair_problem(*one, *two)))
+}
+
+/// The problem with the `userTools` entries `one` and `two`, each its repo, its index and the tool: one path holds the
+/// other ([`nests`]), or both write the same path with different kinds; `None` when neither holds.
+fn pair_problem(one: (&str, usize, &UserTool), two: (&str, usize, &UserTool)) -> Option<String> {
+    let ((repo, index, tool), (other_repo, other_index, other_tool)) = (one, two);
+    let (path, other) = (&tool.path, &other_tool.path);
+    let nested = path != other && nests(path, other);
+    let mixed = path == other && tool.kind != other_tool.kind;
+    if !nested && !mixed {
+        return None;
     }
-    None
+    let one = format!("userTools.{repo:?}[{index}].path {path:?}");
+    let two = format!("userTools.{other_repo:?}[{other_index}].path {other:?}");
+    if nested {
+        return Some(format!("{one} holds or is held by {two}"));
+    }
+    Some(format!(
+        "{one} is {} folder and {two} {} one",
+        kind_text(tool.kind),
+        kind_text(other_tool.kind)
+    ))
+}
+
+/// How a refusal names the kind `kind`: `a git`, or `an installed` and the layout's name quoted.
+fn kind_text(kind: UserToolKind) -> String {
+    match kind {
+        UserToolKind::Git => "a git".to_owned(),
+        UserToolKind::Installed(layout) => format!("an installed {:?}", layout.name()),
+    }
 }
 
 /// Whether the folder `one` names holds the one `other` names, or `other` holds `one`, or both name the same: one's
@@ -1291,13 +1347,24 @@ fn nests(one: &str, other: &str) -> bool {
     })
 }
 
-/// The `userTools` entry `item`, at `index` of `repo`'s list: an object of exactly a string `path` and a `commands`
-/// array, keys in any letter case, or what is wrong with it.
+/// The `userTools` entry `item`, at `index` of `repo`'s list: an object of exactly a string `path`, a `commands` array
+/// and, optionally, an `installed` naming a layout ([`InstalledLayout::named`]), keys in any letter case, or what is
+/// wrong with it. With no `installed` the tool is a git folder.
 fn read_user_tool(repo: &str, index: usize, item: &Value) -> Result<UserTool, String> {
-    let entry = item.as_object().filter(|entry| entry.len() == 2);
+    let installed = item.as_object().and_then(|entry| property(entry, "installed"));
+    let keys = 2 + usize::from(installed.is_some());
+    let entry = item.as_object().filter(|entry| entry.len() == keys);
     let fields = entry.and_then(|entry| Some((property(entry, "path")?.as_str()?, property(entry, "commands")?)));
     let Some((path, commands)) = fields else {
         return Err(format!("userTools.{repo:?}[{index}] is not an object with a path and commands"));
+    };
+    let kind = match installed {
+        None => UserToolKind::Git,
+        Some(value) => value
+            .as_str()
+            .and_then(InstalledLayout::named)
+            .map(UserToolKind::Installed)
+            .ok_or_else(|| format!(r#"userTools.{repo:?}[{index}].installed names no layout gate knows ("godot-mcp"): {value}"#))?,
     };
     if !is_home_folder(path) {
         return Err(format!(
@@ -1316,6 +1383,7 @@ fn read_user_tool(repo: &str, index: usize, item: &Value) -> Result<UserTool, St
     Ok(UserTool {
         path: path.to_owned(),
         commands,
+        kind,
     })
 }
 

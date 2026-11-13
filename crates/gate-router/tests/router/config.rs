@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use gate_router::{Builder, BuilderOs, Config, Pattern, builder_id, ignored_line};
+use gate_router::{Builder, BuilderOs, Config, InstalledLayout, Pattern, UserToolKind, builder_id, ignored_line};
 
 fn reason(text: &str) -> String {
     Config::parse(text).expect_err("the file is unusable")
@@ -698,6 +698,70 @@ fn user_tools_names_a_repo_case_insensitively() {
     assert_eq!(user_tool_texts(&config, "WORLD-OF-INTRIGUE"), expected);
     let keyed = Config::parse(r#"{"host": "builder-1", "repos": {}, "USERTOOLS": {"g": [{"path": "~/a", "commands": ["x"]}]}}"#).expect("usable");
     assert_eq!(user_tool_texts(&keyed, "g"), expected, "the key in any case");
+}
+
+/// Each of `repo`'s user tools as its path and its kind.
+fn user_tool_kinds(config: &Config, repo: &str) -> Result<Vec<(String, UserToolKind)>, String> {
+    config
+        .user_tools(repo)
+        .map(|tools| tools.iter().map(|tool| (tool.path.clone(), tool.kind)).collect())
+        .map_err(str::to_owned)
+}
+
+#[test]
+fn a_user_tool_with_installed_godot_mcp_is_read_with_its_kind() {
+    let config = user_tools_file(r#"{"g": [{"path": "~/AppData/Local/godot-mcp", "Installed": "godot-mcp", "commands": ["pwsh *"]}]}"#);
+    assert_eq!(
+        user_tool_kinds(&config, "g"),
+        Ok(vec![(
+            "~/AppData/Local/godot-mcp".to_owned(),
+            UserToolKind::Installed(InstalledLayout::GodotMcp)
+        )])
+    );
+    assert_eq!(
+        user_tool_texts(&config, "g"),
+        Ok(vec![("~/AppData/Local/godot-mcp".to_owned(), vec!["pwsh *".to_owned()])])
+    );
+}
+
+#[test]
+fn a_user_tool_with_no_installed_key_is_a_git_folder() {
+    let config = user_tools_file(r#"{"g": [{"path": "~/tools/a", "commands": ["x"]}]}"#);
+    assert_eq!(user_tool_kinds(&config, "g"), Ok(vec![("~/tools/a".to_owned(), UserToolKind::Git)]));
+}
+
+#[test]
+fn a_user_tool_whose_installed_names_no_known_layout_makes_the_table_unusable() {
+    let rows = [
+        (
+            r#"{"g": [{"path": "~/a", "installed": "other", "commands": ["x"]}]}"#,
+            r#"userTools."g"[0].installed names no layout gate knows ("godot-mcp"): "other""#,
+        ),
+        (
+            r#"{"g": [{"path": "~/a", "installed": 3, "commands": ["x"]}]}"#,
+            r#"userTools."g"[0].installed names no layout gate knows ("godot-mcp"): 3"#,
+        ),
+        (
+            r#"{"g": [{"path": "~/a", "installed": "godot-mcp", "commands": ["x"], "name": "a"}]}"#,
+            r#"userTools."g"[0] is not an object with a path and commands"#,
+        ),
+    ];
+    for (value, problem) in rows {
+        let config = user_tools_file(value);
+        assert_eq!(config.all_user_tools().map(<[_]>::len), Err(problem), "{value}");
+        assert_eq!(config.user_tools("g").map(<[_]>::len), Err(problem), "{value}");
+    }
+}
+
+#[test]
+fn user_tools_naming_one_path_as_a_git_folder_and_as_an_installed_one_is_unusable() {
+    let config = user_tools_file(
+        r#"{"g": [{"path": "~/tools/a", "commands": ["x"]}],
+            "h": [{"path": "~/tools/a", "installed": "godot-mcp", "commands": ["x"]}]}"#,
+    );
+    let problem = r#"userTools."g"[0].path "~/tools/a" is a git folder and userTools."h"[0].path "~/tools/a" an installed "godot-mcp" one"#;
+    assert_eq!(config.all_user_tools().map(<[_]>::len), Err(problem));
+    assert_eq!(config.user_tools("h").map(<[_]>::len), Err(problem));
 }
 
 #[test]

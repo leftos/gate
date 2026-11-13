@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use gate_args::TestSeams;
 use gate_router::desktop::DesktopMode;
-use gate_router::{Builder, CrossBuild, FolderId, SendPlan, Target, escaped};
+use gate_router::{Builder, CrossBuild, FolderId, SendPlan, Target, UsedTool, escaped};
 use gate_state::v1::WarmFailure;
 use gate_state::{FallbackReason, StateRoot, Verdict};
 use gate_win32::{Interrupt, OwnedMutexGuard};
@@ -250,8 +250,8 @@ pub(crate) struct RemoteCall<'a> {
     pub cross_build: Option<&'a CrossBuild>,
     /// The input globs the run sends: the repo's `inputs` list, none when it has no entry.
     pub inputs: &'a [String],
-    /// The paths of the user tools the route matched for the command ([`gate_router::RemoteRun::user_tools`]).
-    pub user_tools: &'a [String],
+    /// The user tools the route matched for the command, each its path and kind ([`gate_router::RemoteRun::user_tools`]).
+    pub user_tools: &'a [UsedTool],
     /// How the run uses the builder's desktop, `None` for not at all, as the route's decision judged it; a warm-up
     /// never does.
     pub desktop: Option<DesktopMode>,
