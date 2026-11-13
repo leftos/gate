@@ -3589,6 +3589,11 @@ fn started_line(payload: &Value) -> String {
     format!("gate-remote-started: {}", field(payload, "Nonce"))
 }
 
+/// The status line the box says for a command of `payload`'s run that exited with the whole code `code`.
+fn status_said(payload: &Value, code: u32) -> String {
+    format!("gate-remote-status: {} {code}", field(payload, "Nonce"))
+}
+
 /// `stderr` of the run of `payload` past the box's two checkout lines it starts with: its start line, then its done
 /// line, whose seconds are a finite number of at least 0.
 fn after_checkout<'s>(payload: &Value, stderr: &'s str) -> &'s str {
@@ -5323,8 +5328,8 @@ fn box_run_says_the_checkout_start_and_done_lines_before_its_start_marker() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(
         after_checkout(&payload, &outcome.stderr),
-        format!("{}\nran\n{BACK_COMMIT_NONE}\n", started_line(&payload)),
-        "the start and done lines, in order, then the marker, then the command's line changed nothing: {outcome:?}"
+        format!("{}\nran\n{}\n{BACK_COMMIT_NONE}\n", started_line(&payload), status_said(&payload, 0)),
+        "the start and done lines, in order, then the marker, then the command's line, its status, then nothing changed: {outcome:?}"
     );
 }
 
@@ -5359,7 +5364,7 @@ fn box_run_forwards_each_stream_line_by_line_ending_each_line_lf() {
     assert_eq!(outcome.stdout, "a1\na2\nb\nc\nd\n", "CR LF and a lone CR each end a line");
     assert_eq!(
         after_checkout(&payload, &outcome.stderr),
-        format!("{}\ne1\ne2\n{BACK_COMMIT_NONE}\n", started_line(&payload))
+        format!("{}\ne1\ne2\n{}\n{BACK_COMMIT_NONE}\n", started_line(&payload), status_said(&payload, 0))
     );
 }
 
@@ -5915,6 +5920,11 @@ fn a_commit_stage_runs_the_repo_s_stage_prep_before_its_command() {
         matches!((running, passed, started), (Some(running), Some(passed), Some(started)) if running < passed && passed < started),
         "running, then passed, then the start marker: {outcome:?}"
     );
+    assert_eq!(
+        lines_starting(&outcome, "gate-remote-status:"),
+        [status_said(&payload, 0)],
+        "the run's command's status line alone; the stage preparation says none: {outcome:?}"
+    );
 }
 
 #[test]
@@ -6271,8 +6281,8 @@ fn box_run_gives_the_command_a_utf8_console() {
     assert_eq!(outcome.stdout, "Active code page: 65001\n", "{outcome:?}");
     assert_eq!(
         after_checkout(&payload, &outcome.stderr),
-        format!("{}\n{BACK_COMMIT_NONE}\n", started_line(&payload)),
-        "the marker, no fallback, and the command changed nothing: {outcome:?}"
+        format!("{}\n{}\n{BACK_COMMIT_NONE}\n", started_line(&payload), status_said(&payload, 0)),
+        "the marker, no fallback, its status, and the command changed nothing: {outcome:?}"
     );
 
     let mut bytes = renamed(&payload, 1);
@@ -6283,7 +6293,7 @@ fn box_run_gives_the_command_a_utf8_console() {
     assert_eq!(outcome.raw_stdout, "é€\n".as_bytes(), "non-ASCII bytes arrive intact: {outcome:?}");
     assert_eq!(
         after_checkout(&bytes, &outcome.stderr),
-        format!("{}\n{BACK_COMMIT_NONE}\n", started_line(&bytes)),
+        format!("{}\n{}\n{BACK_COMMIT_NONE}\n", started_line(&bytes), status_said(&bytes, 0)),
         "{outcome:?}"
     );
 }
@@ -6300,8 +6310,8 @@ fn the_commands_token(name: &str) -> Vec<String> {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(
         after_checkout(&payload, &outcome.stderr),
-        format!("{}\n{BACK_COMMIT_NONE}\n", started_line(&payload)),
-        "the marker, no line saying the command keeps the box's token, and nothing changed: {outcome:?}"
+        format!("{}\n{}\n{BACK_COMMIT_NONE}\n", started_line(&payload), status_said(&payload, 0)),
+        "the marker, no line saying the command keeps the box's token, its status, and nothing changed: {outcome:?}"
     );
     outcome.stdout.lines().map(str::to_owned).collect()
 }
@@ -6341,8 +6351,12 @@ fn box_run_falls_back_to_its_own_token_when_the_restricted_start_is_refused() {
     );
     assert_eq!(
         after_checkout(&payload, &outcome.stderr),
-        format!("{}\n{fallback}\n{BACK_COMMIT_NONE}\n", started_line(&payload)),
-        "the marker, then the line saying the command keeps the box's token, then nothing changed: {outcome:?}"
+        format!(
+            "{}\n{fallback}\n{}\n{BACK_COMMIT_NONE}\n",
+            started_line(&payload),
+            status_said(&payload, 0)
+        ),
+        "the marker, then the line saying the command keeps the box's token, its status, then nothing changed: {outcome:?}"
     );
     assert_eq!(marks(&count), "run\n", "the command ran once");
 }
@@ -6490,9 +6504,10 @@ fn box_run_falls_back_before_the_start_and_runs_the_command() {
     assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
     let said: Vec<&str> = after_checkout(&payload, &outcome.stderr).lines().collect();
     let marker = started_line(&payload);
+    let status = status_said(&payload, 0);
     assert!(
-        matches!(said[..], [first, line, none] if first == marker && is_console_fallback(line) && none == BACK_COMMIT_NONE),
-        "the marker, then one fallback line, then nothing changed: {outcome:?}"
+        matches!(said[..], [first, line, ended, none] if first == marker && is_console_fallback(line) && ended == status && none == BACK_COMMIT_NONE),
+        "the marker, then one fallback line, its status, then nothing changed: {outcome:?}"
     );
     assert_eq!(marks(&count), "run\n", "the command ran once");
 }
@@ -9921,6 +9936,10 @@ fn box_run_past_its_load_adjusted_ceiling_is_killed_with_the_ruled_line_and_124(
     );
     assert!(adjusted_seconds(&outcome, &payload) >= 1.0, "the clock reached the ceiling: {outcome:?}");
     assert!(
+        lines_starting(&outcome, "gate-remote-status:").is_empty(),
+        "a killed command says no status line: {outcome:?}"
+    );
+    assert!(
         Path::new(field(&payload, "Work")).join("new.txt").exists(),
         "the killed command changed the tree"
     );
@@ -10873,8 +10892,8 @@ fn a_payload_with_no_timeout_gives_the_command_no_ceiling_on_the_box() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(
         after_checkout(&payload, &outcome.stderr),
-        format!("{}\n{BACK_COMMIT_NONE}\n", started_line(&payload)),
-        "no kill, no adjusted line, and the command changed nothing: {outcome:?}"
+        format!("{}\n{}\n{BACK_COMMIT_NONE}\n", started_line(&payload), status_said(&payload, 0)),
+        "no kill, no adjusted line, its status, and the command changed nothing: {outcome:?}"
     );
     wait_until_closed(Path::new(field(&payload, "Lock")));
 }
@@ -10898,6 +10917,63 @@ fn a_box_run_that_ends_by_itself_says_its_load_adjusted_seconds() {
     assert!(
         output.is_some() && output < adjusted,
         "the adjusted line comes after the command's drained output: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_box_run_says_its_command_s_whole_status_after_its_output_and_exits_with_it() {
+    let case = Case::new("box_run_status_whole");
+    // 0xC0000005, an access violation, which fake-tool takes as a signed 32-bit status.
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "err", "e1", "exit", "-1073741819"]);
+    payload["Timeout"] = json!(600);
+    payload["Host"] = json!("builder");
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(-1_073_741_819), "the command's whole status: {outcome:?}");
+    assert_eq!(
+        lines_starting(&outcome, "gate-remote-status:"),
+        [status_said(&payload, 3_221_225_477)],
+        "one status line, unsigned: {outcome:?}"
+    );
+    let said: Vec<&str> = outcome.stderr.lines().collect();
+    let output = said.iter().position(|line| *line == "e1");
+    let status = said.iter().position(|line| line.starts_with("gate-remote-status:"));
+    assert!(
+        output.is_some() && output < status,
+        "the status line comes after the command's drained output: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_box_run_whose_command_passes_says_status_0() {
+    let case = Case::new("box_run_status_zero");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "done", "exit", "0"]);
+    payload["Timeout"] = json!(600);
+    payload["Host"] = json!("builder");
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(lines_starting(&outcome, "gate-remote-status:"), [status_said(&payload, 0)], "{outcome:?}");
+}
+
+#[test]
+fn a_box_run_with_no_timeout_says_its_status_with_no_adjusted_line() {
+    let case = Case::new("box_run_status_no_ceiling");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "exit", "256"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(256), "{outcome:?}");
+    assert!(lines_starting(&outcome, "gate-remote-adjusted:").is_empty(), "no ceiling: {outcome:?}");
+    assert_eq!(
+        lines_starting(&outcome, "gate-remote-status:"),
+        [status_said(&payload, 256)],
+        "{outcome:?}"
     );
 }
 

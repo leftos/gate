@@ -682,6 +682,32 @@ fn a_routed_run_runs_on_the_box_and_passes_its_output_and_status() {
 }
 
 #[test]
+fn a_routed_run_whose_command_exits_256_fails_though_ssh_kept_only_its_low_byte() {
+    let case = client_case("client-whole-256");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok-low-byte"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "exit", "256"]));
+
+    assert_eq!(outcome.code, Some(256), "the command's whole status, not ssh's 0: {outcome:?}");
+    assert!(outcome.stderr.contains("FAILED"), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    let log = log_texts(&case.folder().join("out.log"));
+    assert!(!log.contains("gate-remote-status:"), "the status line is hidden: {log}");
+}
+
+#[test]
+fn a_routed_run_whose_command_crashes_ends_with_the_whole_crash_status() {
+    let case = client_case("client-whole-crash");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok-low-byte"]);
+
+    // 0xC0000005, an access violation, which ssh would cut to 5.
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "exit", "-1073741819"]));
+
+    assert_eq!(outcome.code, Some(-1_073_741_819), "the whole status a local run reports: {outcome:?}");
+    assert!(!outcome.stderr.contains("gate-remote-status:"), "{outcome:?}");
+}
+
+#[test]
 fn a_routed_run_says_the_box_s_checkout_and_its_duration() {
     let case = client_case("client-checkout-lines");
     let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);

@@ -64,7 +64,7 @@ use crate::console::Console;
 use crate::environment::{BOX_EXE_VARIABLE, BOX_JOB_VARIABLE, Variables};
 use crate::outputs::manifest::{Listing, Manifest};
 use crate::remote::git::ProgramPlace;
-use crate::remote::{Refusal, refused_line, started_line};
+use crate::remote::{Refusal, refused_line, started_line, status_line};
 use crate::resolve::{self, Environment};
 use crate::run::{ERROR_FILE_NOT_FOUND, Written, end_leftovers, find_program, written};
 use crate::watch::CeilingReading;
@@ -2324,6 +2324,7 @@ fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut 
         beat,
         ceiling,
         wsl: one.wsl(),
+        nonce: request.nonce,
     };
     let watched = watch_of(started, one.of, console);
     reading_ended(reading, beat, console);
@@ -3114,16 +3115,18 @@ struct Pipes {
 /// before the readers drain, so a leftover holding its output open costs no drain time, and before the outputs are
 /// listed. Under the box's ceiling, a command that passes it has its job ended, the readers drain, then the ceiling
 /// says the kill, and the run goes on as [`Ran::Killed`]; the ceiling's clock stops as the wait ends, and its adjusted
-/// line is said once the readers drained, but for a client gone or a wait that failed. The look that finds a kill
+/// line is said once the readers drained, but for a client gone or a wait that failed. A command that exited by itself
+/// has its whole exit code said in the status line after that, under a ceiling or not ([`status_line`]). The look that finds a kill
 /// hands over the ceiling with it, so a kill is always said by the ceiling that found it.
 fn watch(started: Started<'_, '_>, console: &mut Console) -> Result<Ran, u32> {
     watch_of(started, Of::Run, console)
 }
 
-/// [`watch`] for a command of `of`: a stage preparation's says no adjusted line and no kill line or tag, since the run
-/// has not started for the PC and goes on to its hooks or to a refusal ([`killed`]).
+/// [`watch`] for a command of `of`: a command that exited by itself has its whole exit code said in the status line once
+/// its readers drained, after any adjusted line; a stage preparation's says no adjusted line, no status line and no kill
+/// line or tag, since the run has not started for the PC and goes on to its hooks or to a refusal ([`killed`]).
 fn watch_of(started: Started<'_, '_>, of: Of, console: &mut Console) -> Result<Ran, u32> {
-    let says_ceiling = of != Of::StagePrep;
+    let for_the_run = of != Of::StagePrep;
     let Started {
         job,
         launched,
@@ -3131,6 +3134,7 @@ fn watch_of(started: Started<'_, '_>, of: Of, console: &mut Console) -> Result<R
         beat,
         mut ceiling,
         wsl,
+        nonce,
     } = started;
     let Launched { running, pipes } = launched;
     let forwarders = match Forwarders::start(
@@ -3175,15 +3179,19 @@ fn watch_of(started: Started<'_, '_>, of: Of, console: &mut Console) -> Result<R
             if watched.drained(console).is_err() {
                 return Ok(Ran::Gone);
             }
-            if let Some(ceiling) = ceiling.as_ref().filter(|_| says_ceiling) {
+            if let Some(ceiling) = ceiling.as_ref().filter(|_| for_the_run) {
                 ceiling.ended(console);
+            }
+            // ssh passes on only the low byte of the box's exit, so the whole code goes to the client as a line.
+            if for_the_run {
+                beat.say_protocol(console, &status_line(nonce, code));
             }
             Ok(Ran::Exited(code))
         }
         WaitEnd::Killed((kill, ceiling)) => {
             let ceiling = ceiling.closed();
             beat.adjusted.set(ceiling.adjusted_seconds());
-            Ok(killed(watched, kill, says_ceiling.then_some(&ceiling), beat.seams, console))
+            Ok(killed(watched, kill, for_the_run.then_some(&ceiling), beat.seams, console))
         }
         WaitEnd::ClientGone => {
             watched.client_gone(console);
@@ -3245,6 +3253,8 @@ struct Started<'s, 'b> {
     beat: &'s Beat<'b>,
     ceiling: Option<Ceiling<'s>>,
     wsl: bool,
+    /// The run's nonce, which the status line of a command that exited names ([`status_line`]).
+    nonce: &'s str,
 }
 
 /// Ends what the command that exited left in its `job` as a local run does ([`end_leftovers`]), its gates spared,

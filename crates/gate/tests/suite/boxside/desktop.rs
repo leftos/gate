@@ -16,7 +16,7 @@ use super::{
     BoxCall, ENGINE_ENV_NAME, GIT_BIN_STAND_IN, IN_BOX_LINE, QUIET_CLIENT_GONE_GUARD, STALE_ENGINE_ENV, adjusted_seconds, assert_took_no_slot,
     bare_box_call, box_call, ended_within, engine_env, fake_godot, fake_unreal, field, gate_box, godot_root, inner_gate, let_go, lines_starting,
     owned, pair_payload, pair_snapshot, path_for_run, path_godot, payload as request_line, refused_line, run_box, snapshot, started_line,
-    stopped_line_for, unreal_root,
+    status_said, stopped_line_for, unreal_root,
 };
 use crate::support::{
     Case, FAKE_TOOL, HeldDesktop, KeptDesktop, Outcome, box_payload, build_version, copy_tool, desktop_payload, desktop_seams, junction, shown,
@@ -266,13 +266,19 @@ fn a_desktop_run_prints_the_marker_after_the_command_is_adopted_and_before_its_o
 #[test]
 fn a_desktop_run_passes_the_commands_status_and_output() {
     let case = Case::new("desktop_status");
-    let payload = ready_payload(&case, &[FAKE_TOOL, "out", "ran", "err", "e", "exit", "7"]);
+    // Past a byte, so the status line carries what ssh would cut to 0.
+    let payload = ready_payload(&case, &[FAKE_TOOL, "out", "ran", "err", "e", "exit", "256"]);
 
     let outcome = handed_off(&case, &payload, "ok");
 
-    assert_eq!(outcome.code, Some(7), "the command's own status: {outcome:?}");
+    assert_eq!(outcome.code, Some(256), "the command's own status: {outcome:?}");
     assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
     assert!(outcome.stderr.lines().any(|line| line == "e"), "the command's stderr: {outcome:?}");
+    assert_eq!(
+        lines_starting(&outcome, "gate-remote-status:"),
+        [status_said(&payload, 256)],
+        "one status line, the command's whole status: {outcome:?}"
+    );
     ran_its_command(&outcome, &payload);
 }
 

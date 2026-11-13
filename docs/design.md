@@ -3547,7 +3547,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     `-o RequestTTY=no` leads the options of every `gate box` call and `gate push`'s, so stdin never passes through a pseudo-terminal. The last option, `-o Compression=yes`, is the run call's alone: the preflight, stop, boot and outputs calls, git's ssh command and `gate push` ask for none. The run call's compression covers both directions of its connection: the command's output and protocol lines one way, the request and the outputs manifest the other.
 
-    The box's output passes through to the log and the console, except the box's heartbeats and its machine lines, which the client hides from both and keeps out of the lines it holds: the start marker `gate-remote-started: <nonce>` and the refusal tag `gate-remote-refused: <nonce> busy|tools|layout|inputs|sent|lfs|desktop|install|drain|full`, each naming this run's `Nonce` and read on stderr only, as a whole line, and the kill tag, the adjusted line and the checkout lines below.
+    The box's output passes through to the log and the console, except the box's heartbeats and its machine lines, which the client hides from both and keeps out of the lines it holds.
+
+    The machine lines are the start marker `gate-remote-started: <nonce>` and the refusal tag `gate-remote-refused: <nonce> busy|tools|layout|inputs|sent|lfs|desktop|install|drain|full`, each naming this run's `Nonce` and read on stderr only, as a whole line, and the kill tag, the adjusted line, the status line and the checkout lines below.
 
     The client matches those protocol lines on the raw line, before any unstamping, so a command's own line, stamped by the box, never reads as one.
 
@@ -3562,6 +3564,12 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     The PC's two checkout lines are kept lines: they stay in the log of a run that falls back here after the checkout, count toward the log cap and reach stderr when the call echoes to the console. A box too old to say its lines gives none, and the PC says nothing for the checkout.
 
     The adjusted line `gate-remote-adjusted: <nonce> <s.sss>` carries the load-adjusted seconds the box counted, said once the command's output has drained unless the sampler failed, read like the tag on stderr only and the last one winning; another run's, a malformed one or one whose seconds are not a finite number is a line like any other.
+
+    The status line `gate-remote-status: <nonce> <code>` carries the command's whole exit code, because the Windows builder's OpenSSH returns only the low byte of the box's exit. `<code>` is an unsigned 32-bit decimal, with no sign and no leading zero but a lone `0`. It is read like the adjusted line, on stderr only, as a whole line, the raw line before unstamping and the last one winning, and hidden from the log, the console and the kept lines; another run's, a malformed or out-of-range one is a line like any other.
+
+    The run's status, journal entry and verdict carry the whole code, converted as a local run's is, when the line's low byte equals ssh's exit and neither the PC cut the call nor the box killed the command: a command exiting 256 fails with 256 (ssh says 0), a crash 0xC0000005 ends -1073741819 (ssh says 5).
+
+    With no line (an older box) ssh's code stands. The lost-connection arm (ssh 255) and the refusal arms are unchanged, so a command whose status has low byte 255 still reads as a lost connection.
 
     A status 75 is a refusal only when this run's refusal tag came on stderr before any start marker (`busy`, `tools`, `layout`, `inputs`, `lfs`, `desktop`, `replaced`, `install` or `full`, the fallback reason; `full` is a builder whose own slots are all held, the preflight's tag read as the run's is; `drain` is a refusal the run waits on, never a fallback reason, see Builder drain below); a tag after the marker is ignored, so a command that prints the human busy, tools, layout, inputs, lfs, desktop or install line, or a tag of its own, and exits 75 ends with status 75 and no fallback.
 
@@ -4260,7 +4268,7 @@ A routed run first learns the builder's gate version; when its whole version tex
 
 Builders are configured only in the local `%LOCALAPPDATA%\gate\remote.json`. The repo, its docs and its tests name no builder; the suite's remote cases run against a stub.
 
-The box keeps the PowerShell wrapper's lines for the verbs and the refusals, and adds tagged machine lines the wrapper never emits: the start marker, the refusal tags, the kill tag and the adjusted line (Run call, in [Routing](#routing)). `gate box` is what the Rust remote client calls on a builder, so it runs whenever a routed run goes through the remote client.
+The box keeps the PowerShell wrapper's lines for the verbs and the refusals, and adds tagged machine lines the wrapper never emits: the start marker, the refusal tags, the kill tag, the adjusted line and the status line (Run call, in [Routing](#routing)). `gate box` is what the Rust remote client calls on a builder, so it runs whenever a routed run goes through the remote client.
 
 **Install tripwire.** The box runs elevated, so a gate any other process of its user could replace is not trusted. Before any verb runs or stdin is read, `gate box` judges its own image with `gate_win32::check_installed_file` (the file, its folder and every folder above it are owned and changeable only by SYSTEM, Administrators and TrustedInstaller).
 
@@ -4535,7 +4543,7 @@ Built verbs:
   The `<why>` of a skip is `unknown tool`, the `godot` and `unreal` reasons above, `no answer in <n> s` (or `<n> ms` when the limit is not whole seconds), `no answer in <limit>, and could not be stopped: <error>`, `the probe failed` (followed by `: <panic text>` when the probe panicked), or the runner's failure text: `cannot run <program>: <why>`, `<program> <args> wrote more than 16 MiB` or `cannot run <program>: cannot read the system folder: <error>`.
 
   A payload whose `Needs` is not an object of texts prints `gate: box payload Needs is not an object of texts; probing nothing` on stderr, probes nothing and still exits 0.
-- **`run`** runs the payload's `Command` (a list of texts), or, for a warm-up, each of its `WarmCommands` in order (Warm-up, below), in `Work` (in `Work\{Leaf}` for a sibling pair), and exits with the command's own whole 32-bit status after a successful run. Its stdout is the command's stdout, LF-terminated; its stderr is the command's stderr plus the box's own lines.
+- **`run`** runs the payload's `Command` (a list of texts), or, for a warm-up, each of its `WarmCommands` in order (Warm-up, below), in `Work` (in `Work\{Leaf}` for a sibling pair), and exits with the command's own whole 32-bit status after a successful run; ssh keeps only that status's low byte, so the box also says the whole status as a line (the status line, below). Its stdout is the command's stdout, LF-terminated; its stderr is the command's stderr plus the box's own lines.
 
   A run with a `Session` under a root that has a `slots.json` holds a builder-side slot ([Builder-side slots](#slots)) from after its drain admission to its end: the slot its preflight took, kept; or, when that claim lapsed and was taken, a free one; or with every slot held it is refused as the preflight is, `gate-remote-refused: {nonce} full` and the full line on stderr, exit 75.
 
@@ -4549,7 +4557,7 @@ Built verbs:
 
   The command's stdout lines are `out` and its stderr lines `err`; the box's own lines, the forwarded output of git and of the tool and package restores, the root line `gate pid=<pid> ppid=<ppid>` for the box itself, and the process lines of the command's job are `gat`.
 
-  Bare, byte for byte: the start marker, every refusal tag (`busy` included), the kill tag, the adjusted line, the outputs line and the heartbeat. The process lines come from a thread of its own under the output lock, and none follows the box's final lines. The stamp is read once the line's lock is held.
+  Bare, byte for byte: the start marker, every refusal tag (`busy` included), the kill tag, the adjusted line, the status line, the outputs line and the heartbeat. The process lines come from a thread of its own under the output lock, and none follows the box's final lines. The stamp is read once the line's lock is held.
 
   On the desktop route the command's parent is the helper, a process outside the run's job, so the hand-off writes `gate: the desktop helper pid=<h> started the command pid=<c> on the hidden desktop gate-<32 hex>` for a hidden run or `... on the visible desktop` for a locked or session run, and the process tree joins the command to the box through it.
 
@@ -4580,6 +4588,8 @@ Built verbs:
   The PC journals a tagged kill with the tag's verdict whatever its log holds, applies no sync-back and fetches no outputs. A command's own exit 124 (no tag) is an ordinary status with a sync-back.
 
   `gate-remote-adjusted: <nonce> <s.sss>` is also said as any watched command exits, once its output has drained, unless the sampler failed. A failed sample says `gate: sampler failed: <message>; watching by wall time only` and only the backstop is read from then on.
+
+  `gate-remote-status: <nonce> <code>` is said once per command that exits by itself, after its drained output and after any adjusted line: a run and each warm-up command. It is never said for a stage preparation, a kill, a gone client, a failed wait or a command that never started.
 
   The checkout lines: just before the checkout, the box says `gate-remote-checkout: <nonce> start` on stderr with the payload's `Nonce`, and just after the checkout succeeds `gate-remote-checkout: <nonce> done <s.sss>`, the seconds it took to three decimals. The span is the whole checkout: the fetch, the LFS cover check, the LFS scratch folder, the checkout and the clean. A checkout that fails says no done line. They are protocol lines, said without a stamp.
 
@@ -6004,7 +6014,9 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
   A process shorter than a tick, or one that leaves the group, may be missing, and the box says so once per run (`process lines: the group is sampled every 10 ms; ...`). A spawn line on macOS can name the image before the process has run `exec` (GATE-733). On any other Unix only the leader is listed, and the box says that once.
 
   The process lines go through a writer thread of their own, so neither the sampler nor the runner waits on the output lock; the writer is given 2 s to say what it holds when the lines end, and nothing is written after the box's final lines. On macOS a process still in the group when the sampler stops gets a `left` line.
-- **Statuses.** Exited `c` gives `c`; killed by signal `s` gives `128+s` (a signal outside 1..126 gives 1); a client gone at a probe or at the end gives 255; the box's ceiling or backstop kill gives 124. A command that cannot start gives 127 with `gate: remote could not start <program>: <error>`, said after the start marker. A runner failure gives 1 with `gate: the gate failed while running the command: <why>`. The rest is as on the Windows box ([The box side](#the-box-side)).
+- **Statuses.** Exited `c` gives `c`; killed by signal `s` gives `128+s` (a signal outside 1..126 gives 1); a client gone at a probe or at the end gives 255; the box's ceiling or backstop kill gives 124. A command that cannot start gives 127 with `gate: remote could not start <program>: <error>`, said after the start marker. A runner failure gives 1 with `gate: the gate failed while running the command: <why>`.
+
+  This box says no status line: its status is 8 bits, which ssh carries whole. The rest is as on the Windows box ([The box side](#the-box-side)).
   - **Rosetta.** Before the start marker, a `gate-box` translated by Rosetta (`sysctl.proc_translated` is 1) cannot read the CPU times of the run, so it refuses with status 75, `gate-remote-refused: <nonce> install` and `gate: remote gate-box runs under Rosetta on this builder, whose CPU times it cannot read: install the arm64 build`.
 
     A flag that cannot be read says `gate: remote could not read sysctl.proc_translated: <error>; taking the box as native` and goes on; off macOS a missing flag reads as native, silently.

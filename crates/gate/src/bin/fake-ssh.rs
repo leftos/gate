@@ -50,6 +50,8 @@
 //! the folder named as the host, the word before the line, in the folder the variable `GATE_FAKE_SSH_BUILDERS` names,
 //! made when missing, fed this process's standard input, which it reads whole first and keeps as `<steps file>.input`;
 //! its standard streams are otherwise this process's, and it exits with its status;
+//! `ok-low-byte` does as `ok`, then exits with only the low byte of the call's status, as Windows OpenSSH passes on a
+//! box's exit;
 //! `hold <path>` waits until the path exists, then does as `ok`; `fed-hold <path>` reads its standard input whole and
 //! keeps it as `<steps file>.input`, then waits until the path exists, then runs the call as `ok` does, fed what it
 //! read, so the call's input has all been sent before the call does anything; `version <v>` does as `ok` with the gate's standard
@@ -362,6 +364,7 @@ fn say_exit(step: &str, rest: &str) -> Result<i32, String> {
 fn bare_step(step: &str, call: &BoxCall<'_>) -> Result<i32, String> {
     match step {
         "ok" => call.ok(),
+        "ok-low-byte" => call.ok().map(|status| status & 0xFF),
         "away" => call.away(),
         "no-boot" => call.rewritten(BOOT, None),
         "lock-busy" => call.mac_call(&[("GATE_FAKE_LOCKF", "busy")]),

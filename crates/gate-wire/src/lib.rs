@@ -2007,6 +2007,21 @@ pub fn adjusted_prefix(nonce: &str) -> String {
     format!("gate-remote-adjusted: {nonce} ")
 }
 
+/// The line the Windows box says on stderr once a command of the run whose payload carries `nonce` exited by itself and
+/// its readers drained: the command's whole exit code `code`, as an unsigned 32-bit decimal, `gate-remote-status:
+/// <nonce> <code>`. ssh passes on only the low byte of the box's own exit, so the client reads the whole code from this
+/// line. Never said for a kill, a client gone, a failed wait, a command that never started, or a stage preparation.
+#[must_use]
+pub fn status_line(nonce: &str, code: u32) -> String {
+    format!("{}{code}", status_prefix(nonce))
+}
+
+/// The prefix of the status line ([`status_line`]) of the run whose payload carries `nonce`, its code after it.
+#[must_use]
+pub fn status_prefix(nonce: &str) -> String {
+    format!("gate-remote-status: {nonce} ")
+}
+
 /// The line the box says on stderr just before it checks out the snapshot of the run whose payload carries `nonce`:
 /// `gate-remote-checkout: <nonce> start`. The client reads it only before the start marker ([`started_line`]), so no
 /// command can forge it.
@@ -2552,7 +2567,8 @@ mod tests {
         use crate::{
             BoxKill, DrainAction, IDENTITY_NAMES, LAYOUT_CHANGING, LAYOUT_SINGLE, PathForm, Payload, Refusal, WARM_READ_LIMIT, adjusted_line,
             adjusted_prefix, busy_line, checkout_done_line, checkout_prefix, checkout_start_line, killed_line, layout_line, layout_text,
-            layout_text_for, names_another_layout, readies_single, refused_line, started_line, tools_line, warm_record_hash,
+            layout_text_for, names_another_layout, readies_single, refused_line, started_line, status_line, status_prefix, tools_line,
+            warm_record_hash,
         };
 
         const NONCE: &str = "0123456789abcdef0123456789abcdef";
@@ -2678,6 +2694,18 @@ mod tests {
                 "three decimals always"
             );
             assert!(adjusted_line(NONCE, 7.5).starts_with(&adjusted_prefix(NONCE)));
+        }
+
+        #[test]
+        fn the_status_line_carries_the_nonce_and_the_whole_unsigned_code() {
+            assert_eq!(status_line(NONCE, 0), format!("gate-remote-status: {NONCE} 0"));
+            assert_eq!(
+                status_line(NONCE, 3_221_225_477),
+                format!("gate-remote-status: {NONCE} 3221225477"),
+                "a crash code whole, unsigned"
+            );
+            assert_eq!(status_line(NONCE, u32::MAX), format!("gate-remote-status: {NONCE} 4294967295"));
+            assert_eq!(status_line(NONCE, 256), format!("{}256", status_prefix(NONCE)));
         }
 
         #[test]

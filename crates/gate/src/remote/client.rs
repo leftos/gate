@@ -75,7 +75,7 @@ use super::watchdog::{self, Cut, Kept, Kill, LINE_CAP};
 use super::worktree_lock::{self, Folder, Locked, Wait};
 use super::{
     BoxKill, FAILED, FAILED_RUN, INSTALL_UNTRUSTED, KeyWait, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, Split, WarmEnd, Warmth,
-    adjusted_prefix, install_why, killed_line, refused_line, root_busy_why, root_why, started_line,
+    adjusted_prefix, install_why, killed_line, refused_line, root_busy_why, root_why, started_line, status_prefix,
 };
 use crate::boxside::outputs::{NAMES_SKIPPED, OUTPUTS_BUDGET};
 use crate::commit::forward::Checked;
@@ -1298,8 +1298,13 @@ pub(super) struct Called {
     drain: Option<Drain>,
     /// The kill the box's kill tag for the run named on standard error, the last when it said more than one.
     box_killed: Option<BoxKill>,
-    /// The load-adjusted seconds the box's last adjusted line on standard error said.
+    /// The load-adjusted seconds the box's last adjusted line on standard error said; the status line said beside it is
+    /// kept as [`Called::whole`].
     adjusted: Option<f64>,
+    /// The command's whole exit code the box's last status line on standard error said ([`gate_wire::status_line`]);
+    /// `None` when it said none, as for a kill, or a box too old to say it. [`Called::status`] stays ssh's code, which
+    /// keeps only the low byte of the box's exit; only [`status_end`] reads this one, and only where the two agree.
+    whole: Option<u32>,
     /// The bytes its job had written at the last look, for a call whose watch caps them; `None` for any other call, or
     /// when no look succeeded.
     written: Option<u64>,
@@ -1417,6 +1422,7 @@ impl Called {
             drain: None,
             box_killed: None,
             adjusted: None,
+            whole: None,
             written: None,
             received: None,
             channel: None,
@@ -4437,6 +4443,7 @@ fn called_of(ended: CallEnd, raised: Raised, mut heard: Heard) -> Result<Called,
         drain: heard.drain,
         box_killed: heard.box_killed,
         adjusted: heard.adjusted,
+        whole: heard.whole,
         written: None,
         received: None,
         channel: None,
@@ -5083,6 +5090,8 @@ struct Heard {
     drain: Option<Drain>,
     box_killed: Option<BoxKill>,
     adjusted: Option<f64>,
+    /// The whole exit code the box's last status line said.
+    whole: Option<u32>,
     /// The port the box's data channel line for the call named, the first when it said more than one.
     channel_port: Option<u16>,
     /// Its last standard error line saying what the box sent over a data channel.
@@ -5095,9 +5104,9 @@ struct Heard {
 
 impl Heard {
     /// Keeps one `line` of standard error when `error`, else of standard output, cut to the cap: a heartbeat, and the
-    /// box's start marker, refusal tag, kill tag or adjusted line its reader read the line as, `protocol`, only mark
-    /// the first error line, the latter four also marking the run started, refused or killed by the box, or the
-    /// load-adjusted seconds it counted ([`Heard::marked`]).
+    /// box's start marker, refusal tag, kill tag, adjusted line or status line its reader read the line as, `protocol`,
+    /// only mark the first error line, the latter five also marking the run started, refused or killed by the box, the
+    /// load-adjusted seconds it counted, or the command's whole exit code ([`Heard::marked`]).
     fn record(&mut self, line: &str, error: bool, protocol: Option<Protocol>) {
         let line = watchdog::truncated(line);
         if error {
@@ -5119,7 +5128,7 @@ impl Heard {
     }
 
     /// Marks what the box's line read as `protocol` says: the run started, its first refusal, its last kill tag, its last
-    /// load-adjusted seconds. The first kill tag raises the interrupt [`Heard::raise_at_kill`] holds.
+    /// load-adjusted seconds, its last whole exit code. The first kill tag raises the interrupt [`Heard::raise_at_kill`] holds.
     fn marked(&mut self, protocol: Protocol) {
         match protocol {
             Protocol::Started => self.started = true,
@@ -5145,6 +5154,7 @@ impl Heard {
                 }
             }
             Protocol::Adjusted(seconds) => self.adjusted = Some(seconds),
+            Protocol::Status(code) => self.whole = Some(code),
             Protocol::Channel(port) => {
                 self.channel_port.get_or_insert(port);
             }
@@ -5403,8 +5413,8 @@ struct Reading {
 }
 
 impl Reading {
-    /// The box's start marker, refusal tag, kill tag or adjusted line for the run that `line` is, of standard error when
-    /// `error`; `None` for a line of standard output, any line of a call that is no run call, and any other line.
+    /// The box's start marker, refusal tag, kill tag, adjusted line or status line for the run that `line` is, of
+    /// standard error when `error`; `None` for a line of standard output, any line of a call that is no run call, and any other line.
     fn protocol(&self, line: &str, error: bool) -> Option<Protocol> {
         self.lines.as_deref().filter(|_| error).and_then(|lines| lines.of(line))
     }
@@ -5936,6 +5946,13 @@ fn adjusted_seconds(text: &str) -> Option<f64> {
     text.parse::<f64>().ok().filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
 }
 
+/// The code `text` spells when it is exactly what the box's status line carries: one or more ASCII digits, no leading
+/// zero but a lone `0`, fitting an unsigned 32-bit code; `None` for anything else.
+fn whole_code(text: &str) -> Option<u32> {
+    let digits = !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()) && (text == "0" || !text.starts_with('0'));
+    digits.then(|| text.parse().ok()).flatten()
+}
+
 /// Whether `line` is exactly the box's heartbeat: its prefix and one or more digits.
 fn is_heartbeat(line: &str) -> bool {
     line.strip_prefix(HEARTBEAT)
@@ -5944,7 +5961,8 @@ fn is_heartbeat(line: &str) -> bool {
 
 /// How a run call that ended as `called`, its own lines at `output` among the attempt's, ends the run when neither a
 /// kill nor an interrupt ended it: a lost connection when it exited 255; a refusal when its 75 comes with the box's
-/// refusal tag and no start marker, its `sent` tag among them ([`End::SentRefused`]); else the command's own status.
+/// refusal tag and no start marker, its `sent` tag among them ([`End::SentRefused`]); else the command's own status
+/// ([`command_status`]).
 fn status_end(called: &Called, output: Range<usize>) -> End {
     if called.status == SSH_FAILED {
         return End::Lost(output);
@@ -5954,7 +5972,18 @@ fn status_end(called: &Called, output: Range<usize>) -> End {
         (Some(reason), _) if status == REFUSED => End::Refused(reason),
         (None, Some(drain)) if status == REFUSED => End::Draining(drain),
         (None, None) if status == REFUSED && called.sent_refusal() => End::SentRefused,
-        _ => End::Status(status),
+        _ => End::Status(command_status(called)),
+    }
+}
+
+/// The command's own status of a run call that ended as `called`: the whole code the box's status line said, read as a
+/// local run reads an exit code, when its low byte is ssh's code, which keeps only that byte, and neither the PC cut the
+/// call nor the box killed the command; else ssh's code, as from a box too old to say the line.
+fn command_status(called: &Called) -> i64 {
+    let ssh = u32::try_from(called.status).ok();
+    match called.whole {
+        Some(whole) if Some(whole & 0xFF) == ssh && called.cut.is_none() && called.box_killed.is_none() => i64::from(whole.cast_signed()),
+        _ => i64::from(called.status),
     }
 }
 
@@ -6377,7 +6406,8 @@ pub(super) fn watchdog_line(cut: Cut, doing: &str) -> Option<String> {
 
 /// A line the box says on a run call's standard error for the client alone, besides its heartbeat: the start marker
 /// said just before the command starts, a refusal tag and the fallback reason it names, the `sent` refusal tag, a kill
-/// tag and the kill it names, or the adjusted line and the load-adjusted seconds it carries.
+/// tag and the kill it names, the adjusted line and the load-adjusted seconds it carries, or the status line and the
+/// command's whole exit code it carries.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Protocol {
     Started,
@@ -6393,6 +6423,9 @@ enum Protocol {
     Killed(BoxKill),
     /// The box's adjusted line, said once the command's readers drained.
     Adjusted(f64),
+    /// The box's status line, said once a command that exited by itself had its readers drained, and the command's
+    /// whole exit code it carries ([`gate_wire::status_line`]).
+    Status(u32),
     /// The box's data channel line for the call, and the port it names ([`gate_wire::channel_line`]).
     Channel(u16),
     /// The box's `channel` refusal tag: its data channel did not complete.
@@ -6424,8 +6457,8 @@ impl CheckoutSaid {
 /// What starts the box's line saying what it sent over a data channel ([`gate_wire::channel_sent_line`]).
 const CHANNEL_SENT: &str = "gate: data channel sent ";
 
-/// The start marker, the twelve refusal tags, the two kill tags and the adjusted line's prefix of one call, made once for
-/// its readers, and the run call's checkout lines.
+/// The start marker, the twelve refusal tags, the two kill tags, the adjusted line's prefix and the status line's prefix
+/// of one call, made once for its readers, and the run call's checkout lines.
 struct ProtocolLines {
     drain: String,
     started: String,
@@ -6442,6 +6475,8 @@ struct ProtocolLines {
     timed_out: String,
     backstop: String,
     adjusted: String,
+    /// The prefix of the box's status line, the command's whole exit code after it ([`gate_wire::status_prefix`]).
+    status: String,
     channel: String,
     channel_refused: String,
     /// The run call's checkout lines and how its readers say the PC's for them; `None` for every other call.
@@ -6478,6 +6513,7 @@ impl ProtocolLines {
             timed_out: killed_line(nonce, BoxKill::TimedOut),
             backstop: killed_line(nonce, BoxKill::Backstop),
             adjusted: adjusted_prefix(nonce),
+            status: status_prefix(nonce),
             channel: channel_prefix(nonce),
             channel_refused: refused_line(nonce, Refusal::Channel),
             checkout: None,
@@ -6500,8 +6536,9 @@ impl ProtocolLines {
     }
 
     /// What `line`, compared as a whole line, is of the run: its start marker, one of its refusal tags, one of its kill
-    /// tags or its adjusted line with seconds the line may carry ([`adjusted_seconds`]); `None` for any other line,
-    /// another run's marker, tag or adjusted line included, as for a command's own line.
+    /// tags, its adjusted line with seconds the line may carry ([`adjusted_seconds`]) or its status line with a code the
+    /// line may carry ([`whole_code`]); `None` for any other line, another run's marker, tag, adjusted or status line
+    /// included, as for a command's own line.
     fn of(&self, line: &str) -> Option<Protocol> {
         [
             (&self.started, Protocol::Started),
@@ -6528,6 +6565,7 @@ impl ProtocolLines {
                 .and_then(adjusted_seconds)
                 .map(Protocol::Adjusted)
         })
+        .or_else(|| line.strip_prefix(self.status.as_str()).and_then(whole_code).map(Protocol::Status))
     }
 }
 
@@ -6602,7 +6640,9 @@ mod tests {
     use crate::remote::watchdog::{self, Kill, LOG_CAP};
     use crate::remote::worktree_lock::tests::{held_elsewhere, lock_name};
     use crate::remote::{INSTALL_UNTRUSTED, install_untrusted_line};
-    use crate::remote::{Refusal, RemoteCall, RemoteClient, Sibling, WarmEnd, Warmth, adjusted_line, busy_line, carried, refused_line, started_line};
+    use crate::remote::{
+        Refusal, RemoteCall, RemoteClient, Sibling, WarmEnd, Warmth, adjusted_line, busy_line, carried, refused_line, started_line, status_line,
+    };
     use crate::run::CONTROL_C_EXIT;
     use gate_router::{BuilderOs, escaped};
     use gate_state::v1::{self, WarmFailure};
@@ -7391,6 +7431,7 @@ mod tests {
             drain: None,
             box_killed: None,
             adjusted: None,
+            whole: None,
             written: None,
             received: None,
             channel: None,
@@ -9246,6 +9287,110 @@ mod tests {
         let (untagged, said) = run_call_said("", place, "drain-untagged");
         assert_eq!(said, place, "a place line with no tag before it is a line like any other");
         assert_eq!(untagged.lines, ["gate: drain place 3"]);
+    }
+
+    #[test]
+    fn a_crash_status_the_box_said_whole_outlives_ssh_s_eight_bit_exit() {
+        let marker = started_line(NONCE);
+        let (called, _) = run_call_ended("", &format!("{marker}\ngate-remote-status: {NONCE} 3221225477\n"), 5, "whole-status");
+        let end = status_end(&called, 0..0);
+        assert!(matches!(end, End::Status(-1_073_741_819)), "{end:?}");
+    }
+
+    #[test]
+    fn a_whole_status_of_256_is_a_failure_though_ssh_exited_0() {
+        let marker = started_line(NONCE);
+        let (called, _) = run_call_ended("", &format!("{marker}\n{}\n", status_line(NONCE, 256)), 0, "whole-256");
+        let end = status_end(&called, 0..0);
+        assert!(matches!(end, End::Status(256)), "{end:?}");
+    }
+
+    #[test]
+    fn a_box_that_said_no_whole_status_leaves_ssh_s_code() {
+        let marker = started_line(NONCE);
+        let (called, _) = run_call_ended("", &format!("{marker}\n"), 5, "whole-none");
+        let end = status_end(&called, 0..0);
+        assert!(matches!(end, End::Status(5)), "{end:?}");
+    }
+
+    #[test]
+    fn a_whole_status_whose_low_byte_is_not_ssh_s_code_is_ignored() {
+        let marker = started_line(NONCE);
+        let (called, _) = run_call_ended("", &format!("{marker}\n{}\n", status_line(NONCE, 3_221_225_477)), 1, "whole-disagrees");
+        let end = status_end(&called, 0..0);
+        assert!(matches!(end, End::Status(1)), "{end:?}");
+    }
+
+    #[test]
+    fn a_call_the_pc_cut_keeps_ssh_s_code_whatever_whole_status_was_heard() {
+        let marker = started_line(NONCE);
+        // 380's low byte is 124, the status a cut call ends with.
+        let (mut called, _) = run_call_ended("", &format!("{marker}\n{}\n", status_line(NONCE, 380)), KILLED, "whole-cut");
+        called.cut = Some(Cut::TooLong);
+        let end = status_end(&called, 0..0);
+        assert!(matches!(end, End::Status(124)), "{end:?}");
+    }
+
+    #[test]
+    fn a_whole_status_with_ssh_s_255_is_still_a_lost_connection() {
+        let marker = started_line(NONCE);
+        let (called, _) = run_call_ended("", &format!("{marker}\n{}\n", status_line(NONCE, 255)), SSH_FAILED, "whole-255");
+        let end = status_end(&called, 0..0);
+        assert!(matches!(end, End::Lost(_)), "{end:?}");
+    }
+
+    #[test]
+    fn a_whole_status_with_ssh_s_75_and_this_run_s_refusal_tag_is_still_that_refusal() {
+        let tag = refused_line(NONCE, Refusal::Busy);
+        let (called, _) = run_call_ended("", &format!("{tag}\n{}\n", status_line(NONCE, 75)), 75, "whole-75");
+        let end = status_end(&called, 0..0);
+        assert!(matches!(end, End::Refused(FallbackReason::Busy)), "{end:?}");
+    }
+
+    #[test]
+    fn the_status_line_is_read_from_this_run_s_line_on_standard_error_alone_with_a_whole_u32() {
+        let line = |code: &str| format!("gate-remote-status: {NONCE} {code}\n");
+        let cases: [(&str, String, String, Option<u32>); 13] = [
+            (
+                "whole-read",
+                String::new(),
+                format!("{}\n", status_line(NONCE, 3_221_225_477)),
+                Some(3_221_225_477),
+            ),
+            ("whole-zero", String::new(), line("0"), Some(0)),
+            (
+                "whole-last-wins",
+                String::new(),
+                format!("{}\n{}\n", status_line(NONCE, 1), status_line(NONCE, 256)),
+                Some(256),
+            ),
+            ("whole-stdout", line("5"), String::new(), None),
+            (
+                "whole-other-nonce",
+                String::new(),
+                format!("{}\n", status_line("fedcba9876543210fedcba9876543210", 5)),
+                None,
+            ),
+            ("whole-no-nonce", String::new(), "gate-remote-status: 5\n".to_owned(), None),
+            ("whole-hex", String::new(), line("0x10"), None),
+            ("whole-negative", String::new(), line("-1"), None),
+            ("whole-plus", String::new(), line("+5"), None),
+            ("whole-overflow", String::new(), line("4294967296"), None),
+            ("whole-leading-zero", String::new(), line("007"), None),
+            ("whole-empty", String::new(), line(""), None),
+            ("whole-padded", String::new(), format!("{} \n", status_line(NONCE, 5)), None),
+        ];
+        for (name, stdout, stderr, whole) in cases {
+            let (called, said) = run_call_said(&stdout, &stderr, name);
+            assert_eq!(called.whole, whole, "{name}");
+            if whole.is_some() {
+                assert_eq!(said, "", "this run's status line is not passed on: {name}");
+                assert!(called.lines.is_empty(), "nor kept: {name}");
+            } else {
+                assert_eq!(said, format!("{stdout}{stderr}"), "any other line is passed on: {name}");
+                assert!(!called.lines.is_empty(), "and kept: {name}");
+            }
+        }
     }
 
     #[test]
@@ -11250,6 +11395,7 @@ mod tests {
         use super::super::{BoxKill, Echo, End, ProtocolLines, Reader, Reading, Shared, held, killed_line, relay};
         use super::{Chunks, Step, UNMARKED, outputs_worktree, passed, said_after};
         use crate::remote::outputs::NO_OUTPUTS_LINE;
+        use crate::remote::status_line;
         use crate::remote::watchdog::LOG_CAP;
 
         /// The nonce of the run these cases read the lines of.
@@ -11288,6 +11434,27 @@ mod tests {
                 Some(BoxKill::TimedOut),
                 "the box's own tag, bare, kills it"
             );
+        }
+
+        #[test]
+        fn a_status_line_the_box_stamped_as_the_command_s_line_is_kept_not_read() {
+            let line = status_line(NONCE, 0);
+            let forged = stamp::stamped(&stamp::now(), Tag::Err, &line);
+            let shared = Shared::new();
+
+            relay(format!("{forged}\n").as_bytes(), Reader::new(true, run_reading(), None), &shared);
+
+            let heard = held(&shared.heard);
+            assert_eq!(heard.whole, None, "the command's own line is no status line");
+            assert_eq!(
+                heard.last_error.as_deref(),
+                Some(line.as_str()),
+                "kept as the command's text, without its stamp"
+            );
+            drop(heard);
+            let shared = Shared::new();
+            relay(format!("{line}\n").as_bytes(), Reader::new(true, run_reading(), None), &shared);
+            assert_eq!(held(&shared.heard).whole, Some(0), "the box's own line, bare, is read");
         }
 
         /// The line the box says when a run's cross build brought no Windows outputs back.

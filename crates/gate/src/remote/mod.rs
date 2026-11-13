@@ -85,7 +85,9 @@ const FAILED_RUN: &str = "gate: the remote run failed";
 pub(crate) const COLD_NOTE_PREFIX: &str = "gate: remote cold:";
 
 // The protocol lines the box says and the client matches, built once in `gate-wire` for every box.
-pub(crate) use gate_wire::{BoxKill, Refusal, adjusted_line, adjusted_prefix, busy_line, killed_line, layout_line, refused_line, started_line};
+pub(crate) use gate_wire::{
+    BoxKill, Refusal, adjusted_line, adjusted_prefix, busy_line, killed_line, layout_line, refused_line, started_line, status_line, status_prefix,
+};
 
 /// What the box says on standard error, before why, when it refuses to act because the builder's gate install is not
 /// trusted: its own program, or the desktop helper a desktop run hands its command to, is not installed where only

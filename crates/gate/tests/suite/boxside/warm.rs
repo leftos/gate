@@ -19,8 +19,8 @@ use super::{
     PNPM_LOCKFILE_PATH, STALE_UE_ROOT, box_call, bun_install_call, command_call, engine_env, fake_godot, fake_unreal, field, gate_box, godot_root,
     has_ref, install_call, installs, let_go, lines_starting, marks, npm_install_call, pair_payload, pair_snapshot, pair_tree, passed, path_for_bun,
     path_for_npm, path_for_pnpm, pnpm_box, pnpm_calls, refused_line, renamed, run_box, run_box_with_engine_env, run_box_with_git_bin,
-    run_box_with_godot, run_box_with_seams, run_box_with_unreal, snapshot, started_line, stopped_line_for, stub_bun, stub_npm, stub_pnpm,
-    unreal_root,
+    run_box_with_godot, run_box_with_seams, run_box_with_unreal, snapshot, started_line, status_said, stopped_line_for, stub_bun, stub_npm,
+    stub_pnpm, unreal_root,
 };
 use crate::support::{Case, FAKE_TOOL, GATE, Outcome, box_payload, shown, wait_until, wait_until_closed};
 
@@ -141,6 +141,11 @@ fn box_warm_up_stops_at_a_failing_command() {
         "{outcome:?}"
     );
     assert_eq!(marks(&marked[2]), String::new(), "no later command ran");
+    assert_eq!(
+        lines_starting(&outcome, "gate-remote-status:"),
+        [status_said(&payload, 0), status_said(&payload, 3)],
+        "a status line for each command that exited: {outcome:?}"
+    );
     not_warm(&outcome, &payload);
     wait_until_closed(Path::new(field(&payload, "Lock")));
 }
