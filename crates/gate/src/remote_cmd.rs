@@ -4,15 +4,15 @@
 //! copied to a backup made new beside it, and the new text replaces the file in one move, so a reader sees the old
 //! file or the new one. No line names a `host` the file holds.
 //!
-//! `gate remote match` reads the file as routing does and prints the pattern a command would match
-//! ([`gate_router::pattern_for`]), so nothing outside the gate needs a matcher of its own.
+//! `gate remote match` reads the file as routing does and prints the pattern a command would match and the list that
+//! holds it ([`gate_router::pattern_and_list_for`]), so nothing outside the gate needs a matcher of its own.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use gate_args::{RemoteMatchRequest, RemoteRequest, RemoteVerb};
-use gate_router::{Edit, EditRefusal, EditVerb, Edited, edit_remote_json, pattern_for};
+use gate_router::{Edit, EditRefusal, EditVerb, Edited, edit_remote_json, pattern_and_list_for};
 use jiff::Timestamp;
 
 use crate::answer::FAILED_STATUS;
@@ -48,8 +48,8 @@ pub(crate) fn remote(request: &RemoteRequest, environment: &Environment, console
 }
 
 /// Runs `gate remote match` and returns its exit status: 0 with the first pattern of the repo that matches the text on
-/// stdout, 1 with nothing on it when none matches, or [`CANNOT_ANSWER_STATUS`] saying why on stderr when `remote.json`
-/// cannot be read.
+/// stdout and the list holding it on the line after, 1 with nothing on it when none matches, or
+/// [`CANNOT_ANSWER_STATUS`] saying why on stderr when `remote.json` cannot be read.
 pub(crate) fn remote_match(request: &RemoteMatchRequest, environment: &Environment, console: &mut Console) -> u32 {
     let Some(path) = route::remote_json_path(environment.local_app_data.as_deref()) else {
         console.err("remote: no remote.json: LOCALAPPDATA is not an absolute folder");
@@ -66,9 +66,10 @@ pub(crate) fn remote_match(request: &RemoteMatchRequest, environment: &Environme
             return CANNOT_ANSWER_STATUS;
         }
     };
-    match pattern_for(&config, &request.repo, &request.text) {
-        Some(pattern) => {
+    match pattern_and_list_for(&config, &request.repo, &request.text) {
+        Some((pattern, list)) => {
             console.out(&pattern);
+            console.out(&format!("in {list}"));
             0
         }
         None => u32::from(FAILED_STATUS),

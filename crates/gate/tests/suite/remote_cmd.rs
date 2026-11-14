@@ -10,6 +10,28 @@ use crate::support::{Case, Outcome, write_remote_json};
 const ROUTING: &str =
     "{\n    \"host\": \"builder@example\",\n    \"repos\": {\n        \"gate\": [\n            \"cargo test*\"\n        ]\n    }\n}\n";
 
+/// A routing file with a routed `builders` entry at index 0 listing `gate` beside the top-level `repos`.
+const BUILDER_ROUTING: &str = r#"{
+    "host": "builder@example",
+    "repos": {
+        "gate": [
+            "cargo test*"
+        ]
+    },
+    "builders": [
+        {
+            "host": "one@example",
+            "os": "windows",
+            "repos": {
+                "gate": [
+                    "x*"
+                ]
+            }
+        }
+    ]
+}
+"#;
+
 /// The names in the folder of `path`, sorted.
 fn beside(path: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(path.parent().expect("the file has a folder"))
@@ -46,7 +68,19 @@ fn a_match_prints_the_pattern_and_ends_zero() {
     let outcome = case.run(&["remote", "match", "gate", "cargo test --workspace"]);
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert_eq!(lines(&outcome.stdout), ["cargo test*"], "{outcome:?}");
+    assert_eq!(lines(&outcome.stdout), ["cargo test*", "in repos.gate"], "{outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+}
+
+#[test]
+fn a_match_on_a_builder_s_list_names_the_entry() {
+    let case = Case::new("remote_match_builder");
+    write_remote_json(&case, BUILDER_ROUTING);
+
+    let outcome = case.run(&["remote", "match", "gate", "x --y"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(lines(&outcome.stdout), ["x*", "in builders[0].repos.gate"], "{outcome:?}");
     assert_eq!(outcome.stderr, "", "{outcome:?}");
 }
 

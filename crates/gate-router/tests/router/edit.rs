@@ -55,6 +55,51 @@ const BUILDERS: &str = r#"{
 }
 "#;
 
+/// [`BUILDERS`] with its second entry also listing `other`.
+const BUILDERS_TWO_REPOS: &str = r#"{
+    "host": "builder@example",
+    "repos": {"gate": ["cargo test*"]},
+    "builders": [
+        {"host": "one@example", "os": "windows", "repos": {"gate": ["x*"]}},
+        {"host": "two@example", "os": "windows", "repos": {"gate": ["y*"], "other": ["z*"]}}
+    ]
+}
+"#;
+
+/// A routing file whose top-level `repos` holds an empty list, as an older gate left it.
+const EMPTY_LIST: &str = r#"{
+    "host": "builder@example",
+    "repos": {
+        "gate": [],
+        "other": [
+            "dotnet test*"
+        ]
+    }
+}
+"#;
+
+/// A routing file whose top-level `repos` names one repo only.
+const ONE_REPO: &str = r#"{
+    "host": "builder@example",
+    "repos": {
+        "gate": [
+            "cargo test*"
+        ]
+    }
+}
+"#;
+
+/// A file whose top-level `repos` and first builder list `gate`, and whose second builder lists only `other`.
+const NEW_BUILDER_LIST: &str = r#"{
+    "host": "builder@example",
+    "repos": {"gate": ["cargo test*", "cargo build*"]},
+    "builders": [
+        {"host": "one@example", "os": "windows", "repos": {"gate": ["x*"]}},
+        {"host": "two@example", "os": "windows", "repos": {"other": ["z*"]}}
+    ]
+}
+"#;
+
 fn edit(text: &str, verb: EditVerb, section: &str, builder: Option<&str>, repo: &str, patterns: &[&str]) -> Result<Edited, EditRefusal> {
     let patterns: Vec<String> = patterns.iter().map(|pattern| (*pattern).to_owned()).collect();
     edit_remote_json(
@@ -128,10 +173,90 @@ fn an_absent_pattern_or_repo_is_reported_absent_and_the_text_kept() {
 }
 
 #[test]
-fn removing_the_last_pattern_leaves_an_empty_list_and_the_key() {
+fn removing_the_last_repos_pattern_deletes_the_repo_key() {
     let edited = remove(BASE, "repos", "other", &["dotnet test*"]).expect("the edit is made");
-    assert_eq!(value(&edited.text)["repos"]["other"], Value::Array(Vec::new()));
-    assert!(edited.text.contains("\"other\": []"), "{}", edited.text);
+    assert_eq!(
+        edited.lines,
+        ["remote: repos.other: - dotnet test*", "remote: repos.other: removed the empty list"]
+    );
+    assert_eq!(keys(&value(&edited.text)["repos"]), ["gate"]);
+}
+
+#[test]
+fn removing_from_an_already_empty_repos_list_deletes_the_key() {
+    let edited = remove(EMPTY_LIST, "repos", "gate", &["cargo test*"]).expect("the edit is made");
+    assert!(edited.changed);
+    assert_eq!(
+        edited.lines,
+        [
+            "remote: repos.gate: absent (no cargo test*)",
+            "remote: repos.gate: removed the empty list"
+        ]
+    );
+    assert_eq!(keys(&value(&edited.text)["repos"]), ["other"]);
+}
+
+#[test]
+fn removing_the_last_outputs_pattern_keeps_an_empty_list() {
+    let edited = remove(BASE, "outputs", "gate", &["target/**"]).expect("the edit is made");
+    assert_eq!(edited.lines, ["remote: outputs.gate: - target/**"]);
+    assert_eq!(value(&edited.text)["outputs"]["gate"], Value::Array(Vec::new()));
+}
+
+#[test]
+fn removing_the_last_repos_key_of_the_file_leaves_an_empty_section() {
+    let edited = remove(ONE_REPO, "repos", "gate", &["cargo test*"]).expect("the edit is made");
+    assert_eq!(
+        edited.lines,
+        ["remote: repos.gate: - cargo test*", "remote: repos.gate: removed the empty list"]
+    );
+    assert_eq!(value(&edited.text)["repos"], serde_json::json!({}));
+}
+
+#[test]
+fn removing_the_last_repos_pattern_of_a_builder_deletes_its_key() {
+    let edited = edit(BUILDERS_TWO_REPOS, EditVerb::Remove, "repos", Some("two@example"), "other", &["z*"]).expect("the edit is made");
+    assert_eq!(
+        edited.lines,
+        [
+            "remote: builders[1].repos.other: - z*",
+            "remote: builders[1].repos.other: removed the empty list"
+        ]
+    );
+    let after = value(&edited.text);
+    assert_eq!(keys(&after["builders"][1]["repos"]), ["gate"]);
+    assert_eq!(after["builders"][1]["repos"]["gate"], serde_json::json!(["y*"]));
+}
+
+#[test]
+fn removing_the_only_repo_of_a_routed_builder_is_refused() {
+    let refusal = edit(BUILDERS, EditVerb::Remove, "repos", Some("two@example"), "gate", &["y*"]).expect_err("refused");
+    assert_eq!(
+        refusal,
+        EditRefusal::Guard("the result would be refused: builders[1].repos must name at least one repo".to_owned())
+    );
+}
+
+#[test]
+fn adding_a_builder_s_first_repos_pattern_warns_of_the_patterns_its_pins_stop_matching() {
+    let edited = edit(NEW_BUILDER_LIST, EditVerb::Add, "repos", Some("two@example"), "gate", &["y*"]).expect("the edit is made");
+    let warning = "remote: warning: builders[1].repos.gate is new, so a run pinned to this builder matches only its patterns, \
+                   no longer the 3 in repos.gate, builders[0].repos.gate; to keep them, put the new pattern in the top-level \
+                   repos and pin the command";
+    assert_eq!(edited.lines, ["remote: builders[1].repos.gate: + y*", warning]);
+    assert_eq!(value(&edited.text)["builders"][1]["repos"]["gate"], serde_json::json!(["y*"]));
+}
+
+#[test]
+fn adding_to_a_builder_s_existing_repos_list_does_not_warn() {
+    let edited = edit(BUILDERS, EditVerb::Add, "repos", Some("one@example"), "gate", &["w*"]).expect("the edit is made");
+    assert_eq!(edited.lines, ["remote: builders[0].repos.gate: + w*"]);
+}
+
+#[test]
+fn adding_a_builder_s_first_outputs_glob_does_not_warn() {
+    let edited = edit(NEW_BUILDER_LIST, EditVerb::Add, "outputs", Some("two@example"), "gate", &["bin/**"]).expect("the edit is made");
+    assert_eq!(edited.lines, ["remote: builders[1].outputs.gate: + bin/**"]);
 }
 
 #[test]

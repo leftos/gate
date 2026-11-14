@@ -3856,11 +3856,24 @@ fn candidates(config: &Config, repo: &str, words: &[String], matching: Vec<(Buil
         .collect()
 }
 
-/// The pattern a command of `repo` whose words, joined by single spaces, are `text` would match first: what the first
-/// entry of [`matching`] holds, from the same lists by the same match. `None` when no pattern of the repo matches it.
+/// The pattern a command of `repo` whose words, joined by single spaces, are `text` would match first, and the name of
+/// the list that holds it, as `gate remote match` prints it: `repos.<repo>` for the top-level `repos`,
+/// `builders[<n>].repos.<repo>` for a `builders` entry's own. What the first entry of [`matching`] holds, from the same
+/// lists by the same match. `None` when no pattern of the repo matches it.
+#[must_use]
+pub fn pattern_and_list_for(config: &Config, repo: &str, text: &str) -> Option<(String, String)> {
+    config
+        .routes_with_lists(repo)
+        .into_iter()
+        .find_map(|(_, patterns, list)| first_match_text(patterns, text).map(|pattern| (pattern, list)))
+}
+
+/// The pattern a command of `repo` whose words, joined by single spaces, are `text` would match first: the pattern of
+/// [`pattern_and_list_for`]'s answer, from the same lists by the same match. `None` when no pattern of the repo matches
+/// it.
 #[must_use]
 pub fn pattern_for(config: &Config, repo: &str, text: &str) -> Option<String> {
-    config.routes(repo).into_iter().find_map(|(_, patterns)| first_match_text(patterns, text))
+    pattern_and_list_for(config, repo, text).map(|(pattern, _)| pattern)
 }
 
 /// The `candidates` for the command `words` of the worktree at `place`, best first, and what their scores were

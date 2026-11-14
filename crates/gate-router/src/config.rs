@@ -572,6 +572,24 @@ impl Config {
         entries.chain(self.patterns(repo).map(|patterns| (&self.host, patterns))).collect()
     }
 
+    /// The builders that may run `repo`'s commands, in file order ([`Config::routes`]), each with the name of the list
+    /// that holds its patterns: `repos.<repo>` for the top-level `repos`, `builders[<n>].repos.<repo>` for a `builders`
+    /// entry's own, `n` its index in the file's `builders` array and the repo spelled as `repo` is.
+    #[must_use]
+    pub(crate) fn routes_with_lists(&self, repo: &str) -> Vec<(&Builder, &[Pattern], String)> {
+        let entries = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.routed)
+            .filter_map(|(index, entry)| {
+                find(&entry.repos, repo).map(|patterns| (&entry.builder, patterns, format!("builders[{index}].repos.{repo}")))
+            });
+        entries
+            .chain(self.patterns(repo).map(|patterns| (&self.host, patterns, format!("repos.{repo}"))))
+            .collect()
+    }
+
     /// Whether any builder may run `repo`'s commands: `repos` or a `builders` entry's `repos` lists it, its name matched
     /// in any letter case.
     #[must_use]

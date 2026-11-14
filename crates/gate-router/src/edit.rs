@@ -157,6 +157,7 @@ fn check_section(edit: &Edit<'_>) -> Result<(), EditRefusal> {
 
 /// Makes the edit on the file's value: its lines, and whether the list changed.
 fn apply(file: &mut Value, edit: &Edit<'_>) -> Result<(Vec<String>, bool), EditRefusal> {
+    let warning = new_repos_list_warning(file, edit);
     let (scope, prefix) = scope_of(file, edit)?;
     let label_of = |repo: &str| format!("{prefix}{}.{}", edit.section, escaped(repo));
     let Some(list) = list_of(scope, edit, &prefix)? else {
@@ -189,6 +190,14 @@ fn apply(file: &mut Value, edit: &Edit<'_>) -> Result<(Vec<String>, bool), EditR
         };
         changed |= matches!((edit.verb, held), (EditVerb::Add, false) | (EditVerb::Remove, true));
         lines.push(format!("remote: {label}: {line}"));
+    }
+    if edit.verb == EditVerb::Remove && edit.section == "repos" && items.is_empty() {
+        drop_list(scope, edit.section, edit.repo);
+        lines.push(format!("remote: {label}: removed the empty list"));
+        changed = true;
+    }
+    if let Some(warning) = warning {
+        lines.push(warning);
     }
     Ok((lines, changed))
 }
@@ -253,6 +262,96 @@ fn list_of<'s>(scope: &'s mut Map<String, Value>, edit: &Edit<'_>, prefix: &str)
     let not_list = || EditRefusal::Guard(format!("{prefix}{}.{} is not a list; edit it by hand", edit.section, escaped(&repo_key)));
     let items = section.get_mut(&repo_key).and_then(Value::as_array_mut).ok_or_else(not_list)?;
     Ok(Some((repo_key, items)))
+}
+
+/// The warning an add makes when it starts a `builders` entry's own `repos` list for the edit's repo while another
+/// listing already names the repo: the line naming how many of their patterns the runs pinned to that builder stop
+/// matching, and where they are. `None` for any other edit, for one whose entry already listed the repo, and for one no
+/// other listing names.
+fn new_repos_list_warning(file: &Value, edit: &Edit<'_>) -> Option<String> {
+    if edit.verb != EditVerb::Add || edit.section != "repos" {
+        return None;
+    }
+    let builder = edit.builder?;
+    let top = file.as_object()?;
+    let (index, entry) = array_of(top, "builders")?
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| entry_host(entry).is_some_and(|host| host.eq_ignore_ascii_case(builder)))?;
+    let entry = entry.as_object()?;
+    if table_of(entry, "repos").is_some_and(|section| key_of(section, edit.repo).is_some()) {
+        return None;
+    }
+    let (count, where_) = other_listings(top, edit.repo, index);
+    if count == 0 {
+        return None;
+    }
+    Some(format!(
+        "remote: warning: builders[{index}].repos.{} is new, so a run pinned to this builder matches only its patterns, \
+         no longer the {count} in {where_}; to keep them, put the new pattern in the top-level repos and pin the command",
+        escaped(edit.repo)
+    ))
+}
+
+/// How many patterns the listings of `repo` other than the `builders` entry at `index` hold, and their labels in file
+/// order — the top-level `repos` first, then each other entry's `repos` — joined by `, `. A listing holding no pattern
+/// is left out.
+fn other_listings(top: &Map<String, Value>, repo: &str, index: usize) -> (usize, String) {
+    let mut count = 0;
+    let mut labels = Vec::new();
+    add_listing("repos", table_of(top, "repos"), repo, &mut count, &mut labels);
+    for (m, entry) in array_of(top, "builders")
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .filter(|(m, _)| *m != index)
+    {
+        let section = entry.as_object().and_then(|entry| table_of(entry, "repos"));
+        add_listing(&format!("builders[{m}].repos"), section, repo, &mut count, &mut labels);
+    }
+    (count, labels.join(", "))
+}
+
+/// Adds `section`'s list of `repo`, labelled `name` and spelled as the section spells it, to `count` and `labels` when
+/// it holds a pattern.
+fn add_listing(name: &str, section: Option<&Map<String, Value>>, repo: &str, count: &mut usize, labels: &mut Vec<String>) {
+    let Some((key, items)) = section.and_then(|section| listed(section, repo)) else {
+        return;
+    };
+    if !items.is_empty() {
+        *count += items.len();
+        labels.push(format!("{name}.{}", escaped(&key)));
+    }
+}
+
+/// The repo's list in `section`, with its key as the section spells it: `None` when the section does not name the repo.
+fn listed<'a>(section: &'a Map<String, Value>, repo: &str) -> Option<(String, &'a [Value])> {
+    let key = key_of(section, repo)?;
+    let items = section.get(&key)?.as_array()?;
+    Some((key, items.as_slice()))
+}
+
+/// The object `name` holds in `object`, its key matched in any ASCII letter case.
+fn table_of<'a>(object: &'a Map<String, Value>, name: &str) -> Option<&'a Map<String, Value>> {
+    object.get(&key_of(object, name)?)?.as_object()
+}
+
+/// The array `name` holds in `object`, its key matched in any ASCII letter case.
+fn array_of<'a>(object: &'a Map<String, Value>, name: &str) -> Option<&'a [Value]> {
+    object.get(&key_of(object, name)?)?.as_array().map(Vec::as_slice)
+}
+
+/// Takes `repo`'s list out of `section` in `scope`, leaving the section an empty object when it was its only list.
+fn drop_list(scope: &mut Map<String, Value>, section: &str, repo: &str) {
+    let Some(section_key) = key_of(scope, section) else {
+        return;
+    };
+    let Some(table) = scope.get_mut(&section_key).and_then(Value::as_object_mut) else {
+        return;
+    };
+    if let Some(repo_key) = key_of(table, repo) {
+        table.shift_remove(&repo_key);
+    }
 }
 
 /// The guards a changed file's `new_text` (without its byte order mark) must pass before it is written.

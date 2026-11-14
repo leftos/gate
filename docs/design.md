@@ -829,7 +829,7 @@ Test-seams builds accept hidden options on `prune` and no `--test-print-request`
 
 `gate remote add <section> <repo> <pattern>... [--builder <host>] [--tag <word>] [--dry-run]` and `gate remote remove <section> <repo> <pattern>... [--builder <host>] [--dry-run]` edit one list of `%LOCALAPPDATA%\gate\remote.json`, so no session hand-edits the file other sessions share. Its usage lines follow `gate prune --builders`'s.
 
-`gate remote match <repo> <text>` edits nothing: it reads `remote.json` as routing does and prints, on stdout, the first pattern of the repo's lists that matches `<text>`, the text taken as the command's words joined by single spaces (a journal line's `sentWords`), and exits 0. When no pattern matches, or the repo is not listed, it prints nothing and exits 1. A `remote.json` it cannot read says one `remote:` line on stderr and exits 2.
+`gate remote match <repo> <text>` edits nothing: it reads `remote.json` as routing does and prints, on stdout, the first pattern of the repo's lists that matches `<text>`, the text taken as the command's words joined by single spaces (a journal line's `sentWords`), then `in <list>`, the list that holds it (`repos.<repo>` or `builders[<n>].repos.<repo>`), and exits 0. When no pattern matches, or the repo is not listed, it prints nothing and exits 1. A `remote.json` it cannot read says one `remote:` line on stderr and exits 2.
 
 A missing or unusable `remote.json` prints one `remote: ` line on stderr (the refusal texts below for the file) and exits 1. It takes no `--builder`, `--tag` or `--dry-run`. The local-run watcher asks it in place of a matcher of its own.
 
@@ -837,13 +837,19 @@ A missing or unusable `remote.json` prints one `remote: ` line on stderr (the re
 
 A section's entries are the patterns of a command-matching list, the folder names of `siblings` or the folder globs of `carriedFolders`; the word `<pattern>` stands for any of them.
 
-With `--builder <host>` (a `builders` entry matched by host in ASCII case) the list is the entry's own, and only `repos`, `first`, `outputs` and `failureOutputs` exist there. The flat lists (`warmup`, `hooks`, `commits`, `sendBuild`) are not edited by it. A repo key matches in ASCII case and keeps its spelling; a missing repo or section is appended at the end. Removing the last pattern leaves `[]` and never deletes the key (an empty `outputs` list brings nothing back).
+With `--builder <host>` (a `builders` entry matched by host in ASCII case) the list is the entry's own, and only `repos`, `first`, `outputs` and `failureOutputs` exist there. The flat lists (`warmup`, `hooks`, `commits`, `sendBuild`) are not edited by it. A repo key matches in ASCII case and keeps its spelling; a missing repo or section is appended at the end.
+
+Removing the last pattern of a `repos` list, at the top level or in a builder entry, deletes the repo's key too, since an empty `repos` list still narrows the repo's pins to that builder to nothing. A remove from a `repos` list that is already empty deletes the key the same way, whatever pattern it names. In every other section it leaves `[]` and keeps the key, since an empty list there means something an absent one does not (an empty `outputs` list brings nothing back).
 
 The file is rewritten as it stood: key order, indent (spaces or tabs), line ending, byte order mark and final newline are kept, and a file holding comments or trailing commas is refused, since a rewrite would drop them. Before it writes, the command checks that the result passes the router's parse, changes nothing outside the one list and adds no problem the file did not have, then re-reads the file and compares its bytes with what it edited. The write is `gate_state::write_text_replacing`, an atomic replace.
 
 A write that changes the file first makes a backup beside it, `remote.json.bak-[<tag>-]<yyyyMMddTHHmmssZ>` (UTC; `-2` to `-99` is appended when the name is taken), created new before the replace. `--tag` names the backup (1 to 40 of `A-Za-z0-9_-`) and is for `add` only. A no-op or a `--dry-run` makes no backup and writes nothing.
 
-Output on stdout, one line per pattern: `remote: <section>.<repo>: + <pattern>`, `remote: <section>.<repo>: - <pattern>`, `remote: <section>.<repo>: unchanged (already has <pattern>)` or `remote: <section>.<repo>: absent (no <pattern>)`, with `builders[<n>].<section>.<repo>` for a builder's list. Then `remote: backup <path>` and `remote: wrote <path>`, or `remote: dry run; nothing written`. Adding a present pattern or removing an absent one is not an error (exit 0).
+Output on stdout, one line per pattern: `remote: <section>.<repo>: + <pattern>`, `remote: <section>.<repo>: - <pattern>`, `remote: <section>.<repo>: unchanged (already has <pattern>)` or `remote: <section>.<repo>: absent (no <pattern>)`, with `builders[<n>].<section>.<repo>` for a builder's list. A remove that deletes a `repos` key adds `remote: <section>.<repo>: removed the empty list`.
+
+An add with `--builder` that makes a builder entry's own `repos` list for a repo, while the top-level `repos` or another entry's `repos` holds patterns for it, is made and adds `remote: warning: builders[<n>].repos.<repo> is new, so a run pinned to this builder matches only its patterns, no longer the <k> in <lists>; to keep them, put the new pattern in the top-level repos and pin the command`.
+
+Then `remote: backup <path>` and `remote: wrote <path>`, or `remote: dry run; nothing written`. Adding a present pattern or removing an absent one is not an error (exit 0).
 
 Exit 0 on success, 1 on a refusal and 2 on usage.
 

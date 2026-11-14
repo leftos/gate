@@ -42,7 +42,8 @@ pub use decide::{
     LaterCandidate, LocalReason, NO_OUTPUTS_LINE, Nested, OUTPUT_PROPERTIES, OtherTree, PAIR_CAPS, PROJECT_EXTENSIONS, PinRefusal, Place, RemoteRun,
     Route, SendPlan, SiblingFolder, Slot, Target, TreePath, UsedTool, build_settings, builder_words, builds_in_place, decide, dotnet_builds,
     dotnet_takes_solution, dotnet_target, is_cargo, is_dotnet, is_input_file, is_project_or_solution, later_run, later_stage_run, named_tree_paths,
-    names_git_or_prek, names_program, pattern_for, positional_target, sdk_build_target, sibling_root, stays_local, target, without_no_build,
+    names_git_or_prek, names_program, pattern_and_list_for, pattern_for, positional_target, sdk_build_target, sibling_root, stays_local, target,
+    without_no_build,
 };
 pub use edit::{BUILDER_SECTIONS, EDIT_SECTIONS, Edit, EditRefusal, EditVerb, Edited, edit_remote_json};
 pub use escape::{escaped, is_reordering_mark};
