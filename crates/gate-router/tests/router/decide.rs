@@ -6574,6 +6574,14 @@ fn a_two_word_property_value_is_named() {
     );
 }
 
+#[test]
+fn a_value_word_after_a_colon_switch_is_named() {
+    assert_eq!(
+        named_for(&["dotnet", "build", "-p:", "ProbeSource=.tmp/a.cs"], &[".tmp/a.cs"]),
+        [".tmp/a.cs".to_owned()]
+    );
+}
+
 /// The routed words of the dotnet `command` from the gate's folder `prefix`, the facts reporting `.tmp/a.targets` and
 /// `.tmp/copy/X.csproj` and `.tmp/x.runsettings` carried.
 fn carrying_words(prefix: &str, command: &[&str]) -> Vec<String> {
@@ -6619,6 +6627,27 @@ fn a_property_naming_no_carried_file_is_left_alone() {
 #[test]
 fn a_two_word_property_naming_a_carried_file_is_marked() {
     holds_word(&["dotnet", "build", "-p", "Custom=.tmp/a.targets"], "Custom={gate-folder}/.tmp/a.targets");
+}
+
+#[test]
+fn a_colon_switch_before_its_value_word_marks_a_carried_file() {
+    holds_word(
+        &["dotnet", "build", "-p:", "Custom=.tmp/a.targets"],
+        "Custom={gate-folder}/.tmp/a.targets",
+    );
+}
+
+#[test]
+fn a_long_colon_switch_before_its_value_word_is_marked_in_any_case() {
+    holds_word(
+        &["dotnet", "run", "--project", "src/App", "/PROPERTY:", "Custom=.tmp/a.targets"],
+        "Custom={gate-folder}/.tmp/a.targets",
+    );
+}
+
+#[test]
+fn a_colon_switch_as_the_last_word_marks_nothing() {
+    holds_word(&["dotnet", "build", "-p:"], "-p:");
 }
 
 #[test]

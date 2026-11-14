@@ -36,7 +36,7 @@ A command whose word names an existing gitignored project input (a project, solu
 
 A gitignored `.targets` or `.props` file a word names also carries each file its text names by a quoted relative path, and each file those name in turn through imports; a project or solution file and a folder named that way are not carried, and a wildcard keeps the run here, since the gate does not follow one. A gitignored file of any other extension that a dotnet property value names (`-p:ProbeSource=.tmp/a.cs`) carries itself; one that a run's own logger or output option names does not.
 
-A property value (`-p:`, `/p:`, `-property:`, `/property:`, `--property:`, or the switch and its value as two words) that names a carried file reaches the builder as `{gate-folder}/<path>`, and the box replaces the mark with the folder the command runs in, since MSBuild reads such a value from the project's folder.
+A property value (`-p:`, `/p:`, `-property:`, `/property:`, `--property:`, or the switch, with or without its `:`, and its value as two words) that names a carried file reaches the builder as `{gate-folder}/<path>`, and the box replaces the mark with the folder the command runs in, since MSBuild reads such a value from the project's folder.
 
 A gitignored folder that a command names only by one file inside it (a page's `index.html` and its assets, say) is carried whole when the PC's `remote.json` lists a matching glob in `carriedFolders`: `"carriedFolders": {"<repo>": [".tmp/mocks/*-src"]}`, each entry a `/`-separated folder below the worktree root where `*` is any run of characters within one name and `?` one character, matched ignoring letter case as PowerShell `-like` does.
 

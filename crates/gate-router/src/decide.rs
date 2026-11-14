@@ -2339,7 +2339,7 @@ pub const GATE_FOLDER_MARK: &str = "{gate-folder}";
 const PROPERTY_SWITCHES: [&str; 5] = ["-p", "/p", "-property", "/property", "--property"];
 
 /// Each of `words` with its property values naming a `carried` file marked: a value joined to its switch by `:`
-/// ([`carried_property`]), or the word after a switch standing alone ([`marked_values`]).
+/// ([`carried_property`]), or the word after a switch standing alone or ending in `:` ([`marked_values`]).
 fn mark_carried_properties(words: &mut [String], marks: &Marks) {
     let mut after_switch = false;
     for word in words {
@@ -2348,13 +2348,19 @@ fn mark_carried_properties(words: &mut [String], marks: &Marks) {
         } else {
             carried_property(word, marks)
         };
-        after_switch = is_property_switch(word);
+        after_switch = takes_next_word(word);
     }
 }
 
 /// Whether `word` is one of [`PROPERTY_SWITCHES`], in any letter case.
 fn is_property_switch(word: &str) -> bool {
     PROPERTY_SWITCHES.iter().any(|known| eq_ignoring_case(word, known))
+}
+
+/// Whether `word` is a property switch whose value is the next word: one of [`PROPERTY_SWITCHES`] standing alone
+/// (`-p`) or followed by a `:` with nothing after it (`-p:`), in any letter case.
+fn takes_next_word(word: &str) -> bool {
+    is_property_switch(word) || word.strip_suffix(':').is_some_and(is_property_switch)
 }
 
 /// `word` with its value marked when it is a property switch joined to its value by `:` ([`marked_values`]). Any other
@@ -2406,7 +2412,7 @@ fn marked_values(value: &str, marks: &Marks) -> String {
 
 /// The paths the `matched` command's property words name, as [`mark_carried_properties`] reads them: each piece of the
 /// value of a property switch joined to it by `:` ([`property_switch_value`]) or of the word after a switch standing
-/// alone, through [`tree_path`], each in its tree, less each piece setting one of [`OUTPUT_PROPERTIES`].
+/// alone or ending in `:`, through [`tree_path`], each in its tree, less each piece setting one of [`OUTPUT_PROPERTIES`].
 fn named_inputs(matched: &Matched) -> Vec<TreePath> {
     let prefix = &matched.target.place.prefix;
     let siblings = sibling_names(matched);
@@ -2428,7 +2434,7 @@ fn named_inputs(matched: &Matched) -> Vec<TreePath> {
                 named.push(path);
             }
         }
-        after_switch = is_property_switch(word);
+        after_switch = takes_next_word(word);
     }
     named
 }
