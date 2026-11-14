@@ -40,7 +40,7 @@ use crate::console::Console;
 use crate::outputs::archive::pack;
 use crate::outputs::glob::Globs;
 use crate::outputs::hash::file_sha256;
-use crate::outputs::manifest::{Listing, Manifest, hash_possible_copies, select};
+use crate::outputs::manifest::{Chosen, Listing, Manifest, Wrote, hash_possible_copies, select};
 use crate::outputs::walk::{Found, in_context, walk_outputs, walk_with_refused};
 
 /// How long an outputs archive is kept in the output folder before a run with output globs removes it, as the wrapper's
@@ -66,6 +66,9 @@ pub(super) struct Asked<'a> {
     failure: Option<Globs>,
     full: bool,
     capping: Capping,
+    /// Whether only the files the run created or changed are packed: a failed command's set, whose test reports and
+    /// failure outputs say what this run did.
+    written_only: bool,
     /// The name of the run's own outputs archive in its output folder.
     pub(super) archive: String,
     /// The output folder the archive is written in.
@@ -97,14 +100,15 @@ impl<'a> Asked<'a> {
             failure,
             full,
             capping: Capping::Uncapped,
+            written_only: false,
             archive: archive_file_name(key, nonce),
             folder,
         }))
     }
 
     /// What a failed command brings back, in the same archive and folder: the failed run's set of these outputs
-    /// ([`failure::failed_run_globs`]), its failure outputs held to `caps` ([`Capping`]); `None` when no glob names a
-    /// `TestResults` folder and there are no failure output globs.
+    /// ([`failure::failed_run_globs`]), its failure outputs held to `caps` ([`Capping`]), holding only the files the run
+    /// created or changed; `None` when no glob names a `TestResults` folder and there are no failure output globs.
     pub(super) fn failed_run(&self, caps: Caps) -> Option<Asked<'a>> {
         let (globs, capping) = failure::failed_run_globs(&self.globs, self.failure.as_ref(), caps)?;
         Some(Asked {
@@ -112,6 +116,7 @@ impl<'a> Asked<'a> {
             failure: None,
             full: self.full,
             capping,
+            written_only: true,
             archive: self.archive.clone(),
             folder: self.folder,
         })
@@ -124,6 +129,16 @@ impl<'a> Asked<'a> {
         self.failure
             .as_ref()
             .map_or_else(|| self.globs.clone(), |failure| self.globs.joined(failure))
+    }
+
+    /// The files of `chosen` this set packs: only those the run wrote ([`Wrote::ThisRun`]) for a failed command's set,
+    /// else all of them.
+    fn kept<'found>(&self, chosen: Vec<Chosen<'found>>) -> Vec<Chosen<'found>> {
+        if self.written_only {
+            chosen.into_iter().filter(|item| item.wrote == Wrote::ThisRun).collect()
+        } else {
+            chosen
+        }
     }
 }
 
@@ -363,8 +378,9 @@ fn trim_to_fit(archives: &[Archive], mine: &Archive, mut total: u64, budget: u64
 
 /// The stat listing of the files under [`Asked::listed_globs`] in `work`, taken before the command so a file below a
 /// `.tmp` folder comes back only from the run that wrote it, marked [`Listing::under_outputs_full`] under
-/// `OutputsFull`; or, when the walk fails, no listing and the line saying so ([`unlisted_line`]): then every file
-/// outside a `.tmp` folder counts as changed and none below one comes back ([`select`]).
+/// `OutputsFull`, and a failed command's set holds only the files it shows the run created or changed; or, when the
+/// walk fails, no listing and the line saying so ([`unlisted_line`]): then every file outside a `.tmp` folder counts as
+/// changed and none below one comes back ([`select`]), and a failed command's set holds none.
 pub(super) fn listing(asked: &Asked<'_>, work: &Path) -> (Option<Listing>, Option<String>) {
     let globs = asked.listed_globs();
     let found = if globs.is_empty() {
@@ -382,16 +398,17 @@ pub(super) fn listing(asked: &Asked<'_>, work: &Path) -> (Option<Listing>, Optio
 /// The line the box says when its listing before the command could not be taken for `error`.
 fn unlisted_line(error: &str) -> String {
     format!(
-        "gate: remote could not list the outputs before the command: {}; outputs under .tmp are not brought back this run",
+        "gate: remote could not list the outputs before the command: {}; outputs under .tmp, and every output of a failed command, \
+         are not brought back this run",
         escaped(error)
     )
 }
 
 /// Packs the files under `asked`'s globs in `work` to bring back after a passing command ([`select`]), or a failed one's
-/// test reports and failure outputs ([`Asked::failed_run`]), the failure outputs held to their caps, leaving out `skip`,
-/// the paths of the run's back commit, which the sync-back replaces on the PC, so no copy is made from the PC's file at
-/// one of them either: the line saying how many were
-/// packed and the archive's name, and the line before it saying the archive's size in bytes as the pack wrote them
+/// test reports and failure outputs ([`Asked::failed_run`]), only the files `listing` shows the run created or changed
+/// ([`Wrote::ThisRun`]), the failure outputs held to their caps, leaving out `skip`, the paths of the run's back commit,
+/// which the sync-back replaces on the PC, so no copy is made from the PC's file at one of them either: the line saying
+/// how many were packed and the archive's name, and the line before it saying the archive's size in bytes as the pack wrote them
 /// ([`size_line`]); or `gate-remote-outputs: 0` with no archive written when none were; and before them the line saying
 /// the files [`select`] would have packed but for a name this PC cannot take ([`skipped_line`]), when there were any.
 /// Else why the outputs are not brought back; an archive left half written is removed. The archive is made anew: a file
@@ -418,9 +435,9 @@ pub(super) fn bring_back(
     }
     let walked = walk_with_refused(work, &asked.globs).map_err(|error| format!("the outputs could not be listed: {error}"))?;
     let hash = |file: &Found| file_sha256(&file.full);
-    let refused = select(&walked.refused, manifest, listing, skip, hash).map_err(|error| error.to_string())?;
+    let refused = asked.kept(select(&walked.refused, manifest, listing, skip, hash).map_err(|error| error.to_string())?);
     let skipped = skipped_line(&refused.iter().map(|chosen| chosen.file).collect::<Vec<_>>());
-    let chosen = select(&walked.found, manifest, listing, skip, hash).map_err(|error| error.to_string())?;
+    let chosen = asked.kept(select(&walked.found, manifest, listing, skip, hash).map_err(|error| error.to_string())?);
     let (mut chosen, left) = asked.capping.capped(chosen);
     if chosen.is_empty() {
         return Ok(Brought {
@@ -931,7 +948,7 @@ mod tests {
         let line = line.expect("the failed listing is said");
         assert!(
             line.starts_with("gate: remote could not list the outputs before the command: ")
-                && line.ends_with("; outputs under .tmp are not brought back this run"),
+                && line.ends_with("; outputs under .tmp, and every output of a failed command, are not brought back this run"),
             "{line}"
         );
         let brought = super::bring_back(&asked, &Ok(super::Manifest::default()), taken.as_ref(), &work, (&[], None)).expect("the pack works");
@@ -940,6 +957,25 @@ mod tests {
             format!("gate-remote-outputs: 1 {}", asked.archive),
             "the file outside .tmp comes back, the old one below it does not"
         );
+    }
+
+    #[test]
+    fn a_failed_run_without_a_listing_brings_nothing_back() {
+        let root = scratch("unlisted-failed");
+        let work = root.join("work");
+        let file = work.join("bin/a.txt");
+        fs::create_dir_all(file.parent().expect("a file has a folder")).expect("the folder can be made");
+        fs::write(file, "a").expect("the file can be written");
+        let folder = root.join("outputs");
+        let folder = folder.to_str().expect("the scratch folder is Unicode");
+        let asked = Asked::new((&["bin/**".to_owned()], &["bin/**".to_owned()]), false, "k", "n", folder)
+            .expect("the globs are fine")
+            .expect("globs ask");
+        let failed = asked.failed_run(super::Caps::BUILT_IN).expect("a failure glob asks");
+
+        let brought = super::bring_back(&failed, &Ok(super::Manifest::default()), None, &work, (&[], None)).expect("the pack works");
+
+        assert_eq!(brought.line, "gate-remote-outputs: 0", "no listing shows the failed run wrote anything");
     }
 
     #[test]

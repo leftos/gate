@@ -72,6 +72,9 @@ pub struct Asked<'a> {
     failure: Option<Globs>,
     full: bool,
     capping: Capping,
+    /// Whether only the files the run created or changed are packed: a failed command's set, whose test reports and
+    /// failure outputs say what this run did.
+    written_only: bool,
     /// The runtime identifier of the run's cross build, whose outputs the walk lists at their PC paths
     /// ([`cross::crossed`]); `None` for a run without one.
     rid: Option<String>,
@@ -103,6 +106,7 @@ impl<'a> Asked<'a> {
             failure,
             full,
             capping: Capping::Uncapped,
+            written_only: false,
             rid: None,
             archive: archive_file_name(key, nonce),
             folder,
@@ -110,8 +114,9 @@ impl<'a> Asked<'a> {
     }
 
     /// What a failed command brings back, in the same archive and folder and without a cross build's: the failed run's
-    /// set of these outputs ([`failure::failed_run_globs`]), its failure outputs held to `caps` ([`Capping`]); `None`
-    /// when no glob names a `TestResults` folder and there are no failure output globs.
+    /// set of these outputs ([`failure::failed_run_globs`]), its failure outputs held to `caps` ([`Capping`]), holding
+    /// only the files the run created or changed; `None` when no glob names a `TestResults` folder and there are no
+    /// failure output globs.
     #[must_use]
     pub fn failed_run(&self, caps: Caps) -> Option<Asked<'a>> {
         let (globs, capping) = failure::failed_run_globs(&self.globs, self.failure.as_ref(), caps)?;
@@ -120,6 +125,7 @@ impl<'a> Asked<'a> {
             failure: None,
             full: self.full,
             capping,
+            written_only: true,
             rid: None,
             archive: self.archive.clone(),
             folder: self.folder,
@@ -141,6 +147,16 @@ impl<'a> Asked<'a> {
         if self.rid.is_some() { cross::crossed(found) } else { found }
     }
 
+    /// The files of `chosen` this set packs: only those the run wrote ([`Wrote::ThisRun`]) for a failed command's set,
+    /// else all of them.
+    fn kept<'found>(&self, chosen: Vec<Chosen<'found>>) -> Vec<Chosen<'found>> {
+        if self.written_only {
+            chosen.into_iter().filter(|item| item.wrote == Wrote::ThisRun).collect()
+        } else {
+            chosen
+        }
+    }
+
     /// These outputs over the output globs and the failure output globs together: what the listing before the command
     /// walks, so a failed command's outputs are judged by it as a passing one's are, under `OutputsFull` too, where the
     /// listing still tells each file the run wrote from one it did not ([`Listing::written`]).
@@ -154,6 +170,7 @@ impl<'a> Asked<'a> {
             failure: None,
             full: self.full,
             capping: Capping::Uncapped,
+            written_only: false,
             rid: self.rid.clone(),
             archive: self.archive.clone(),
             folder: self.folder,
@@ -592,8 +609,9 @@ fn flock(file: &File, operation: libc::c_int) -> io::Result<()> {
 
 /// The stat listing of the files under [`Asked::listed`]'s globs in the folder `work`, taken before the command so a
 /// file below a `.tmp` folder comes back only from the run that wrote it, marked [`Listing::under_outputs_full`] under
-/// `OutputsFull`; or, when the walk fails, no listing and the line saying so ([`unlisted_line`]): then every file
-/// outside a `.tmp` folder counts as changed and none below one comes back ([`select`]).
+/// `OutputsFull`, and a failed command's set holds only the files it shows the run created or changed; or, when the
+/// walk fails, no listing and the line saying so ([`unlisted_line`]): then every file outside a `.tmp` folder counts as
+/// changed and none below one comes back ([`select`]), and a failed command's set holds none.
 #[must_use]
 pub fn listing(asked: &Asked<'_>, work: &Path) -> (Option<Listing>, Option<String>) {
     let listed = asked.listed();
@@ -615,7 +633,8 @@ pub fn listing(asked: &Asked<'_>, work: &Path) -> (Option<Listing>, Option<Strin
 /// The line the box says when its listing before the command could not be taken for `error`.
 fn unlisted_line(error: &str) -> String {
     format!(
-        "gate: remote could not list the outputs before the command: {}; outputs under .tmp are not brought back this run",
+        "gate: remote could not list the outputs before the command: {}; outputs under .tmp, and every output of a failed command, \
+         are not brought back this run",
         escaped(error)
     )
 }
@@ -847,10 +866,10 @@ impl Brought {
 }
 
 /// Packs the files under `asked`'s globs in the folder `work` to bring back after a passing command ([`select`]), or a
-/// failed one's test reports and failure outputs ([`Asked::failed_run`]), the failure outputs held to their caps,
-/// leaving out `skip`, the paths of the run's back commit, which
-/// the sync-back replaces on the PC, so no copy is made from the PC's file at one of them either: the line saying how
-/// many were packed and the archive's name, with the line saying the archive's size in bytes to say before it, or
+/// failed one's test reports and failure outputs ([`Asked::failed_run`]), only the files `listing` shows the run created
+/// or changed ([`Wrote::ThisRun`]), the failure outputs held to their caps, leaving out `skip`, the paths of the run's
+/// back commit, which the sync-back replaces on the PC, so no copy is made from the PC's file at one of them either: the
+/// line saying how many were packed and the archive's name, with the line saying the archive's size in bytes to say before it, or
 /// `gate-remote-outputs: 0` with no archive written when none were, and before it the line saying the files [`select`]
 /// would have packed but for a name this PC cannot take ([`skipped_line`]), when there were any. The output folder is
 /// made when missing ([`output_folder`]), and the archive is made anew beneath it, 0600: a file or a link already at
@@ -887,9 +906,9 @@ pub fn bring_back(
     let tree = Tree::new(&top, work);
     let found = asked.deduped(walked.found);
     let hash = |file: &Found| tree.sha256(file);
-    let refused = select(&walked.refused, manifest, listing, skip, hash).map_err(|error| error.to_string())?;
+    let refused = asked.kept(select(&walked.refused, manifest, listing, skip, hash).map_err(|error| error.to_string())?);
     let skipped = skipped_line(&refused.iter().map(|chosen| chosen.file).collect::<Vec<_>>());
-    let chosen = select(&found, manifest, listing, skip, hash).map_err(|error| error.to_string())?;
+    let chosen = asked.kept(select(&found, manifest, listing, skip, hash).map_err(|error| error.to_string())?);
     let chosen = match &asked.rid {
         None => chosen,
         Some(rid) => match portable_chosen(&tree, chosen)? {
@@ -1466,6 +1485,7 @@ pub(crate) mod tests {
     use base64::engine::general_purpose::STANDARD;
     use gate_args::BoxSeams;
     use gate_inputs::archive::{Item, UnpackError, read_members};
+    use gate_inputs::failure::Caps;
     use gate_inputs::hash::sha256_of;
     use gate_inputs::manifest::{Held, Listing, MANIFEST_LIMIT, Manifest, Stamp, Wrote};
     use gate_inputs::pack::Packer;
@@ -2375,7 +2395,7 @@ pub(crate) mod tests {
         let line = line.expect("the failed listing is said");
         assert!(
             line.starts_with("gate: remote could not list the outputs before the command: ")
-                && line.ends_with("; outputs under .tmp are not brought back this run"),
+                && line.ends_with("; outputs under .tmp, and every output of a failed command, are not brought back this run"),
             "{line}"
         );
         let brought = bring(&asked, &Ok(Manifest::default()), before.as_ref(), &case.work(), &[]);
@@ -2407,6 +2427,63 @@ pub(crate) mod tests {
         case.write(".tmp/newer.json", b"newer");
         let brought = bring(&full, &Ok(Manifest::default()), before.as_ref(), &case.work(), &[]);
         assert_eq!(brought, Ok((None, packed_line(1, '2'))), "nor under OutputsFull");
+    }
+
+    /// The outputs of a run asking for `masters/**` as both its output and its failure output globs, every file
+    /// counted as changed when `full`, its archive's nonce 32 copies of `digit`.
+    fn masters_asked(case: &Case, full: bool, digit: char) -> Asked<'_> {
+        let globs = ["masters/**".to_owned()];
+        Asked::new((&globs, &globs), full, KEY, &digit.to_string().repeat(32), &case.folder)
+            .expect("the globs are fine")
+            .expect("globs ask")
+    }
+
+    #[test]
+    fn a_failed_run_packs_only_the_files_it_wrote() {
+        let case = Case::new("pack-failed-written");
+        case.write("masters/a.wav", b"a");
+        let asked = masters_asked(&case, false, '1');
+        let (before, line) = listing(&asked, &case.work());
+        assert!(line.is_none(), "{line:?}");
+        case.write("masters/b.wav", b"b");
+        let failed = asked.failed_run(Caps::BUILT_IN).expect("a failure glob asks");
+
+        let brought = bring(&failed, &Ok(Manifest::default()), before.as_ref(), &case.work(), &[]);
+
+        assert_eq!(brought, Ok((None, packed_line(1, '1'))), "though the PC lacks both");
+        let (members, _) = read_back(&case, &archive('1'), &Manifest::default(), &[]);
+        assert_eq!(
+            members,
+            [("masters/b.wav".to_owned(), b"b".to_vec())],
+            "only the file the failed run wrote"
+        );
+        let full = masters_asked(&case, true, '2');
+        let (before, _) = listing(&full, &case.work());
+        case.write("masters/c.wav", b"c");
+        let failed = full.failed_run(Caps::BUILT_IN).expect("a failure glob asks");
+        let brought = bring(&failed, &Ok(Manifest::default()), before.as_ref(), &case.work(), &[]);
+        assert_eq!(brought, Ok((None, packed_line(1, '2'))), "nor under OutputsFull");
+        let (members, _) = read_back(&case, &archive('2'), &Manifest::default(), &[]);
+        assert_eq!(
+            members,
+            [("masters/c.wav".to_owned(), b"c".to_vec())],
+            "only the file the failed run wrote"
+        );
+    }
+
+    #[test]
+    fn a_failed_run_without_a_listing_packs_nothing() {
+        let case = Case::new("pack-failed-unlisted");
+        case.write("masters/a.wav", b"a");
+        let failed = masters_asked(&case, false, '1').failed_run(Caps::BUILT_IN).expect("a failure glob asks");
+
+        let brought = bring(&failed, &Ok(Manifest::default()), None, &case.work(), &[]);
+
+        assert_eq!(
+            brought,
+            Ok((None, NOTHING_PACKED.to_owned())),
+            "no listing shows the failed run wrote anything"
+        );
     }
 
     /// A reader of a file that, at its first read, appends to the file at `path`, as a command still writing it does.

@@ -1391,6 +1391,52 @@ fn box_run_of_a_failed_command_packs_only_the_tmp_dumps_it_wrote() {
     );
 }
 
+/// The ignore file of a masters case's snapshot: neither the masters nor `.tmp` are committed.
+const IGNORE_MASTERS: (&str, &str) = (".gitignore", "masters/\n.tmp/\n");
+
+/// A passing run writing `masters\a.wav` and `masters\b.wav` under the output and failure output globs `masters/**`,
+/// its snapshot taken and its two files packed.
+fn passing_masters_run(case: &Case) -> Value {
+    let command = [FAKE_TOOL, "write", r"masters\a.wav", "a", "write", r"masters\b.wav", "b", "exit", "0"];
+    let mut first = failure_payload(case, &command, &["masters/**"], &["masters/**"]);
+    snapshot(case, &mut first, &[IGNORE_MASTERS]);
+    let passed = run_with_manifest(case, &first, &manifest(&[]));
+    assert!(has_line(&passed.stderr, &packed_line(&first, 2)), "{passed:?}");
+    first
+}
+
+#[test]
+fn box_run_of_a_failed_command_leaves_an_earlier_run_s_output_on_the_builder() {
+    let case = Case::new("box_outputs_failed_old_master");
+    let first = passing_masters_run(&case);
+
+    let mut second = renamed(&first, 1);
+    second["Command"] = json!([FAKE_TOOL, "write", r"masters\b.wav", "b2", "exit", "3"]);
+    let outcome = run_with_manifest(&case, &second, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    assert!(has_line(&outcome.stderr, &packed_line(&second, 1)), "{outcome:?}");
+    assert_eq!(
+        archive_members(&archive_path(&second)),
+        ["masters/b.wav"],
+        "the file this failed run wrote comes back; the one the passing run left stays on the builder"
+    );
+}
+
+#[test]
+fn box_run_of_a_failed_command_that_wrote_nothing_brings_nothing_back() {
+    let case = Case::new("box_outputs_failed_wrote_nothing");
+    let first = passing_masters_run(&case);
+
+    let mut second = renamed(&first, 1);
+    second["Command"] = json!([FAKE_TOOL, "exit", "3"]);
+    let outcome = run_with_manifest(&case, &second, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    let said: Vec<&str> = outcome.stderr.lines().filter(|line| line.starts_with("gate-remote-outputs")).collect();
+    assert_eq!(said, ["gate-remote-outputs: 0"], "{outcome:?}");
+}
+
 #[test]
 fn box_run_of_a_failed_command_with_both_kinds_of_glob_packs_both() {
     let case = Case::new("box_outputs_failed_both");

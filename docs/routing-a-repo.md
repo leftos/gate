@@ -84,7 +84,9 @@ A repo's first routed run to a builder pushes its reachable history in one pack,
 
    A test report under a `TestResults` folder (an MTP TRX) comes back only through a glob that names the `TestResults` folder, such as `tests/*/bin/*/*/TestResults/*.trx`. `**` and `*TestResults*` bring back nothing under it.
 
-   A routed run copies back its `outputs` only after a passing command. A failed command (exit other than 0) copies back only its `TestResults` globs' files and the files under `failureOutputs`, an object of repo to globs beside `outputs` (the same glob rules and `[`/`]` ban; a `builders` entry's own list wins for a run on it; absent by default, no derived globs), such as `{"yaat": ["**/*.dmp"]}`.
+   A routed run copies back its `outputs` only after a passing command. A failed command (exit other than 0) copies back only the files under its `TestResults` globs and under `failureOutputs` that this run created or changed (an earlier run's file left on the builder stays there).
+
+   `failureOutputs` is an object of repo to globs beside `outputs` (the same glob rules and `[`/`]` ban; a `builders` entry's own list wins for a run on it; absent by default, no derived globs), such as `{"yaat": ["**/*.dmp"]}`.
 
    An `outputs` or `failureOutputs` glob brings back a file below a `.tmp` folder only when its folder segment is exactly `.tmp` (`.tmp/dumps/**`, `**/.tmp/x.json`; `**` and `.t*p/x` do not reach), and only a file this run created or changed. The gate's own `.tmp` files never come back.
 
