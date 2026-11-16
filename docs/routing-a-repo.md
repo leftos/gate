@@ -290,6 +290,14 @@ Without the consent the command runs here with `gate: not routed: desktop patter
 
 A `.gate/desktop.toml` the gate cannot use keeps every routed command of the repo here with `gate: not routed: .gate/desktop.toml: <problem>`, said ahead of any later reason, so fix it before relying on routing. The one locked desktop run past the PC's queue holds a remote slot while it waits for the desktop, up to its own ceiling, and the waiting box names the run that holds the desktop. Format and rules: [design.md](design.md#remotejson).
 
+### An agent that drives the builder's desktop
+
+An agent that drives apps on the builder's own desktop (through a desktop-control MCP server) holds the desktop with `gate desktop hold --builder <host> --holder "<what it is doing>" --ceiling <seconds> [--wait <seconds>]`, run in the background for as long as the agent drives the desktop. The builder's locked desktop runs then wait for it as for another locked run, their busy line naming the holder text, and fail at their own ceiling if the hold outlasts it. `--ceiling` is the longest the hold lasts (1 to 86400 s), so set it to cover the driving; `--wait` is how long the hold itself waits when another run has the desktop (0 to 86400 s, 0 when not given).
+
+The hold says `gate: holding the builder's desktop as <holder> (ceiling <n> s)` once it has the desktop. To release it, stop the `gate desktop hold` process (Ctrl+C, or end it; killing `gate.exe` releases it too, since the builder's hold ends with its ssh connection), and it says `gate: desktop hold released` and exits 0. Ending it while it still waits for the desktop says `gate: desktop hold ended before it held the desktop` and exits 0, holding nothing. At its ceiling it says `gate: desktop hold ended at its ceiling of <n> s` and exits 124, and a desktop that stayed busy for the whole `--wait` exits 75. A macOS builder has no desktop to hold.
+
+A session run and a hidden run take no desktop lock and never touch the console desktop, so a hold waits for neither and delays neither. Only a locked desktop run waits. A builder whose gate predates the verb needs a `gate push` first (`gate desktop hold: <alias> runs a gate without desktop-hold; run gate push`).
+
 ### A command that needs only the console session
 
 A command that needs the builder's console session (its logon session, where MSYS programs and a GUI-capable process start) but never touches the desktop itself is declared under a second key, `session = ["dotnet test *Headless*"]`, beside `patterns` (either may be absent, at most 32 each, no pattern in both, letter case aside). The PC consents under its own key, `"desktopSession": {"<repo>": ["dotnet test *Headless*"]}`, each pattern exact; without it the command runs here with `gate: not routed: desktop session pattern '<pattern>' not allowed in remote.json desktopSession`. A command matching both a `patterns` and a `session` pattern is a locked run.

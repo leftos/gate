@@ -96,10 +96,15 @@ impl Profile {
         }
     }
 
+    /// The folder every work folder is in, where a locked desktop run keeps its holder record: `{root}\work`, or
+    /// `{root}/work` on macOS.
+    pub(crate) fn works(&self) -> String {
+        format!("{}{}work", self.base(), self.separator())
+    }
+
     /// The work folder `key`: `{root}\work\{key}`, or `{root}/work/{key}` on macOS.
     pub(crate) fn work(&self, key: &str) -> String {
-        let separator = self.separator();
-        format!("{}{separator}work{separator}{key}", self.base())
+        format!("{}{}{key}", self.works(), self.separator())
     }
 
     /// The bare repository of `repo`: `{root}\{repo}.git`, or `{root}/{repo}.git` on macOS.

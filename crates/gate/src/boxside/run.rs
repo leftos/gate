@@ -69,7 +69,7 @@ use crate::resolve::{self, Environment};
 use crate::run::{ERROR_FILE_NOT_FOUND, Written, end_leftovers, find_program, written};
 use crate::watch::CeilingReading;
 
-mod desktop_run;
+pub(super) mod desktop_run;
 
 use desktop_run::{DesktopEnd, DesktopTake};
 

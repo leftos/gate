@@ -19,8 +19,8 @@ use super::{
     status_said, stopped_line_for, unreal_root,
 };
 use crate::support::{
-    Case, FAKE_TOOL, HeldDesktop, KeptDesktop, Outcome, box_payload, build_version, copy_tool, desktop_payload, desktop_seams, junction, shown,
-    wait_until, wait_until_closed,
+    Case, FAKE_TOOL, HeldDesktop, KeptDesktop, Outcome, box_payload, build_version, copy_tool, desktop_payload, desktop_seams, desktop_unique,
+    junction, shown, start_with_stdin, wait_until, wait_until_closed,
 };
 
 /// The box's prefix of every line refusing a run the builder's desktop cannot take.
@@ -989,6 +989,47 @@ fn a_run_waiting_for_the_desktop_names_the_run_that_holds_it() {
         "the busy line names the holder, once: {waited:?}"
     );
     ran_its_command(&waited, &waiting);
+}
+
+#[test]
+fn a_locked_desktop_run_waits_for_a_desktop_hold_naming_its_holder() {
+    let case = Case::new("desktop_waits_for_hold");
+    let payload = ready_payload(&case, COMMAND);
+    // The folder of the run's work folder, where the run looks for the holder record.
+    let root = holder_record(&payload).parent().expect("the record is in a folder").to_path_buf();
+    fs::create_dir_all(&root).expect("the work root can be made");
+    let (unique, root_word) = (desktop_unique(&case), shown(&root));
+    let hold = case.gate_without_state_dir(&[
+        "box",
+        "--test-box-desktop-mutex",
+        &unique,
+        "desktop-hold",
+        "--root",
+        &root_word,
+        "--holder",
+        "builder-desktop MCP",
+        "--ceiling",
+        "600",
+    ]);
+
+    let (holding, input) = start_with_stdin(hold);
+    holding.wait_for_stdout("gate: holding the builder's desktop as builder-desktop MCP");
+    let waiter = desktop_call(&case, &payload, "ok", &[]).start();
+    waiter.wait_for_stderr("gate: remote waiting for the builder's desktop: held by builder-desktop MCP for ");
+    drop(input);
+    let released = holding.finish_read();
+    let waited = waiter.finish_read();
+
+    assert_eq!(released.code, Some(0), "the hold let the desktop go once its input closed: {released:?}");
+    assert_eq!(waited.code, Some(0), "the run took the desktop once the hold let it go: {waited:?}");
+    assert_eq!(waited.stdout, "ran\n", "{waited:?}");
+    let named = Regex::new(r"^gate: remote waiting for the builder's desktop: held by builder-desktop MCP for \d+ s$").expect("the pattern compiles");
+    let said = lines_starting(&waited, BUSY_WAIT_PREFIX);
+    assert!(
+        said.len() == 1 && named.is_match(said[0]),
+        "the busy line names the hold's holder, once: {waited:?}"
+    );
+    ran_its_command(&waited, &payload);
 }
 
 #[test]

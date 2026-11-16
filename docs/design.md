@@ -27,7 +27,7 @@ Non-goals:
 
 The CLI is subcommands with GNU-style flags: `--name value` or `--name=value`, and `--` ends the gate's options. The first word picks the parser. `--version`, `--help`, `-h` and `help` are matched first; then a subcommand name selects the CLI below, and any other first word starting with `-` selects the [compatibility layer](#compatibility-layer). No arguments at all print the usage on stderr and exit 2.
 
-A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `drain`, `prune`, `remote`, `check`, `warm`, `burn`, `expect` or `csharp` line also prints the usage on stdout and exits 0, whatever else the line holds; after the `--` it belongs to the command (`gate run --slot light --timeout 5 --log x.log -- tool --help` runs `tool --help`).
+A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `drain`, `desktop`, `prune`, `remote`, `check`, `warm`, `burn`, `expect` or `csharp` line also prints the usage on stdout and exits 0, whatever else the line holds; after the `--` it belongs to the command (`gate run --slot light --timeout 5 --log x.log -- tool --help` runs `tool --help`).
 
 | Subcommand | Purpose |
 |---|---|
@@ -36,6 +36,7 @@ A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `
 | `gate cutover` | Switch this machine from the PowerShell gate to `gate.exe`, draining it first. |
 | `gate push` | Copy the installed `gate.exe` and desktop helper to every builder `remote.json` names and register the desktop task there, and sync the user-level tools `remote.json` names to each Windows builder. |
 | `gate drain` | Raise a barrier on a builder and wait until no routed run is going there, so it can be redeployed; `--lift` lifts it, `--status` reports ([`gate drain`](#gate-drain)). |
+| `gate desktop hold` | Hold a Windows builder's desktop lock for an agent driving apps on its console desktop, so locked desktop runs wait for it, until the gate ends or its ceiling passes ([`gate desktop hold`](#gate-desktop-hold)). |
 | `gate prune --builders` | Mark the worktree records whose worktree is gone, and prune the work folder of each one that has been gone an hour on every builder `remote.json` lists, then remove what this PC keeps of the key ([`gate prune`](#gate-prune)). |
 | `gate remote` | Add or remove entries (patterns, names or folder globs) in one list of `remote.json`, keeping the rest of the file as it is, or ask which pattern of a repo matches a text with `match` ([`gate remote`](#gate-remote)). |
 | `gate check` | Say what this PC lacks for the repo in the current folder, and how to install it. |
@@ -769,6 +770,23 @@ Test-seams builds accept hidden options on `drain` and no `--test-print-request`
 
 `--test-drain-poll-ms` stays `gate run`'s.
 
+### `gate desktop hold`
+
+`gate desktop hold --builder <host> --holder "<text>" --ceiling <seconds> [--wait <seconds>]` holds a Windows builder's desktop lock (`gate\desktop`) for an agent that drives apps on the builder's console desktop through a desktop-control MCP server, so the builder's locked desktop runs wait for it as for another run ([The desktop run's design](#the-desktop-runs-design), The desktop lock). Its usage line is `       gate desktop hold --builder <host> --holder "<text>" --ceiling <seconds> [--wait <seconds>]`, right after `gate drain`'s, and `gate desktop hold --help` or `-h` prints it.
+
+- `--builder` must be a builder `remote.json` lists (there is no default builder). `--holder` is the text a waiting run names in its busy line: 1 to 80 characters of ASCII letters, digits, spaces and `- _ . : ( ) / @ + ,`, none of the characters cmd reads, so it travels as one double-quoted word of the ssh line. `--ceiling` is whole seconds from 1 to 86400, and `--wait` whole seconds from 0 to 86400, 0 when not given: how long the hold waits for a desktop another run holds.
+- It reads `%LOCALAPPDATA%` only, as `gate drain` does, takes no slot and writes no claim, journal line or log. It calls the builder's `gate box desktop-hold` ([The box side](#the-box-side), `desktop-hold`) over ssh with `--root` the builder's `work` folder, where this PC's locked runs keep their holder record, and passes the box's own `gate:` lines on without their stamps, on the stream they came on.
+- The PC runs ssh in a kill-on-close job on a hidden console, so a Ctrl+C reaches only the gate, with the box's stdin held open: the box holds the lock until that input ends, so ending `gate.exe` by any means (the job ends ssh) releases the hold. Ctrl+C closes the input first, waits up to 30 s for the box to say it released, and exits 0xC000013A, also when the Ctrl+C comes as ssh's streams end, with no unreachable line. The hold has no release word of its own: the agent stops the `gate desktop hold` process.
+- The exit is the box's status: 0 when released (or when its input ended before it held the desktop), 124 at the ceiling, 75 when the desktop stayed busy for the whole wait, 1 for the box's failure.
+
+Lines of the PC's own, each on stderr:
+
+- Exit 2: `gate desktop hold: {host} is not a builder remote.json lists`; `gate desktop hold: {alias} is a macOS builder, which has no desktop`; `gate desktop hold: --holder must be 1 to 80 characters of letters, digits, spaces and - _ . : ( ) / @ + ,`; and, before the usage, `gate: missing --builder <host>`, `gate: missing --holder "<text>"`, `gate: missing --ceiling <seconds>`, `gate: --ceiling must be a whole number from 1 to 86400, got '{v}'`, `gate: --wait must be a whole number from 0 to 86400, got '{v}'`, `gate: unknown subcommand desktop[ {word}]` (`desktop` alone or with a word but `hold`).
+- Exit 1: `gate desktop hold: no remote.json at {path}`, `gate desktop hold: ignored {path}: {why}`, `gate desktop hold: the builder could not be reached: {why}` (the alias and its host replaced with `the builder`), and `gate desktop hold: {alias} runs a gate without desktop-hold; run gate push`.
+- The box's own status: `gate desktop hold: the builder could not be reached: {the box's last stderr line, host masked}`, or `gate desktop hold: the builder could not be reached: the call exited {code} with no message`, when the box fails with no `gate:` line.
+
+Test-seams builds accept the hidden options `--test-remote-transport` and `--test-remote-ssh` (as `gate drain` takes them) and the switch `--test-desktop-hold-interrupt-after-held`, which raises the interrupt once the box's held line has come.
+
 ### `gate prune`
 
 `gate prune --builders` sweeps the PC's worktree records ([State root files](#state-root), `remote\<key>.worktree`) and prunes, on every builder, the work folder of each key whose worktree has been gone an hour. Its usage line is `       gate prune --builders`, after `gate drain`'s, and `gate prune --help` or `-h` prints it.
@@ -875,11 +893,11 @@ Hidden from the usage and from `--help`. It is the builder side of a routed run,
 
 `gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs|drain --stdin` takes exactly one verb and the word `--stdin`, and no `--state-dir`: the request is the first line of stdin, and every path comes from it.
 
-Three exceptions take no request and no `--stdin`: `gate box register-desktop`, `gate box prune --root <folder> [--keys <key>...]`, which takes the root and, optionally, the keys to remove, and `gate box hold --root <root> --holder <text> --ceiling <seconds> [--wait <seconds>] -- <command> [args...]` ([The box side](#the-box-side), `hold`).
+Four exceptions take no request and no `--stdin`: `gate box register-desktop`, `gate box prune --root <folder> [--keys <key>...]`, which takes the root and, optionally, the keys to remove, `gate box hold --root <root> --holder <text> --ceiling <seconds> [--wait <seconds>] -- <command> [args...]` ([The box side](#the-box-side), `hold`) and `gate box desktop-hold --root <folder> --holder <text> --ceiling <seconds> [--wait <seconds>]` (`desktop-hold`; no `--`, no command).
 
 Any other shape (no verb, no `--stdin`, any other word in its place, an unknown verb, an extra word) prints the box usage alone on stderr and exits 2.
 
-The usage is three lines: `usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs|drain --stdin (the base64 JSON request as stdin's first line)`, then the `       gate box prune --root <folder> [--keys <key>...]` line, then the `       gate box hold --root <root> --holder <text> --ceiling <seconds> [--wait <seconds>] -- <command> [args...]` line.
+The usage is four lines: `usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs|drain --stdin (the base64 JSON request as stdin's first line)`, then the `       gate box prune --root <folder> [--keys <key>...]` line, then the `       gate box hold --root <root> --holder <text> --ceiling <seconds> [--wait <seconds>] -- <command> [args...]` line, then the `       gate box desktop-hold --root <folder> --holder <text> --ceiling <seconds> [--wait <seconds>]` line.
 
 ### Later subcommands
 
@@ -5450,6 +5468,16 @@ Built verbs:
 
   Its exit status is the command's own. At the ceiling it ends the command's job, says `gate: hold ended at its ceiling of {s} s` on stderr and exits 124. A command it cannot start says `gate: hold could not start {program}: {why}` and exits 127. Any other failure is `gate: hold failed: {why}` on stderr and exit 1; a slot that cannot be let go says `gate: slot release failed: {why}`. The Unix box builds it too ([The Unix box](#the-unix-box), `hold`).
 
+- **`desktop-hold`** (`boxside/desktop_hold.rs`) is `gate box desktop-hold --root <folder> --holder <text> --ceiling <seconds> [--wait <seconds>]`: it holds the builder's desktop lock `gate\desktop` for an agent driving the console desktop, which `gate desktop hold` calls ([`gate desktop hold`](#gate-desktop-hold)). It reads no request and takes no `--stdin`, and its stdin is only watched for its end.
+
+  `--ceiling` is whole seconds from 1, `--wait` whole seconds from 0 (0 when not given), both at most 86400. A holder that is not 1 to 80 characters of ASCII letters, digits, spaces and `- _ . : ( ) / @ + ,` says `gate box desktop-hold: --holder must be ...` and exits 2, by the one rule the PC's parse shares.
+
+  It opens, waits for, holds and lets go the lock on one thread, since a mutex belongs to its thread; a helper thread only reads stdin to its end. It waits up to `--wait` as a locked run does, ending the wait when stdin ends, with the same busy-wait line, naming the holder in the record, and abandoned-lock line. Once it holds the lock it writes the holder record `desktop-holder.json` in `<folder>` (the PC passes the builder's `work` folder, where its locked runs keep theirs; [The desktop run's design](#the-desktop-runs-design), The desktop lock) as `{"repo": "<holder>", "since": ...}`, so a waiting locked run names the hold, and says on stdout `gate: holding the builder's desktop as {holder} (ceiling {s} s)`.
+
+  It holds until stdin ends, then removes the record before it lets the lock go, says `gate: desktop hold released` on stderr and exits 0; or until its ceiling, saying `gate: desktop hold ended at its ceiling of {s} s` and exiting 124. A desktop still held by another after the wait says `gate: desktop hold: the builder's desktop stayed busy for {n} s` and exits 75; a lock that cannot be opened or waited for says `gate: desktop hold failed: the builder's desktop lock cannot be opened: {error}` (or `waited for`) and exits 1. Stdin that ends while the hold waits, or as the lock is taken, says `gate: desktop hold ended before it held the desktop` and exits 0, writing no record and holding no lock; stdin that cannot be watched says `gate: desktop hold failed: its input cannot be watched: {error}` and exits 1.
+
+  It never touches a session or hidden run, which take no lock. A test-seams build honours `--test-box-desktop-mutex` and `--test-box-desktop-ms` as a locked run does. The Unix box says `gate: box desktop-hold is not built on this builder` and exits 2.
+
 **The outputs module** (GATE-44) is shared by both ends, this exe, in `crates/gate/src/outputs/`. The box's `run` packs with it and the box's `outputs` verb sends the archive. The PC's manifest, the pending marker, the reading of the box's `gate-remote-outputs: ` line, the fetch of the archive and its install are built in the Rust remote client ([The remote client's run](#routing)).
 
 - Globs: each is relative to the work folder's root and `/`-separated, matched without regard to case: `**/` is any number of folders (none included), `**` anything, `*` any run of characters within one name, `?` one character within one name.
@@ -5609,6 +5637,8 @@ The rules behind the desktop run (GATE-231) that a later change to the helper, t
   On the PC a locked run takes the desktop queue first, then its key lock, then the PC's remote slot, and the box takes its slot and these two locks after; the queue serialises this PC's locked runs only, so runs from another PC still wait at the box's desktop lock. The desktop lock is taken after the checkout and the restores, so it is held only while the command runs, and on the run's main thread, which also releases it, since a mutex belongs to its thread; it is released once the job is empty and the output drained, before the back commit.
 - The holder record `desktop-holder.json`, `{"repo": "<repo>", "since": "<UTC RFC 3339>"}`, sits in the box's work root (the folder of the run's work folder). The run writes it once it holds the lock (staged as `desktop-holder.json.tmp`, then renamed) and removes it just before it lets the lock go, since removing it after would race the next holder's write.
 
+  `gate box desktop-hold` ([`gate desktop hold`](#gate-desktop-hold)) takes the same lock and writes and removes the same record, with its holder text in `repo`.
+
   A waiting run reads it for its busy-wait line only, through an open that shares read, write and delete so it never blocks the holder's rename or removal; it decides nothing, and a missing or unreadable record only changes the line.
 
   The record and its stage are never followed through a link or a second name: the stage is written as the box's other records are, and a link at either name is refused. A record that cannot be written or removed prints `gate: the builder's desktop holder record <path> could not be written: <error>` or `... could not be removed: <error>` (path and error escaped) and the run goes on; a failed write also removes the earlier holder's record, so no stale holder is named.
@@ -5694,7 +5724,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
   `<target>` is the target as written, escaped, or `the command's folder` when the command names none; a named target is never replaced by the gate's folder. `<why>` is, for example, `<folder> holds no project or solution file`, `<folder> holds more than one project file`, `<folder> holds a project and a solution file` (which `dotnet build` there would take as the solution, or refuse as MSB1011), `<path> does not exist`, `<path> is no project file` or `cannot read <path>: <error>`.
   A target named by a solution or project extension needs no disk question; any other is read from disk (a project file is itself, a folder its one project file, else its one solution file), and only for a run that would otherwise cross (opted in, cross verb, no blocking word, builds in place).
 
-  A pair run brings back from its main tree only. `OutputsFull` with no globs is taken and does nothing. `--test-outputs-budget-bytes` reaches the run. Every other verb (`inflight`, `register-desktop`, `channel-check`) says `gate: box <verb> is not built on this builder` and exits 2.
+  A pair run brings back from its main tree only. `OutputsFull` with no globs is taken and does nothing. `--test-outputs-budget-bytes` reaches the run. Every other verb (`inflight`, `register-desktop`, `channel-check`, `desktop-hold`) says `gate: box <verb> is not built on this builder` and exits 2.
 
   The run checks a payload's `InputsDigest` as the Windows box does ([The box side](#the-box-side)), and refuses a `SentDigest` as not built (`gate-remote-refused: <nonce> sent`, then `gate: remote SentDigest is not built on this builder`, status 75), so the PC runs such a run itself. It takes `LfsDigest` and `SiblingLfsDigests` and checks the LFS content out (next paragraphs). A payload with `CommitStage` true is refused `layout` the same way, naming `CommitStage` in the line.
 

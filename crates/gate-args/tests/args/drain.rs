@@ -95,7 +95,12 @@ fn the_usage_lists_drain_between_push_and_prune() {
         .position(|line| *line == "       gate drain [--lift | --status] [--builder <host>]")
         .expect("the usage lists gate drain");
     assert_eq!(lines[at - 1], "       gate push", "{USAGE}");
-    assert_eq!(lines[at + 1], "       gate prune --builders", "{USAGE}");
+    assert_eq!(
+        lines[at + 1],
+        "       gate desktop hold --builder <host> --holder \"<text>\" --ceiling <seconds> [--wait <seconds>]",
+        "{USAGE}"
+    );
+    assert_eq!(lines[at + 2], "       gate prune --builders", "{USAGE}");
 }
 
 #[cfg(feature = "test-seams")]

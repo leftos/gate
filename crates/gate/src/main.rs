@@ -18,6 +18,7 @@ mod console;
 mod covered;
 mod csharp_format;
 mod cutover;
+mod desktop_hold_cmd;
 mod dotnet_projects;
 mod drain_cmd;
 mod durations;

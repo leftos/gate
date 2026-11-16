@@ -24,7 +24,7 @@ use crate::remote::launch;
 use crate::remote::payload;
 use crate::remote::transport::ssh::Ssh;
 use crate::remote::transport::{Program, Transport, Wire};
-use crate::remote::{SSH_FAILED, no_box};
+use crate::remote::{SSH_FAILED, no_box, unnamed};
 use crate::resolve::Environment;
 use crate::route;
 use crate::run::CONTROL_C_EXIT;
@@ -49,8 +49,6 @@ const INTERRUPTED: &str = "gate: drain: interrupted; the barrier stands; gate dr
 /// The line of a drain Ctrl+C ended during its first raise.
 const INTERRUPTED_BEFORE: &str =
     "gate: drain: interrupted before the builder answered the raise; a barrier may stand; gate drain --status says, gate drain --lift lifts it";
-/// What a line says in place of the builder's name.
-const THE_BUILDER: &str = "the builder";
 
 /// Runs `gate drain` and returns its exit status: 0 drained, lifted or reported, 1 a failure, 2 a builder `remote.json`
 /// does not list, `CONTROL_C_EXIT` on Ctrl+C.
@@ -187,43 +185,6 @@ fn classified(answer: Result<Status, Unanswered>, interrupted: bool, alias: &str
         Err(Unanswered::Said(line)) => Err(Unanswered::Unreachable(unnamed(&line, alias))),
         Err(other) => Err(other),
     }
-}
-
-/// Whether `byte` may be part of a host name, so a name next to it is not a whole word.
-fn in_name(byte: Option<&u8>) -> bool {
-    byte.is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'-' || *byte == b'.')
-}
-
-/// `why` with every whole-word occurrence of the builder's ssh `alias`, and of the host part of it after any `user@`,
-/// said as "the builder", letter case aside, so no line names the builder; a word is bounded by anything but an ASCII
-/// letter or digit, `-` or `.`.
-fn unnamed(why: &str, alias: &str) -> String {
-    let host = alias.rsplit_once('@').map_or(alias, |(_, host)| host);
-    let mut names: Vec<String> = [alias, host]
-        .iter()
-        .filter(|name| !name.is_empty())
-        .map(|name| name.to_ascii_lowercase())
-        .collect();
-    names.sort_by_key(|name| std::cmp::Reverse(name.len()));
-    names.dedup();
-    let lowered = why.to_ascii_lowercase();
-    let bytes = lowered.as_bytes();
-    let (mut text, mut copied, mut at) = (String::new(), 0, 0);
-    while at < bytes.len() {
-        let starts_word = at == 0 || !in_name(bytes.get(at - 1));
-        let whole = |name: &&String| bytes[at..].starts_with(name.as_bytes()) && !in_name(bytes.get(at + name.len()));
-        match names.iter().find(whole).filter(|_| starts_word) {
-            Some(name) => {
-                text.push_str(&why[copied..at]);
-                text.push_str(THE_BUILDER);
-                at += name.len();
-                copied = at;
-            }
-            None => at += 1,
-        }
-    }
-    text.push_str(&why[copied..]);
-    text
 }
 
 /// Makes the one call `program`, fed `input` on its standard input, bounded at [`BOUND`] and ended by `interrupt`, as the
@@ -793,8 +754,9 @@ mod tests {
 
     use gate_args::DrainSeams;
 
-    use super::{Barrier, Item, State, Status, Unanswered, Wait, classified, list_lines, status_lines, status_of, still_waiting, unnamed};
+    use super::{Barrier, Item, State, Status, Unanswered, Wait, classified, list_lines, status_lines, status_of, still_waiting};
     use crate::console::Console;
+    use crate::remote::unnamed;
 
     fn status(lines: &[&str]) -> Option<Status> {
         status_of(lines.iter().copied())

@@ -108,6 +108,46 @@ pub(crate) fn no_box<'a>(status: i32, lines: &'a [String], errors: impl IntoIter
     matches!(status, SHELL_CANNOT_EXECUTE | SHELL_NOT_FOUND) && !box_spoke(lines, errors)
 }
 
+/// What a line says in place of the builder's name.
+const THE_BUILDER: &str = "the builder";
+
+/// Whether `byte` may be part of a host name, so a name next to it is not a whole word.
+fn in_name(byte: Option<&u8>) -> bool {
+    byte.is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'-' || *byte == b'.')
+}
+
+/// `why` with every whole-word occurrence of the builder's ssh `alias`, and of the host part of it after any `user@`,
+/// said as "the builder", letter case aside, so no line names the builder; a word is bounded by anything but an ASCII
+/// letter or digit, `-` or `.`.
+pub(crate) fn unnamed(why: &str, alias: &str) -> String {
+    let host = alias.rsplit_once('@').map_or(alias, |(_, host)| host);
+    let mut names: Vec<String> = [alias, host]
+        .iter()
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    names.sort_by_key(|name| std::cmp::Reverse(name.len()));
+    names.dedup();
+    let lowered = why.to_ascii_lowercase();
+    let bytes = lowered.as_bytes();
+    let (mut text, mut copied, mut at) = (String::new(), 0, 0);
+    while at < bytes.len() {
+        let starts_word = at == 0 || !in_name(bytes.get(at - 1));
+        let whole = |name: &&String| bytes[at..].starts_with(name.as_bytes()) && !in_name(bytes.get(at + name.len()));
+        match names.iter().find(whole).filter(|_| starts_word) {
+            Some(name) => {
+                text.push_str(&why[copied..at]);
+                text.push_str(THE_BUILDER);
+                at += name.len();
+                copied = at;
+            }
+            None => at += 1,
+        }
+    }
+    text.push_str(&why[copied..]);
+    text
+}
+
 /// Whether a preflight call said one of the box's own lines, `gate: …` once its stamp is taken off, on standard output
 /// `lines` or standard error `errors`: both boxes stamp the lines they say themselves.
 fn box_spoke<'a>(lines: &'a [String], errors: impl IntoIterator<Item = &'a str>) -> bool {

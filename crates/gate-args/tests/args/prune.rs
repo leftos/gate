@@ -68,7 +68,7 @@ fn the_usage_lists_prune_after_drain() {
         .iter()
         .position(|line| *line == "       gate prune --builders")
         .expect("the usage lists gate prune");
-    assert_eq!(lines[at - 1], "       gate drain [--lift | --status] [--builder <host>]", "{USAGE}");
+    assert_eq!(lines[at - 2], "       gate drain [--lift | --status] [--builder <host>]", "{USAGE}");
 }
 
 #[cfg(feature = "test-seams")]

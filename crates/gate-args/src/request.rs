@@ -29,6 +29,8 @@ pub enum Invocation {
     Check(CheckRequest),
     /// `gate drain`.
     Drain(DrainRequest),
+    /// `gate desktop hold`.
+    DesktopHold(DesktopHoldRequest),
     /// `gate prune --builders`.
     Prune(PruneRequest),
     /// `gate burn`.
@@ -54,13 +56,14 @@ pub enum Invocation {
 pub struct BoxRequest {
     pub verb: BoxVerb,
     pub seams: BoxSeams,
-    /// The builder root `prune` sweeps or `hold` takes a slot under, the word after its `--root`; `None` for every
-    /// other verb.
+    /// The builder root `prune` sweeps or `hold` takes a slot under, or the work root `desktop-hold` keeps its holder
+    /// record in, the word after its `--root`; `None` for every other verb.
     pub root: Option<PathBuf>,
     /// The keys a keyed `prune` removes, the words after its `--keys`, each once in any case as first spelled, in the order given; empty for the
     /// age prune and every other verb.
     pub keys: Vec<String>,
-    /// What `hold` holds a slot for; `None` for every other verb.
+    /// What `hold` holds a slot for, or `desktop-hold` holds the builder's desktop for, its command then empty; `None`
+    /// for every other verb.
     pub hold: Option<HoldRequest>,
 }
 
@@ -311,6 +314,9 @@ pub enum BoxVerb {
     Drain,
     /// One of the builder's own slots, held while a command runs; it takes no request, only its words.
     Hold,
+    /// The builder's desktop lock, held for an agent driving the console's desktop until the box's input closes or its
+    /// ceiling passes; it takes no request, only its words.
+    DesktopHold,
     /// A test of the builder's data channel: the box listens, takes the PC's connection and checks its proof, then
     /// drops it; it reads only the request's `Nonce` and `Channel`.
     ChannelCheck,
@@ -333,15 +339,16 @@ impl BoxVerb {
             BoxVerb::Prune => "prune",
             BoxVerb::Drain => "drain",
             BoxVerb::Hold => "hold",
+            BoxVerb::DesktopHold => "desktop-hold",
             BoxVerb::ChannelCheck => "channel-check",
         }
     }
 
     /// Whether the verb reads a request, as stdin's first line, after the word `--stdin`: every verb but
-    /// `register-desktop`, `prune` and `hold`.
+    /// `register-desktop`, `prune`, `hold` and `desktop-hold`.
     #[must_use]
     pub fn takes_request(self) -> bool {
-        !matches!(self, BoxVerb::RegisterDesktop | BoxVerb::Prune | BoxVerb::Hold)
+        !matches!(self, BoxVerb::RegisterDesktop | BoxVerb::Prune | BoxVerb::Hold | BoxVerb::DesktopHold)
     }
 }
 
@@ -743,6 +750,34 @@ pub struct DrainSeams {
     pub remote_transport: Option<String>,
     /// The program the local transport's call starts with ssh's own words (`--test-remote-ssh`).
     pub remote_ssh: Option<PathBuf>,
+}
+
+/// A valid `gate desktop hold`: the builder whose desktop lock it holds, the holder text the lock's waiters name, how
+/// long it may hold the lock and wait for it, and the hidden seams the black-box suite gives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DesktopHoldRequest {
+    /// `--builder <host>` as given.
+    pub builder: String,
+    /// `--holder <text>` as given, which the holder rule took.
+    pub holder: String,
+    /// `--ceiling <seconds>`: from 1 to 86400.
+    pub ceiling: u64,
+    /// `--wait <seconds>`: from 0 to 86400, 0 when not given.
+    pub wait: u64,
+    /// The hidden `--test-*` flags that set the transport and the interrupt.
+    pub seams: DesktopHoldSeams,
+}
+
+/// What the black-box suite sets on `gate desktop hold` through its hidden `--test-*` flags; each field keeps its
+/// default, `None` or off, in a gate built without the `test-seams` feature.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DesktopHoldSeams {
+    /// The local transport to the builder, as `gate check --builder` takes it (`--test-remote-transport`).
+    pub remote_transport: Option<String>,
+    /// The program the local transport's call starts with ssh's own words (`--test-remote-ssh`).
+    pub remote_ssh: Option<PathBuf>,
+    /// Raise the console interrupt once the box's held line has come (`--test-desktop-hold-interrupt-after-held`).
+    pub interrupt_after_held: bool,
 }
 
 /// A valid `gate prune --builders`, which takes no other words but `--quiet`: whether an empty sweep says nothing, and

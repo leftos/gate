@@ -17,6 +17,7 @@ mod cores;
 mod critical;
 mod csharp_format;
 mod cutover;
+mod desktop_hold;
 mod diagnostics;
 mod drain;
 mod durations;

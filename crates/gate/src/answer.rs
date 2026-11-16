@@ -47,6 +47,7 @@ pub(crate) fn answer(args: Vec<OsString>, environment: &Environment, console: &m
         Ok(Invocation::Cutover(request)) => crate::cutover::cutover(&request, environment, console),
         Ok(Invocation::Push(request)) => crate::push::push(&request, environment, console),
         Ok(Invocation::Drain(request)) => crate::drain_cmd::drain(&request, environment, console),
+        Ok(Invocation::DesktopHold(request)) => crate::desktop_hold_cmd::desktop_hold(&request, environment, console),
         Ok(Invocation::Prune(request)) => crate::prune_cmd::prune(&request, environment, console),
         Ok(Invocation::Remote(request)) => crate::remote_cmd::remote(&request, environment, console),
         Ok(Invocation::RemoteMatch(request)) => crate::remote_cmd::remote_match(&request, environment, console),

@@ -1,5 +1,5 @@
 //! The gate's own argv: the subcommand CLI (`gate run`, `gate burn`, `gate expect`, `gate csharp`, `gate stop-tree`, `gate cutover`,
-//! `gate push`, `gate drain`, `gate prune`, `gate remote`, `gate check`, `gate warm`, the hidden `gate box`, `--version`,
+//! `gate push`, `gate drain`, `gate desktop hold`, `gate prune`, `gate remote`, `gate check`, `gate warm`, the hidden `gate box`, `--version`,
 //! `--help`/`-h`) and the compatibility layer that reads the PowerShell gate's `-Log <path> -TimeoutSeconds <n>
 //! -Slot <kind> -- <command>` form. Parsing is pure: it reads the words it is given, opens no file and reads no
 //! environment, so it builds and tests everywhere. A usage error is a list of [`Problem`]s, each printed on its own
@@ -15,6 +15,7 @@ mod boxcmd;
 mod cli;
 mod cmdline;
 mod compat;
+mod desktop;
 mod problem;
 mod program;
 mod remote;
@@ -33,8 +34,9 @@ pub use remote::RemoteProblem;
 pub use request::WarmRequest;
 pub use request::{
     BoxRequest, BoxSeams, BoxVerb, BurnRequest, Ceiling, CheckRequest, CheckSeams, CsharpFormatRequest, CutoverRequest, CutoverSeams,
-    DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, DesktopMode, DesktopSession, DrainAction, DrainRequest, DrainSeams, ExpectRequest, HoldRequest,
-    Invocation, ProcessScan, PruneRequest, PruneSeams, PushRequest, PushSeams, RunRequest, Slot, StopRequest, TestSeams,
+    DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, DesktopHoldRequest, DesktopHoldSeams, DesktopMode, DesktopSession, DrainAction, DrainRequest,
+    DrainSeams, ExpectRequest, HoldRequest, Invocation, ProcessScan, PruneRequest, PruneSeams, PushRequest, PushSeams, RunRequest, Slot, StopRequest,
+    TestSeams,
 };
 pub use request::{REMOTE_BUILDER_SECTIONS, REMOTE_SECTIONS, RemoteMatchRequest, RemoteRequest, RemoteVerb};
 pub use usage::USAGE;
@@ -46,12 +48,13 @@ pub use values::{
 /// Reads the gate's arguments, without the program name.
 ///
 /// The first word picks the parser: `--version`, `--help`, `-h` and `help` first, then a subcommand name (`run`,
-/// `burn`, `expect`, `csharp`, `stop-tree`, `cutover`, `push`, `drain`, `prune`, `remote`, `check`, `warm`, the hidden `box`) selects the
+/// `burn`, `expect`, `csharp`, `stop-tree`, `cutover`, `push`, `drain`, `desktop`, `prune`, `remote`, `check`, `warm`, the hidden `box`) selects the
 /// CLI and a first word starting with `-` selects the compatibility layer.
 ///
-/// A `--help` or `-h` word before the first `--` separator of a `run`, `stop-tree`, `cutover`, `push`, `drain`, `prune`, `remote`, `check`, `warm`,
-/// `csharp`, `burn` or `expect` line is the usage too, whatever else the line holds. The words after `--` belong to the command the gate
-/// runs, so `gate run --slot light -- tool --help` runs `tool --help`.
+/// A `--help` or `-h` word before the first `--` separator of a `run`, `stop-tree`, `cutover`, `push`, `drain`, `desktop`,
+/// `prune`, `remote`, `check`, `warm`, `csharp`, `burn` or `expect` line is the usage too, whatever else the line holds.
+/// The words after `--` belong to the command the gate runs, so `gate run --slot light -- tool --help` runs
+/// `tool --help`.
 ///
 /// # Errors
 ///
@@ -70,7 +73,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Invocation, Vec<Problem>> {
     match text {
         "--version" => alone(rest.into_iter(), Invocation::Version),
         "--help" | "-h" | "help" => alone(rest.into_iter(), Invocation::Help),
-        "run" | "stop-tree" | "cutover" | "push" | "drain" | "prune" | "remote" | "check" | "warm" | "burn" | "expect" | "csharp"
+        "run" | "stop-tree" | "cutover" | "push" | "drain" | "desktop" | "prune" | "remote" | "check" | "warm" | "burn" | "expect" | "csharp"
             if help_before_separator(&rest) =>
         {
             Ok(Invocation::Help)
@@ -80,6 +83,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Invocation, Vec<Problem>> {
         "cutover" => cli::parse_cutover(rest.into_iter()).map(Invocation::Cutover),
         "push" => cli::parse_push(rest.into_iter()).map(Invocation::Push),
         "drain" => cli::parse_drain(rest.into_iter()).map(Invocation::Drain),
+        "desktop" => desktop::parse(rest.into_iter()).map(Invocation::DesktopHold),
         "prune" => cli::parse_prune(rest.into_iter()).map(Invocation::Prune),
         "remote" => remote::parse(rest.into_iter()),
         "check" => cli::parse_check(rest.into_iter()).map(Invocation::Check),

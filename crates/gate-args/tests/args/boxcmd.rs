@@ -12,8 +12,78 @@ use crate::support::{invocation, os, problems, problems_of, unreadable_word};
 const BOX_USAGE: &str = concat!(
     "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs|drain --stdin (the base64 JSON request as stdin's first line)\n",
     "       gate box prune --root <folder> [--keys <key>...]\n",
-    "       gate box hold --root <root> --holder <text> --ceiling <seconds> [--wait <seconds>] -- <command> [args...]",
+    "       gate box hold --root <root> --holder <text> --ceiling <seconds> [--wait <seconds>] -- <command> [args...]\n",
+    "       gate box desktop-hold --root <folder> --holder <text> --ceiling <seconds> [--wait <seconds>]",
 );
+
+/// The box's hold of the builder's desktop under `C:\r\work` by `mcp 1` for a ceiling of `ceiling` s and a wait of
+/// `wait` s.
+fn desktop_held(ceiling: u64, wait: u64) -> Invocation {
+    Invocation::Box(BoxRequest {
+        verb: BoxVerb::DesktopHold,
+        seams: BoxSeams::default(),
+        root: Some(PathBuf::from(r"C:\r\work")),
+        keys: Vec::new(),
+        hold: Some(HoldRequest {
+            holder: "mcp 1".to_owned(),
+            ceiling,
+            wait,
+            command: Vec::new(),
+        }),
+    })
+}
+
+#[test]
+fn gate_box_desktop_hold_parses_its_words() {
+    let root = ["--root", r"C:\r\work"];
+    let holder = ["--holder", "mcp 1"];
+    let ceiling = ["--ceiling", "60"];
+    let verb = ["box", "desktop-hold"];
+    assert_eq!(
+        invocation(&cat(&[&verb, &root, &holder, &ceiling])),
+        desktop_held(60, 0),
+        "no wait is a wait of 0"
+    );
+    assert_eq!(
+        invocation(&cat(&[&verb, &["--wait", "86400", "--ceiling", "86400"], &holder, &root])),
+        desktop_held(86_400, 86_400),
+        "in any order, at most a day each"
+    );
+    assert_eq!(
+        invocation(&cat(&[&verb, &root, &holder, &["--ceiling", "1", "--wait", "0"]])),
+        desktop_held(1, 0)
+    );
+    assert_eq!(BoxVerb::DesktopHold.as_str(), "desktop-hold", "the verb as the CLI spells it");
+    assert!(!BoxVerb::DesktopHold.takes_request(), "desktop-hold reads no request");
+
+    let all = cat(&[&root, &holder, &ceiling]);
+    let refused: Vec<Vec<&str>> = vec![
+        verb.to_vec(),
+        cat(&[&verb, &["--stdin"]]),
+        cat(&[&verb, &all, &["--stdin"]]),
+        cat(&[&verb, &all, &["--", "a"]]),
+        cat(&[&verb, &holder, &ceiling]),
+        cat(&[&verb, &root, &ceiling]),
+        cat(&[&verb, &root, &holder]),
+        cat(&[&verb, &all, &["--root", r"C:\y"]]),
+        cat(&[&verb, &all, &["--holder", "again"]]),
+        cat(&[&verb, &all, &["--ceiling", "61"]]),
+        cat(&[&verb, &all, &["--wait", "1", "--wait", "2"]]),
+        cat(&[&verb, &root, &holder, &["--ceiling", "0"]]),
+        cat(&[&verb, &root, &holder, &["--ceiling", "86401"]]),
+        cat(&[&verb, &root, &holder, &["--ceiling", "soon"]]),
+        cat(&[&verb, &all, &["--wait", "86401"]]),
+        cat(&[&verb, &all, &["--wait", "-1"]]),
+        cat(&[&verb, &["--root", ""], &holder, &ceiling]),
+        cat(&[&verb, &all, &["--keys", "k"]]),
+        cat(&[&verb, &all, &["extra"]]),
+        cat(&[&verb, &root, &holder, &["--ceiling"]]),
+        cat(&[&["box", "Desktop-Hold"], &all]),
+    ];
+    for words in &refused {
+        assert_eq!(problems(words), [BOX_USAGE], "{words:?}");
+    }
+}
 
 /// The hold of a slot under `C:\x` by `ci 7` for a ceiling of 60 s and a wait of `wait` s, running `command`.
 fn held(wait: u64, command: &[&str]) -> Invocation {

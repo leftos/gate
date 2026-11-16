@@ -10,6 +10,7 @@ mod check;
 mod compat;
 mod csharp;
 mod cutover;
+mod desktop;
 mod drain;
 mod expect;
 mod program;

@@ -6,6 +6,7 @@ mod boot;
 mod ceiling;
 mod channel;
 mod desktop;
+mod desktop_hold;
 mod drain;
 pub(crate) mod forward;
 mod heartbeat;
@@ -91,6 +92,8 @@ pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
         BoxVerb::ChannelCheck => with_request(console, |payload, console| channel::channel_check(payload, seams, console)),
         // Its words are all it takes; it reads no request, and its command gets no stdin (`NUL`).
         BoxVerb::Hold => slots::hold(request, console),
+        // Its words are all it takes; its stdin is only watched for its end, which lets the desktop go.
+        BoxVerb::DesktopHold => desktop_hold::desktop_hold(request, console),
     }
 }
 

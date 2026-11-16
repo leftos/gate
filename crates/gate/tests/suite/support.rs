@@ -39,6 +39,7 @@ usage: gate run --slot heavy|light|critical|none [--alone] [--reason \"<why>\"] 
        gate cutover
        gate push
        gate drain [--lift | --status] [--builder <host>]
+       gate desktop hold --builder <host> --holder \"<text>\" --ceiling <seconds> [--wait <seconds>]
        gate prune --builders
        gate remote add <section> <repo> <pattern>... [--builder <host>] [--tag <word>] [--dry-run]
        gate remote remove <section> <repo> <pattern>... [--builder <host>] [--dry-run]

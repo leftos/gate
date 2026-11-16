@@ -2,7 +2,8 @@
 //! is stdin's first line, which the binary reads and decodes. `gate box register-desktop` takes no `--stdin`: it reads
 //! no request; nor does `gate box prune --root <folder> [--keys <key>...]`, whose words are its root and the keys it
 //! removes, nor `gate box hold --root <root> --holder <text> --ceiling <seconds> [--wait <seconds>] -- <command>
-//! [args...]`, whose words are all it takes. A `test-seams` build also reads the hidden `--test-box-hold-poll-ms <n>`,
+//! [args...]`, nor `gate box desktop-hold --root <folder> --holder <text> --ceiling <seconds> [--wait <seconds>]`,
+//! whose words are all they take. A `test-seams` build also reads the hidden `--test-box-hold-poll-ms <n>`,
 //! `--test-heartbeat-ms <n>`, `--test-box-console fail-before`, `--test-box-token refused`, `--test-box-park-launch <path>`,
 //! `--test-outputs-budget-bytes <n>`, `--test-box-failure-cap-bytes <n>` (the Windows box's alone: the Unix box always
 //! holds failure outputs to the built-in caps), `--test-inputs-budget-bytes <n>`, `--test-lfs-budget-bytes <n>`,
@@ -75,6 +76,10 @@ pub(crate) fn parse(words: impl Iterator<Item = OsString>) -> Result<BoxRequest,
             _ => (false, None, Vec::new(), None),
         },
         Some(BoxVerb::Hold) => match hold_words(&mut words) {
+            Some((root, hold)) => (true, Some(root), Vec::new(), Some(hold)),
+            None => (false, None, Vec::new(), None),
+        },
+        Some(BoxVerb::DesktopHold) => match desktop_hold_words(&mut words, &mut problems) {
             Some((root, hold)) => (true, Some(root), Vec::new(), Some(hold)),
             None => (false, None, Vec::new(), None),
         },
@@ -168,11 +173,50 @@ fn hold_words(words: &mut impl Iterator<Item = OsString>) -> Option<(PathBuf, Ho
 
 /// The whole seconds `word` gives: ASCII digits alone, at least one, at most [`MOST_HOLD_SECONDS`].
 fn seconds(word: &OsStr) -> Option<u64> {
+    seconds_up_to(word, MOST_HOLD_SECONDS)
+}
+
+/// The whole seconds `word` gives: ASCII digits alone, at least one, at most `most`.
+fn seconds_up_to(word: &OsStr, most: u64) -> Option<u64> {
     let text = word.to_str()?;
     if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    text.parse().ok().filter(|seconds| *seconds <= MOST_HOLD_SECONDS)
+    text.parse().ok().filter(|seconds| *seconds <= most)
+}
+
+/// The words of a `desktop-hold` after its verb: `--root`, `--holder` and `--ceiling`, each with its value, and
+/// `--wait` with its own, in any order and each once, and nothing else. The root is a word that is not empty, the
+/// ceiling whole seconds from 1 to [`crate::desktop::MOST_DESKTOP_HOLD_SECONDS`] and the wait whole seconds up to it, 0 when not given;
+/// the hold's command is empty. `None` for any other words, which is the box usage; a holder the holder rule refuses
+/// ([`crate::desktop::holder_taken`]) is its own problem, put in `problems`.
+fn desktop_hold_words(words: &mut impl Iterator<Item = OsString>, problems: &mut Vec<Problem>) -> Option<(PathBuf, HoldRequest)> {
+    let (mut root, mut holder, mut ceiling, mut wait) = (None, None, None, None);
+    let day = |value: &OsStr| seconds_up_to(value, u64::from(crate::desktop::MOST_DESKTOP_HOLD_SECONDS));
+    while let Some(flag) = words.next() {
+        let value = words.next()?;
+        let first = match flag.to_str()? {
+            ROOT if !value.is_empty() => root.replace(PathBuf::from(value)).is_none(),
+            HOLDER => holder.replace(value.into_string().ok()?).is_none(),
+            CEILING => ceiling.replace(day(&value).filter(|seconds| *seconds > 0)?).is_none(),
+            WAIT => wait.replace(day(&value)?).is_none(),
+            _ => return None,
+        };
+        if !first {
+            return None;
+        }
+    }
+    let (root, holder, ceiling) = (root?, holder?, ceiling?);
+    if !crate::desktop::holder_taken(&holder) {
+        problems.push(Problem::BadDesktopHolder("gate box desktop-hold"));
+    }
+    let hold = HoldRequest {
+        holder,
+        ceiling,
+        wait: wait.unwrap_or(0),
+        command: Vec::new(),
+    };
+    Some((root, hold))
 }
 
 fn verb(text: &str) -> Option<BoxVerb> {
@@ -189,6 +233,7 @@ fn verb(text: &str) -> Option<BoxVerb> {
         "prune" => Some(BoxVerb::Prune),
         "drain" => Some(BoxVerb::Drain),
         "hold" => Some(BoxVerb::Hold),
+        "desktop-hold" => Some(BoxVerb::DesktopHold),
         "channel-check" => Some(BoxVerb::ChannelCheck),
         _ => None,
     }

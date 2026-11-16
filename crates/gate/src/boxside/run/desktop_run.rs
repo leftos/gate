@@ -34,7 +34,7 @@ use crate::remote::{Refusal, refused_line};
 const OTHER_USER: &str = "gate-seam-other-user";
 
 /// The name of the record of the run holding the builder's desktop, in the box's work root ([`HolderRecord`]).
-const HOLDER_RECORD: &str = "desktop-holder.json";
+pub(crate) const HOLDER_RECORD: &str = "desktop-holder.json";
 
 /// How a desktop run that did not run its command ended, its lines said.
 pub(super) enum DesktopEnd {
@@ -198,7 +198,7 @@ fn locked(
 /// decides nothing from: [`HOLDER_RECORD`] in the box's work root, the folder of the run's work folder. It is written,
 /// its `.tmp` stage included, and read without following a link there and only as a plain file ([`write_record_file`],
 /// [`shared_record`]). Each failure is said once on stderr through `say`, and none fails the run.
-struct HolderRecord {
+pub(crate) struct HolderRecord {
     /// The record's path; `None` for a work folder in no folder, which keeps none.
     path: Option<String>,
 }
@@ -210,7 +210,7 @@ impl HolderRecord {
     }
 
     /// The holder record in the work root `root`.
-    fn in_root(root: Option<&Path>) -> HolderRecord {
+    pub(crate) fn in_root(root: Option<&Path>) -> HolderRecord {
         HolderRecord {
             path: root.and_then(|root| root.join(HOLDER_RECORD).to_str().map(str::to_owned)),
         }
@@ -218,7 +218,7 @@ impl HolderRecord {
 
     /// The holder the record names; `None` when there is none, said through `say` when the record cannot be read or is
     /// not a holder record.
-    fn holder(&self, say: &mut impl FnMut(&str)) -> Option<DesktopHolder> {
+    pub(crate) fn holder(&self, say: &mut impl FnMut(&str)) -> Option<DesktopHolder> {
         let path = self.path.as_deref()?;
         let text = match shared_record(path).and_then(|file| file.map(read_whole).transpose()) {
             Ok(text) => text?,
@@ -237,7 +237,7 @@ impl HolderRecord {
     /// Writes the record of a run of `repo` that takes the builder's desktop now, whole: to a `.tmp` stage first, then
     /// renamed over the record, which replaces a link there rather than following it. When the write fails, the record
     /// an earlier holder left is removed, so this run's hold is never said to be another's.
-    fn write(&self, repo: &str, say: &mut impl FnMut(&str)) {
+    pub(crate) fn write(&self, repo: &str, say: &mut impl FnMut(&str)) {
         let Some(path) = self.path.as_deref() else { return };
         let holder = DesktopHolder {
             repo: repo.to_owned(),
@@ -251,7 +251,7 @@ impl HolderRecord {
     }
 
     /// Removes the record; one already gone is left so.
-    fn remove(&self, say: &mut impl FnMut(&str)) {
+    pub(crate) fn remove(&self, say: &mut impl FnMut(&str)) {
         let Some(path) = self.path.as_deref() else { return };
         match fs::remove_file(path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => say(&record_failed_line(path, "removed", &error.to_string())),
@@ -308,7 +308,7 @@ fn held_session(
 }
 
 /// Why the builder's desktop lock was not taken.
-enum Unheld {
+pub(crate) enum Unheld {
     /// The run ended on a stop, with this status, its line said, or on a gone client with [`CLOSED_STATUS`].
     Ended(u32),
     /// Another run held it for the whole wait.
@@ -348,15 +348,15 @@ fn wait_for_desktop<'m>(
 }
 
 /// How a wait for the builder's desktop is cut into turns: `total` in all, turns of at most `step`, on the clock `now`.
-struct Turns<N> {
-    total: Duration,
-    step: Duration,
-    now: N,
+pub(crate) struct Turns<N> {
+    pub(crate) total: Duration,
+    pub(crate) step: Duration,
+    pub(crate) now: N,
 }
 
 /// The turns of [`wait_for_desktop`]: before each, `look` at the stop signal; each `acquire` given at most a step and
 /// never more than is left of the total; `busy` said once, after a turn that timed out with some of the wait left.
-fn waited<G>(
+pub(crate) fn waited<G>(
     turns: &Turns<impl Fn() -> Instant>,
     console: &mut Console,
     look: impl Fn(&mut Console) -> Result<(), u32>,
@@ -478,7 +478,7 @@ fn run_limits(seams: &BoxSeams) -> Limits {
 
 /// The builder's desktop lock's name: the production `gate\desktop`, or, under the mutex seam, a namespace of the
 /// box's own user named by the seam's unique part.
-fn desktop_name(seams: &BoxSeams) -> io::Result<PrivateName> {
+pub(crate) fn desktop_name(seams: &BoxSeams) -> io::Result<PrivateName> {
     match seams.desktop_mutex.as_deref() {
         None => Ok(PrivateName::desktop()),
         Some(unique) => seam_name(unique),

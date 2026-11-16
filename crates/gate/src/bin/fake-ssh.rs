@@ -45,7 +45,10 @@
 //! seams, and a `preflight` call those of `GATE_FAKE_SSH_PREFLIGHT_SEAMS` the same way, a `preflight` or `drain` call
 //! then `--test-box-root-walk-stop <folder>` when the variable `GATE_FAKE_SSH_ROOT_WALK_STOP` names the folder, one path
 //! never split; a keyed prune's line, `<exe> box prune --root <root> --keys <key>...`, which has no `--stdin`, runs
-//! `<gate> box` with that walk stop, `prune` and the words after it, split at each space;
+//! `<gate> box` with that walk stop, `prune` and the words after it, split at each space; a desktop hold's line,
+//! `<exe> box desktop-hold --root "<folder>" --holder "<text>" ...`, which has no `--stdin` either, runs `<gate> box`
+//! with the words of `GATE_FAKE_SSH_BOX_SEAMS`, `desktop-hold` and the words after it split as Windows splits a command
+//! line, its standard input this process's, so the box reads the call's input to its end as this process would;
 //! or `git upload-pack <path>` or `git receive-pack <path>`, or a push call's words with this PC's `pwsh`, its `LOCALAPPDATA`
 //! the folder named as the host, the word before the line, in the folder the variable `GATE_FAKE_SSH_BUILDERS` names,
 //! made when missing, fed this process's standard input, which it reads whole first and keeps as `<steps file>.input`;
@@ -732,6 +735,36 @@ fn hold(path: &Path) -> Result<(), String> {
 const PRUNE_LINE: &str = " box prune ";
 /// The verb of a keyed prune call.
 const PRUNE: &str = "prune";
+/// What a desktop hold's line holds after the box's exe: the verb, whose words after it are its options, with no
+/// `--stdin`, the holder's a double-quoted run.
+const DESKTOP_HOLD_LINE: &str = " box desktop-hold ";
+/// The verb of a desktop hold call.
+const DESKTOP_HOLD: &str = "desktop-hold";
+
+/// The words of `text` as Windows splits a command line that holds no escaped quote: spaces and tabs part the words,
+/// and a double-quoted run, its quotes taken off, is part of one word, spaces and all.
+fn windows_words(text: &str) -> Vec<String> {
+    let (mut words, mut word, mut quoted, mut started) = (Vec::new(), String::new(), false, false);
+    for character in text.chars() {
+        match character {
+            '"' => (quoted, started) = (!quoted, true),
+            ' ' | '\t' if !quoted => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                }
+                started = false;
+            }
+            other => {
+                word.push(other);
+                started = true;
+            }
+        }
+    }
+    if started {
+        words.push(word);
+    }
+    words
+}
 
 /// The call the line carries: `gate box`'s verb and the word after it, `--stdin`, a git service's name and the
 /// repository's path, [`PRUNE`] and the prune's words after it, or [`PUSH`] and the push call's whole line, as `rest`;
@@ -774,6 +807,14 @@ impl<'a> BoxCall<'a> {
                 steps,
             });
         }
+        if let Some((_, rest)) = line.split_once(DESKTOP_HOLD_LINE) {
+            return Ok(BoxCall {
+                verb: DESKTOP_HOLD,
+                rest,
+                host,
+                steps,
+            });
+        }
         if let Some((_, rest)) = line.split_once(PRUNE_LINE) {
             return Ok(BoxCall {
                 verb: PRUNE,
@@ -804,7 +845,7 @@ impl<'a> BoxCall<'a> {
         let mut command = Command::new(variable("GATE_FAKE_SSH_GATE")?);
         command.arg("box");
         let seams = match self.verb {
-            "run" | "lfs" | "inputs" | "drain" | "outputs" | "channel-check" => Some("GATE_FAKE_SSH_BOX_SEAMS"),
+            "run" | "lfs" | "inputs" | "drain" | "outputs" | "channel-check" | DESKTOP_HOLD => Some("GATE_FAKE_SSH_BOX_SEAMS"),
             "preflight" => Some("GATE_FAKE_SSH_PREFLIGHT_SEAMS"),
             _ => None,
         };
@@ -816,12 +857,18 @@ impl<'a> BoxCall<'a> {
         {
             command.arg("--test-box-root-walk-stop").arg(stop);
         }
-        if self.verb == PRUNE {
-            command.arg(PRUNE).args(self.rest.split(' '));
-        } else {
-            command.args([self.verb, self.rest]);
-        }
+        command.args(self.verb_words());
         Ok(command)
+    }
+
+    /// The words after the box's seams: [`PRUNE`] and its words split at each space, [`DESKTOP_HOLD`] and its words
+    /// split as Windows splits a command line ([`windows_words`]), or the verb and the word after it.
+    fn verb_words(&self) -> Vec<String> {
+        match self.verb {
+            PRUNE => std::iter::once(PRUNE).chain(self.rest.split(' ')).map(str::to_owned).collect(),
+            DESKTOP_HOLD => std::iter::once(DESKTOP_HOLD.to_owned()).chain(windows_words(self.rest)).collect(),
+            _ => vec![self.verb.to_owned(), self.rest.to_owned()],
+        }
     }
 
     /// This PC's `pwsh` with the push call's words after `pwsh`, its `LOCALAPPDATA` the host's folder in the folder

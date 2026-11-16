@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use crate::desktop::{HOLDER_MARKS, MOST_HOLDER_CHARS};
 use crate::remote::RemoteProblem;
 #[cfg(feature = "test-seams")]
 use crate::request::{DESKTOP_MODES, DESKTOP_SESSIONS};
@@ -33,6 +34,12 @@ pub enum Required {
     Seconds,
     /// `gate prune`'s `--builders`, which it cannot do without.
     Builders,
+    /// `gate desktop hold`'s `--builder`, which it cannot do without.
+    Builder,
+    /// `gate desktop hold`'s `--holder`, which it cannot do without.
+    Holder,
+    /// `gate desktop hold`'s `--ceiling`, which it cannot do without.
+    Ceiling,
 }
 
 /// One thing wrong with the command line. `option` is the option as the caller spelled it, without its value.
@@ -204,6 +211,9 @@ pub enum Problem {
     },
     /// A `gate remote` line it cannot take, said as `gate: remote: ...`.
     Remote(RemoteProblem),
+    /// A desktop hold's `--holder` text the one holder rule refuses, said after the command that refused it:
+    /// `gate desktop hold` or `gate box desktop-hold`.
+    BadDesktopHolder(&'static str),
     /// A `--env` word that is not valid Unicode, `position` its place among the run's `--env` words. The word is not
     /// said: it may be a secret pasted without its name.
     EnvWordNotUnicode(usize),
@@ -281,11 +291,7 @@ impl fmt::Display for Problem {
             Problem::MissingPid => f.write_str("gate: missing the process id"),
             Problem::BadPid(value) => write!(f, "gate: the process id must be a whole number above 0, got '{value}'"),
             Problem::Unreadable(lossy) => write!(f, "gate: cannot read the argument {lossy}"),
-            Problem::BoxUsage => f.write_str(concat!(
-                "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs|drain --stdin (the base64 JSON request as stdin's first line)\n",
-                "       gate box prune --root <folder> [--keys <key>...]\n",
-                "       gate box hold --root <root> --holder <text> --ceiling <seconds> [--wait <seconds>] -- <command> [args...]",
-            )),
+            Problem::BoxUsage => f.write_str(BOX_USAGE),
             Problem::NoCsharpVerb => f.write_str("gate: csharp needs the verb format"),
             Problem::BadCsharpVerb(word) => write!(f, "gate: csharp takes the verb format, not {word}"),
             Problem::SeamNeeds { option, needs } => write!(f, "gate: {option} needs {needs}"),
@@ -311,11 +317,29 @@ impl fmt::Display for Problem {
             Problem::SeamNotUsedWith { option, with } => write!(f, "gate: {option} is not used with {with}"),
             Problem::EnvRefused { refusal, name, position } => f.write_str(&refusal.usage_line(&escaped(&shown_name(name)), *position)),
             Problem::Remote(problem) => write!(f, "gate: remote: {problem}"),
+            Problem::BadDesktopHolder(command) => write!(f, "{command}: {}", holder_rule()),
             Problem::EnvWordNotUnicode(n) => write!(f, "gate: --env word {n} is not valid Unicode"),
             Problem::EnvForwardNotSet(n) => write!(f, "gate: --env word {n} names a variable to forward, and it is not set"),
             Problem::EnvForwardNotUnicode(n) => write!(f, "gate: --env word {n} names a variable whose value is not Unicode"),
         }
     }
+}
+
+/// The hidden `gate box`'s own usage, said alone.
+const BOX_USAGE: &str = concat!(
+    "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs|drain --stdin (the base64 JSON request as stdin's first line)\n",
+    "       gate box prune --root <folder> [--keys <key>...]\n",
+    "       gate box hold --root <root> --holder <text> --ceiling <seconds> [--wait <seconds>] -- <command> [args...]\n",
+    "       gate box desktop-hold --root <folder> --holder <text> --ceiling <seconds> [--wait <seconds>]",
+);
+
+/// What a desktop hold's holder text must be, as its refusal says it after the command that refused it.
+fn holder_rule() -> String {
+    let marks: Vec<String> = HOLDER_MARKS.iter().map(char::to_string).collect();
+    format!(
+        "--holder must be 1 to {MOST_HOLDER_CHARS} characters of letters, digits, spaces and {}",
+        marks.join(" ")
+    )
 }
 
 /// The choices a seam may name, as a choice: `a or b`, `a, b or c`.
@@ -340,5 +364,8 @@ fn missing_text(required: Required, spelling: Spelling) -> &'static str {
         (Required::Command, _) => "the command after --",
         (Required::Seconds, _) => "--seconds <seconds>",
         (Required::Builders, _) => "--builders",
+        (Required::Builder, _) => "--builder <host>",
+        (Required::Holder, _) => "--holder \"<text>\"",
+        (Required::Ceiling, _) => "--ceiling <seconds>",
     }
 }
