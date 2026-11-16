@@ -12,7 +12,7 @@ use gate_router::{
     DotnetTarget, ElsewhereRead, Facts, FolderSends, GitignoredInput, Inputs, InstalledLayout, LocalReason, NO_OUTPUTS_LINE, Nested,
     PROJECT_EXTENSIONS, Pattern, PinRefusal, Place, RemoteRun, Route, SiblingFolder, Slot, Target, UsedTool, UserToolKind, build_settings,
     builder_words, decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet, is_usable_host, later_run, named_tree_paths, pattern_for,
-    sdk_build_target, target, without_no_build, work_folder_key,
+    sdk_build_target, target, without_no_build, without_no_restore, work_folder_key,
 };
 
 use crate::support::{FakeFacts, HEAD, ROOT, carried, fake_id, heavy, light, place_at, sibling_root, words};
@@ -2039,6 +2039,59 @@ fn a_dotnet_command_with_a_response_file_is_opaque() {
     let run = routed(decide(&heavy(&words(&["dotnet", "test", "@x.rsp", "--no-build"])), &FakeFacts::at_root()));
     assert_eq!(run.words, ["dotnet", "test", "@x.rsp", "--no-build"], "no drop and no stamp");
     assert!(!run.dropped_no_build);
+}
+
+#[test]
+fn a_routed_dotnet_command_drops_its_no_restore_so_the_builder_restores() {
+    for verb in ["build", "test", "run", "publish", "pack", "format", "Format"] {
+        assert_eq!(
+            without_no_restore(words(&["dotnet", verb, "All.sln", "--no-restore"])),
+            ["dotnet", verb, "All.sln"],
+            "{verb}"
+        );
+    }
+    let kept: [&[&str]; 6] = [
+        &["dotnet", "tool", "run", "t", "--no-restore"],
+        &["dotnet", "app.dll", "--no-restore"],
+        &["dotnet", "msbuild", "--no-restore"],
+        &["dotnet", "test", "@x.rsp", "--no-restore"],
+        &["dotnet", "run", "--", "--no-restore"],
+        &["pwsh", "-File", "x.ps1", "--no-restore", "--", "dotnet", "format"],
+    ];
+    for given in kept {
+        assert_eq!(without_no_restore(words(given)), given, "kept: {given:?}");
+    }
+    assert_eq!(
+        without_no_restore(words(&["pwsh", "-File", "x.ps1", "--", "dotnet", "format", "analyzers", "--no-restore"])),
+        ["pwsh", "-File", "x.ps1", "--", "dotnet", "format", "analyzers"],
+        "a wrapped dotnet command's own word goes"
+    );
+}
+
+#[test]
+fn a_routed_run_drops_no_restore_beside_no_build_and_says_only_the_no_build_line() {
+    let run = routed(decide(
+        &heavy(&words(&["dotnet", "test", "--no-build", "--no-restore"])),
+        &FakeFacts::at_root(),
+    ));
+    assert!(
+        !run.words.iter().any(|word| word == "--no-restore" || word == "--no-build"),
+        "{:?}",
+        run.words
+    );
+    assert!(run.dropped_no_build);
+    let run = routed(decide(
+        &heavy(&words(&["dotnet", "test", "-c", "Release", "--no-restore"])),
+        &FakeFacts::at_root(),
+    ));
+    assert!(!run.words.iter().any(|word| word == "--no-restore"), "{:?}", run.words);
+    assert!(!run.dropped_no_build, "--no-restore alone is no --no-build drop");
+    assert!(!run.lines().iter().any(|line| line.contains("--no-restore")), "{:?}", run.lines());
+    assert_eq!(
+        run.fallback,
+        ["dotnet", "test", "-c", "Release", "--no-restore"],
+        "the PC's words keep it"
+    );
 }
 
 #[test]

@@ -2709,6 +2709,10 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   `--no-build` is dropped from the builder's words of a dotnet `test` or `run` command, saying so (T4); `build`, `msbuild`, `pack` and `publish` keep it everywhere.
 
+  `--no-restore` is dropped from the builder's words of a dotnet `build`, `test`, `run`, `publish`, `pack` or `format` command, saying nothing, so the builder restores the work folder for itself: `NuGet`'s no-op check in a warm folder, and the restore a cold one lacks, whose `obj` holds no assets for the command to read.
+
+  The PC's own words and a run that falls back keep it, and so do a sent build's kept `--no-build` words, which restore nothing. A commit stage's hooks run inside `git commit`, out of the router's reach, so they need `.gate/stage.toml` instead.
+
   A fallback here decides `--no-build` again for the run here, as a Local route does (below), whatever the refusal: the word stays when the built-here record says the last build of what the command builds ran here, or the worktree has no nothing-back record and every project the command builds has `obj\project.assets.json`, so the run tests the PC's own build, else it drops.
 
   The record is what an earlier routed step (a repo's test-all build) leaves when it built only on the builder, where a `dotnet test --no-build` here would find no build output.

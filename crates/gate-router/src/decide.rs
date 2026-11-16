@@ -28,6 +28,8 @@ pub const DROPPED_UNSENT_LINE: &str = "gate: dropped --no-build: the PC's build 
 pub const NO_OUTPUTS_LINE: &str = "gate: outputs: bins not brought back for a --no-build command";
 
 const NO_BUILD: &str = "--no-build";
+/// The word a routed dotnet command loses, so the builder restores its work folder for itself ([`without_no_restore`]).
+const NO_RESTORE: &str = "--no-restore";
 
 /// The word that ends a dotnet command's own arguments: what follows it goes to the program the command runs. After a
 /// wrapping script's words it starts the dotnet command the script is handed.
@@ -66,6 +68,8 @@ const RUNTIME_PART_OPTIONS: [&str; 5] = ["-a", "--arch", "--os", "--ucr", "--use
 const TARGET_SWITCH_NAMES: [&str; 2] = ["target", "t"];
 /// The dotnet verbs whose `--no-build` the gate drops; `pack` and `publish` keep theirs.
 const NO_BUILD_DROP_VERBS: [&str; 2] = ["test", "run"];
+/// The dotnet verbs whose `--no-restore` a routed run drops ([`without_no_restore`]).
+const NO_RESTORE_DROP_VERBS: [&str; 6] = ["build", "test", "run", "publish", "pack", "format"];
 /// The dotnet verb that hands its words to `MSBuild` as they are: a target such as `-t:Restore` may build nothing.
 const MSBUILD: &str = "msbuild";
 /// The dotnet verb that runs tests.
@@ -924,7 +928,8 @@ pub struct RemoteRun {
     pub subfolder: String,
     /// The pattern that matched.
     pub pattern: String,
-    /// The words the builder runs: paths rewritten, `--no-build` dropped from a dotnet command, the worktree's `HEAD`
+    /// The words the builder runs: paths rewritten, `--no-build` and `--no-restore` dropped from a dotnet command
+    /// ([`without_no_build`], [`without_no_restore`]), the worktree's `HEAD`
     /// sha pinned onto a dotnet command that builds as `SourceRevisionId`, a bare first word naming a file of the
     /// gate's folder written `./name`, and a first word naming a program by a path outside the worktree sent as the
     /// program's name ([`RemoteRun::program_named`]), which is never the file of the folder; a property value naming a
@@ -1415,7 +1420,7 @@ pub fn target(config: &Config, place: Place, facts: &dyn Facts) -> Result<Target
     settle(config, opened, config.host_builder().clone(), facts)
 }
 
-/// The words the builder of `target` runs for the command `words`: `--no-build` dropped as a routed run drops it, then
+/// The words the builder of `target` runs for the command `words`: `--no-build` and `--no-restore` dropped as a routed run drops them, then
 /// the paths rewritten as for `host`, the bare first word marked and the builder's own words written in ([`stamp`]), as
 /// a routed run's are; the worktree's `HEAD` is asked only when the source-revision word may go in.
 #[must_use]
@@ -1423,7 +1428,7 @@ pub fn builder_words(target: &Target, words: &[String], facts: &dyn Facts) -> Bu
     let drives = subst_drives(&target.place.root, words, facts);
     let siblings = carried_pairs(&target.siblings);
     let sent = rewritten(&target.place, siblings, words, &drives, Separators::AsWritten);
-    let mut words = without_no_build(sent.words);
+    let mut words = without_no_restore(without_no_build(sent.words));
     mark_bare_first_word(&mut words, facts, sent.program_named);
     stamp(&mut words, || head_of(&target.place, facts), target, facts);
     BuilderWords {
@@ -4492,8 +4497,9 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
     let opted_in = opted_rid.is_some();
     let rid = opted_rid.filter(|_| !outputs.is_empty());
     let crosses = rid.is_some() && cross_verb(&sent);
-    let mut words = without_no_build(sent);
-    let dropped_no_build = words.len() != sent_count;
+    let no_build_dropped = without_no_build(sent);
+    let dropped_no_build = no_build_dropped.len() != sent_count;
+    let mut words = without_no_restore(no_build_dropped);
     mark_bare_first_word(&mut words, facts, program_named);
     let source_revision = head_of(&target.place, facts);
     stamp(&mut words, || source_revision.clone(), &target, facts);
@@ -4726,6 +4732,24 @@ pub fn without_no_build(words: Vec<String>) -> Vec<String> {
         .into_iter()
         .enumerate()
         .filter(|(index, word)| !(own.contains(index) && word == NO_BUILD))
+        .map(|(_, word)| word)
+        .collect()
+}
+
+/// The words without each of the dotnet command's own words ([`is_dotnet`]) that is exactly `--no-restore`, when its verb
+/// is one of [`NO_RESTORE_DROP_VERBS`], so a routed run restores on the builder: `NuGet`'s no-op check in a warm work
+/// folder, and the restore a cold one lacks, whose `obj` holds no assets for the command to read. A word before a
+/// wrapping script's `--` or after the dotnet command's own `--` stays, and the words of any other command, `dotnet
+/// tool run`, `dotnet app.dll`, `dotnet msbuild` and a command naming a response file among them, are unchanged.
+#[must_use]
+pub fn without_no_restore(words: Vec<String>) -> Vec<String> {
+    let Some(own) = dotnet_own(&words).filter(|own| verb_in(&words[own.clone()], &NO_RESTORE_DROP_VERBS)) else {
+        return words;
+    };
+    words
+        .into_iter()
+        .enumerate()
+        .filter(|(index, word)| !(own.contains(index) && word == NO_RESTORE))
         .map(|(_, word)| word)
         .collect()
 }
