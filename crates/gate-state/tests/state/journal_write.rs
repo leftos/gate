@@ -822,6 +822,7 @@ fn a_release_line_carries_not_routed_reason_fell_back_balanced_and_parent_pid_wh
         parent_pid: Some(40267),
         sent_words: None,
         stage: None,
+        low_disk: None,
     });
     let line = journal_line(&identity(), ts(NOW), &event, None, None);
 

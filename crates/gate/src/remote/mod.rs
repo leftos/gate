@@ -359,6 +359,9 @@ pub(crate) struct RemoteOutcome {
     /// Whether the builder was sent the words with `--no-build` dropped ([`RemoteCall::dropped_no_build`]), a run whose
     /// send of the PC's build did not land among them: it built there, and brings nothing back.
     pub dropped_no_build: bool,
+    /// The builder low on disk whose preflight, the last of the attempt to say one, said what it did about its age
+    /// prune, for the release's `lowDisk` fact; `None` when no preflight of the attempt said a prune line.
+    pub low_disk: Option<gate_state::LowDiskFacts>,
     /// What the builder's `drain` refusal said, a status 75 with no reason that is no fallback: the run waits behind
     /// the drain. `None` for any other end.
     pub draining: Option<drain::Drain>,

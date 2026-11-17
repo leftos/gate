@@ -3561,6 +3561,8 @@ impl Run<'_> {
         let Some(Behind { outcome, admitted }) = behind else {
             return Attempt::Done(Remotely::Ended(self.interrupted_before_start(console)));
         };
+        // The last builder that said it is low on disk names the release's fact, a refused attempt's too.
+        self.routing.low_disk = outcome.low_disk.clone().or(self.routing.low_disk.take());
         // A wait for a builder slot, behind the drain or for a pending push is no part of the run's time: its slot's hold
         // and its wall time count from the admission.
         if let Some(admitted) = admitted {

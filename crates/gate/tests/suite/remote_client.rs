@@ -4668,6 +4668,89 @@ fn a_toolchain_refusal_with(case: &Case, box_path: &OsString, said: &[String], r
     outcome
 }
 
+/// A routed run of the case `case` whose builder's preflight is given the box seams `seams` after [`ANSWERING`]: the
+/// run's outcome and its release line.
+fn low_disk_run(case: &Case, seams: &str) -> (Outcome, Value) {
+    let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
+    let preflight_seams = format!("{ANSWERING} {seams}");
+    let tuned = Tuned {
+        preflight_seams: &preflight_seams,
+        ..Tuned::default()
+    };
+    let (pid, outcome) = finish_with_pid(client_gate_tuned(case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]));
+    let release = own(case, pid)
+        .into_iter()
+        .find(|event| event["event"] == "release")
+        .expect("the run journalled its release");
+    (outcome, release)
+}
+
+/// The box seams of a builder with 50 GiB free of 1000 GiB, under its low mark of 200 GiB.
+const LOW_SPACE: &str = "--test-box-space 53687091200:1073741824000";
+
+/// The low-disk lines a run said on its console.
+fn low_disk_lines(outcome: &Outcome) -> Vec<&str> {
+    outcome.stderr.lines().filter(|line| line.contains(" is low on disk: ")).collect()
+}
+
+#[test]
+fn a_builder_low_on_disk_that_started_its_prune_is_said_and_journalled() {
+    let case = client_case("client-low-disk-started");
+    let record = case.folder().join("prune-start.record");
+    let seams = format!("{LOW_SPACE} --test-box-prune-start record:{}", shown(&record));
+
+    let (outcome, release) = low_disk_run(&case, &seams);
+
+    assert_eq!(outcome.code, Some(0), "the run goes on: {outcome:?}");
+    assert_eq!(
+        low_disk_lines(&outcome),
+        [format!(
+            "gate: remote {HOST} is low on disk: 50 GiB free of 1000 GiB; the builder is pruning"
+        )],
+        "{outcome:?}"
+    );
+    assert_eq!(
+        release["lowDisk"],
+        json!({"builder": HOST, "freeGiB": 50, "prune": "started"}),
+        "{release}"
+    );
+    assert_eq!(
+        fs::read_to_string(&record).expect("the start is recorded"),
+        "start\n",
+        "the prune is started once"
+    );
+}
+
+#[test]
+fn a_builder_low_on_disk_whose_prune_did_not_start_says_why_and_journals_it() {
+    let seams = format!("{LOW_SPACE} --test-box-prune-start fail:the-scheduler-is-away");
+
+    let (outcome, release) = low_disk_run(&client_case("client-low-disk-failed"), &seams);
+
+    assert_eq!(outcome.code, Some(0), "the run goes on: {outcome:?}");
+    assert_eq!(
+        low_disk_lines(&outcome),
+        [format!(
+            "gate: remote {HOST} is low on disk: 50 GiB free of 1000 GiB; its prune did not start: the-scheduler-is-away"
+        )],
+        "{outcome:?}"
+    );
+    assert_eq!(
+        release["lowDisk"],
+        json!({"builder": HOST, "freeGiB": 50, "prune": "failed"}),
+        "{release}"
+    );
+}
+
+#[test]
+fn a_builder_that_says_no_free_or_prune_line_says_nothing_of_its_disk() {
+    let (outcome, release) = low_disk_run(&client_case("client-low-disk-older-box"), "");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(low_disk_lines(&outcome), Vec::<&str>::new(), "{outcome:?}");
+    assert!(release.get("lowDisk").is_none(), "{release}");
+}
+
 /// A routed run of a case whose builder, given the `PATH` `box_path`, the preflight seams `seams` and the
 /// `GATE_GODOT_ROOT` `godot`, serves what the case's tree needs: it goes remote with no mismatch line, and runs the
 /// command once, on the builder.

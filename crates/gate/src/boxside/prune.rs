@@ -299,7 +299,7 @@ static SPACE_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 /// in a build with the test seams, the free bytes `GATE_BOX_TEST_FREE_BYTES` and the volume's size
 /// `GATE_BOX_TEST_TOTAL_BYTES` give each in place of the volume's own when set. The free bytes may be a comma list: the
 /// process's first read takes the first, each read after it the next, and every read past its end the last.
-fn space_read(root: &str) -> io::Result<DiskSpace> {
+pub(crate) fn space_read(root: &str) -> io::Result<DiskSpace> {
     let named = root_name(root);
     // Set by the suite's floor cases in tests/suite/boxside/prune.rs.
     #[cfg(feature = "test-seams")]

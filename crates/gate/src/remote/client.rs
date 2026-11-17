@@ -37,11 +37,12 @@ use gate_args::TestSeams;
 use gate_args::is_godot_console;
 use gate_inputs::lfs::{Blob, Listed, Small, is_attributes, is_small_blob};
 use gate_state::v1::{self, WarmFailure};
-use gate_state::{FallbackReason, KernelObject, key_hash};
+use gate_state::{FallbackReason, KernelObject, LowDiskFacts, LowDiskPrune, key_hash};
 use gate_win32::{AcquireError, Interrupt, Job, NamedMutex, OwnedMutexGuard, PipedConsole, Running, Share};
+use gate_wire::floor::{PruneStart, free_of_line};
 use gate_wire::slots::{BOX_SLOTS_LINE, BoxSlots};
 use gate_wire::stamp::{self, Tag};
-use gate_wire::{EngineKind, build_version};
+use gate_wire::{EngineKind, GIB, build_version};
 use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
@@ -523,6 +524,7 @@ impl RustClient {
             tamper: self.tamper.as_deref(),
             brought_back: None,
             dropped_no_build: call.dropped_no_build,
+            low_disk: None,
             split: Split::default(),
             lines: Vec::new(),
             problem: None,
@@ -572,9 +574,7 @@ impl RustClient {
         if attempt.interrupt_at.is_some() && call.interrupt.is_none() {
             attempt.told(NO_HANDLER);
         }
-        let end = match attempt.phases() {
-            Ok(end) | Err(end) => end,
-        };
+        let (Ok(end) | Err(end)) = attempt.phases();
         // An attempt the drain refused, before its run call or at it, never used the work folder its preflight found:
         // the next attempt takes it on.
         if matches!(end, End::Draining(_)) {
@@ -744,6 +744,15 @@ pub(super) enum End {
     /// The builder's drain refused a preflight, inputs, LFS or run call with its `drain` tag, which no fallback
     /// answers: status 75 with no reason, and the run waits behind the drain.
     Draining(Drain),
+}
+
+/// The free bytes and the volume's size of a preflight's last free-space line and what its last prune line says
+/// ([`gate_wire::floor::PruneStart`]); `None` when it said either line not, as an older box, a volume over its low mark
+/// or a free space the box could not read leaves it.
+fn low_disk_of(lines: &[String]) -> Option<(u64, u64, PruneStart)> {
+    let (free, total) = lines.iter().rev().find_map(|line| free_of_line(line))?;
+    let prune = lines.iter().rev().find_map(|line| PruneStart::of_line(line))?;
+    Some((free, total, prune))
 }
 
 /// What the preflight found: the bare repositories it created just now, as its `gate: remote created {bare}` lines name
@@ -1574,6 +1583,9 @@ pub(super) struct Attempt<'c, 'a> {
     pub(super) brought_back: Option<bool>,
     /// Whether the builder was sent the words with `--no-build` dropped ([`RemoteOutcome::dropped_no_build`]).
     dropped_no_build: bool,
+    /// The builder low on disk the last preflight of the attempt that said a prune line found
+    /// ([`RemoteOutcome::low_disk`]).
+    low_disk: Option<LowDiskFacts>,
     /// How long the run call and each transfer took, as far as the attempt got.
     pub(super) split: Split,
     lines: Vec<String>,
@@ -2605,6 +2617,7 @@ impl Attempt<'_, '_> {
         let sdks = sdks_of(&called.lines);
         let tools = toolchain::reported(&called.lines, &sent);
         let user_tools = user_tools_of(&called.lines, user_tools);
+        let low_disk = low_disk_of(&called.lines);
         let ended = preflight_ended(self.call.host(), self.profile().root(), &called);
         let cache = v1::box_slots_path(self.call.state_dir, self.call.builder.id.as_deref());
         let unkept = box_slots_kept(&called.lines, &ended, &cache, at);
@@ -2627,6 +2640,7 @@ impl Attempt<'_, '_> {
                 started.elapsed().as_secs_f64()
             ));
         }
+        self.low_disk_said(low_disk, said);
         Ok(Prepared {
             created,
             new_tree,
@@ -2636,6 +2650,32 @@ impl Attempt<'_, '_> {
             tools,
             user_tools,
         })
+    }
+
+    /// Says, unless `said` is false, that the builder is low on disk and what its preflight did about its age prune,
+    /// as `low_disk` has it ([`low_disk_of`]), and keeps it for the release's `lowDisk` fact; nothing for `None`, as for
+    /// an older box, which says neither line.
+    fn low_disk_said(&mut self, low_disk: Option<(u64, u64, PruneStart)>, said: bool) {
+        let Some((free, total, prune)) = low_disk else {
+            return;
+        };
+        let host = self.call.host().to_owned();
+        let (free_gib, total_gib) = (free / GIB, total / GIB);
+        let (doing, kept) = match prune {
+            PruneStart::Started => ("the builder is pruning".to_owned(), LowDiskPrune::Started),
+            PruneStart::Recent(_) => ("the builder is pruning".to_owned(), LowDiskPrune::Recent),
+            PruneStart::Failed(why) => (format!("its prune did not start: {why}"), LowDiskPrune::Failed),
+        };
+        if said {
+            self.say(format!(
+                "gate: remote {host} is low on disk: {free_gib} GiB free of {total_gib} GiB; {doing}"
+            ));
+        }
+        self.low_disk = Some(LowDiskFacts {
+            builder: host,
+            free_gib,
+            prune: kept,
+        });
     }
 
     /// The run's preflight ([`Attempt::preflight`]), sent the user tools the route matched, the bare repositories it
@@ -4310,6 +4350,7 @@ impl Attempt<'_, '_> {
             detail: self.problem.or(detail),
             brought_back: self.brought_back,
             dropped_no_build: self.dropped_no_build,
+            low_disk: self.low_disk,
             split: self.split,
             adjusted: self.adjusted,
             box_killed: self.box_killed,
@@ -4368,6 +4409,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             tamper: None,
             brought_back: None,
             dropped_no_build: call.dropped_no_build,
+            low_disk: None,
             split: Split::default(),
             lines: Vec::new(),
             problem: None,
@@ -6853,6 +6895,7 @@ mod tests {
             lfs_budget: gate_inputs::lfs::LFS_BUDGET,
             brought_back: None,
             dropped_no_build: call.dropped_no_build,
+            low_disk: None,
             split: Split::default(),
             lines: Vec::new(),
             problem: None,

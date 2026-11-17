@@ -206,6 +206,41 @@ pub(crate) fn port_range(option: &str, value: &str) -> Result<(u16, u16), Proble
     }
 }
 
+/// The space `--test-box-space` names: `<free>:<total>`, two whole counts of bytes, `unreadable` or `real`; else the
+/// problem naming the value as given.
+#[cfg(feature = "test-seams")]
+pub(crate) fn space(option: &str, value: &str) -> Result<crate::request::SpaceSeam, Problem> {
+    let counted = |text: &str| text.parse::<u64>().ok().filter(|_| text.bytes().all(|byte| byte.is_ascii_digit()));
+    match value {
+        "unreadable" => return Ok(crate::request::SpaceSeam::Unreadable),
+        "real" => return Ok(crate::request::SpaceSeam::Real),
+        _ => {}
+    }
+    match value.split_once(':').map(|(free, total)| (counted(free), counted(total))) {
+        Some((Some(free), Some(total))) => Ok(crate::request::SpaceSeam::Given { free, total }),
+        _ => Err(Problem::BadSeamValue {
+            option: option.to_owned(),
+            value: value.to_owned(),
+            wanted: "<free bytes>:<total bytes>, unreadable or real",
+        }),
+    }
+}
+
+/// What `--test-box-prune-start` names: `record:<path>` or `fail:<message>`, each with something after its `:`; else
+/// the problem naming the value as given.
+#[cfg(feature = "test-seams")]
+pub(crate) fn prune_start(option: &str, value: &str) -> Result<crate::request::PruneStartSeam, Problem> {
+    match value.split_once(':') {
+        Some(("record", path)) if !path.is_empty() => Ok(crate::request::PruneStartSeam::Record(std::path::PathBuf::from(path))),
+        Some(("fail", message)) if !message.is_empty() => Ok(crate::request::PruneStartSeam::Fail(message.to_owned())),
+        _ => Err(Problem::BadSeamValue {
+            option: option.to_owned(),
+            value: value.to_owned(),
+            wanted: "record:<path> or fail:<message>",
+        }),
+    }
+}
+
 /// The fault `--test-box-desktop` names, one of [`DESKTOP_MODES`] or `wrong-version-once <path>` with a path that is
 /// not empty; else the problem naming the value.
 #[cfg(feature = "test-seams")]

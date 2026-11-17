@@ -1,6 +1,8 @@
 //! `gate box preflight`, the first call of every routed run: readies the work folder and its bare repository as the
 //! PowerShell wrapper's `Initialize-WorkFolder` does, then says the version and warm lines, the new work tree line when
-//! it laid the work folder's tree out now, the boot and SDK lines, a line for each tool the payload's `Needs` names,
+//! it laid the work folder's tree out now, the boot line, the free-space line of the work root's volume and, under its
+//! floor's low mark, the line of the age prune it started out of schedule, the SDK lines, a line for each tool the
+//! payload's `Needs` names,
 //! a line for each user tool its `UserTools` names, and the path line when no trusted Git `bin` was found for the command's `PATH`.
 
 use std::cell::Cell;
@@ -14,11 +16,14 @@ use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::{OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use gate_args::BoxSeams;
+#[cfg(feature = "test-seams")]
+use gate_args::{PruneStartSeam, SpaceSeam};
 use gate_router::escaped;
 use gate_win32::{Job, LaunchError, Make, NamedEvent, PipedConsole, PipedLaunch, Share};
+use gate_wire::floor::{PRUNE_STAMP, PruneStart, free_line, is_low, recent_start};
 use gate_wire::{
     NEW_WORK_TREE, Pair, PathForm, Payload, ROOT_STATUS, WARM_READ_LIMIT, bare_stem, created_line, layout_text_for, names_another_layout,
     readies_single, root_busy_line, root_unsafe_line, sdks_failure, sdks_line, trees, version_line, warm_line, warm_record_hash, work_root,
@@ -38,6 +43,7 @@ use crate::boxside::heartbeat;
 use crate::boxside::helper_trusted;
 use crate::boxside::msys;
 use crate::boxside::probe;
+use crate::boxside::prune;
 use crate::boxside::run::{self, FILE_FLAG_OPEN_REPARSE_POINT, Stamp, StopSignal, WaitEnd, Watched, Watching};
 use crate::boxside::slots;
 use crate::boxside::stamping;
@@ -194,6 +200,7 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
         stamping::out(console, NEW_WORK_TREE);
     }
     boot::say(console);
+    say_free_space(&root, seams, console);
     // The run puts Git's `bin` at the front of its command's `PATH` when it finds a trusted one; a machine `PATH` that
     // leaves it untrusted resolves a recipe's bare `bash` to the system folder's WSL launcher, so the log says so
     // before the command runs. The client relays a preflight's lines into the log only, so this one never reaches the
@@ -208,6 +215,90 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
         slot.kept();
     }
     0
+}
+
+/// The age prune's scheduled task, which a preflight starts out of schedule on a volume under its low mark; its
+/// `IgnoreNew` keeps a second instance from starting while one runs, so at most one age prune sweeps the root.
+const PRUNE_TASK: &str = r"\build-box\gate-prune-work";
+
+/// How long a preflight waits for the Task Scheduler to take the prune task's start; never for the prune itself.
+const PRUNE_TASK_LIMIT: Duration = Duration::from_secs(10);
+
+/// Says the free-space line of the work root `root`'s volume ([`free_line`]), and on a volume under its floor's low mark
+/// ([`is_low`]) the line of what it did about the age prune ([`prune_started`]). A space that cannot be read says neither
+/// and starts nothing. Nothing here fails the preflight or changes its status.
+fn say_free_space(root: &str, seams: &BoxSeams, console: &mut Console) {
+    let Some(space) = space_of(root, seams) else {
+        return;
+    };
+    stamping::out(console, &free_line(space.free_to_caller, space.total));
+    if is_low(space.free_to_caller, space.total) {
+        stamping::out(console, &prune_started(root, seams).line());
+    }
+}
+
+/// The space of the work root `root`'s volume ([`prune::space_read`]); `None` when it cannot be read. In a build with
+/// the test seams, `--test-box-space` gives it, and a preflight without that seam reads none.
+fn space_of(root: &str, seams: &BoxSeams) -> Option<gate_win32::DiskSpace> {
+    #[cfg(feature = "test-seams")]
+    match seams.space {
+        None | Some(SpaceSeam::Unreadable) => return None,
+        Some(SpaceSeam::Given { free, total }) => {
+            return Some(gate_win32::DiskSpace { free_to_caller: free, total });
+        }
+        Some(SpaceSeam::Real) => {}
+    }
+    #[cfg(not(feature = "test-seams"))]
+    let _ = seams;
+    prune::space_read(root).ok()
+}
+
+/// What a preflight on a volume under its low mark does about the age prune of the work root `root`: nothing while the
+/// stamp `<root>\prune-started` ([`PRUNE_STAMP`]) was written within [`gate_wire::floor::PRUNE_DEBOUNCE`]; else it
+/// writes the stamp and starts the prune task ([`prune_start_made`]), never waiting for the prune, and removes the stamp
+/// again when the start fails. The stamp only rate-limits starts; a stamp that cannot be written keeps no start back,
+/// since a volume too full for it needs the prune most.
+fn prune_started(root: &str, seams: &BoxSeams) -> PruneStart {
+    let stamp = PathBuf::from(format!(r"{}\{PRUNE_STAMP}", root.trim_end_matches(['\\', '/'])));
+    let written = fs::metadata(&stamp).and_then(|metadata| metadata.modified()).ok();
+    if let Some(seconds) = recent_start(written, SystemTime::now()) {
+        return PruneStart::Recent(seconds);
+    }
+    let _ = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&stamp)
+        .and_then(|written| written.set_modified(SystemTime::now()));
+    match prune_start_made(seams) {
+        Ok(()) => PruneStart::Started,
+        Err(why) => {
+            let _ = fs::remove_file(&stamp);
+            PruneStart::Failed(why)
+        }
+    }
+}
+
+/// Starts the prune task [`PRUNE_TASK`] through the Task Scheduler ([`gate_win32::start_task`]); else why it did not
+/// start. In a build with the test seams, `--test-box-prune-start` records the start to a file or fails it in place
+/// of the real start.
+fn prune_start_made(seams: &BoxSeams) -> Result<(), String> {
+    #[cfg(feature = "test-seams")]
+    match &seams.prune_start {
+        Some(PruneStartSeam::Record(path)) => {
+            return OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(path)
+                .and_then(|mut record| record.write_all(b"start\n"))
+                .map_err(|error| format!("{} could not be written: {error}", path.display()));
+        }
+        Some(PruneStartSeam::Fail(message)) => return Err(message.clone()),
+        None => {}
+    }
+    #[cfg(not(feature = "test-seams"))]
+    let _ = seams;
+    gate_win32::start_task(PRUNE_TASK, Instant::now() + PRUNE_TASK_LIMIT).map_err(|error| error.to_string())
 }
 
 /// The builder's work root, `<root>` of the work folder `work` (`<root>\work\<key>`), made locked when it is missing,

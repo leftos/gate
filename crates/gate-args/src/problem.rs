@@ -136,6 +136,13 @@ pub enum Problem {
         option: String,
         value: String,
     },
+    /// A `--test-box-space` or `--test-box-prune-start` value of none of the forms the seam takes, named by `wanted`.
+    #[cfg(feature = "test-seams")]
+    BadSeamValue {
+        option: String,
+        value: String,
+        wanted: &'static str,
+    },
     NeedsValue(String),
     /// A bare `--timeout auto`, which carries no floor.
     AutoNeedsFloor(String),
@@ -281,6 +288,8 @@ impl fmt::Display for Problem {
                 f,
                 "gate: {option} must be <first>-<last>, ports from 1 to 65535 with the first not above the last, got '{value}'"
             ),
+            #[cfg(feature = "test-seams")]
+            Problem::BadSeamValue { option, value, wanted } => write!(f, "gate: {option} must be {wanted}, got '{value}'"),
             Problem::NeedsValue(option) => write!(f, "gate: {option} needs a value"),
             Problem::AutoNeedsFloor(option) => write!(f, "gate: {option} auto needs a floor in seconds: auto:<n>"),
             Problem::GivenTwice(option) => write!(f, "gate: {option} is given twice"),

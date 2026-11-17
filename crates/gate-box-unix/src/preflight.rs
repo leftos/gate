@@ -1,14 +1,21 @@
 //! `gate-box box preflight`, the first call of every routed run: judges the builder's work root, readies the bare
-//! repository and the work folder's tree, then says the version, warm, new work tree, boot, SDK and tool lines in the
-//! order the PC's client reads them.
+//! repository and the work folder's tree, then says the version, warm, new work tree and boot lines, the free-space line of
+//! the work root's volume and, under its floor's low mark, the line of the age prune it started out of schedule, then
+//! the SDK and tool lines, in the order the PC's client reads them.
 
-use std::fs::{self, DirBuilder};
+use std::fs::{self, DirBuilder, OpenOptions};
 use std::io;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::thread;
+use std::time::SystemTime;
 
 use gate_args::BoxSeams;
+#[cfg(any(test, feature = "test-seams"))]
+use gate_args::{PruneStartSeam, SpaceSeam};
+use gate_wire::floor::{PRUNE_STAMP, PruneStart, free_line, is_low, recent_start};
 use gate_wire::{
     NEW_WORK_TREE, Pair, PairSibling, PathForm, Payload, ROOT_STATUS, WARM_READ_LIMIT, bare_stem, created_line, escaped, layout_text_for,
     names_another_layout, readies_single, root_unsafe_line, sdks_failure, sdks_line, tool_line, trees, version_line, warm_line, warm_record_hash,
@@ -21,7 +28,126 @@ use crate::lines::{
     work_layout, write_failure,
 };
 use crate::stop::open_folder_line;
-use crate::{boot, drain, files, probe, process, run, slots};
+use crate::{boot, drain, files, probe, process, prune, run, slots};
+
+/// Says the free-space line of the work root `root`'s volume ([`free_line`]), and on a volume under its floor's low mark
+/// ([`is_low`]) the line of what it did about the age prune ([`prune_started`]). A space that cannot be read says neither
+/// and starts nothing. Nothing here fails the preflight or changes its status.
+fn say_free_space(root: &str, seams: &BoxSeams, console: &mut Console) {
+    let Some(space) = space_of(root, seams) else {
+        return;
+    };
+    console.out(&free_line(space.free, space.total));
+    if is_low(space.free, space.total) {
+        console.out(&prune_started(root, seams).line());
+    }
+}
+
+/// The space of the work root `root`'s volume ([`prune::space_read`]); `None` when it cannot be read. In a build with
+/// the test seams, and in this crate's unit tests, `--test-box-space` gives it, and a preflight without that seam reads
+/// none.
+fn space_of(root: &str, seams: &BoxSeams) -> Option<prune::Space> {
+    #[cfg(any(test, feature = "test-seams"))]
+    match seams.space {
+        None | Some(SpaceSeam::Unreadable) => return None,
+        Some(SpaceSeam::Given { free, total }) => return Some(prune::Space { free, total }),
+        Some(SpaceSeam::Real) => {}
+    }
+    #[cfg(not(any(test, feature = "test-seams")))]
+    let _ = seams;
+    prune::space_read(Path::new(root)).ok()
+}
+
+/// What a preflight on a volume under its low mark does about the age prune of the work root `root`: nothing while the
+/// stamp `<root>/prune-started` ([`PRUNE_STAMP`]) was written within [`gate_wire::floor::PRUNE_DEBOUNCE`]; else it
+/// writes the stamp and starts the prune ([`prune_spawned`]), never waiting for it, and removes the stamp again when
+/// the start fails. The stamp only rate-limits starts; the prune's own lock ([`prune::PRUNE_LOCK`]) keeps a second
+/// sweep from running. A stamp that cannot be written keeps no start back, since a volume too full for it needs the
+/// prune most.
+fn prune_started(root: &str, seams: &BoxSeams) -> PruneStart {
+    let stamp = Path::new(root).join(PRUNE_STAMP);
+    let written = fs::symlink_metadata(&stamp).and_then(|metadata| metadata.modified()).ok();
+    if let Some(seconds) = recent_start(written, SystemTime::now()) {
+        return PruneStart::Recent(seconds);
+    }
+    let _ = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&stamp)
+        .and_then(|written| written.set_modified(SystemTime::now()));
+    match prune_spawned(root, seams) {
+        Ok(()) => PruneStart::Started,
+        Err(why) => {
+            let _ = fs::remove_file(&stamp);
+            PruneStart::Failed(why)
+        }
+    }
+}
+
+/// Starts `<own exe> box prune --root <root>`, the age prune, detached: in a process group of its own, so the ssh
+/// session's end does not reach it, its standard streams null, and never waited for. Else why it did not start. In a
+/// build with the test seams, and in this crate's unit tests, `--test-box-prune-start` records the start to a file or
+/// fails it in place of the real start.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the spawn lock is the Windows gate's; the detached prune is no program of a run, so no bounded runner owns it"
+)]
+fn prune_spawned(root: &str, seams: &BoxSeams) -> Result<(), String> {
+    #[cfg(any(test, feature = "test-seams"))]
+    match &seams.prune_start {
+        Some(PruneStartSeam::Record(path)) => {
+            return OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(path)
+                .and_then(|mut record| io::Write::write_all(&mut record, b"start\n"))
+                .map_err(|error| format!("{} could not be written: {error}", path.display()));
+        }
+        Some(PruneStartSeam::Fail(message)) => return Err(message.clone()),
+        None => {}
+    }
+    #[cfg(not(any(test, feature = "test-seams")))]
+    let _ = seams;
+    let exe = std::env::current_exe().map_err(|error| format!("the box's own path cannot be read: {error}"))?;
+    let mut command = Command::new(exe);
+    command
+        .args(["box", "prune", "--root", root])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    // SAFETY: the hook runs in the child between fork and exec and makes one `setpriority(2)` call, which is
+    // async-signal-safe, allocates nothing and takes no lock; it always returns `Ok`, so the start goes on whatever the
+    // call gives.
+    unsafe {
+        command.pre_exec(|| {
+            background_priority();
+            Ok(())
+        });
+    }
+    command
+        .spawn()
+        .map(drop)
+        .map_err(|error| format!("the prune could not be started: {error}"))
+}
+
+/// Lowers this process to background priority, as the launchd job runs the scheduled prune: macOS's darwin background
+/// band (`PRIO_DARWIN_BG`), which throttles its CPU and disk use. A failure is ignored.
+#[cfg(target_os = "macos")]
+fn background_priority() {
+    // SAFETY: a plain system call on this process (`who` 0), reading and writing no memory.
+    let _ = unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, libc::PRIO_DARWIN_BG) };
+}
+
+/// Lowers this process to background priority: a nice value of 10. A failure is ignored.
+#[cfg(not(target_os = "macos"))]
+fn background_priority() {
+    // SAFETY: a plain system call on this process (`who` 0), reading and writing no memory.
+    let _ = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 10) };
+}
 
 /// Why the work root is not used.
 pub(crate) enum Refusal {
@@ -131,6 +257,7 @@ pub fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> 
         console.out(NEW_WORK_TREE);
     }
     boot::say(console);
+    say_free_space(&root, seams, console);
     say_sdks_and_tools(payload, console);
     // Said last, so every line before it keeps its place.
     slots::look_said(slots::looked(Path::new(&root), seams), console);
@@ -465,6 +592,140 @@ mod tests {
         let mut console = Console::captured();
         let status = preflight(payload, &gate_args::BoxSeams::default(), &mut console);
         (status, console)
+    }
+
+    /// Runs the preflight of `payload` with the box seams `seams`; its status and console.
+    fn preflighted_with(payload: &Payload, seams: &gate_args::BoxSeams) -> (u8, Console) {
+        let mut console = Console::captured();
+        let status = preflight(payload, seams, &mut console);
+        (status, console)
+    }
+
+    /// A volume's size the free-space cases give, whose floor's low mark is 200 GiB.
+    const SPACE_TOTAL: u64 = 1000 << 30;
+
+    /// The seams of a volume with `free` bytes free of [`SPACE_TOTAL`] and a prune start `start`.
+    fn space_seams(space: gate_args::SpaceSeam, start: gate_args::PruneStartSeam) -> gate_args::BoxSeams {
+        gate_args::BoxSeams {
+            space: Some(space),
+            prune_start: Some(start),
+            ..gate_args::BoxSeams::default()
+        }
+    }
+
+    /// `free` bytes free of [`SPACE_TOTAL`].
+    fn given(free: u64) -> gate_args::SpaceSeam {
+        gate_args::SpaceSeam::Given { free, total: SPACE_TOTAL }
+    }
+
+    /// The line after a passed preflight's boot line, and the one after that.
+    fn after_boot(out: &[String]) -> (Option<&str>, Option<&str>) {
+        let boot = out
+            .iter()
+            .position(|line| line.starts_with("gate: remote boot "))
+            .expect("a passed preflight says its boot line");
+        (out.get(boot + 1).map(String::as_str), out.get(boot + 2).map(String::as_str))
+    }
+
+    #[test]
+    fn over_the_low_mark_the_preflight_says_the_free_line_and_starts_no_prune() {
+        let case = Case::new("free-over");
+        let record = case.base.join("start.record");
+        let seams = space_seams(given(300 << 30), gate_args::PruneStartSeam::Record(record.clone()));
+
+        let (status, console) = preflighted_with(&case.payload(&json!({})), &seams);
+
+        assert_eq!(status, 0, "{:?}", console.err);
+        let (free, next) = after_boot(&console.out);
+        assert_eq!(free, Some(format!("gate: remote free {} {SPACE_TOTAL}", 300u64 << 30).as_str()));
+        assert!(next.is_none_or(|line| !line.starts_with("gate: remote prune")), "{:?}", console.out);
+        assert!(!record.exists(), "nothing is started over the low mark");
+        assert!(!Path::new(&case.root()).join("prune-started").exists(), "no stamp is written");
+    }
+
+    #[test]
+    fn under_the_low_mark_the_preflight_starts_the_prune_once_and_a_fresh_stamp_starts_none() {
+        let case = Case::new("free-under");
+        let record = case.base.join("start.record");
+        let seams = space_seams(given(50 << 30), gate_args::PruneStartSeam::Record(record.clone()));
+        let payload = case.payload(&json!({}));
+
+        let (status, console) = preflighted_with(&payload, &seams);
+
+        assert_eq!(status, 0, "{:?}", console.err);
+        assert_eq!(
+            after_boot(&console.out),
+            (
+                Some(format!("gate: remote free {} {SPACE_TOTAL}", 50u64 << 30).as_str()),
+                Some("gate: remote prune started")
+            )
+        );
+        assert!(Path::new(&case.root()).join("prune-started").is_file(), "the stamp is written");
+        assert_eq!(fs::read_to_string(&record).expect("the start is recorded"), "start\n");
+
+        let (status, console) = preflighted_with(&payload, &seams);
+
+        assert_eq!(status, 0, "{:?}", console.err);
+        let ago = after_boot(&console.out).1.expect("a prune line follows the free line");
+        let seconds = ago
+            .strip_prefix("gate: remote prune started ")
+            .and_then(|rest| rest.strip_suffix(" s ago"))
+            .and_then(|seconds| seconds.parse::<u64>().ok());
+        assert!(seconds.is_some(), "{ago}");
+        assert_eq!(
+            fs::read_to_string(&record).expect("the start is recorded"),
+            "start\n",
+            "a fresh stamp starts none"
+        );
+    }
+
+    #[test]
+    fn a_failed_prune_start_removes_the_stamp_and_says_not_started() {
+        let case = Case::new("free-failed");
+        let seams = space_seams(given(50 << 30), gate_args::PruneStartSeam::Fail("no prune here".to_owned()));
+
+        let (status, console) = preflighted_with(&case.payload(&json!({})), &seams);
+
+        assert_eq!(status, 0, "{:?}", console.err);
+        assert_eq!(after_boot(&console.out).1, Some("gate: remote prune not started: no prune here"));
+        assert!(!Path::new(&case.root()).join("prune-started").exists(), "the stamp is removed");
+    }
+
+    #[test]
+    fn an_unreadable_free_space_says_neither_line_and_starts_nothing() {
+        let case = Case::new("free-unreadable");
+        let record = case.base.join("start.record");
+        let seams = space_seams(gate_args::SpaceSeam::Unreadable, gate_args::PruneStartSeam::Record(record.clone()));
+
+        let (status, console) = preflighted_with(&case.payload(&json!({})), &seams);
+
+        assert_eq!(status, 0, "{:?}", console.err);
+        let said = console
+            .out
+            .iter()
+            .any(|line| line.starts_with("gate: remote free ") || line.starts_with("gate: remote prune"));
+        assert!(!said, "{:?}", console.out);
+        assert!(!record.exists(), "nothing is started");
+    }
+
+    #[test]
+    fn a_real_free_space_read_says_the_volume_s_free_line() {
+        let case = Case::new("free-real");
+        let seams = space_seams(
+            gate_args::SpaceSeam::Real,
+            gate_args::PruneStartSeam::Record(case.base.join("start.record")),
+        );
+
+        let (status, console) = preflighted_with(&case.payload(&json!({})), &seams);
+
+        assert_eq!(status, 0, "{:?}", console.err);
+        let counts = after_boot(&console.out)
+            .0
+            .and_then(|line| line.strip_prefix("gate: remote free "))
+            .and_then(|counts| counts.split_once(' '))
+            .and_then(|(free, total)| Some((free.parse::<u64>().ok()?, total.parse::<u64>().ok()?)));
+        let (free, total) = counts.expect("the line after the boot line is the free line");
+        assert!(total > 0 && free <= total, "{free} of {total}");
     }
 
     /// Checks `lines`, what follows the boot line, are at most one sdks line, then exactly `tools`.

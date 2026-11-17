@@ -35,8 +35,8 @@ pub use request::WarmRequest;
 pub use request::{
     BoxRequest, BoxSeams, BoxVerb, BurnRequest, Ceiling, CheckRequest, CheckSeams, CsharpFormatRequest, CutoverRequest, CutoverSeams,
     DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, DesktopHoldRequest, DesktopHoldSeams, DesktopMode, DesktopSession, DrainAction, DrainRequest,
-    DrainSeams, ExpectRequest, HoldRequest, Invocation, ProcessScan, PruneRequest, PruneSeams, PushRequest, PushSeams, RunRequest, Slot, StopRequest,
-    TestSeams,
+    DrainSeams, ExpectRequest, HoldRequest, Invocation, ProcessScan, PruneRequest, PruneSeams, PruneStartSeam, PushRequest, PushSeams, RunRequest,
+    Slot, SpaceSeam, StopRequest, TestSeams,
 };
 pub use request::{REMOTE_BUILDER_SECTIONS, REMOTE_SECTIONS, RemoteMatchRequest, RemoteRequest, RemoteVerb};
 pub use usage::USAGE;

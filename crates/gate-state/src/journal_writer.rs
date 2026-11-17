@@ -189,10 +189,34 @@ pub struct RoutingFacts {
     /// How a commit's pre-commit stage on a builder went: written as `stage`, after `sentWords`, and left out when
     /// `None`, as for every run that is no commit with a stage.
     pub stage: Option<StageFacts>,
+    /// The last builder of the run whose preflight found its work drive under the free-space floor's low mark and said
+    /// what it did about its age prune: written as `lowDisk`, after `stage`, `{"builder", "freeGiB", "prune"}`, and
+    /// left out when `None`, as for every run no builder said so to.
+    pub low_disk: Option<LowDiskFacts>,
+}
+
+/// A builder low on disk, as a release line's `lowDisk` object has it: `{"builder", "freeGiB", "prune"}`, the builder's
+/// alias, the whole GiB free on its work drive, and what its preflight did about the age prune.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LowDiskFacts {
+    pub builder: String,
+    pub free_gib: u64,
+    pub prune: LowDiskPrune,
+}
+
+/// What a low builder's preflight did about its age prune, as `lowDisk`'s `prune` spells it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LowDiskPrune {
+    /// `started`: it started the prune.
+    Started,
+    /// `recent`: another preflight started it a short while ago, so it started none.
+    Recent,
+    /// `failed`: its start failed.
+    Failed,
 }
 
 impl RoutingFacts {
-    /// Whether the run carries none of the seven facts, so its release line gains no key of theirs.
+    /// Whether the run carries none of the eight facts, so its release line gains no key of theirs.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.not_routed.is_none()
@@ -202,6 +226,7 @@ impl RoutingFacts {
             && self.parent_pid.is_none()
             && self.sent_words.is_none()
             && self.stage.is_none()
+            && self.low_disk.is_none()
     }
 }
 
@@ -511,10 +536,10 @@ impl fmt::Display for JournalNote {
 /// decimals. A `release` without facts writes null times and the verdict
 /// `unknown`.
 ///
-/// A `release` also carries the run's routing facts, `notRouted`, `reason`, `fellBack`, `balanced`, `parentPid` and
-/// `sentWords`, as the run's `queue`, `fallback` and `take` lines said them and, for `balanced`, as its routing decision
-/// scored its builders, so that the archive keeps them once the journal rolls: each field is left out when the run has
-/// none of it.
+/// A `release` also carries the run's routing facts, `notRouted`, `reason`, `fellBack`, `balanced`, `parentPid`,
+/// `sentWords`, `stage` and `lowDisk`, as the run's `queue`, `fallback` and `take` lines said them (`stage` and `lowDisk`
+/// as its builder calls found them) and, for `balanced`, as its routing decision scored its builders, so that the
+/// archive keeps them once the journal rolls: each field is left out when the run has none of it.
 ///
 /// `remote` is the tag of a routed run up to its fallback: when it is `Some`, the event's own fields are followed by
 /// `remote: true`, `host` and `key`, and, when the tag names a critical request, `routedFor: critical` and `criticalPid`;
@@ -739,31 +764,51 @@ fn tenths(value: f64) -> Value {
 }
 
 /// Inserts a release line's `routing` facts ([`RoutingFacts`]), each only when the run has it: `notRouted`, `reason`,
-/// `fellBack`, `balanced`, `parentPid`, `sentWords`, then `stage`.
+/// `fellBack`, `balanced`, `parentPid`, `sentWords`, `stage`, then `lowDisk`.
 fn insert_routing(line: &mut Map<String, Value>, routing: &RoutingFacts) {
-    if let Some(not_routed) = &routing.not_routed {
-        line.insert("notRouted".to_owned(), Value::from(not_routed.as_str()));
+    let text = |value: &Option<String>| value.as_deref().map(Value::from);
+    let fell_back =
+        (!routing.fell_back.is_empty()).then(|| Value::Array(routing.fell_back.iter().map(|reason| Value::from(reason.as_str())).collect()));
+    let facts = [
+        ("notRouted", text(&routing.not_routed)),
+        ("reason", text(&routing.reason)),
+        ("fellBack", fell_back),
+        ("balanced", routing.balanced.as_ref().map(balanced_value)),
+        ("parentPid", routing.parent_pid.map(Value::from)),
+        ("sentWords", text(&routing.sent_words)),
+        ("stage", routing.stage.as_ref().map(stage_value)),
+        ("lowDisk", routing.low_disk.as_ref().map(low_disk_value)),
+    ];
+    for (key, value) in facts {
+        if let Some(value) = value {
+            line.insert(key.to_owned(), value);
+        }
     }
-    if let Some(reason) = &routing.reason {
-        line.insert("reason".to_owned(), Value::from(reason.as_str()));
-    }
-    if !routing.fell_back.is_empty() {
-        let reasons: Vec<Value> = routing.fell_back.iter().map(|reason| Value::from(reason.as_str())).collect();
-        line.insert("fellBack".to_owned(), Value::Array(reasons));
-    }
-    if let Some(balanced) = &routing.balanced {
-        let entries = balanced.entries.iter().map(|entry| balanced_entry(entry, balanced.has_duration));
-        line.insert("balanced".to_owned(), Value::Array(entries.collect()));
-    }
-    if let Some(parent_pid) = routing.parent_pid {
-        line.insert("parentPid".to_owned(), Value::from(parent_pid));
-    }
-    if let Some(sent_words) = &routing.sent_words {
-        line.insert("sentWords".to_owned(), Value::from(sent_words.as_str()));
-    }
-    if let Some(stage) = &routing.stage {
-        line.insert("stage".to_owned(), stage_value(stage));
-    }
+}
+
+/// A routing decision's scored builders as a release line's `balanced` field writes them ([`balanced_entry`]).
+fn balanced_value(balanced: &Balanced) -> Value {
+    Value::Array(
+        balanced
+            .entries
+            .iter()
+            .map(|entry| balanced_entry(entry, balanced.has_duration))
+            .collect(),
+    )
+}
+
+/// A builder low on disk as a release line's `lowDisk` field writes it ([`LowDiskFacts`]).
+fn low_disk_value(low_disk: &LowDiskFacts) -> Value {
+    let prune = match low_disk.prune {
+        LowDiskPrune::Started => "started",
+        LowDiskPrune::Recent => "recent",
+        LowDiskPrune::Failed => "failed",
+    };
+    let mut object = Map::new();
+    object.insert("builder".to_owned(), Value::from(low_disk.builder.as_str()));
+    object.insert("freeGiB".to_owned(), Value::from(low_disk.free_gib));
+    object.insert("prune".to_owned(), Value::from(prune));
+    Value::Object(object)
 }
 
 /// A commit stage as a release line's `stage` field writes it ([`StageFacts`]).

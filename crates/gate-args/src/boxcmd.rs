@@ -20,7 +20,8 @@
 //! decides what to pack; the Unix box right after the command ends, before its back commit),
 //! `--test-box-park-back-paths <path>` (the run waits for the path just before it reads its back commit's paths),
 //! `--test-box-channel-ports <first>-<last>`, `--test-box-channel-accept-ms <n>`, `--test-box-channel-proof-ms <n>`,
-//! `--test-box-channel-idle-ms <n>` and `--test-box-channel-send-buffer-bytes <n>` (each also as `--<seam>=<value>`)
+//! `--test-box-channel-idle-ms <n>`, `--test-box-channel-send-buffer-bytes <n>`, `--test-box-space <free>:<total>|unreadable|real`
+//! and `--test-box-prune-start record:<path>|fail:<message>` (each also as `--<seam>=<value>`)
 //! before the verb; without the feature each is no verb, and so the box usage.
 
 use std::ffi::{OsStr, OsString};
@@ -334,6 +335,11 @@ enum Seam {
     ChannelIdleMs,
     /// `--test-box-channel-send-buffer-bytes <n>`: the send buffer a data channel's connection gets.
     ChannelSendBufferBytes,
+    /// `--test-box-space <free>:<total>|unreadable|real`: the space a preflight takes its work root's volume to have.
+    Space,
+    /// `--test-box-prune-start record:<path>|fail:<message>`: what a preflight's start of the age prune does in place of
+    /// the real start.
+    PruneStart,
 }
 
 #[cfg(feature = "test-seams")]
@@ -384,6 +390,8 @@ impl Seam {
             "--test-box-channel-proof-ms" => Some(Seam::ChannelProofMs),
             "--test-box-channel-idle-ms" => Some(Seam::ChannelIdleMs),
             "--test-box-channel-send-buffer-bytes" => Some(Seam::ChannelSendBufferBytes),
+            "--test-box-space" => Some(Seam::Space),
+            "--test-box-prune-start" => Some(Seam::PruneStart),
             _ => None,
         }
     }
@@ -433,6 +441,8 @@ impl Seam {
             Seam::ChannelProofMs => "--test-box-channel-proof-ms",
             Seam::ChannelIdleMs => "--test-box-channel-idle-ms",
             Seam::ChannelSendBufferBytes => "--test-box-channel-send-buffer-bytes",
+            Seam::Space => "--test-box-space",
+            Seam::PruneStart => "--test-box-prune-start",
         }
     }
 }
@@ -537,6 +547,8 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::Token => seams.refuse_token = the_word(name, value, "refused", |option, value| Problem::BadTokenRefusal { option, value })?,
         Seam::ParkLaunch => seams.park_launch = Some(std::path::PathBuf::from(value)),
         Seam::RootWalkStop => seams.root_walk_stop = Some(std::path::PathBuf::from(value)),
+        Seam::Space => seams.space = Some(crate::values::space(name, &value)?),
+        Seam::PruneStart => seams.prune_start = Some(crate::values::prune_start(name, &value)?),
     }
     Ok(())
 }

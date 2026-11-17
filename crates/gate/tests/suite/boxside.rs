@@ -390,6 +390,144 @@ fn preflight_creates_the_bare_repo_and_work_folder() {
     assert_eq!(case.folder_entries(), ["remote"], "the box writes only where the payload says");
 }
 
+/// A volume's size the free-space cases give, whose floor's low mark is 200 GiB.
+const SPACE_TOTAL: u64 = 1000 << 30;
+
+/// A preflight of `folders` with the box seams `seams` before its verb.
+fn preflight_seamed(case: &Case, folders: &Folders, seams: &[&str]) -> Outcome {
+    let mut words = vec!["box"];
+    words.extend_from_slice(seams);
+    words.push("preflight");
+    box_call(case, &words, &folders.payload()).finish_read()
+}
+
+/// The line after a passed preflight's boot line, and the one after that.
+fn after_boot<'o>(printed: &[&'o str]) -> (Option<&'o str>, Option<&'o str>) {
+    let boot = printed
+        .iter()
+        .position(|line| line.starts_with("gate: remote boot "))
+        .expect("a passed preflight says its boot line");
+    (printed.get(boot + 1).copied(), printed.get(boot + 2).copied())
+}
+
+/// The `--test-box-space` value of `free` bytes free of [`SPACE_TOTAL`].
+fn space_of(free: u64) -> String {
+    format!("{free}:{SPACE_TOTAL}")
+}
+
+#[test]
+fn preflight_over_the_low_mark_says_the_free_line_and_starts_no_prune() {
+    let case = Case::new("preflight_over_the_low_mark_says_the_free_line_and_starts_no_prune");
+    let folders = Folders::new(&case);
+    let record = case.folder().join("prune-start.record");
+    let (space, start) = (space_of(300 << 30), format!("record:{}", shown(&record)));
+
+    let outcome = preflight_seamed(&case, &folders, &["--test-box-space", &space, "--test-box-prune-start", &start]);
+
+    let printed = passed(&outcome);
+    let (free, next) = after_boot(&printed);
+    assert_eq!(
+        free,
+        Some(format!("gate: remote free {} {SPACE_TOTAL}", 300u64 << 30).as_str()),
+        "{outcome:?}"
+    );
+    assert!(next.is_none_or(|line| !line.starts_with("gate: remote prune")), "{outcome:?}");
+    assert!(!record.exists(), "nothing is started over the low mark");
+    assert!(!case.folder().join("remote").join("prune-started").exists(), "no stamp is written");
+}
+
+#[test]
+fn preflight_under_the_low_mark_starts_the_prune_once_and_a_fresh_stamp_starts_none() {
+    let case = Case::new("preflight_under_the_low_mark_starts_the_prune_once");
+    let folders = Folders::new(&case);
+    let record = case.folder().join("prune-start.record");
+    let (space, start) = (space_of(50 << 30), format!("record:{}", shown(&record)));
+    let seams = ["--test-box-space", space.as_str(), "--test-box-prune-start", start.as_str()];
+
+    let first = preflight_seamed(&case, &folders, &seams);
+
+    let printed = passed(&first);
+    assert_eq!(
+        after_boot(&printed),
+        (
+            Some(format!("gate: remote free {} {SPACE_TOTAL}", 50u64 << 30).as_str()),
+            Some("gate: remote prune started")
+        ),
+        "{first:?}"
+    );
+    assert!(case.folder().join("remote").join("prune-started").is_file(), "the stamp is written");
+    assert_eq!(fs::read_to_string(&record).expect("the start is recorded"), "start\n");
+
+    let second = preflight_seamed(&case, &folders, &seams);
+
+    let printed = passed(&second);
+    let ago = Regex::new(r"^gate: remote prune started \d+ s ago$").expect("the pattern compiles");
+    assert!(after_boot(&printed).1.is_some_and(|line| ago.is_match(line)), "{second:?}");
+    assert_eq!(
+        fs::read_to_string(&record).expect("the start is recorded"),
+        "start\n",
+        "a fresh stamp starts none"
+    );
+}
+
+#[test]
+fn a_failed_prune_start_removes_the_stamp_and_says_not_started() {
+    let case = Case::new("a_failed_prune_start_removes_the_stamp_and_says_not_started");
+    let folders = Folders::new(&case);
+    let space = space_of(50 << 30);
+
+    let outcome = preflight_seamed(
+        &case,
+        &folders,
+        &["--test-box-space", &space, "--test-box-prune-start", "fail:the scheduler is away"],
+    );
+
+    let printed = passed(&outcome);
+    assert_eq!(
+        after_boot(&printed).1,
+        Some("gate: remote prune not started: the scheduler is away"),
+        "{outcome:?}"
+    );
+    assert!(!case.folder().join("remote").join("prune-started").exists(), "the stamp is removed");
+}
+
+#[test]
+fn an_unreadable_free_space_says_neither_line_and_starts_nothing() {
+    let case = Case::new("an_unreadable_free_space_says_neither_line_and_starts_nothing");
+    let folders = Folders::new(&case);
+    let record = case.folder().join("prune-start.record");
+    let start = format!("record:{}", shown(&record));
+
+    let outcome = preflight_seamed(&case, &folders, &["--test-box-space", "unreadable", "--test-box-prune-start", &start]);
+
+    let printed = passed(&outcome);
+    assert!(
+        !printed
+            .iter()
+            .any(|line| line.starts_with("gate: remote free ") || line.starts_with("gate: remote prune")),
+        "{outcome:?}"
+    );
+    assert!(!record.exists(), "nothing is started");
+}
+
+#[test]
+fn a_real_free_space_read_says_the_volume_s_free_line() {
+    let case = Case::new("a_real_free_space_read_says_the_volume_s_free_line");
+    let folders = Folders::new(&case);
+    let start = format!("record:{}", shown(&case.folder().join("prune-start.record")));
+
+    let outcome = preflight_seamed(&case, &folders, &["--test-box-space", "real", "--test-box-prune-start", &start]);
+
+    let printed = passed(&outcome);
+    let (free, total) = after_boot(&printed)
+        .0
+        .and_then(|line| line.strip_prefix("gate: remote free "))
+        .and_then(|counts| counts.split_once(' '))
+        .and_then(|(free, total)| Some((free.parse::<u64>().ok()?, total.parse::<u64>().ok()?)))
+        .expect("the line after the boot line is the free line");
+    assert!(total > 0 && free <= total, "{free} of {total}");
+}
+
 /// The created line shows the bare repository's path escaped, as the Unix box says it, so a bidi mark in the folder
 /// holding it can neither reorder the line nor reach the PC raw.
 #[test]

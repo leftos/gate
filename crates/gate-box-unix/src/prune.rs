@@ -216,9 +216,9 @@ const VOLUMES: &str = "/Volumes";
 const TMP: &str = "/tmp";
 /// The space of a volume: the bytes the box's user may still write there, and the volume's size.
 #[derive(Clone, Copy)]
-struct Space {
-    free: u64,
-    total: u64,
+pub(crate) struct Space {
+    pub(crate) free: u64,
+    pub(crate) total: u64,
 }
 
 /// What a prune is given besides its words, which a test replaces: what it calls with each work folder just before
@@ -237,6 +237,11 @@ struct Seams<'a> {
 
 /// The line of an age prune that removed nothing, a drain barrier standing.
 const SKIPPED_DRAINED: &str = "gate: remote prune skipped: the builder is drained";
+/// What the age prune says, before it removes anything, when another age prune holds the root's prune lock.
+const SKIPPED_RUNNING: &str = "gate: remote prune skipped: another prune is running";
+/// The lock in the root every age prune holds for its whole sweep, the scheduled job's and one a preflight started
+/// alike, so at most one sweeps the root at a time; the keyed prune does not take it.
+pub(crate) const PRUNE_LOCK: &str = "prune.lock";
 
 /// Whether a drain barrier stands on the root `root` at the clock `clock` ([`barrier_stands`]); else the line saying
 /// the prune failed for why it could not be read.
@@ -268,7 +273,7 @@ fn tmp_root() -> PathBuf {
 /// The space of the volume holding `path` ([`space_bytes`]); in a build with the test seams, the free bytes
 /// `GATE_BOX_TEST_FREE_BYTES` and the volume's size `GATE_BOX_TEST_TOTAL_BYTES` give each in place of the volume's own
 /// when set.
-fn space_read(path: &Path) -> io::Result<Space> {
+pub(crate) fn space_read(path: &Path) -> io::Result<Space> {
     // Set by tests/run.rs `an_age_prune_removes_an_idle_work_folder_and_a_leftover_run_folder`.
     #[cfg(feature = "test-seams")]
     {
@@ -364,6 +369,21 @@ fn aged(root: &str, now: SystemTime, seams: &Seams<'_>, console: &mut Console) -
         console.out(SKIPPED_DRAINED);
         return Ok(0);
     }
+    // Held for the whole sweep, without waiting: another age prune holding it is sweeping the root already.
+    let _sweeping = match files::take_lock(&Path::new(root).join(PRUNE_LOCK)) {
+        Ok(Locked::Held(held)) => Some(held),
+        Ok(Locked::Busy) => {
+            console.out(SKIPPED_RUNNING);
+            return Ok(0);
+        }
+        // A root that is not there holds nothing to remove, as the sweep finds it.
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        // A lock that cannot be made or taken at all keeps no sweep back: each removal still goes through its key's lock.
+        Err(error) => {
+            console.err(&format!("gate: remote prune takes no lock: {error}"));
+            None
+        }
+    };
     let (removed, folders) = match Sweep::opened(root, now, seams, false, console)? {
         Some(sweep) => {
             let listed = listed(&sweep.work).map_err(|error| cannot_list(&sweep.work, &error))?;
@@ -1302,8 +1322,8 @@ mod tests {
     use gate_wire::drain::Clock;
 
     use super::{
-        GIB, IDLE_AGE, RECORDS_BEFORE, Seams, Space, folder_bytes, idle_for, key_file_stem, no_rename_seen, prune, pruned_with, size_read,
-        space_bytes,
+        GIB, IDLE_AGE, PRUNE_LOCK, RECORDS_BEFORE, Seams, Space, folder_bytes, idle_for, key_file_stem, no_rename_seen, prune, pruned_with,
+        size_read, space_bytes,
     };
     use crate::console::Console;
     use crate::files::held_for_test;
@@ -1501,6 +1521,54 @@ mod tests {
         assert_eq!(console.out, [format!("gate: remote pruned {KEY}: idle 48 h"), summary(1, 1)]);
         assert_eq!(names(&case.work()), [format!("{KEY}.lock")], "the lock alone stays");
         assert!(names(&case.pruned()).is_empty(), "the folder set aside is removed");
+    }
+
+    #[test]
+    fn an_age_prune_whose_lock_cannot_be_taken_says_so_and_sweeps_without_it() {
+        let case = Case::new("prune-lock-folder");
+        let folder = case.folder(TWO_DAYS);
+        fs::create_dir(case.root.join(PRUNE_LOCK)).expect("a folder stands where the lock belongs");
+
+        let (status, console) = case.sweep();
+
+        assert_eq!(status, 0, "{:?}", console.err);
+        assert_eq!(console.err.len(), 1, "{:?}", console.err);
+        assert!(console.err[0].starts_with("gate: remote prune takes no lock: "), "{:?}", console.err);
+        assert_eq!(console.out.last(), Some(&summary(1, 1)), "{:?}", console.out);
+        assert!(!folder.exists(), "the idle folder goes all the same");
+    }
+
+    #[test]
+    fn an_age_prune_whose_lock_another_prune_holds_says_so_and_removes_nothing() {
+        let case = Case::new("prune-lock-held");
+        let folder = case.folder(TWO_DAYS);
+        let lock = held_for_test(&case.root.join(PRUNE_LOCK));
+
+        let (status, console) = case.sweep();
+        drop(lock);
+
+        assert_eq!(
+            (status, console.out),
+            (0, vec!["gate: remote prune skipped: another prune is running".to_owned()])
+        );
+        assert!(console.err.is_empty(), "{:?}", console.err);
+        assert!(folder.is_dir(), "the idle folder stays for the prune that holds the lock");
+    }
+
+    #[test]
+    fn a_keyed_prune_takes_no_prune_lock() {
+        let case = Case::new("prune-lock-keyed");
+        case.folder(TWO_DAYS);
+        let lock = held_for_test(&case.root.join(PRUNE_LOCK));
+
+        let (status, console) = case.keyed(&[KEY]);
+        drop(lock);
+
+        assert_eq!(status, 0, "{:?}", console.err);
+        assert!(
+            !case.work().join(KEY).exists(),
+            "the keyed prune removes its key while an age prune sweeps"
+        );
     }
 
     #[test]

@@ -197,6 +197,33 @@ pub struct BoxSeams {
     /// The send buffer a box's data channel connection gets, in bytes, in place of the built-in 16 MiB; `None` without
     /// the feature.
     pub channel_send_buffer_bytes: Option<u32>,
+    /// The space `gate box preflight` takes its work root's volume to have; `None` without the feature. In a build with
+    /// the feature, a preflight given none reads no space and says no free-space line, so no case's lines depend on the
+    /// host's disk.
+    pub space: Option<SpaceSeam>,
+    /// What `gate box preflight`'s out-of-schedule start of the age prune does in place of the real start; `None`
+    /// without the feature, and the start is real.
+    pub prune_start: Option<PruneStartSeam>,
+}
+
+/// The space `--test-box-space` gives a preflight's work root volume.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpaceSeam {
+    /// `<free>:<total>`: this many bytes free of a volume of this size.
+    Given { free: u64, total: u64 },
+    /// `unreadable`: the read fails.
+    Unreadable,
+    /// `real`: the volume's own, read as a build without the feature reads it.
+    Real,
+}
+
+/// What `--test-box-prune-start` makes a preflight's start of the age prune do in place of the real start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PruneStartSeam {
+    /// `record:<path>`: append a line to the file at the path and succeed.
+    Record(PathBuf),
+    /// `fail:<message>`: fail with the message.
+    Fail(String),
 }
 
 /// What `gate box hold` holds a builder slot for: its holder's text, its ceiling and its wait for a slot, both in

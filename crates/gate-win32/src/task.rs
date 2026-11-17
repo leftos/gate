@@ -678,6 +678,50 @@ pub fn register_task(path: &str, helper: &Path, user_sid: &str, deadline: Instan
     answered(waited, thread, "registers the task")
 }
 
+/// Starts the registered task `path`, such as `\build-box\gate-prune-work`, now, as its own principal with no
+/// parameters, its constraints and its instance policy kept, so a task set to ignore a new instance while one runs
+/// starts no second one; and returns once the Task Scheduler has taken the start, never waiting for the task. Unlike
+/// [`run_task`] it checks no definition: it is for a task the installer registered whose action takes nothing from the
+/// caller. It never registers, changes or stops a task. The Task Scheduler is asked on a thread of its own, which this
+/// waits for until `deadline`.
+///
+/// # Errors
+///
+/// [`TaskError::Failed`] naming the path for a task or folder that is not registered, naming the call that failed for
+/// any other failed call, and for a path that holds no task name; [`TaskError::TimedOut`] when the Task Scheduler did
+/// not answer by `deadline`, the thread that asked it left to finish on its own, the task perhaps started;
+/// [`TaskError::Unanswered`] when the wait failed or that thread panicked.
+pub fn start_task(path: &str, deadline: Instant) -> Result<(), TaskError> {
+    let Some((folder, name)) = split_task_path(path) else {
+        return Err(TaskError::failed(&format!("{} is not a task path, \\<folder>\\<name>", shown(path))));
+    };
+    let (folder, name) = (folder.to_owned(), name.to_owned());
+    let thread = std::thread::Builder::new()
+        .name("gate-task-start".to_owned())
+        .spawn(move || start_on_demand(&folder, &name))
+        .map_err(|error| TaskError::failed(&format!("the thread that starts the task could not be made: {error}")))?;
+    let waited = wait_any(&[thread.as_raw_handle()], deadline);
+    answered(waited, thread, "starts the task").map_err(|error| match error {
+        TaskError::NotRegistered => TaskError::failed(&format!("the task {} is not registered", shown(path))),
+        other => other,
+    })
+}
+
+/// The task `name` of the folder `folder` started on this thread as [`start_task`] starts it: COM joined, then the
+/// work, whose interfaces are all released when it returns, before COM is left.
+fn start_on_demand(folder: &str, name: &str) -> Result<(), TaskError> {
+    let library = task_library()?;
+    let _apartment = Apartment::join()?;
+    let service = connected(library)?;
+    // SAFETY: the folder's path is a valid BSTR for the call.
+    let found = unsafe { service.GetFolder(&BSTR::from(folder)) }.map_err(missing("open the task's folder"))?;
+    // SAFETY: the task's name is a valid BSTR for the call.
+    let task = unsafe { found.GetTask(&BSTR::from(name)) }.map_err(missing("open the task"))?;
+    // SAFETY: an empty variant passes the task no parameters.
+    unsafe { task.Run(&VARIANT::default()) }.map_err(failed("run the task"))?;
+    Ok(())
+}
+
 /// The task registered on this thread: COM joined, then the work, whose interfaces are all released when it returns,
 /// before COM is left.
 fn register_on_this_thread(registration: &Registration) -> Result<(), TaskError> {
@@ -1417,7 +1461,7 @@ mod tests {
     use super::{
         Action, Definition, Entry, Expected, FOLDER_NOT_FOUND, Instance, StartedTask, TASK_NOT_FOUND, TaskArgument, TaskError, TaskStart, answered,
         check_action, check_definition, check_folder, check_loaded_from, engine_pid, failed, given_up, is_not_found, missing, register_task,
-        run_task, split_task_path, task_xml, unseen, wanted_definition, wanted_security,
+        run_task, split_task_path, start_task, task_xml, unseen, wanted_definition, wanted_security,
     };
     use crate::pipe::Signalled;
 
@@ -1919,6 +1963,15 @@ mod tests {
         let started = run_task(&start_of(&path, &argument), Instant::now() + Duration::from_secs(600), &[]);
 
         assert_eq!(started, Err(TaskError::NotRegistered));
+    }
+
+    #[test]
+    fn a_task_start_of_a_task_not_registered_names_it_and_starts_nothing() {
+        let path = format!(r"\gate-no-such-task-{}", std::process::id());
+
+        let started = start_task(&path, Instant::now() + HANG_GUARD);
+
+        assert_eq!(started, Err(TaskError::Failed(format!("the task {path} is not registered"))));
     }
 
     /// A started instance whose snapshots are scripted: each refresh takes the next, `None` or one past the last

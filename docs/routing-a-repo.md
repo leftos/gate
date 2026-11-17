@@ -144,6 +144,8 @@ This repo's `tools/builder/install-toolchains.ps1` does the rest: the toolchains
 
   The sweep removes work folders idle over 12 hours and, while the work drive's free space is under the greater of 20% and 100 GiB, the least recently used others until it reaches the greater of 30% and 150 GiB. Under a standing drain barrier the prune touches nothing. After its sweep it runs `git gc --auto` in each bare repository under the work root, which a push no longer starts (a push to the builder runs with `receive.autogc` off).
 
+  A routed run whose builder finds the drive under that low mark does not wait for the schedule: the builder's preflight starts this task at once (at most once in 10 minutes), and the run says `gate: remote <alias> is low on disk: <g> GiB free of <t> GiB; the builder is pruning` (or `...; its prune did not start: <why>`) and journals it as `lowDisk` on its release line. The run itself goes on. On a macOS builder the preflight starts `box prune` the same way.
+
   Its output goes to the Application log under the event source `gate-prune`, event ID 1: each output line is an Information event, and a closing event `gate box prune exited {code}; {drive}: free {n} GB` (`(no exit code)` when there is none) is Information on exit 0 and Warning otherwise.
 
   The step logs `event source gate-prune: already registered` or `registered in the Application log`, and `task \build-box\gate-prune-work registered: ...`, adding that the task `will fail until a gate push installs C:\Program Files\gate\bin\gate.exe` when that exe is not there yet.
