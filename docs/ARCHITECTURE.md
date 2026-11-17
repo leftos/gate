@@ -478,7 +478,7 @@ It makes no OS calls, builds and tests on any OS, and must never depend on `gate
 
   `cpu.rs` holds the command group's CPU: the tally that counts each process's CPU once, by (pid, start) and reaper, from `proc_pid_rusage` and `proc_pidinfo` reads, the mach timebase; `LoadTotals` and `host_cpu_load`, the machine's CPU load from `host_statistics` as 64-bit totals.
 
-  `prune.rs` holds `prune`: the age prune with its free-space floor and `/tmp` sweep, and the keyed prune with its refs, each key's work folder renamed aside under its lock and its records removed, the root checked as `stop` checks it; its only environment seams, `GATE_BOX_TEST_TMP_ROOT`, `GATE_BOX_TEST_FREE_BYTES` and `GATE_BOX_TEST_TOTAL_BYTES`, exist in a `test-seams` build.
+  `prune.rs` holds `prune`: the age prune with its folder cap, free-space floor and `/tmp` sweep, and the keyed prune with its refs, each key's work folder renamed aside under its lock and its records removed, the root checked as `stop` checks it; its only environment seams, `GATE_BOX_TEST_TMP_ROOT`, `GATE_BOX_TEST_FREE_BYTES`, `GATE_BOX_TEST_TOTAL_BYTES` and `GATE_BOX_TEST_FOLDER_BYTES`, exist in a `test-seams` build.
 
   The other verbs are `boot.rs`, `preflight.rs`, `probe.rs` (the tool probes, the `godot` probe's listing of the installs under the login shell's `GATE_GODOT_ROOT` with `installed_godot`, the run's find of one by its folder name, and `dotnet --list-sdks`) and `stop.rs`.
 

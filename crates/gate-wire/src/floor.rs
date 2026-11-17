@@ -4,6 +4,9 @@
 
 /// A gibibyte, as the free space is said.
 pub const GIB: u64 = 1 << 30;
+/// The size over which both boxes' age prunes remove a work folder no run holds, however recent its last use: a folder
+/// in daily use is never idle, and cargo keeps every output whose hash changes, so without a cap it grows unbounded.
+pub const FOLDER_CAP: u64 = 60 * GIB;
 /// The share of a volume, in hundredths, under whose free space the floor pass starts.
 const LOW_PERCENT: u128 = 20;
 /// The share of a volume, in hundredths, at whose free space the floor pass stops.

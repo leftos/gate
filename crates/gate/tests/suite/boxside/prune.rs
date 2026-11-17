@@ -225,6 +225,95 @@ fn a_free_space_that_cannot_be_read_is_said_and_a_recent_work_folder_stays() {
     assert_k_kept(&root, &outcome);
 }
 
+/// The seam of the measured size of named work folders, as `<key>=<bytes>[,<key>=<bytes>...]`.
+const FOLDER_BYTES_SEAM: &str = "GATE_BOX_TEST_FOLDER_BYTES";
+
+/// `gate box prune --root <root>`, told its root's volume has `free` bytes free of 500 GiB and the work folders
+/// `sizes` names measure as given, run to its end.
+fn prune_sized(case: &Case, root: &Path, free: &str, sizes: &str) -> Outcome {
+    let mut command = bare_box_command(case, &["box", "prune", "--root", &shown(root)]);
+    command
+        .env(FREE_SEAMS[0], free)
+        .env(FREE_SEAMS[1], (500 * GIB).to_string())
+        .env(FOLDER_BYTES_SEAM, sizes);
+    finish(command)
+}
+
+#[test]
+fn a_recent_work_folder_over_the_cap_is_removed_and_said() {
+    let case = Case::new("prune_cap_over");
+    let root = root_with_k(&case);
+    let plenty = (1000 * GIB).to_string();
+
+    let outcome = prune_sized(&case, &root, &plenty, &format!("k={}", 61 * GIB));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout, "gate: remote pruned k: 61 GiB, over the 60 GiB cap\ngate: remote prune removed 1 of 1 work folders\n",
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_k_gone(&root, &outcome);
+}
+
+#[test]
+fn a_recent_work_folder_at_the_cap_stays() {
+    let case = Case::new("prune_cap_at");
+    let root = root_with_k(&case);
+    let plenty = (1000 * GIB).to_string();
+
+    let outcome = prune_sized(&case, &root, &plenty, &format!("k={}", 60 * GIB));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "gate: remote prune removed 0 of 1 work folders\n", "{outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_k_kept(&root, &outcome);
+}
+
+#[test]
+fn a_work_folder_the_cap_removed_is_not_counted_again_by_the_floor_pass() {
+    let case = Case::new("prune_cap_floor");
+    let root = root_with_k(&case);
+    let j = root.join(r"work\j");
+    fs::create_dir_all(&j).expect("the second work folder can be made");
+    fs::write(root.join(r"work\j.lock"), "").expect("its lock can be written");
+
+    // 10 GiB free whatever goes: the floor pass takes every folder the cap pass left.
+    let outcome = prune_sized(&case, &root, &(10 * GIB).to_string(), &format!("k={}", 61 * GIB));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout,
+        "gate: remote pruned k: 61 GiB, over the 60 GiB cap\ngate: remote pruned j: 10 GiB free\n\
+         gate: remote prune removed 2 of 2 work folders\n",
+        "{outcome:?}"
+    );
+    assert_eq!(
+        outcome.stderr, "gate: remote prune could not reach the free-space floor: 10 GiB free\n",
+        "{outcome:?}"
+    );
+    assert_k_gone(&root, &outcome);
+    assert!(!j.exists(), "the floor pass takes the other folder: {outcome:?}");
+}
+
+#[test]
+fn a_work_folder_whose_size_cannot_be_read_is_said_and_stays() {
+    let case = Case::new("prune_cap_unsized");
+    let root = root_with_k(&case);
+    let plenty = (1000 * GIB).to_string();
+
+    let outcome = prune_sized(&case, &root, &plenty, "k=lots");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "gate: remote prune removed 0 of 1 work folders\n", "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!("gate: remote could not size k: {FOLDER_BYTES_SEAM} is not a list of key=bytes pairs\n"),
+        "{outcome:?}"
+    );
+    assert_k_kept(&root, &outcome);
+}
+
 #[test]
 fn an_idle_work_folder_s_sent_build_record_goes_with_it() {
     let case = Case::new("prune_sent_build");

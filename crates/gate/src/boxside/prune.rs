@@ -2,10 +2,13 @@
 //! modes. The age prune, without `--keys`, which a scheduled task on the builder runs every few hours, removes the work
 //! folders no run has used for over 12 hours: a folder's last use is the newest last write of the folder, each tree's
 //! `.git\FETCH_HEAD` (every run fetches into each tree it checks out), the key's records and its lock. After its age
-//! pass, the age prune keeps the root's volume from filling: while its free space is under the low mark of the
-//! volume's floor ([`gate_wire::floor_marks`]), it removes the work folders the age pass kept that no run holds, least
-//! recent use first, one at a time, until the free space is at the high mark. The keyed prune removes
-//! the keys it is given, whatever their last use, and no other: the PC names the keys of worktrees it found gone.
+//! pass, its cap pass removes each work folder the age pass kept whose files total over [`FOLDER_CAP`] and that no run
+//! holds, whatever its last use, as the age pass removes one: a folder in daily use is never idle, and its build
+//! outputs grow without end. A folder whose lock the age pass found held is not measured. Then the age prune keeps the
+//! root's volume from filling: while its free space is under the low mark of the volume's floor
+//! ([`gate_wire::floor_marks`]), it removes the work folders the cap pass kept that no run holds, least recent use
+//! first, one at a time, until the free space is at the high mark. The keyed prune removes the keys it is given,
+//! whatever their last use, and no other: the PC names the keys of worktrees it found gone.
 //! Either way a key's work folder `<root>\work\<key>` goes only with its lock `<root>\work\<key>.lock` held, so no run
 //! is using it and none can start in it meanwhile (one that tries is refused busy, status 75, and its PC runs the
 //! command itself); a key whose lock is held is kept.
@@ -36,6 +39,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind};
 use std::os::windows::fs::OpenOptionsExt;
@@ -45,8 +49,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use gate_args::BoxSeams;
 use gate_router::escaped;
 use gate_win32::{DiskSpace, Make, Share};
+use gate_wire::floor::FOLDER_CAP;
 use gate_wire::{GIB, LAYOUT_CHANGING, floor_marks, is_drive_path, is_key};
-use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES};
+use windows_sys::Win32::Storage::FileSystem::{
+    DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_LIST_DIRECTORY,
+    FILE_READ_ATTRIBUTES,
+};
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
 use crate::boxside::forward::{ClientGone, OutputLock};
@@ -130,18 +138,24 @@ pub(crate) fn prune(root: &Path, keys: &[String], seams: &BoxSeams, now: SystemT
     }
 }
 
-/// The age prune of the root `root`, the space of its volume read as [`space_read`] reads it ([`aged_with`]).
+/// The age prune of the root `root`, the space of its volume read as [`space_read`] reads it and the size of each work
+/// folder as [`size_read`] does ([`aged_with`]).
 fn aged(root: &str, now: SystemTime, seams: &BoxSeams, console: &mut Console) -> Result<u32, String> {
-    aged_with(root, now, seams, &space_read, console)
+    let reads = Reads {
+        space: &space_read,
+        size: &size_read,
+    };
+    aged_with(root, now, seams, &reads, console)
 }
 
 /// The age prune of the root `root`, given without a trailing separator: removes the work folders idle at `now`, and
-/// the records of a key whose folder is gone, then those of the floor pass ([`Sweep::floor_removed`]), the space of the
-/// root's volume read by `space`; says each folder removed and how many, with a line on stderr for each key kept for a
-/// failure, then runs gc in each bare repository ([`Gc::bares_collected`]), and gives 0. Under a standing drain
-/// barrier, judged at the time `seams` give, it says so and touches nothing. Else the line saying why the sweep ended,
-/// or the barrier could not be read. A root or work folder that is not there holds nothing to remove.
-fn aged_with(root: &str, now: SystemTime, seams: &BoxSeams, space: &SpaceRead<'_>, console: &mut Console) -> Result<u32, String> {
+/// the records of a key whose folder is gone, then those of the cap pass ([`Sweep::cap_removed`]), the size of each
+/// folder read by `reads`, then those of the floor pass ([`Sweep::floor_removed`]), the space of the root's volume read
+/// by `reads`; says each folder removed and how many, with a line on stderr for each key kept for a failure, then runs
+/// gc in each bare repository ([`Gc::bares_collected`]), and gives 0. Under a standing drain barrier, judged at the time
+/// `seams` give, it says so and touches nothing. Else the line saying why the sweep ended, or the barrier could not be
+/// read. A root or work folder that is not there holds nothing to remove.
+fn aged_with(root: &str, now: SystemTime, seams: &BoxSeams, reads: &Reads<'_>, console: &mut Console) -> Result<u32, String> {
     if drained(root, seams)? {
         stamping::out(console, "gate: remote prune skipped: the builder is drained");
         return Ok(0);
@@ -152,16 +166,21 @@ fn aged_with(root: &str, now: SystemTime, seams: &BoxSeams, space: &SpaceRead<'_
     };
     let listed = listed(&sweep.work).map_err(|error| cannot_list(Path::new(&sweep.work_path), &error))?;
     let mut removed = 0;
-    // The floor pass takes the keys the age pass kept; one it failed has said its line once.
+    // The cap pass takes the keys the age pass kept, each marked held when a run held its lock; one it failed has said
+    // its line once.
     let mut left = Vec::new();
     for key in &listed.keys {
         match sweep.aged_key(key, console) {
             Pruned::Removed(_) => removed += 1,
             Pruned::Failed => {}
-            Pruned::Held | Pruned::Kept => left.push(key.as_str()),
+            Pruned::Held => left.push((key.as_str(), true)),
+            Pruned::Kept => left.push((key.as_str(), false)),
         }
     }
-    removed += sweep.floor_removed(&left, space, console);
+    // The floor pass takes the keys the cap pass kept, so a folder it removed is neither taken nor counted again.
+    let (capped, left) = sweep.cap_removed(&left, reads.size, console);
+    removed += capped;
+    removed += sweep.floor_removed(&left, reads.space, console);
     stamping::out(
         console,
         &format!("gate: remote prune removed {removed} of {} work folders", listed.folders),
@@ -188,6 +207,88 @@ fn aged_with(root: &str, now: SystemTime, seams: &BoxSeams, space: &SpaceRead<'_
 
 /// The reader of the space of the volume holding a root, given without a trailing separator, which a test replaces.
 type SpaceRead<'a> = dyn Fn(&str) -> io::Result<DiskSpace> + 'a;
+
+/// The reader of the size of a key's work folder, given the key and the folder held open for listing as itself, which a
+/// test replaces.
+type SizeRead<'a> = dyn Fn(&str, &File) -> io::Result<u64> + 'a;
+
+/// What the age prune reads beyond its root, which a test replaces: the space of the root's volume, and the size of a
+/// work folder.
+struct Reads<'a> {
+    space: &'a SpaceRead<'a>,
+    size: &'a SizeRead<'a>,
+}
+
+/// The size of the key `key`'s work folder `folder`, held open for listing as itself ([`folder_bytes`]); in a build with
+/// the test seams, `GATE_BOX_TEST_FOLDER_BYTES` gives the size of each key it names in place of the folder's own.
+fn size_read(key: &str, folder: &File) -> io::Result<u64> {
+    // Set by the suite's cap cases in tests/suite/boxside/prune.rs.
+    #[cfg(feature = "test-seams")]
+    if let Some(bytes) = seam_folder_bytes(key)? {
+        return Ok(bytes);
+    }
+    #[cfg(not(feature = "test-seams"))]
+    let _ = key;
+    folder_bytes(folder)
+}
+
+/// The bytes `GATE_BOX_TEST_FOLDER_BYTES`, a comma list of `<key>=<bytes>`, gives for the key `key`; `None` when it is
+/// not set or does not name the key. Else that it is no such list.
+#[cfg(feature = "test-seams")]
+fn seam_folder_bytes(key: &str) -> io::Result<Option<u64>> {
+    const NAME: &str = "GATE_BOX_TEST_FOLDER_BYTES";
+    let Some(value) = std::env::var_os(NAME) else {
+        return Ok(None);
+    };
+    let invalid = || io::Error::new(ErrorKind::InvalidInput, format!("{NAME} is not a list of key=bytes pairs"));
+    for pair in value.to_str().ok_or_else(invalid)?.split(',') {
+        let (named, bytes) = pair.split_once('=').ok_or_else(invalid)?;
+        if named.trim() == key {
+            return bytes.trim().parse().map(Some).map_err(|_| invalid());
+        }
+    }
+    Ok(None)
+}
+
+/// The sum of the sizes of the files beneath the folder `folder`, held open for listing as itself, each size and kind
+/// taken from its folder's listing ([`gate_win32::entries_beneath`]), so no file is opened. A link or a junction is
+/// neither counted nor entered. The walk is depth first, holding open only the folders on its current path, each
+/// opened beneath its parent's handle as itself; a folder beneath that cannot be opened or listed is skipped. Else why
+/// `folder` itself cannot be listed.
+fn folder_bytes(folder: &File) -> io::Result<u64> {
+    let mut total: u64 = 0;
+    // `held[n]` is the folder whose listing is `pending[n + 1]`; `pending[0]` is `folder`'s own.
+    let mut pending = vec![gate_win32::entries_beneath(folder)?.into_iter()];
+    let mut held: Vec<File> = Vec::new();
+    while let Some(entries) = pending.last_mut() {
+        let Some(entry) = entries.next() else {
+            pending.pop();
+            held.pop();
+            continue;
+        };
+        if entry.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            continue;
+        }
+        if entry.attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            total = total.saturating_add(entry.size);
+        } else if let Some((beneath, listing)) = listed_folder(held.last().unwrap_or(folder), &entry.name) {
+            held.push(beneath);
+            pending.push(listing.into_iter());
+        }
+    }
+    Ok(total)
+}
+
+/// The folder `name` in the held folder `parent`, opened beneath it as itself for listing, and its listing; `None`
+/// when it cannot be opened or listed, or is no folder of its own.
+fn listed_folder(parent: &File, name: &OsStr) -> Option<(File, Vec<gate_win32::ListedEntry>)> {
+    let folder = gate_win32::open_beneath_as(parent, name.to_str()?, LOOK_ACCESS, Share::All, Make::Open).ok()?;
+    if !is_folder_itself(&folder).ok()? {
+        return None;
+    }
+    let listing = gate_win32::entries_beneath(&folder).ok()?;
+    Some((folder, listing))
+}
 
 /// The reads of the space of a volume this process has made, which pick the value of a sequence the free-space seam
 /// gives.
@@ -465,6 +566,8 @@ enum Mode {
     Aged,
     /// The age prune's floor pass: a folder whatever its last use, and the lock kept.
     Floor,
+    /// The age prune's cap pass: a folder over [`FOLDER_CAP`] whatever its last use, and the lock kept.
+    Cap,
     /// The keyed prune: whatever the folder's last use, the lock it made removed, and the key's refs deleted.
     Named,
 }
@@ -572,6 +675,63 @@ impl Sweep {
             stamping::out(console, &format!("gate: remote pruned {}: idle {hours} h", escaped(key)));
         }
         pruned
+    }
+
+    /// The age prune's cap pass over the keys `left` after its age pass, each marked held when a run held its lock then:
+    /// removes each work folder whose files total over [`FOLDER_CAP`], its size read by `size` ([`Sweep::size_said`]),
+    /// when no run holds its key's lock ([`Mode::Cap`]), whatever its last use, saying each removed with its size in
+    /// whole GiB. A key marked held is kept unmeasured. How many it removed, and the keys it kept, a key that failed left
+    /// out as the age pass leaves it out, for it has said its line.
+    fn cap_removed<'k>(&self, left: &[(&'k str, bool)], size: &SizeRead<'_>, console: &mut Console) -> (usize, Vec<&'k str>) {
+        let (mut removed, mut kept) = (0, Vec::new());
+        for &(key, held) in left {
+            let measured = if held { None } else { self.size_said(key, size, console) };
+            let Some(bytes) = measured.filter(|bytes| *bytes > FOLDER_CAP) else {
+                kept.push(key);
+                continue;
+            };
+            match self.pruned_key(key, Mode::Cap, console) {
+                Pruned::Removed(_) => {
+                    removed += 1;
+                    let (gib, cap) = (bytes / GIB, FOLDER_CAP / GIB);
+                    stamping::out(
+                        console,
+                        &format!("gate: remote pruned {}: {gib} GiB, over the {cap} GiB cap", escaped(key)),
+                    );
+                }
+                Pruned::Failed => {}
+                Pruned::Held | Pruned::Kept => kept.push(key),
+            }
+        }
+        (removed, kept)
+    }
+
+    /// The size of the key's work folder, opened beneath the work folder as itself for listing and read by `size`;
+    /// `None` when it has no folder or it is no folder of its own, or once a line on stderr said it cannot be opened,
+    /// looked at or read.
+    fn size_said(&self, key: &str, size: &SizeRead<'_>, console: &mut Console) -> Option<u64> {
+        let say = |error: &io::Error, console: &mut Console| {
+            let why = escaped(&error.to_string());
+            stamping::err(console, &format!("gate: remote could not size {}: {why}", escaped(key)));
+        };
+        let looked = match gate_win32::open_beneath_as(&self.work, key, LOOK_ACCESS, Share::All, Make::Open) {
+            Ok(looked) => looked,
+            Err(error) if error.kind() == ErrorKind::NotFound => return None,
+            Err(error) => {
+                say(&error, console);
+                return None;
+            }
+        };
+        match is_folder_itself(&looked) {
+            Ok(true) => {}
+            // A key whose folder is a link, a junction or a file failed the age pass, which said why.
+            Ok(false) => return None,
+            Err(error) => {
+                say(&error, console);
+                return None;
+            }
+        }
+        size(key, &looked).inspect_err(|error| say(error, console)).ok()
     }
 
     /// The age prune's floor pass over the keys `left` after its age pass: while the free space of the root's volume,
@@ -1110,7 +1270,7 @@ fn cannot_list(path: &Path, error: &io::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::fs::{self, File};
     use std::io;
     use std::os::windows::fs::OpenOptionsExt;
@@ -1123,7 +1283,10 @@ mod tests {
     use gate_wire::GIB;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 
-    use super::{Gc, IDLE_AGE, RECORDS_BEFORE, SpaceRead, aged_with, held_bare, idle_for, key_file_stem, opened_root, prune, root_name};
+    use super::{
+        Gc, IDLE_AGE, RECORDS_BEFORE, Reads, SpaceRead, aged_with, folder_bytes, held_bare, idle_for, key_file_stem, opened_root, prune, root_name,
+        size_read,
+    };
     use crate::boxside::preflight::Git;
 
     #[test]
@@ -1301,11 +1464,17 @@ mod tests {
 
     /// The age prune of `root` at `now`, the space of its volume read by `space`: its status and the lines it said on
     /// stderr.
-    #[expect(clippy::expect_used, reason = "a floor case that cannot make, age or remove its folders must fail loudly")]
     fn floor_swept(root: &Path, now: SystemTime, space: &SpaceRead<'_>) -> (Result<u32, String>, Vec<String>) {
+        swept(root, now, &Reads { space, size: &size_read })
+    }
+
+    /// The age prune of `root` at `now`, the space of its volume and the size of each work folder read by `reads`: its
+    /// status and the lines it said on stderr.
+    #[expect(clippy::expect_used, reason = "a case whose root is not Unicode must fail loudly")]
+    fn swept(root: &Path, now: SystemTime, reads: &Reads<'_>) -> (Result<u32, String>, Vec<String>) {
         let mut console = Console::new();
         let text = root.to_str().expect("the root is Unicode");
-        let status = aged_with(text, now, &BoxSeams::default(), space, &mut console);
+        let status = aged_with(text, now, &BoxSeams::default(), reads, &mut console);
         (status, console.take_notes())
     }
 
@@ -1483,5 +1652,196 @@ mod tests {
         assert!(said.is_empty(), "{said:?}");
         assert!(unlocked_gone, "the folder used 10 hours ago goes first, whatever its new lock's stamp");
         assert!(older_kept, "the high mark is reached before it");
+    }
+
+    const BIG: &str = "big";
+
+    /// The age prune of `root` at `now`, its volume with 1000 GiB free so the floor pass never acts, and the work folder
+    /// [`BIG`] measured as `big` bytes, every other as one byte: its status and the lines it said on stderr.
+    fn cap_swept(root: &Path, now: SystemTime, big: io::Result<u64>) -> (Result<u32, String>, Vec<String>) {
+        let plenty = |_: &str| {
+            Ok(DiskSpace {
+                free_to_caller: 1000 * GIB,
+                total: TOTAL,
+            })
+        };
+        let big = RefCell::new(Some(big));
+        let size = |key: &str, _: &File| {
+            if key == BIG {
+                big.borrow_mut().take().unwrap_or_else(|| Err(io::Error::other("measured twice")))
+            } else {
+                Ok(1)
+            }
+        };
+        swept(root, now, &Reads { space: &plenty, size: &size })
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a cap case that cannot make, age or remove its folders must fail loudly")]
+    fn a_recent_folder_over_the_cap_that_no_run_holds_goes() {
+        let (root, now) = (floor_root("cap-over"), SystemTime::now());
+        let big = used_folder(&root, BIG, Duration::from_mins(5), now);
+        let recent = used_folder(&root, RECENT, Duration::from_mins(5), now);
+
+        let (status, said) = cap_swept(&root, now, Ok(60 * GIB + 1));
+
+        let (big_gone, recent_kept) = (!big.exists(), recent.is_dir());
+        let lock_kept = root.join(format!(r"work\{BIG}.lock")).is_file();
+        fs::remove_dir_all(&root).expect("the root can be removed");
+        assert_eq!(status, Ok(0));
+        assert!(said.is_empty(), "{said:?}");
+        assert!(big_gone, "a folder a byte over 60 GiB goes, however recent");
+        assert!(lock_kept, "its lock stays, as the age pass leaves it");
+        assert!(recent_kept, "a folder under the cap stays");
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a cap case that cannot make, age or remove its folders must fail loudly")]
+    fn a_folder_over_the_cap_a_run_holds_stays() {
+        let (root, now) = (floor_root("cap-held"), SystemTime::now());
+        let big = used_folder(&root, BIG, Duration::from_mins(5), now);
+        // A run holds its lock sharing nothing.
+        let run = File::options()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(root.join(format!(r"work\{BIG}.lock")));
+
+        let (status, said) = cap_swept(&root, now, Ok(100 * GIB));
+
+        drop(run.expect("the run's hold is taken"));
+        let kept = big.is_dir();
+        fs::remove_dir_all(&root).expect("the root can be removed");
+        assert_eq!(status, Ok(0));
+        assert!(said.is_empty(), "{said:?}");
+        assert!(kept, "a folder whose lock a run holds stays, whatever its size");
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a cap case that cannot make, age or remove its folders must fail loudly")]
+    fn a_folder_of_60_gib_exactly_stays() {
+        let (root, now) = (floor_root("cap-at"), SystemTime::now());
+        let big = used_folder(&root, BIG, Duration::from_mins(5), now);
+
+        let (status, said) = cap_swept(&root, now, Ok(60 * GIB));
+
+        let kept = big.is_dir();
+        fs::remove_dir_all(&root).expect("the root can be removed");
+        assert_eq!(status, Ok(0));
+        assert!(said.is_empty(), "{said:?}");
+        assert!(kept, "the cap removes a folder over 60 GiB alone");
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a cap case that cannot make, age or remove its folders must fail loudly")]
+    fn a_folder_whose_size_cannot_be_read_is_said_and_stays() {
+        let (root, now) = (floor_root("cap-unsized"), SystemTime::now());
+        let big = used_folder(&root, BIG, Duration::from_mins(5), now);
+
+        let (status, said) = cap_swept(&root, now, Err(io::Error::other("the folder is gone")));
+
+        let kept = big.is_dir();
+        fs::remove_dir_all(&root).expect("the root can be removed");
+        assert_eq!(status, Ok(0));
+        assert_eq!(said, [format!("gate: remote could not size {BIG}: the folder is gone")]);
+        assert!(kept);
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a cap case that cannot make, hold or remove its folders must fail loudly")]
+    fn a_folder_a_run_holds_is_not_measured() {
+        let (root, now) = (floor_root("cap-unmeasured"), SystemTime::now());
+        let big = used_folder(&root, BIG, Duration::from_mins(5), now);
+        let run = File::options()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(root.join(format!(r"work\{BIG}.lock")));
+
+        // A measure would fail, and say so.
+        let (status, said) = cap_swept(&root, now, Err(io::Error::other("measured")));
+
+        drop(run.expect("the run's hold is taken"));
+        let kept = big.is_dir();
+        fs::remove_dir_all(&root).expect("the root can be removed");
+        assert_eq!(status, Ok(0));
+        assert!(said.is_empty(), "a held folder is never measured: {said:?}");
+        assert!(kept);
+    }
+
+    /// A folder under the temp folder for the walk case `name`, holding `a.txt` (3 bytes), `sub\b.txt` (5 bytes) and
+    /// `sub\deep\c.txt` (7 bytes), removed first if an earlier run left it.
+    #[expect(clippy::expect_used, reason = "a walk case that cannot make its folders must fail loudly")]
+    fn walk_folder(name: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("gate-prune-walk-{name}-{}", std::process::id()));
+        if base.exists() {
+            fs::remove_dir_all(&base).expect("an earlier folder can be removed");
+        }
+        let top = base.join("top");
+        fs::create_dir_all(top.join(r"sub\deep")).expect("the folders can be made");
+        fs::write(top.join("a.txt"), "aaa").expect("a file can be written");
+        fs::write(top.join(r"sub\b.txt"), "bbbbb").expect("a file can be written");
+        fs::write(top.join(r"sub\deep\c.txt"), "ccccccc").expect("a file can be written");
+        base
+    }
+
+    /// The size [`folder_bytes`] reads of the folder `top`, opened for listing.
+    #[expect(clippy::expect_used, reason = "a walk case that cannot open its folder must fail loudly")]
+    fn walked(top: &Path) -> u64 {
+        let folder = File::options()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(top)
+            .expect("the folder opens");
+        folder_bytes(&folder).expect("the folder is measured")
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a walk case that cannot remove its folders must fail loudly")]
+    fn the_walk_sums_the_files_of_every_nested_folder() {
+        let base = walk_folder("nested");
+
+        let bytes = walked(&base.join("top"));
+
+        fs::remove_dir_all(&base).expect("the folders can be removed");
+        assert_eq!(bytes, 15);
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a walk case that cannot make or remove its folders must fail loudly")]
+    fn the_walk_neither_counts_nor_enters_a_junction() {
+        let base = walk_folder("junction");
+        let outside = base.join("outside");
+        fs::create_dir(&outside).expect("the outside folder can be made");
+        fs::write(outside.join("e.txt"), "eeeeeeeeeeeee").expect("a file can be written");
+        crate::test_support::junction(&base.join(r"top\sub\link"), &outside);
+
+        let bytes = walked(&base.join("top"));
+
+        fs::remove_dir(base.join(r"top\sub\link")).expect("the junction can be removed");
+        fs::remove_dir_all(&base).expect("the folders can be removed");
+        assert_eq!(bytes, 15, "the 13 bytes through the junction are not counted");
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a walk case that cannot make, hold or remove its folders must fail loudly")]
+    fn the_walk_skips_a_folder_it_cannot_list_and_sums_the_rest() {
+        let base = walk_folder("unlisted");
+        let locked = base.join(r"top\locked");
+        fs::create_dir(&locked).expect("the folder can be made");
+        fs::write(locked.join("d.txt"), "ddddddddddd").expect("a file can be written");
+        // Held sharing nothing, so the walk cannot open it to list it.
+        let hold = File::options()
+            .read(true)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&locked)
+            .expect("the folder can be held");
+
+        let bytes = walked(&base.join("top"));
+
+        drop(hold);
+        fs::remove_dir_all(&base).expect("the folders can be removed");
+        assert_eq!(bytes, 15, "the 11 bytes in the folder it cannot list are skipped");
     }
 }

@@ -339,14 +339,22 @@ pub fn names_beneath(folder: &File) -> io::Result<Vec<OsString>> {
     Ok(entries_beneath(folder)?.into_iter().map(|entry| entry.name).collect())
 }
 
-/// One entry of a folder's listing as the full directory class gives it: its name and its attributes.
-struct Listed {
-    name: OsString,
-    attributes: u32,
+/// One entry of a folder's listing as the full directory class gives it: its name, its attributes, and its size, the
+/// end of its data (`EndOfFile`), which for a link or a junction is the link's own.
+#[derive(Clone, Debug)]
+pub struct ListedEntry {
+    pub name: OsString,
+    pub attributes: u32,
+    pub size: u64,
 }
 
-/// Every entry inside the open folder `folder`, as [`names_beneath`] lists them, each with what the listing says of it.
-fn entries_beneath(folder: &File) -> io::Result<Vec<Listed>> {
+/// Every entry inside the open folder `folder`, as [`names_beneath`] lists them, each with what the listing says of it,
+/// so no entry has to be opened to learn its kind or its size.
+///
+/// # Errors
+///
+/// As [`names_beneath`].
+pub fn entries_beneath(folder: &File) -> io::Result<Vec<ListedEntry>> {
     // Eight-byte units, so each entry the system writes is aligned for its structure.
     let mut buffer = vec![0_u64; DIRECTORY_BUFFER_UNITS];
     let size = u32::try_from(size_of_val(buffer.as_slice())).map_err(io::Error::other)?;
@@ -372,7 +380,7 @@ const DIRECTORY_BUFFER_UNITS: usize = 8 * 1024;
 
 /// Adds to `entries` each entry the system wrote in `buffer`, `.` and `..` left out. Each entry is read only as far as
 /// its name ends, so a short last entry near the buffer's end is read whole.
-fn listed_in(buffer: &[u64], entries: &mut Vec<Listed>) -> io::Result<()> {
+fn listed_in(buffer: &[u64], entries: &mut Vec<ListedEntry>) -> io::Result<()> {
     const DOT: u16 = b'.' as u16;
     // SAFETY: the bytes of `buffer`, which it holds for as long as the slice lives; a byte needs no alignment.
     let raw = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), size_of_val(buffer)) };
@@ -387,9 +395,11 @@ fn listed_in(buffer: &[u64], entries: &mut Vec<Listed>) -> io::Result<()> {
         let name_bytes = raw.get(name_start..name_start + length).ok_or_else(past)?;
         let wide: Vec<u16> = name_bytes.as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
         if wide != [DOT] && wide != [DOT, DOT] {
-            entries.push(Listed {
+            entries.push(ListedEntry {
                 name: OsString::from_wide(&wide),
                 attributes: u32_at(header, std::mem::offset_of!(FILE_FULL_DIR_INFO, FileAttributes))?,
+                // A negative end of data is no size the system gives a file; it counts as none.
+                size: u64::try_from(i64::from_le_bytes(bytes_at(header, std::mem::offset_of!(FILE_FULL_DIR_INFO, EndOfFile))?)).unwrap_or(0),
             });
         }
         if next == 0 {
@@ -590,13 +600,13 @@ pub fn delete_fresh_beneath(top: &File, fresh: Fresh, spared: &dyn Fn(&Path) -> 
 struct FreshLevel {
     folder: Option<File>,
     path: PathBuf,
-    entries: Vec<Listed>,
+    entries: Vec<ListedEntry>,
 }
 
 /// What [`fresh_visit`] did with an entry.
 enum Visit {
     /// A folder of its own, held without delete sharing, and the entries in it.
-    Descend(File, Vec<Listed>),
+    Descend(File, Vec<ListedEntry>),
     /// A fresh file, deleted.
     Deleted,
     /// Anything else, left as it is: a file that is not fresh, a folder that is a reparse point, or an entry gone.
@@ -604,7 +614,7 @@ enum Visit {
 }
 
 /// Visits the listed `entry` of the open folder `parent` for [`delete_fresh_beneath`].
-fn fresh_visit(parent: &File, entry: &Listed, fresh: Fresh) -> io::Result<Visit> {
+fn fresh_visit(parent: &File, entry: &ListedEntry, fresh: Fresh) -> io::Result<Visit> {
     let wide: Vec<u16> = entry.name.encode_wide().collect();
     if entry.attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
         if entry.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -656,7 +666,7 @@ fn written_at_or_after(metadata: &Metadata, since: SystemTime) -> io::Result<boo
 
 /// The entries in the open folder `folder`, listed through a second handle of it with list access alone, closed once
 /// listed.
-fn listed_entries(folder: &File) -> io::Result<Vec<Listed>> {
+fn listed_entries(folder: &File) -> io::Result<Vec<ListedEntry>> {
     let opening = Opening {
         access: FILE_LIST_DIRECTORY,
         share: Share::All,
