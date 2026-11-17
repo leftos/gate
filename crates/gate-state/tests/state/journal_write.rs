@@ -785,12 +785,14 @@ fn two_balanced(has_duration: bool) -> Balanced {
                 tenths: 404,
                 free: 1,
                 cold: false,
+                spared: false,
             },
             BalancedEntry {
                 alias: "host".to_owned(),
                 tenths: 1250,
                 free: 0,
                 cold: true,
+                spared: false,
             },
         ],
         has_duration,
@@ -849,6 +851,32 @@ fn a_release_line_carries_not_routed_reason_fell_back_balanced_and_parent_pid_wh
             r#"{"builder":"host","expectedSeconds":125.0,"free":0,"cold":true}],"parentPid":40267}"#
         )),
         "{line}"
+    );
+}
+
+/// A release line's `balanced` entry writes `"spared": true` for a spared builder and no `spared` key for any other.
+#[test]
+fn a_release_line_writes_spared_only_for_a_spared_builder() {
+    let mut balanced = two_balanced(true);
+    balanced.entries[1].spared = true;
+    let event = release_routed(RoutingFacts {
+        not_routed: None,
+        reason: None,
+        fell_back: Vec::new(),
+        balanced: Some(balanced),
+        parent_pid: None,
+        sent_words: None,
+        stage: None,
+        low_disk: None,
+    });
+    let line = journal_line(&identity(), ts(NOW), &event, None, None);
+    let entries = &parsed(&line)["balanced"];
+
+    assert_eq!(entries[1]["spared"], true, "{line}");
+    assert!(entries[0].get("spared").is_none(), "{line}");
+    assert!(
+        line.contains(r#"{"builder":"host","expectedSeconds":125.0,"free":0,"cold":true,"spared":true}"#),
+        "spared follows cold: {line}"
     );
 }
 

@@ -532,7 +532,8 @@ pub trait Facts {
 
     /// What the PC knows of each of `builders` for the command `words`, rewritten for Windows, of the worktree at
     /// `place` ([`BuilderFigures`]): one entry per builder, in the order given, which [`balance::ranked_with_first`]
-    /// ranks, a builder first for the command with a free slot ahead, then score order; `None` when these facts read no
+    /// ranks, a builder first for the command with a free slot ahead, then score order, the top builder's last free slots
+    /// spared for a builder with room; `None` when these facts read no
     /// figures, which keeps the builders in file order, those first for the command ahead, and the run without a balanced pick
     /// ([`RemoteRun::balanced`]). Asked once per decision, with every builder one of whose own patterns matches the
     /// command, of a matched command whose worktree opened and that its `.gate/local.toml` does not keep here, only when
@@ -895,7 +896,8 @@ pub struct UsedTool {
 pub struct RemoteRun {
     /// The builder this run goes to: the command's pick, the first builder listing the repo with a pattern that matches
     /// (each `builders` entry, then `host`), a builder first for the command with a free slot ahead, then in score
-    /// order ([`balance::ranked_with_first`]), a held work folder and then file order breaking ties.
+    /// order, the top builder's last free slots spared for a builder with room ([`balance::ranked_with_first`]), a held
+    /// work folder and then file order breaking ties.
     pub builder: Builder,
     /// The worktree root as git gives it.
     pub root: String,
@@ -971,16 +973,17 @@ pub struct RemoteRun {
     /// read it.
     pub source_revision: Option<String>,
     /// The builders the run may try next when it falls back, in the order it would try them: each `builders` entry
-    /// listing the repo, then `host`, a builder first for the command with a free slot ahead, then in score order
-    /// ([`balance::ranked_with_first`]), a held work folder and then file order breaking ties, minus the builder this
+    /// listing the repo, then `host`, a builder first for the command with a free slot ahead, then in score order, the
+    /// top builder's last free slots spared for a builder with room ([`balance::ranked_with_first`]), a held work folder
+    /// and then file order breaking ties, minus the builder this
     /// run goes to, each one a pattern of whose own list the command matched, held
     /// by its alias alone. A caller that falls back builds a candidate's run when it tries it ([`later_run`]); nothing is
     /// built here.
     pub later: Vec<LaterCandidate>,
     /// Every builder the decision scored, when it scored two or more from figures the facts read
     /// ([`Facts::builder_figures`], [`balance::ranked_with_first`]): the builder this run goes to first, then every other
-    /// in rank order, a builder first for the command with a free slot ahead, then score order, each with its score and
-    /// figures. `None` for a run pinned with `--builder`, a command only one builder may
+    /// in rank order, a builder first for the command with a free slot ahead, then score order, the top builder's last
+    /// free slots spared for a builder with room ([`balance::ranked_with_first`]), each with its score and figures. `None` for a run pinned with `--builder`, a command only one builder may
     /// run, a decision whose facts read no figures (a light run's reroute by a critical request, `gate warm`), and a
     /// later candidate's run ([`later_run`]).
     pub balanced: Option<Balanced>,
@@ -3211,8 +3214,8 @@ fn kept_here(here: Here) -> String {
 }
 
 /// The builders the run may try next after the `chosen` one, in the order it would try them: the decision's score
-/// `order` ([`scored`]), a free first builder ahead and ties broken as [`balance::ranked_with_first`] ranks them, minus
-/// the chosen builder. No fact is asked.
+/// `order` ([`scored`]), a free first builder ahead, the top builder's last free slots spared for a builder with room
+/// and ties broken as [`balance::ranked_with_first`] ranks them, minus the chosen builder. No fact is asked.
 fn later_candidates(order: &[(Builder, String)], chosen: &Builder) -> Vec<LaterCandidate> {
     order
         .iter()
@@ -3929,6 +3932,7 @@ fn scored(candidates: Vec<Candidate>, place: &Place, words: &[String], facts: &d
             tenths: balance::tenths(rank.seconds),
             free: figures[rank.index].free_slots,
             cold: !figures[rank.index].holds_folder,
+            spared: rank.spared,
         })
         .collect();
     let balanced = Balanced {
@@ -3982,10 +3986,12 @@ fn proven_faster_here(local_p50: Option<f64>, scores: Option<&Scores>, chosen: &
 }
 
 /// The scored builders as the run that goes to `chosen` tells them ([`RemoteRun::balanced`]): the chosen builder first,
-/// then every other in score order.
+/// then every other in score order. The chosen builder is never said spared ([`BalancedEntry::spared`]), as the run
+/// takes its slot after all.
 fn picked_first(mut balanced: Balanced, chosen: &Builder) -> Balanced {
     if let Some(at) = balanced.entries.iter().position(|entry| entry.alias == chosen.alias) {
-        let pick = balanced.entries.remove(at);
+        let mut pick = balanced.entries.remove(at);
+        pick.spared = false;
         balanced.entries.insert(0, pick);
     }
     balanced

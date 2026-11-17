@@ -220,6 +220,7 @@ fn a_light_gate_with_no_local_history_routes() {
         tenths,
         free: 1,
         cold: false,
+        spared: false,
     };
     assert_eq!(
         run.balanced,
@@ -5018,6 +5019,31 @@ fn a_backslash_steered_off_best_builder_falls_to_the_next_best_score_not_the_nex
 }
 
 #[test]
+fn a_spared_builder_the_steer_off_picks_is_not_said_spared() {
+    let builders = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["dotnet *"]}},
+        {"host": "win-2", "os": "windows", "repos": {"yaat": ["dotnet *"]}}]"#;
+    let last_two = BuilderFigures {
+        free_slots: 2,
+        ..figures(0.0, Some(587.0))
+    };
+    let roomy = BuilderFigures {
+        free_slots: 6,
+        holds_folder: false,
+        ..figures(0.0, Some(375.5))
+    };
+    let facts = windows_only_facts(r#"{"other": ["*"]}"#, builders, false)
+        .with_figures("mac-1", roomy)
+        .with_figures("win-2", last_two);
+    let run = routed(decide(&heavy(&words(&["dotnet", "build", r"src\Duel.sln"])), &facts));
+    assert_eq!(run.builder.alias, "win-2", "the backslash word takes the Mac the spare moved up away");
+    assert_eq!(
+        run.balanced,
+        Some(with_durations(vec![entry("win-2", 5870, 2, false), entry("mac-1", 7510, 6, true)])),
+        "the pick is never said spared"
+    );
+}
+
+#[test]
 fn a_routed_run_with_two_capable_builders_asks_their_figures_once() {
     let facts = FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, TWO_WINDOWS));
     routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
@@ -5086,6 +5112,7 @@ fn entry(alias: &str, tenths: u64, free: u32, cold: bool) -> BalancedEntry {
         tenths,
         free,
         cold,
+        spared: false,
     }
 }
 
@@ -5121,6 +5148,32 @@ fn the_balanced_value_lists_the_pick_then_the_others_in_score_order() {
             entry("win-1", 3000, 1, false),
         ]))
     );
+}
+
+#[test]
+fn a_balanced_value_marks_the_builder_spared_for_one_with_room() {
+    let last_two = BuilderFigures {
+        free_slots: 2,
+        ..figures(0.0, Some(587.0))
+    };
+    let roomy = BuilderFigures {
+        free_slots: 6,
+        holds_folder: false,
+        ..figures(0.0, Some(375.5))
+    };
+    let facts = FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, TWO_WINDOWS))
+        .with_figures("win-2", last_two)
+        .with_figures("win-3", roomy);
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(
+        run.builder.alias, "win-3",
+        "751 s with room is within 1.5 times 587 s on win-2's last two slots"
+    );
+    let spared = BalancedEntry {
+        spared: true,
+        ..entry("win-2", 5870, 2, false)
+    };
+    assert_eq!(run.balanced, Some(with_durations(vec![entry("win-3", 7510, 6, true), spared])));
 }
 
 #[test]

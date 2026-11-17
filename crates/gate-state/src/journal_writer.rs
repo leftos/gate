@@ -830,7 +830,9 @@ fn stage_value(stage: &StageFacts) -> Value {
 }
 
 /// A scored builder as a release line's `balanced` field writes it: `{"builder", "expectedSeconds", "free", "cold"}`,
-/// the score to the one decimal it keeps, or `null` when the decision's scores include no duration (`has_duration`).
+/// the score to the one decimal it keeps, or `null` when the decision's scores include no duration (`has_duration`),
+/// then `"spared": true` for a builder the run passed over to spare its last free slots
+/// ([`BalancedEntry::spared`]), and no `spared` key for any other.
 fn balanced_entry(entry: &BalancedEntry, has_duration: bool) -> Value {
     let mut object = Map::new();
     object.insert("builder".to_owned(), Value::from(entry.alias.as_str()));
@@ -838,6 +840,9 @@ fn balanced_entry(entry: &BalancedEntry, has_duration: bool) -> Value {
     object.insert("expectedSeconds".to_owned(), expected);
     object.insert("free".to_owned(), Value::from(entry.free));
     object.insert("cold".to_owned(), Value::Bool(entry.cold));
+    if entry.spared {
+        object.insert("spared".to_owned(), Value::Bool(true));
+    }
     Value::Object(object)
 }
 

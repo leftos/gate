@@ -402,7 +402,8 @@ fn balanced_line(balanced: &Balanced) -> Option<String> {
 
 /// A scored builder's figures as the balanced line says them: `about {score}` (a span by [`durations::span_text`])
 /// when the decision's scores include a duration (`has_duration`), else `no history`; then `, {n} free`, or `, full`
-/// with no free slot; then `, cold` when it is not known to hold the worktree's work folder.
+/// with no free slot; then `, spared` when the run passed it over to spare its last free slots
+/// ([`BalancedEntry::spared`]); then `, cold` when it is not known to hold the worktree's work folder.
 fn balanced_figures(entry: &BalancedEntry, has_duration: bool) -> String {
     let expected = if has_duration {
         format!("about {}", durations::span_text(entry.seconds()))
@@ -414,8 +415,9 @@ fn balanced_figures(entry: &BalancedEntry, has_duration: bool) -> String {
     } else {
         ", full".to_owned()
     };
+    let spared = if entry.spared { ", spared" } else { "" };
     let cold = if entry.cold { ", cold" } else { "" };
-    format!("{expected}{free}{cold}")
+    format!("{expected}{free}{spared}{cold}")
 }
 
 /// What a light gate held back behind a critical request does once its command is asked again as heavy
@@ -3030,6 +3032,7 @@ mod tests {
             tenths,
             free,
             cold,
+            spared: false,
         }
     }
 
@@ -3054,6 +3057,24 @@ mod tests {
             Some("gate: balanced to a: about 10 s, 1 free (b about 20 s, 1 free; c about 30 s, 1 free)")
         );
         assert_eq!(balanced_line(&balanced(true, Vec::new())), None, "no line when nothing was scored");
+    }
+
+    #[test]
+    fn a_spared_builder_says_spared_in_the_balanced_line() {
+        let spared = |cold: bool| BalancedEntry {
+            spared: true,
+            ..entry("win", 5870, 2, cold)
+        };
+        let warm = balanced(true, vec![entry("mac", 7510, 6, true), spared(false)]);
+        assert_eq!(
+            balanced_line(&warm).as_deref(),
+            Some("gate: balanced to mac: about 13 min, 6 free, cold (win about 10 min, 2 free, spared)")
+        );
+        let cold = balanced(true, vec![entry("mac", 7510, 6, true), spared(true)]);
+        assert_eq!(
+            balanced_line(&cold).as_deref(),
+            Some("gate: balanced to mac: about 13 min, 6 free, cold (win about 10 min, 2 free, spared, cold)")
+        );
     }
 
     #[test]

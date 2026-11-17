@@ -1,7 +1,8 @@
 //! The order a routed run tries its capable builders in: by the earliest expected finish of each, read from the figures
 //! the caller gives for it ([`BuilderFigures`]), a held work folder and then file order breaking an exact tie
 //! ([`order`], [`ranked`]), a builder `first` for the command with a free slot going before all of them
-//! ([`ranked_with_first`]);
+//! ([`ranked_with_first`]), and a top builder down to its last [`SPARE_SLOTS`] free slots giving way to one with more
+//! room whose expected finish is at most [`SPARE_SHARE`] times its own, so they stay for runs with no other builder;
 //! and the compare that keeps a light run here when its learned local p50 is under
 //! [`FASTER_HERE_SHARE`] of the expected finish of the builder it would go to ([`faster_here`]).
 
@@ -50,7 +51,16 @@ pub struct Rank {
     /// cold gap, else the duration once more; the queue wait alone when no builder has a duration
     /// ([`Ranking::has_duration`]).
     pub seconds: f64,
+    /// Whether the run passed this builder over to spare its last free slots ([`SPARE_SLOTS`]) for runs with no other
+    /// builder.
+    pub spared: bool,
 }
+
+/// The most free slots a top builder can have and still be spared for one with more ([`ranked_with_first`]).
+pub const SPARE_SLOTS: u32 = 2;
+
+/// The share of the spared builder's expected finish up to which, inclusive, a builder with room is taken in its place.
+pub const SPARE_SHARE: f64 = 1.5;
 
 /// The builders of one decision's figures, best first, each with its score ([`ranked`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -74,7 +84,10 @@ pub fn ranked(figures: &[BuilderFigures]) -> Ranking {
 /// (`free_slots` above 0) ranks before every other builder, whatever their scores or warmth, and among several such
 /// builders the chain of [`ranked`] (expected finish, a held work folder, then the given order) decides. A first
 /// builder with no free slot ranks by that chain like any other, even when its queue wait reads 0, as it does for a
-/// full pool whose holder has overrun its usual time. Each score stays the builder's own.
+/// full pool whose holder has overrun its usual time. A top builder that is no free first builder and has 1 to
+/// [`SPARE_SLOTS`] free slots is spared ([`Rank::spared`]) for the best builder after it with more free slots and an
+/// expected finish at most [`SPARE_SHARE`] times its own, which moves to the front ahead of it. Each score stays the
+/// builder's own.
 #[must_use]
 pub fn ranked_with_first(figures: &[BuilderFigures], first: &[bool]) -> Ranking {
     let usable = |seconds: f64| seconds.is_finite() && seconds >= 0.0;
@@ -94,11 +107,13 @@ pub fn ranked_with_first(figures: &[BuilderFigures], first: &[bool]) -> Ranking 
         let warm_first = figures[right].holds_folder.cmp(&figures[left].holds_folder);
         first_ahead.then(scores[left].total_cmp(&scores[right])).then(warm_first)
     });
+    let spared = spare_last_slots(&mut indexes, figures, &scores, free_first);
     let ranks = indexes
         .into_iter()
         .map(|index| Rank {
             index,
             seconds: scores[index],
+            spared: spared == Some(index),
         })
         .collect();
     Ranking {
@@ -107,12 +122,29 @@ pub fn ranked_with_first(figures: &[BuilderFigures], first: &[bool]) -> Ranking 
     }
 }
 
+/// Moves to the front of the sorted `indexes` the first builder after the top one with more than [`SPARE_SLOTS`] free
+/// slots and an expected finish (`scores`) at most [`SPARE_SHARE`] times the top one's, when the top builder is no free
+/// first builder (`free_first`) and has 1 to [`SPARE_SLOTS`] free slots; every other index keeps its place in order.
+/// The index of the top builder so passed over, `None` when the order stays as sorted.
+fn spare_last_slots(indexes: &mut Vec<usize>, figures: &[BuilderFigures], scores: &[f64], free_first: impl Fn(usize) -> bool) -> Option<usize> {
+    let &top = indexes.first()?;
+    if free_first(top) || !(1..=SPARE_SLOTS).contains(&figures[top].free_slots) {
+        return None;
+    }
+    let roomy = |index: usize| figures[index].free_slots > SPARE_SLOTS && scores[index] <= SPARE_SHARE * scores[top];
+    let position = indexes.iter().skip(1).position(|&index| roomy(index))? + 1;
+    let alt = indexes.remove(position);
+    indexes.insert(0, alt);
+    Some(top)
+}
+
 /// The builders a routed run's decision scored from the figures this PC read, two or more, as the run's `balanced to`
 /// line and its journal's `balanced` field tell them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Balanced {
     /// The builder the run goes to first, then every other in rank order: a builder first for the command with a free
-    /// slot ahead ([`ranked_with_first`]), then score order.
+    /// slot ahead ([`ranked_with_first`]), then score order, the pick being a builder ranked ahead of a spared one
+    /// ([`BalancedEntry::spared`]) when the run spared the top builder's last free slots.
     pub entries: Vec<BalancedEntry>,
     /// Whether the scores include a duration ([`Ranking::has_duration`]); the same for every builder of a decision.
     pub has_duration: bool,
@@ -129,6 +161,8 @@ pub struct BalancedEntry {
     pub free: u32,
     /// Whether the builder is not known to hold a work folder for the worktree.
     pub cold: bool,
+    /// Whether the run passed this builder over to spare its last free slots ([`Rank::spared`]).
+    pub spared: bool,
 }
 
 impl BalancedEntry {
@@ -257,7 +291,11 @@ mod tests {
         let ranking = ranked(&[figures(0.0, Some(150.0), true), cold]);
         assert_eq!(
             ranking.ranks[0],
-            Rank { index: 1, seconds: 120.0 },
+            Rank {
+                index: 1,
+                seconds: 120.0,
+                spared: false
+            },
             "the cold 100 s builder pays its 20 s gap, not 100 s more, and beats the warm 150 s one"
         );
     }
@@ -270,7 +308,11 @@ mod tests {
         };
         assert_eq!(
             ranked(&[warm]).ranks,
-            [Rank { index: 0, seconds: 105.0 }],
+            [Rank {
+                index: 0,
+                seconds: 105.0,
+                spared: false
+            }],
             "the wait and the duration alone"
         );
     }
@@ -365,7 +407,15 @@ mod tests {
         let given = [figures(0.0, Some(100.0), true), figures(0.0, Some(300.0), false)];
         assert_eq!(first_order(&given, &[false, true]), [1, 0], "first and free beats 100 s warm");
         let ranking = ranked_with_first(&given, &[false, true]);
-        assert_eq!(ranking.ranks[0], Rank { index: 1, seconds: 600.0 }, "it keeps its own score");
+        assert_eq!(
+            ranking.ranks[0],
+            Rank {
+                index: 1,
+                seconds: 600.0,
+                spared: false
+            },
+            "it keeps its own score"
+        );
     }
 
     #[test]
@@ -408,10 +458,21 @@ mod tests {
     #[test]
     fn a_local_p50_under_80_percent_of_the_chosen_finish_stays_here() {
         let ranking = ranked(&[figures(0.0, Some(20.0), true), figures(0.0, Some(10.0), true)]);
-        assert_eq!(faster_here(7.9, &ranking, 1), Some(Rank { index: 1, seconds: 10.0 }));
+        assert_eq!(
+            faster_here(7.9, &ranking, 1),
+            Some(Rank {
+                index: 1,
+                seconds: 10.0,
+                spared: false
+            })
+        );
         assert_eq!(
             faster_here(15.9, &ranking, 0),
-            Some(Rank { index: 0, seconds: 20.0 }),
+            Some(Rank {
+                index: 0,
+                seconds: 20.0,
+                spared: false
+            }),
             "compared with the chosen builder, not the best"
         );
     }
@@ -437,15 +498,128 @@ mod tests {
         let ranking = ranked(&[figures(0.0, Some(6.0), false), figures(0.0, Some(10.0), true)]);
         assert_eq!(
             faster_here(9.5, &ranking, 0),
-            Some(Rank { index: 0, seconds: 12.0 }),
+            Some(Rank {
+                index: 0,
+                seconds: 12.0,
+                spared: false
+            }),
             "the cold 6 s builder finishes at 12 s"
         );
         assert_eq!(faster_here(10.0, &ranking, 0), None, "at or above 80% of its 12 s");
         let ranking = ranked(&[figures(5.0, Some(10.0), true)]);
         assert_eq!(
             faster_here(11.9, &ranking, 0),
-            Some(Rank { index: 0, seconds: 15.0 }),
+            Some(Rank {
+                index: 0,
+                seconds: 15.0,
+                spared: false
+            }),
             "the queue wait counts"
         );
+    }
+
+    /// A builder with `free_slots` free, no wait and a learned `duration`, holding a work folder when `holds_folder`.
+    fn with_free(free_slots: u32, duration: f64, holds_folder: bool) -> BuilderFigures {
+        BuilderFigures {
+            free_slots,
+            queue_wait: 0.0,
+            duration: Some(duration),
+            holds_folder,
+            cold_gap: None,
+        }
+    }
+
+    /// The indexes `ranked` gives `given`, best first, and the indexes it marks spared.
+    fn order_and_spared(given: &[BuilderFigures]) -> (Vec<usize>, Vec<usize>) {
+        let ranks = ranked(given).ranks;
+        let spared = ranks.iter().filter(|rank| rank.spared).map(|rank| rank.index).collect();
+        (ranks.into_iter().map(|rank| rank.index).collect(), spared)
+    }
+
+    #[test]
+    fn a_builder_down_to_its_last_two_slots_is_spared_for_one_with_room_within_half_again() {
+        let given = [with_free(2, 587.0, true), with_free(6, 375.5, false)];
+        assert_eq!(
+            ranked(&given).ranks,
+            [
+                Rank {
+                    index: 1,
+                    seconds: 751.0,
+                    spared: false
+                },
+                Rank {
+                    index: 0,
+                    seconds: 587.0,
+                    spared: true
+                }
+            ],
+            "751 s with room is within 1.5 times 587 s on its last two slots; each keeps its own score"
+        );
+    }
+
+    #[test]
+    fn a_builder_with_three_free_slots_is_not_spared() {
+        let given = [with_free(3, 587.0, true), with_free(6, 375.5, false)];
+        assert_eq!(order_and_spared(&given), (vec![0, 1], vec![]));
+    }
+
+    #[test]
+    fn a_builder_with_one_free_slot_is_spared() {
+        let given = [with_free(1, 587.0, true), with_free(6, 375.5, false)];
+        assert_eq!(order_and_spared(&given), (vec![1, 0], vec![0]));
+    }
+
+    #[test]
+    fn no_builder_is_spared_without_another_with_more_than_two_free() {
+        let given = [with_free(2, 587.0, true), with_free(2, 375.5, false)];
+        assert_eq!(order_and_spared(&given), (vec![0, 1], vec![]));
+    }
+
+    #[test]
+    fn a_spare_at_exactly_half_again_the_time_is_taken() {
+        let given = [with_free(2, 600.0, true), with_free(6, 900.0, true)];
+        assert_eq!(order_and_spared(&given), (vec![1, 0], vec![0]));
+    }
+
+    #[test]
+    fn a_spare_past_half_again_the_time_is_not_taken() {
+        let given = [with_free(2, 600.0, true), with_free(6, 901.0, true)];
+        assert_eq!(order_and_spared(&given), (vec![0, 1], vec![]));
+    }
+
+    #[test]
+    fn a_free_first_builder_on_its_last_slot_is_not_spared() {
+        let given = [with_free(1, 587.0, true), with_free(6, 600.0, true)];
+        let ranks = ranked_with_first(&given, &[true, false]).ranks;
+        assert_eq!(ranks.iter().map(|rank| rank.index).collect::<Vec<_>>(), [0, 1]);
+        assert!(ranks.iter().all(|rank| !rank.spared), "{ranks:?}");
+    }
+
+    #[test]
+    fn a_full_top_builder_is_not_spared() {
+        let given = [with_free(0, 100.0, true), with_free(6, 140.0, true)];
+        assert_eq!(
+            order_and_spared(&given),
+            (vec![0, 1], vec![]),
+            "a full builder whose wait reads 0 keeps its place"
+        );
+    }
+
+    #[test]
+    fn a_roomy_builder_with_exactly_three_free_slots_takes_the_spare() {
+        let given = [with_free(2, 600.0, true), with_free(3, 700.0, true)];
+        assert_eq!(order_and_spared(&given), (vec![1, 0], vec![0]));
+    }
+
+    #[test]
+    fn the_better_ranked_of_two_roomy_builders_takes_the_spare() {
+        let given = [with_free(2, 600.0, true), with_free(3, 700.0, true), with_free(6, 650.0, true)];
+        assert_eq!(order_and_spared(&given), (vec![2, 0, 1], vec![0]));
+    }
+
+    #[test]
+    fn the_spare_keeps_the_others_in_score_order() {
+        let given = [with_free(2, 500.0, true), with_free(1, 550.0, true), with_free(6, 700.0, true)];
+        assert_eq!(order_and_spared(&given), (vec![2, 0, 1], vec![0]));
     }
 }
