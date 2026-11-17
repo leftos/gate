@@ -309,6 +309,24 @@ function Get-TopLevelValue([string]$Name) {
     return $null
 }
 
+# Runs install-toolchains.ps1's cargo config merge, its functions taken from the AST and $cargoBuildKey from its top
+# level, on $Lines with the wrapper $Wrapper, and returns the merged lines.
+function Invoke-CargoConfigMerge([string[]]$Lines, [string]$Wrapper) {
+    $cargoBuildKey = Get-TopLevelValue 'cargoBuildKey'
+    if (-not $cargoBuildKey) { throw 'install-toolchains.ps1 assigns no literal to $cargoBuildKey' }
+    $names = 'Merge-CargoBuildConfig', 'Merge-CargoBuildKey', 'Find-CargoBuildKey', 'Get-CargoKeyPattern',
+    'Add-CargoConfigLine', 'Add-CargoConfigSection', 'Add-CargoBuildLine'
+    . ([scriptblock]::Create((Get-InstallerFunctionText $names)))
+    return , [string[]](Merge-CargoBuildConfig $Lines $Wrapper)
+}
+
+# What differs between the merge of $Lines and $Want, or '' when they match line for line.
+function Get-CargoMergeProblem([string[]]$Lines, [string[]]$Want) {
+    $got = Invoke-CargoConfigMerge $Lines 'C:\Tools\bin\sccache.exe'
+    if (($got -join "`n") -ceq ($Want -join "`n")) { return '' }
+    return "got [$($got -join ' | ')], expected [$($Want -join ' | ')]"
+}
+
 # The text $Block builds for $Call's -$Name parameter, the step's variable assignments followed; '' when it is absent.
 function Get-StepArgumentText {
     param([Parameter(Mandatory)]$Block, [Parameter(Mandatory)]$Call, [Parameter(Mandatory)][string]$Name)
@@ -1362,6 +1380,62 @@ try {
             if (-not $text.Contains($wanted)) { return "the step does not name '$wanted'" }
         }
         if ($text.Contains('webkit')) { return 'the step names webkit' }
+        return ''
+    }
+
+    $wrapperLine = "rustc-wrapper = 'C:\Tools\bin\sccache.exe'"
+    Test-Case 'with no cargo config the merge writes a [build] table with rustc-wrapper and incremental = false' {
+        Get-CargoMergeProblem @() @('[build]', $wrapperLine, 'incremental = false')
+    }
+
+    Test-Case 'a cargo config with only rustc-wrapper gets the wrapper replaced and incremental = false after it' {
+        Get-CargoMergeProblem @('[build]', "rustc-wrapper = 'old.exe'") @('[build]', $wrapperLine, 'incremental = false')
+    }
+
+    Test-Case 'an existing incremental = true is replaced in place and every other line kept' {
+        $lines = @('# mine', '[build]', 'incremental = true', 'jobs = 4', '', '[net]', 'retry = 2')
+        $want = @('# mine', '[build]', 'incremental = false', 'jobs = 4', $wrapperLine, '', '[net]', 'retry = 2')
+        Get-CargoMergeProblem $lines $want
+    }
+
+    Test-Case 'top-level dotted build keys get dotted rustc-wrapper and incremental keys' {
+        $problem = Get-CargoMergeProblem @('build.jobs = 4', '[net]', 'retry = 2') @(
+            'build.jobs = 4', "build.$wrapperLine", 'build.incremental = false', '[net]', 'retry = 2')
+        if ($problem) { return "added: $problem" }
+        $problem = Get-CargoMergeProblem @('build . incremental = true', 'build.jobs = 4') @(
+            'build.incremental = false', 'build.jobs = 4', "build.$wrapperLine")
+        if ($problem) { return "replaced: $problem" }
+        return ''
+    }
+
+    Test-Case 'basic- and literal-quoted build and incremental keys are found and replaced' {
+        $problem = Get-CargoMergeProblem @('["build"]', '"incremental" = true', "'rustc-wrapper' = 'old.exe'") @(
+            '["build"]', 'incremental = false', $wrapperLine)
+        if ($problem) { return "table: $problem" }
+        $problem = Get-CargoMergeProblem @("`"build`".'incremental' = true", "'build'.`"rustc-wrapper`" = 'old.exe'") @(
+            'build.incremental = false', "build.$wrapperLine")
+        if ($problem) { return "dotted: $problem" }
+        return ''
+    }
+
+    Test-Case 'a cargo config that sets build.incremental twice is refused' {
+        try {
+            $got = Invoke-CargoConfigMerge @('[build]', 'incremental = true', '"incremental" = false') 'C:\x.exe'
+            return "merged to [$($got -join ' | ')]"
+        }
+        catch {
+            $message = $_.Exception.Message
+            if ($message -notlike '*sets build.incremental twice; line 3: "incremental" = false*') { return "threw: $message" }
+            return ''
+        }
+    }
+
+    Test-Case 'the sccache step merges the cargo config and its log line names both keys' {
+        $block = Get-StepBlock 'sccache 0.18.0'
+        if (-not $block) { return 'install-toolchains.ps1 has no sccache 0.18.0 step' }
+        $text = $block.Extent.Text
+        if (-not $text.Contains('Merge-CargoBuildConfig $lines $exe')) { return 'the step does not call Merge-CargoBuildConfig' }
+        if (-not $text.Contains('[build] rustc-wrapper -> $exe, incremental = false"')) { return 'the log line does not name both keys' }
         return ''
     }
 }

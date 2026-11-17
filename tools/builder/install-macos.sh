@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Makes the macOS (Apple-silicon) builder's home mode 0700, and installs its toolchains at pinned versions from official
-# release URLs, its login PATH, its git config and the gate's work root, all as the builder user without sudo. A
+# release URLs, its login PATH, its git config, its cargo config (build.incremental = false, so routed cargo runs build
+# without incremental compilation) and the gate's work root, all as the builder user without sudo. A
 # separate System step, run only under sudo with --system, keeps the machine awake, raises the open-file limits, turns
 # on Remote Login and installs the launchd job dev.gate.prune-work, which runs the box's prune of the work root every
 # two hours as the builder user.
@@ -35,6 +36,7 @@
 # An unknown argument exits 2. Every step but System, Homebrew and FFmpeg refuses to run as root (exit 2): the
 # toolchains must land in the builder user's home, and --admin refuses root itself. Rust and cargo-nextest go to
 # $CARGO_HOME (default ~/.cargo) and rustup's $RUSTUP_HOME, as rustup itself places them; just goes to $CARGO_HOME/bin.
+# The Cargo config step writes build.incremental = false into $CARGO_HOME/config.toml, keeping every other line.
 #
 # Each step logs BEGIN, then OK, SKIP or FAIL with the reason, to stdout and timestamped to <prefix>/install.log; a
 # failed step does not stop the later ones, and the script exits 1 when any step failed. Rerunnable: finished downloads
@@ -519,6 +521,78 @@ step_git_config() {
     git config --global gc.pruneExpire never
 }
 
+# Prints the cargo config.toml on stdin with build.incremental set to false, every other line kept: an existing
+# incremental line in the build table, a [build] table or top-level build.<key> dotted keys, with the keys bare,
+# basic-quoted or literal-quoted, is replaced, else the key goes after the build table's last key, else a [build] table
+# is appended. On an inline build table, an incremental key set twice or both build forms it prints only the reason and
+# exits 1.
+cargo_incremental_merged() {
+    awk '
+    function bare(s) { gsub(/["\047]/, "", s); return s }
+    { line[NR] = $0 }
+    /^[ \t]*\[/ {
+        name = $0
+        sub(/^[ \t]*\[[ \t]*/, "", name)
+        sub(/[ \t]*\].*$/, "", name)
+        section = bare(name)
+        if (section == "build") { table = 1; end = NR }
+        next
+    }
+    section == "" && /^[ \t]*("build"|\047build\047|build)[ \t]*=/ { if (!inline) inline = NR; next }
+    section == "" && /^[ \t]*("build"|\047build\047|build)[ \t]*\./ {
+        dotted = 1
+        end = NR
+        if ($0 ~ /^[ \t]*("build"|\047build\047|build)[ \t]*\.[ \t]*("incremental"|\047incremental\047|incremental)[ \t]*=/) {
+            if (key) { if (!twice) twice = NR } else key = NR
+        }
+        next
+    }
+    section == "build" && /^[ \t]*[^# \t]/ {
+        end = NR
+        if ($0 ~ /^[ \t]*("incremental"|\047incremental\047|incremental)[ \t]*=/) {
+            if (key) { if (!twice) twice = NR } else key = NR
+        }
+    }
+    END {
+        err = ""
+        if (inline) err = "line " inline " sets build as an inline table, which this step does not rewrite: " line[inline]
+        else if (table && dotted) err = "has both a [build] table and top-level build.<key> keys"
+        else if (twice) err = "sets build.incremental twice; line " twice ": " line[twice]
+        if (err != "") { print "cargo config.toml " err; exit 1 }
+        entry = dotted ? "build.incremental = false" : "incremental = false"
+        for (i = 1; i <= NR; i++) {
+            if (i == key) print entry
+            else print line[i]
+            if (!key && i == end) print entry
+        }
+        if (!key && !end) {
+            if (NR) print ""
+            print "[build]"
+            print entry
+        }
+    }'
+}
+
+# Routed cargo runs build without incremental compilation: build.incremental in the builder's cargo config overrides
+# every profile's incremental setting, and a run's CARGO_INCREMENTAL still overrides it. The merge goes to a scratch
+# file first and is copied over the config, so a refusal leaves the config as it was and a link or mode on it is kept.
+step_cargo_config() {
+    local config="$cargo_home/config.toml" merged="$cargo_home/config.toml.gate-tmp" why
+    mkdir -p "$cargo_home"
+    if [ -e "$config" ]; then
+        if ! cargo_incremental_merged <"$config" >"$merged"; then
+            why=$(cat "$merged")
+            rm -f "$merged"
+            fail "$config: ${why#cargo config.toml }"
+        fi
+    else
+        cargo_incremental_merged </dev/null >"$merged"
+    fi
+    cat "$merged" >"$config"
+    rm -f "$merged"
+    log "$config [build] incremental = false"
+}
+
 # The box refuses a work root that is a link, not its user's, or writable by group or others.
 step_gate_root() {
     local d mode
@@ -842,6 +916,7 @@ step 'Homebrew' step_homebrew
 step 'FFmpeg' step_ffmpeg
 step 'Login PATH' step_login_path
 step 'Git config' step_git_config
+step 'Cargo config' step_cargo_config
 step 'Gate work root' step_gate_root
 step 'Playwright 1.65.1 Chromium' step_playwright_1651
 step 'System' step_system

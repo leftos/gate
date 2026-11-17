@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Tests install-macos.sh without downloading anything or touching the real HOME: the argument handling, the Homebrew
 # and FFmpeg steps' dry run, their --admin refusals, the System step's dry run with its prune-job plist (linted where
-# plutil exists), the builder-home parse of dscl's output, the Login PATH block in a temporary HOME, the Private home
-# step and the root refusal. Runs on macOS and in Git Bash.
+# plutil exists), the builder-home parse of dscl's output, the Login PATH block in a temporary HOME, the Cargo config
+# step's build.incremental merge in a temporary CARGO_HOME, the Private home step and the root refusal. Runs on macOS and in Git Bash.
 # Usage: bash tools/builder/test-install-macos.sh
 set -euo pipefail
 
@@ -104,6 +104,7 @@ Homebrew
 FFmpeg
 Login PATH
 Git config
+Cargo config
 Gate work root
 Playwright 1.65.1 Chromium
 System'
@@ -347,6 +348,64 @@ case_login_path_block() {
         expect [ "$(head -n 1 "$zp")" = 'export KEEP_ME=1' ]
 }
 
+# Runs the Cargo config step on a $CARGO_HOME/config.toml holding the lines given, or none when no line is given.
+cargo_config="$scratch/cargo/config.toml"
+run_cargo_config() {
+    rm -f "$cargo_config"
+    if [ "$#" -gt 0 ]; then
+        mkdir -p "$scratch/cargo"
+        printf '%s\n' "$@" >"$cargo_config"
+    fi
+    run --prefix "$scratch/p-cargo" --only 'Cargo config'
+}
+# Whether the config file holds exactly the lines given.
+config_is() {
+    local want
+    want=$(printf '%s\n' "$@")
+    if [ "$(cat "$cargo_config")" != "$want" ]; then
+        printf 'config.toml holds:\n%s\nexpected:\n%s\n' "$(cat "$cargo_config")" "$want"
+        return 1
+    fi
+}
+
+case_cargo_config_absent() {
+    rm -rf "$scratch/cargo"
+    run_cargo_config
+    printf '[build]\nincremental = false\n' >"$scratch/want-cargo"
+    expect rc_is 0 && expect cmp -s "$scratch/want-cargo" "$cargo_config" && expect has "$cargo_config [build] incremental = false" || return 1
+    run --prefix "$scratch/p-cargo" --only 'Cargo config'
+    expect rc_is 0 && expect config_is '[build]' 'incremental = false'
+}
+
+case_cargo_config_kept() {
+    run_cargo_config '# mine' '[net]' 'retry = 2' '' '[build]' 'rustc-wrapper = "/x/sccache"' 'incremental = true' 'jobs = 4' \
+        '# trailing' '' '[env]' 'A = "1"'
+    expect rc_is 0 && expect config_is '# mine' '[net]' 'retry = 2' '' '[build]' 'rustc-wrapper = "/x/sccache"' \
+        'incremental = false' 'jobs = 4' '# trailing' '' '[env]' 'A = "1"' || return 1
+    run_cargo_config '[build]' 'jobs = 4' '' '[env]' 'A = "1"'
+    expect rc_is 0 && expect config_is '[build]' 'jobs = 4' 'incremental = false' '' '[env]' 'A = "1"' || return 1
+    run_cargo_config '[net]' 'retry = 2'
+    expect rc_is 0 && expect config_is '[net]' 'retry = 2' '' '[build]' 'incremental = false'
+}
+
+case_cargo_config_quoted_and_dotted() {
+    run_cargo_config '[ "build" ]' "'incremental' = true"
+    expect rc_is 0 && expect config_is '[ "build" ]' 'incremental = false' || return 1
+    run_cargo_config 'build.jobs = 4' "\"build\" . 'incremental' = true" '[net]' 'retry = 2'
+    expect rc_is 0 && expect config_is 'build.jobs = 4' 'build.incremental = false' '[net]' 'retry = 2' || return 1
+    run_cargo_config 'build.jobs = 4' '[net]' 'retry = 2'
+    expect rc_is 0 && expect config_is 'build.jobs = 4' 'build.incremental = false' '[net]' 'retry = 2'
+}
+
+case_cargo_config_refusals() {
+    run_cargo_config 'build = { jobs = 4 }'
+    expect rc_is 1 && expect has 'sets build as an inline table, which this step does not rewrite: build = { jobs = 4 }' &&
+        expect config_is 'build = { jobs = 4 }' && expect absent "$cargo_config.gate-tmp" || return 1
+    run_cargo_config '[build]' 'incremental = true' '"incremental" = false'
+    expect rc_is 1 && expect has 'sets build.incremental twice; line 3: "incremental" = false' &&
+        expect config_is '[build]' 'incremental = true' '"incremental" = false'
+}
+
 # The package caches the box's restores make land in the builder's home are readable by every account the home's mode
 # lets in, and every standard macOS account is in that group; the step makes the home 0700, and says so once.
 case_private_home() {
@@ -505,6 +564,10 @@ check 'the prune log folder must be root'"'"'s and writable by no one else, its 
 check 'a bootout still in progress is waited out and the prune job bootstrapped' case_prune_bootout_in_progress
 check '--system without root exits 2' case_system_needs_root
 check 'the Login PATH block is written once and replaced on rerun' case_login_path_block
+check 'the Cargo config step writes [build] incremental = false to a missing config, and again unchanged' case_cargo_config_absent
+check 'the Cargo config step sets incremental = false in the build table and keeps every other line' case_cargo_config_kept
+check 'the Cargo config step finds quoted and dotted build keys' case_cargo_config_quoted_and_dotted
+check 'the Cargo config step refuses an inline build table and an incremental key set twice' case_cargo_config_refusals
 check 'the Private home step makes the home mode 0700 and says so only when it changes it' case_private_home
 check 'a home that is a link is refused' case_private_home_refuses_a_link
 check 'a toolchain step as root is refused' case_root_refused

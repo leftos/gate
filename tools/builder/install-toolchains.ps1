@@ -430,15 +430,19 @@ Invoke-Step 'WSL Ubuntu (Linux build deps, Rust 1.96.1)' {
     & wsl.exe -d Ubuntu -u root -e bash $unix
     if ($LASTEXITCODE) { throw "wsl.exe -d Ubuntu -u root -e bash $unix exited $LASTEXITCODE" }
 }
-# The spellings of the keys build and rustc-wrapper in a cargo config.toml: bare, basic-quoted or literal-quoted.
+# The spellings of the key build in a cargo config.toml: bare, basic-quoted or literal-quoted.
 $cargoBuildKey = '(?:build|"build"|''build'')'
-$cargoWrapperKey = '(?:rustc-wrapper|"rustc-wrapper"|''rustc-wrapper'')'
-# Records a line of the build table: the table ends after it, and it is the rustc-wrapper line when it matches $Pattern.
+# The spellings of the key $Key in a cargo config.toml, as $cargoBuildKey spells build.
+function Get-CargoKeyPattern([string]$Key) {
+    $k = [regex]::Escape($Key)
+    return "(?:$k|`"$k`"|'$k')"
+}
+# Records a line of the build table: the table ends after it, and it is the line of key $At.Name when it matches $Pattern.
 function Add-CargoBuildLine([hashtable]$At, [int]$Index, [string]$Line, [string]$Pattern) {
     $At.End = $Index + 1
     if ($Line -notmatch $Pattern) { return }
-    if ($At.Wrapper -ge 0) { throw "cargo config.toml sets build.rustc-wrapper twice; line $($Index + 1): $Line" }
-    $At.Wrapper = $Index
+    if ($At.Key -ge 0) { throw "cargo config.toml sets build.$($At.Name) twice; line $($Index + 1): $Line" }
+    $At.Key = $Index
 }
 # Records a [table] header named $Name in $At, when it is the build table.
 function Add-CargoConfigSection([hashtable]$At, [int]$Index, [string]$Name) {
@@ -457,19 +461,19 @@ function Add-CargoConfigLine([hashtable]$At, [int]$Index, [string]$Line, [string
     }
     if ($Section -eq '' -and $Line -match "^\s*$cargoBuildKey\s*\.") {
         $At.Dotted = $true
-        Add-CargoBuildLine $At $Index $Line "^\s*$cargoBuildKey\s*\.\s*$cargoWrapperKey\s*="
+        Add-CargoBuildLine $At $Index $Line "^\s*$cargoBuildKey\s*\.\s*$($At.Pattern)\s*="
         return $Section
     }
     if ($Section -eq 'build' -and $Line -match '^\s*[^#\s]') {
-        Add-CargoBuildLine $At $Index $Line "^\s*$cargoWrapperKey\s*="
+        Add-CargoBuildLine $At $Index $Line "^\s*$($At.Pattern)\s*="
     }
     return $Section
 }
 # Finds the build table of a cargo config.toml's lines, as a [build] table or as top-level build.<key> dotted keys: the
-# index of its rustc-wrapper line, the index after its last key line (comments and blanks before the next table stay
-# outside it), and which form it has. Throws on a form the merge does not rewrite, naming the line.
-function Find-CargoBuildWrapper([string[]]$Lines) {
-    $at = @{ Wrapper = -1; End = -1; Table = $false; Dotted = $false }
+# index of its $Key line, the index after its last key line (comments and blanks before the next table stay outside
+# it), and which form it has. Throws on a form the merge does not rewrite, naming the line.
+function Find-CargoBuildKey([string[]]$Lines, [string]$Key) {
+    $at = @{ Name = $Key; Pattern = (Get-CargoKeyPattern $Key); Key = -1; End = -1; Table = $false; Dotted = $false }
     $section = ''
     for ($i = 0; $i -lt $Lines.Count; $i++) {
         $section = Add-CargoConfigLine -At $at -Index $i -Line $Lines[$i] -Section $section
@@ -477,20 +481,27 @@ function Find-CargoBuildWrapper([string[]]$Lines) {
     if ($at.Table -and $at.Dotted) { throw 'cargo config.toml has both a [build] table and top-level build.<key> keys' }
     return $at
 }
-# Returns the lines of a cargo config.toml with build.rustc-wrapper set to $Wrapper, every other line kept: an existing
-# rustc-wrapper line is replaced, else the key goes after the build table's last key, else a [build] table is appended.
-function Merge-CargoBuildWrapper([string[]]$Lines, [string]$Wrapper) {
-    $at = Find-CargoBuildWrapper $Lines
-    $entry = if ($at.Dotted) { "build.rustc-wrapper = '$Wrapper'" } else { "rustc-wrapper = '$Wrapper'" }
+# Returns the lines of a cargo config.toml with build.$Key set to the TOML value $Value, every other line kept: an
+# existing $Key line is replaced, else the key goes after the build table's last key, else a [build] table is appended.
+function Merge-CargoBuildKey([string[]]$Lines, [string]$Key, [string]$Value) {
+    $at = Find-CargoBuildKey $Lines $Key
+    $entry = if ($at.Dotted) { "build.$Key = $Value" } else { "$Key = $Value" }
     $merged = New-Object System.Collections.Generic.List[string]
     $merged.AddRange($Lines)
-    if ($at.Wrapper -ge 0) { $merged[$at.Wrapper] = $entry }
+    if ($at.Key -ge 0) { $merged[$at.Key] = $entry }
     elseif ($at.End -ge 0) { $merged.Insert($at.End, $entry) }
     else {
         if ($merged.Count) { $merged.Add('') }
         $merged.AddRange([string[]]@('[build]', $entry))
     }
     return , $merged.ToArray()
+}
+# Returns the lines of a cargo config.toml with build.rustc-wrapper set to $Wrapper and build.incremental to false, by
+# Merge-CargoBuildKey's rules. Routed cargo runs build without incremental compilation: build.incremental overrides
+# every profile's incremental setting, and a run's CARGO_INCREMENTAL still overrides it.
+function Merge-CargoBuildConfig([string[]]$Lines, [string]$Wrapper) {
+    $withWrapper = Merge-CargoBuildKey $Lines 'rustc-wrapper' "'$Wrapper'"
+    return , (Merge-CargoBuildKey $withWrapper 'incremental' 'false')
 }
 # Rust builds share compiled dependencies across the gate's fresh work folders through sccache's disk cache, in the
 # -SccacheDir folder.
@@ -593,10 +604,10 @@ Invoke-Step 'sccache 0.18.0' {
     $cargoConfig = Join-Path $env:USERPROFILE '.cargo\config.toml'
     [string[]]$lines = @()
     if (Test-Path -LiteralPath $cargoConfig) { $lines = [IO.File]::ReadAllLines($cargoConfig) }
-    $merged = Merge-CargoBuildWrapper $lines $exe
+    $merged = Merge-CargoBuildConfig $lines $exe
     New-Item -ItemType Directory -Force (Split-Path $cargoConfig) | Out-Null
     [IO.File]::WriteAllText($cargoConfig, (($merged -join "`n") + "`n"), (New-Object Text.UTF8Encoding $false))
-    Write-InstallLog "$cargoConfig [build] rustc-wrapper -> $exe"
+    Write-InstallLog "$cargoConfig [build] rustc-wrapper -> $exe, incremental = false"
     New-Item -ItemType Directory -Force $sccacheDir | Out-Null
     # sccache reads %APPDATA%\Mozilla\sccache\config\config on Windows when SCCACHE_CONF is unset
     # (https://github.com/mozilla/sccache/blob/v0.18.0/docs/Configuration.md). The cap is -SccacheCapBytes; its default
