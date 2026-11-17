@@ -308,7 +308,8 @@ pub enum BoxVerb {
     Lfs,
     /// The registration of the desktop helper's task; it takes no request.
     RegisterDesktop,
-    /// The removal of the builder's work folders no run has used for over a day; it takes no request, only its root.
+    /// The removal of the builder's work folders no run has used for over 12 hours, and of more while its volume is
+    /// under the free-space floor; it takes no request, only its root.
     Prune,
     /// The builder's drain barrier: raised or raised again, read, or lifted, as the request's `Action` says.
     Drain,

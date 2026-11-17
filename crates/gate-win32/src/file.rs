@@ -2,7 +2,8 @@
 //! a name inside an open folder, a folder made there with the security it is to have from the instant it exists, a
 //! listing and a tree delete through an open folder's handle, an open that reads an
 //! open file through its reparse point's filter, an open file's id, whether two open files are one, and whether an open
-//! file is on a network volume ([`on_network_volume`]).
+//! file is on a network volume ([`on_network_volume`]), and the free space and size of a folder's volume
+//! ([`disk_space`]).
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, Metadata};
@@ -28,7 +29,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE,
     FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_FULL_DIR_INFO, FILE_GENERIC_READ, FILE_ID_INFO, FILE_LIST_DIRECTORY,
     FILE_READ_ATTRIBUTES, FILE_REMOTE_PROTOCOL_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfoEx,
-    FileFullDirectoryInfo, FileFullDirectoryRestartInfo, FileIdInfo, FileRemoteProtocolInfo, GetFileInformationByHandle,
+    FileFullDirectoryInfo, FileFullDirectoryRestartInfo, FileIdInfo, FileRemoteProtocolInfo, GetDiskFreeSpaceExW, GetFileInformationByHandle,
     GetFileInformationByHandleEx, MoveFileExW, ReOpenFile, SYNCHRONIZE, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -907,6 +908,43 @@ pub fn on_network_volume(file: &File) -> io::Result<bool> {
     } else {
         Err(error)
     }
+}
+
+/// The space of the volume holding a folder: the bytes the calling user may still write there, a disk quota counted,
+/// and the volume's size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiskSpace {
+    pub free_to_caller: u64,
+    pub total: u64,
+}
+
+/// The space of the volume holding the folder `folder` (`GetDiskFreeSpaceExW`), the folder named with a trailing
+/// separator, as the call takes a UNC root.
+///
+/// # Errors
+///
+/// An error of kind [`io::ErrorKind::InvalidInput`] for a path holding a NUL; else the system's error, such as one for a
+/// folder that is not there.
+pub fn disk_space(folder: &Path) -> io::Result<DiskSpace> {
+    let mut wide: Vec<u16> = folder.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("the path {} holds a NUL", folder.display()),
+        ));
+    }
+    if wide.last().is_none_or(|last| *last != SEP && *last != u16::from(b'/')) {
+        wide.push(SEP);
+    }
+    wide.push(0);
+    let (mut free_to_caller, mut total) = (0u64, 0u64);
+    // SAFETY: `wide` is a NUL-terminated UTF-16 buffer and the two counts are writable `u64`s, all living across the
+    // call, which only reads the one and writes the others; the total free count, not wanted, may be null.
+    let read = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &raw mut free_to_caller, &raw mut total, ptr::null_mut()) };
+    if read == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(DiskSpace { free_to_caller, total })
 }
 
 /// Renames the file `source` to `target` on the same volume, never replacing a file `target` already names. Both are

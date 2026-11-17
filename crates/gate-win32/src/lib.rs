@@ -101,8 +101,8 @@ pub fn check_plain_file(file: &std::fs::File) -> io::Result<()> {
     launch::check_plain_file(file.as_raw_handle())
 }
 pub use file::{
-    Fresh, Make, NotDeleted, Share, delete_fresh_beneath, delete_opened, delete_tree_opened, file_id, make_file_beneath, make_folder_beneath,
-    move_no_replace, names_beneath, on_network_volume, open_beneath, open_beneath_as, rename_beneath, rename_beneath_no_replace,
+    DiskSpace, Fresh, Make, NotDeleted, Share, delete_fresh_beneath, delete_opened, delete_tree_opened, disk_space, file_id, make_file_beneath,
+    make_folder_beneath, move_no_replace, names_beneath, on_network_volume, open_beneath, open_beneath_as, rename_beneath, rename_beneath_no_replace,
     reopen_through_filter, same_file,
 };
 pub use security::{

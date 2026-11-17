@@ -1,7 +1,10 @@
 //! `gate box prune --root <folder> [--keys <key>...]`: removes keys' work folders from a builder root, in one of two
 //! modes. The age prune, without `--keys`, which a scheduled task on the builder runs every few hours, removes the work
-//! folders no run has used for over a day: a folder's last use is the newest last write of the folder, each tree's
-//! `.git\FETCH_HEAD` (every run fetches into each tree it checks out) and the key's records. The keyed prune removes
+//! folders no run has used for over 12 hours: a folder's last use is the newest last write of the folder, each tree's
+//! `.git\FETCH_HEAD` (every run fetches into each tree it checks out), the key's records and its lock. After its age
+//! pass, the age prune keeps the root's volume from filling: while its free space is under the low mark of the
+//! volume's floor ([`gate_wire::floor_marks`]), it removes the work folders the age pass kept that no run holds, least
+//! recent use first, one at a time, until the free space is at the high mark. The keyed prune removes
 //! the keys it is given, whatever their last use, and no other: the PC names the keys of worktrees it found gone.
 //! Either way a key's work folder `<root>\work\<key>` goes only with its lock `<root>\work\<key>.lock` held, so no run
 //! is using it and none can start in it meanwhile (one that tries is refused busy, status 75, and its PC runs the
@@ -31,6 +34,7 @@
 //! [`gate_win32::check_work_root`] passes, and each only while the barrier, read again before it, does not stand. A gc
 //! that fails is said and the next goes on.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind};
@@ -40,8 +44,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gate_args::BoxSeams;
 use gate_router::escaped;
-use gate_win32::{Make, Share};
-use gate_wire::{LAYOUT_CHANGING, is_drive_path, is_key};
+use gate_win32::{DiskSpace, Make, Share};
+use gate_wire::{GIB, LAYOUT_CHANGING, floor_marks, is_drive_path, is_key};
 use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES};
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
@@ -52,7 +56,7 @@ use crate::boxside::{drain, stamping};
 use crate::console::Console;
 
 /// How long a work folder goes unused before a sweep removes it.
-const IDLE_AGE: Duration = Duration::from_hours(24);
+const IDLE_AGE: Duration = Duration::from_hours(12);
 /// The extensions of the files beside a work folder `<key>` named `<key>.<extension>`: its lock and its records.
 const KEY_FILES: [&str; 11] = [
     "lock",
@@ -126,22 +130,38 @@ pub(crate) fn prune(root: &Path, keys: &[String], seams: &BoxSeams, now: SystemT
     }
 }
 
-/// The age prune of the root `root`, given without a trailing separator: removes the work folders idle at `now`, and
-/// the records of a key whose folder is gone; says each folder removed and how many, with a line on stderr for each
-/// key kept for a failure, then runs gc in each bare repository ([`Gc::bares_collected`]), and gives 0. Under a
-/// standing drain barrier, judged at the time `seams` give, it says so and touches nothing. Else the line saying why
-/// the sweep ended, or the barrier could not be read. A root or work folder that is not there holds nothing to remove.
+/// The age prune of the root `root`, the space of its volume read as [`space_read`] reads it ([`aged_with`]).
 fn aged(root: &str, now: SystemTime, seams: &BoxSeams, console: &mut Console) -> Result<u32, String> {
+    aged_with(root, now, seams, &space_read, console)
+}
+
+/// The age prune of the root `root`, given without a trailing separator: removes the work folders idle at `now`, and
+/// the records of a key whose folder is gone, then those of the floor pass ([`Sweep::floor_removed`]), the space of the
+/// root's volume read by `space`; says each folder removed and how many, with a line on stderr for each key kept for a
+/// failure, then runs gc in each bare repository ([`Gc::bares_collected`]), and gives 0. Under a standing drain
+/// barrier, judged at the time `seams` give, it says so and touches nothing. Else the line saying why the sweep ended,
+/// or the barrier could not be read. A root or work folder that is not there holds nothing to remove.
+fn aged_with(root: &str, now: SystemTime, seams: &BoxSeams, space: &SpaceRead<'_>, console: &mut Console) -> Result<u32, String> {
     if drained(root, seams)? {
         stamping::out(console, "gate: remote prune skipped: the builder is drained");
         return Ok(0);
     }
-    let Some(sweep) = Sweep::opened(root, now, false, console)? else {
+    let Some(sweep) = Sweep::opened(root, now, Mode::Aged, console)? else {
         stamping::out(console, "gate: remote prune removed 0 of 0 work folders");
         return Ok(0);
     };
     let listed = listed(&sweep.work).map_err(|error| cannot_list(Path::new(&sweep.work_path), &error))?;
-    let removed = listed.keys.iter().filter(|key| sweep.aged_key(key, console)).count();
+    let mut removed = 0;
+    // The floor pass takes the keys the age pass kept; one it failed has said its line once.
+    let mut left = Vec::new();
+    for key in &listed.keys {
+        match sweep.aged_key(key, console) {
+            Pruned::Removed(_) => removed += 1,
+            Pruned::Failed => {}
+            Pruned::Held | Pruned::Kept => left.push(key.as_str()),
+        }
+    }
+    removed += sweep.floor_removed(&left, space, console);
     stamping::out(
         console,
         &format!("gate: remote prune removed {removed} of {} work folders", listed.folders),
@@ -164,6 +184,55 @@ fn aged(root: &str, now: SystemTime, seams: &BoxSeams, console: &mut Console) ->
     };
     gc.bares_collected(console)?;
     Ok(0)
+}
+
+/// The reader of the space of the volume holding a root, given without a trailing separator, which a test replaces.
+type SpaceRead<'a> = dyn Fn(&str) -> io::Result<DiskSpace> + 'a;
+
+/// The reads of the space of a volume this process has made, which pick the value of a sequence the free-space seam
+/// gives.
+#[cfg(feature = "test-seams")]
+static SPACE_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The space of the volume holding the root `root`, given without a trailing separator ([`gate_win32::disk_space`]);
+/// in a build with the test seams, the free bytes `GATE_BOX_TEST_FREE_BYTES` and the volume's size
+/// `GATE_BOX_TEST_TOTAL_BYTES` give each in place of the volume's own when set. The free bytes may be a comma list: the
+/// process's first read takes the first, each read after it the next, and every read past its end the last.
+fn space_read(root: &str) -> io::Result<DiskSpace> {
+    let named = root_name(root);
+    // Set by the suite's floor cases in tests/suite/boxside/prune.rs.
+    #[cfg(feature = "test-seams")]
+    {
+        let read = SPACE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (free, total) = (seam_bytes("GATE_BOX_TEST_FREE_BYTES", read)?, seam_bytes("GATE_BOX_TEST_TOTAL_BYTES", 0)?);
+        if let (Some(free_to_caller), Some(total)) = (free, total) {
+            return Ok(DiskSpace { free_to_caller, total });
+        }
+        if free.is_some() || total.is_some() {
+            let read = gate_win32::disk_space(Path::new(&named))?;
+            return Ok(DiskSpace {
+                free_to_caller: free.unwrap_or(read.free_to_caller),
+                total: total.unwrap_or(read.total),
+            });
+        }
+    }
+    gate_win32::disk_space(Path::new(&named))
+}
+
+/// The count of bytes the environment variable `name` holds for the read `read`, the counts of a comma list taken in
+/// turn and the last past its end; `None` when it is not set. Else that it is no count.
+#[cfg(feature = "test-seams")]
+fn seam_bytes(name: &str, read: usize) -> io::Result<Option<u64>> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let counts: Vec<&str> = value.to_str().map(|text| text.split(',').collect()).unwrap_or_default();
+    counts
+        .get(read)
+        .or(counts.last())
+        .and_then(|count| count.trim().parse().ok())
+        .map(Some)
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, format!("{name} is not a count of bytes")))
 }
 
 /// The age prune's gc of the bare repositories of a root, once its sweep is done: the root, without a trailing
@@ -305,7 +374,7 @@ fn named(root: &str, keys: &[String], seams: &BoxSeams, now: SystemTime, console
         kept_drained(keys, console);
         return Ok(0);
     }
-    let Some(mut sweep) = Sweep::opened(root, now, true, console)? else {
+    let Some(mut sweep) = Sweep::opened(root, now, Mode::Named, console)? else {
         for key in keys {
             stamping::out(console, &gone_line(key));
         }
@@ -389,10 +458,21 @@ fn removed_beneath(folder: &File, name: &str) -> io::Result<()> {
     }
 }
 
+/// How a sweep prunes a key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// The age prune: an idle folder alone, and the lock kept.
+    Aged,
+    /// The age prune's floor pass: a folder whatever its last use, and the lock kept.
+    Floor,
+    /// The keyed prune: whatever the folder's last use, the lock it made removed, and the key's refs deleted.
+    Named,
+}
+
 /// One sweep: the root, its path without a trailing separator, and its work folder and `pruned` folder, with their
 /// paths for its lines, each held until the sweep is done so no one can rename or remove it meanwhile; the time it
-/// judges by; whether it is the keyed prune, which judges no age and deletes refs; why the root may not have git run
-/// in it, when the keyed prune's check of it refused it; and git, for the refs.
+/// judges by; why the root may not have git run in it, when the keyed prune's check of it refused it; git, for the
+/// refs; and the keys whose lock this sweep made, which the floor pass's order does not count as a use.
 struct Sweep {
     root: String,
     root_folder: File,
@@ -401,9 +481,9 @@ struct Sweep {
     pruned: File,
     pruned_path: PathBuf,
     now: SystemTime,
-    named: bool,
     refused: Option<String>,
     git: Git,
+    made_locks: RefCell<Vec<String>>,
 }
 
 /// A key's lock as a sweep holds it, and its last write from before the sweep took it, `None` for one the sweep made.
@@ -452,11 +532,11 @@ struct Aside {
 }
 
 impl Sweep {
-    /// The sweep of the root `root`, given without a trailing separator, at `now`, keyed as `named` says: the root,
-    /// `pruned` (made when missing, and what an earlier sweep left in it removed) and `work` held; the keyed prune
+    /// The sweep of the root `root`, given without a trailing separator, at `now`, for the prune `mode` names: the
+    /// root, `pruned` (made when missing, and what an earlier sweep left in it removed) and `work` held; the keyed prune
     /// makes a missing `work`, so each key's lock is taken there as a run takes it. `None` when the root, or for the age
     /// prune `work`, is not there. Else the line saying why the sweep ended.
-    fn opened(root: &str, now: SystemTime, named: bool, console: &mut Console) -> Result<Option<Sweep>, String> {
+    fn opened(root: &str, now: SystemTime, mode: Mode, console: &mut Console) -> Result<Option<Sweep>, String> {
         let Some(root_folder) = opened_root(root)? else {
             return Ok(None);
         };
@@ -465,7 +545,7 @@ impl Sweep {
             .ok_or_else(|| cannot_list(&pruned_path, &io::Error::from(ErrorKind::NotFound)))?;
         leftovers_removed(&pruned, &pruned_path, console)?;
         let work_path = format!(r"{root}\work");
-        let make = if named { Make::Folder } else { Make::Open };
+        let make = if mode == Mode::Named { Make::Folder } else { Make::Open };
         let Some(work) = folder_beneath(&root_folder, "work", Path::new(&work_path), make)? else {
             return Ok(None);
         };
@@ -477,21 +557,126 @@ impl Sweep {
             pruned,
             pruned_path,
             now,
-            named,
             refused: None,
             git: Git::find(),
+            made_locks: RefCell::default(),
         }))
     }
 
-    /// The age prune of the key `key` ([`Sweep::pruned_key`]), saying the folder removed and how long it was idle:
-    /// `true` once it is removed.
-    fn aged_key(&self, key: &str, console: &mut Console) -> bool {
-        let Pruned::Removed(Some(idle)) = self.pruned_key(key, console) else {
-            return false;
+    /// The age prune of the key `key` ([`Sweep::pruned_key`]), saying the folder removed and how long it was idle;
+    /// what became of the key.
+    fn aged_key(&self, key: &str, console: &mut Console) -> Pruned {
+        let pruned = self.pruned_key(key, Mode::Aged, console);
+        if let Pruned::Removed(Some(idle)) = pruned {
+            let hours = idle.as_secs() / HOUR_SECONDS;
+            stamping::out(console, &format!("gate: remote pruned {}: idle {hours} h", escaped(key)));
+        }
+        pruned
+    }
+
+    /// The age prune's floor pass over the keys `left` after its age pass: while the free space of the root's volume,
+    /// read by `space`, is under the low mark of the volume's floor ([`floor_marks`]), removes their work folders that
+    /// no run holds, least recent use first ([`Sweep::floor_order`]), one at a time and the free space read again after
+    /// each, until it is at the high mark ([`Sweep::floored`]). Says on stderr a free space that cannot be read, which
+    /// ends the pass, or a floor not reached once no folder is left. How many it removed.
+    fn floor_removed(&self, left: &[&str], space: &SpaceRead<'_>, console: &mut Console) -> usize {
+        let Some(start) = self.space_said(space, console) else {
+            return 0;
         };
-        let hours = idle.as_secs() / HOUR_SECONDS;
-        stamping::out(console, &format!("gate: remote pruned {}: idle {hours} h", escaped(key)));
-        true
+        let marks = floor_marks(start.total);
+        if start.free_to_caller >= marks.low {
+            return 0;
+        }
+        let order = self.floor_order(left, console);
+        let (removed, free) = self.floored(&order, space, start, console);
+        if let Some(free) = free
+            && free < marks.high
+        {
+            stamping::err(
+                console,
+                &format!("gate: remote prune could not reach the free-space floor: {} GiB free", free / GIB),
+            );
+        }
+        removed
+    }
+
+    /// Removes the work folders of the keys `order` in turn ([`Mode::Floor`]), from the space `start` of the root's
+    /// volume, until its free space is at the high mark of its floor, each removal said with the free space, in whole
+    /// GiB, before it, the free space read by `space` again after each; a removal that freed nothing moves on to the
+    /// next key, and a free space that cannot be read ends it. How many it removed, and the free space last read,
+    /// `None` when that read failed.
+    fn floored(&self, order: &[&str], space: &SpaceRead<'_>, start: DiskSpace, console: &mut Console) -> (usize, Option<u64>) {
+        let high = floor_marks(start.total).high;
+        let (mut removed, mut free) = (0, start.free_to_caller);
+        for key in order {
+            if free >= high {
+                break;
+            }
+            if !matches!(self.pruned_key(key, Mode::Floor, console), Pruned::Removed(_)) {
+                continue;
+            }
+            removed += 1;
+            stamping::out(console, &format!("gate: remote pruned {}: {} GiB free", escaped(key), free / GIB));
+            let Some(read) = self.space_said(space, console) else {
+                return (removed, None);
+            };
+            free = read.free_to_caller;
+        }
+        (removed, Some(free))
+    }
+
+    /// The space of the root's volume, read by `space`; `None` once a line on stderr said it cannot be read.
+    fn space_said(&self, space: &SpaceRead<'_>, console: &mut Console) -> Option<DiskSpace> {
+        space(&self.root)
+            .inspect_err(|error| {
+                stamping::err(
+                    console,
+                    &format!(
+                        "gate: remote could not read the free space of {}: {}",
+                        escaped(&self.root),
+                        escaped(&error.to_string())
+                    ),
+                );
+            })
+            .ok()
+    }
+
+    /// The keys of `keys` with a work folder whose last use can be read ([`Sweep::folder_last_use`]), least recent use
+    /// first; a last use after the sweep's time is the most recent.
+    fn floor_order<'k>(&self, keys: &[&'k str], console: &mut Console) -> Vec<&'k str> {
+        let mut dated: Vec<(SystemTime, &str)> = Vec::new();
+        for key in keys {
+            // A key with no plain folder, or whose last use cannot be read, is left out of the floor pass: the age pass
+            // said why it could not prune a folder it could not read, and an unreadable lock stamp is said here.
+            if let Some(last_use) = self.folder_last_use(key, console) {
+                dated.push((last_use, key));
+            }
+        }
+        dated.sort_unstable();
+        dated.into_iter().map(|(_, key)| key).collect()
+    }
+
+    /// The last use of the key's work folder, looked at as the age pass looks at it ([`Sweep::last_use`]), with its
+    /// lock's last write, which a lock this sweep made does not count, as the age pass does not count it. `None` when it
+    /// has no plain folder or any of it cannot be read; a lock whose last write cannot be read is a line on stderr.
+    fn folder_last_use(&self, key: &str, console: &mut Console) -> Option<SystemTime> {
+        let looked = gate_win32::open_beneath_as(&self.work, key, LOOK_ACCESS, Share::All, Make::Open).ok()?;
+        if !is_folder_itself(&looked).ok()? {
+            return None;
+        }
+        let lock_written = if self.made_locks.borrow().iter().any(|made| made == key) {
+            None
+        } else {
+            match written(&self.work, &format!("{key}.lock")) {
+                Ok(written) => written,
+                Err(error) => {
+                    let why = escaped(&error.to_string());
+                    stamping::err(console, &format!("gate: remote could not read the lock of {}: {why}", escaped(key)));
+                    return None;
+                }
+            }
+        };
+        self.last_use(key, &looked, lock_written).ok()
     }
 
     /// The keyed prune of each key of `keys` in turn ([`Sweep::pruned_key`]), each said as it ends, the drain barrier
@@ -504,7 +689,7 @@ impl Sweep {
                 kept_drained(keys.get(at..).unwrap_or_default(), console);
                 break;
             }
-            match self.pruned_key(key, console) {
+            match self.pruned_key(key, Mode::Named, console) {
                 Pruned::Removed(_) => stamping::out(console, &gone_line(key)),
                 Pruned::Held => stamping::out(console, &format!("gate: remote kept {}: in use", escaped(key))),
                 // The keyed prune judges no age, so it keeps a key only for a held lock or a failure.
@@ -515,11 +700,11 @@ impl Sweep {
         Ok(failed)
     }
 
-    /// Prunes the key `key` when no run holds its lock and, in the age prune, its work folder is idle: its folder
-    /// renamed aside, its records removed, in the keyed prune its refs too, and the folder removed once the lock is let
-    /// go. A failure is a line on stderr and keeps what is left.
-    fn pruned_key(&self, key: &str, console: &mut Console) -> Pruned {
-        let lock = match self.lock(key) {
+    /// Prunes the key `key` as `mode` says when no run holds its lock and, in the age prune, its work folder is idle:
+    /// its folder renamed aside, its records removed, in the keyed prune its refs too, and the folder removed once the
+    /// lock is let go. A failure is a line on stderr and keeps what is left.
+    fn pruned_key(&self, key: &str, mode: Mode, console: &mut Console) -> Pruned {
+        let lock = match self.lock(key, mode) {
             Ok(Some(lock)) => lock,
             Ok(None) => return Pruned::Held,
             Err(line) => {
@@ -527,32 +712,33 @@ impl Sweep {
                 return Pruned::Failed;
             }
         };
-        let aside = match self.set_aside(key, lock.written) {
+        let aside = match self.set_aside(key, lock.written, mode) {
             Ok(Found::Aside(aside)) => Some(aside),
-            Ok(Found::Missing) if self.named => None,
+            Ok(Found::Missing) if mode == Mode::Named => None,
             Ok(Found::Missing | Found::Fresh) => {
-                self.let_go(key, lock, console);
+                self.let_go(key, lock, mode, console);
                 return Pruned::Kept;
             }
             Err(line) => {
-                self.let_go(key, lock, console);
+                self.let_go(key, lock, mode, console);
                 stamping::err(console, &line);
                 return Pruned::Failed;
             }
         };
-        self.removed(key, lock, aside, console)
+        self.removed(key, lock, aside, mode, console)
     }
 
     /// With the key's lock `lock` held and its work folder `aside` renamed aside, or none there: in the keyed prune its
     /// refs deleted, then the lock let go and the folder removed. A folder that cannot be removed is a line on stderr,
     /// which the next sweep takes. A record left once the folder was aside is a line on stderr, and fails the key in the
     /// keyed prune; refs that cannot be deleted are the key's line saying why.
-    fn removed(&self, key: &str, lock: KeyLock, aside: Option<Aside>, console: &mut Console) -> Pruned {
+    fn removed(&self, key: &str, lock: KeyLock, aside: Option<Aside>, mode: Mode, console: &mut Console) -> Pruned {
+        let named = mode == Mode::Named;
         // The age prune leaves every ref: a worktree still alive may have pushed one just before the lock was taken, and
         // its run's fetch would fail where a rebuilt folder alone does no harm. A gone worktree pushes nothing.
         // Under the lock and with the folder out of `work`, so a run that comes for the key waits, then finds neither.
-        let refs = if self.named { self.refs_removed(key, console) } else { Ok(()) };
-        self.let_go(key, lock, console);
+        let refs = if named { self.refs_removed(key, console) } else { Ok(()) };
+        self.let_go(key, lock, mode, console);
         let (idle, left) = match aside {
             Some(aside) => {
                 if let Err(error) = gate_win32::delete_tree_opened(&aside.folder) {
@@ -564,7 +750,7 @@ impl Sweep {
         };
         if let Some(line) = left {
             stamping::err(console, &line);
-            if self.named {
+            if named {
                 return Pruned::Failed;
             }
         }
@@ -579,8 +765,8 @@ impl Sweep {
 
     /// Lets the key's lock `lock` go; in the keyed prune, one the sweep made is deleted first, through its handle, so a
     /// key the builder never had leaves nothing behind. A lock that cannot be deleted is a line on stderr.
-    fn let_go(&self, key: &str, lock: KeyLock, console: &mut Console) {
-        if self.named
+    fn let_go(&self, key: &str, lock: KeyLock, mode: Mode, console: &mut Console) {
+        if mode == Mode::Named
             && lock.written.is_none()
             && let Err(error) = gate_win32::delete_opened(&lock.file)
         {
@@ -665,10 +851,10 @@ impl Sweep {
     /// with its last write from before this sweep took it (`None` for a lock the sweep made); `None` when a run or
     /// another sweep holds it, or made it meanwhile. Else the line saying it cannot be opened or is not a plain file:
     /// in the keyed prune, the key's own line.
-    fn lock(&self, key: &str) -> Result<Option<KeyLock>, String> {
+    fn lock(&self, key: &str, mode: Mode) -> Result<Option<KeyLock>, String> {
         let name = format!("{key}.lock");
         let cannot = |error: io::Error| {
-            if self.named {
+            if mode == Mode::Named {
                 return could_not_prune(key, &error.to_string());
             }
             format!(
@@ -688,6 +874,7 @@ impl Sweep {
                 let written = if existed {
                     Some(lock.metadata().and_then(|metadata| metadata.modified()).map_err(cannot)?)
                 } else {
+                    self.made_locks.borrow_mut().push(key.to_owned());
                     None
                 };
                 Ok(Some(KeyLock { file: lock, written }))
@@ -703,7 +890,7 @@ impl Sweep {
     /// layout and index records removed; the records alone removed when it has no folder; a folder not idle left. Else
     /// the line saying why the key is kept. A record that cannot be removed once the folder is aside is the aside
     /// folder's line saying so ([`Aside::left`]).
-    fn set_aside(&self, key: &str, lock_written: Option<SystemTime>) -> Result<Found, String> {
+    fn set_aside(&self, key: &str, lock_written: Option<SystemTime>, mode: Mode) -> Result<Found, String> {
         let keep = |why: &dyn ToString| could_not_prune(key, &why.to_string());
         let looked = match gate_win32::open_beneath_as(&self.work, key, LOOK_ACCESS, Share::All, Make::Open) {
             Ok(looked) => looked,
@@ -716,14 +903,14 @@ impl Sweep {
         if !is_folder_itself(&looked).map_err(|error| keep(&error))? {
             return Err(keep(&"its work folder is not a plain folder"));
         }
-        let idle = if self.named {
-            None
-        } else {
+        let idle = if mode == Mode::Aged {
             let last_use = self.last_use(key, &looked, lock_written).map_err(|error| keep(&error))?;
             let Some(idle) = idle_for(last_use, self.now) else {
                 return Ok(Found::Fresh);
             };
             Some(idle)
+        } else {
+            None
         };
         let folder =
             gate_win32::open_beneath_as(&self.work, key, FILE_GENERIC_READ | DELETE, Share::NoDelete, Make::Open).map_err(|error| keep(&error))?;
@@ -923,12 +1110,20 @@ fn cannot_list(path: &Path, error: &io::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::cell::Cell;
+    use std::fs::{self, File};
+    use std::io;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
 
     use gate_args::BoxSeams;
+    use gate_router::escaped;
+    use gate_win32::DiskSpace;
+    use gate_wire::GIB;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 
-    use super::{Gc, IDLE_AGE, RECORDS_BEFORE, held_bare, idle_for, key_file_stem, opened_root, prune, root_name};
+    use super::{Gc, IDLE_AGE, RECORDS_BEFORE, SpaceRead, aged_with, held_bare, idle_for, key_file_stem, opened_root, prune, root_name};
     use crate::boxside::preflight::Git;
 
     #[test]
@@ -1028,14 +1223,15 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_last_used_exactly_a_day_ago_is_not_idle() {
+    fn a_folder_last_used_exactly_12_hours_ago_is_not_idle() {
         let now = SystemTime::now();
 
+        assert_eq!(IDLE_AGE, Duration::from_hours(12));
         assert_eq!(idle_for(now - IDLE_AGE, now), None);
     }
 
     #[test]
-    fn a_folder_last_used_a_day_and_a_second_ago_is_idle() {
+    fn a_folder_last_used_12_hours_and_a_second_ago_is_idle() {
         let now = SystemTime::now();
         let idle = IDLE_AGE + Duration::from_secs(1);
 
@@ -1047,5 +1243,245 @@ mod tests {
         let now = SystemTime::now();
 
         assert_eq!(idle_for(now + Duration::from_hours(48), now), None);
+    }
+
+    const OLDEST: &str = "oldest";
+    const OLDER: &str = "older";
+    const RECENT: &str = "recent";
+    const NEWEST: &str = "newest";
+    const HELD: &str = "held";
+    const STALE: &str = "stale";
+    /// A volume of 500 GiB, whose floor is 100 GiB to 150 GiB.
+    const TOTAL: u64 = 500 * GIB;
+
+    /// A builder root for the floor case `name` under the temp folder, with an empty `work`, removed first if an earlier
+    /// run left it.
+    #[expect(clippy::expect_used, reason = "a floor case that cannot make, age or remove its folders must fail loudly")]
+    fn floor_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("gate-prune-floor-{name}-{}", std::process::id()));
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("an earlier root can be removed");
+        }
+        fs::create_dir_all(root.join("work")).expect("the work folder can be made");
+        root
+    }
+
+    /// The work folder of `key` under `root`, holding a file, and its lock, both last written `age` before `now`.
+    #[expect(clippy::expect_used, reason = "a floor case that cannot make, age or remove its folders must fail loudly")]
+    fn used_folder(root: &Path, key: &str, age: Duration, now: SystemTime) -> PathBuf {
+        let folder = root.join("work").join(key);
+        fs::create_dir(&folder).expect("the work folder can be made");
+        fs::write(folder.join("file"), "x").expect("a file can be written in it");
+        let lock = root.join("work").join(format!("{key}.lock"));
+        fs::write(&lock, "").expect("the lock can be written");
+        for path in [&lock, &folder] {
+            File::options()
+                .write(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+                .and_then(|opened| opened.set_modified(now - age))
+                .expect("the last write can be set");
+        }
+        folder
+    }
+
+    /// A reader of the space of a 500 GiB volume: `start` GiB free, and `each` more for every key of `keys` whose work
+    /// folder is gone from `root`.
+    #[expect(clippy::expect_used, reason = "a floor case that cannot make, age or remove its folders must fail loudly")]
+    fn freeing(root: &Path, keys: &'static [&'static str], start: u64, each: u64) -> impl Fn(&str) -> io::Result<DiskSpace> + use<> {
+        let work = root.join("work");
+        move |_| {
+            let gone = u64::try_from(keys.iter().filter(|key| !work.join(key).exists()).count()).expect("a count fits");
+            Ok(DiskSpace {
+                free_to_caller: (start + each * gone) * GIB,
+                total: TOTAL,
+            })
+        }
+    }
+
+    /// The age prune of `root` at `now`, the space of its volume read by `space`: its status and the lines it said on
+    /// stderr.
+    #[expect(clippy::expect_used, reason = "a floor case that cannot make, age or remove its folders must fail loudly")]
+    fn floor_swept(root: &Path, now: SystemTime, space: &SpaceRead<'_>) -> (Result<u32, String>, Vec<String>) {
+        let mut console = Console::new();
+        let text = root.to_str().expect("the root is Unicode");
+        let status = aged_with(text, now, &BoxSeams::default(), space, &mut console);
+        (status, console.take_notes())
+    }
+
+    #[expect(clippy::expect_used, reason = "a floor case that cannot make, age or remove its folders must fail loudly")]
+    #[test]
+    fn under_the_floor_the_least_recently_used_free_folders_go_until_the_high_mark_and_a_held_one_stays() {
+        let (root, now) = (floor_root("order"), SystemTime::now());
+        used_folder(&root, OLDEST, Duration::from_hours(10), now);
+        used_folder(&root, OLDER, Duration::from_hours(8), now);
+        used_folder(&root, RECENT, Duration::from_mins(10), now);
+        let newest = used_folder(&root, NEWEST, Duration::from_mins(5), now);
+        let held = used_folder(&root, HELD, Duration::from_hours(11), now);
+        // A run holds its lock sharing nothing.
+        let run = File::options()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(root.join(format!(r"work\{HELD}.lock")));
+        let free = freeing(&root, &[OLDEST, OLDER, RECENT, NEWEST], 90, 25);
+
+        let (status, said) = floor_swept(&root, now, &free);
+
+        drop(run.expect("the run's hold is taken"));
+        let gone = [OLDEST, OLDER, RECENT].map(|key| !root.join("work").join(key).exists());
+        let kept = newest.is_dir() && held.is_dir();
+        fs::remove_dir_all(&root).expect("the root can be removed");
+        assert_eq!(status, Ok(0));
+        assert!(said.is_empty(), "{said:?}");
+        assert_eq!(gone, [true; 3], "the three least recently used go, 90, 115 and 140 GiB free before each");
+        assert!(kept, "the high mark reached, the newest stays, and the held one is never taken");
+    }
+
+    #[expect(clippy::expect_used, reason = "a floor case that cannot make, age or remove its folders must fail loudly")]
+    #[test]
+    fn at_the_low_mark_nothing_goes_beyond_the_age_pass() {
+        let (root, now) = (floor_root("over"), SystemTime::now());
+        let stale = used_folder(&root, STALE, Duration::from_hours(13), now);
+        let recent = used_folder(&root, RECENT, Duration::from_hours(1), now);
+
+        let (status, said) = floor_swept(&root, now, &|_| {
+            Ok(DiskSpace {
+                free_to_caller: 100 * GIB,
+                total: TOTAL,
+            })
+        });
+
+        let (stale_gone, recent_kept) = (!stale.exists(), recent.is_dir());
+        fs::remove_dir_all(&root).expect("the root can be removed");
+        assert_eq!(status, Ok(0));
+        assert!(said.is_empty(), "{said:?}");
+        assert!(stale_gone, "the age pass removes the folder idle 13 hours");
+        assert!(recent_kept, "at the low mark the floor pass removes nothing");
+    }
+
+    #[expect(clippy::expect_used, reason = "a floor case that cannot make, age or remove its folders must fail loudly")]
+    #[test]
+    fn a_free_space_that_cannot_be_read_is_said_and_nothing_more_goes() {
+        let (root, now) = (floor_root("unread"), SystemTime::now());
+        let recent = used_folder(&root, RECENT, Duration::from_hours(1), now);
+
+        let (status, said) = floor_swept(&root, now, &|_| Err(io::Error::other("the volume is gone")));
+
+        let kept = recent.is_dir();
+        fs::remove_dir_all(&root).expect("the root can be removed");
+        let shown = escaped(root.to_str().expect("the root is Unicode"));
+        assert_eq!(status, Ok(0));
+        assert_eq!(
+            said,
+            [format!("gate: remote could not read the free space of {shown}: the volume is gone")]
+        );
+        assert!(kept);
+    }
+
+    #[expect(clippy::expect_used, reason = "a floor case that cannot make, age or remove its folders must fail loudly")]
+    #[test]
+    fn a_floor_pass_that_ends_under_the_high_mark_says_so() {
+        let (root, now) = (floor_root("short"), SystemTime::now());
+        let recent = used_folder(&root, RECENT, Duration::from_hours(1), now);
+
+        let (status, said) = floor_swept(&root, now, &|_| {
+            Ok(DiskSpace {
+                free_to_caller: 90 * GIB,
+                total: TOTAL,
+            })
+        });
+
+        let gone = !recent.exists();
+        fs::remove_dir_all(&root).expect("the root can be removed");
+        assert_eq!(status, Ok(0));
+        assert_eq!(said, ["gate: remote prune could not reach the free-space floor: 90 GiB free"]);
+        assert!(gone, "the one folder goes, and with no key left the pass ends");
+    }
+
+    /// A reader of the space of a [`TOTAL`] volume: `steps[n]` GiB free once `n` keys of `keys` have their work folder
+    /// gone from `root`, the last step past the end.
+    fn stepped(root: &Path, keys: &'static [&'static str], steps: &'static [u64]) -> impl Fn(&str) -> io::Result<DiskSpace> + use<> {
+        let work = root.join("work");
+        move |_| {
+            let gone = keys.iter().filter(|key| !work.join(key).exists()).count();
+            let gib = steps.get(gone).or(steps.last()).copied().unwrap_or_default();
+            Ok(DiskSpace {
+                free_to_caller: gib * GIB,
+                total: TOTAL,
+            })
+        }
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a floor case that cannot make, age or remove its folders must fail loudly")]
+    fn a_removal_that_frees_nothing_moves_on_to_the_next_folder() {
+        let (root, now) = (floor_root("flat"), SystemTime::now());
+        used_folder(&root, OLDEST, Duration::from_hours(10), now);
+        used_folder(&root, OLDER, Duration::from_hours(8), now);
+        let recent = used_folder(&root, RECENT, Duration::from_mins(10), now);
+        // Flat after the first removal, over the high mark after the second.
+        let free = stepped(&root, &[OLDEST, OLDER, RECENT], &[90, 90, 160]);
+
+        let (status, said) = floor_swept(&root, now, &free);
+
+        let gone = [OLDEST, OLDER].map(|key| !root.join("work").join(key).exists());
+        let kept = recent.is_dir();
+        fs::remove_dir_all(&root).expect("the root can be removed");
+        assert_eq!(status, Ok(0));
+        assert!(said.is_empty(), "{said:?}");
+        assert_eq!(gone, [true; 2], "a removal that freed nothing moves on to the next folder");
+        assert!(kept, "the pass ends at the high mark");
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a floor case that cannot make, age or remove its folders must fail loudly")]
+    fn a_free_space_that_cannot_be_read_again_ends_the_pass_with_its_line_alone() {
+        let (root, now) = (floor_root("reread"), SystemTime::now());
+        let oldest = used_folder(&root, OLDEST, Duration::from_hours(10), now);
+        let older = used_folder(&root, OLDER, Duration::from_hours(8), now);
+        let reads = Cell::new(0);
+        let space = |_: &str| {
+            reads.set(reads.get() + 1);
+            if reads.get() == 1 {
+                Ok(DiskSpace {
+                    free_to_caller: 90 * GIB,
+                    total: TOTAL,
+                })
+            } else {
+                Err(io::Error::other("the volume is gone"))
+            }
+        };
+
+        let (status, said) = floor_swept(&root, now, &space);
+
+        let (oldest_gone, older_kept) = (!oldest.exists(), older.is_dir());
+        fs::remove_dir_all(&root).expect("the root can be removed");
+        let shown = escaped(root.to_str().expect("the root is Unicode"));
+        assert_eq!(status, Ok(0));
+        assert_eq!(
+            said,
+            [format!("gate: remote could not read the free space of {shown}: the volume is gone")]
+        );
+        assert!(oldest_gone && older_kept, "the pass ends at the failed read");
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a floor case that cannot make, age or remove its folders must fail loudly")]
+    fn a_lock_the_age_pass_made_does_not_make_its_folder_recent() {
+        let (root, now) = (floor_root("made-lock"), SystemTime::now());
+        let unlocked = used_folder(&root, OLDEST, Duration::from_hours(10), now);
+        fs::remove_file(root.join(format!(r"work\{OLDEST}.lock"))).expect("the lock can be removed");
+        let older = used_folder(&root, OLDER, Duration::from_hours(8), now);
+        let free = stepped(&root, &[OLDEST, OLDER], &[90, 160]);
+
+        let (status, said) = floor_swept(&root, now, &free);
+
+        let (unlocked_gone, older_kept) = (!unlocked.exists(), older.is_dir());
+        fs::remove_dir_all(&root).expect("the root can be removed");
+        assert_eq!(status, Ok(0));
+        assert!(said.is_empty(), "{said:?}");
+        assert!(unlocked_gone, "the folder used 10 hours ago goes first, whatever its new lock's stamp");
+        assert!(older_kept, "the high mark is reached before it");
     }
 }

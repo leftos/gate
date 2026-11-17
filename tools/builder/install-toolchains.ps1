@@ -959,7 +959,7 @@ Invoke-Step "Gate work root $GateRoot" {
     if ($after) { throw "gate work root ${GateRoot}: $after" }
     Write-InstallLog "gate work root ${GateRoot}: protected DACL SYSTEM, Administrators, $User full control; no label"
 }
-# Every 6 hours a task runs gate box prune on the work root and writes its lines to the Application event log. The whole
+# Every 2 hours a task runs gate box prune on the work root and writes its lines to the Application event log. The whole
 # command sits in the task's own action, which only an administrator can change, so no script file backs it. The task is
 # not started here: gate.exe arrives with the gate push that follows this installer.
 Invoke-Step 'Work-folder prune task' {
@@ -984,17 +984,17 @@ Invoke-Step 'Work-folder prune task' {
     $arguments = "-NoProfile -NonInteractive -Command `"$pruneCommand`""
     $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument $arguments
     # No -RepetitionDuration: the repetition runs indefinitely, which the read-back below confirms.
-    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddMinutes(17) -RepetitionInterval (New-TimeSpan -Hours 6)
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddMinutes(17) -RepetitionInterval (New-TimeSpan -Hours 2)
     $principal = New-ScheduledTaskPrincipal -UserId $User -LogonType S4U -RunLevel Limited
     $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 2) -MultipleInstances IgnoreNew -StartWhenAvailable
     Register-ScheduledTask -TaskPath $sccacheTaskPath -TaskName $pruneTaskName -Action $action -Trigger $trigger -Principal $principal `
         -Settings $settings -Force | Out-Null
     $repetition = @((Get-ScheduledTask -TaskPath $sccacheTaskPath -TaskName $pruneTaskName).Triggers)[0].Repetition
-    if ($repetition.Interval -ne 'PT6H' -or $repetition.Duration) {
+    if ($repetition.Interval -ne 'PT2H' -or $repetition.Duration) {
         throw ("task $sccacheTaskPath$pruneTaskName reads back with repetition interval '$($repetition.Interval)' and duration " +
-            "'$($repetition.Duration)', expected PT6H and none (indefinite)")
+            "'$($repetition.Duration)', expected PT2H and none (indefinite)")
     }
-    Write-InstallLog "task $sccacheTaskPath$pruneTaskName registered: every 6 h, gate box prune --root $GateRoot as $User (S4U, Limited)"
+    Write-InstallLog "task $sccacheTaskPath$pruneTaskName registered: every 2 h, gate box prune --root $GateRoot as $User (S4U, Limited)"
     if (-not (Test-Path -LiteralPath $gateExe)) {
         Write-InstallLog "task $sccacheTaskPath$pruneTaskName will fail until a gate push installs $gateExe"
     }

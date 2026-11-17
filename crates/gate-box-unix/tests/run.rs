@@ -1438,7 +1438,11 @@ mod unix {
 
         let ended = pruned(
             &["--root", &case.root()],
-            &[("GATE_BOX_TEST_TMP_ROOT", tmp_root), ("GATE_BOX_TEST_FREE_BYTES", &free)],
+            &[
+                ("GATE_BOX_TEST_TMP_ROOT", tmp_root),
+                ("GATE_BOX_TEST_FREE_BYTES", &free),
+                ("GATE_BOX_TEST_TOTAL_BYTES", &free),
+            ],
         );
 
         assert_eq!(ended.status, Some(0), "{:?}", ended.err);
@@ -3617,7 +3621,7 @@ mod unix {
 
     /// An idle work folder of `case` and a leftover run folder in its own temp folder, both two days old; the
     /// variables an age prune of it runs with, the free space plenty.
-    fn idle_work(case: &Case) -> (PathBuf, PathBuf, [(&'static str, String); 2]) {
+    fn idle_work(case: &Case) -> (PathBuf, PathBuf, [(&'static str, String); 3]) {
         let two_days = std::time::Duration::from_hours(48);
         let work = PathBuf::from(case.work());
         fs::create_dir(&work).expect("the work folder is made");
@@ -3629,6 +3633,7 @@ mod unix {
         let env = [
             ("GATE_BOX_TEST_TMP_ROOT", tmp.to_str().expect("the temp folder is UTF-8").to_owned()),
             ("GATE_BOX_TEST_FREE_BYTES", (1000u64 << 30).to_string()),
+            ("GATE_BOX_TEST_TOTAL_BYTES", (1000u64 << 30).to_string()),
         ];
         (work, leftover, env)
     }

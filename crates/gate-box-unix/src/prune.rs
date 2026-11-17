@@ -1,5 +1,5 @@
 //! `gate-box box prune --root <folder>`: the age prune, which a scheduled job on the builder runs every few hours. It
-//! removes the work folders no run has used for over a day: a folder's last use is the newest last write of the folder,
+//! removes the work folders no run has used for over 12 hours: a folder's last use is the newest last write of the folder,
 //! each tree's `.git/FETCH_HEAD` (every run fetches into each tree it checks out) and the key's records. A key's work
 //! folder `<root>/work/<key>` goes only with its lock `<root>/work/<key>.lock` held, so no run is using it and none can
 //! start in it meanwhile (one that tries is refused busy, status 75, and its PC runs the command itself); a key whose
@@ -13,9 +13,9 @@
 //! folder has its records removed. The lock stays. The age prune never deletes a ref.
 //! `gate-box box prune --root <folder> --keys <key>...`, the keyed prune the PC sends for worktrees that are gone,
 //! removes those keys whatever their last use, a lock it made with them, and their refs in each bare repository.
-//! After its age pass, the age prune keeps the root's volume from filling: while under 100 GiB is free, it removes the
-//! work folders no run holds, oldest use first, until 150 GiB is. Then it removes the temp folders runs ended hard left
-//! in `/tmp`, idle for over a day.
+//! After its age pass, the age prune keeps the root's volume from filling: while its free space is under the low mark
+//! of the volume's floor ([`floor_marks`]), it removes the work folders no run holds, oldest use first, until the free
+//! space is at the high mark. Then it removes the temp folders runs ended hard left in `/tmp`, idle for over a day.
 //! The sweep works only in a root private to the box user: the box's own folder, writable by no one but the builder, as
 //! [`records_folder`] checks it before anything beneath it is looked at, so only that user can swap what the sweep
 //! looks at between its look and its act. A root the check refuses is left whole: the age prune ends there, and the
@@ -35,7 +35,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gate_args::BoxSeams;
 use gate_wire::drain::Clock;
-use gate_wire::{LAYOUT_CHANGING, escaped, is_key};
+use gate_wire::{GIB, LAYOUT_CHANGING, escaped, floor_marks, is_key};
 
 use crate::console::Console;
 use crate::drain::barrier_stands;
@@ -45,7 +45,9 @@ use crate::lines::{FAILED_STATUS, OwnerFlaw, Recorded, USAGE_STATUS, WRITABLE_BY
 use crate::stop::{Record, own_group, record_current, records_folder, unusable_refusal};
 
 /// How long a work folder goes unused before a sweep removes it.
-const IDLE_AGE: Duration = Duration::from_hours(24);
+const IDLE_AGE: Duration = Duration::from_hours(12);
+/// How long a leftover run folder in `/tmp` goes unused before a sweep removes it ([`leftover_idle`]).
+const LEFTOVER_IDLE_AGE: Duration = Duration::from_hours(24);
 /// The extensions of the files beside a work folder `<key>` named `<key>.<extension>`: its lock and its records.
 const KEY_FILES: [&str; 15] = [
     "lock",
@@ -116,9 +118,7 @@ pub fn prune(root: &Path, keys: &[String], now: SystemTime, drain_seams: &BoxSea
         before_rename: &no_rename_seen,
         after_rename: &no_rename_seen,
         volumes: Path::new(VOLUMES),
-        free: &free_read,
-        floor_low: FLOOR_LOW,
-        floor_high: FLOOR_HIGH,
+        space: &space_read,
         tmp: &tmp,
         clock: Clock::of(drain_seams),
     };
@@ -130,24 +130,22 @@ const VOLUMES: &str = "/Volumes";
 /// The folder a run makes its own temp folder in, `gate.` and eight letters or digits ([`is_run_temp_name`]): `/tmp`
 /// itself, whatever the sweep's own `TMPDIR`.
 const TMP: &str = "/tmp";
-/// A gibibyte, as the free space is said.
-const GIB: u64 = 1 << 30;
-/// The free space under which the age prune goes on to remove work folders however recent ([`Sweep::floor_removed`]).
-const FLOOR_LOW: u64 = 100 * GIB;
-/// The free space at which that removal stops.
-const FLOOR_HIGH: u64 = 150 * GIB;
+/// The space of a volume: the bytes the box's user may still write there, and the volume's size.
+#[derive(Clone, Copy)]
+struct Space {
+    free: u64,
+    total: u64,
+}
 
 /// What a prune is given besides its words, which a test replaces: what it calls with each work folder just before
-/// renaming it aside and with its new name just after, the folder the volumes are mounted in, the reader of the free
-/// bytes of the volume holding a folder, the free-space floors, the folder runs make their temp folders in, and the
-/// clock the drain barrier is judged at.
+/// renaming it aside and with its new name just after, the folder the volumes are mounted in, the reader of the space
+/// of the volume holding a folder, the folder runs make their temp folders in, and the clock the drain barrier is
+/// judged at.
 struct Seams<'a> {
     before_rename: &'a dyn Fn(&Path),
     after_rename: &'a dyn Fn(&Path),
     volumes: &'a Path,
-    free: &'a dyn Fn(&Path) -> io::Result<u64>,
-    floor_low: u64,
-    floor_high: u64,
+    space: &'a dyn Fn(&Path) -> io::Result<Space>,
     tmp: &'a Path,
     clock: Clock,
 }
@@ -182,22 +180,44 @@ fn tmp_root() -> PathBuf {
     PathBuf::from(TMP)
 }
 
-/// The free bytes of the volume holding `path` ([`free_bytes`]), or in a build with the test seams
-/// `GATE_BOX_TEST_FREE_BYTES` when set.
-fn free_read(path: &Path) -> io::Result<u64> {
+/// The space of the volume holding `path` ([`space_bytes`]); in a build with the test seams, the free bytes
+/// `GATE_BOX_TEST_FREE_BYTES` and the volume's size `GATE_BOX_TEST_TOTAL_BYTES` give each in place of the volume's own
+/// when set.
+fn space_read(path: &Path) -> io::Result<Space> {
     // Set by tests/run.rs `an_age_prune_removes_an_idle_work_folder_and_a_leftover_run_folder`.
     #[cfg(feature = "test-seams")]
-    if let Some(bytes) = std::env::var_os("GATE_BOX_TEST_FREE_BYTES") {
-        return bytes
-            .to_str()
-            .and_then(|bytes| bytes.parse().ok())
-            .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "GATE_BOX_TEST_FREE_BYTES is not a count of bytes"));
+    {
+        let (free, total) = (seam_bytes("GATE_BOX_TEST_FREE_BYTES")?, seam_bytes("GATE_BOX_TEST_TOTAL_BYTES")?);
+        if let (Some(free), Some(total)) = (free, total) {
+            return Ok(Space { free, total });
+        }
+        if free.is_some() || total.is_some() {
+            let read = space_bytes(path)?;
+            return Ok(Space {
+                free: free.unwrap_or(read.free),
+                total: total.unwrap_or(read.total),
+            });
+        }
     }
-    free_bytes(path)
+    space_bytes(path)
 }
 
-/// The bytes of the volume holding `path` that the box's user may still write, by `statfs(2)`.
-fn free_bytes(path: &Path) -> io::Result<u64> {
+/// The count of bytes the environment variable `name` holds, `None` when it is not set; else that it is no count.
+#[cfg(feature = "test-seams")]
+fn seam_bytes(name: &str) -> io::Result<Option<u64>> {
+    std::env::var_os(name)
+        .map(|bytes| {
+            bytes
+                .to_str()
+                .and_then(|bytes| bytes.parse().ok())
+                .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, format!("{name} is not a count of bytes")))
+        })
+        .transpose()
+}
+
+/// The space of the volume holding `path`, by one `statfs(2)`: the bytes the box's user may still write (`f_bavail`
+/// blocks) and the volume's size (`f_blocks` blocks).
+fn space_bytes(path: &Path) -> io::Result<Space> {
     let name = CString::new(path.as_os_str().as_bytes())?;
     // SAFETY: `statfs` is plain data, for which all zeroes is a valid value, filled in by the call below.
     let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
@@ -206,7 +226,11 @@ fn free_bytes(path: &Path) -> io::Result<u64> {
     if unsafe { libc::statfs(name.as_ptr(), &raw mut stat) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(statfs_count(stat.f_bavail)?.saturating_mul(statfs_count(stat.f_bsize)?))
+    let block = statfs_count(stat.f_bsize)?;
+    Ok(Space {
+        free: statfs_count(stat.f_bavail)?.saturating_mul(block),
+        total: statfs_count(stat.f_blocks)?.saturating_mul(block),
+    })
 }
 
 /// A count `statfs` gave, whose type is unsigned on macOS and may be signed elsewhere (Linux's block size); else that
@@ -478,15 +502,16 @@ impl<'a> Sweep<'a> {
     }
 
     /// The age prune's floor pass over the keys `left` after its age pass: while the free space of the root's volume
-    /// ([`Seams::free`]) is under the low floor, removes their work folders, those no run holds and no recorded process
-    /// group of which is still its run's, in the floor's order ([`Sweep::floor_order`]), one at a time and the free
-    /// space read again after each, until it is at the high floor. Says each folder removed and the free space before
-    /// it, and, on stderr, a free space that cannot be read, or a floor not reached once no folder is left or a removal
-    /// freed nothing. How many it removed.
+    /// ([`Seams::space`]) is under the low mark of the volume's floor ([`floor_marks`]), removes their work folders,
+    /// those no run holds and no recorded process group of which is still its run's, in the floor's order
+    /// ([`Sweep::floor_order`]), one at a time and the free space read again after each, until it is at the high mark.
+    /// A removal that freed nothing moves on to the next key. Says each folder removed and the free space before it,
+    /// and, on stderr, a free space that cannot be read, which ends the pass, or a floor not reached once no folder is
+    /// left. How many it removed.
     fn floor_removed(&self, left: &[&String], seams: &Seams<'_>, console: &mut Console) -> usize {
         let root = Path::new(&self.root);
         let read = |console: &mut Console| {
-            (seams.free)(root)
+            (seams.space)(root)
                 .inspect_err(|error| {
                     console.err(&format!(
                         "gate: remote could not read the free space of {}: {}",
@@ -496,15 +521,17 @@ impl<'a> Sweep<'a> {
                 })
                 .ok()
         };
-        let Some(mut free) = read(console) else {
+        let Some(start) = read(console) else {
             return 0;
         };
-        if free >= seams.floor_low {
+        let marks = floor_marks(start.total);
+        let mut free = start.free;
+        if free >= marks.low {
             return 0;
         }
         let mut removed = 0;
         for key in self.floor_order(left) {
-            if free >= seams.floor_high {
+            if free >= marks.high {
                 break;
             }
             if !matches!(self.pruned_key(key, Mode::Floor, console), Pruned::Removed(_)) {
@@ -512,16 +539,12 @@ impl<'a> Sweep<'a> {
             }
             removed += 1;
             console.out(&format!("gate: remote pruned {}: {} GiB free", escaped(key), free / GIB));
-            let before = free;
-            let Some(now_free) = read(console) else {
+            let Some(now_space) = read(console) else {
                 return removed;
             };
-            free = now_free;
-            if free <= before {
-                break;
-            }
+            free = now_space.free;
         }
-        if free < seams.floor_high {
+        if free < marks.high {
             console.err(&format!(
                 "gate: remote prune could not reach the free-space floor: {} GiB free",
                 free / GIB
@@ -868,7 +891,7 @@ fn leftover_run_folders_removed(tmp: &Path, now: SystemTime, console: &mut Conso
 
 /// How long the folder `path` has been idle at `now` when it is a leftover run folder: a folder looked at as itself,
 /// not a link, owned by the user `euid`, the newest last write of it and of each entry directly in it over
-/// [`IDLE_AGE`] before `now`. `None` when it is not, or is gone. Else why it could not be looked at or listed.
+/// [`LEFTOVER_IDLE_AGE`] before `now`. `None` when it is not, or is gone. Else why it could not be looked at or listed.
 fn leftover_idle(path: &Path, euid: u32, now: SystemTime) -> io::Result<Option<Duration>> {
     let looked = match fs::symlink_metadata(path) {
         Ok(looked) => looked,
@@ -884,7 +907,7 @@ fn leftover_idle(path: &Path, euid: u32, now: SystemTime) -> io::Result<Option<D
             newest = newest.max(stamp);
         }
     }
-    Ok(idle_for(newest, now))
+    Ok(now.duration_since(newest).ok().filter(|idle| *idle > LEFTOVER_IDLE_AGE))
 }
 
 /// Whether `name` is a run's temp folder's: `gate.` and eight letters or digits, as `mkdtemp(3)` fills them in.
@@ -1139,7 +1162,7 @@ mod tests {
     use gate_wire::ROOT_UNSAFE;
     use gate_wire::drain::Clock;
 
-    use super::{GIB, IDLE_AGE, RECORDS_BEFORE, Seams, free_bytes, idle_for, key_file_stem, no_rename_seen, prune, pruned_with};
+    use super::{GIB, IDLE_AGE, RECORDS_BEFORE, Seams, Space, idle_for, key_file_stem, no_rename_seen, prune, pruned_with, space_bytes};
     use crate::console::Console;
     use crate::files::held_for_test;
 
@@ -1159,6 +1182,24 @@ mod tests {
 
     /// Free space no floor pass acts on.
     const PLENTY: u64 = 1000 * GIB;
+    /// A volume of 500 GiB, whose floor is 100 GiB to 150 GiB.
+    const TOTAL: u64 = 500 * GIB;
+
+    /// The space of a volume with [`PLENTY`] free, all of it.
+    #[expect(clippy::unnecessary_wraps, reason = "a reader of the space a prune is given, whose type gives a result")]
+    fn plenty(_: &Path) -> std::io::Result<Space> {
+        Ok(Space { free: PLENTY, total: PLENTY })
+    }
+
+    /// A reader of the space of a [`TOTAL`] volume with `gib` GiB free, whatever is removed.
+    fn fixed(gib: u64) -> impl Fn(&Path) -> std::io::Result<Space> {
+        move |_| {
+            Ok(Space {
+                free: gib * GIB,
+                total: TOTAL,
+            })
+        }
+    }
 
     impl Case {
         fn new(name: &str) -> Case {
@@ -1215,25 +1256,23 @@ mod tests {
         }
 
         fn sweep_seeing(&self, before_rename: &dyn Fn(&Path)) -> (u8, Console) {
-            let seams = self.seams(before_rename, &|_| Ok(PLENTY), Path::new("/Volumes"));
+            let seams = self.seams(before_rename, &plenty, Path::new("/Volumes"));
             self.ran(&self.root, &[], &seams)
         }
 
-        /// The age prune, the free space read by `free`.
-        fn sweep_freeing(&self, free: &dyn Fn(&Path) -> std::io::Result<u64>) -> (u8, Console) {
-            let seams = self.seams(&|_| {}, free, Path::new("/Volumes"));
+        /// The age prune, the space of the volume read by `space`.
+        fn sweep_freeing(&self, space: &dyn Fn(&Path) -> std::io::Result<Space>) -> (u8, Console) {
+            let seams = self.seams(&|_| {}, space, Path::new("/Volumes"));
             self.ran(&self.root, &[], &seams)
         }
 
-        /// The case's seams: floors of 100 and 150 GiB, and its own temp folder.
-        fn seams<'a>(&'a self, before_rename: &'a dyn Fn(&Path), free: &'a dyn Fn(&Path) -> std::io::Result<u64>, volumes: &'a Path) -> Seams<'a> {
+        /// The case's seams: the space of the volume read by `space`, and its own temp folder.
+        fn seams<'a>(&'a self, before_rename: &'a dyn Fn(&Path), space: &'a dyn Fn(&Path) -> std::io::Result<Space>, volumes: &'a Path) -> Seams<'a> {
             Seams {
                 before_rename,
                 after_rename: &no_rename_seen,
                 volumes,
-                free,
-                floor_low: 100 * GIB,
-                floor_high: 150 * GIB,
+                space,
                 tmp: &self.tmp,
                 clock: Clock::of(&BoxSeams::default()),
             }
@@ -1247,7 +1286,7 @@ mod tests {
         /// The keyed prune of the root `root` for `keys`, its volumes mounted in `volumes`.
         fn keyed_in(&self, root: &Path, keys: &[&str], volumes: &Path) -> (u8, Console) {
             let keys: Vec<String> = keys.iter().map(|key| (*key).to_owned()).collect();
-            let seams = self.seams(&|_| {}, &|_| Ok(PLENTY), volumes);
+            let seams = self.seams(&|_| {}, &plenty, volumes);
             self.ran(root, &keys, &seams)
         }
 
@@ -1482,7 +1521,7 @@ mod tests {
         let taken = |aside: &Path| fs::remove_dir_all(aside).expect("the aside folder is taken");
         let seams = Seams {
             after_rename: &taken,
-            ..case.seams(&|_| {}, &|_| Ok(PLENTY), Path::new("/Volumes"))
+            ..case.seams(&|_| {}, &plenty, Path::new("/Volumes"))
         };
 
         let (status, console) = case.ran(&case.root, &[], &seams);
@@ -1926,25 +1965,39 @@ mod tests {
     const LOCKED: &str = "locked-0123abcd";
     const LIVE: &str = "live-0123abcd";
 
-    /// A free-space reader: `start` GiB, and `each` more for every key of `keys` whose work folder is gone from `work`.
-    fn freeing(work: &Path, keys: &'static [&'static str], start: u64, each: u64) -> impl Fn(&Path) -> std::io::Result<u64> + use<> {
+    /// A reader of the space of a volume of `total` GiB: `start` GiB free, and `each` more for every key of `keys` whose
+    /// work folder is gone from `work`.
+    fn freeing_of(
+        work: &Path,
+        keys: &'static [&'static str],
+        total: u64,
+        (start, each): (u64, u64),
+    ) -> impl Fn(&Path) -> std::io::Result<Space> + use<> {
         let work = work.to_owned();
         move |_| {
             let gone = u64::try_from(keys.iter().filter(|key| !work.join(key).exists()).count()).expect("a count fits");
-            Ok((start + each * gone) * GIB)
+            Ok(Space {
+                free: (start + each * gone) * GIB,
+                total: total * GIB,
+            })
         }
+    }
+
+    /// [`freeing_of`] a [`TOTAL`] volume.
+    fn freeing(work: &Path, keys: &'static [&'static str], start: u64, each: u64) -> impl Fn(&Path) -> std::io::Result<Space> + use<> {
+        freeing_of(work, keys, TOTAL / GIB, (start, each))
     }
 
     #[test]
     fn under_the_floor_the_oldest_free_keys_go_until_the_high_floor_and_a_recent_one_last() {
         let case = Case::new("floor");
-        case.folder_of(OLDEST, Duration::from_hours(20));
-        case.folder_of(OLDER, Duration::from_hours(10));
+        case.folder_of(OLDEST, Duration::from_hours(10));
+        case.folder_of(OLDER, Duration::from_hours(8));
         case.folder_of(RECENT, Duration::from_mins(10));
         case.folder_of(NEWEST, Duration::from_mins(5));
-        let locked = case.folder_of(LOCKED, Duration::from_hours(22));
+        let locked = case.folder_of(LOCKED, Duration::from_hours(11));
         let lock = held_for_test(&case.work().join(format!("{LOCKED}.lock")));
-        let live = case.folder_of(LIVE, Duration::from_hours(21));
+        let live = case.folder_of(LIVE, Duration::from_hours(11));
         let mut child = sleeping_group();
         fs::write(case.work().join(format!("{LIVE}.pgid")), live_record_text(child.id())).expect("the record is written");
         let free = freeing(&case.work(), &[OLDEST, OLDER, RECENT, NEWEST], 90, 25);
@@ -1974,7 +2027,7 @@ mod tests {
         let folder = case.folder(TWO_DAYS);
         fs::create_dir(case.work().join(format!("{KEY}.pgid"))).expect("the record's name is taken by a folder");
 
-        let (status, console) = case.sweep_freeing(&|_| Ok(90 * GIB));
+        let (status, console) = case.sweep_freeing(&fixed(90));
 
         assert_eq!(status, 0, "{:?}", console.err);
         let said = format!("gate: remote could not prune {KEY}: ");
@@ -1985,9 +2038,9 @@ mod tests {
     #[test]
     fn over_the_low_floor_nothing_goes() {
         let case = Case::new("floor-over");
-        let folder = case.folder(Duration::from_hours(20));
+        let folder = case.folder(Duration::from_hours(10));
 
-        let (status, console) = case.sweep_freeing(&|_| Ok(120 * GIB));
+        let (status, console) = case.sweep_freeing(&fixed(120));
 
         assert_eq!((status, console.out), (0, vec![summary(0, 1)]), "{:?}", console.err);
         assert!(console.err.is_empty(), "{:?}", console.err);
@@ -1995,23 +2048,68 @@ mod tests {
     }
 
     #[test]
-    fn a_removal_that_frees_nothing_ends_the_floor_pass() {
+    fn a_floor_pass_with_no_key_left_says_the_floor_was_not_reached() {
         let case = Case::new("floor-stuck");
-        case.folder_of(OLDEST, Duration::from_hours(20));
-        let older = case.folder_of(OLDER, Duration::from_hours(10));
+        case.folder_of(OLDEST, Duration::from_hours(10));
+        let older = case.folder_of(OLDER, Duration::from_hours(8));
 
-        let (status, console) = case.sweep_freeing(&|_| Ok(90 * GIB));
+        let (status, console) = case.sweep_freeing(&fixed(90));
 
         assert_eq!(status, 0);
-        assert_eq!(console.out, [format!("gate: remote pruned {OLDEST}: 90 GiB free"), summary(1, 2)]);
+        assert_eq!(
+            console.out,
+            [
+                format!("gate: remote pruned {OLDEST}: 90 GiB free"),
+                format!("gate: remote pruned {OLDER}: 90 GiB free"),
+                summary(2, 2)
+            ]
+        );
         assert_eq!(console.err, ["gate: remote prune could not reach the free-space floor: 90 GiB free"]);
-        assert!(older.is_dir());
+        assert!(!older.exists(), "a removal that freed nothing moves on to the next key");
+    }
+
+    /// A reader of the space of a [`TOTAL`] volume: `steps[n]` GiB free once `n` keys of `keys` have their work folder
+    /// gone from `work`, the last step past the end.
+    fn stepped(work: &Path, keys: &'static [&'static str], steps: &'static [u64]) -> impl Fn(&Path) -> std::io::Result<Space> + use<> {
+        let work = work.to_owned();
+        move |_| {
+            let gone = keys.iter().filter(|key| !work.join(key).exists()).count();
+            let gib = steps.get(gone).or(steps.last()).copied().unwrap_or_default();
+            Ok(Space {
+                free: gib * GIB,
+                total: TOTAL,
+            })
+        }
+    }
+
+    #[test]
+    fn a_removal_that_frees_nothing_moves_on_to_the_next_key() {
+        let case = Case::new("floor-flat");
+        case.folder_of(OLDEST, Duration::from_hours(10));
+        case.folder_of(OLDER, Duration::from_hours(8));
+        let recent = case.folder_of(RECENT, Duration::from_mins(10));
+        // Flat after the first removal, over the high mark after the second.
+        let free = stepped(&case.work(), &[OLDEST, OLDER, RECENT], &[90, 90, 160]);
+
+        let (status, console) = case.sweep_freeing(&free);
+
+        assert_eq!(status, 0, "{:?}", console.err);
+        assert!(console.err.is_empty(), "{:?}", console.err);
+        assert_eq!(
+            console.out,
+            [
+                format!("gate: remote pruned {OLDEST}: 90 GiB free"),
+                format!("gate: remote pruned {OLDER}: 90 GiB free"),
+                summary(2, 3)
+            ]
+        );
+        assert!(recent.is_dir(), "the pass ends at the high mark");
     }
 
     #[test]
     fn a_free_space_that_cannot_be_read_says_so_and_the_sweep_passes() {
         let case = Case::new("floor-unread");
-        let folder = case.folder(Duration::from_hours(20));
+        let folder = case.folder(Duration::from_hours(10));
 
         let (status, console) = case.sweep_freeing(&|_| Err(std::io::Error::other("statfs failed")));
 
@@ -2027,13 +2125,54 @@ mod tests {
     }
 
     #[test]
+    fn a_small_volume_s_floor_is_100_to_150_gib() {
+        let case = Case::new("floor-small");
+        case.folder_of(OLDEST, Duration::from_hours(10));
+        let older = case.folder_of(OLDER, Duration::from_hours(8));
+        // 20% of 300 GiB is 60 GiB, under the least low mark of 100 GiB, and 30% is 90, under the least high of 150.
+        let free = freeing_of(&case.work(), &[OLDEST, OLDER], 300, (99, 51));
+
+        let (status, console) = case.sweep_freeing(&free);
+
+        assert_eq!(status, 0, "{:?}", console.err);
+        assert!(console.err.is_empty(), "{:?}", console.err);
+        assert_eq!(console.out, [format!("gate: remote pruned {OLDEST}: 99 GiB free"), summary(1, 2)]);
+        assert!(older.is_dir(), "150 GiB free reaches the high mark");
+    }
+
+    #[test]
+    fn a_large_volume_s_floor_is_20_to_30_percent_of_it() {
+        let case = Case::new("floor-large");
+        case.folder_of(OLDEST, Duration::from_hours(10));
+        case.folder_of(OLDER, Duration::from_hours(8));
+        let recent = case.folder_of(RECENT, Duration::from_mins(10));
+        // A 2000 GiB volume: the low mark is 400 GiB and the high 600, over the least marks of 100 and 150.
+        let free = freeing_of(&case.work(), &[OLDEST, OLDER, RECENT], 2000, (390, 110));
+
+        let (status, console) = case.sweep_freeing(&free);
+
+        assert_eq!(status, 0, "{:?}", console.err);
+        assert!(console.err.is_empty(), "{:?}", console.err);
+        assert_eq!(
+            console.out,
+            [
+                format!("gate: remote pruned {OLDEST}: 390 GiB free"),
+                format!("gate: remote pruned {OLDER}: 500 GiB free"),
+                summary(2, 3),
+            ]
+        );
+        assert!(recent.is_dir(), "610 GiB free reaches the high mark");
+    }
+
+    #[test]
     fn the_free_space_of_a_real_folder_is_read() {
         let case = Case::new("statfs");
 
-        let free = free_bytes(&case.root).expect("the free space is read");
+        let space = space_bytes(&case.root).expect("the free space is read");
 
-        assert!(free > 0);
-        assert!(free_bytes(&case.base.join("none")).is_err());
+        assert!(space.free > 0);
+        assert!(space.total >= space.free);
+        assert!(space_bytes(&case.base.join("none")).is_err());
     }
 
     /// A folder at `path` holding a file, both last written `age` before `now`.
@@ -2135,7 +2274,7 @@ mod tests {
         let case = Case::new("missing-root");
         let root = case.base.join("none");
 
-        let (status, console) = case.ran(&root, &[], &case.seams(&|_| {}, &|_| Ok(PLENTY), Path::new("/Volumes")));
+        let (status, console) = case.ran(&root, &[], &case.seams(&|_| {}, &plenty, Path::new("/Volumes")));
 
         assert_eq!((status, console.out), (0, vec![summary(0, 0)]), "{:?}", console.err);
         assert!(!root.exists(), "the prune makes no root");
@@ -2171,14 +2310,15 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_last_used_exactly_a_day_ago_is_not_idle() {
+    fn a_folder_last_used_exactly_12_hours_ago_is_not_idle() {
         let now = SystemTime::now();
 
+        assert_eq!(IDLE_AGE, Duration::from_hours(12));
         assert_eq!(idle_for(now - IDLE_AGE, now), None);
     }
 
     #[test]
-    fn a_folder_last_used_a_day_and_a_second_ago_is_idle() {
+    fn a_folder_last_used_12_hours_and_a_second_ago_is_idle() {
         let now = SystemTime::now();
         let idle = IDLE_AGE + Duration::from_secs(1);
 

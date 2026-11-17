@@ -1,6 +1,8 @@
 //! `gate box prune --root <folder> [--keys <key>...]`. The age prune, which a builder's scheduled task runs: a work
-//! folder no run has used for over a day goes with its records, its lock and its refs left in place; one a run holds,
-//! one a run fetched into lately, one that is a link and a name that is no key all stay. The keyed prune: each named
+//! folder no run has used for over 12 hours goes with its records, its lock and its refs left in place; one a run holds,
+//! one a run fetched into lately, one that is a link and a name that is no key all stay; and under the volume's
+//! free-space floor, which the `GATE_BOX_TEST_FREE_BYTES` and `GATE_BOX_TEST_TOTAL_BYTES` seams give, a recent one
+//! goes too. Every other age prune is given plenty of free space, so the floor never acts. The keyed prune: each named
 //! key goes with its refs whatever its age, unless its lock is held or its folder is a link, and no other key is
 //! touched. Each case
 //! builds its builder root by hand under the case's folder, and its bare repositories with real git.
@@ -8,6 +10,7 @@
 use std::fs::{self, File};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 use serde_json::json;
@@ -27,7 +30,27 @@ const NOTHING: &str = "gate: remote prune removed 0 of 0 work folders\n";
 
 /// `gate box prune --root <root>`, run to its end.
 fn prune(case: &Case, root: &Path) -> Outcome {
-    finish(bare_box_command(case, &["box", "prune", "--root", &shown(root)]))
+    finish(plenty_free(bare_box_command(case, &["box", "prune", "--root", &shown(root)])))
+}
+
+/// The seams of the free space of the root's volume: the free bytes, then the volume's size.
+const FREE_SEAMS: [&str; 2] = ["GATE_BOX_TEST_FREE_BYTES", "GATE_BOX_TEST_TOTAL_BYTES"];
+/// A gibibyte.
+const GIB: u64 = 1 << 30;
+
+/// `command`, an age prune, told its root's volume has 1000 GiB free of 1000 GiB, so its floor pass never acts.
+fn plenty_free(mut command: Command) -> Command {
+    let plenty = (1000 * GIB).to_string();
+    command.env(FREE_SEAMS[0], &plenty).env(FREE_SEAMS[1], &plenty);
+    command
+}
+
+/// `gate box prune --root <root>`, told its root's volume has `free` bytes free of 500 GiB, run to its end: a comma
+/// list gives each read of the free space the next value, the last one past the end.
+fn prune_with_free(case: &Case, root: &Path, free: &str) -> Outcome {
+    let mut command = bare_box_command(case, &["box", "prune", "--root", &shown(root)]);
+    command.env(FREE_SEAMS[0], free).env(FREE_SEAMS[1], (500 * GIB).to_string());
+    finish(command)
 }
 
 /// Sets the last write of the file or folder at `path` to `age` ago.
@@ -56,12 +79,17 @@ fn root_with_k(case: &Case) -> PathBuf {
 /// Ages the work folder `k` under `root`, its `.git\FETCH_HEAD` and every record by [`AGED`], the folder last, since a
 /// change inside it moves its own last write.
 fn age_k(root: &Path) {
+    age_k_by(root, AGED);
+}
+
+/// Ages the work folder `k` under `root`, its `.git\FETCH_HEAD` and every record by `by`, the folder last.
+fn age_k_by(root: &Path, by: Duration) {
     let work = root.join("work");
-    age(&work.join(r"k\.git\FETCH_HEAD"), AGED);
+    age(&work.join(r"k\.git\FETCH_HEAD"), by);
     for record in RECORDS {
-        age(&work.join(format!("k.{record}")), AGED);
+        age(&work.join(format!("k.{record}")), by);
     }
-    age(&work.join("k"), AGED);
+    age(&work.join("k"), by);
 }
 
 /// Asserts the work folder `k` under `root` and every record but its lock are gone, its lock and an empty `pruned`
@@ -101,6 +129,100 @@ fn an_idle_work_folder_and_its_records_are_removed() {
     );
     assert_eq!(outcome.stderr, "", "{outcome:?}");
     assert_k_gone(&root, &outcome);
+}
+
+#[test]
+fn a_work_folder_idle_13_hours_is_removed() {
+    let case = Case::new("prune_idle_13_h");
+    let root = root_with_k(&case);
+    age_k_by(&root, Duration::from_hours(13));
+
+    let outcome = prune(&case, &root);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout, "gate: remote pruned k: idle 13 h\ngate: remote prune removed 1 of 1 work folders\n",
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_k_gone(&root, &outcome);
+}
+
+#[test]
+fn a_work_folder_idle_11_hours_stays() {
+    let case = Case::new("prune_idle_11_h");
+    let root = root_with_k(&case);
+    age_k_by(&root, Duration::from_hours(11));
+
+    let outcome = prune(&case, &root);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "gate: remote prune removed 0 of 1 work folders\n", "{outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_k_kept(&root, &outcome);
+}
+
+#[test]
+fn under_the_floor_recent_work_folders_go_least_recently_used_first_each_with_the_free_space_before_it() {
+    let case = Case::new("prune_floor_two");
+    let root = root_with_k(&case);
+    age_k_by(&root, Duration::from_hours(10));
+    let j = root.join(r"work\j");
+    fs::create_dir_all(&j).expect("the second work folder can be made");
+    fs::write(root.join(r"work\j.lock"), "").expect("its lock can be written");
+    // Each read of the free space takes the next value: 10 GiB, then 30, then 300, over the high mark of 150.
+    let free = [10, 30, 300].map(|gib| (gib * GIB).to_string()).join(",");
+
+    let outcome = prune_with_free(&case, &root, &free);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout, "gate: remote pruned k: 10 GiB free\ngate: remote pruned j: 30 GiB free\ngate: remote prune removed 2 of 2 work folders\n",
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_k_gone(&root, &outcome);
+    assert!(!j.exists(), "the second folder goes too: {outcome:?}");
+}
+
+#[test]
+fn under_the_floor_with_no_folder_left_to_remove_the_floor_is_said_not_reached() {
+    let case = Case::new("prune_floor");
+    let root = root_with_k(&case);
+
+    // One byte free, which the removal does not change: with no folder left, the pass ends under the high mark.
+    let outcome = prune_with_free(&case, &root, "1");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout, "gate: remote pruned k: 0 GiB free\ngate: remote prune removed 1 of 1 work folders\n",
+        "{outcome:?}"
+    );
+    assert_eq!(
+        outcome.stderr, "gate: remote prune could not reach the free-space floor: 0 GiB free\n",
+        "{outcome:?}"
+    );
+    assert_k_gone(&root, &outcome);
+}
+
+#[test]
+fn a_free_space_that_cannot_be_read_is_said_and_a_recent_work_folder_stays() {
+    let case = Case::new("prune_floor_unread");
+    let root = root_with_k(&case);
+
+    let outcome = prune_with_free(&case, &root, "plenty");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "gate: remote prune removed 0 of 1 work folders\n", "{outcome:?}");
+    assert_eq!(
+        outcome.stderr,
+        format!(
+            "gate: remote could not read the free space of {}: GATE_BOX_TEST_FREE_BYTES is not a count of bytes\n",
+            shown(&root)
+        ),
+        "{outcome:?}"
+    );
+    assert_k_kept(&root, &outcome);
 }
 
 #[test]
@@ -1045,7 +1167,10 @@ fn raise(case: &Case, root: &Path) {
 /// `gate box prune --root <root>` with the drain judged at the Unix second `now`, run to its end.
 fn prune_at(case: &Case, root: &Path, now: u64) -> Outcome {
     let now = now.to_string();
-    finish(bare_box_command(case, &["box", "--test-box-now", &now, "prune", "--root", &shown(root)]))
+    finish(plenty_free(bare_box_command(
+        case,
+        &["box", "--test-box-now", &now, "prune", "--root", &shown(root)],
+    )))
 }
 
 /// The bare repository at `bare`, made with real git, with `gc.auto` 1 and the two loose objects of [`LOOSE_IN_17`],
@@ -1195,10 +1320,10 @@ fn a_bare_repository_whose_gc_fails_is_named_and_the_next_is_collected() {
 /// the keyed cases' does.
 fn prune_judged(case: &Case, root: &Path) -> Outcome {
     let (root, stop) = (shown(root), shown(&case.folder()));
-    finish(bare_box_command(
+    finish(plenty_free(bare_box_command(
         case,
         &["box", "--test-box-root-walk-stop", &stop, "prune", "--root", &root],
-    ))
+    )))
 }
 
 /// The NULL SID, which has no members, stands for another account, as the keyed prune's own case of it.

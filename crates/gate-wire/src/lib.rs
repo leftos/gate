@@ -21,6 +21,8 @@ use gate_router::{is_layout_name, repo_name};
 use serde_json::{Map, Value};
 
 pub mod drain;
+pub mod floor;
+pub use floor::{FloorMarks, GIB, floor_marks};
 pub mod slots;
 pub mod stamp;
 

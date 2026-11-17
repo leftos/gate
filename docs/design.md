@@ -5358,21 +5358,27 @@ Built verbs:
 
   A `test-seams` build given `--test-box-register ok|fail` skips the Task Scheduler: `ok` says the registered line, `fail` says `failed: the test seam refused`.
 
-- **`prune`** (`boxside/prune.rs`) removes the work folders of keys idle for over 24 hours, from `gate box prune --root <folder>` (an absolute path on a drive; anything else prints `gate: box prune --root is not an absolute path on a drive: "<value>"` and exits 2), or the named keys' whatever their age, from `gate box prune --root <folder> --keys <key> [<key>...]`.
+- **`prune`** (`boxside/prune.rs`) removes the work folders of keys idle for over 12 hours, and more while the root's volume is under the free-space floor, from `gate box prune --root <folder>` (an absolute path on a drive; anything else prints `gate: box prune --root is not an absolute path on a drive: "<value>"` and exits 2), or the named keys' whatever their age, from `gate box prune --root <folder> --keys <key> [<key>...]`.
 
-  It reads no request and never reads stdin, and any other shape is the box usage. The builder's scheduled task runs the age form every 6 hours ([Builder setup](routing-a-repo.md#builder-setup)).
+  It reads no request and never reads stdin, and any other shape is the box usage. The builder's scheduled task runs the age form every 2 hours ([Builder setup](routing-a-repo.md#builder-setup)).
 
   The `root`, `{root}\work` and `{root}\pruned` must each be a plain folder, else `gate: remote could not prune: <path> is not a plain folder` and exit 1; a folder it cannot list prints `gate: remote cannot list <path>: <error>` and exits 1. Leftovers in `pruned` are deleted at the start of each sweep, and one that cannot be removed prints `gate: remote could not remove the pruned folder <path>: <error>`.
 
   For each key under `work` it takes `{key}.lock` (a lock it cannot open prints `gate: remote could not open the work folder lock <path>: <error>`), so a key whose lock a run or a sweep holds is kept, and `inflight` does not see a key whose lock a sweep holds. Idleness is the newest write time among the folder, each tree's `.git\FETCH_HEAD`, the key's records and the lock's write time (the stamp of the last take or release by a run, `inputs` or `lfs`).
 
-  A key idle for over 24 hours loses its records in this order: `.layout` is written as `changing` first; `.warm`, `.ran`, `.packages`, `.tools`, `.inputs`, `.sent-build`, `.ceiling` and `.command` are removed; the folder is renamed by handle into `{root}\pruned\{key}-{pid}-{nanos}`; `.layout` and `.index` are removed. The lock is released and the renamed folder is deleted through its handle. The `.lock` file stays.
+  A key idle for over 12 hours loses its records in this order: `.layout` is written as `changing` first; `.warm`, `.ran`, `.packages`, `.tools`, `.inputs`, `.sent-build`, `.ceiling` and `.command` are removed; the folder is renamed by handle into `{root}\pruned\{key}-{pid}-{nanos}`; `.layout` and `.index` are removed. The lock is released and the renamed folder is deleted through its handle. The `.lock` file stays.
 
   Every step works beneath held handles and never follows a link. A failed rename leaves `.layout` reading `changing`, so the next run clears the folder whole.
 
   A key it cannot prune prints `gate: remote could not prune <key>: <reason>` on stderr (reasons include `its work folder is not a plain folder` and `its work folder changed during the sweep`), keeps the key, and the exit stays 0.
 
-  On stdout it prints `gate: remote pruned <key>: idle <h> h` per removed folder and, last, always, `gate: remote prune removed <n> of <m> work folders`.
+  On stdout it prints `gate: remote pruned <key>: idle <h> h` per removed folder and, last, always, `gate: remote prune removed <n> of <m> work folders` (`n` counts the floor pass's folders too).
+
+  **The free-space floor.** After its age pass the age form reads the free bytes of the root's volume that the box user may write (`GetDiskFreeSpaceExW`) and the volume's size. While the free space is under the low mark, the greater of 20% of the volume and 100 GiB, it removes the work folders the age pass kept and no run holds, least recently used first by the last use above (the lock's stamp included), whatever their age, one at a time with the free space read again after each, until it reaches the high mark, the greater of 30% and 150 GiB. A key the age pass could not prune is not tried again, and the floor pass deletes no ref.
+
+  It prints `gate: remote pruned <key>: <g> GiB free` per folder (`g` the whole GiB free before that removal). On stderr it prints `gate: remote could not read the free space of <root>: <error>` (and does no floor pass) and `gate: remote prune could not reach the free-space floor: <g> GiB free` when it ends under the high mark, with no folder left to remove or a removal that freed nothing. The keyed form runs no floor pass, and under a drain barrier the age form touches nothing.
+
+  A `test-seams` build reads `GATE_BOX_TEST_FREE_BYTES` and `GATE_BOX_TEST_TOTAL_BYTES`, each replacing the volume's own free bytes or size when set (the free bytes as a comma list, one value per read and the last repeating); a value that is no count says `<NAME> is not a count of bytes`. The installed binary ignores both.
 
   The age form deletes no ref: a worktree still alive may have pushed `refs/gate/{key}` just before the lock was taken, and deleting it would fail that run's fetch. Only the keyed form deletes refs, below.
 
@@ -5784,7 +5790,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
   The `.lock` file stays, but for a keyed prune of a key the builder never had: a lock that prune made is removed while still held (a failure says `gate: remote could not remove the work folder lock <path>: <error>`).
 
-  A key's last use is the newest write time among its folder, the `.git/FETCH_HEAD` of the folder and of each folder directly in it (a pair keeps each tree in its own folder), and its records; the lock is left out, since nothing writes it. A key is idle strictly over 24 hours; a last use in the future is not idle.
+  A key's last use is the newest write time among its folder, the `.git/FETCH_HEAD` of the folder and of each folder directly in it (a pair keeps each tree in its own folder), and its records; the lock is left out, since nothing writes it. A key is idle strictly over 12 hours; a last use in the future is not idle.
 
   Keys are the names in `work` that are keys and the `<key>.<extension>` of the extensions below, the key being the part before the first `.`, listed without regard to case.
 
@@ -5807,9 +5813,9 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
   The age prune exits 0 unless the sweep ended on the root, a folder or a listing as above, and deletes no ref.
 
-  **The free-space floor.** After its age pass the age prune reads the free bytes of the root's volume that the box user may write (`statfs`). While under 100 GiB are free it removes the work folders the age pass kept and no run holds, oldest last use first, whatever their age, one at a time with the free space read again after each, until 150 GiB are free.
+  **The free-space floor.** After its age pass the age prune reads the free bytes of the root's volume that the box user may write (`statfs`). While less than the low mark is free, the greater of 20% of the volume and 100 GiB, it removes the work folders the age pass kept and no run holds, oldest last use first, whatever their age, one at a time with the free space read again after each, until the high mark, the greater of 30% and 150 GiB, is free (`gate_wire::floor_marks`, shared with the Windows box).
 
-  It prints `gate: remote pruned <key>: <g> GiB free` per folder (`g` the whole GiB free before that removal). On stderr it prints `gate: remote could not read the free space of <root>: <error>` (and does no floor pass) and `gate: remote prune could not reach the free-space floor: <g> GiB free` when it ends under 150 GiB, with no folder left to remove or a removal that freed nothing.
+  It prints `gate: remote pruned <key>: <g> GiB free` per folder (`g` the whole GiB free before that removal). On stderr it prints `gate: remote could not read the free space of <root>: <error>` (and does no floor pass) and `gate: remote prune could not reach the free-space floor: <g> GiB free` when it ends under the high mark, with no folder left to remove or a removal that freed nothing.
 
   A key the age pass could not prune is not tried again. The floor pass deletes no ref.
 
@@ -5825,7 +5831,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
   A root that is missing is gone, and every key answers `pruned`, only when its parent folder can be read; under `/Volumes/<name>` it is unknown while that volume is not mounted. Unknown is never gone: each key gets `gate: remote could not prune <key>: the root's volume is not there` (or `the root cannot be looked at: <error>` for any other failure to look at it) and the exit is 1. A record left once the folder was aside fails the key, as on the Windows box.
 
-  A `test-seams` build of `gate-box-unix` reads two environment variables, the one exception to "never environment variables" for seams, because the prune takes no request and its seams are not in `gate-args`' shared `BoxSeams`: `GATE_BOX_TEST_TMP_ROOT` replaces `/tmp` in the sweep above and `GATE_BOX_TEST_FREE_BYTES` replaces the `statfs` read with a byte count. The installed binary ignores both (`cfg(feature = "test-seams")`).
+  A `test-seams` build of `gate-box-unix` reads three environment variables, the one exception to "never environment variables" for seams, because the prune takes no request and its seams are not in `gate-args`' shared `BoxSeams`: `GATE_BOX_TEST_TMP_ROOT` replaces `/tmp` in the sweep above, and `GATE_BOX_TEST_FREE_BYTES` and `GATE_BOX_TEST_TOTAL_BYTES` replace the free bytes and the size of the `statfs` read with a byte count each (a value that is no count says `<NAME> is not a count of bytes`). The installed binary ignores all three (`cfg(feature = "test-seams")`).
 
   **The drain barrier.** The age prune reads the builder's drain barrier ([`drain`](#the-unix-box), below) after the root check and before it opens `work`. Under a standing barrier it says `gate: remote prune skipped: the builder is drained` on stdout and exits 0, removing nothing: no age pass, no floor pass, no leftover run folders. The keyed prune says `gate: remote kept <key>: the builder is drained` on stdout for each key, and removes nothing.
 

@@ -745,7 +745,7 @@ try {
         return ''
     }
 
-    Test-Case 'the prune task step registers S4U Limited every 6 hours running gate box prune' {
+    Test-Case 'the prune task step registers S4U Limited every 2 hours running gate box prune' {
         $block = Get-StepBlock 'Work-folder prune task'
         if (-not $block) { return 'install-toolchains.ps1 has no Work-folder prune task step' }
         $principals = Get-BlockCommand $block 'New-ScheduledTaskPrincipal'
@@ -760,7 +760,7 @@ try {
         $interval = Get-ParameterArgument $triggers[0] 'RepetitionInterval'
         if (-not $interval) { return "the trigger $($triggers[0].Extent.Text) has no -RepetitionInterval" }
         $intervalText = (Resolve-BlockExpression -Block $block -Expression $interval).Texts -join ' '
-        if ($intervalText -notmatch 'New-TimeSpan\s+-Hours\s+6\b') { return "the repetition interval is $intervalText, not New-TimeSpan -Hours 6" }
+        if ($intervalText -notmatch 'New-TimeSpan\s+-Hours\s+2\b') { return "the repetition interval is $intervalText, not New-TimeSpan -Hours 2" }
         if ($triggers[0].Extent.Text -match '-RepetitionDuration') { return "the trigger $($triggers[0].Extent.Text) sets -RepetitionDuration" }
         $settings = Get-BlockCommand $block 'New-ScheduledTaskSettingsSet'
         if ($settings.Count -ne 1) { return "the step has $($settings.Count) New-ScheduledTaskSettingsSet calls, expected 1" }
