@@ -1478,6 +1478,99 @@ fn noted<S: LineSink>(output: &Output<S>, stamp: Stamp, line: &str) {
     said_as(output, &[(stamp, line)], 0);
 }
 
+/// The Python virtual environment folder uv makes at the top of a tree, the one name [`venvs_cleared`] looks at.
+const VENV: &str = ".venv";
+
+/// Removes the broken `.venv` at the top of each tree of the run ([`venv_cleared`]), so the command's `uv` makes it
+/// anew, and says `gate: remote cleared a broken .venv in <tree>` for each, the tree `.` on a run of one repo and the
+/// repo's name on a pair run; a look, a git listing or a removal that fails is said, and the run goes on either way.
+fn venvs_cleared<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>, output: &Output<S>) {
+    for repo in request.repos() {
+        let tree = repo.name.as_deref().unwrap_or(".");
+        let cleared = tree_held(request.work, repo)
+            .map_err(|error| error.to_string())
+            .and_then(|held| venv_cleared(&held, || venv_tracked(git, repo)));
+        let line = match cleared {
+            Ok(false) => continue,
+            Ok(true) => format!("gate: remote cleared a broken .venv in {tree}"),
+            Err(error) => format!("gate: remote could not clear the broken .venv in {tree}: {error}"),
+        };
+        noted(output, GAT, &line);
+    }
+}
+
+/// Whether git tracks any file under the `.venv` of the tree of `repo` (`git ls-files -- .venv` lists one); else why
+/// the listing failed.
+fn venv_tracked<S: LineSink>(git: &RunGit<'_, S>, repo: &Repo<'_>) -> Result<bool, String> {
+    git.tree_step(
+        &repo.step("venv listing"),
+        &repo.git_tree().args(&["ls-files", "--", VENV]),
+        GitClass::Short,
+    )
+    .map(|listed| !listed.is_empty())
+    .map_err(|failed| failed.lines.join("; "))
+}
+
+/// The tree of `repo` in the work folder `work`, held by its descriptor: the work folder itself, reached beneath its
+/// judged root ([`beneath::work_beneath_root`]), on a run of one repo, its folder `<name>` in it on a pair run, no link
+/// at any of them followed.
+fn tree_held(work: &str, repo: &Repo<'_>) -> io::Result<beneath::Folder> {
+    let work = beneath::work_beneath_root(Path::new(work))?;
+    match &repo.name {
+        None => Ok(work),
+        Some(name) => work.open_child(OsStr::new(name)),
+    }
+}
+
+/// Removes the `.venv` folder at the top of the held tree `tree` when it is broken ([`venv_broken`]) and git tracks no
+/// file under it (`tracked`, asked only then), with everything in it ([`beneath::Folder::remove_child_tree`]). A
+/// `.venv` that is a link, or anything but a folder, is left alone and never followed. Whether it was removed; else
+/// why the look, the listing or the removal failed.
+fn venv_cleared(tree: &beneath::Folder, tracked: impl FnOnce() -> Result<bool, String>) -> Result<bool, String> {
+    if !venv_broken(tree).map_err(|error| error.to_string())? || tracked()? {
+        return Ok(false);
+    }
+    tree.remove_child_tree(OsStr::new(VENV)).map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+/// Whether the held tree `tree` holds a broken `.venv`: a folder itself, opened beneath it with no link followed, with
+/// no `pyvenv.cfg` in it or no `bin/python` nor `bin/python3` ([`venv_whole`]).
+fn venv_broken(tree: &beneath::Folder) -> io::Result<bool> {
+    let name = OsStr::new(VENV);
+    match tree.stat_child(name) {
+        Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFDIR => Ok(!venv_whole(&tree.open_child(name)?)?),
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether the held `.venv` folder `venv` holds its `pyvenv.cfg` and its interpreter, `bin/python` or `bin/python3`,
+/// each looked at as itself ([`holds_entry`]): an interpreter that is a link, as a venv's usually is, counts, never
+/// followed; `bin` only when it is a folder itself.
+fn venv_whole(venv: &beneath::Folder) -> io::Result<bool> {
+    if !holds_entry(venv, "pyvenv.cfg")? {
+        return Ok(false);
+    }
+    let bin = match venv.stat_child(OsStr::new("bin")) {
+        Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFDIR => venv.open_child(OsStr::new("bin"))?,
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(holds_entry(&bin, "python")? || holds_entry(&bin, "python3")?)
+}
+
+/// Whether the held folder `folder` holds `name` as anything but a folder, a link included, looked at as itself.
+fn holds_entry(folder: &beneath::Folder, name: &str) -> io::Result<bool> {
+    match folder.stat_child(OsStr::new(name)) {
+        Ok(stat) => Ok(stat.st_mode & libc::S_IFMT != libc::S_IFDIR),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// How a run starts its heartbeat: [`heartbeat::start`], or a test's own.
 type StartBeat = fn(Arc<dyn Forwarding>, Duration) -> io::Result<Pump>;
 
@@ -1591,6 +1684,7 @@ fn locked<S: LineSink + 'static>(
         blender_names: &request.blender_names,
         ceiling: None,
     };
+    venvs_cleared(request, &git, output);
     // A Blender that did not resolve skips the restores: the command then says why and ends 127 before it starts.
     let restored = if blender.is_err() {
         Ok(())

@@ -1553,6 +1553,125 @@ mod unix {
             .unwrap_or_default()
     }
 
+    /// The line a run of one repo says once it removed its tree's broken `.venv`.
+    const VENV_CLEARED: &str = "gate: remote cleared a broken .venv in .";
+
+    /// Lays the work folder of a run of `case` out with a first run, its `.venv` ignored, then has `plant` make what the
+    /// second run finds at the tree's `.venv`; the second run, its command passed, and the `.venv`'s path. The command
+    /// says whether it found a `.venv`, so a removal is seen to come before it.
+    fn venv_ran(case: &Case, plant: impl FnOnce(&Path)) -> (Ended, PathBuf) {
+        venv_ran_of(case, &[(".gitignore", ".venv\n")], plant)
+    }
+
+    /// [`venv_ran`] of a snapshot also holding `files`.
+    fn venv_ran_of(case: &Case, files: &[(&str, &str)], plant: impl FnOnce(&Path)) -> (Ended, PathBuf) {
+        let commit = case.snapshot_holding(files);
+        let command = json!(["/bin/sh", "-c", "if [ -e .venv ] || [ -L .venv ]; then echo venv; else echo none; fi"]);
+        let request = case.request(&commit, &json!({ "Command": command }));
+        let first = ran(&[], &request, Reading::All, &case.base.join("beaten"));
+        assert_eq!(first.status, Some(0), "the run that lays the work folder out: {:?}", first.err);
+        let venv = Path::new(&case.work()).join(".venv");
+        plant(&venv);
+        let second = ran(&[], &request, Reading::All, &case.base.join("beaten-again"));
+        assert_eq!(second.status, Some(0), "the command runs: {:?}", second.err);
+        case.ended_clean();
+        (second, venv)
+    }
+
+    /// Makes the folder `venv` as a cut-short venv creation leaves it: its `lib` with a package file in it and an
+    /// empty `bin`.
+    fn half_made_venv(venv: &Path) {
+        fs::create_dir_all(venv.join("lib/python3.12/site-packages")).expect("the venv's packages folder is made");
+        fs::write(venv.join("lib/python3.12/site-packages/x.py"), "x\n").expect("a package file is written");
+        fs::create_dir_all(venv.join("bin")).expect("the venv's bin folder is made");
+    }
+
+    #[test]
+    fn a_run_clears_a_venv_without_its_pyvenv_cfg_before_the_command() {
+        let case = Case::new("venv-no-cfg");
+
+        let (ended, venv) = venv_ran(&case, half_made_venv);
+
+        assert!(!venv.exists(), "the broken .venv is removed: {:?}", ended.err);
+        assert!(ended.err_texts().contains(&VENV_CLEARED), "{:?}", ended.err);
+        assert_eq!(texts(&ended.out), ["none"], "removed before the command");
+    }
+
+    #[test]
+    fn a_run_clears_a_venv_whose_pyvenv_cfg_has_no_python() {
+        let case = Case::new("venv-no-python");
+
+        let (ended, venv) = venv_ran(&case, |venv| {
+            half_made_venv(venv);
+            fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin\n").expect("the pyvenv.cfg is written");
+        });
+
+        assert!(!venv.exists(), "the venv with no interpreter is removed: {:?}", ended.err);
+        assert!(ended.err_texts().contains(&VENV_CLEARED), "{:?}", ended.err);
+    }
+
+    #[test]
+    fn a_run_keeps_a_venv_with_its_pyvenv_cfg_and_a_python_link() {
+        let case = Case::new("venv-healthy");
+
+        let (ended, venv) = venv_ran(&case, |venv| {
+            half_made_venv(venv);
+            fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin\n").expect("the pyvenv.cfg is written");
+            std::os::unix::fs::symlink("/usr/bin/python3", venv.join("bin/python")).expect("the interpreter link is made");
+        });
+
+        assert!(
+            venv.join("lib/python3.12/site-packages/x.py").exists(),
+            "a healthy .venv is untouched: {:?}",
+            ended.err
+        );
+        assert!(
+            !ended.err_texts().iter().any(|line| line.contains(".venv")),
+            "nothing is said of it: {:?}",
+            ended.err
+        );
+        assert_eq!(texts(&ended.out), ["venv"]);
+    }
+
+    #[test]
+    fn a_run_keeps_a_broken_venv_under_which_git_tracks_a_file() {
+        let case = Case::new("venv-tracked");
+
+        let (ended, venv) = venv_ran_of(&case, &[(".venv/keep.txt", "k\n")], |_| {});
+
+        assert!(venv.join("keep.txt").exists(), "a .venv holding a tracked file stays: {:?}", ended.err);
+        assert!(
+            !ended.err_texts().iter().any(|line| line.contains(".venv")),
+            "nothing is said of it: {:?}",
+            ended.err
+        );
+        assert_eq!(texts(&ended.out), ["venv"]);
+    }
+
+    #[test]
+    fn a_run_neither_follows_nor_removes_a_symlink_named_venv() {
+        let case = Case::new("venv-link");
+        let elsewhere = case.base.join("elsewhere");
+        half_made_venv(&elsewhere);
+
+        let (ended, venv) = venv_ran(&case, |venv| std::os::unix::fs::symlink(&elsewhere, venv).expect("the link is made"));
+
+        assert!(
+            fs::symlink_metadata(&venv).is_ok_and(|metadata| metadata.is_symlink()),
+            "the link stays: {:?}",
+            ended.err
+        );
+        assert!(
+            elsewhere.join("lib/python3.12/site-packages/x.py").exists(),
+            "what it leads to is untouched"
+        );
+        assert!(
+            !ended.err_texts().iter().any(|line| line.contains(".venv")),
+            "nothing is said of it: {:?}",
+            ended.err
+        );
+    }
+
     /// The package files of a node project of `lockfile`, its `node_modules` ignored.
     fn node_project(lockfile: &'static str) -> [(&'static str, &'static str); 3] {
         [(lockfile, "{}\n"), ("package.json", "{}\n"), (".gitignore", "node_modules/\n")]

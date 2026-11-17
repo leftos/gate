@@ -10181,6 +10181,167 @@ fn box_run_after_a_clean_run_clears_nothing() {
     wait_until_closed(Path::new(field(&payload, "Lock")));
 }
 
+/// The line a run of one repo says once it removed its tree's broken `.venv`.
+const VENV_CLEARED: &str = "gate: remote cleared a broken .venv in .";
+
+/// Lays the work folder of a run of `case` out with a first run, its `.venv` ignored, then has `plant` make what the
+/// second run finds at the tree's `.venv`; the second run's outcome, its command passed, and the work folder.
+fn venv_run(case: &Case, plant: impl FnOnce(&Path)) -> (Outcome, PathBuf) {
+    venv_run_of(case, &[(".gitignore", ".venv\n"), ("a.txt", "a\n")], plant)
+}
+
+/// [`venv_run`] of a snapshot of `files`.
+fn venv_run_of(case: &Case, files: &[(&str, &str)], plant: impl FnOnce(&Path)) -> (Outcome, PathBuf) {
+    let mut payload = box_payload(case, "k", &[FAKE_TOOL, "out", "ran"]);
+    snapshot(case, &mut payload, files);
+    let first = run_box(case, &payload);
+    assert_eq!(first.code, Some(0), "the run that lays the work folder out: {first:?}");
+    let work = PathBuf::from(field(&payload, "Work"));
+    plant(&work.join(".venv"));
+    let second = run_box(case, &renamed(&payload, 1));
+    assert_eq!(second.code, Some(0), "the command runs: {second:?}");
+    assert!(second.stdout.contains("ran"), "{second:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+    (second, work)
+}
+
+/// Makes the folder `venv` as a cut-short venv creation leaves it: its `Lib\site-packages` with a file in it and an
+/// empty `Scripts`.
+fn half_made_venv(venv: &Path) {
+    fs::create_dir_all(venv.join(r"Lib\site-packages")).expect("the venv's packages folder can be made");
+    fs::write(venv.join(r"Lib\site-packages\x.py"), "x\n").expect("a package file can be written");
+    fs::create_dir_all(venv.join("Scripts")).expect("the venv's Scripts folder can be made");
+}
+
+#[test]
+fn box_run_clears_a_venv_without_its_pyvenv_cfg_before_the_command() {
+    let case = Case::new("box_run_venv_no_cfg");
+
+    let (second, work) = venv_run(&case, half_made_venv);
+
+    assert!(!work.join(".venv").exists(), "the broken .venv is removed: {second:?}");
+    assert!(lines(&second.stderr).contains(&VENV_CLEARED), "{second:?}");
+}
+
+#[test]
+fn box_run_clears_a_venv_whose_pyvenv_cfg_has_no_python_exe() {
+    let case = Case::new("box_run_venv_no_python");
+
+    let (second, work) = venv_run(&case, |venv| {
+        half_made_venv(venv);
+        fs::write(venv.join("pyvenv.cfg"), "home = C:\\Python\n").expect("the pyvenv.cfg can be written");
+    });
+
+    assert!(!work.join(".venv").exists(), "the venv with no interpreter is removed: {second:?}");
+    assert!(lines(&second.stderr).contains(&VENV_CLEARED), "{second:?}");
+}
+
+#[test]
+fn box_run_keeps_a_venv_with_its_pyvenv_cfg_and_python_exe() {
+    let case = Case::new("box_run_venv_healthy");
+
+    let (second, work) = venv_run(&case, |venv| {
+        half_made_venv(venv);
+        fs::write(venv.join("pyvenv.cfg"), "home = C:\\Python\n").expect("the pyvenv.cfg can be written");
+        fs::write(venv.join(r"Scripts\python.exe"), "MZ").expect("the python.exe can be written");
+    });
+
+    assert!(
+        work.join(r".venv\Scripts\python.exe").exists(),
+        "a healthy .venv is untouched: {second:?}"
+    );
+    assert!(work.join(r".venv\Lib\site-packages\x.py").exists(), "{second:?}");
+    assert!(!second.stderr.contains(".venv"), "nothing is said of it: {second:?}");
+}
+
+#[test]
+fn box_run_keeps_a_wsl_made_venv_with_its_pyvenv_cfg_and_bin_python() {
+    let case = Case::new("box_run_venv_wsl");
+
+    let (second, work) = venv_run(&case, |venv| {
+        fs::create_dir_all(venv.join("bin")).expect("the venv's bin folder can be made");
+        fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin\n").expect("the pyvenv.cfg can be written");
+        fs::write(venv.join(r"bin\python"), "ELF").expect("the interpreter can be written");
+    });
+
+    assert!(work.join(r".venv\bin\python").exists(), "a venv WSL made is whole: {second:?}");
+    assert!(!second.stderr.contains(".venv"), "nothing is said of it: {second:?}");
+}
+
+#[test]
+fn box_run_keeps_a_broken_venv_under_which_git_tracks_a_file() {
+    let case = Case::new("box_run_venv_tracked");
+
+    let (second, work) = venv_run_of(&case, &[("a.txt", "a\n"), (".venv/keep.txt", "k\n")], |_| {});
+
+    assert!(work.join(r".venv\keep.txt").exists(), "a .venv holding a tracked file stays: {second:?}");
+    assert!(!second.stderr.contains(".venv"), "nothing is said of it: {second:?}");
+}
+
+#[test]
+fn box_run_says_a_broken_venv_it_cannot_remove_and_runs_the_command() {
+    let case = Case::new("box_run_venv_held");
+    let mut held = None;
+
+    let (second, work) = venv_run(&case, |venv| {
+        half_made_venv(venv);
+        // Held without delete sharing, so the removal fails on it.
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(venv.join(r"Lib\site-packages\x.py"))
+            .expect("the package file can be held");
+        held = Some(file);
+    });
+
+    drop(held);
+    assert!(
+        lines(&second.stderr)
+            .iter()
+            .any(|line| line.starts_with("gate: remote could not clear the broken .venv in .: ")),
+        "{second:?}"
+    );
+    assert!(work.join(r".venv\Lib\site-packages\x.py").exists(), "{second:?}");
+}
+
+#[test]
+fn box_run_with_a_pair_names_the_sibling_whose_broken_venv_it_cleared() {
+    let case = Case::new("box_run_venv_pair");
+    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "out", "ran"]);
+    let lib: &[(&str, &str)] = &[("b.txt", "b\n"), (".gitignore", ".venv\n")];
+    pair_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[("lib", lib)]);
+    let first = run_box(&case, &payload);
+    assert_eq!(first.code, Some(0), "the run that lays the work folder out: {first:?}");
+    let venv = Path::new(&pair_tree(&payload, "lib")).join(".venv");
+    half_made_venv(&venv);
+
+    let second = run_box(&case, &renamed(&payload, 1));
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert!(!venv.exists(), "{second:?}");
+    assert!(
+        lines(&second.stderr).contains(&"gate: remote cleared a broken .venv in lib"),
+        "{second:?}"
+    );
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_run_neither_follows_nor_removes_a_junction_named_venv() {
+    let case = Case::new("box_run_venv_junction");
+    let elsewhere = case.folder().join("elsewhere");
+    half_made_venv(&elsewhere);
+
+    let (second, work) = venv_run(&case, |venv| junction(venv, &elsewhere));
+
+    assert!(fs::symlink_metadata(work.join(".venv")).is_ok(), "the junction stays: {second:?}");
+    assert!(
+        elsewhere.join(r"Lib\site-packages\x.py").exists(),
+        "what it leads to is untouched: {second:?}"
+    );
+    assert!(!second.stderr.contains(".venv"), "nothing is said of it: {second:?}");
+}
+
 #[test]
 fn box_run_after_a_stopped_run_clears_what_it_wrote() {
     let case = Case::new("box_run_after_stop");

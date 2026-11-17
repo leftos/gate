@@ -32,7 +32,8 @@ use gate_inputs::lfs::{ATTRIBUTES_FILES, RECHECKOUT_OUTPUT, no_storage, pointers
 use gate_router::{GATE_FOLDER_MARK, escaped};
 use gate_watchdog::{Kill, Pump, is_wsl_command};
 use gate_win32::{
-    Donor, EnvironmentBlock, Job, LaunchError, NamedEvent, PipedConsole, PipedLaunch, PipedSuspended, RestrictedToken, Running, Utf8Console,
+    Donor, EnvironmentBlock, Job, LaunchError, Make, NamedEvent, PipedConsole, PipedLaunch, PipedSuspended, RestrictedToken, Running, Share,
+    Utf8Console,
 };
 use gate_wire::stamp::Tag;
 use gate_wire::{
@@ -1760,15 +1761,9 @@ fn renewed_empty(record: &str) -> Result<(), NotLaidOut> {
     let beside = format!("{name}{RENEWING_SUFFIX}");
     // One a box that died mid-renewal left is no record: it goes first.
     removed(&parent.join(&beside))?;
-    let made = gate_win32::open_beneath_as(
-        &folder,
-        &beside,
-        FILE_GENERIC_WRITE | DELETE,
-        gate_win32::Share::NoDelete,
-        gate_win32::Make::NewFile,
-    )
-    .and_then(|file| file.sync_all().map(|()| file))
-    .and_then(|file| gate_win32::rename_beneath(&file, &folder, name));
+    let made = gate_win32::open_beneath_as(&folder, &beside, FILE_GENERIC_WRITE | DELETE, Share::NoDelete, Make::NewFile)
+        .and_then(|file| file.sync_all().map(|()| file))
+        .and_then(|file| gate_win32::rename_beneath(&file, &folder, name));
     made.map_err(|error| not_written(&error))
 }
 
@@ -1954,6 +1949,7 @@ fn restored(
         );
         return Err(ended_before(u32::from(USAGE_STATUS), request, beat, console));
     }
+    venvs_cleared(request, git, console);
     let restored = tools::update(request, folders.work, folders.place, beat, console)
         .and_then(|()| tools::update_sent(request, folders.place, beat, console))
         .and_then(|()| packages::update(request, git, folders, beat, console))
@@ -1964,6 +1960,115 @@ fn restored(
         Err(REFUSED_STATUS) => Err(REFUSED_STATUS),
         Err(status) => Err(ended_before(status, request, beat, console)),
         Ok(()) => Ok(()),
+    }
+}
+
+/// The Python virtual environment folder uv makes at the top of a tree, the one name [`venvs_cleared`] looks at.
+const VENV: &str = ".venv";
+/// The access a `.venv` and what is in it are looked at with ([`venv_cleared`]): their attributes alone.
+const VENV_LOOK_ACCESS: u32 = windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+
+/// The folders of a `.venv` its interpreter may be in, each with the interpreter's names there: `Scripts` of a venv
+/// made on Windows, `bin` of one made under WSL.
+const VENV_INTERPRETERS: [(&str, &[&str]); 2] = [("Scripts", &["python.exe"]), ("bin", &["python", "python3"])];
+
+/// Removes the broken `.venv` at the top of each tree of the run ([`venv_cleared`]), so the command's `uv` makes it
+/// anew, and says `gate: remote cleared a broken .venv in <tree>` for each, the tree `.` on a run of one repo and the
+/// repo's name on a pair run; a look, a git listing or a removal that fails is said, and the run goes on either way.
+fn venvs_cleared(request: &Request<'_>, git: &WorkGit, console: &mut Console) {
+    for repo in request.repos() {
+        let tree = repo.name.as_deref().unwrap_or(".");
+        let cleared = venv_cleared(Path::new(&repo.tree), || venv_tracked(git, repo, console));
+        match cleared {
+            Ok(false) => {}
+            Ok(true) => stamping::err(console, &format!("gate: remote cleared a broken .venv in {tree}")),
+            Err(error) => stamping::err(console, &format!("gate: remote could not clear the broken .venv in {tree}: {error}")),
+        }
+    }
+}
+
+/// Whether git tracks any file under the `.venv` of the tree of `repo` (`git ls-files -- .venv` lists one); else why
+/// the listing failed.
+fn venv_tracked(git: &WorkGit, repo: &Repo<'_>, console: &mut Console) -> Result<bool, String> {
+    git.output(
+        ("venv listing", GitClass::Short),
+        repo,
+        &["ls-files", "--", VENV],
+        (None, TREE_LISTING),
+        console,
+    )
+    .map(|listed| !listed.is_empty())
+    .map_err(|failed| failed.line)
+}
+
+/// Removes the `.venv` folder at the top of the tree `tree` when it is broken ([`venv_broken`]) and git tracks no file
+/// under it (`tracked`, asked only then), with everything in it ([`gate_win32::delete_tree_opened`]). The tree is held
+/// as itself and the `.venv` opened beneath it as itself, so a link or a junction at either is never followed: a
+/// `.venv` that is one is left alone, as is a tree that is one. Delete access is taken only once it is judged broken.
+/// Whether it was removed; else why the look, the listing or the removal failed.
+fn venv_cleared(tree: &Path, tracked: impl FnOnce() -> Result<bool, String>) -> Result<bool, String> {
+    use windows_sys::Win32::Storage::FileSystem::DELETE;
+
+    let Some(tree) = preflight::held_folder_at(tree).map_err(|error| error.to_string())? else {
+        return Ok(false);
+    };
+    if !venv_broken(&tree).map_err(|error| error.to_string())? || tracked()? {
+        return Ok(false);
+    }
+    let venv = gate_win32::open_beneath_as(&tree, VENV, DELETE | VENV_LOOK_ACCESS, Share::NoDelete, Make::Open).map_err(|error| error.to_string())?;
+    // Judged again on the handle that deletes, so a link swapped in since the look is left alone.
+    if !preflight::is_folder_itself(&venv).map_err(|error| error.to_string())? {
+        return Ok(false);
+    }
+    gate_win32::delete_tree_opened(&venv).map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+/// Whether the held tree `tree` holds a broken `.venv`: a folder itself, opened beneath it for its attributes alone and
+/// sharing everything, that is not whole ([`venv_whole`]).
+fn venv_broken(tree: &File) -> io::Result<bool> {
+    match folder_in(tree, VENV)? {
+        Some(venv) => Ok(!venv_whole(&venv)?),
+        None => Ok(false),
+    }
+}
+
+/// Whether the held `.venv` folder `venv` holds its `pyvenv.cfg` and an interpreter of [`VENV_INTERPRETERS`], each
+/// looked at beneath its folder as itself ([`entry_file`]), an interpreter's folder only when it is a folder itself.
+fn venv_whole(venv: &File) -> io::Result<bool> {
+    if !entry_file(venv, "pyvenv.cfg")? {
+        return Ok(false);
+    }
+    for (folder, names) in VENV_INTERPRETERS {
+        let Some(held) = folder_in(venv, folder)? else {
+            continue;
+        };
+        for name in names {
+            if entry_file(&held, name)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// The folder `name` in the held folder `folder`, opened beneath it as itself for its attributes alone, sharing
+/// everything; `None` when nothing has the name or it is not a folder itself (a link, a junction or a file).
+fn folder_in(folder: &File, name: &str) -> io::Result<Option<File>> {
+    match gate_win32::open_beneath_as(folder, name, VENV_LOOK_ACCESS, Share::All, Make::Open) {
+        Ok(held) => Ok(preflight::is_folder_itself(&held)?.then_some(held)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether the held folder `folder` holds `name` as anything but a folder, a link included, opened beneath it as itself
+/// and never followed.
+fn entry_file(folder: &File, name: &str) -> io::Result<bool> {
+    match gate_win32::open_beneath_as(folder, name, VENV_LOOK_ACCESS, Share::All, Make::Open) {
+        Ok(entry) => Ok(!entry.metadata()?.is_dir()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
