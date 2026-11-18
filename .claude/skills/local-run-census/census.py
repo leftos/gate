@@ -28,7 +28,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Iterable, Iterator, Mapping, Sequence
 
 # The gate's `notRouted` token of a command no pattern matched, which the tables read as no value.
 NO_PATTERN = "no pattern"
@@ -276,15 +276,28 @@ def family_of(command: str) -> str:
 # ---------------------------------------------------------------- repos
 
 
+def sibling_map(remote: dict[str, Any]) -> dict[str, list[str]]:
+    """``remote.json``'s declared siblings: each repo's sibling names, both as the file spells them."""
+    declared = remote.get("siblings")
+    if not isinstance(declared, dict):
+        return {}
+    return {
+        str(repo): [name for name in names if isinstance(name, str)]
+        for repo, names in declared.items()
+        if isinstance(names, list)
+    }
+
+
 class RepoNamer:
     """Names the repo a run's ``cwd`` belongs to, caching one answer per ``cwd``."""
 
-    def __init__(self) -> None:
+    def __init__(self, siblings: Mapping[str, Sequence[str]]) -> None:
+        self._siblings = siblings
         self._cache: dict[str, str] = {}
 
     def __call__(self, cwd: str) -> str:
         if cwd not in self._cache:
-            self._cache[cwd] = repo_of(cwd)
+            self._cache[cwd] = repo_of(cwd, self._siblings)
         return self._cache[cwd]
 
 
@@ -294,26 +307,50 @@ def _segments(path: str) -> list[str]:
     ]
 
 
-def repo_of(cwd: str) -> str:
+def repo_of(cwd: str, siblings: Mapping[str, Sequence[str]]) -> str:
     """The repo of a working folder.
 
-    A ``<repo>.wt`` segment names its repo and a ``.claude-wt`` segment names
-    claude-config; otherwise git names the main checkout. A folder git names no
-    repo for is ``(no repo)`` and a folder that is gone is ``(gone)``: a folder's
-    own name is never printed, since it may be a machine path's part.
+    A folder at ``<repo>.wt\\<slug>\\<sibling>`` is named ``<sibling>`` when
+    ``remote.json`` lists it among ``<repo>``'s siblings; any other folder under
+    a ``<repo>.wt`` segment is named by the segment, and a ``.claude-wt`` segment
+    names claude-config. A folder outside a worktree segment that git names no
+    repo for is ``(no repo)`` and one that is gone is ``(gone)``: a folder's own
+    name is never printed, since it may be a machine path's part.
     """
     segments = _segments(cwd)
-    for segment in segments:
+    for index, segment in enumerate(segments):
         if segment.lower() == ".claude-wt":
             return CLAUDE_CONFIG
         if segment.lower().endswith(".wt") and len(segment) > 3:
-            return segment[:-3]
+            return _worktree_name(siblings, segments, index)
     if not segments:
         return NO_REPO
     if not Path(cwd).is_dir():
         return GONE
     common = _git_common_dir(cwd)
     return NO_REPO if common is None else repo_of_common_dir(common)
+
+
+def _worktree_name(
+    siblings: Mapping[str, Sequence[str]], segments: list[str], index: int
+) -> str:
+    """The repo of a folder under ``segments[index]``: its declared sibling's, else the segment's."""
+    repo = segments[index][:-3]
+    if index + 2 >= len(segments):
+        return repo
+    below = segments[index + 2].lower()
+    for name in _siblings_of(siblings, repo):
+        if name.lower() == below:
+            return name
+    return repo
+
+
+def _siblings_of(siblings: Mapping[str, Sequence[str]], repo: str) -> Sequence[str]:
+    """The names ``remote.json`` lists as siblings of ``repo``, its key matched in any case."""
+    for key, names in siblings.items():
+        if key.lower() == repo.lower():
+            return names
+    return ()
 
 
 def repo_of_common_dir(common: str) -> str:
@@ -1232,22 +1269,22 @@ def _default_journal() -> Path:
 
 
 def _default_remote() -> Path | None:
-    """The ``remote.json`` whose builder names are hidden, or None when this PC has no local app data."""
+    """The ``remote.json`` holding the builder names and the declared siblings, or None when this PC has no local app data."""
     local = os.environ.get("LOCALAPPDATA")
     return Path(local) / "gate" / "remote.json" if local else None
 
 
-def _remote_builders(path: Path | None) -> list[str]:
-    """The builder names ``remote.json`` holds; a file that is absent means no names."""
+def _read_remote(path: Path | None) -> dict[str, Any]:
+    """``remote.json`` as read, the builder names and the declared siblings; a file that is absent means no names."""
     if path is None or not path.exists():
-        return []
+        return {}
     try:
         remote = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         sys.exit(f"census: cannot read {path}: {error}")
     if not isinstance(remote, dict):
         sys.exit(f"census: cannot read {path}: not a JSON object")
-    return builder_names(remote)
+    return remote
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -1273,8 +1310,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--remote",
         type=Path,
-        help="the remote.json holding the builder names to hide "
-        "(default %%LOCALAPPDATA%%\\gate\\remote.json)",
+        help="the remote.json holding the builder names to hide and the declared "
+        "siblings (default %%LOCALAPPDATA%%\\gate\\remote.json)",
     )
     parser.add_argument(
         "--json", type=Path, help="also write the census as JSON to this file"
@@ -1330,12 +1367,13 @@ def main(argv: list[str] | None = None) -> int:
         sys.exit(
             f"census: no journal files in {folder}; pass --journal <folder holding events.jsonl>"
         )
+    remote = _read_remote(args.remote or _default_remote())
     data = census_data(
         read_journal(folder),
         start,
         now,
-        RepoNamer(),
-        builders=_remote_builders(args.remote or _default_remote()),
+        RepoNamer(sibling_map(remote)),
+        builders=builder_names(remote),
     )
     if args.json is not None:
         args.json.write_text(

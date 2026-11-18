@@ -229,7 +229,6 @@ class JournalCache:
 
 
 CACHE = JournalCache()
-NAMER = census.RepoNamer()
 
 
 def recent(path: Path, cutoff: datetime) -> bool:
@@ -394,6 +393,7 @@ def counted_runs(
     options: Options, events: list[dict[str, Any]], cursor: datetime
 ) -> list[Run]:
     """The counted runs of the events read."""
+    name_repo = census.RepoNamer(load_siblings(options.remote))
     runs: list[Run] = []
     for event in events:
         if not counts(event, cursor, options.min_seconds):
@@ -405,7 +405,7 @@ def counted_runs(
             continue
         runs.append(
             Run(
-                repo=NAMER(str(event.get("cwd") or "")),
+                repo=name_repo(str(event.get("cwd") or "")),
                 shape=shape_of(command_text(event)),
                 at=moment,
                 started=start,
@@ -608,6 +608,23 @@ def load_patterns(path: Path) -> dict[str, list[str]]:
     return patterns_of(remote)
 
 
+def load_siblings(path: Path) -> dict[str, list[str]]:
+    """``remote.json``'s declared siblings as a map of repo to its sibling names; no file means none."""
+    if not path.exists():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise LocalRunsError(f"cannot read {path}: {error}") from error
+    try:
+        remote = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise LocalRunsError(f"cannot read {path}: {error}") from error
+    if not isinstance(remote, dict):
+        return {}
+    return census.sibling_map(remote)
+
+
 def gate_key(repo: str) -> str:
     """The key ``remote.json`` uses for a repo the census names."""
     return GATE_KEYS.get(repo.lower(), repo)
@@ -749,13 +766,15 @@ def fell_back(event: dict[str, Any]) -> str:
     return "; ".join(reason for reason in reasons if isinstance(reason, str))
 
 
-def routed_counter(events: list[dict[str, Any]]) -> Counter[tuple[str, str]]:
+def routed_counter(
+    events: list[dict[str, Any]], name_repo: census.RepoNamer
+) -> Counter[tuple[str, str]]:
     """The releases that routed, counted per repo and shape family."""
     counter: Counter[tuple[str, str]] = Counter()
     for event in events:
         if event.get("event") != "release" or event.get("remote") is not True:
             continue
-        repo = NAMER(str(event.get("cwd") or "")).lower()
+        repo = name_repo(str(event.get("cwd") or "")).lower()
         counter[(repo, census.family_of(shape_of(command_text(event))))] += 1
     return counter
 
@@ -831,7 +850,11 @@ def report(options: Options, view: View, cursor: datetime) -> list[str]:
     state = load_state(options.state)
     pending = pending_of(view.groups, state)
     patterns = load_patterns(options.remote) if pending else {}
-    counter = routed_counter(view.events) if pending else Counter()
+    counter = (
+        routed_counter(view.events, census.RepoNamer(load_siblings(options.remote)))
+        if pending
+        else Counter()
+    )
     routable = routable_index(view.events) if pending else {}
     blocks = {
         group.id: block_of(

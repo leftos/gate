@@ -34,7 +34,9 @@ What the script counts:
   **Nested**: a run whose `take`, `covered`, `parent` or `release` line carries a `parentPid` belongs to the latest run with that `pid` that started before it. That run must be a commit run, and the child must have started before it released (a commit with no release yet counts).
 
   A run the archive kept as a bare `release` belongs to the commit run whose folder is its own or one above it, once both are normalized (lower case, `/` turned into `\`, no trailing `\`), with a `processStart` at or after the commit's and a release at most 1 s past the commit's.
-- **The repo**: a `<repo>.wt` segment of `cwd` names `<repo>`, and a `.claude-wt` segment names `claude-config`; else the main checkout's folder name from `git rev-parse --git-common-dir` (a submodule's names its superproject, and `.claude` is `claude-config`). A folder git names no repo for is `(no repo)`, and a folder that is gone is `(gone)`: a folder's own name is never printed.
+- **The repo**: a folder at `<repo>.wt\<slug>\<sibling>` is named `<sibling>` when `remote.json`'s `siblings` lists it for `<repo>` (a sibling-pair worktree holds that repo's checkout beside its own); any other folder under a `<repo>.wt` segment is named `<repo>`, and a `.claude-wt` segment names `claude-config`.
+
+  Any other folder takes the main checkout's folder name from `git rev-parse --git-common-dir` (a submodule's names its superproject, and `.claude` is `claude-config`). Outside a worktree segment, a folder git names no repo for is `(no repo)`, and a folder that is gone is `(gone)`: a folder's own name is never printed.
 - **Left out**: runs whose `cwd` holds `gate-selftest`, and heavy runs lent or covered by a parent's slot with no `release` of their own and no split commit parent (the footer counts them; a covered gate nested in a commit is counted, with no seconds, in the **Covered** column).
 - **The window** keeps a run by its `release` time, else its `queue` time: every line is read first, so a run queued before the window and released in it counts. A gate nested in a commit run that is split counts only in that commit's window, never by its own moment.
 - **The family**: the program (file name, lower-cased, `.exe`/`.cmd`/`.bat` stripped) plus, for a shell or interpreter (`pwsh`, `powershell`, `bash`, `sh`, `python`, `py`, `node`, `cmd`), its first script word, else its `-c`/`-Command`/`/c`.
@@ -55,7 +57,9 @@ What the script counts:
 
 The report names repos and families only: it never prints a `cwd`, `log`, `host` or `key`, free-text reasons have absolute paths replaced by `<path>`, and replaces every builder name `remote.json` lists with `{builder}`. The repo is public, so keep it that way in the note.
 
-**The archive keeps only `release` lines, and a release carries the run's routing facts**: `notRouted` and `reason` as its `queue` says them, `fellBack` with one reason per fallback attempt, `balanced` (the builders a routed run's decision scored, which the census does not read), `parentPid` as its `take` says it, and `sentWords` (the text the repo's patterns were asked about, which the census does not read; the `route-local-runs` watcher does), `notRouted` being `no pattern` for a command none matched. So the `notRouted` cells, the fallback reasons and the `--local` table cover every run journalled since, archived or not. A run released before the gate wrote them onto its release keeps none: judge its family from its commands, not from an empty `notRouted` cell.
+**The archive keeps only `release` lines, and a release carries the run's routing facts**: `notRouted` and `reason` as its `queue` says them, `fellBack` with one reason per fallback attempt, `balanced` (the builders a routed run's decision scored, unread by the census), `parentPid` as its `take` says it, and `sentWords` (the text the repo's patterns were asked about, which the census does not read; the `route-local-runs` watcher does), `notRouted` being `no pattern` for a command none matched.
+
+So the `notRouted` cells, the fallback reasons and the `--local` table cover every run journalled since, archived or not. A run released before the gate wrote them onto its release keeps none: judge its family from its commands, not from an empty `notRouted` cell.
 
 ## Sort every heavy family with local runs
 

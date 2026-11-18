@@ -335,6 +335,15 @@ class ReportTests(Case):
         self.assertIn("runs=2 seconds=200", text)
         self.assertEqual(text.count("  shape: "), 1)
 
+    def test_a_declared_sibling_s_run_is_reported_under_the_sibling(self) -> None:
+        self.write_remote_data({"siblings": {"yaat": ["yaat-server"]}})
+        self.write_events(
+            release(1, START, cwd=r"X:\dev\yaat.wt\pair\yaat-server", wall=120.0)
+        )
+        status, text = self.scan()
+        self.assertEqual(status, 0)
+        self.assertIn(" yaat-server runs=1", text)
+
     def test_a_near_miss_names_its_nearest_pattern(self) -> None:
         shape_command = (
             "cargo build --manifest-path Cargo.toml -p daemon -p tracer --release"

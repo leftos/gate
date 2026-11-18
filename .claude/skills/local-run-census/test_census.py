@@ -208,22 +208,64 @@ class RepoTests(unittest.TestCase):
     """The repo a working folder belongs to."""
 
     def test_a_worktree_names_its_repo(self) -> None:
-        self.assertEqual(census.repo_of(r"X:\dev\gate.wt\gate-831"), "gate")
+        self.assertEqual(census.repo_of(r"X:\dev\gate.wt\gate-831", {}), "gate")
 
     def test_a_claude_worktree_names_claude_config(self) -> None:
         self.assertEqual(
-            census.repo_of(r"C:\Users\someone\.claude-wt\cc-484"), "claude-config"
+            census.repo_of(r"C:\Users\someone\.claude-wt\cc-484", {}), "claude-config"
         )
+
+    def test_a_declared_sibling_in_a_pair_worktree_names_its_own_repo(self) -> None:
+        self.assertEqual(
+            census.repo_of(
+                r"X:\dev\yaat.wt\pair\yaat-server\src", {"yaat": ["yaat-server"]}
+            ),
+            "yaat-server",
+        )
+
+    def test_the_main_folder_of_a_pair_worktree_names_the_pair_repo(self) -> None:
+        self.assertEqual(
+            census.repo_of(r"X:\dev\yaat.wt\pair\yaat", {"yaat": ["yaat-server"]}),
+            "yaat",
+        )
+
+    def test_an_undeclared_subfolder_keeps_the_worktree_repo(self) -> None:
+        self.assertEqual(
+            census.repo_of(r"X:\dev\gate.wt\gate-1\crates", {"yaat": ["yaat-server"]}),
+            "gate",
+        )
+
+    def test_a_sibling_name_right_under_the_wt_folder_is_not_a_sibling(self) -> None:
+        self.assertEqual(
+            census.repo_of(r"X:\dev\yaat.wt\yaat-server", {"yaat": ["yaat-server"]}),
+            "yaat",
+        )
+
+    def test_sibling_names_match_in_any_case(self) -> None:
+        self.assertEqual(
+            census.repo_of(
+                r"X:\dev\Yaat.wt\pair\YAAT-Server", {"yaat": ["yaat-server"]}
+            ),
+            "yaat-server",
+        )
+
+    def test_the_sibling_map_reads_remote_json_siblings(self) -> None:
+        self.assertEqual(
+            census.sibling_map({"siblings": {"yaat": ["yaat-server", 3]}}),
+            {"yaat": ["yaat-server"]},
+        )
+        self.assertEqual(census.sibling_map({"siblings": "x"}), {})
+        self.assertEqual(census.sibling_map({}), {})
 
     def test_a_missing_plain_checkout_is_gone(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             self.assertEqual(
-                census.repo_of(str(Path(root) / "gone" / "my-repo")), "(gone)"
+                census.repo_of(str(Path(root) / "gone" / "my-repo"), {}), "(gone)"
             )
 
     def test_a_folder_in_no_repo_is_no_repo(self) -> None:
         with tempfile.TemporaryDirectory() as root:
-            self.assertEqual(census.repo_of(root), "(no repo)")
+            self.assertEqual(census.repo_of(root, {}), "(no repo)")
 
     def test_a_common_dir_names_its_checkout_or_superproject(self) -> None:
         self.assertEqual(census.repo_of_common_dir("X:/dev/gate/.git"), "gate")
@@ -314,7 +356,7 @@ class ReleaseFactsTests(unittest.TestCase):
     @staticmethod
     def census_of(*events: dict[str, object]) -> dict[str, object]:
         return census.census_data(
-            journal_of(*events), START, END, census.RepoNamer(), builders=[]
+            journal_of(*events), START, END, census.RepoNamer({}), builders=[]
         )
 
     @staticmethod
@@ -525,7 +567,7 @@ class RunTests(unittest.TestCase):
         ]
         runs, _ = census.group_runs(events, START, END)
         data = census.census_data(
-            journal_of(*events), START, END, census.RepoNamer(), builders=[]
+            journal_of(*events), START, END, census.RepoNamer({}), builders=[]
         )
         self.assertEqual(len(runs), 6)
         (row,) = data["heavy"]
@@ -558,7 +600,7 @@ class RunTests(unittest.TestCase):
             )
         ]
         (row,) = census.census_data(
-            journal_of(*events), START, END, census.RepoNamer(), builders=[]
+            journal_of(*events), START, END, census.RepoNamer({}), builders=[]
         )["heavy"]
         self.assertIsNone(row["localMedianSeconds"])
         self.assertEqual(row["localSecondsTotal"], 0)
@@ -566,7 +608,7 @@ class RunTests(unittest.TestCase):
     def test_an_empty_window_says_so(self) -> None:
         report = census.render(
             census.census_data(
-                journal_of(), START, END, census.RepoNamer(), builders=[]
+                journal_of(), START, END, census.RepoNamer({}), builders=[]
             )
         )
         self.assertIn(census.NO_HEAVY_LOCAL, report)
@@ -582,7 +624,7 @@ class CommitSplitTests(unittest.TestCase):
     @staticmethod
     def census_of(*events: dict[str, object]) -> dict[str, object]:
         return census.census_data(
-            journal_of(*events), START, END, census.RepoNamer(), builders=[]
+            journal_of(*events), START, END, census.RepoNamer({}), builders=[]
         )
 
     @staticmethod
@@ -938,7 +980,7 @@ class NestedLinkTests(unittest.TestCase):
     @staticmethod
     def census_of(*events: dict[str, object]) -> dict[str, object]:
         return census.census_data(
-            journal_of(*events), START, END, census.RepoNamer(), builders=[]
+            journal_of(*events), START, END, census.RepoNamer({}), builders=[]
         )
 
     @staticmethod
@@ -1242,7 +1284,7 @@ class SplitRuleTests(unittest.TestCase):
     @staticmethod
     def census_of(*events: dict[str, object]) -> dict[str, object]:
         return census.census_data(
-            journal_of(*events), START, END, census.RepoNamer(), builders=[]
+            journal_of(*events), START, END, census.RepoNamer({}), builders=[]
         )
 
     @staticmethod
@@ -1497,7 +1539,7 @@ class StageTests(unittest.TestCase):
     @staticmethod
     def census_of(*events: dict[str, object]) -> dict[str, object]:
         return census.census_data(
-            journal_of(*events), START, END, census.RepoNamer(), builders=[]
+            journal_of(*events), START, END, census.RepoNamer({}), builders=[]
         )
 
     @staticmethod
@@ -1634,7 +1676,7 @@ class BuilderNameTests(unittest.TestCase):
     @staticmethod
     def census_of(*events: dict[str, object], builders: list[str]) -> dict[str, object]:
         return census.census_data(
-            journal_of(*events), START, END, census.RepoNamer(), builders=builders
+            journal_of(*events), START, END, census.RepoNamer({}), builders=builders
         )
 
     def test_builder_names_take_host_and_host_part_not_user(self) -> None:
@@ -1731,7 +1773,7 @@ class NoMachinePathTests(unittest.TestCase):
                 ),
             ]
         data = census.census_data(
-            journal_of(*events), START, END, census.RepoNamer(), builders=[]
+            journal_of(*events), START, END, census.RepoNamer({}), builders=[]
         )
         for text in (census.render(data), json.dumps(data)):
             self.assertIsNone(
