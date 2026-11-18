@@ -262,6 +262,7 @@ mod tests {
             slot_held: None,
             box_job: None,
             commit_slot: None,
+            local_parent: None,
             stage_blocking: Vec::new(),
             handed_over: None,
         }

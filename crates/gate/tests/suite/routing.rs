@@ -16,13 +16,13 @@ use gate_state::{KernelObject, StateRoot, key_hash};
 use gate_win32::NamedMutex;
 use serde_json::{Value, json};
 
-use crate::nesting::{LOOK_OFTEN, end_parent, first_event, marked, orphaned_as, spawned, test_marker};
+use crate::nesting::{LOOK_OFTEN, commit_with_hook_gate, end_parent, first_event, marked, orphaned_as, spawned, test_marker};
 
 use crate::remote_client::{PREK_SHIM, STAGE_COMMIT, Tuned, client_case, client_gate, client_gate_tuned, fallbacks};
 use crate::support::{
     Case, DenyEntry, FAKE_TOOL, GATE, Go, Junction, LOCAL_REASON, Outcome, Running, UNTIL_KILLED, assert_in_order, beside, calls, copy_tool,
-    critical_words, events, finish, git, git_init, heavy_words, latest_run_of, log_texts, nothing_back, powershell_folder, record_path, release,
-    run_words, shown, ssh_steps, start, wait_for_journal_line, wait_until, write_counts, write_remote_json,
+    critical_words, events, finish, git, git_init, heavy_words, latest_run_of, log_texts, none_words, nothing_back, powershell_folder, record_path,
+    release, run_words, shown, ssh_steps, start, wait_for_journal_line, wait_until, write_counts, write_remote_json,
 };
 
 pub(crate) const HOST: &str = "builder";
@@ -1941,6 +1941,220 @@ fn a_heavy_gate_routed_from_under_a_light_parent_does_not_say_the_parent_does_no
     let events = events(&case);
     assert_eq!(names(&events), ["queue", "take", "release"], "{events:#?}");
     assert!(events.iter().all(has_remote_tag), "{events:#?}");
+}
+
+/// The `--local` words of a case's outer gate, whose reason its nested gates say.
+const LOCAL_PARENT: [&str; 3] = ["--local", "--reason", "freeze Godot"];
+/// The seam a routed gate nested in a case's gate command takes, as [`Case::prepare`] gives a routed gate it starts.
+const NESTED_PATH_WAIT: [&str; 2] = ["--test-tailscale-wait-ms", "600000"];
+
+/// The words of a heavy gate a case's gate command starts, logging to `log`, whose `.\tool.exe exit 0` routes through
+/// the scripted client of the step file `steps` unless something keeps it here.
+fn nested_routed<'a>(log: &'a str, steps: &'a str) -> Vec<&'a str> {
+    let mut words = vec![GATE];
+    words.extend(routed_words(log, steps, &NESTED_PATH_WAIT, &[r".\tool.exe", "exit", "0"]));
+    words
+}
+
+/// The words of a light gate a case's gate command starts, logging to `log`, `extra` before `--` and `command` after it.
+fn nested_light<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
+    let mut words = vec![GATE];
+    words.extend(run_words(log, extra, command));
+    words
+}
+
+/// Writes the script `name` in the case folder, which runs `words`, each quoted, and exits with their status; the
+/// script as a command's first word.
+fn gate_script(case: &Case, name: &str, words: &[&str]) -> String {
+    let line: Vec<String> = words.iter().map(|word| format!("\"{word}\"")).collect();
+    let script = format!("@echo off\r\n{}\r\nexit /b %ERRORLEVEL%\r\n", line.join(" "));
+    fs::write(case.folder().join(name), script).expect("the script can be written");
+    format!(r".\{name}")
+}
+
+/// The journal's queue line of the gate that logged to `log` in the case folder.
+fn queue_of<'e>(events: &'e [Value], log: &str) -> &'e Value {
+    events
+        .iter()
+        .find(|event| event["event"] == "queue" && event["log"].as_str().is_some_and(|path| path.ends_with(log)))
+        .expect("the gate that logged there wrote a queue line")
+}
+
+/// Asserts that the gate that logged to `log` ran here for the `--local` gate around it whose reason is `reason`: its
+/// log says so, and its queue line has `notRouted` `--local`, `reason` `parent: <reason>` and no remote field.
+fn assert_kept_by_local_parent(case: &Case, log: &str, reason: &str) {
+    let text = log_texts(&case.folder().join(log));
+    assert!(text.contains(&format!("gate: not routed: --local parent: {reason}")), "{text}");
+    let events = events(case);
+    let queue = queue_of(&events, log);
+    assert_eq!(queue["notRouted"], "--local", "{queue}");
+    assert_eq!(queue["reason"], format!("parent: {reason}"), "{queue}");
+    assert!(has_no_remote_fields(queue), "{queue}");
+}
+
+#[test]
+fn a_heavy_gate_under_a_light_local_gate_stays_here_with_the_parent_reason() {
+    let case = routed_case("routing-local-parent");
+    let steps = shown(&stub(&case, &["status 0"]));
+    let inner = nested_routed("inner.log", &steps);
+
+    let outcome = finish(case.gate(&run_words("outer.log", &LOCAL_PARENT, &inner)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_kept_by_local_parent(&case, "inner.log", "freeze Godot");
+}
+
+#[test]
+fn a_grandchild_under_a_local_gate_stays_here() {
+    let case = routed_case("routing-local-parent-grandchild");
+    let steps = shown(&stub(&case, &["status 0"]));
+    let script = gate_script(&case, "grand.cmd", &nested_routed("grand.log", &steps));
+    let child = nested_light("child.log", &[], &[&script]);
+
+    let outcome = finish(case.gate(&run_words("outer.log", &LOCAL_PARENT, &child)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_kept_by_local_parent(&case, "grand.log", "freeze Godot");
+}
+
+#[test]
+fn the_nearest_local_parent_reason_is_said() {
+    let case = routed_case("routing-local-parent-nearest");
+    let steps = shown(&stub(&case, &["status 0"]));
+    let script = gate_script(&case, "grand.cmd", &nested_routed("grand.log", &steps));
+    let child = nested_light("child.log", &["--local", "--reason", "child reason"], &[&script]);
+
+    // A no-slot parent covers neither gate, so the light child decides as itself and says its own `--local`.
+    let outcome = finish(case.gate(&none_words("outer.log", &["--local", "--reason", "outer reason"], &child)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let child_log = log_texts(&case.folder().join("child.log"));
+    assert!(
+        child_log.lines().any(|line| line.trim_end() == "gate: not routed: --local"),
+        "the --local child says its own flag: {child_log}"
+    );
+    assert_kept_by_local_parent(&case, "grand.log", "child reason");
+    let grand_log = log_texts(&case.folder().join("grand.log"));
+    assert!(!grand_log.contains("outer reason"), "{grand_log}");
+}
+
+#[test]
+fn a_gate_with_a_reason_of_its_own_under_a_local_parent_journals_its_own() {
+    let case = routed_case("routing-local-parent-own-reason");
+    let steps = shown(&stub(&case, &["status 0"]));
+    let mut inner = vec![GATE];
+    let extra = ["--test-tailscale-wait-ms", "600000", "--reason", "own reason"];
+    inner.extend(routed_words("inner.log", &steps, &extra, &[r".\tool.exe", "exit", "0"]));
+
+    let outcome = finish(case.gate(&run_words("outer.log", &LOCAL_PARENT, &inner)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let text = log_texts(&case.folder().join("inner.log"));
+    assert!(text.contains("gate: not routed: --local parent: freeze Godot"), "{text}");
+    let events = events(&case);
+    let queue = queue_of(&events, "inner.log");
+    assert_eq!(
+        (&queue["notRouted"], &queue["reason"]),
+        (&json!("--local"), &json!("own reason")),
+        "{queue}"
+    );
+}
+
+#[test]
+fn a_heavy_gate_under_a_none_slot_local_gate_stays_here() {
+    let case = routed_case("routing-local-parent-none-slot");
+    let steps = shown(&stub(&case, &["status 0"]));
+    let inner = nested_routed("inner.log", &steps);
+
+    let outcome = finish(case.gate(&none_words("outer.log", &LOCAL_PARENT, &inner)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_kept_by_local_parent(&case, "inner.log", "freeze Godot");
+}
+
+/// The words of a heavy `--local` run, as [`heavy_words`] gives those of a heavy one.
+fn local_heavy_words<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
+    let mut before: Vec<&'a str> = LOCAL_PARENT.to_vec();
+    before.extend(extra);
+    heavy_words(log, &before, command)
+}
+
+#[test]
+fn a_hook_gate_under_a_local_commit_run_stays_here() {
+    let case = routed_case("routing-local-parent-commit-hook");
+    let steps = shown(&stub(&case, &["status 0"]));
+    let inner = routed_words("inner.log", &steps, &NESTED_PATH_WAIT, &[r".\tool.exe", "exit", "0"]);
+
+    let (_, inner_pid, status) = commit_with_hook_gate(&case, local_heavy_words, &inner);
+
+    assert_eq!(status, 0, "the hook gate passed");
+    let text = log_texts(&case.folder().join("inner.log"));
+    assert!(text.contains("gate: not routed: --local parent: freeze Godot"), "{text}");
+    let lines = own(&case, inner_pid);
+    assert!(lines.iter().all(has_no_remote_fields), "the hook gate ran here: {lines:#?}");
+}
+
+#[test]
+fn a_stale_local_parent_variable_without_a_live_parent_is_ignored() {
+    let case = routed_case("routing-stale-local-parent");
+    let direct_steps = shown(&stub(&case, &["status 0"]));
+    let mut direct = case.gate(&routed_words("direct.log", &direct_steps, &[], &[r".\tool.exe", "exit", "0"]));
+    direct.env("GATE_LOCAL_PARENT", "stale reason");
+    let grand_steps = shown(&stub(&case, &["status 0"]));
+    let script = gate_script(&case, "grand.cmd", &nested_routed("grand.log", &grand_steps));
+    let mut outer = case.gate(&run_words("outer.log", &[], &[&script]));
+    outer.env("GATE_LOCAL_PARENT", "stale reason");
+
+    let (direct, outer) = (finish(direct), finish(outer));
+
+    assert_eq!((direct.code, outer.code), (Some(0), Some(0)), "{direct:?} {outer:?}");
+    assert!(!direct.stderr.contains("--local parent"), "{direct:?}");
+    let events = events(&case);
+    assert!(has_remote_tag(queue_of(&events, "direct.log")), "{events:#?}");
+    assert!(
+        has_remote_tag(queue_of(&events, "grand.log")),
+        "a gate that ignored the variable does not hand it on: {events:#?}"
+    );
+}
+
+#[test]
+fn a_caller_cannot_set_gate_local_parent_through_env() {
+    let case = Case::new("routing-env-local-parent");
+
+    let refused = case.run(&run_words("refused.log", &["--env", "GATE_LOCAL_PARENT=x"], &[FAKE_TOOL, "exit", "0"]));
+
+    assert_eq!(refused.code, Some(2), "{refused:?}");
+    assert!(
+        refused
+            .stderr
+            .starts_with("gate: --env sets GATE_LOCAL_PARENT, which the gate sets itself\n"),
+        "{refused:?}"
+    );
+    assert!(!case.folder().join("refused.log").exists(), "a refused run readies no log");
+}
+
+#[test]
+fn a_no_build_test_under_a_local_parent_after_a_routed_build_builds_here() {
+    let case = routed_case("routing-local-parent-no-build");
+    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
+    routed_build(&case, "routed.log");
+    let steps = shown(&stub(&case, &["status 0"]));
+    let mut extra = vec!["--test-remote-client", steps.as_str()];
+    extra.extend(GIT_HANG_GUARDS);
+    extra.extend(NESTED_PATH_WAIT);
+    let child = nested_light("nested.log", &extra, &NO_BUILD_TEST);
+
+    let outcome = finish(case.gate(&run_words("outer.log", &LOCAL_PARENT, &child)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let text = log_texts(&case.folder().join("nested.log"));
+    assert!(text.contains(NOTHING_BACK_LINE), "{text}");
+    assert!(
+        text.lines().any(|line| line.trim_end() == "test"),
+        "the words that ran lack --no-build: {text}"
+    );
+    assert_kept_by_local_parent(&case, "nested.log", "freeze Godot");
 }
 
 #[test]

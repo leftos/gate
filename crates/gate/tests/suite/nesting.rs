@@ -1604,7 +1604,7 @@ const NO_SLOT_COMMIT_LINE: &str = "gate: a commit's hooks take a slot: pass --sl
 const IN_COMMIT_LINE: &str = "gate: inside a git commit's hooks; a critical or --alone gate cannot run there";
 
 /// The words of a run on a slot of some kind, as [`run_words`] and its siblings give them.
-type Words = for<'a> fn(&'a str, &[&'a str], &[&'a str]) -> Vec<&'a str>;
+pub(crate) type Words = for<'a> fn(&'a str, &[&'a str], &[&'a str]) -> Vec<&'a str>;
 
 /// How many times `line` is among `lines`.
 fn count_of<'a>(lines: impl IntoIterator<Item = &'a str>, line: &str) -> usize {
@@ -1708,7 +1708,7 @@ fn json_empty() -> Value {
 
 /// A commit run of `outer` words in `case` whose hooks start a gate of `inner` words, logging to `inner.log`, and wait
 /// for it to end: the commit's pid, the nested gate's pid and the nested gate's exit status, once the commit passed.
-fn commit_with_hook_gate(case: &Case, outer: Words, inner: &[&str]) -> (u32, u32, u32) {
+pub(crate) fn commit_with_hook_gate(case: &Case, outer: Words, inner: &[&str]) -> (u32, u32, u32) {
     let git = tool(case, "git.exe");
     let (pid_file, release) = (case.folder().join("inner.pid"), case.folder().join("outer.release"));
     let (pid_text, release_text) = (shown(&pid_file), shown(&release));

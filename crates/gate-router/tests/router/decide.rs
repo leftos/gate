@@ -740,6 +740,63 @@ fn a_covering_parent_keeps_it_here_silently_even_with_local_and_reads_no_routing
     assert_eq!(facts.asked(), Vec::<String>::new());
 }
 
+#[test]
+fn a_local_parent_keeps_a_routable_run_here_with_its_reason() {
+    let command = words(&["dotnet", "build", "X:/dev/yaat.wt/a/src/A.csproj"]);
+    routed(decide(&heavy(&command), &FakeFacts::at_root()));
+    let facts = FakeFacts::at_root();
+    for inputs in [heavy(&command), light(&command)] {
+        let route = decide(
+            &Inputs {
+                local_parent: Some("freeze Godot"),
+                ..inputs
+            },
+            &facts,
+        );
+        assert_eq!(
+            route,
+            Route::Local {
+                reason: Some(LocalReason::LocalParent {
+                    reason: "freeze Godot".to_owned()
+                })
+            }
+        );
+        assert_eq!(local_line(&route).as_deref(), Some("gate: not routed: --local parent: freeze Godot"));
+    }
+    assert_eq!(facts.asked(), Vec::<String>::new(), "kept here before the routing file is read");
+    let local = Inputs {
+        local: true,
+        local_parent: Some("freeze Godot"),
+        ..heavy(&command)
+    };
+    assert_eq!(
+        decide(&local, &facts),
+        Route::Local {
+            reason: Some(LocalReason::LocalFlag)
+        },
+        "a gate given --local itself says its own flag"
+    );
+}
+
+#[test]
+fn a_covering_parent_stays_silent_even_with_a_local_parent() {
+    let command = words(&["dotnet", "build", "X:/dev/yaat.wt/a/src/A.csproj"]);
+    assert!(matches!(
+        decide(&covered(&command), &FakeFacts::at_root()),
+        Route::Local {
+            reason: Some(LocalReason::RoutableUnderParent { .. })
+        }
+    ));
+    for parent in [Nested::Covering, Nested::Lent, Nested::BoxRun] {
+        let inputs = Inputs {
+            parent,
+            local_parent: Some("freeze Godot"),
+            ..light(&command)
+        };
+        assert_eq!(decide(&inputs, &FakeFacts::at_root()), SILENT, "{parent:?}");
+    }
+}
+
 /// A light gate a parent's slot covers, running `command`.
 fn covered(command: &[String]) -> Inputs<'_> {
     Inputs {
@@ -4212,6 +4269,19 @@ fn a_hidden_proof_run_under_an_unusable_routing_file_is_refused_saying_it_was_ig
 }
 
 #[test]
+fn a_desktop_hidden_gate_under_a_local_parent_is_refused() {
+    let command = words(&["dotnet", "test"]);
+    let inputs = Inputs {
+        local_parent: Some("freeze Godot"),
+        ..hidden_run(heavy(&command))
+    };
+    assert_eq!(
+        refused(decide(&inputs, &hidden_consented())).line(),
+        "gate: --desktop hidden cannot route this run: --local parent: freeze Godot"
+    );
+}
+
+#[test]
 fn a_hidden_proof_run_no_routing_pattern_matches_is_refused_as_nothing_routes_it() {
     assert_eq!(
         refused(decide(&hidden_run(heavy(&words(&["npm", "test"]))), &hidden_consented())).line(),
@@ -5476,6 +5546,31 @@ fn a_pin_under_a_covering_parent_is_refused() {
         "gate: --builder win-2 cannot route this run: a parent gate's slot covers this gate"
     );
     assert!(facts.asked().is_empty(), "asked {:?}", facts.asked());
+}
+
+#[test]
+fn a_pin_under_a_local_parent_is_refused() {
+    let command = words(&["dotnet", "build"]);
+    let facts = FakeFacts::with_config(with_builders(r#"{"yaat": ["dotnet *"]}"#, MAC_AND_WIN));
+    let under_local = Inputs {
+        local_parent: Some("freeze Godot"),
+        ..pinned_to(&command, "win-2")
+    };
+    let refusal = refused(decide(&under_local, &facts));
+    assert_eq!(
+        refusal.line(),
+        "gate: --builder win-2 cannot route this run: its parent gate runs --local"
+    );
+    assert!(facts.asked().is_empty(), "asked {:?}", facts.asked());
+    let covered = Inputs {
+        parent: Nested::Covering,
+        ..under_local
+    };
+    assert_eq!(
+        refused(decide(&covered, &facts)),
+        PinRefusal::covered("win-2"),
+        "the covered-parent refusal comes first"
+    );
 }
 
 #[test]

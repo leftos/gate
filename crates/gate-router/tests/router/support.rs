@@ -76,6 +76,7 @@ pub fn heavy(words: &[String]) -> Inputs<'_> {
         slot: Slot::Heavy,
         parent: Nested::None,
         local: false,
+        local_parent: None,
         git_hook: false,
         words,
         given: None,

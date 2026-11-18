@@ -55,7 +55,9 @@ use crate::covered::Covered;
 use crate::durations::{
     Resolved, RunDurations, RunIdentity, Usual, ceiling_hint, expected_field, expected_line, raised_ceiling_line, resolve_ceiling, span_text,
 };
-use crate::environment::{self, BOX_JOB_VARIABLE, COMMIT_SLOT_VARIABLE, SLOT_HELD_VARIABLE, STAGE_HEAD_VARIABLE, STAGE_TREE_VARIABLE, Variables};
+use crate::environment::{
+    self, BOX_JOB_VARIABLE, COMMIT_SLOT_VARIABLE, LOCAL_PARENT_VARIABLE, SLOT_HELD_VARIABLE, STAGE_HEAD_VARIABLE, STAGE_TREE_VARIABLE, Variables,
+};
 use crate::escaped::{self, Found, Reach, Reached, Recorded};
 use crate::installed;
 use crate::journal::{self, RunJournal};
@@ -86,6 +88,8 @@ use crate::worktree_record;
 
 /// The status of a run the gate itself failed.
 const GATE_FAILED: i64 = 1;
+/// The reason a `--local` gate with no `--reason` hands its command in `GATE_LOCAL_PARENT`.
+const NO_REASON_GIVEN: &str = "no --reason given";
 /// The status of a command that exited 0 with a failure marker in its log.
 const LOG_FAILURE: i64 = 1;
 /// The status of a commit run whose child exited 0 but whose commit is not the one its stage's hooks checked, or could
@@ -786,6 +790,16 @@ impl Plan {
             variables
         } else {
             variables.without(COMMIT_SLOT_VARIABLE)
+        };
+        // A `--local` gate names its own reason, so every gate nested in its command stays here saying it; any other hands
+        // on the reason it inherited only under a bound parent gate, so a value left in a shell reaches no gate nested in
+        // its command.
+        let variables = if request.local {
+            variables.with(LOCAL_PARENT_VARIABLE, request.reason.as_deref().unwrap_or(NO_REASON_GIVEN))
+        } else if nesting.has_bound_parent() {
+            variables
+        } else {
+            variables.without(LOCAL_PARENT_VARIABLE)
         };
         // Every gate names its own reading, so a command never reads the file of a gate around this one.
         let variables = variables.with(CEILING_FILE_VARIABLE, &watch::ceiling_reading_path(log).to_string_lossy());
@@ -2426,7 +2440,7 @@ impl Run<'_> {
     fn route(&mut self, environment: &Environment, given: Option<&[String]>, console: &mut Console) -> (Route, Placed) {
         if self.request.builder.is_none() && !self.request.desktop_hidden && self.lend_before_queue(console) {
             self.lent = true;
-            let decided = route::route(self.request, environment, (Nested::Lent, given), (self.root, &self.gate), console);
+            let decided = route::route(self.request, environment, (Nested::Lent, None, given), (self.root, &self.gate), console);
             assert!(
                 matches!(decided.route, Route::Local { .. }),
                 "a covered gate's decision keeps it here: {:?}",
@@ -2436,7 +2450,10 @@ impl Run<'_> {
         }
         // A gate inside a box run stays here as a covered gate does, saying nothing. A gate a commit run's slot covers
         // is asked as one under no parent, so a build in the commit's hooks still routes.
+        // A gate under a `--local` gate, through any gates between, stays here saying that gate's reason, once a live
+        // parent gate bears the variable out.
         let parent = self.nesting.nested();
+        let local_parent = self.nesting.local_parent(environment.local_parent.as_deref());
         let route::Decided {
             mut route,
             placed: place,
@@ -2444,7 +2461,7 @@ impl Run<'_> {
             spare_folders,
             decision,
             sent,
-        } = route::route(self.request, environment, (parent, given), (self.root, &self.gate), console);
+        } = route::route(self.request, environment, (parent, local_parent, given), (self.root, &self.gate), console);
         self.sent = sent;
         self.warm_hash = warm_hash;
         self.spare_folders = spare_folders;
@@ -2648,7 +2665,7 @@ impl Run<'_> {
         let sent = self.sent.take();
         self.routing.not_routed = route::not_routed(route, sent.as_ref());
         self.routing.sent_words = sent.map(|sent| sent.text);
-        self.routing.reason = self.request.reason.clone();
+        self.routing.reason = route::queue_reason(route, self.request.reason.as_deref());
         let event = JournalEvent::Queue {
             log: self.log.path().to_string_lossy().into_owned(),
             not_routed: self.routing.not_routed.clone(),

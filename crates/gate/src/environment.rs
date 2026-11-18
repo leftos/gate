@@ -20,6 +20,10 @@ pub(crate) const SLOT_HELD_VARIABLE: &str = "GATE_SLOT_HELD";
 /// The variable a commit run gives its command holding its own slot marker, so a gate in its hooks that the marker's
 /// slot covers knows it runs under a commit run ([`crate::nesting::Nesting::under_commit`]).
 pub(crate) const COMMIT_SLOT_VARIABLE: &str = "GATE_COMMIT_SLOT";
+/// The variable a `--local` gate gives its command holding its `--reason`, so every gate nested in that command, through
+/// any gates between, stays here saying it ([`crate::nesting::Nesting::local_parent`]). A gate that is not `--local`
+/// hands it on only while a live parent gate bears it out, and unsets it otherwise.
+pub(crate) const LOCAL_PARENT_VARIABLE: &str = "GATE_LOCAL_PARENT";
 /// The variable a commit run whose stage passed on a builder gives its child holding the `HEAD` the builder checked,
 /// which the forwarder pre-commit hook compares ([`crate::commit::forward`]).
 pub(crate) const STAGE_HEAD_VARIABLE: &str = "GATE_STAGE_HEAD";

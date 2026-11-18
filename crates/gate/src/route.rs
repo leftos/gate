@@ -174,6 +174,9 @@ pub(crate) struct Decided {
 pub(crate) struct Decision {
     parent: Nested,
     local: bool,
+    /// The `--reason` of the `--local` gate the run is nested under, once its live parent bears it out
+    /// ([`Inputs::local_parent`]).
+    local_parent: Option<String>,
     git_hook: bool,
     words: Vec<String>,
     /// The words as the caller wrote them, for a run that dropped its `--no-build` before its decision.
@@ -189,13 +192,14 @@ pub(crate) struct Decision {
 }
 
 impl Decision {
-    /// What the decision of a run with `request` sees under `parent`, read from `environment`, its records under the
-    /// state root `state`.
-    fn of(request: &RunRequest, environment: &Environment, parent: Nested, state: &Path) -> Decision {
+    /// What the decision of a run with `request` sees under `parent` and the `--local` gate's reason `local_parent`
+    /// ([`Inputs::local_parent`]), read from `environment`, its records under the state root `state`.
+    fn of(request: &RunRequest, environment: &Environment, parent: Nested, local_parent: Option<String>, state: &Path) -> Decision {
         Decision {
             state: state.to_owned(),
             parent,
             local: request.local,
+            local_parent,
             git_hook: environment.git_index_file.as_deref().is_some_and(|value| !value.is_empty()),
             words: request.command.iter().map(|word| word.to_string_lossy().into_owned()).collect(),
             given: None,
@@ -212,6 +216,7 @@ impl Decision {
             slot,
             parent: self.parent,
             local: self.local,
+            local_parent: self.local_parent.as_deref(),
             git_hook: self.git_hook,
             words: &self.words,
             given: self.given.as_deref(),
@@ -230,17 +235,18 @@ impl Decision {
 /// its parent ([`LocalReason::DesktopUnderParent`]) or that a routable one does
 /// ([`LocalReason::RoutableUnderParent`]), and a gate inside a box run ([`Nested::BoxRun`]) says nothing. A
 /// run that dropped its `--no-build` before its decision names the words the caller wrote as `given`, which the repo's
-/// `.gate/local.toml` is matched against too ([`Inputs::given`]). With the route, what the decision learnt of the
+/// `.gate/local.toml` is matched against too ([`Inputs::given`]). A run nested under a `--local` gate names that gate's
+/// `--reason` as `local_parent` ([`Inputs::local_parent`]), and runs here saying it. With the route, what the decision learnt of the
 /// gate's place in its git worktree, and, for a routed run of a repo whose warm-up is set up, the hash of its warm-up
 /// file ([`consented_hash`]).
 pub(crate) fn route(
     request: &RunRequest,
     environment: &Environment,
-    (parent, given): (Nested, Option<&[String]>),
+    (parent, local_parent, given): (Nested, Option<String>, Option<&[String]>),
     (root, gate): (&ResolvedRoot, &ThisGate),
     console: &mut Console,
 ) -> Decided {
-    let mut decision = Decision::of(request, environment, parent, &root.path);
+    let mut decision = Decision::of(request, environment, parent, local_parent, &root.path);
     decision.given = given.map(<[String]>::to_vec);
     let mut machine = Machine::new(environment, &request.test_seams)
         .with_state(&decision)
@@ -611,7 +617,8 @@ fn consented_hash(remote: &RemoteRun, machine: &Machine<'_>) -> Option<String> {
 
 /// The queue line's `notRouted`. A run kept here for a reason it says writes that reason's token:
 ///
-/// - `--local`: a heavy or light gate its caller kept here with `--local` ([`LocalReason::LocalFlag`]);
+/// - `--local`: a heavy or light gate its caller kept here with `--local` ([`LocalReason::LocalFlag`]), or one nested
+///   under a `--local` gate ([`LocalReason::LocalParent`]), whose queue line's `reason` [`queue_reason`] gives;
 /// - `faster here`: a light gate its learned local run time proves faster here ([`LocalReason::FasterHere`]);
 /// - `outside path`: a matched command whose word names a path outside the worktree ([`LocalReason::Outside`]);
 /// - `another worktree`: one whose outside path lies in another git worktree ([`LocalReason::OtherWorktree`]);
@@ -639,7 +646,7 @@ fn consented_hash(remote: &RemoteRun, machine: &Machine<'_>) -> Option<String> {
 pub(crate) fn not_routed(route: &Route, sent: Option<&Sent>) -> Option<String> {
     let token = match route {
         Route::Local { reason: Some(reason) } => match reason {
-            LocalReason::LocalFlag => LOCAL_FLAG,
+            LocalReason::LocalFlag | LocalReason::LocalParent { .. } => LOCAL_FLAG,
             LocalReason::FasterHere { .. } => FASTER_HERE,
             // Ignored: said on every run's line; a machine-wide fault, not a reason of the run's shape.
             // DesktopUnderParent, RoutableUnderParent: a covered gate writes the `covered` line, never a queue line with
@@ -667,6 +674,22 @@ pub(crate) fn not_routed(route: &Route, sent: Option<&Sent>) -> Option<String> {
         _ => return None,
     };
     Some(token.to_owned())
+}
+
+/// The queue line's `reason` of a run sent by `route` whose own `--reason` is `own`: its own reason when it gave one,
+/// as its claim, lend marker and ticket say; else, for a run a `--local` gate around it keeps here
+/// ([`LocalReason::LocalParent`]), `parent: <that gate's reason>`, so it reads as a `--local` run; else none.
+pub(crate) fn queue_reason(route: &Route, own: Option<&str>) -> Option<String> {
+    match (own, route) {
+        (Some(own), _) => Some(own.to_owned()),
+        (
+            None,
+            Route::Local {
+                reason: Some(LocalReason::LocalParent { reason }),
+            },
+        ) => Some(format!("parent: {reason}")),
+        (None, _) => None,
+    }
 }
 
 /// The exclusions of the input globs a word's project input is matched against ([`Machine::uncovered`]): none, a
@@ -3061,8 +3084,8 @@ mod tests {
     use super::{
         CHANGE_DEADLINE, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, GATE_FILE_NOT_A_FILE, Machine, Origin, SIBLING_GIT_LINK, SIBLING_LINK,
         SIBLING_NOT_A_FOLDER, Sent, Source, balanced_line, change_error, change_limit, checkout_of, holds_existing_path, is_fixed_local,
-        is_share_target, judge_declarations, not_routed, nul_separated, parse_head, parse_place, read_declaration, read_siblings, same_folder,
-        sibling_folder, unsent_folder, worktree_of,
+        is_share_target, judge_declarations, not_routed, nul_separated, parse_head, parse_place, queue_reason, read_declaration, read_siblings,
+        same_folder, sibling_folder, unsent_folder, worktree_of,
     };
     use crate::remote::box_trees;
     use crate::remote::git;
@@ -4505,6 +4528,7 @@ mod tests {
             slot: gate_router::Slot::Heavy,
             parent: gate_router::Nested::None,
             local: false,
+            local_parent: None,
             git_hook: false,
             words: &words,
             given: None,
@@ -4959,6 +4983,7 @@ mod tests {
             ),
             (LocalReason::GitignoredUnsent { path: x(), why: x() }, "gitignored input"),
             (LocalReason::BuiltHere { project: x() }, "built here"),
+            (LocalReason::LocalParent { reason: x() }, "--local"),
             (LocalReason::DesktopUnderParent { pattern: x() }, NO_TOKEN),
             (LocalReason::RoutableUnderParent { pattern: x() }, NO_TOKEN),
         ];
@@ -4969,6 +4994,30 @@ mod tests {
             };
             assert_eq!(not_routed(&route, None).as_deref(), token, "{reason:?}");
             assert_eq!(not_routed(&route, Some(&sent(true))).as_deref(), token, "{reason:?}, matched");
+        }
+    }
+
+    #[test]
+    fn the_queue_reason_is_the_run_s_own_else_its_local_parent_s() {
+        let kept = Route::Local {
+            reason: Some(LocalReason::LocalParent {
+                reason: "freeze Godot".to_owned(),
+            }),
+        };
+        let flag = Route::Local {
+            reason: Some(LocalReason::LocalFlag),
+        };
+        let silent = Route::Local { reason: None };
+        let table: [(&Route, Option<&str>, Option<&str>); 6] = [
+            (&kept, None, Some("parent: freeze Godot")),
+            (&kept, Some("own reason"), Some("own reason")),
+            (&flag, Some("own reason"), Some("own reason")),
+            (&flag, None, None),
+            (&silent, Some("own reason"), Some("own reason")),
+            (&silent, None, None),
+        ];
+        for (route, own, reason) in table {
+            assert_eq!(queue_reason(route, own).as_deref(), reason, "{route:?} {own:?}");
         }
     }
 

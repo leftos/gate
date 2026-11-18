@@ -240,6 +240,10 @@ pub struct Inputs<'a> {
     pub parent: Nested,
     /// Whether `--local` was given.
     pub local: bool,
+    /// The `--reason` of the nearest `--local` gate this one runs under, through any gates between (`GATE_LOCAL_PARENT`),
+    /// once a live parent gate this gate runs inside bears it out; `None` under no `--local` ancestor. It keeps a run that
+    /// may route here ([`LocalReason::LocalParent`]).
+    pub local_parent: Option<&'a str>,
     /// Whether `GIT_INDEX_FILE` is set to a non-empty value: the gate runs inside a git hook.
     pub git_hook: bool,
     /// The command's words: as given, or as the gate runs them once it dropped a `--no-build` from them.
@@ -656,6 +660,9 @@ const NO_DESKTOP_BUILDER: &str = "no builder remote.json lists can run a desktop
 /// Why a pinned run on a covering parent's slot, or inside a box run, cannot route.
 const PIN_COVERED: &str = "a parent gate's slot covers this gate";
 
+/// Why a pinned run under a `--local` gate ([`Inputs::local_parent`]) cannot route.
+const PIN_LOCAL_PARENT: &str = "its parent gate runs --local";
+
 impl PinRefusal {
     /// The refusal of a run pinned to `host` that runs on a covering parent's slot or inside a box run.
     #[must_use]
@@ -710,6 +717,9 @@ impl PinRefusal {
 pub enum LocalReason {
     /// `--local` was given on a heavy or light gate.
     LocalFlag,
+    /// A heavy or light gate runs under a `--local` gate, through any gates between, whose `--reason` is `reason`
+    /// ([`Inputs::local_parent`]).
+    LocalParent { reason: String },
     /// A light gate's command is proven faster here ([`balance::faster_here`]): its learned local p50, `here_tenths`,
     /// is under the share of the expected finish, `there_tenths`, of `builder`, the builder the run would go to once the
     /// steer-offs chose it; both in whole tenths of a second ([`balance::tenths`]).
@@ -796,6 +806,7 @@ impl LocalReason {
     pub fn reason(&self) -> String {
         match self {
             Self::LocalFlag => "--local".to_owned(),
+            Self::LocalParent { reason } => format!("--local parent: {}", escaped(reason)),
             Self::FasterHere {
                 here_tenths,
                 builder,
@@ -1184,7 +1195,8 @@ fn absent_line(names: &[String]) -> Option<String> {
 }
 
 /// Where a gate's command runs. In order: only a heavy or light gate routes; a covering or lending parent keeps it here; `--local`
-/// keeps it here saying so; then the routing file is read, and no file keeps it here, an unusable one saying it was
+/// keeps it here saying so, and so does a `--local` gate it runs under ([`LocalReason::LocalParent`], with that gate's
+/// `--reason`); then the routing file is read, and no file keeps it here, an unusable one saying it was
 /// ignored; a git hook whose `hooks` names no repo, no non-empty word, or a first word whose file name without extension
 /// is `git` keep it here, and so does one that is `prek` unless it is a `prek run` naming its files; so does a folder in
 /// no git worktree, a repo the routing file does not list, a git hook whose repo its `hooks` does not name, and words
@@ -1627,7 +1639,8 @@ fn eligible(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Config, Here> {
 /// The routing file when the gate may route at all, read only after the slot, parent and `--local` checks: what a
 /// commit stage is judged under ([`commit_stage`]) before the rules of [`routable`]. A gate inside a box run stays here
 /// saying nothing, one a parent's slot covers stays here saying only what [`covered_here`] says, and one a light parent
-/// lends its slot stays here saying only what the desktop check ([`desktop_under_parent`]) says.
+/// lends its slot stays here saying only what the desktop check ([`desktop_under_parent`]) says. Any other gate under a
+/// `--local` gate ([`Inputs::local_parent`]), not given `--local` itself, stays here saying that gate's `--reason`.
 fn configured(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Config, Here> {
     if !routes_on(inputs.slot) {
         return Err(None);
@@ -1640,6 +1653,9 @@ fn configured(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Config, Here> {
     }
     if inputs.local {
         return Err(Some(LocalReason::LocalFlag));
+    }
+    if let Some(reason) = inputs.local_parent {
+        return Err(Some(LocalReason::LocalParent { reason: reason.to_owned() }));
     }
     facts
         .config()
@@ -3163,13 +3179,15 @@ fn pinned_builder(inputs: &Inputs<'_>, host: &str, facts: &dyn Facts) -> Result<
     Ok((config, builder))
 }
 
-/// Whether a run pinned to `host` may route at all: a heavy or light gate on no covering parent's slot, without
-/// `--local`.
+/// Whether a run pinned to `host` may route at all: a heavy or light gate on no covering parent's slot, under no
+/// `--local` gate ([`Inputs::local_parent`]), without `--local`.
 fn pin_eligible(inputs: &Inputs<'_>, host: &str) -> Result<(), PinRefusal> {
     let why = if !routes_on(inputs.slot) {
         format!("only a heavy or light run routes, and this one is --slot {}", slot_word(inputs.slot))
     } else if inputs.parent != Nested::None {
         PIN_COVERED.to_owned()
+    } else if inputs.local_parent.is_some() {
+        PIN_LOCAL_PARENT.to_owned()
     } else if inputs.local {
         "--local keeps it here".to_owned()
     } else {

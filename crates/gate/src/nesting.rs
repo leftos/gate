@@ -322,6 +322,25 @@ impl Nesting {
         (self.covering().is_some() && self.under_commit().is_none()) || matches!(self, Nesting::InBox)
     }
 
+    /// Whether the live parent gate this gate runs under was judged bound to it: one whose slot covers the gate, does not
+    /// cover it, or that holds no slot ([`Nesting::Beside`]), its binding judged ([`Parent::unjudged`] is `None`) and not
+    /// a stand-in found once the marker's gate ended ([`Parent::stand_in`]). Only such a parent bears out a `--local`
+    /// gate's reason in the environment ([`Nesting::local_parent`]).
+    pub(crate) fn has_bound_parent(&self) -> bool {
+        match self {
+            Nesting::Covered(parent) | Nesting::Under(parent) | Nesting::Beside(parent) => parent.unjudged.is_none() && !parent.stand_in,
+            Nesting::Own | Nesting::Malformed(_) | Nesting::Ended { .. } | Nesting::Unbound { .. } | Nesting::Refused(_) | Nesting::InBox => false,
+        }
+    }
+
+    /// The `--reason` of the nearest `--local` gate this one runs under, from `GATE_LOCAL_PARENT` (`variable`), honoured
+    /// only under a bound parent gate ([`Nesting::has_bound_parent`]): a value left in a shell with no such parent, or an
+    /// empty one, is ignored. A value that is not Unicode is read lossily.
+    pub(crate) fn local_parent(&self, variable: Option<&OsStr>) -> Option<String> {
+        let value = variable.filter(|value| !value.is_empty() && self.has_bound_parent())?;
+        Some(value.to_string_lossy().into_owned())
+    }
+
     /// What holds this gate as routing is told it ([`gate_router::Nested`]): a box run first, then a parent's slot it
     /// routes as covered by ([`Nesting::routes_as_covered`]), else nothing.
     pub(crate) fn nested(&self) -> gate_router::Nested {
@@ -749,6 +768,63 @@ mod tests {
             stand_in: false,
             commit: false,
         }
+    }
+
+    #[test]
+    fn a_local_parent_s_reason_is_honoured_only_under_a_bound_live_parent() {
+        let reason = Some(OsStr::new("freeze Godot"));
+        let honoured = |nesting: Nesting| nesting.local_parent(reason);
+        let said = Some("freeze Godot".to_owned());
+        assert_eq!(honoured(Nesting::Covered(parent(Slot::Heavy))), said, "covered");
+        assert_eq!(honoured(Nesting::Under(parent(Slot::Light))), said, "under");
+        assert_eq!(honoured(Nesting::Beside(parent(Slot::None))), said, "beside");
+        let unjudged = Parent {
+            unjudged: Some("the query failed".to_owned()),
+            ..parent(Slot::Heavy)
+        };
+        let stand_in = Parent {
+            stand_in: true,
+            ..parent(Slot::Heavy)
+        };
+        let ignored = [
+            ("unjudged", Nesting::Covered(unjudged.clone())),
+            (
+                "unjudged under",
+                Nesting::Under(Parent {
+                    held: Slot::Light,
+                    ..unjudged
+                }),
+            ),
+            ("stand-in", Nesting::Covered(stand_in.clone())),
+            (
+                "stand-in under",
+                Nesting::Under(Parent {
+                    held: Slot::Light,
+                    ..stand_in
+                }),
+            ),
+            ("own", Nesting::Own),
+            (
+                "ended",
+                Nesting::Ended {
+                    marker: marker(Slot::Heavy),
+                    pid: PID,
+                },
+            ),
+            (
+                "unbound",
+                Nesting::Unbound {
+                    marker: marker(Slot::Heavy),
+                    pid: PID,
+                },
+            ),
+            ("malformed", Nesting::Malformed("x".to_owned())),
+        ];
+        for (name, nesting) in ignored {
+            assert_eq!(nesting.local_parent(reason), None, "{name}");
+        }
+        assert_eq!(Nesting::Covered(parent(Slot::Heavy)).local_parent(Some(OsStr::new(""))), None, "empty");
+        assert_eq!(Nesting::Covered(parent(Slot::Heavy)).local_parent(None), None, "unset");
     }
 
     /// The parent [`parent`] gives for `held`, as the commit run whose hooks this gate runs in.
@@ -1303,6 +1379,7 @@ mod tests {
             slot_held: marker.map(OsString::from),
             box_job: job.map(OsString::from),
             commit_slot: None,
+            local_parent: None,
             stage_blocking: Vec::new(),
             handed_over: None,
         }

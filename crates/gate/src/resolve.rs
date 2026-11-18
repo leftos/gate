@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use gate_state::{StateRoot, default_root};
 
-use crate::environment::{BOX_JOB_VARIABLE, COMMIT_SLOT_VARIABLE, SLOT_HELD_VARIABLE};
+use crate::environment::{BOX_JOB_VARIABLE, COMMIT_SLOT_VARIABLE, LOCAL_PARENT_VARIABLE, SLOT_HELD_VARIABLE};
 
 /// The variable a stale gate starts the installed gate it hands its run to with, set to its own build.
 pub(crate) const HANDED_OVER_VARIABLE: &str = "GATE_HANDED_OVER";
@@ -25,6 +25,9 @@ pub(crate) struct Environment {
     pub box_job: Option<OsString>,
     /// `GATE_COMMIT_SLOT`, the slot marker of the commit run this gate may run in the hooks of, if any.
     pub commit_slot: Option<OsString>,
+    /// `GATE_LOCAL_PARENT`, the `--reason` of the nearest `--local` gate this one may run under, if any: honoured only
+    /// with a live parent gate ([`crate::nesting::Nesting::local_parent`]).
+    pub local_parent: Option<OsString>,
     /// The variables among those that keep a commit's stage here ([`crate::commit::stage::BLOCKING_VARIABLES`]) that
     /// the gate's environment sets, to any value.
     pub stage_blocking: Vec<&'static str>,
@@ -42,6 +45,7 @@ impl Environment {
             slot_held: std::env::var_os(SLOT_HELD_VARIABLE),
             box_job: std::env::var_os(BOX_JOB_VARIABLE),
             commit_slot: std::env::var_os(COMMIT_SLOT_VARIABLE),
+            local_parent: std::env::var_os(LOCAL_PARENT_VARIABLE),
             stage_blocking: crate::commit::stage::BLOCKING_VARIABLES
                 .into_iter()
                 .filter(|name| std::env::var_os(name).is_some())
@@ -136,6 +140,7 @@ mod tests {
             slot_held: None,
             box_job: None,
             commit_slot: None,
+            local_parent: None,
             stage_blocking: Vec::new(),
             handed_over: None,
         };
@@ -146,6 +151,7 @@ mod tests {
             slot_held: None,
             box_job: None,
             commit_slot: None,
+            local_parent: None,
             stage_blocking: Vec::new(),
             handed_over: None,
         };
