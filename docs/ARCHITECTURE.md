@@ -536,6 +536,10 @@ It makes no OS calls, builds and tests on any OS, and must never depend on `gate
 
   `dotnet_projects.rs` is the reader behind `Facts::windows_only_tests`, which `route.rs` implements: it judges the project or solution a `dotnet test` names, else the first on-disk word, else the gate's folder, as Windows-only, and reads a solution's members inside the worktree; what it cannot read counts as Windows-only, with the `kept off the macOS builder` log note.
 
+  It is also the reader behind `Facts::tested_closure_clear`, for a command whose first word is the dotnet program and whose `dotnet test` names one project. It reads the `ProjectReference` closure in full and, when no project folder in it overlaps a `.gate/windows.toml` entry (`gate_router::windows::overlaps_folder`), the macOS pick skips the change read.
+
+  Anything unreadable is not clear, nor is an `<Import`, a build file above a project naming `ProjectReference`, or an item `Include` that holds `$(` or `%(` or reaches a declared folder; an entry naming an absent sibling matches nothing.
+
   `carried.rs` makes the siblings a routed call carries from the route's decision alone, re-checking each one's name and root as text and reading no folder; a failure falls the run back before the slot hold (`run.rs`).
 
   `held.rs` holds and checks a sibling pair's folders: the root's parent opened once, the root and each sibling opened beneath it without following a link and without delete sharing, then id, final path, case, reparse point, `.git` and network-volume checks, the git folder and common folder git names for each repository (`hold_git`), and a recheck that opens each path as git would.

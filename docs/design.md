@@ -2678,6 +2678,20 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   **Windows paths.** A `macos` pick, whatever the command, of a repo whose `.gate/windows.toml` declares at least one path goes the same way (the next builder that is no `macos` one, else `host`, else here) when the change touches a declared path or cannot be told to; a later `macos` candidate is skipped silently. Git runs only for such a pick, never for another builder or a repo with no file or no entry.
 
+  A readable `dotnet test` that names one project is asked first whether that project's `ProjectReference` closure is clear, and when it is the pick stays on the Mac with git not asked for the change and no kept-off line logged. The tested project is a word after `test` ending `.csproj`, `.fsproj` or `.vbproj` that does not start with `-`, the value of `--project=` or `--project:`, or the folder right after `test` holding exactly one project file and no solution.
+
+  An option's value or a later positional word is never read as the project, nor is a solution or the gate's folder. The rule needs the command's first word to be the dotnet program itself: a wrapping script such as `pwsh <script> -- dotnet test ...` keeps the rule above. With no tested project no file is read.
+
+  The closure is clear when it is read in full inside the worktree and its present siblings and no project folder in it overlaps a declared entry. An entry's literal prefix, before its first wildcard or backtick, overlaps a folder when either is a path prefix of the other, letter case ignored; a file declared in a folder above the project (such as `tests/Directory.Build.props` or a root `Directory.Packages.props`) overlaps it too.
+
+  A sibling's project is matched against that sibling's entries only, and an entry naming an absent sibling matches nothing, as for the change read.
+
+  The closure is not clear, and the rule above applies, when a reference is unreadable or outside the worktree and its siblings, the closure holds more than 256 projects, or the `.gate/windows.toml` has a problem. It is not clear either when a closure project holds an `<Import`, or when a `Directory.Build.props` or `.targets` above any closure project, up to its own tree's root, names `ProjectReference`.
+
+  Any other item `Include` part (`Compile`, `Content`, `None` and so on; `PackageReference`, `PackageVersion`, `Using` and `InternalsVisibleTo` are names and skipped) in a closure project or such a build file also makes it not clear when it holds `$(` or `%(`, lies outside every tree root, or lies outside the project's folder in a folder a declared entry overlaps.
+
+  On a clear closure the `.gate/windows.toml` source lines (where it was read from, an unusable declarations folder) are logged once and git is not asked.
+
   The log says `gate: kept off the macOS builder: the change touches <path> (<file>)`, the first changed path a declared path matches, or `gate: kept off the macOS builder: cannot tell whether the change touches <file>'s paths: <why>`, both escaped, `<file>` being `.gate/windows.toml` or the path of the declarations-folder copy that was read.
 
   `--builder` naming a `macos` builder for such a run is refused on stderr, exit 2, with `gate: --builder <host> cannot route this run: ` and the same words as the note.

@@ -371,7 +371,19 @@ A project of a declared sibling (present or not) is written `../<sibling>/<path>
 
 No consent in `remote.json` is needed, since the file only keeps runs off the Mac.
 
-A macOS pick (whatever the command) of a change that touches a declared path, or whose change cannot be read, goes to the next builder that is no macOS one, else `host`, else runs here, saying `gate: kept off the macOS builder: the change touches <path> (<file>)` or `gate: kept off the macOS builder: cannot tell whether the change touches <file>'s paths: <why>`, `<file>` being `.gate/windows.toml` or the path of the declarations-folder copy that was read.
+A macOS pick (whatever the command, except a readable `dotnet test` of one named project whose project references all lie clear of the declared paths, see below) of a change that touches a declared path, or whose change cannot be read, goes to the next builder that is no macOS one, else `host`, else runs here.
+
+It says `gate: kept off the macOS builder: the change touches <path> (<file>)` or `gate: kept off the macOS builder: cannot tell whether the change touches <file>'s paths: <why>`, `<file>` being `.gate/windows.toml` or the path of the declarations-folder copy that was read.
+
+A `dotnet test` that names one project stays on the Mac with no change read and no kept-off line when every project in its `ProjectReference` closure has a folder clear of the declared paths. The project is a word after `test` ending `.csproj`, `.fsproj` or `.vbproj` that does not start with `-`, the value of `--project=` or `--project:`, or the folder right after `test` holding exactly one project file and no solution; an option's value or a later positional word is never read as the project.
+
+The command's first word must be the dotnet program itself: a wrapping script such as `pwsh <script> -- dotnet test ...` keeps the rule above. With no tested project no file is read, and on a clear closure the `.gate/windows.toml` source lines (where it was read from, an unusable declarations folder) are logged once.
+
+A declared entry's literal prefix (before its first wildcard or backtick) overlaps a folder when either is a path prefix of the other, letter case ignored, and a file declared in a folder above the project (such as `tests/Directory.Build.props` or a root `Directory.Packages.props`) overlaps it too. An entry naming an absent sibling matches nothing and does not make the closure not clear.
+
+A closure that is not clear takes the rule above: a reference that cannot be read or lies outside the worktree and its siblings, more than 256 projects, a `.gate/windows.toml` with a problem, or a closure project holding an `<Import`. A `Directory.Build.props` or `.targets` above any closure project that names `ProjectReference` does the same.
+
+So does any other item `Include` part (`Compile`, `Content`, `None` and so on; `PackageReference`, `PackageVersion`, `Using` and `InternalsVisibleTo` are names and skipped) in a closure project or such a build file that holds `$(` or `%(`, lies outside every tree root, or lies outside the project's folder in a folder a declared entry overlaps.
 
 A `--builder` pin to the Mac is refused with the same words.
 

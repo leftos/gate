@@ -92,6 +92,7 @@ pub fn light(words: &[String]) -> Inputs<'_> {
     }
 }
 
+#[expect(clippy::struct_excessive_bools, reason = "each bool is one fact a case sets, read by one method")]
 pub struct FakeFacts {
     pub config: Result<Option<Config>, ConfigProblem>,
     pub place: Result<Option<Place>, String>,
@@ -149,6 +150,11 @@ pub struct FakeFacts {
     pub windows_change_asked: Cell<u32>,
     /// The names of the present siblings and of the absent ones each time that was asked, in order.
     pub windows_change_named: RefCell<Vec<(Vec<String>, Vec<String>)>>,
+    /// Whether the one tested project's reference closure is clear of `.gate/windows.toml`'s paths; `false` unless a
+    /// case says otherwise.
+    pub tested_closure_clear: bool,
+    /// How many times that was asked, kept apart from [`FakeFacts::asked`].
+    pub tested_closure_asked: Cell<u32>,
     /// The paths, `/`-separated from the root, that name a gitignored project input the snapshot leaves out, each with
     /// the files that carry it.
     pub gitignored: Vec<GitignoredInput>,
@@ -223,6 +229,8 @@ impl FakeFacts {
             windows_change: WindowsChange::Untouched,
             windows_change_asked: Cell::new(0),
             windows_change_named: RefCell::new(Vec::new()),
+            tested_closure_clear: false,
+            tested_closure_asked: Cell::new(0),
             gitignored: Vec::new(),
             sibling_gitignored: Vec::new(),
             gitignored_asked: RefCell::new(Vec::new()),
@@ -339,6 +347,12 @@ impl Facts for FakeFacts {
         let present = siblings.iter().map(|sibling| sibling.name.clone()).collect();
         self.windows_change_named.borrow_mut().push((present, absent.to_vec()));
         self.windows_change.clone()
+    }
+
+    /// What [`FakeFacts::tested_closure_clear`] says.
+    fn tested_closure_clear(&self, _place: &Place, _words: &[String], _siblings: &[SiblingRoot], _absent: &[String]) -> bool {
+        self.tested_closure_asked.set(self.tested_closure_asked.get() + 1);
+        self.tested_closure_clear
     }
 
     /// The box's layout under [`FakeFacts::builder_root`]: the work folder `{root}\work\{key}` itself with no sibling,

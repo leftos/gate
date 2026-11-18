@@ -423,9 +423,21 @@ pub trait Facts {
     /// `siblings` are the present siblings, whose change git reads; `absent` are the declared names with nothing at
     /// their name beside the root, which an entry may name and whose paths are then untouched. `siblings_problem` is how the lines
     /// name the siblings file when it has a problem, and `siblings` and `absent` then empty. Asked only of a macOS pick,
-    /// whatever the command, which a touched or unknown change sends on to the next builder that is no macOS one; the
-    /// lines name the file as [`Facts::declaration_said`] says.
+    /// which a touched or unknown change sends on to the next builder that is no macOS one, unless the command is a
+    /// readable `dotnet test` of one project whose reference closure is clear ([`Facts::tested_closure_clear`]), which
+    /// is asked first and then leaves this unasked; the lines name the file as [`Facts::declaration_said`] says.
     fn windows_change(&self, place: &Place, siblings: &[SiblingRoot], absent: &[String], siblings_problem: Option<&str>) -> WindowsChange;
+
+    /// Whether the `dotnet test` command `words`, read against the gate's folder at `place`, names exactly one test
+    /// project (a project file, or a folder argument holding one and no solution; never a solution nor the gate's
+    /// folder) whose `ProjectReference` closure, read in full within the worktree root and its present `siblings`,
+    /// holds no project whose folder a path of the worktree's `.gate/windows.toml` could match; `true` too when that
+    /// file is missing or declares no path, `false` whenever anything cannot be read. The file is read as
+    /// [`Facts::windows_change`] reads it, an entry naming one of the `absent` siblings matching nothing. Asked only of
+    /// a macOS pick of a readable `dotnet test` whose first word is the dotnet program and whose declared siblings
+    /// pass their checks, before [`Facts::windows_change`]: a `true` keeps the pick on the Mac with no change read, a
+    /// `false` leaves the change to decide.
+    fn tested_closure_clear(&self, place: &Place, words: &[String], siblings: &[SiblingRoot], absent: &[String]) -> bool;
 
     /// Whether a file of exactly this name is in the gate's folder.
     fn file_in_folder(&self, name: &str) -> bool;
@@ -3529,19 +3541,38 @@ fn macos_windows_only(builder: &Builder, place: &Place, words: &[String], facts:
 
 /// Why a pick of `builder` for the opened worktree's run is kept off it for the change: a macOS builder and a change the
 /// facts say touches the paths of the worktree's `.gate/windows.toml`, or cannot be told to
-/// ([`Facts::windows_change`]), whatever the command; `None` for any other builder, which reads nothing, and for a
-/// worktree whose declared siblings fail their checks ([`checked_siblings`]), which steers nothing: settling the run
-/// checks them again and keeps it here with that reason ([`settle`]).
-fn macos_windows_change(config: &Config, builder: &Builder, opened: &Opened, facts: &dyn Facts) -> Option<String> {
+/// ([`Facts::windows_change`]), unless the command `words` is a readable `dotnet test` of one project whose reference
+/// closure is clear ([`tested_closure_clear`]), which is asked first and, when clear, reads no change; `None` for any
+/// other builder, which reads nothing, and for a worktree whose declared siblings fail their checks
+/// ([`checked_siblings`]), which steers nothing: settling the run checks them again and keeps it here with that reason
+/// ([`settle`]).
+fn macos_windows_change(config: &Config, builder: &Builder, opened: &Opened, words: &[String], facts: &dyn Facts) -> Option<String> {
     if builder.os != BuilderOs::Macos {
         return None;
     }
     checked_siblings(config, opened, facts).ok()?;
+    if tested_closure_clear(opened, words, facts) {
+        return None;
+    }
     let siblings_problem = opened.problem.as_ref().map(|_| opened.file.as_str());
-    let roots: Vec<SiblingRoot> = opened.siblings.iter().map(|sibling| sibling.root.clone()).collect();
     facts
-        .windows_change(&opened.place, &roots, &opened.absent, siblings_problem)
+        .windows_change(&opened.place, &opened_sibling_roots(opened), &opened.absent, siblings_problem)
         .reason(&facts.declaration_said(&opened.place, WINDOWS_NAME))
+}
+
+/// The roots of the opened worktree's present siblings, in declared order.
+fn opened_sibling_roots(opened: &Opened) -> Vec<SiblingRoot> {
+    opened.siblings.iter().map(|sibling| sibling.root.clone()).collect()
+}
+
+/// Whether the command `words` of the opened worktree is a readable `dotnet test` ([`dotnet_test`]) whose first word
+/// is the dotnet program itself, no wrapping script's, and whose one tested project's reference closure the facts say
+/// is clear of the Windows paths ([`Facts::tested_closure_clear`]); `false`, asking nothing, for any other command.
+fn tested_closure_clear(opened: &Opened, words: &[String], facts: &dyn Facts) -> bool {
+    let unwrapped = first_word(words).is_some_and(|(_, first)| names_program(first, DOTNET));
+    unwrapped
+        && matches!(dotnet_test(words), DotnetTest::Readable)
+        && facts.tested_closure_clear(&opened.place, words, &opened_sibling_roots(opened), &opened.absent)
 }
 
 /// The opened worktree's present siblings put through the checks a routed run's siblings pass ([`check_siblings`]:
@@ -3571,9 +3602,10 @@ fn here_why(here: Here) -> String {
 
 /// The first rule that keeps a pick of `builder` for the opened worktree's command `words` off it, as a macOS builder:
 /// a declared desktop pattern the command matches ([`macos_desktop`]), a Windows-only test ([`macos_windows_only`]), the
-/// change ([`macos_windows_change`]) or a last build that ran here ([`macos_built_here`]), each asked only when no
-/// earlier one keeps it off; `None` when none does, or
-/// for any other builder. `read` is what the pick read of the desktop file ([`macos_desktop`]). The one list of these
+/// change ([`macos_windows_change`]), which a readable `dotnet test` whose one project's reference closure is clear
+/// lets through without reading the change ([`tested_closure_clear`]), or a last build that ran here
+/// ([`macos_built_here`]), each asked only when no earlier one keeps it off; `None` when none does, or for any other
+/// builder. `read` is what the pick read of the desktop file ([`macos_desktop`]). The one list of these
 /// rules that the first pick ([`steer_off_macos`]) and a later or pinned builder ([`kept_run`]) both follow.
 fn macos_kept_off(
     config: &Config,
@@ -3586,7 +3618,7 @@ fn macos_kept_off(
         Some(Unkept::Desktop)
     } else if macos_windows_only(builder, &opened.place, words, facts) {
         Some(Unkept::WindowsOnly)
-    } else if let Some(reason) = macos_windows_change(config, builder, opened, facts) {
+    } else if let Some(reason) = macos_windows_change(config, builder, opened, words, facts) {
         Some(Unkept::WindowsChange(reason))
     } else {
         macos_built_here(builder, opened, facts).map(Unkept::BuiltHere)

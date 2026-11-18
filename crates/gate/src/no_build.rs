@@ -39,7 +39,7 @@ const FOLDER_SOLUTIONS: [&str; 2] = [".sln", ".slnx"];
 /// The most of a solution or a worktree's build file read; a larger one cannot be told.
 pub(crate) const FILE_CAP: usize = 1 << 20;
 /// The files at a worktree's root whose `MSBuild` properties apply to every project in it.
-const BUILD_FILES: [&str; 2] = ["Directory.Build.props", "Directory.Build.targets"];
+pub(crate) const BUILD_FILES: [&str; 2] = ["Directory.Build.props", "Directory.Build.targets"];
 /// The `MSBuild` properties that can move a project's `project.assets.json` out of its `obj` folder.
 const MOVING_PROPERTIES: [&str; 4] = [
     "UseArtifactsOutput",
@@ -563,7 +563,7 @@ pub(crate) fn named_without_assets(target: &DotnetTarget, root: &Path) -> Result
 }
 
 /// `path` with each `.` left out and each `..` taking the part before it away, as the system reads a full path.
-fn lexical(path: &Path) -> PathBuf {
+pub(crate) fn lexical(path: &Path) -> PathBuf {
     let mut kept = PathBuf::new();
     for part in path.components() {
         match part {

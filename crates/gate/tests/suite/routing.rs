@@ -5025,6 +5025,90 @@ fn a_change_outside_the_windows_paths_stays_on_the_mac() {
     assert!(!log.contains("kept off the macOS builder"), "{log}");
 }
 
+/// A [`windows_paths_case`] declaring `tools/Hook/*` whose routing file lets host and the Mac run its `dotnet test`
+/// commands, its `tests/Sim/Sim.csproj` referencing `reference` (`/`-separated below the root) and committed with the
+/// referenced project and `tools/Hook/a.cs`, a change under the declared path.
+fn named_test_case(name: &str, reference: &str) -> Case {
+    let case = windows_paths_case(name, "['tools/Hook/*']", true);
+    let routing = json!({
+        "host": HOST,
+        "repos": { repo(&case): ["dotnet test *"] },
+        "builders": [{ "host": MAC, "os": "macos", "root": "/m", "repos": { repo(&case): ["dotnet test *"] } }],
+    });
+    write_remote_json(&case, &routing.to_string());
+    let folder = case.folder();
+    let project = |path: &str, text: &str| {
+        let file = folder.join(path);
+        fs::create_dir_all(file.parent().expect("a project has a folder")).expect("the project folder can be made");
+        fs::write(file, text).expect("the project can be written");
+    };
+    let sim = format!(
+        "<Project><ItemGroup><ProjectReference Include=\"..\\..\\{}\" /></ItemGroup></Project>\n",
+        reference.replace('/', "\\")
+    );
+    project("tests/Sim/Sim.csproj", &sim);
+    project(reference, "<Project />\n");
+    write_below(&folder, "tools/Hook/a.cs");
+    commit_all(&case, &folder, "hook");
+    case
+}
+
+/// Runs `dotnet test tests/Sim` of the case routed through a scripted client that records its call; the host the call
+/// went to and the run's log.
+fn named_test_run(case: &Case) -> (Value, String) {
+    let call = case.folder().join("call.json");
+    let record = format!("record {}", shown(&call));
+    let steps = shown(&stub(case, &[&record, "status 0"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &["dotnet", "test", "tests/Sim"])));
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    (recorded(&call)["host"].clone(), log_texts(&case.folder().join("out.log")))
+}
+
+/// Takes the case's `.gate/windows.toml` out of its worktree, the removal committed, and names `folder` as its repo's
+/// declarations folder.
+fn declare_in(case: &Case, folder: &Path) {
+    fs::remove_file(case.folder().join(".gate").join("windows.toml")).expect("the worktree's declaration can be removed");
+    commit_all(case, &case.folder(), "declared elsewhere");
+    name_declarations(case, folder);
+}
+
+#[test]
+fn a_named_dotnet_test_whose_references_miss_the_windows_paths_stays_on_the_mac() {
+    let case = named_test_case("routing-windows-paths-named-clear", "src/Core/Core.csproj");
+    let folder = declarations_holding(&case, &[("windows.toml", "paths = ['tools/Hook/*']\n")]);
+    declare_in(&case, &folder);
+
+    let (host, log) = named_test_run(&case);
+
+    assert_eq!(host, MAC, "{log}");
+    assert!(!log.contains("kept off the macOS builder"), "{log}");
+    let read = format!("gate: .gate/windows.toml read from {}", folder.join("windows.toml").display());
+    assert!(has_line_once(&log, &read), "the source is said once: {read}: {log}");
+}
+
+#[test]
+fn a_named_dotnet_test_with_a_clear_closure_logs_an_unusable_declarations_folder_once() {
+    let case = named_test_case("routing-windows-paths-named-unusable", "src/Core/Core.csproj");
+    let missing = case.local_app_data().join("no-such-folder");
+    declare_in(&case, &missing);
+
+    let (host, log) = named_test_run(&case);
+
+    assert_eq!(host, MAC, "no windows.toml is read, so the closure is clear: {log}");
+    let why = format!("gate: declarations for {} not read: '{}' does not exist", repo(&case), missing.display());
+    assert!(has_line_once(&log, &why), "said once: {why}: {log}");
+}
+
+#[test]
+fn a_named_dotnet_test_referencing_a_windows_path_goes_past_the_mac() {
+    let case = named_test_case("routing-windows-paths-named-touching", "tools/Hook/Hook.csproj");
+
+    let (host, log) = named_test_run(&case);
+
+    assert_eq!(host, HOST, "{log}");
+    assert!(has_line(&log, &touched_note("tools/Hook/Hook.csproj")), "git lists it first: {log}");
+}
+
 #[test]
 fn a_checkout_with_no_origin_ref_goes_past_the_mac_to_host_saying_it_cannot_tell() {
     let case = windows_paths_case("routing-windows-paths-no-origin", "['tools/Hook/*']", false);

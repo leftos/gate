@@ -6233,6 +6233,94 @@ fn a_macos_pick_of_a_change_touching_the_windows_paths_or_not_known_to_goes_on_t
     }
 }
 
+/// The gate's facts of [`windows_change_facts`] whose one tested project's reference closure is `clear`.
+fn closure_facts(builders: &str, change: WindowsChange, clear: bool) -> FakeFacts {
+    FakeFacts {
+        tested_closure_clear: clear,
+        ..windows_change_facts(r#"{"other": ["*"]}"#, builders, change)
+    }
+}
+
+/// The measured `dotnet test` of one named test project.
+const SIM_TEST: [&str; 5] = ["dotnet", "test", "tests/Yaat.Sim.Tests", "-c", "Release"];
+
+#[test]
+fn a_named_single_project_dotnet_test_with_a_clear_closure_stays_on_the_mac() {
+    let facts = closure_facts(MAC_THEN_WINDOWS_DOTNET, touched(), true);
+    let run = routed(decide(&heavy(&words(&SIM_TEST)), &facts));
+    assert_eq!(run.builder.alias, "mac-1", "the clear closure keeps the test on the Mac");
+    assert_eq!(facts.windows_change_asked.get(), 0, "no change is read once the closure is clear");
+    assert_eq!(facts.tested_closure_asked.get(), 1, "the closure is read once");
+}
+
+#[test]
+fn a_named_dotnet_test_whose_closure_is_not_clear_goes_past_the_mac() {
+    let facts = closure_facts(MAC_THEN_WINDOWS_DOTNET, touched(), false);
+    let run = routed(decide(&heavy(&words(&SIM_TEST)), &facts));
+    assert_eq!(run.builder.alias, "win-2", "the closure is not clear, so the test leaves the Mac");
+    assert_eq!(facts.tested_closure_asked.get(), 1);
+    assert_eq!(facts.windows_change_asked.get(), 1, "the change decides");
+
+    let facts = closure_facts(MAC_THEN_WINDOWS_DOTNET, touched(), false);
+    assert_eq!(
+        refused(decide(&pinned_to(&words(&SIM_TEST), "mac-1"), &facts)).line(),
+        "gate: --builder mac-1 cannot route this run: the change touches tools/Hook/a.cs (.gate/windows.toml)",
+        "the existing kept-off reason"
+    );
+}
+
+#[test]
+fn a_dotnet_test_with_a_clear_closure_and_an_unknown_change_stays_on_the_mac() {
+    let facts = closure_facts(MAC_THEN_WINDOWS_DOTNET, unknown(), true);
+    let run = routed(decide(&heavy(&words(&SIM_TEST)), &facts));
+    assert_eq!(run.builder.alias, "mac-1");
+    assert_eq!(facts.tested_closure_asked.get(), 1);
+    assert_eq!(facts.windows_change_asked.get(), 0, "no change is read");
+}
+
+#[test]
+fn a_script_with_a_clear_closure_fact_still_goes_past_the_mac() {
+    let builders = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["pwsh *"]}},
+        {"host": "win-2", "os": "windows", "repos": {"yaat": ["pwsh *"]}}]"#;
+    let facts = closure_facts(builders, touched(), true);
+    let run = routed(decide(&heavy(&words(&["pwsh", "tools/test-all.ps1"])), &facts));
+    assert_eq!(run.builder.alias, "win-2", "a script is no dotnet test");
+    assert_eq!(facts.windows_change_asked.get(), 1);
+    assert_eq!(facts.tested_closure_asked.get(), 0, "the closure is never asked of a script");
+}
+
+#[test]
+fn a_wrapped_dotnet_test_with_a_clear_closure_still_goes_past_the_mac() {
+    let builders = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["pwsh *"]}},
+        {"host": "win-2", "os": "windows", "repos": {"yaat": ["pwsh *"]}}]"#;
+    let facts = closure_facts(builders, touched(), true);
+    let command = words(&["pwsh", "tools/run.ps1", "--", "dotnet", "test", "tests/Yaat.Sim.Tests"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "win-2", "a script's dotnet test keeps today's rule");
+    assert_eq!(facts.windows_change_asked.get(), 1);
+    assert_eq!(facts.tested_closure_asked.get(), 0, "the closure is never asked of a wrapped dotnet test");
+}
+
+#[test]
+fn a_windows_only_test_project_is_kept_off_whatever_its_closure() {
+    let facts = FakeFacts {
+        windows_only: true,
+        ..closure_facts(MAC_THEN_WINDOWS_DOTNET, touched(), true)
+    };
+    let run = routed(decide(&heavy(&words(&SIM_TEST)), &facts));
+    assert_eq!(run.builder.alias, "win-2", "the Windows-only test leaves the Mac");
+    assert_eq!(facts.tested_closure_asked.get(), 0, "the Windows-only rule comes first");
+
+    let facts = FakeFacts {
+        windows_only: true,
+        ..closure_facts(MAC_THEN_WINDOWS_DOTNET, touched(), true)
+    };
+    assert_eq!(
+        refused(decide(&pinned_to(&words(&SIM_TEST), "mac-1"), &facts)).line(),
+        "gate: --builder mac-1 cannot route this run: it may test a Windows-only project, which a macOS builder cannot run"
+    );
+}
+
 #[test]
 fn a_macos_pick_of_a_change_touching_the_windows_paths_goes_to_host_else_stays_here() {
     let facts = windows_change_facts(r#"{"yaat": ["dotnet *"]}"#, MAC_DOTNET, touched());

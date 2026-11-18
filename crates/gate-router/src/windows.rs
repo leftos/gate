@@ -108,6 +108,38 @@ pub fn sibling_path(name: &str, path: &str) -> String {
     format!("../{name}/{path}")
 }
 
+/// Whether an entry of `patterns` that applies to the tree of `sibling` ([`entries_for`]: the worktree's own for
+/// `None`) could match a path inside the folder `folder` of that tree (`/`-separated from the tree's root, empty at the
+/// root): the entry's literal prefix ([`literal_prefix`]), its `../{name}/` left out for a sibling, starts with the
+/// folder's path and `/`, or the folder's path and `/` starts with it; or the prefix's folder, its text before its last
+/// `/` (empty with no `/`), is empty, is the folder or holds it (a file declared in a folder above, which the build
+/// may import); letter case ignored. A folder at the root overlaps every entry of its tree.
+#[must_use]
+pub fn overlaps_folder(patterns: &[Pattern], sibling: Option<&str>, folder: &str) -> bool {
+    let folder = folder.replace('\\', "/").trim_matches('/').to_lowercase();
+    let inside = format!("{folder}/");
+    entries_for(patterns, sibling).iter().any(|entry| {
+        let text = entry.as_str();
+        let text = sibling
+            .and_then(|name| text.strip_prefix("../")?.strip_prefix(name)?.strip_prefix('/'))
+            .unwrap_or(text);
+        let literal = literal_prefix(text).replace('\\', "/").to_lowercase();
+        let above = literal.rsplit_once('/').map_or("", |(above, _)| above);
+        folder.is_empty()
+            || literal.starts_with(&inside)
+            || inside.starts_with(&literal)
+            || above.is_empty()
+            || folder == above
+            || folder.starts_with(&format!("{above}/"))
+    })
+}
+
+/// The text of a `-like` pattern before its first wildcard or escape (`*`, `?`, `[` or `` ` ``): every path it can
+/// match starts with it.
+fn literal_prefix(text: &str) -> &str {
+    text.find(['*', '?', '[', '`']).map_or(text, |at| &text[..at])
+}
+
 /// The first of `paths`, in their order, that one of `patterns` matches whole, letter case ignored.
 #[must_use]
 pub fn first_touched<'p>(patterns: &[Pattern], paths: &'p [String]) -> Option<&'p str> {
@@ -120,7 +152,7 @@ pub fn first_touched<'p>(patterns: &[Pattern], paths: &'p [String]) -> Option<&'
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a fixture that does not read must fail loudly")]
 mod tests {
-    use super::{WindowsChange, entries_for, first_touched, read_windows, sibling_path};
+    use super::{WindowsChange, entries_for, first_touched, overlaps_folder, read_windows, sibling_path};
     use crate::like::Pattern;
 
     const SIBLINGS: [&str; 1] = ["yaat-server"];
@@ -299,6 +331,49 @@ mod tests {
             Some("Directory.Build.props")
         );
         assert_eq!(first_touched(&entries_for(&declared, None), &paths(&["../yaat-server/tools/a.cs"])), None);
+    }
+
+    #[test]
+    fn a_folder_overlaps_an_entry_whose_literal_prefix_lies_inside_it_or_holds_it() {
+        let overlaps = |entry: &str, folder: &str| overlaps_folder(&patterns(&[entry]), None, folder);
+        assert!(overlaps("tools/Yaat.CrcDriverHook/*", "tools/Yaat.CrcDriverHook"), "a folder entry");
+        assert!(
+            overlaps("tests/Yaat.Client.Tests/EnsureSherpaNativesTests.cs", "tests/Yaat.Client.Tests"),
+            "a file entry"
+        );
+        assert!(overlaps("tools/*", "tools/A"), "an entry above the folder");
+        assert!(!overlaps("tests/Yaat.Client.Tests/*", "tests/Yaat.Sim.Tests"), "another folder");
+        assert!(overlaps("TOOLS/yaat.crcdriverhook/*", "tools/Yaat.CrcDriverHook"), "case ignored");
+        assert!(overlaps("tests/Yaat.Client.Tests/*", ""), "the root overlaps any entry");
+        assert!(overlaps("*.props", "src/App"), "an entry with no literal prefix overlaps every folder");
+    }
+
+    #[test]
+    fn a_file_declared_in_a_folder_above_overlaps_and_one_beside_does_not() {
+        let overlaps = |entry: &str, folder: &str| overlaps_folder(&patterns(&[entry]), None, folder);
+        assert!(overlaps("tests/Directory.Build.props", "tests/Yaat.Sim.Tests"), "a build file above");
+        for folder in ["tests/Yaat.Sim.Tests", "src/A/B", "tools"] {
+            assert!(overlaps("Directory.Packages.props", folder), "a root entry: {folder}");
+        }
+        assert!(
+            !overlaps("tests/Yaat.Client.Tests/EnsureSherpaNativesTests.cs", "tests/Yaat.Sim.Tests"),
+            "a file in another folder"
+        );
+        assert!(!overlaps("tools/Yaat.CrcDriverHook/*", "tests/Yaat.Sim.Tests"));
+    }
+
+    #[test]
+    fn a_sibling_entry_applies_only_to_that_sibling_s_tree() {
+        let declared = patterns(&["../yaat-server/tools/X/*"]);
+        assert!(overlaps_folder(&declared, Some("yaat-server"), "tools/X"));
+        assert!(!overlaps_folder(&declared, Some("yaat-server"), "src/X"), "another folder of the sibling");
+        assert!(!overlaps_folder(&declared, None, "tools/X"), "the worktree's own folder");
+        assert!(!overlaps_folder(&declared, None, ""), "the worktree's root has no entry");
+        assert!(!overlaps_folder(&declared, Some("other"), "tools/X"), "another sibling");
+        assert!(
+            !overlaps_folder(&patterns(&["tools/X/*"]), Some("yaat-server"), "tools/X"),
+            "a root entry never applies to a sibling"
+        );
     }
 
     #[test]

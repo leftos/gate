@@ -1105,9 +1105,32 @@ fn build_text(root: &Path, file: &str) -> Result<String, String> {
     Ok(decoded(&bytes))
 }
 
+/// The sibling names a Windows declaration's entries may give: the present `siblings`' names, then the `absent` ones.
+fn sibling_names<'a>(siblings: &'a [SiblingRoot], absent: &'a [String]) -> Vec<&'a str> {
+    siblings
+        .iter()
+        .map(|sibling| sibling.name.as_str())
+        .chain(absent.iter().map(String::as_str))
+        .collect()
+}
+
+/// The paths a Windows declaration `read` ([`read_declaration`]) declares ([`windows::read_windows`]), each sibling
+/// entry's name one of `names`, or none while the siblings file has a problem, `siblings_problem` naming it; `None` for
+/// no file.
+///
+/// # Errors
+///
+/// Why the file cannot be read, or its first problem.
+fn windows_patterns(read: Result<Option<Vec<u8>>, String>, names: &[&str], siblings_problem: Option<&str>) -> Result<Option<Vec<Pattern>>, String> {
+    let Some(bytes) = read? else {
+        return Ok(None);
+    };
+    windows::read_windows(&bytes, siblings_problem.map_or(Ok(names), Err)).map(Some)
+}
+
 /// The text of `bytes`, decoded as `MSBuild` reads a file: UTF-16 little or big endian with its byte order mark, else
 /// UTF-8, a file that is not valid UTF-8 read lossily.
-fn decoded(bytes: &[u8]) -> String {
+pub(crate) fn decoded(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
         return utf16(rest, false);
     }
@@ -1551,17 +1574,28 @@ impl<'a> Machine<'a> {
     /// of a worktree other than the gate's own (another worktree's `.gate/local.toml`, read only to judge whether a
     /// command is told to `--cd` there) keeps neither: this run's log and lines are about its own worktree.
     fn declaration(&self, place: &Place, name: &str) -> Result<Option<Vec<u8>>, String> {
-        let repo = repo_name(&place.checkout);
-        let (read, source) = read_declaration(Path::new(&place.root), &repo, self.config.borrow().as_ref(), name);
+        let (read, source) = self.quiet_declaration(place, name);
+        self.note_declaration(place, name, &source);
+        read
+    }
+
+    /// The declaration file `name` of the repo at `place` ([`read_declaration`]) and where it was read from, its
+    /// declarations folder the one the routing file the decision read names, keeping nothing.
+    fn quiet_declaration(&self, place: &Place, name: &str) -> (Result<Option<Vec<u8>>, String>, Source) {
+        read_declaration(Path::new(&place.root), &repo_name(&place.checkout), self.config.borrow().as_ref(), name)
+    }
+
+    /// Keeps the log lines of the declaration file `name` read from `source` among the notes, and how the lines name
+    /// it, as [`Machine::declaration`] does: only for the gate's own worktree.
+    fn note_declaration(&self, place: &Place, name: &str, source: &Source) {
         let own = self.found.borrow().place().is_none_or(|own| own.root == place.root);
         if !own {
-            return read;
+            return;
         }
-        self.notes.borrow_mut().extend(source.log_lines(&repo, name));
+        self.notes.borrow_mut().extend(source.log_lines(&repo_name(&place.checkout), name));
         let mut said = self.said.borrow_mut();
         said.retain(|(read_name, _)| read_name != name);
         said.push((name.to_owned(), source.said(name)));
-        read
     }
 
     /// Which of `paths`, relative to the root of `place`, one `git ls-files --cached --others --exclude-standard` of the
@@ -1830,16 +1864,10 @@ impl<'a> Machine<'a> {
         absent: &[String],
         siblings_problem: Option<&str>,
     ) -> Result<WindowsChange, String> {
-        let Some(bytes) = self.declaration(place, windows::WINDOWS_NAME)? else {
+        let names = sibling_names(siblings, absent);
+        let Some(patterns) = windows_patterns(self.declaration(place, windows::WINDOWS_NAME), &names, siblings_problem)? else {
             return Ok(WindowsChange::Untouched);
         };
-        let names: Vec<&str> = siblings
-            .iter()
-            .map(|sibling| sibling.name.as_str())
-            .chain(absent.iter().map(String::as_str))
-            .collect();
-        let declared = siblings_problem.map_or(Ok(names.as_slice()), Err);
-        let patterns = windows::read_windows(&bytes, declared)?;
         if patterns.is_empty() {
             return Ok(WindowsChange::Untouched);
         }
@@ -2207,6 +2235,26 @@ impl Facts for Machine<'_> {
             self.notes.borrow_mut().push(format!("gate: kept off the macOS builder: {reason}"));
         }
         change
+    }
+
+    /// The tested project told first ([`dotnet_projects::tested_project`]), none being `false` with no file read; then
+    /// the worktree's `.gate/windows.toml` read as [`Machine::read_change`] reads it ([`windows_patterns`]), an entry
+    /// naming one of the present `siblings` or the `absent` ones ([`sibling_names`]); the closure judged by
+    /// [`dotnet_projects::closure_clear`]. The file's lines are kept ([`Machine::note_declaration`]) only for a
+    /// clear closure, which reads no change; one that is not clear leaves them to [`Facts::windows_change`], so they
+    /// are said once.
+    fn tested_closure_clear(&self, place: &Place, words: &[String], siblings: &[SiblingRoot], absent: &[String]) -> bool {
+        let root = Path::new(&place.root);
+        let Some(project) = dotnet_projects::tested_project(root, &place.prefix, words) else {
+            return false;
+        };
+        let (read, source) = self.quiet_declaration(place, windows::WINDOWS_NAME);
+        let declared = windows_patterns(read, &sibling_names(siblings, absent), None);
+        let clear = dotnet_projects::closure_clear(root, &project, siblings, declared);
+        if clear {
+            self.note_declaration(place, windows::WINDOWS_NAME, &source);
+        }
+        clear
     }
 
     fn file_in_folder(&self, name: &str) -> bool {
@@ -4196,6 +4244,26 @@ mod tests {
         };
         assert!(why.starts_with("git --no-optional-locks ls-files"), "{why}");
         assert!(why.ends_with("its output passed 8 bytes"), "{why}");
+    }
+
+    #[test]
+    fn a_clean_closure_stays_clear_beside_an_entry_of_an_absent_sibling() {
+        let (root, _removed) = scratch("closure-absent-sibling");
+        put(&root, ".gate/windows.toml");
+        let declared = "paths = ['tools/Hook/*', '../yaat-server/tools/X/*']\n";
+        fs::write(root.join(".gate").join("windows.toml"), declared).expect("the declaration can be written");
+        put(&root, "tests/Sim/Sim.csproj");
+        fs::write(root.join("tests").join("Sim").join("Sim.csproj"), "<Project />\n").expect("the project can be written");
+        let words: Vec<String> = ["dotnet", "test", "tests/Sim"].iter().map(|word| (*word).to_owned()).collect();
+        let machine = Machine::at(None, Duration::from_secs(60), Duration::from_secs(5));
+        assert!(
+            machine.tested_closure_clear(&place_of(&root), &words, &[], &["yaat-server".to_owned()]),
+            "the absent sibling's entry matches nothing"
+        );
+        assert!(
+            !machine.tested_closure_clear(&place_of(&root), &words, &[], &[]),
+            "an entry naming no declared sibling is a problem"
+        );
     }
 
     /// A change that cannot be told, for `why`.
