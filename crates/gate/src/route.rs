@@ -187,6 +187,8 @@ pub(crate) struct Decision {
     pin: Option<String>,
     /// `--desktop hidden`: the run's desktop command runs on a hidden desktop ([`Inputs::desktop_hidden`]).
     desktop_hidden: bool,
+    /// The run holds a `--lock` ([`Inputs::lock_run`]).
+    lock_run: bool,
     /// The state root the run's records are under, the built-here record among them ([`Facts::built_here`]).
     state: PathBuf,
 }
@@ -207,6 +209,7 @@ impl Decision {
             local_app_data: environment.local_app_data.clone(),
             pin: request.builder.clone(),
             desktop_hidden: request.desktop_hidden,
+            lock_run: request.lock.is_some(),
         }
     }
 
@@ -222,6 +225,7 @@ impl Decision {
             given: self.given.as_deref(),
             pin: self.pin.as_deref(),
             desktop_hidden: self.desktop_hidden,
+            lock_run: self.lock_run,
         }
     }
 }
@@ -236,9 +240,10 @@ impl Decision {
 /// ([`LocalReason::RoutableUnderParent`]), and a gate inside a box run ([`Nested::BoxRun`]) says nothing. A
 /// run that dropped its `--no-build` before its decision names the words the caller wrote as `given`, which the repo's
 /// `.gate/local.toml` is matched against too ([`Inputs::given`]). A run nested under a `--local` gate names that gate's
-/// `--reason` as `local_parent` ([`Inputs::local_parent`]), and runs here saying it. With the route, what the decision learnt of the
-/// gate's place in its git worktree, and, for a routed run of a repo whose warm-up is set up, the hash of its warm-up
-/// file ([`consented_hash`]).
+/// `--reason` as `local_parent` ([`Inputs::local_parent`]), and runs here saying it. A run holding a `--lock` that the
+/// decision would run here, kept here or a commit's stage, is refused instead ([`lock_refused`]). With the route, what
+/// the decision learnt of the gate's place in its git worktree, and, for a routed run of a repo whose warm-up is set
+/// up, the hash of its warm-up file ([`consented_hash`]).
 pub(crate) fn route(
     request: &RunRequest,
     environment: &Environment,
@@ -269,6 +274,7 @@ pub(crate) fn route(
         },
         route => route,
     };
+    let route = lock_refused(request, route);
     // A run that would route is refused when its log belongs to another worktree of its repo than the one the snapshot
     // is of.
     let route = match route {
@@ -318,6 +324,26 @@ pub(crate) fn route(
         spare_folders,
         decision,
         sent: machine.sent.into_inner(),
+    }
+}
+
+/// Why a commit's stage refuses a `--lock` run: the commit itself runs here.
+const LOCK_STAGE_HERE: &str = "a commit's stage runs here";
+
+/// `route`, but refused for a run of `request` holding a `--lock`, which runs only on a builder, when the decision would
+/// run it here: kept here, saying why or silently ([`PinRefusal::lock_kept_here`]), or a commit whose stage runs on the
+/// builder while the commit itself runs here ([`LOCK_STAGE_HERE`]).
+fn lock_refused(request: &RunRequest, route: Route) -> Route {
+    let Some(name) = request.lock.as_deref() else {
+        return route;
+    };
+    match route {
+        Route::Local { reason } => Route::Refused(PinRefusal::lock_kept_here(name, reason.as_ref())),
+        Route::Stage(_) => Route::Refused(PinRefusal::LockCannotRoute {
+            name: name.to_owned(),
+            why: LOCK_STAGE_HERE.to_owned(),
+        }),
+        route @ (Route::Routed(_) | Route::Refused(_)) => route,
     }
 }
 
@@ -4534,6 +4560,7 @@ mod tests {
             given: None,
             pin: None,
             desktop_hidden: false,
+            lock_run: false,
         };
         machine.commit_stage(config, &inputs)
     }

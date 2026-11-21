@@ -949,6 +949,75 @@ fn a_commit_stage_sends_its_repo_s_spare_folders() {
     assert!(!outcome.stderr.contains("spare.toml"), "a good file says nothing: {outcome:?}");
 }
 
+/// Runs `command` in `case` as a heavy gate holding the lock `mac-signing`, whose scripted client records its call:
+/// the outcome and whether the client ran.
+fn run_locked(case: &Case, command: &[&str]) -> (Outcome, bool) {
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &["--lock", "mac-signing"], command)));
+    (outcome, call.exists())
+}
+
+/// A `--lock` run runs only on a builder: one the decision would keep here, silently or saying why, is refused and
+/// nothing runs.
+#[test]
+fn a_lock_run_that_does_not_route_is_refused() {
+    let case = routed_case("routing-lock-not-routed");
+
+    let (outcome, called) = run_locked(&case, &["cmd", "/c", "echo", "ran-here"]);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: --lock mac-signing cannot route this run: nothing routes it\n"),
+        "{outcome:?}"
+    );
+    assert!(!called, "the client never ran: {outcome:?}");
+    assert!(!outcome.stdout.contains("ran-here"), "the command never ran here: {outcome:?}");
+
+    let (outcome, called) = run_locked(&case, &[r".\tool.exe", "out", "ran-here", FAKE_TOOL]);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains(&format!(
+            "gate: --lock mac-signing cannot route this run: {FAKE_TOOL} is outside the worktree\n"
+        )),
+        "{outcome:?}"
+    );
+    assert!(!called, "the client never ran: {outcome:?}");
+    assert!(!outcome.stdout.contains("ran-here"), "the command never ran here: {outcome:?}");
+}
+
+/// A commit whose pre-commit stage would run on the builder still commits here, so a `--lock` commit is refused before
+/// its stage runs.
+#[test]
+fn a_lock_commit_stage_is_refused() {
+    let case = routed_case("routing-lock-stage");
+    let routing = json!({ "host": HOST, "repos": { repo(&case): ["*tool*"] }, "commits": [repo(&case)] });
+    write_remote_json(&case, &routing.to_string());
+    fs::write(case.folder().join(".gitignore"), "*.exe\n*.log\n").expect("the ignore file can be written");
+    fs::write(case.folder().join("a.txt"), "a\n").expect("a.txt can be written");
+    git(&case, &["add", "-A"]);
+    git(&case, &["commit", "--quiet", "-m", "base"]);
+    fs::write(case.folder().join("a.txt"), "b\n").expect("a.txt can be changed");
+    git(&case, &["add", "a.txt"]);
+    let hooks = case.folder().join(".git").join("hooks");
+    fs::create_dir_all(&hooks).expect("the hooks folder can be made");
+    fs::write(hooks.join("pre-commit"), PREK_SHIM).expect("the hook shim can be written");
+
+    let (outcome, called) = run_locked(&case, &STAGE_COMMIT);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: --lock mac-signing cannot route this run: a commit's stage runs here\n"),
+        "{outcome:?}"
+    );
+    assert!(!called, "the stage never called the builder: {outcome:?}");
+}
+
 #[test]
 fn a_spare_file_with_a_problem_says_so_and_still_routes() {
     let case = routed_case("routing-spare-broken");
@@ -7040,6 +7109,25 @@ fn a_light_gate_proven_faster_here_says_so_and_journals_faster_here() {
         assert_eq!(event["notRouted"], "faster here", "{event}");
         assert_eq!(event["reason"], reason, "the run's own --reason: {event}");
     }
+}
+
+/// A `--lock` run runs only on a builder, so a light one is never kept here as faster here.
+#[test]
+fn a_light_lock_run_proven_faster_here_still_routes() {
+    let case = routed_case("routing-light-lock-faster-here");
+    let command = [r".\tool.exe", "out", "ran here"];
+    seed_faster_here(&case, &command, &[HOST], 1.0, 100.0);
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let mut before = vec!["--test-remote-client", steps.as_str(), "--lock", "mac-signing"];
+    before.extend(GIT_HANG_GUARDS);
+
+    let outcome = finish(case.gate(&run_words("out.log", &before, &command)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains("faster here"), "{outcome:?}");
+    assert!(call.exists(), "the builder ran it: {outcome:?}");
+    assert_eq!(recorded(&call)["lock"], json!("mac-signing"), "{outcome:?}");
 }
 
 #[test]

@@ -214,6 +214,7 @@ fn run_option(name: &str) -> Option<RunOption> {
         "alone" => RunOption::Switch(SwitchOption::Alone),
         "builder" => RunOption::Value(ValueOption::Builder),
         "desktop" => RunOption::Value(ValueOption::Desktop),
+        "lock" => RunOption::Value(ValueOption::Lock),
         _ => return seam_option(name),
     };
     Some(option)

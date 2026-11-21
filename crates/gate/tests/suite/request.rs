@@ -71,6 +71,7 @@ fn print_request_shows_the_new_cli_request() {
         "local": false,
         "builder": null,
         "desktopHidden": false,
+        "lock": null,
         "reason": null,
         "bringTracked": [],
         "env": [],
@@ -112,6 +113,16 @@ fn print_request_shows_the_reason_as_given() {
     words.splice(7..7, ["--reason", "why"]);
 
     assert_eq!(case.run(&words).request()["reason"], "why");
+}
+
+#[test]
+fn print_request_shows_the_lock() {
+    let case = Case::new("print_request_shows_the_lock");
+    let mut words = print_run(&["cmd"]);
+    words.splice(7..7, ["--lock", "mac-signing"]);
+
+    assert_eq!(case.run(&words).request()["lock"], "mac-signing");
+    assert_eq!(case.run(&print_run(&["cmd"])).request()["lock"], json!(null), "no lock is null");
 }
 
 #[test]

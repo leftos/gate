@@ -1831,6 +1831,7 @@ impl Attempt<'_, '_> {
             unreal_version: chosen.unreal.as_deref(),
             blender_version: chosen.blender.as_deref(),
             engine_env: &chosen.engine_env,
+            lock: self.call.lock,
             desktop: self.call.desktop,
             cross_build: self.call.cross_build,
             base: snapshot.base.as_ref().map(|base| base.name.as_str()),
@@ -6555,6 +6556,7 @@ struct ProtocolLines {
     install: String,
     lfs: String,
     full: String,
+    lock: String,
     timed_out: String,
     backstop: String,
     adjusted: String,
@@ -6593,6 +6595,7 @@ impl ProtocolLines {
             install: refused_line(nonce, Refusal::Install),
             lfs: refused_line(nonce, Refusal::Lfs),
             full: refused_line(nonce, Refusal::Full),
+            lock: refused_line(nonce, Refusal::Lock),
             timed_out: killed_line(nonce, BoxKill::TimedOut),
             backstop: killed_line(nonce, BoxKill::Backstop),
             adjusted: adjusted_prefix(nonce),
@@ -6635,6 +6638,7 @@ impl ProtocolLines {
             (&self.install, Protocol::Refused(FallbackReason::Install)),
             (&self.lfs, Protocol::Refused(FallbackReason::Lfs)),
             (&self.full, Protocol::Refused(FallbackReason::Full)),
+            (&self.lock, Protocol::Refused(FallbackReason::Lock)),
             (&self.drain, Protocol::Drain),
             (&self.timed_out, Protocol::Killed(BoxKill::TimedOut)),
             (&self.backstop, Protocol::Killed(BoxKill::Backstop)),
@@ -6859,6 +6863,7 @@ mod tests {
             tail: 0,
             no_markers: false,
             bring_tracked: &[],
+            lock: None,
             env: &[],
             interrupt: Some(raised()),
             state: &STATE,
@@ -9926,6 +9931,15 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_refusal_ends_the_call_refused_for_the_lock() {
+        let tag = refused_line(NONCE, Refusal::Lock);
+        let (called, said) = run_call_said("", &format!("{tag}\n"), "lock-refusal");
+
+        assert_eq!(called.refusal(), Some(FallbackReason::Lock), "{said:?}");
+        assert!(matches!(status_end(&called, 0..0), End::Refused(FallbackReason::Lock)), "{said:?}");
+    }
+
+    #[test]
     fn a_progress_line_is_what_its_last_update_shows() {
         assert_eq!(
             last_update("Writing objects:  50% (1/2)\rWriting objects: 100% (2/2), 1 KiB | 1 KiB/s, done."),
@@ -10607,6 +10621,7 @@ mod tests {
             tail: 0,
             no_markers: false,
             bring_tracked: &[],
+            lock: None,
             env: &[],
             interrupt,
             state,

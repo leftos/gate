@@ -12,6 +12,10 @@ pub const DEFAULT_TAIL_LINES: u64 = 20;
 
 /// What the gate was asked to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one invocation is read per process and handed on whole; a run's request is no hot value to box"
+)]
 pub enum Invocation {
     /// `gate --version`.
     Version,
@@ -627,6 +631,9 @@ pub struct RunRequest {
     /// `--desktop hidden`: the command, which must match a declared desktop pattern its repo is allowed, runs on a
     /// hidden desktop of the builder's console session, whatever mode its pattern declares.
     pub desktop_hidden: bool,
+    /// `--lock <name>`: the builder-wide lock of that name the run holds on its builder while its command runs there;
+    /// a run that names one never runs here.
+    pub lock: Option<String>,
     /// The `--reason` text the caller gave, recorded with the run; required when `local` or a critical slot.
     pub reason: Option<String>,
     /// The `--bring-tracked` globs, in the order given: a fetched output git tracks is installed only when one matches it.

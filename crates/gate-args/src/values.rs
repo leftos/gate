@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 
-use crate::problem::{MAX_WHOLE_NUMBER, Problem};
+use crate::problem::{LockProblem, MAX_WHOLE_NUMBER, Problem};
 use crate::request::{Ceiling, Slot};
 #[cfg(feature = "test-seams")]
 use crate::request::{DESKTOP_MODES, DESKTOP_SESSIONS, DesktopMode, DesktopSession};
@@ -269,6 +269,28 @@ pub(crate) fn desktop_session(option: &str, value: &str) -> Result<DesktopSessio
             option: option.to_owned(),
             value: value.to_owned(),
         })
+}
+
+/// The most characters a `--lock` name holds.
+pub const MOST_LOCK_NAME_CHARS: usize = 63;
+
+/// Whether `name` is a lock name, as `--lock` takes it and a box reads `RunLock`: a lower-case ASCII letter or digit,
+/// then lower-case ASCII letters, digits and `-`, [`MOST_LOCK_NAME_CHARS`] at most in all, so it is safe as a file name
+/// on any builder and the same name in any spelling of case.
+#[must_use]
+pub fn is_lock_name(name: &str) -> bool {
+    let allowed = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    let mut bytes = name.bytes();
+    name.len() <= MOST_LOCK_NAME_CHARS && bytes.next().is_some_and(allowed) && bytes.all(|byte| allowed(byte) || byte == b'-')
+}
+
+/// The `--lock` name `value`, or the problem naming it when it is not a lock name ([`is_lock_name`]).
+pub(crate) fn lock_name(value: &str) -> Result<String, Problem> {
+    if is_lock_name(value) {
+        Ok(value.to_owned())
+    } else {
+        Err(Problem::Lock(LockProblem::BadName(value.to_owned())))
+    }
 }
 
 /// The longest unique part `--test-box-desktop-mutex` takes.

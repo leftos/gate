@@ -14450,6 +14450,97 @@ fn a_non_desktop_run_refused_still_runs_here() {
     assert_eq!(fallbacks(&own(&case, pid)), ["busy"]);
 }
 
+/// What a `--lock mac-signing` run says after its builder's fallback head when no builder ran it.
+const LOCK_NOT_HERE: &str = "; a --lock mac-signing run never runs here";
+
+/// A routed case of the scripted client (`crate::routing::routed_case`) sending its `*tool*` commands to `host`; with
+/// `second`, the `builders` entry `builder-a`, a Windows builder, matches them too and is tried first.
+fn lock_case(name: &str, second: bool) -> Case {
+    let case = crate::routing::routed_case(name);
+    if second {
+        let repo = crate::routing::repo(&case);
+        let routing = json!({
+            "host": HOST,
+            "repos": { &repo: ["*tool*"] },
+            "builders": [{ "host": FIRST_BUILDER, "os": "windows", "repos": { &repo: ["*tool*"] } }],
+        });
+        write_remote_json(&case, &routing.to_string());
+    }
+    case
+}
+
+/// Runs `.\tool.exe mark <marker> out ran here` in `case` as a routed heavy gate holding `--lock mac-signing`, its
+/// scripted client logging to `log` and taking `steps`: the gate's pid, its outcome and the marker file, which exists
+/// only once the command ran here.
+fn run_locked_marking(case: &Case, log: &str, steps: &[&str]) -> (u32, Outcome, PathBuf) {
+    let marker = case.folder().join("marker.txt");
+    let stub = shown(&crate::routing::stub(case, steps));
+    let marked = shown(&marker);
+    let command = [r".\tool.exe", "mark", &marked, "out", "ran here"];
+    let words = crate::routing::routed_words(log, &stub, &["--lock", "mac-signing"], &command);
+    let running = case.start(&words);
+    let pid = running.id();
+    (pid, running.finish(), marker)
+}
+
+/// The path of the case's one worktree record, `<root>\remote\<key>.worktree`, and what it holds.
+fn lock_case_builders(case: &Case) -> (PathBuf, Value) {
+    let remote = case.root().join("remote");
+    let record = fs::read_dir(&remote)
+        .expect("the remote folder can be listed")
+        .map(|entry| entry.expect("an entry can be read").path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "worktree"))
+        .expect("the run wrote its worktree record");
+    let written: Value = serde_json::from_str(&fs::read_to_string(&record).expect("the record can be read")).expect("the record is JSON");
+    (record, written)
+}
+
+#[test]
+fn a_lock_run_the_builder_refuses_never_runs_here() {
+    let case = lock_case("client-lock-refused", false);
+    let call = case.folder().join("call.json");
+    let record = format!("record {}", shown(&call));
+
+    let (pid, outcome, marker) = run_locked_marking(
+        &case,
+        "out.log",
+        &[&record, "err gate: a Windows builder holds no --lock locks", "refuse lock"],
+    );
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: a Windows builder holds no --lock locks\n"), "{outcome:?}");
+    let line = format!("gate: remote {HOST} lock{LOCK_NOT_HERE}");
+    assert!(outcome.stderr.lines().any(|said| said == line), "{outcome:?}");
+    assert!(!outcome.stderr.contains("; running here"), "{outcome:?}");
+    assert!(!marker.exists(), "the command never ran here: {outcome:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), Vec::<&str>::new(), "the end journals no fallback");
+    let recorded: Value = serde_json::from_str(&fs::read_to_string(&call).expect("the client recorded its call")).expect("the record is JSON");
+    assert_eq!(recorded["lock"], json!("mac-signing"), "the call carries the lock: {recorded}");
+}
+
+#[test]
+fn a_lock_refusal_tries_the_next_builder_and_forgets_none() {
+    let case = lock_case("client-lock-next-builder", true);
+    let (first_on, host_on) = (format!("on {FIRST_BUILDER}"), format!("on {HOST}"));
+    let (_, outcome, _) = run_locked_marking(&case, "first.log", &["status 0"]);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let (record, mut written) = lock_case_builders(&case);
+    written["builders"] = json!([FIRST_BUILDER, HOST]);
+    fs::write(&record, written.to_string()).expect("the record can be rewritten");
+
+    let (pid, outcome, marker) = run_locked_marking(&case, "second.log", &[&first_on, "refuse lock", &host_on, "status 0"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let line = format!("gate: remote {FIRST_BUILDER} lock; trying {HOST}");
+    assert!(outcome.stderr.lines().any(|said| said == line), "{outcome:?}");
+    assert!(!outcome.stderr.contains("; running here"), "{outcome:?}");
+    assert!(!marker.exists(), "the command never ran here: {outcome:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), ["lock"], "the hop is journaled lock");
+    let (_, written) = lock_case_builders(&case);
+    let builders = written["builders"].as_array().expect("the record lists its builders");
+    assert!(builders.contains(&json!(FIRST_BUILDER)), "a lock refusal forgets no builder: {written}");
+}
+
 /// The `userTools` path every user-tool case names.
 const USER_TOOL: &str = "~/tools/t";
 

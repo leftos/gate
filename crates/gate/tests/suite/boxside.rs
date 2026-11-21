@@ -3813,6 +3813,38 @@ fn a_busy_refusal_is_tagged_and_has_no_marker() {
     assert!(!marker.exists(), "the command never ran");
 }
 
+/// A Windows box holds no `--lock` locks: a run asking for one is refused `lock` before its admission and its work
+/// lock, so a held work folder still answers `lock`, not `busy`, and the command never runs.
+#[test]
+fn a_windows_box_refuses_run_lock_with_the_lock_tag_before_its_work_lock() {
+    let case = Case::new("box_run_lock_refused");
+    let marker = case.folder().join("marker");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &shown(&marker)]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    payload["RunLock"] = json!("mac-signing");
+    payload["RunLockWait"] = json!(30);
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(field(&payload, "Lock"))
+        .expect("the work folder's lock can be held");
+
+    let outcome = run_box(&case, &payload);
+
+    drop(held);
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    let tag = refused_line(&payload, "lock");
+    assert_eq!(
+        lines(&outcome.stderr),
+        [tag.as_str(), "gate: a Windows builder holds no --lock locks"],
+        "the lock tag and its line, never busy and no marker: {outcome:?}"
+    );
+    assert!(!marker.exists(), "the command never ran");
+}
+
 #[test]
 fn box_run_refuses_a_subfolder_outside_the_work_folder_and_deletes_the_back_ref() {
     let case = Case::new("box_run_subfolder_outside");

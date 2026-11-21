@@ -747,6 +747,7 @@ fn call_of<'a>(
         inputs: &target.inputs,
         user_tools: &[],
         bring_tracked: &[],
+        lock: None,
         env: &[],
         log,
         timeout,

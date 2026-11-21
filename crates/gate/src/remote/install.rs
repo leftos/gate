@@ -2402,6 +2402,7 @@ mod tests {
                 tail: 0,
                 no_markers: false,
                 bring_tracked: &[],
+                lock: None,
                 env: &[],
                 interrupt: None,
                 state: &STATE,

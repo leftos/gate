@@ -197,6 +197,9 @@ pub(crate) struct RunCall<'a> {
     /// (`EngineEnv`, an object of each name and `"unreal"` or `"blender"`, sent only when there is one, whether or not
     /// a version is chosen, so the box removes a value it inherited), which a warm-up sends too.
     pub engine_env: &'a [(String, EngineKind)],
+    /// The builder-wide lock the run holds while its command runs, `--lock`'s name (`RunLock` and `RunLockWait`, the
+    /// run's lock wait in whole seconds ([`desktop_wait`]), sent only when there is one); a warm-up never sends them.
+    pub lock: Option<&'a str>,
     /// How the run uses the builder's desktop, `None` for not at all (`Desktop: true` and `DesktopWait`, the run's
     /// desktop wait in whole seconds ([`desktop_wait`]), sent only for a desktop run, with `DesktopSession: true` for a
     /// session or hidden one and `DesktopHidden: true` for a hidden one); a warm-up never sends them, as the box
@@ -356,8 +359,8 @@ pub(crate) fn drain_word(root: &str, action: DrainAction) -> String {
     word(&object)
 }
 
-/// How long a desktop run may wait for the builder's desktop, in whole seconds: the run's `timeout`, the `Timeout` its
-/// payload sends, so it waits for the desktop as long as it may run there; at least 1, and never past
+/// How long a desktop run may wait for the builder's desktop, and a `--lock` run for its lock, in whole seconds: the
+/// run's `timeout`, the `Timeout` its payload sends, so it waits as long as it may run there; at least 1, and never past
 /// [`MAX_WHOLE_NUMBER`], the box's most, so a huge ceiling waits that long rather than refusing the payload.
 fn desktop_wait(timeout: u64) -> u64 {
     timeout.clamp(1, MAX_WHOLE_NUMBER)
@@ -367,7 +370,8 @@ fn desktop_wait(timeout: u64) -> u64 {
 /// `SourceRevisionId`) as `Env` when there is one, and `Desktop: true` with `DesktopWait` ([`desktop_wait`], the run's
 /// `Timeout`) for a run that asks for the builder's desktop, with `DesktopSession: true` beside them for a session run,
 /// which takes no desktop lock (a box that does not know the key takes the lock), and `DesktopHidden: true` beside
-/// those for a hidden run, a session run on a desktop of its own that no one sees, `CrossBuild` (`Rid` and `Words`) for
+/// those for a hidden run, a session run on a desktop of its own that no one sees, `RunLock` with `RunLockWait`
+/// ([`desktop_wait`], the run's `Timeout`) for a run that holds a `--lock`, `CrossBuild` (`Rid` and `Words`) for
 /// a run with a cross build and output globs, and the repos' default branches as `Base` and `SiblingBases` when any has
 /// one, and `CommitStage: true` with the PC's `Head` for a commit's pre-commit stage.
 pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
@@ -401,6 +405,10 @@ pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
         if mode == DesktopMode::Hidden {
             object.insert("DesktopHidden".to_owned(), json!(true));
         }
+    }
+    if let Some(name) = run.lock {
+        object.insert("RunLock".to_owned(), json!(name));
+        object.insert("RunLockWait".to_owned(), json!(desktop_wait(run.timeout)));
     }
     if let Some(cross) = run.cross_build.filter(|_| !run.outputs.is_empty()) {
         object.insert("CrossBuild".to_owned(), json!({"Rid": cross.rid, "Words": cross.words}));
@@ -735,6 +743,7 @@ mod tests {
             unreal_version: None,
             blender_version: None,
             engine_env: &[],
+            lock: None,
             desktop: None,
         };
         run_word(&location().with_pair("app", &["lib".to_owned(), "tools".to_owned()]), &run)
@@ -1096,6 +1105,7 @@ mod tests {
             unreal_version: None,
             blender_version: None,
             engine_env: &[],
+            lock: None,
             desktop: None,
         };
         let mut expected = preflight;
@@ -1149,6 +1159,7 @@ mod tests {
             unreal_version: None,
             blender_version: None,
             engine_env: &[],
+            lock: None,
             desktop: None,
         };
 
@@ -1263,6 +1274,7 @@ mod tests {
             unreal_version: None,
             blender_version: None,
             engine_env: &[],
+            lock: None,
             desktop: None,
         };
 
@@ -1309,6 +1321,7 @@ mod tests {
             unreal_version: None,
             blender_version: None,
             engine_env: &[],
+            lock: None,
             desktop: None,
         };
         let commands = warm_commands();
@@ -1361,6 +1374,7 @@ mod tests {
             unreal_version: Some("5.8.0"),
             blender_version: None,
             engine_env: &[],
+            lock: None,
             desktop: None,
         };
         let commands = warm_commands();
@@ -1413,6 +1427,7 @@ mod tests {
             unreal_version: None,
             blender_version: Some("5.2.2"),
             engine_env: &[],
+            lock: None,
             desktop: None,
         };
         let commands = warm_commands();
@@ -1469,6 +1484,7 @@ mod tests {
             unreal_version: None,
             blender_version: None,
             engine_env: &names,
+            lock: None,
             desktop: None,
         };
         let commands = warm_commands();
@@ -1526,6 +1542,7 @@ mod tests {
             unreal_version: None,
             blender_version: None,
             engine_env: &[],
+            lock: None,
             desktop: Some(gate_router::desktop::DesktopMode::Locked),
         };
         let commands = warm_commands();
@@ -1615,6 +1632,7 @@ mod tests {
             unreal_version: None,
             blender_version: None,
             engine_env: &[],
+            lock: None,
             desktop: Some(gate_router::desktop::DesktopMode::Hidden),
         };
         let word = run_word(&location(), &run);
@@ -1636,6 +1654,90 @@ mod tests {
             warm_sent.get("DesktopSession").is_none() && warm_sent.get("DesktopHidden").is_none(),
             "a warm-up never asks for a hidden desktop: {warm_sent}"
         );
+    }
+
+    /// A run call of `./tool.exe` under the ceiling `timeout`, holding the lock `lock` when it names one.
+    fn lock_run<'a>(words: &'a [String], timeout: u64, lock: Option<&'a str>) -> RunCall<'a> {
+        RunCall {
+            cross_build: None,
+            words,
+            subfolder: "",
+            nonce: "0123456789abcdef0123456789abcdef",
+            snapshot: SHA,
+            outputs: &[],
+            failure_outputs: &[],
+            full: false,
+            timeout,
+            host: "builder",
+            sibling_snapshots: &[],
+            base: None,
+            sibling_bases: &[],
+            commit_stage_head: None,
+            inputs_digest: None,
+            lfs_digest: None,
+            sibling_lfs_digests: &[],
+            sent_digest: None,
+            env: &[],
+            godot_version: None,
+            unreal_version: None,
+            blender_version: None,
+            engine_env: &[],
+            lock,
+            desktop: None,
+        }
+    }
+
+    #[test]
+    fn a_lock_run_sends_run_lock_and_its_wait_and_keeps_the_work_lock_path() {
+        let words = ["./tool.exe".to_owned()];
+        let run = lock_run(&words, 300, Some("mac-signing"));
+        let word = run_word(&location(), &run);
+        let sent = decoded(&word);
+        assert_eq!(
+            (&sent["RunLock"], &sent["RunLockWait"]),
+            (&json!("mac-signing"), &json!(300)),
+            "a lock run sends its name and waits up to its Timeout: {sent}"
+        );
+        assert_eq!(sent["Lock"], json!(location().lock), "Lock is still the work lock's path: {sent}");
+        assert_eq!(on_the_box(&word).run_lock(), Ok(Some("mac-signing")), "the box reads RunLock back");
+        assert_eq!(on_the_box(&word).run_lock_wait(), Ok(Some(300)), "the box reads RunLockWait back");
+        let sent = decoded(&run_word(&location(), &lock_run(&words, 300, None)));
+        assert!(
+            sent.get("RunLock").is_none() && sent.get("RunLockWait").is_none(),
+            "a run without a lock sends neither key: {sent}"
+        );
+    }
+
+    #[test]
+    fn run_lock_wait_never_exceeds_the_run_ceiling() {
+        let words = ["./tool.exe".to_owned()];
+        for (timeout, wait) in [(0, 1), (1, 1), (45, 45), (3_000_000_000, 2_147_483_647)] {
+            let sent = decoded(&run_word(&location(), &lock_run(&words, timeout, Some("mac-signing"))));
+            assert_eq!(
+                sent["RunLockWait"],
+                json!(wait),
+                "the wait is the Timeout, at least 1 s and at most the box's longest whole number: {timeout}"
+            );
+            let sent_wait = sent["RunLockWait"].as_u64().expect("a whole number");
+            assert!(sent_wait <= timeout.max(1), "never past the run's ceiling: {timeout}");
+        }
+    }
+
+    #[test]
+    fn a_warm_up_sends_no_run_lock() {
+        let words = ["./tool.exe".to_owned()];
+        let run = lock_run(&words, 300, Some("mac-signing"));
+        let commands = warm_commands();
+        let warm = WarmCall {
+            commands: &commands,
+            hash: WARM_HASH,
+        };
+        let sent = decoded(&warm_word(&location(), &run, &warm));
+        assert!(
+            sent.get("RunLock").is_none() && sent.get("RunLockWait").is_none(),
+            "a warm-up never holds a lock: {sent}"
+        );
+        assert_eq!(sent["Lock"], json!(location().lock), "the work lock's path is sent as ever: {sent}");
     }
 
     #[test]
@@ -1670,6 +1772,7 @@ mod tests {
             unreal_version: None,
             blender_version: None,
             engine_env: &[],
+            lock: None,
             desktop: None,
         };
         let commands = warm_commands();
@@ -1742,6 +1845,7 @@ mod tests {
             unreal_version: None,
             blender_version: None,
             engine_env: &[],
+            lock: None,
             desktop: None,
         }
     }

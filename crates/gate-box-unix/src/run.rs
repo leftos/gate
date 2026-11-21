@@ -57,6 +57,9 @@ use crate::tools;
 /// builder does not build. Said with a refusal tag and before any start marker, so the PC runs the command itself.
 pub const REFUSED_STATUS: u8 = 75;
 
+/// The line this builder says after its `lock` refusal tag: it holds no `--lock` locks.
+const LOCK_REFUSED_LINE: &str = "gate: this builder holds no --lock locks";
+
 /// What a run asks for that this builder does not build, refused with the tag of its refusal.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Unbuilt {
@@ -67,13 +70,14 @@ pub(crate) struct Unbuilt {
 
 impl Unbuilt {
     /// The line said after the refusal's tag: the layout line naming the repo of the bare repository `bare` for a
-    /// `layout` refusal ([`layout_line`]), else `gate: remote <key> is not built on this builder`.
+    /// `layout` refusal ([`layout_line`]), [`LOCK_REFUSED_LINE`] for a `lock` one, else
+    /// `gate: remote <key> is not built on this builder`.
     pub(crate) fn line(self, bare: &str) -> String {
         let why = format!("{} is not built on this builder", self.key);
-        if self.refusal == Refusal::Layout {
-            layout_line(repo_name(bare), &escaped(&why))
-        } else {
-            format!("gate: remote {why}")
+        match self.refusal {
+            Refusal::Layout => layout_line(repo_name(bare), &escaped(&why)),
+            Refusal::Lock => LOCK_REFUSED_LINE.to_owned(),
+            _ => format!("gate: remote {why}"),
         }
     }
 }
@@ -252,7 +256,7 @@ pub struct Request<'p> {
 impl<'p> Request<'p> {
     /// Reads `payload` in the order the Windows box reads it, each key checked as it does, the outputs asked for
     /// ([`Asked::new`]) read once the output folder is; then notes the first thing asking for what this builder does not
-    /// build: `Desktop`, `CommitStage`, a warm-up's `WarmCommands`, an unreal `EngineEnv` name, `UnrealVersion` or
+    /// build: `RunLock`, `Desktop`, `CommitStage`, a warm-up's `WarmCommands`, an unreal `EngineEnv` name, `UnrealVersion` or
     /// `SentDigest`; then, last, the repos ([`repos`]), a sibling pair and its `SiblingLfsDigests` as `gate-wire` checks
     /// them. A work root holding a `:` is refused just after the work folder is read ([`work_layout`]).
     ///
@@ -274,6 +278,7 @@ impl<'p> Request<'p> {
         if desktop && payload.desktop_wait()?.is_none() {
             return Err("gate: box payload lacks DesktopWait".to_owned());
         }
+        let run_lock = payload.run_lock()?.is_some();
         let bare = payload.path("Bare")?;
         let lock = payload.beside_work("Lock", work, "lock")?;
         let index = payload.beside_work("Index", work, "index")?;
@@ -304,7 +309,9 @@ impl<'p> Request<'p> {
         let commit_stage = payload.commit_stage_head()?.is_some();
         // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
         let (main, siblings) = repos(payload, work, bare, (snapshot, lfs_digest))?;
+        // A `--lock` run first: this builder holds no lock, so it never runs one without it.
         let unbuilt = [
+            (run_lock, Refusal::Lock, "RunLock"),
             (desktop, Refusal::Desktop, "Desktop"),
             (commit_stage, Refusal::Layout, "CommitStage"),
             (warm, Refusal::Layout, "WarmCommands"),
@@ -4855,6 +4862,28 @@ mod tests {
         let case = Case::new("desktop");
         let desktop = json!({ "Desktop": true, "DesktopWait": 60 });
         assert_refused(&case, &desktop, Refusal::Desktop, "gate: remote Desktop is not built on this builder");
+    }
+
+    #[test]
+    fn a_unix_box_refuses_run_lock_with_the_lock_tag() {
+        let case = Case::new("run-lock");
+        let lock = json!({ "RunLock": "mac-signing", "RunLockWait": 60 });
+        assert_refused(&case, &lock, Refusal::Lock, "gate: this builder holds no --lock locks");
+        let with_desktop = json!({ "RunLock": "mac-signing", "RunLockWait": 60, "Desktop": true, "DesktopWait": 60 });
+        assert_refused(&case, &with_desktop, Refusal::Lock, "gate: this builder holds no --lock locks");
+        let commit = "a".repeat(40);
+        for (extra, line) in [
+            (
+                json!({ "RunLock": "Mac", "RunLockWait": 60 }),
+                "gate: box payload RunLock is not a lock name: Mac",
+            ),
+            (json!({ "RunLock": "mac-signing" }), "gate: box payload RunLock comes with RunLockWait"),
+        ] {
+            let (status, said) = ran(&case.json(&commit, &extra));
+            assert_eq!(status, 2, "{line}: {said:?}");
+            assert_eq!(said, [line]);
+            assert!(!Path::new(&case.lock()).exists(), "the lock is not taken");
+        }
     }
 
     #[test]

@@ -82,6 +82,7 @@ pub fn heavy(words: &[String]) -> Inputs<'_> {
         given: None,
         pin: None,
         desktop_hidden: false,
+        lock_run: false,
     }
 }
 

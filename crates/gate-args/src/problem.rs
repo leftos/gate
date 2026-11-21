@@ -8,7 +8,7 @@ use crate::remote::RemoteProblem;
 use crate::request::{DESKTOP_MODES, DESKTOP_SESSIONS};
 #[cfg(feature = "test-seams")]
 use crate::values::MAX_MUTEX_NAME;
-use crate::values::{EnvRefusal, escaped, shown_name};
+use crate::values::{EnvRefusal, MOST_LOCK_NAME_CHARS, escaped, shown_name};
 
 /// The largest value a timeout, stall window, tail or test-seam value may take.
 pub const MAX_WHOLE_NUMBER: u64 = 2_147_483_647;
@@ -184,6 +184,8 @@ pub enum Problem {
     DesktopCannotRoute {
         why: String,
     },
+    /// A `--lock` the run cannot take ([`LockProblem`]).
+    Lock(LockProblem),
     /// A run that must state its reason (`local`, `slot critical`, or both) and gave no `--reason`, in the caller's
     /// spelling.
     ReasonNeeded {
@@ -229,6 +231,33 @@ pub enum Problem {
     EnvForwardNotSet(usize),
     /// A `--env` word naming a variable to forward whose value is not Unicode, `n` its position among the run's words.
     EnvForwardNotUnicode(usize),
+}
+
+/// Why a run cannot take its `--lock`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LockProblem {
+    /// A value that is not a lock name ([`crate::is_lock_name`]), as given.
+    BadName(String),
+    /// `--lock` given a second time.
+    GivenTwice,
+    /// `--lock` given on a run that can never route, with `with`, the option that keeps it here: `--local`,
+    /// `--slot critical` or `--slot none`.
+    CannotRoute { with: String },
+}
+
+impl fmt::Display for LockProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LockProblem::BadName(value) => write!(
+                f,
+                "gate: --lock takes a name of lower-case letters, digits and hyphens that starts with a letter or digit, at most \
+                 {MOST_LOCK_NAME_CHARS} characters, not '{}'",
+                escaped(value)
+            ),
+            LockProblem::GivenTwice => f.write_str("gate: --lock is given once"),
+            LockProblem::CannotRoute { with } => write!(f, "gate: --lock cannot go with {with}: a --lock run runs only on a builder"),
+        }
+    }
 }
 
 impl fmt::Display for Problem {
@@ -309,6 +338,7 @@ impl fmt::Display for Problem {
             Problem::BuilderCannotRoute { host, why } => write!(f, "gate: --builder {} cannot route this run: {why}", escaped(host)),
             Problem::BadDesktop { option, value } => write!(f, "gate: {option} takes hidden, got '{value}'"),
             Problem::DesktopCannotRoute { why } => write!(f, "gate: --desktop hidden cannot route this run: {why}"),
+            Problem::Lock(problem) => write!(f, "{problem}"),
             Problem::ReasonNeeded { local, critical, spelling } => f.write_str(match (local, critical, spelling) {
                 (true, false, Spelling::Cli) => "gate: --local needs --reason \"<why>\"",
                 (false, true, Spelling::Cli) => "gate: --slot critical needs --reason \"<why>\"",

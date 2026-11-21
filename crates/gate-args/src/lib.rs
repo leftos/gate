@@ -28,7 +28,7 @@ use std::ffi::OsString;
 
 pub use batch::{BatchRefusal, batch_command_line, batch_refusal, is_batch_target, quote_batch_arg, quote_batch_arg_str};
 pub use cmdline::{command_line, command_text, quote_arg, quote_arg_str};
-pub use problem::{MAX_WHOLE_NUMBER, Problem, Required, Spelling};
+pub use problem::{LockProblem, MAX_WHOLE_NUMBER, Problem, Required, Spelling};
 pub use program::{ProgramSearch, is_godot_console, resolve_program};
 pub use remote::RemoteProblem;
 pub use request::WarmRequest;
@@ -41,8 +41,8 @@ pub use request::{
 pub use request::{REMOTE_BUILDER_SECTIONS, REMOTE_SECTIONS, RemoteMatchRequest, RemoteRequest, RemoteVerb};
 pub use usage::USAGE;
 pub use values::{
-    EnvRefusal, GATE_NAME_PREFIX, GATE_SET_NAMES, GATE_SET_PREFIXES, GIT_READ_NAMES, MACHINE_PATH_NAMES, MOST_ENV_BYTES, MOST_ENV_NAMES, env_refusal,
-    over_cap, repeated_name, shown_name,
+    EnvRefusal, GATE_NAME_PREFIX, GATE_SET_NAMES, GATE_SET_PREFIXES, GIT_READ_NAMES, MACHINE_PATH_NAMES, MOST_ENV_BYTES, MOST_ENV_NAMES,
+    MOST_LOCK_NAME_CHARS, env_refusal, is_lock_name, over_cap, repeated_name, shown_name,
 };
 
 /// Reads the gate's arguments, without the program name.

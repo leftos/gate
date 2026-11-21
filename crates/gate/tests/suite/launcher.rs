@@ -480,6 +480,70 @@ fn a_run_desktop_value_given_as_its_own_word_reaches_gate_exe() {
     }
 }
 
+/// A `run` holding a lock writes its name as a word of its own: the launcher must read it as the option's value and not
+/// as the command's first word, whichever side of `--slot` the option falls.
+#[test]
+fn a_run_lock_value_given_as_its_own_word_reaches_gate_exe() {
+    let case = Case::new("a_run_lock_value_given_as_its_own_word_reaches_gate_exe");
+    let exe = install_gate(&case);
+    let command = ["cmd", "/c", "echo", "hi"];
+    let orderings = [
+        [
+            "run",
+            "--lock",
+            "mac-signing",
+            "--log",
+            "out.log",
+            "--timeout",
+            "5",
+            "--slot",
+            "heavy",
+            "--test-print-request",
+        ],
+        [
+            "run",
+            "--log",
+            "out.log",
+            "--timeout",
+            "5",
+            "--slot",
+            "heavy",
+            "--lock",
+            "mac-signing",
+            "--test-print-request",
+        ],
+    ];
+
+    for options in orderings {
+        let in_session: Vec<&str> = options.iter().chain(&command).copied().collect();
+        let restored: Vec<&str> = options.iter().chain(&["--"]).chain(&command).copied().collect();
+
+        let handed = run_launcher_in_session(&case, &in_session);
+        let direct = run_direct(&exe, &case, &restored);
+
+        assert_eq!(
+            handed.request(),
+            direct.request(),
+            "the launcher did not put the -- back: {options:?}: {handed:?}"
+        );
+        assert_eq!(
+            handed.request()["command"],
+            serde_json::json!(command),
+            "a command word was split or lost: {options:?}"
+        );
+        assert_eq!(handed.request()["lock"], "mac-signing", "the lock was lost: {options:?}");
+
+        let filed = run_launcher(&case, &restored);
+
+        assert_eq!(
+            filed.request(),
+            direct.request(),
+            "the -File call with its -- was split: {options:?}: {filed:?}"
+        );
+        assert_eq!(filed.request()["lock"], "mac-signing", "the lock was lost through -File: {options:?}");
+    }
+}
+
 #[test]
 fn the_stop_tree_subcommand_is_handed_over_as_it_came() {
     let case = Case::new("the_stop_tree_subcommand_is_handed_over_as_it_came");
@@ -778,6 +842,118 @@ fn with_no_gate_csharp_says_it_cannot_and_fails() {
     assert_eq!(ran.code, Some(1), "{ran:?}");
     assert_eq!(ran.stdout, "", "{ran:?}");
     assert_eq!(lines(&ran.stderr), "gate: no gate.exe found; cannot run gate csharp", "{ran:?}");
+}
+
+#[test]
+fn a_lock_run_without_gate_exe_is_refused_and_runs_nothing() {
+    let case = Case::new("a_lock_run_without_gate_exe_is_refused_and_runs_nothing");
+    let marker = case.folder().join("marker.txt");
+    let marked = shown(&marker);
+    let calls: [&[&str]; 2] = [
+        &[
+            "run",
+            "--lock",
+            "mac-signing",
+            "--log",
+            "out.log",
+            "--timeout",
+            "5",
+            "--slot",
+            "heavy",
+            "--",
+            FAKE_TOOL,
+            "mark",
+            &marked,
+        ],
+        &[
+            "run",
+            "--log",
+            "out.log",
+            "--timeout",
+            "5",
+            "--slot",
+            "heavy",
+            "--lock=mac-signing",
+            "--",
+            FAKE_TOOL,
+            "mark",
+            &marked,
+        ],
+    ];
+
+    for call in calls {
+        let ran = run_launcher(&case, call);
+        assert_eq!(ran.code, Some(2), "{call:?}: {ran:?}");
+        assert_eq!(ran.stdout, "", "{call:?}: {ran:?}");
+        assert_eq!(
+            lines(&ran.stderr),
+            "gate: --lock needs gate.exe: a --lock run runs only on a builder",
+            "{call:?}: {ran:?}"
+        );
+        assert!(!marker.exists(), "the command never ran: {call:?}");
+    }
+}
+
+#[test]
+fn a_mis_cased_lock_equals_run_without_gate_exe_is_refused() {
+    let case = Case::new("a_mis_cased_lock_equals_run_without_gate_exe_is_refused");
+    let marker = case.folder().join("marker.txt");
+    let marked = shown(&marker);
+
+    let ran = run_launcher(
+        &case,
+        &[
+            "run",
+            "--Lock=a",
+            "--log",
+            "out.log",
+            "--timeout",
+            "5",
+            "--slot",
+            "heavy",
+            "--",
+            FAKE_TOOL,
+            "mark",
+            &marked,
+        ],
+    );
+
+    assert_eq!(ran.code, Some(2), "{ran:?}");
+    assert_eq!(ran.stdout, "", "{ran:?}");
+    assert_eq!(
+        lines(&ran.stderr),
+        "gate: --lock needs gate.exe: a --lock run runs only on a builder",
+        "{ran:?}"
+    );
+    assert!(!marker.exists(), "the command never ran");
+}
+
+#[test]
+fn a_reason_whose_text_is_lock_without_gate_exe_is_not_refused_as_a_lock_run() {
+    let case = Case::new("a_reason_whose_text_is_lock_without_gate_exe_is_not_refused_as_a_lock_run");
+
+    let ran = run_launcher(
+        &case,
+        &[
+            "run",
+            "--reason",
+            "--lock",
+            "--log",
+            "out.log",
+            "--timeout",
+            "5",
+            "--slot",
+            "heavy",
+            "--",
+            FAKE_TOOL,
+            "out",
+            "hi",
+        ],
+    );
+
+    assert_eq!(ran.code, Some(0), "{ran:?}");
+    assert_eq!(lines(&ran.stdout), "hi", "{ran:?}");
+    assert_eq!(lines(&ran.stderr), NO_GATE, "{ran:?}");
 }
 
 #[test]

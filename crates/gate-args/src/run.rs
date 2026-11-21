@@ -4,7 +4,7 @@ use std::ffi::{OsStr, OsString};
 use std::iter::Peekable;
 use std::path::PathBuf;
 
-use crate::problem::{Problem, Required, Spelling};
+use crate::problem::{LockProblem, Problem, Required, Spelling};
 use crate::request::{
     BurnRequest, Ceiling, CheckRequest, CheckSeams, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, DrainAction,
     DrainRequest, DrainSeams, ExpectRequest, PruneRequest, PruneSeams, PushRequest, PushSeams, RunRequest, Slot, StopRequest, TestSeams, WarmRequest,
@@ -47,6 +47,7 @@ pub(crate) enum ValueOption {
     Reason,
     Builder,
     Desktop,
+    Lock,
     #[cfg(feature = "test-seams")]
     SampleMs,
     #[cfg(feature = "test-seams")]
@@ -275,6 +276,8 @@ pub(crate) struct RunBuilder {
     builder: Option<String>,
     /// `--desktop hidden`: the run's desktop command runs on a hidden desktop.
     desktop_hidden: bool,
+    /// `--lock <name>`: the builder-wide lock the run holds on its builder.
+    lock: Option<String>,
     /// `gate check`'s own seams (`CheckSeams`); its builder seams are read into `test_seams`, as a run's are.
     check_seams: CheckSeams,
     given: Vec<RunOption>,
@@ -297,12 +300,17 @@ impl RunBuilder {
         self.given.iter().any(|option| !is_print_request(*option))
     }
 
-    /// Records `option` as given, or the problem of its being given twice; `--bring-tracked` and `--env` may be given any
-    /// number of times.
+    /// Records `option` as given, or the problem of its being given twice, which `--lock` says as given once;
+    /// `--bring-tracked` and `--env` may be given any number of times.
     fn first_time(&mut self, option: RunOption, spelled: &str) -> bool {
         let repeatable = matches!(option, RunOption::Value(ValueOption::BringTracked | ValueOption::Env));
         if self.given.contains(&option) && !repeatable {
-            self.problems.push(Problem::GivenTwice(spelled.to_owned()));
+            let problem = if option == RunOption::Value(ValueOption::Lock) {
+                Problem::Lock(LockProblem::GivenTwice)
+            } else {
+                Problem::GivenTwice(spelled.to_owned())
+            };
+            self.problems.push(problem);
             return false;
         }
         self.given.push(option);
@@ -324,12 +332,13 @@ impl RunBuilder {
         Ok(())
     }
 
-    /// Reads `option`'s value, spelled `spelled` by the caller; an empty value is no value.
+    /// Reads `option`'s value, spelled `spelled` by the caller; an empty value is no value, but for `--lock`, whose
+    /// name rule refuses it.
     pub(crate) fn value(&mut self, option: ValueOption, spelled: &str, value: &str) {
         if !self.first_time(RunOption::Value(option), spelled) {
             return;
         }
-        if value.is_empty() {
+        if value.is_empty() && option != ValueOption::Lock {
             if option == ValueOption::Env {
                 self.next_env_word();
             }
@@ -382,6 +391,7 @@ impl RunBuilder {
             ValueOption::Reason => self.reason = Some(Self::reason_value(spelled, value)?),
             ValueOption::Builder => self.builder = Some(value.to_owned()),
             ValueOption::Desktop => self.desktop_hidden = Self::desktop_value(spelled, value)?,
+            ValueOption::Lock => self.lock = Some(values::lock_name(value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::SampleMs
             | ValueOption::LoadWindowMs
@@ -526,7 +536,8 @@ impl RunBuilder {
             | ValueOption::Env
             | ValueOption::Reason
             | ValueOption::Builder
-            | ValueOption::Desktop => {}
+            | ValueOption::Desktop
+            | ValueOption::Lock => {}
         }
         Ok(())
     }
@@ -655,6 +666,7 @@ impl RunBuilder {
                 alone: self.alone,
                 builder: self.builder,
                 desktop_hidden: self.desktop_hidden,
+                lock: self.lock,
                 reason: self.reason,
                 bring_tracked: self.bring_tracked,
                 env: self.env,
@@ -669,8 +681,13 @@ impl RunBuilder {
         }
     }
 
-    /// Refuses a `--builder` pin and `--desktop hidden` on a run that can never route ([`Self::never_routes`]).
+    /// Refuses a `--builder` pin, `--desktop hidden` and `--lock` on a run that can never route ([`Self::never_routes`]).
     fn check_never_routes(&mut self) {
+        if self.lock.is_some()
+            && let Some(with) = self.kept_here_by()
+        {
+            self.problems.push(Problem::Lock(LockProblem::CannotRoute { with }));
+        }
         let Some(why) = self.never_routes() else {
             return;
         };
@@ -682,6 +699,18 @@ impl RunBuilder {
         }
         if self.desktop_hidden {
             self.problems.push(Problem::DesktopCannotRoute { why });
+        }
+    }
+
+    /// The option that keeps the run here, as the caller gives it: `--local`, else `--slot critical` or `--slot none`;
+    /// `None` for a run that may route.
+    fn kept_here_by(&self) -> Option<String> {
+        if self.local {
+            return Some("--local".to_owned());
+        }
+        match self.slot {
+            Some(slot @ (Slot::Critical | Slot::None)) => Some(format!("--slot {}", slot.as_str())),
+            _ => None,
         }
     }
 

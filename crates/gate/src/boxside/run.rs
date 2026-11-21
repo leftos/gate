@@ -211,7 +211,13 @@ pub(super) struct Request<'a> {
     /// The folders below the main repo's tree whose files the clear after an interrupted command leaves alone,
     /// `SpareFolders`; none when the payload gives none.
     spare: Vec<String>,
+    /// The `--lock` the run holds, its `RunLock`, which this box refuses ([`LOCK_REFUSED_LINE`]); `None` for a run
+    /// holding none.
+    run_lock: Option<&'a str>,
 }
+
+/// The line a Windows box says after its `lock` refusal tag: it holds no `--lock` locks.
+const LOCK_REFUSED_LINE: &str = "gate: a Windows builder holds no --lock locks";
 
 impl Request<'_> {
     /// Whether this run is a commit stage's.
@@ -232,6 +238,8 @@ impl Request<'_> {
         let nonce = payload.nonce()?;
         let outputs = Asked::new((&globs, &failure), full, key, nonce, payload.output_folder(work)?)?;
         let (timeout, host) = (payload.timeout()?, payload.optional_text("Host")?);
+        // Read and judged here; the run refuses it once read, before its admission and its work lock.
+        let run_lock = payload.run_lock()?;
         // A run of the builder's desktop has to say how long it may wait for one; a wait no run asks for is ignored,
         // whatever it says.
         let asked = payload.desktop()?;
@@ -312,6 +320,7 @@ impl Request<'_> {
             inputs_digest,
             sent_digest,
             spare,
+            run_lock,
         })
     }
 
@@ -747,6 +756,13 @@ pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) ->
             return u32::from(USAGE_STATUS);
         }
     };
+    // This box holds no `--lock` locks: a run holding one is refused rather than run without it, before it is admitted
+    // or takes the work folder.
+    if request.run_lock.is_some() {
+        stamping::protocol(console, &refused_line(request.nonce, Refusal::Lock));
+        stamping::err(console, LOCK_REFUSED_LINE);
+        return REFUSED_STATUS;
+    }
     // Held until the run returns, its command and back commit done, so a drain counts the run as going.
     let _admitted = match admitted(payload, &request, seams, console) {
         Ok(admitted) => admitted,

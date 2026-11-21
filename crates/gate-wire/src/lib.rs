@@ -15,6 +15,8 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use gate_args::{EnvRefusal, MAX_WHOLE_NUMBER, MOST_ENV_BYTES, MOST_ENV_NAMES, env_refusal, over_cap, repeated_name, shown_name};
+/// The lock name rule, one function for the PC's `--lock` parse and each box's read of `RunLock`.
+pub use gate_args::{MOST_LOCK_NAME_CHARS, is_lock_name};
 use gate_router::warm::MOST_COMMANDS;
 pub use gate_router::{GATE_FOLDER_MARK, escaped};
 use gate_router::{is_layout_name, repo_name};
@@ -683,6 +685,36 @@ impl Payload {
                 .filter(|seconds| (1..=MAX_WHOLE_NUMBER).contains(seconds))
                 .map(Some)
                 .ok_or_else(|| "gate: box payload DesktopWait is not a whole number of seconds".to_owned()),
+        }
+    }
+
+    /// The builder-wide lock the run holds while its command runs, `RunLock`, a lock name ([`is_lock_name`], the rule
+    /// `--lock` parses by); `None` when the key is absent or null. Else the usage line: a value that is not a text, a
+    /// text that is not a lock name, shown with its control characters escaped, a lock without its `RunLockWait`, or a
+    /// `RunLockWait` the box refuses ([`Payload::run_lock_wait`]).
+    pub fn run_lock(&self) -> Result<Option<&str>, String> {
+        let Some(name) = self.text_or_none("RunLock")? else {
+            return Ok(None);
+        };
+        if !is_lock_name(name) {
+            return Err(format!("gate: box payload RunLock is not a lock name: {}", escaped(name)));
+        }
+        if self.run_lock_wait()?.is_none() {
+            return Err("gate: box payload RunLock comes with RunLockWait".to_owned());
+        }
+        Ok(Some(name))
+    }
+
+    /// The run's `RunLockWait`: whole seconds from 1 to 2147483647, how long the box may wait for the run's lock
+    /// ([`Payload::run_lock`]); `None` when the key is absent or null. Else the usage line.
+    pub fn run_lock_wait(&self) -> Result<Option<u64>, String> {
+        match self.object.get("RunLockWait") {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => value
+                .as_u64()
+                .filter(|seconds| (1..=MAX_WHOLE_NUMBER).contains(seconds))
+                .map(Some)
+                .ok_or_else(|| "gate: box payload RunLockWait is not a whole number of seconds".to_owned()),
         }
     }
 
@@ -1873,6 +1905,8 @@ pub enum Refusal {
     /// The data channel did not complete: nothing was installed. A pull's outputs archive is kept; a put's stage is
     /// removed.
     Channel,
+    /// The run holds a `--lock` (`RunLock`) the builder cannot give it.
+    Lock,
 }
 
 impl Refusal {
@@ -1892,6 +1926,7 @@ impl Refusal {
             Refusal::Drain => "drain",
             Refusal::Full => "full",
             Refusal::Channel => "channel",
+            Refusal::Lock => "lock",
         }
     }
 }
@@ -2594,6 +2629,7 @@ mod tests {
                 (Refusal::Drain, "drain"),
                 (Refusal::Full, "full"),
                 (Refusal::Channel, "channel"),
+                (Refusal::Lock, "lock"),
             ] {
                 assert_eq!(refusal.word(), word);
                 assert_eq!(refused_line(NONCE, refusal), format!("gate-remote-refused: {NONCE} {word}"));
@@ -3866,6 +3902,85 @@ mod tests {
             Err("gate: box payload DesktopSession needs Desktop".to_owned()),
             "absent Desktop"
         );
+    }
+
+    #[test]
+    fn a_run_lock_outside_the_name_rule_is_a_usage_line() {
+        let lock = |json: serde_json::Value| decoded(&json.to_string()).and_then(|payload| payload.run_lock().map(|name| name.map(str::to_owned)));
+        assert_eq!(lock(json!({})), Ok(None), "absent");
+        assert_eq!(lock(json!({ "RunLock": null })), Ok(None), "null");
+        assert_eq!(
+            lock(json!({ "RunLock": "mac-signing", "RunLockWait": 30 })),
+            Ok(Some("mac-signing".to_owned()))
+        );
+        let too_long = "a".repeat(64);
+        for bad in [
+            "",
+            "-x",
+            "Mac",
+            "mac_signing",
+            "mac.signing",
+            "../x",
+            "a/b",
+            "mac signing",
+            "ä",
+            too_long.as_str(),
+        ] {
+            assert_eq!(
+                lock(json!({ "RunLock": bad, "RunLockWait": 30 })),
+                Err(format!("gate: box payload RunLock is not a lock name: {bad}")),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            lock(json!({ "RunLock": "a\nb", "RunLockWait": 30 })),
+            Err("gate: box payload RunLock is not a lock name: a\\nb".to_owned()),
+            "shown escaped"
+        );
+        for bad in [json!(1), json!(true), json!(["mac-signing"])] {
+            assert_eq!(
+                lock(json!({ "RunLock": bad, "RunLockWait": 30 })),
+                Err("gate: box payload RunLock is not a text".to_owned()),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_lock_without_run_lock_wait_is_a_usage_line() {
+        let lock = |json: serde_json::Value| decoded(&json.to_string()).and_then(|payload| payload.run_lock().map(|name| name.map(str::to_owned)));
+        for json in [
+            json!({ "RunLock": "mac-signing" }),
+            json!({ "RunLock": "mac-signing", "RunLockWait": null }),
+        ] {
+            assert_eq!(
+                lock(json.clone()),
+                Err("gate: box payload RunLock comes with RunLockWait".to_owned()),
+                "{json}"
+            );
+        }
+        assert_eq!(
+            lock(json!({ "RunLock": "mac-signing", "RunLockWait": 0 })),
+            Err("gate: box payload RunLockWait is not a whole number of seconds".to_owned()),
+            "a bad wait is refused as the wait"
+        );
+        assert_eq!(lock(json!({ "RunLockWait": 30 })), Ok(None), "a wait no lock asks for is ignored");
+    }
+
+    #[test]
+    fn run_lock_wait_is_whole_seconds_like_timeout() {
+        let wait = |json: serde_json::Value| decoded(&json.to_string()).and_then(|payload| payload.run_lock_wait());
+        assert_eq!(wait(json!({})), Ok(None), "absent");
+        assert_eq!(wait(json!({ "RunLockWait": null })), Ok(None), "null");
+        assert_eq!(wait(json!({ "RunLockWait": 1 })), Ok(Some(1)), "a second");
+        assert_eq!(wait(json!({ "RunLockWait": 2_147_483_647 })), Ok(Some(2_147_483_647)), "the ceiling");
+        for bad in [json!(0), json!("30"), json!(1.5), json!([30]), json!(-1), json!(2_147_483_648u64)] {
+            assert_eq!(
+                wait(json!({ "RunLockWait": bad })),
+                Err("gate: box payload RunLockWait is not a whole number of seconds".to_owned()),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

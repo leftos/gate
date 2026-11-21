@@ -2019,6 +2019,7 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         tail: request.tail,
         no_markers: request.no_markers,
         bring_tracked: &request.bring_tracked,
+        lock: request.lock.as_deref(),
         env,
         interrupt: host.interrupt,
         state: &root.root,
@@ -2127,14 +2128,21 @@ struct Walk {
     figures: Option<Figures>,
 }
 
+/// The walk of a routed run of `request`, a `desktop` run or not, once it waited `queued` in this PC's desktop queue and
+/// `key_waited` for its work folder's key ([`Walk::after_key`]), judged by whether it never runs here
+/// ([`wait::never_runs_here`]).
+fn key_walk(request: &RunRequest, desktop: bool, queued: Duration, key_waited: Duration) -> Walk {
+    Walk::after_key(queued, key_waited, wait::never_runs_here(request, desktop))
+}
+
 impl Walk {
-    /// The walk of a run that waited `queued` in this PC's desktop queue and `key_waited` for its work folder's key: a
-    /// `desktop` run's queue and key waits count as remote waits, so they and the remote slot waits share its one
-    /// budget, its ceiling; any other run, which never queues, has its remote budget start whole. A new drain session,
-    /// nothing tried yet.
-    fn after_key(queued: Duration, key_waited: Duration, desktop: bool) -> Walk {
+    /// The walk of a run that waited `queued` in this PC's desktop queue and `key_waited` for its work folder's key: the
+    /// queue and key waits of a run that `never_here` runs here ([`wait::never_runs_here`]) count as remote waits, so
+    /// they and the remote slot waits share its one budget, its ceiling; any other run has its remote budget start
+    /// whole. A new drain session, nothing tried yet.
+    fn after_key(queued: Duration, key_waited: Duration, never_here: bool) -> Walk {
         Walk {
-            waited: if desktop { queued + key_waited } else { Duration::ZERO },
+            waited: if never_here { queued + key_waited } else { Duration::ZERO },
             session: remote::payload::run_nonce(),
             tried: HashSet::new(),
             built: Vec::new(),
@@ -2427,18 +2435,19 @@ fn prepare_log(log: &Log, console: &mut Console) -> Result<(), u32> {
     })
 }
 
-impl Run<'_> {
+impl<'r> Run<'r> {
     /// Decides where the command runs, and sets the remote tag of a routed run. A gate a parent's slot covers runs
     /// here, as does one whose light parent lends it its slot before it queues, while a critical request drains, which
     /// is not routed ([`Run::on_parent`]) but is decided as a lent gate ([`Nested::Lent`]), so a desktop command says it
     /// runs here ([`gate_router::LocalReason::DesktopUnderParent`]); a covered gate also says a routable one does
-    /// ([`gate_router::LocalReason::RoutableUnderParent`]); a run pinned with `--builder` or given `--desktop hidden`
-    /// asks for no lend, so it is decided as itself whatever a critical request is doing. The route, and what the
-    /// decision learnt of the gate's place in its worktree. The hash of the warm-up file the route asks the builder's
-    /// work folder to be warm with is kept for the call. `given` holds the words as the caller wrote them for a run
-    /// that dropped its `--no-build` before its route ([`route::route`]).
+    /// ([`gate_router::LocalReason::RoutableUnderParent`]); a run that is never lent ([`never_lent`]), pinned with
+    /// `--builder`, given `--desktop hidden` or holding a `--lock`, asks for no lend, so it is decided as itself whatever
+    /// a critical request is doing. The route, and what the decision learnt of the gate's place in its worktree. The
+    /// hash of the warm-up file the route asks the builder's work folder to be warm with is kept for the call. `given`
+    /// holds the words as the caller wrote them for a run that dropped its `--no-build` before its route
+    /// ([`route::route`]).
     fn route(&mut self, environment: &Environment, given: Option<&[String]>, console: &mut Console) -> (Route, Placed) {
-        if self.request.builder.is_none() && !self.request.desktop_hidden && self.lend_before_queue(console) {
+        if !never_lent(self.request) && self.lend_before_queue(console) {
             self.lent = true;
             let decided = route::route(self.request, environment, (Nested::Lent, None, given), (self.root, &self.gate), console);
             assert!(
@@ -2603,10 +2612,9 @@ impl Run<'_> {
 
     /// Asks a light parent whose slot does not cover this run, once it dropped its `--no-build` and asks for a heavy
     /// slot, whether it lends that slot before the run queues, as [`Run::route`] asked of the nesting the run was read
-    /// with; a run already lent its parent's slot keeps it, and a run pinned with `--builder` or given
-    /// `--desktop hidden` asks for none.
+    /// with; a run already lent its parent's slot keeps it, and a run that is never lent ([`never_lent`]) asks for none.
     fn lend_again(&mut self, console: &mut Console) {
-        if !self.lent && self.request.builder.is_none() && !self.request.desktop_hidden {
+        if !self.lent && !never_lent(self.request) {
             self.lent = self.lend_before_queue(console);
         }
     }
@@ -3079,12 +3087,12 @@ impl Run<'_> {
     /// client's work-folder key lock once, the worktree's on every builder, both held until the remote attempt ends
     /// ([`Run::take_locks`]), then tries each builder in turn ([`Run::attempt`]), its remote slot taken into `hold` and
     /// freed when it falls back. A key lock another run of the worktree holds is waited for up to its bound, and one
-    /// that stays held, like a client not ready, falls back here before any remote slot is taken; a pinned or desktop
-    /// run ends instead ([`Run::pin_ended`]). Each later candidate is built when it is tried
+    /// that stays held, like a client not ready, falls back here before any remote slot is taken; a pinned, desktop or
+    /// `--lock` run ends instead ([`Run::pin_ended`]). Each later candidate is built when it is tried
     /// ([`Run::next_candidate`]) and says its route lines once the fallback line naming it is said; the run's remote tag
     /// names it from its take on. A run whose last attempt fell back runs here, its local take counting from the run's
     /// queue line only when that fallback was the full remote pool; one a Ctrl+C or the client ended ends as it did,
-    /// and a desktop run whose walk found no builder left ends failed.
+    /// and a desktop or `--lock` run whose walk found no builder left ends failed.
     fn routed(&mut self, remote: &RemoteRun, hold: &mut Hold, console: &mut Console) -> Remotely {
         let (remotely, last) = self.try_builders(remote, hold, console);
         // Only a run whose last fallback is the full remote pool counts its local take from its own queue line; the
@@ -3098,7 +3106,8 @@ impl Run<'_> {
     /// The locks of the routed run `remote`'s remote attempt, taken in order, and the walk its attempts start from: a
     /// locked desktop run first takes this PC's desktop queue ([`Run::take_desktop_queue`]), so while another locked
     /// run is ahead of it it waits holding no key and no slot; then every run takes its work folder's key
-    /// ([`Run::take_key`]). The walk's remote budget is already spent by a desktop run's queue and key waits. Else how
+    /// ([`Run::take_key`]). The walk's remote budget is already spent by the queue and key waits of a run that never
+    /// runs here, a desktop or `--lock` run ([`key_walk`]). Else how
     /// the run goes on, as the take that failed ended it; a queue it could not take holds nothing.
     fn take_locks(&mut self, remote: &RemoteRun, console: &mut Console) -> Result<(Locks, Walk), Remotely> {
         let (queue, queued) = self.take_desktop_queue(remote, console)?;
@@ -3108,7 +3117,7 @@ impl Run<'_> {
         // Under the key lock, once a run: the key is the same for every builder the run tries.
         worktree_record::leave(&self.root.path, &remote.root, &remote.repo, &remote.key, console);
         // One drain session for every attempt and poll of the run.
-        let walk = Walk::after_key(queued, key_waited, self.is_desktop(remote));
+        let walk = key_walk(self.request, self.is_desktop(remote), queued, key_waited);
         Ok((Locks { _key: key, _queue: queue }, walk))
     }
 
@@ -3183,9 +3192,9 @@ impl Run<'_> {
     /// noted before anything of the next builder is built, then looks for the next builder of the routed run `first`
     /// ([`Run::next_candidate`]). The next builder's run, once the fallback line naming it and its route lines are said
     /// and the run's remote tag names it; else how the run ends: here, saying so, or, when a Ctrl+C ended the walk, as
-    /// an interrupt before the command started, saying only why the builder did not run it. A desktop run never runs
-    /// here: its next builder is looked for before the attempt is given up, and a walk with none left ends the run on
-    /// `current` ([`Run::pin_ended`]), its slot kept in `hold` for the release to let go.
+    /// an interrupt before the command started, saying only why the builder did not run it. A desktop or `--lock` run
+    /// never runs here ([`Run::never_here`]): its next builder is looked for before the attempt is given up, and a walk
+    /// with none left ends the run on `current` ([`Run::pin_ended`]), its slot kept in `hold` for the release to let go.
     fn after_refusal(
         &mut self,
         first: &RemoteRun,
@@ -3198,16 +3207,17 @@ impl Run<'_> {
         let said = self.drop_warm_record(current, reason);
         self.forget_builder(current, reason, console);
         // A connection lost once the command started ends the walk: the command may have run once already.
-        let early = self.is_desktop(current).then(|| {
+        let never_here = self.never_here(current);
+        let early = never_here.map(|_| {
             if outcome.lost_mid_run {
                 Next::Here
             } else {
                 self.next_candidate(first, reason, walk, console)
             }
         });
-        if matches!(early, Some(Next::Here)) {
+        if let (Some(Next::Here), Some(not_here)) = (&early, never_here) {
             hold.taken = held;
-            return Err(self.pin_ended(reason, &outcome, said.as_deref(), NotHere::Desktop, console));
+            return Err(self.pin_ended(reason, &outcome, said.as_deref(), not_here, console));
         }
         // The refused attempt's slot is let go here: the run holds nothing until it takes another.
         hold.took = None;
@@ -3498,9 +3508,9 @@ impl Run<'_> {
         Some(runs)
     }
 
-    /// What is left of the run's remote budget ([`wait::remote_budget`]), a `desktop` run's its ceiling, after `waited`,
-    /// the time its remote waits took so far: none for a light run a critical request sent here, which never waits for
-    /// the remote.
+    /// What is left of the run's remote budget ([`wait::remote_budget`]), a `desktop` or `--lock` run's its ceiling,
+    /// after `waited`, the time its remote waits took so far: none for a light run a critical request sent here, which
+    /// never waits for the remote.
     fn remote_left(&self, desktop: bool, waited: Duration) -> Duration {
         remote_left(self.request, desktop, self.rerouted_for.is_some(), waited)
     }
@@ -4075,8 +4085,8 @@ impl Run<'_> {
     }
 
     /// Gives up the remote attempt of the routed run `run` for `reason`, before it took a remote slot
-    /// ([`Run::give_up`]), and says the run goes on here; a run pinned with `--builder` and a desktop run end instead
-    /// ([`Run::pin_ended`]).
+    /// ([`Run::give_up`]), and says the run goes on here; a run pinned with `--builder`, a desktop run and a `--lock` run
+    /// end instead ([`Run::pin_ended`]).
     fn fell_back(&mut self, run: &RemoteRun, reason: FallbackReason, outcome: &RemoteOutcome, console: &mut Console) -> Remotely {
         if let Some(not_here) = self.not_here(run) {
             return self.pin_ended(reason, outcome, None, not_here, console);
@@ -4087,25 +4097,35 @@ impl Run<'_> {
     }
 
     /// Why the routed run `run` never runs here once its builder did not run it: pinned with `--builder`, which wins, or
-    /// a desktop run ([`Run::is_desktop`]); `None` for a run that falls back here.
-    fn not_here(&self, run: &RemoteRun) -> Option<NotHere> {
+    /// not pinned and never here ([`Run::never_here`]); `None` for a run that falls back here.
+    fn not_here(&self, run: &RemoteRun) -> Option<NotHere<'r>> {
         if self.request.builder.is_some() {
             Some(NotHere::Pinned)
         } else {
-            self.is_desktop(run).then_some(NotHere::Desktop)
+            self.never_here(run)
         }
     }
 
-    /// Ends a run pinned with `--builder`, or a desktop run, whose builder did not run it, for `reason`, as `not_here`
-    /// says: no other builder is tried, nothing runs here and no fallback is journaled. Says why after the fallback head
-    /// ([`not_here_line`]), then `said`, the line of a warm-up record the refusal dropped, and ends the log; the run ends
-    /// failed, its release journaled with the run's remote tag.
+    /// Why the routed run `run` ends rather than running here once no builder ran it: it holds a `--lock`, which names
+    /// it before a desktop run does ([`Run::is_desktop`]); `None` for a run that runs here.
+    fn never_here(&self, run: &RemoteRun) -> Option<NotHere<'r>> {
+        let request: &'r RunRequest = self.request;
+        match request.lock.as_deref() {
+            Some(name) => Some(NotHere::Lock(name)),
+            None => self.is_desktop(run).then_some(NotHere::Desktop),
+        }
+    }
+
+    /// Ends a run pinned with `--builder`, a desktop run or a `--lock` run, whose builder did not run it, for `reason`,
+    /// as `not_here` says: no other builder is tried, nothing runs here and no fallback is journaled. Says why after the
+    /// fallback head ([`not_here_line`]), then `said`, the line of a warm-up record the refusal dropped, and ends the
+    /// log; the run ends failed, its release journaled with the run's remote tag.
     fn pin_ended(
         &mut self,
         reason: FallbackReason,
         outcome: &RemoteOutcome,
         said: Option<&str>,
-        not_here: NotHere,
+        not_here: NotHere<'_>,
         console: &mut Console,
     ) -> Remotely {
         let host = self.tag.as_ref().map_or_else(String::new, |tag| tag.host.clone());
@@ -6337,20 +6357,29 @@ fn fallback_head(host: &str, reason: FallbackReason, detail: Option<&str>) -> St
     }
 }
 
-/// Whether a routed run of `request` waits out its work folder's other holders up to its own ceiling: a `desktop` run,
-/// which never runs here, and a heavy run, which here would take a heavy slot for its whole length and build again what
-/// the work folder already holds. A commit's stage (`staged`) and a light run keep the short wait.
+/// Whether a routed run of `request` waits out its work folder's other holders up to its own ceiling: a `desktop` run
+/// or a `--lock` run, which never run here ([`wait::never_runs_here`]), and a heavy run, which here would take a heavy slot
+/// for its whole length and build again what the work folder already holds. A commit's stage (`staged`) and a light
+/// run keep the short wait.
 fn waits_its_ceiling(request: &RunRequest, desktop: bool, staged: bool) -> bool {
-    desktop || (request.slot == Slot::Heavy && !staged)
+    wait::never_runs_here(request, desktop) || (request.slot == Slot::Heavy && !staged)
+}
+
+/// Whether a run of `request` is never lent its light parent's slot, so it is decided as itself whatever a critical
+/// request is doing: one pinned with `--builder`, given `--desktop hidden`, or holding a `--lock`, none of which a
+/// parent's slot here can run.
+fn never_lent(request: &RunRequest) -> bool {
+    request.builder.is_some() || request.desktop_hidden || request.lock.is_some()
 }
 
 /// How long a routed run of `request` waits for its worktree's work folder while another of its runs holds it
-/// ([`Run::take_key`]): `--test-key-wait-ms`, else the run's own ceiling for a `desktop` run, which never runs here and
-/// waits for the folder as long as it may run there, else the longer of that ceiling and [`KEY_WAIT`] for a run that
-/// `patient` waits its ceiling ([`waits_its_ceiling`]), else [`KEY_WAIT`].
+/// ([`Run::take_key`]): `--test-key-wait-ms`, else the run's own ceiling for a `desktop` run or a `--lock` run, which
+/// never run here ([`wait::never_runs_here`]) and wait for the folder as long as they may run there, else the longer of
+/// that ceiling and [`KEY_WAIT`] for a run that `patient` waits its ceiling ([`waits_its_ceiling`]), else
+/// [`KEY_WAIT`].
 fn key_limit(request: &RunRequest, desktop: bool, patient: bool) -> Duration {
     let ceiling = Duration::from_secs(request.timeout.floor());
-    let unseamed = if desktop {
+    let unseamed = if wait::never_runs_here(request, desktop) {
         ceiling
     } else if patient {
         ceiling.max(KEY_WAIT)
@@ -6407,36 +6436,39 @@ const DESKTOP_NOT_HERE: &str = "a desktop run never runs here";
 
 /// Why a routed run whose builder did not run it ends instead of running here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NotHere {
+enum NotHere<'a> {
     /// The run was pinned with `--builder`.
     Pinned,
     /// The run is a desktop run.
     Desktop,
+    /// The run holds the `--lock` of this name, which only a builder holds.
+    Lock(&'a str),
 }
 
 /// The line a routed run says as it ends, not running here, for `reason` from the builder `host` ([`NotHere`]): the
-/// fallback head ([`fallback_head`]), then [`PIN_NOT_HERE`] or [`DESKTOP_NOT_HERE`]; a pinned or desktop run whose
-/// `outcome` says the run call's connection was lost after the start says before it that the command may have run there.
-fn not_here_line(host: &str, reason: FallbackReason, outcome: &RemoteOutcome, not_here: NotHere) -> String {
+/// fallback head ([`fallback_head`]), then [`PIN_NOT_HERE`], [`DESKTOP_NOT_HERE`] or `a --lock <name> run never runs
+/// here`; a run whose `outcome` says the run call's connection was lost after the start says before it that the
+/// command may have run there.
+fn not_here_line(host: &str, reason: FallbackReason, outcome: &RemoteOutcome, not_here: NotHere<'_>) -> String {
     let head = fallback_head(host, reason, outcome.detail.as_deref());
-    match not_here {
-        NotHere::Pinned if outcome.lost_mid_run => {
-            format!("{head} after the command started; it may have run there; {PIN_NOT_HERE}")
-        }
-        NotHere::Pinned => format!("{head}; {PIN_NOT_HERE}"),
-        NotHere::Desktop if outcome.lost_mid_run => {
-            format!("{head} after the command started; it may have run there; {DESKTOP_NOT_HERE}")
-        }
-        NotHere::Desktop => format!("{head}; {DESKTOP_NOT_HERE}"),
+    let why = match not_here {
+        NotHere::Pinned => PIN_NOT_HERE.to_owned(),
+        NotHere::Desktop => DESKTOP_NOT_HERE.to_owned(),
+        NotHere::Lock(name) => format!("a --lock {name} run never runs here"),
+    };
+    if outcome.lost_mid_run {
+        format!("{head} after the command started; it may have run there; {why}")
+    } else {
+        format!("{head}; {why}")
     }
 }
 
 /// The fallback reasons worth another builder: a builder that is full, busy, cannot be reached, or lacks the version,
-/// parity, install or tools the run needs may be one another builder has. Every other reason runs here, and a desktop
-/// run ends instead: the PC's own failures (`client`, a copy of a user tool this PC cannot read among them, `inputs`,
-/// `lfs`, and `push`, a snapshot push that failed other than as a connection fails) and those of the worktree, the
-/// desktop or a lost run.
-const RETRIED: [FallbackReason; 7] = [
+/// parity, install, tools or `--lock` the run needs may be one another builder has. Every other reason runs here, and a
+/// desktop or `--lock` run ends instead: the PC's own failures (`client`, a copy of a user tool this PC cannot read
+/// among them, `inputs`, `lfs`, and `push`, a snapshot push that failed other than as a connection fails) and those of
+/// the worktree, the desktop or a lost run.
+const RETRIED: [FallbackReason; 8] = [
     FallbackReason::Full,
     FallbackReason::Busy,
     FallbackReason::Unreachable,
@@ -6444,6 +6476,7 @@ const RETRIED: [FallbackReason; 7] = [
     FallbackReason::Parity,
     FallbackReason::Install,
     FallbackReason::Tools,
+    FallbackReason::Lock,
 ];
 
 /// A line holding a failure marker: its number, counted from 1, and its text as printed.
@@ -6862,6 +6895,38 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_run_waits_its_ceiling_for_a_full_builder() {
+        let mut request = crate::wait::scratch::request(Slot::Light);
+        request.timeout = gate_args::Ceiling::Given(900);
+        request.lock = Some("mac-signing".to_owned());
+        let ceiling = Duration::from_mins(15);
+        assert_eq!(
+            crate::wait::remote_budget(&request, false),
+            ceiling,
+            "a --lock run waits for a full builder up to its ceiling, not 60 s"
+        );
+        assert_eq!(
+            super::remote_left(&request, false, false, Duration::from_secs(100)),
+            Duration::from_secs(800)
+        );
+        assert_eq!(
+            super::key_limit(&request, false, false),
+            ceiling,
+            "and for its work folder's key the same"
+        );
+        assert!(super::waits_its_ceiling(&request, false, true), "even a light one");
+        let walk = super::key_walk(&request, false, Duration::ZERO, Duration::from_secs(100));
+        assert_eq!(walk.waited, Duration::from_secs(100), "its key wait spends the same budget");
+        request.lock = None;
+        assert_eq!(
+            crate::wait::remote_budget(&request, false),
+            crate::wait::REMOTE_LIMIT,
+            "a run without one waits 60 s"
+        );
+        assert!(!super::wait::never_runs_here(&request, false), "and may run here");
+    }
+
+    #[test]
     fn a_desktop_runs_key_bound_is_what_its_queue_wait_left_of_its_ceiling() {
         let mut request = crate::wait::scratch::request(Slot::Heavy);
         request.timeout = gate_args::Ceiling::Given(900);
@@ -7111,6 +7176,7 @@ mod tests {
                 tail: 0,
                 no_markers: false,
                 bring_tracked: &[],
+                lock: None,
                 env: &[],
                 interrupt: Some(interrupt),
                 state: &scratch.root.root,

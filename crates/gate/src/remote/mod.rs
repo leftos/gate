@@ -255,6 +255,9 @@ pub(crate) struct RemoteCall<'a> {
     /// How the run uses the builder's desktop, `None` for not at all, as the route's decision judged it; a warm-up
     /// never does.
     pub desktop: Option<DesktopMode>,
+    /// The `--lock` name, the builder-wide lock the run holds on the builder while its command runs; a warm-up never
+    /// holds one.
+    pub lock: Option<&'a str>,
     /// The `--bring-tracked` globs: a fetched output git tracks is installed only when one matches it.
     pub bring_tracked: &'a [String],
     /// The variables sent in the run call's `Env` for the command on the builder: the caller's `--env` pairs, then the
@@ -647,6 +650,7 @@ mod snapshot_only {
                 tail: 0,
                 no_markers: false,
                 bring_tracked: &[],
+                lock: None,
                 env: &[],
                 interrupt,
                 state: &STATE,
@@ -749,7 +753,7 @@ mod scripted {
     /// How often `wait` looks for its path and the interrupt.
     const WAIT_STEP: Duration = Duration::from_millis(20);
     /// Every reason a `refuse` step may give.
-    const REASONS: [FallbackReason; 17] = [
+    const REASONS: [FallbackReason; 18] = [
         FallbackReason::Full,
         FallbackReason::Busy,
         FallbackReason::Unreachable,
@@ -767,6 +771,7 @@ mod scripted {
         FallbackReason::Lfs,
         FallbackReason::Root,
         FallbackReason::Push,
+        FallbackReason::Lock,
     ];
 
     #[derive(Debug, Clone, PartialEq)]
@@ -1139,6 +1144,7 @@ mod scripted {
             "inputs": call.inputs,
             "desktop": call.desktop.is_some(),
             "desktopHidden": call.desktop == Some(gate_router::desktop::DesktopMode::Hidden),
+            "lock": call.lock,
             "log": call.log.to_string_lossy(),
             "timeout": call.timeout,
             "stall": call.stall,

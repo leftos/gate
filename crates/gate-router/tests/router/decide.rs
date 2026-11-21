@@ -4209,6 +4209,7 @@ fn a_hidden_pattern_neither_desktop_key_lists_stays_here_naming_both_keys() {
 fn hidden_run(inputs: Inputs<'_>) -> Inputs<'_> {
     Inputs {
         desktop_hidden: true,
+        lock_run: false,
         ..inputs
     }
 }
@@ -5941,6 +5942,20 @@ fn a_declared_local_pattern_keeps_a_consented_desktop_command_here() {
             })
         }
     );
+}
+
+#[test]
+fn a_lock_run_is_never_kept_faster_here() {
+    let facts = faster_desktop_facts(&["dotnet test*"]);
+    let command = words(&["dotnet", "build"]);
+    let inputs = Inputs {
+        lock_run: true,
+        ..light(&command)
+    };
+    let run = routed(decide(&inputs, &facts));
+    assert_eq!(run.builder.alias, "win-2");
+    assert_eq!(run.desktop, None, "no desktop pattern matched");
+    assert_eq!(facts.local_p50_asked.get(), 0, "a --lock run asks no local p50");
 }
 
 #[test]

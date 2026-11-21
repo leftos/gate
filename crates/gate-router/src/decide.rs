@@ -233,6 +233,10 @@ pub enum Nested {
 
 /// What the caller knows before the decision asks anything.
 #[derive(Debug, Clone, Copy)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is a fact of its own about the run, set independently of the others"
+)]
 pub struct Inputs<'a> {
     /// The gate's slot kind; only a heavy or light gate routes.
     pub slot: Slot,
@@ -257,6 +261,8 @@ pub struct Inputs<'a> {
     /// repo, and then runs as a hidden run ([`DesktopMode::Hidden`]), else it is refused; `false` for a run whose
     /// matched pattern gives its mode.
     pub desktop_hidden: bool,
+    /// The run holds a `--lock`, which runs only on a builder: no speed check keeps it here.
+    pub lock_run: bool,
 }
 
 /// The gate's place in its git worktree.
@@ -651,6 +657,8 @@ pub enum PinRefusal {
     HiddenKeptHere { reason: Option<LocalReason> },
     /// A `--desktop hidden` run on a covering parent's slot or inside a box run, which can never route.
     HiddenCovered,
+    /// A run holding the `--lock` `name` that would run here, for `why`: a `--lock` run runs only on a builder.
+    LockCannotRoute { name: String, why: String },
 }
 
 /// Why a desktop run the decision would keep here silently cannot route: no builder left once the macOS ones are
@@ -700,6 +708,17 @@ impl PinRefusal {
                 reason.as_ref().map_or_else(|| "nothing routes it".to_owned(), LocalReason::reason)
             ),
             Self::HiddenCovered => "gate: --desktop hidden cannot route under a parent gate".to_owned(),
+            Self::LockCannotRoute { name, why } => format!("gate: --lock {} cannot route this run: {why}", escaped(name)),
+        }
+    }
+
+    /// The refusal of a run holding the `--lock` `name` that the decision would keep here, for `reason`, `None` for one
+    /// it would keep here silently.
+    #[must_use]
+    pub fn lock_kept_here(name: &str, reason: Option<&LocalReason>) -> PinRefusal {
+        PinRefusal::LockCannotRoute {
+            name: name.to_owned(),
+            why: reason.map_or_else(|| "nothing routes it".to_owned(), LocalReason::reason),
         }
     }
 
@@ -2149,8 +2168,8 @@ fn matched(config: &Config, inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Ma
         .as_ref()
         .is_some_and(|(pattern, mode)| desktop_consent(config, &opened.repo, pattern, *mode).is_ok());
     let picked = || -> Result<Matched, Here> {
-        // A desktop run always routes, so it asks no local p50 that only the speed check would use.
-        let local_p50 = (inputs.slot == Slot::Light && !desktop_run)
+        // A desktop run and a `--lock` run always route, so they ask no local p50 that only the speed check would use.
+        let local_p50 = (inputs.slot == Slot::Light && !desktop_run && !inputs.lock_run)
             .then(|| facts.local_p50(&opened.place, &sent.words))
             .flatten();
         let candidates = candidates(config, &opened.repo, &sent.words, matching);
@@ -5136,6 +5155,26 @@ mod tests {
         FolderGlob, PinRefusal, Place, TreePath, carried_folder_inputs, derived_outputs, input_values, names_bin_folder, send_bin, switch_outputs,
         tree_path,
     };
+
+    #[test]
+    fn a_lock_that_cannot_route_names_the_lock_and_why() {
+        let reason = super::LocalReason::Failed {
+            reason: "a word of the command is not valid Unicode".to_owned(),
+        };
+        assert_eq!(
+            PinRefusal::lock_kept_here("mac-signing", Some(&reason)).line(),
+            format!("gate: --lock mac-signing cannot route this run: {}", reason.reason())
+        );
+        assert_eq!(
+            PinRefusal::lock_kept_here("mac-signing", None).line(),
+            "gate: --lock mac-signing cannot route this run: nothing routes it"
+        );
+        assert_eq!(
+            PinRefusal::lock_kept_here("a\nb", None).line(),
+            "gate: --lock a\\nb cannot route this run: nothing routes it",
+            "the name shown escaped"
+        );
+    }
 
     /// The `carriedFolders` entries the carried-folder cases match against.
     fn mock_globs() -> Vec<&'static str> {

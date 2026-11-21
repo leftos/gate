@@ -562,6 +562,7 @@ fn a_fallback_line_names_each_reason_by_its_word() {
         (FallbackReason::Lfs, "lfs"),
         (FallbackReason::Root, "root"),
         (FallbackReason::Push, "push"),
+        (FallbackReason::Lock, "lock"),
     ];
     for (reason, word) in reasons {
         let line = journal_line(&identity(), ts(NOW), &JournalEvent::Fallback { reason }, Some(&tag()), None);

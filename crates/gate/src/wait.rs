@@ -39,15 +39,21 @@ const BUSY_RETRY: Duration = Duration::from_millis(100);
 pub(crate) const REMOTE_LIMIT: Duration = Duration::from_secs(60);
 
 /// The whole time a routed run of `request` waits for remote slots, across every builder it tries:
-/// `--test-remote-wait-ms`, else the run's own ceiling for a `desktop` run, which never runs here and so waits for the
-/// builder as long as it may run there, else [`REMOTE_LIMIT`].
+/// `--test-remote-wait-ms`, else the run's own ceiling for a `desktop` run or a `--lock` run, which never run here and
+/// so wait for the builder as long as they may run there, else [`REMOTE_LIMIT`].
 pub(crate) fn remote_budget(request: &RunRequest, desktop: bool) -> Duration {
-    let unseamed = if desktop {
+    let unseamed = if never_runs_here(request, desktop) {
         Duration::from_secs(request.timeout.floor())
     } else {
         REMOTE_LIMIT
     };
     request.test_seams.remote_wait_ms.map_or(unseamed, Duration::from_millis)
+}
+
+/// Whether a routed run of `request` never runs here once its builders did not run it: a `desktop` run, or one holding
+/// a `--lock`, which runs only on a builder.
+pub(crate) fn never_runs_here(request: &RunRequest, desktop: bool) -> bool {
+    desktop || request.lock.is_some()
 }
 
 /// A probe of a pool's slots: for each, whether some gate has it open, `None` for a slot that could not be probed.
@@ -1487,6 +1493,7 @@ pub(crate) mod scratch {
             desktop_hidden: false,
             reason: None,
             bring_tracked: Vec::new(),
+            lock: None,
             env: Vec::new(),
             state_dir: None,
             cd: None,

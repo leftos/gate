@@ -383,6 +383,8 @@ pub enum FallbackReason {
     Root,
     /// The snapshot push to a builder that answered its preflight failed.
     Push,
+    /// The builder could not give the run the `--lock` it holds.
+    Lock,
 }
 
 impl FallbackReason {
@@ -407,6 +409,7 @@ impl FallbackReason {
             FallbackReason::Lfs => "lfs",
             FallbackReason::Root => "root",
             FallbackReason::Push => "push",
+            FallbackReason::Lock => "lock",
         }
     }
 }

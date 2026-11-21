@@ -32,6 +32,7 @@ fn run_reads_every_option_and_the_defaults() {
             desktop_hidden: false,
             reason: None,
             bring_tracked: Vec::new(),
+            lock: None,
             env: Vec::new(),
             state_dir: None,
             cd: None,
@@ -855,4 +856,113 @@ fn run_usage_lists_reason() {
                 == "  --reason \"<why>\"     why this run is local, critical or alone; required with --local, --slot critical and --alone"),
         "the usage lists --reason:\n{USAGE}"
     );
+}
+
+/// The `--lock` refusal of a name outside the lock name rule, naming the value as given.
+fn bad_lock_line(value: &str) -> String {
+    format!(
+        "gate: --lock takes a name of lower-case letters, digits and hyphens that starts with a letter or digit, at most 63 characters, not '{value}'"
+    )
+}
+
+#[test]
+fn a_lock_name_outside_the_rule_is_a_usage_error() {
+    let too_long = "a".repeat(64);
+    for value in [
+        "",
+        "-x",
+        "Mac",
+        "mac_signing",
+        "mac.signing",
+        "../x",
+        "a/b",
+        "mac signing",
+        "ä",
+        too_long.as_str(),
+    ] {
+        let given = format!("--lock={value}");
+        assert_eq!(problems_with(&[&given, "--", "cmd"]), [bad_lock_line(value)], "{value:?}");
+    }
+    assert_eq!(problems_with(&["--lock", "Mac", "--", "cmd"]), [bad_lock_line("Mac")], "the spaced form");
+    assert_eq!(
+        problems_with(&["--lock", "-x", "--", "cmd"]),
+        [bad_lock_line("-x")],
+        "a value starting with a hyphen"
+    );
+}
+
+#[test]
+fn a_lock_name_inside_the_rule_parses() {
+    let longest = "a".repeat(63);
+    for value in ["mac-signing", "a", "0", "x9-y", longest.as_str()] {
+        assert_eq!(run_with(&["--lock", value, "--", "cmd"]).lock.as_deref(), Some(value), "{value:?}");
+    }
+    assert_eq!(
+        run_with(&["--lock=mac-signing", "--", "cmd"]).lock.as_deref(),
+        Some("mac-signing"),
+        "the inline form"
+    );
+    assert_eq!(run_with(&["--", "cmd"]).lock, None, "no lock by default");
+    assert!(
+        USAGE.lines().any(|line| line
+            == "  --lock <name>        hold the builder-wide lock <name> while the command runs on its builder; a --lock run never runs here"),
+        "the usage lists --lock:\n{USAGE}"
+    );
+}
+
+#[test]
+fn a_second_lock_is_a_usage_error() {
+    assert_eq!(
+        problems_with(&["--lock", "mac-signing", "--lock", "other", "--", "cmd"]),
+        ["gate: --lock is given once"]
+    );
+    assert_eq!(
+        problems_with(&["--lock", "mac-signing", "--lock", "mac-signing", "--", "cmd"]),
+        ["gate: --lock is given once"],
+        "the same name twice too"
+    );
+}
+
+#[test]
+fn lock_cannot_go_with_local_or_a_critical_or_none_slot() {
+    assert_eq!(
+        problems_with(&["--lock", "mac-signing", "--local", "--reason", "trial", "--", "cmd"]),
+        ["gate: --lock cannot go with --local: a --lock run runs only on a builder"]
+    );
+    for slot in ["critical", "none"] {
+        let problems = problems(&[
+            "run",
+            "--slot",
+            slot,
+            "--timeout",
+            "5",
+            "--log",
+            "out.log",
+            "--lock",
+            "mac-signing",
+            "--reason",
+            "r",
+            "--",
+            "cmd",
+        ]);
+        assert_eq!(
+            problems,
+            [format!("gate: --lock cannot go with --slot {slot}: a --lock run runs only on a builder")],
+            "{slot}"
+        );
+    }
+    let light = run_request(&[
+        "run",
+        "--slot",
+        "light",
+        "--timeout",
+        "5",
+        "--log",
+        "out.log",
+        "--lock",
+        "mac-signing",
+        "--",
+        "cmd",
+    ]);
+    assert_eq!(light.lock.as_deref(), Some("mac-signing"), "a light run may hold a lock");
 }

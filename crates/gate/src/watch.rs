@@ -1422,6 +1422,7 @@ mod tests {
             desktop_hidden: false,
             reason: None,
             bring_tracked: Vec::new(),
+            lock: None,
             env: Vec::new(),
             state_dir: None,
             cd: None,
