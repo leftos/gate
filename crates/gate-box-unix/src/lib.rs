@@ -53,6 +53,8 @@ pub mod prune;
 #[cfg(unix)]
 pub mod run;
 #[cfg(unix)]
+mod run_lock;
+#[cfg(unix)]
 mod slots;
 #[cfg(unix)]
 pub mod stop;

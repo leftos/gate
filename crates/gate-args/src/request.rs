@@ -117,6 +117,9 @@ pub struct BoxSeams {
     /// How long, in milliseconds, a call waits for the drain lock another call holds, in place of 10 s; `None` without
     /// the feature.
     pub drain_lock_ms: Option<u64>,
+    /// How long, in milliseconds, a run waits for its `--lock` another run holds, in place of its `RunLockWait`;
+    /// `None` without the feature.
+    pub lock_wait_ms: Option<u64>,
     /// The time, in whole seconds since the Unix epoch, the drain's barrier, tickets and sessions are judged at, in
     /// place of the clock's; `None` without the feature.
     pub now: Option<u64>,
@@ -173,6 +176,9 @@ pub struct BoxSeams {
     /// commit is made, just before it decides what to pack; on the Unix box right after its command ends, before its
     /// back commit. `None` without the feature, and the run does not wait.
     pub park_outputs: Option<PathBuf>,
+    /// The file the Unix box's `gate box run` waits for just before a passing run's pack, after its cross build,
+    /// making `<path>.parked` as it starts to wait. `None` without the feature, and the run does not wait.
+    pub park_pack: Option<PathBuf>,
     /// The file `gate box run` waits for just before it reads the paths its back commit changes (`diff-tree`), making
     /// `<path>.parked` as it starts to wait; `None` without the feature, and the read does not wait.
     pub park_back_paths: Option<PathBuf>,

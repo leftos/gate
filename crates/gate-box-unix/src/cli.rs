@@ -196,6 +196,19 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-seams")]
+    #[test]
+    fn the_lock_wait_seam_given_before_the_verb_reaches_the_run() {
+        let seams = BoxSeams {
+            lock_wait_ms: Some(50),
+            ..BoxSeams::default()
+        };
+        assert_eq!(
+            action(words("box --test-box-lock-wait-ms 50 run --stdin")),
+            verb_action(BoxVerb::Run, seams, None, &[])
+        );
+    }
+
     #[test]
     fn a_prune_with_a_root_is_that_verb_and_reads_no_request() {
         assert_eq!(

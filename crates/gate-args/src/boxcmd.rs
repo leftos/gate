@@ -11,13 +11,15 @@
 //! `--test-box-sample-ms <n>`, `--test-box-pack-delay-ms <n>` (the pack waits once its archive file is made, before its
 //! first byte), `--test-box-sampler-fail true|false`, `--test-box-free-percent <1-100>`,
 //! `--test-box-drain-lease-ms <n>`, `--test-box-drain-lapse-ms <n>`, `--test-box-drain-lock-ms <n>`, `--test-box-now <unix s>`,
-//! `--test-box-drain-readable-only true|false`,
+//! `--test-box-lock-wait-ms <n>`, `--test-box-drain-readable-only true|false`,
 //! `--test-box-kill-leaves <n>`, `--test-box-start-shift-ms <i64>`, `--test-probe-limit-ms <n>`, `--test-probe-drain-ms <n>`,
 //! `--test-box-desktop <fault>`, `--test-box-desktop-session <state>`, `--test-box-desktop-mutex <name>`, `--test-box-desktop-ms <n>`,
 //! `--test-box-desktop-message-ms <n>` and `--test-box-register ok|fail`, `--test-box-root-walk-stop <folder>`,
 //! `--test-box-git-limit <step>:<ms>`, `--test-box-git-armed-by <path>`, `--test-box-git-long-ms <ms>`, `--test-box-gone-reached <path>`,
 //! `--test-box-park-outputs <path>` (the run waits for the path: the Windows box after its back commit, just before it
 //! decides what to pack; the Unix box right after the command ends, before its back commit),
+//! `--test-box-park-pack <path>` (the Unix box's passing run waits for the path just before its pack, after its cross
+//! build),
 //! `--test-box-park-back-paths <path>` (the run waits for the path just before it reads its back commit's paths),
 //! `--test-box-channel-ports <first>-<last>`, `--test-box-channel-accept-ms <n>`, `--test-box-channel-proof-ms <n>`,
 //! `--test-box-channel-idle-ms <n>`, `--test-box-channel-send-buffer-bytes <n>`, `--test-box-space <free>:<total>|unreadable|real`
@@ -279,6 +281,8 @@ enum Seam {
     DrainLapseMs,
     /// `--test-box-drain-lock-ms <n>`: how long a call waits for the drain lock another call holds.
     DrainLockMs,
+    /// `--test-box-lock-wait-ms <n>`: how long a run waits for its `--lock` another run holds.
+    LockWaitMs,
     /// `--test-box-now <unix s>`: the fixed time the drain judges its barrier, tickets and sessions at.
     Now,
     /// `--test-box-drain-readable-only true|false`: the drained test counts only processes whose command line it reads.
@@ -319,6 +323,9 @@ enum Seam {
     /// `--test-box-park-outputs <path>`: the run waits for the path; the Windows box after its back commit, just before
     /// it decides what to pack, the Unix box right after the command ends, before its back commit.
     ParkOutputs,
+    /// `--test-box-park-pack <path>`: the Unix box's passing run waits for the path just before its pack, after its
+    /// cross build.
+    ParkPack,
     /// `--test-box-park-back-paths <path>`: the run waits for the path just before it reads its back commit's paths.
     ParkBackPaths,
     /// `--test-box-git-long-ms <ms>`: how long each of the box's long git steps may take, in milliseconds.
@@ -364,6 +371,7 @@ impl Seam {
             "--test-box-drain-lease-ms" => Some(Seam::DrainLeaseMs),
             "--test-box-drain-lapse-ms" => Some(Seam::DrainLapseMs),
             "--test-box-drain-lock-ms" => Some(Seam::DrainLockMs),
+            "--test-box-lock-wait-ms" => Some(Seam::LockWaitMs),
             "--test-box-now" => Some(Seam::Now),
             "--test-box-drain-readable-only" => Some(Seam::DrainReadableOnly),
             "--test-box-kill-leaves" => Some(Seam::KillLeaves),
@@ -382,6 +390,7 @@ impl Seam {
             "--test-box-git-armed-by" => Some(Seam::GitArmedBy),
             "--test-box-gone-reached" => Some(Seam::GoneReached),
             "--test-box-park-outputs" => Some(Seam::ParkOutputs),
+            "--test-box-park-pack" => Some(Seam::ParkPack),
             "--test-box-park-back-paths" => Some(Seam::ParkBackPaths),
             "--test-box-git-long-ms" => Some(Seam::GitLongMs),
             "--test-box-hold-poll-ms" => Some(Seam::HoldPollMs),
@@ -415,6 +424,7 @@ impl Seam {
             Seam::DrainLeaseMs => "--test-box-drain-lease-ms",
             Seam::DrainLapseMs => "--test-box-drain-lapse-ms",
             Seam::DrainLockMs => "--test-box-drain-lock-ms",
+            Seam::LockWaitMs => "--test-box-lock-wait-ms",
             Seam::Now => "--test-box-now",
             Seam::DrainReadableOnly => "--test-box-drain-readable-only",
             Seam::KillLeaves => "--test-box-kill-leaves",
@@ -433,6 +443,7 @@ impl Seam {
             Seam::GitArmedBy => "--test-box-git-armed-by",
             Seam::GoneReached => "--test-box-gone-reached",
             Seam::ParkOutputs => "--test-box-park-outputs",
+            Seam::ParkPack => "--test-box-park-pack",
             Seam::ParkBackPaths => "--test-box-park-back-paths",
             Seam::GitLongMs => "--test-box-git-long-ms",
             Seam::HoldPollMs => "--test-box-hold-poll-ms",
@@ -510,6 +521,7 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::DrainLeaseMs => seams.drain_lease_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::DrainLapseMs => seams.drain_lapse_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::DrainLockMs => seams.drain_lock_ms = Some(crate::values::above_zero(name, &value)?),
+        Seam::LockWaitMs => seams.lock_wait_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::HoldPollMs => seams.hold_poll_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::Now => seams.now = Some(crate::values::above_zero(name, &value)?),
         Seam::DrainReadableOnly => {
@@ -533,6 +545,7 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::GitArmedBy => seams.git_armed_by = Some(PathBuf::from(value)),
         Seam::GoneReached => seams.gone_reached = Some(PathBuf::from(value)),
         Seam::ParkOutputs => seams.park_outputs = Some(PathBuf::from(value)),
+        Seam::ParkPack => seams.park_pack = Some(PathBuf::from(value)),
         Seam::ParkBackPaths => seams.park_back_paths = Some(PathBuf::from(value)),
         Seam::GitLongMs => seams.git_long_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::ChannelPorts => seams.channel_ports = Some(crate::values::port_range(name, &value)?),

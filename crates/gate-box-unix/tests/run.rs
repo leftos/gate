@@ -4300,4 +4300,529 @@ mod unix {
         assert_eq!(ended.err, [r"gate box: the holder 'ci\u{1b}[2J' holds a control character"]);
         assert!(!Path::new(&format!("{root}/slots")).exists(), "no slot is taken");
     }
+
+    /// The run lock the lock cases name.
+    const LOCK_NAME: &str = "signing";
+    /// The key of a lock case's second work folder.
+    const LOCK_OTHER_KEY: &str = "other-0123abcd";
+    /// The line a run says when it waits for the lock its record names held by `repo` from `pc1`, the start of it.
+    const HELD_BY_REPO: &str = "gate: remote waiting for lock signing: held by repo from pc1";
+    /// The start of every line a run waiting for the lock says.
+    const WAITING_FOR_LOCK: &str = "gate: remote waiting for lock signing";
+
+    /// The keys of a run holding the lock [`LOCK_NAME`] while it runs `script` in `sh`, from the repo `repo` and the PC
+    /// `pc1`.
+    fn lock_keys(script: &str) -> Value {
+        json!({
+            "Command": ["/bin/sh", "-c", script],
+            "RunLock": LOCK_NAME,
+            "RunLockWait": 600,
+            "Repo": "repo",
+            "Pc": "pc1",
+        })
+    }
+
+    /// `keys` with every key of `more` set over them.
+    fn merged(mut keys: Value, more: &Value) -> Value {
+        if let (Some(object), Some(more)) = (keys.as_object_mut(), more.as_object()) {
+            object.extend(more.clone());
+        }
+        keys
+    }
+
+    /// Waits until `done`, a hang guard of 120 s only: every case waits on a file or a line, never on the clock.
+    fn until(done: impl Fn() -> bool, what: &str) {
+        let guard = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !done() && std::time::Instant::now() < guard {
+            thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(done(), "{what}");
+    }
+
+    impl Case {
+        /// The keys naming the work folder [`LOCK_OTHER_KEY`] of this case's root, its `refs/gate/<key>` pointed at `commit`.
+        fn lock_other_keys(&self, commit: &str) -> Value {
+            git(&[&self.bare_dir(), "update-ref", &format!("refs/gate/{LOCK_OTHER_KEY}"), commit]);
+            let work = format!("{}/work/{LOCK_OTHER_KEY}", self.root());
+            json!({
+                "Key": LOCK_OTHER_KEY,
+                "Work": work,
+                "Lock": format!("{work}.lock"),
+                "Index": format!("{work}.index"),
+                "Job": format!("gate-remote-{LOCK_OTHER_KEY}-0123456789ab"),
+            })
+        }
+
+        /// The run lock's file, `<root>/locks/signing.lock`.
+        fn run_lock_file(&self) -> PathBuf {
+            PathBuf::from(format!("{}/locks/{LOCK_NAME}.lock", self.root()))
+        }
+
+        /// The run lock's holder record, `<root>/locks/signing.holder.json`.
+        fn holder_record(&self) -> PathBuf {
+            PathBuf::from(format!("{}/locks/{LOCK_NAME}.holder.json", self.root()))
+        }
+
+        /// The run lock, made and held by this case as another box holds it, with no holder record.
+        fn run_lock_held_here(&self) -> fs::File {
+            let locks = format!("{}/locks", self.root());
+            if !Path::new(&locks).exists() {
+                std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700)
+                    .create(&locks)
+                    .expect("the locks folder is made");
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(self.run_lock_file())
+                .expect("the run lock opens");
+            assert!(flocked(&file, libc::LOCK_EX | libc::LOCK_NB), "the run lock is taken");
+            file
+        }
+
+        /// The run lock was let go: its holder record removed, its file still there and free.
+        fn run_lock_let_go(&self) {
+            assert!(!self.holder_record().exists(), "the holder record is removed");
+            assert!(self.run_lock_file().exists(), "the lock file is never removed");
+            drop(self.run_lock_held_here());
+        }
+    }
+
+    /// A run started in the background ([`lock_run`]): its box's pid and the reader that gives how it ended.
+    struct Background {
+        pid: u32,
+        ended: thread::JoinHandle<Ended>,
+    }
+
+    impl Background {
+        fn ended(self) -> Ended {
+            self.ended.join().expect("the run's reader ends")
+        }
+    }
+
+    /// Starts `gate-box box --test-heartbeat-ms 50 --test-box-sample-ms 50 <seams> run --stdin` with `request` on its
+    /// stdin, in the background, reading every line. Each of `marks`, in order, is made once a line on stderr starts
+    /// with its text after the mark before it was made; with `close`, the box's pipes are closed once the last is made,
+    /// a client gone.
+    fn lock_run(seams: &[&str], request: &str, marks: Vec<(&'static str, PathBuf)>, close: bool) -> Background {
+        let mut words = vec!["box", "--test-heartbeat-ms", "50", "--test-box-sample-ms", "50"];
+        words.extend(seams);
+        words.extend(["run", "--stdin"]);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_gate-box"))
+            .args(&words)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("gate-box starts");
+        let pid = child.id();
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        stdin.write_all(format!("{request}\n").as_bytes()).expect("the request is written");
+        drop(stdin);
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let stderr = child.stderr.take().expect("stderr is piped");
+        let ended = thread::spawn(move || {
+            let stop = Arc::new(AtomicBool::new(false));
+            let out_stop = Arc::clone(&stop);
+            let reading = if close { Reading::CloseAfterStart } else { Reading::All };
+            let out = thread::spawn(move || lines_of(stdout, reading, &out_stop));
+            let mut marks = marks.into_iter().peekable();
+            let mut said = Vec::new();
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
+                let text = line.trim_end_matches('\n').to_owned();
+                line.clear();
+                if let Some((_, mark)) = marks.next_if(|(start, _)| unstamped(&text).text.starts_with(start)) {
+                    fs::write(&mark, "").expect("the mark is made");
+                    if close && marks.peek().is_none() {
+                        said.push(text);
+                        stop.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                }
+                said.push(text);
+            }
+            drop(reader);
+            let out = out.join().expect("the stdout reader ends");
+            let status = child.wait().expect("gate-box is waited for").code();
+            Ended { status, out, err: said }
+        });
+        Background { pid, ended }
+    }
+
+    /// Whether the run that wrote `log` wrote `entry` to it.
+    fn wrote(log: &Path, entry: &str) -> bool {
+        logged(log).iter().any(|line| line == entry)
+    }
+
+    #[test]
+    fn a_second_run_on_the_lock_starts_only_after_the_first_command_and_cross_build_end() {
+        let case = Case::new("lock-order");
+        let commit = case.snapshot_holding(&[(".gitignore", "bin/\n")]);
+        let (log, waiting) = (case.base.join("log"), case.base.join("waiting"));
+        let shown = log.display();
+        let first = format!(
+            "echo first-command >> '{shown}'; {}; echo first-command-end >> '{shown}'",
+            waits_for_file(&waiting)
+        );
+        let cross = format!("echo first-cross >> '{shown}'; echo first-cross-end >> '{shown}'");
+        let keys = merged(
+            cross_keys(&first, &cross),
+            &json!({ "RunLock": LOCK_NAME, "RunLockWait": 600, "Repo": "repo", "Pc": "pc1" }),
+        );
+        let holder = lock_run(&[], &case.outputs_request(&commit, &keys, &Manifest::default()), Vec::new(), false);
+        until(|| wrote(&log, "first-command"), "the first command started");
+        let second_keys = merged(case.lock_other_keys(&commit), &lock_keys(&format!("echo second-command >> '{shown}'")));
+        let waiter = lock_run(&[], &case.request(&commit, &second_keys), vec![(HELD_BY_REPO, waiting)], false);
+
+        let (first, second) = (holder.ended(), waiter.ended());
+
+        assert_eq!(first.status, Some(0), "{:?}", first.err);
+        assert_eq!(second.status, Some(0), "{:?}", second.err);
+        assert_eq!(
+            logged(&log),
+            ["first-command", "first-command-end", "first-cross", "first-cross-end", "second-command"],
+            "the second command starts once the first's command and cross build ended"
+        );
+        let texts = second.err_texts();
+        let named = texts.iter().position(|line| line.starts_with(HELD_BY_REPO) && line.ends_with(" s"));
+        let took = texts.iter().position(|line| line.starts_with("gate: remote took lock signing after "));
+        let started = texts.iter().position(|line| *line == started_line(NONCE));
+        assert!(
+            matches!((named, took, started), (Some(named), Some(took), Some(started)) if named < took && took < started),
+            "named the holder, took the lock, then started: {:?}",
+            second.err
+        );
+        case.run_lock_let_go();
+    }
+
+    /// A probe run of the work folder [`LOCK_OTHER_KEY`] on the lock, waiting 300 ms for it: refused `lock` with 75,
+    /// its command never run.
+    fn assert_probe_refused(case: &Case, commit: &str) {
+        let marker = case.base.join("probe-ran");
+        let keys = merged(case.lock_other_keys(commit), &lock_keys(&format!(": > '{}'", marker.display())));
+        let probe = ran(
+            &["--test-box-lock-wait-ms", "300"],
+            &case.request(commit, &keys),
+            Reading::All,
+            &case.base.join("probe-beaten"),
+        );
+        assert_eq!(probe.status, Some(75), "{:?}", probe.err);
+        assert!(
+            probe.err_texts().contains(&refused_line(NONCE, Refusal::Lock).as_str()),
+            "{:?}",
+            probe.err
+        );
+        assert!(!marker.exists(), "the probe's command never ran");
+    }
+
+    /// The keys of a holder run on the lock running `script`, its outputs `bin/**` asked for, with `cross` as its cross
+    /// build when one is given.
+    fn parked_keys(script: &str, cross: Option<&str>) -> Value {
+        let keys = match cross {
+            Some(cross) => cross_keys(script, cross),
+            None => outputs_keys(script, &["bin/**"]),
+        };
+        merged(keys, &json!({ "RunLock": LOCK_NAME, "RunLockWait": 600, "Repo": "repo", "Pc": "pc1" }))
+    }
+
+    #[test]
+    fn a_probe_is_refused_while_the_holder_is_parked_after_its_command() {
+        let case = Case::new("lock-park-command");
+        let commit = case.snapshot_holding(&[(".gitignore", "bin/\n")]);
+        let park = case.base.join("park");
+        let park_arg = park.to_str().expect("the temp folder is UTF-8").to_owned();
+        let request = case.outputs_request(&commit, &parked_keys("true", None), &Manifest::default());
+        let holder = lock_run(&["--test-box-park-outputs", &park_arg], &request, Vec::new(), false);
+        until(|| case.base.join("park.parked").exists(), "the holder parks after its command");
+        assert_probe_refused(&case, &commit);
+        fs::write(&park, "").expect("the holder is let go");
+        let ended = holder.ended();
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        case.run_lock_let_go();
+    }
+
+    #[test]
+    fn a_probe_is_refused_while_the_holder_is_parked_in_its_cross_build() {
+        let case = Case::new("lock-park-cross");
+        let commit = case.snapshot_holding(&[(".gitignore", "bin/\n")]);
+        let (started, go) = (case.base.join("cross-started"), case.base.join("cross-go"));
+        let cross = format!(": > '{}'; {}", started.display(), waits_for_file(&go));
+        let request = case.outputs_request(&commit, &parked_keys("true", Some(&cross)), &Manifest::default());
+        let holder = lock_run(&[], &request, Vec::new(), false);
+        until(|| started.exists(), "the holder's cross build runs");
+        assert_probe_refused(&case, &commit);
+        fs::write(&go, "").expect("the cross build is let go");
+        let ended = holder.ended();
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        case.run_lock_let_go();
+    }
+
+    #[test]
+    fn a_probe_is_refused_while_the_holder_is_parked_in_its_pack() {
+        let case = Case::new("lock-park-pack");
+        let commit = case.snapshot_holding(&[(".gitignore", "bin/\n")]);
+        let request = case.outputs_request(&commit, &parked_keys("mkdir -p bin && echo x > bin/x.txt", None), &Manifest::default());
+        let park = case.base.join("park");
+        let park_arg = park.to_str().expect("the temp folder is UTF-8").to_owned();
+        let holder = lock_run(&["--test-box-park-pack", &park_arg], &request, Vec::new(), false);
+        until(|| case.base.join("park.parked").exists(), "the holder parks just before its pack");
+        assert!(!case.archive().exists(), "parked before its pack");
+        assert_probe_refused(&case, &commit);
+        fs::write(&park, "").expect("the holder is let go");
+        let ended = holder.ended();
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        case.run_lock_let_go();
+    }
+
+    #[test]
+    fn a_holder_box_killed_mid_command_keeps_the_lock_until_its_command_ends() {
+        let case = Case::new("lock-orphan");
+        let commit = case.snapshot();
+        let (log, go, orphaned) = (case.base.join("log"), case.base.join("go"), case.base.join("orphaned"));
+        let shown = log.display();
+        let first = format!("echo first >> '{shown}'; {}; echo first-end >> '{shown}'", waits_for_file(&go));
+        let holder = lock_run(&[], &case.request(&commit, &lock_keys(&first)), Vec::new(), false);
+        until(|| wrote(&log, "first"), "the first command started");
+        let record = format!("{}.pgid", case.work());
+        let names_a_start = || {
+            fs::read(&record)
+                .ok()
+                .and_then(|bytes| gate_box_unix::lines::recorded_group(&bytes))
+                .is_some_and(|recorded| recorded.started.is_some())
+        };
+        until(names_a_start, "the command's group and its leader's start are recorded");
+        let pid = i32::try_from(holder.pid).expect("a pid fits");
+        // SAFETY: `kill` with the holder box's own pid touches no memory.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0, "the holder box is killed");
+        let killed = holder.ended();
+        assert_eq!(killed.status, None, "killed by a signal: {:?}", killed.err);
+
+        let second_keys = merged(case.lock_other_keys(&commit), &lock_keys(&format!("echo second >> '{shown}'")));
+        let orphan = format!("{HELD_BY_REPO}, whose box ended; its command still runs");
+        let waiter = lock_run(
+            &[],
+            &case.request(&commit, &second_keys),
+            vec![(WAITING_FOR_LOCK, orphaned.clone())],
+            false,
+        );
+        until(|| orphaned.exists(), "the second run waits");
+        fs::write(&go, "").expect("the first command is let go");
+        let second = waiter.ended();
+
+        assert_eq!(second.status, Some(0), "{:?}", second.err);
+        assert!(second.err_texts().contains(&orphan.as_str()), "the orphan is named: {:?}", second.err);
+        assert_eq!(
+            logged(&log),
+            ["first", "first-end", "second"],
+            "the second command starts once the first's ended"
+        );
+        case.run_lock_let_go();
+    }
+
+    /// Runs a lock case's command `script` with `extra` keys and the box's `seams`, read as `reading` says; how it ended.
+    fn lock_ran(case: &Case, script: &str, (extra, seams): (&Value, &[&str]), reading: Reading) -> Ended {
+        let commit = case.snapshot();
+        let request = case.request(&commit, &merged(lock_keys(script), extra));
+        ran(seams, &request, reading, &case.base.join("beaten"))
+    }
+
+    #[test]
+    fn the_lock_is_let_go_after_a_pass() {
+        let case = Case::new("lock-pass");
+        let ended = lock_ran(&case, "true", (&json!({}), &[]), Reading::All);
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        case.run_lock_let_go();
+        case.ended_clean();
+    }
+
+    #[test]
+    fn the_lock_is_let_go_after_a_failure() {
+        let case = Case::new("lock-fail");
+        let ended = lock_ran(&case, "exit 3", (&json!({}), &[]), Reading::All);
+        assert_eq!(ended.status, Some(3), "{:?}", ended.err);
+        case.run_lock_let_go();
+        case.ended_clean();
+    }
+
+    #[test]
+    fn the_lock_is_let_go_after_a_ceiling_kill() {
+        let case = Case::new("lock-ceiling");
+        // The whole machine free, so the ceiling's clock runs with wall time however loaded the machine is.
+        let ended = lock_ran(
+            &case,
+            "sleep 600",
+            (&json!({ "Timeout": 1 }), &["--test-box-free-percent", "100"]),
+            Reading::All,
+        );
+        assert_eq!(ended.status, Some(124), "{:?}", ended.err);
+        assert!(ended.err_has(&killed_line(NONCE, BoxKill::TimedOut)), "{:?}", ended.err);
+        case.run_lock_let_go();
+    }
+
+    #[test]
+    fn the_lock_is_let_go_after_a_client_gone_mid_command() {
+        let case = Case::new("lock-gone");
+        let ended = lock_ran(&case, "sleep 600", (&json!({}), &[]), Reading::CloseAfterStart);
+        assert_eq!(ended.status, Some(255), "{:?}", ended.err);
+        case.run_lock_let_go();
+    }
+
+    #[test]
+    fn the_lock_is_let_go_after_a_box_stop() {
+        let case = Case::new("lock-stop");
+        let commit = case.snapshot();
+        let marker = case.base.join("started");
+        let request = case.request(&commit, &lock_keys(&format!(": > '{}'; sleep 600", marker.display())));
+        let run = lock_run(&[], &request, Vec::new(), false);
+        let record = format!("{}.pgid", case.work());
+        let names_a_start = || {
+            fs::read(&record)
+                .ok()
+                .and_then(|bytes| gate_box_unix::lines::recorded_group(&bytes))
+                .is_some_and(|recorded| recorded.started.is_some())
+        };
+        until(|| marker.exists() && names_a_start(), "the command started and its group is recorded");
+        let mut stop = Command::new(env!("CARGO_BIN_EXE_gate-box"))
+            .args(["box", "stop", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("gate-box starts");
+        let mut stdin = stop.stdin.take().expect("stdin is piped");
+        stdin.write_all(format!("{request}\n").as_bytes()).expect("the request is written");
+        drop(stdin);
+        let stopped = stop.wait_with_output().expect("the stop is waited for");
+        let ended = run.ended();
+
+        assert_eq!(stopped.status.code(), Some(0), "{}", String::from_utf8_lossy(&stopped.stderr));
+        assert!(
+            ended.status.is_some_and(|status| status != 0),
+            "the stopped command fails the run: {:?}",
+            ended.err
+        );
+        case.run_lock_let_go();
+    }
+
+    #[test]
+    fn a_lock_wait_that_runs_out_is_refused_lock_and_starts_nothing() {
+        let case = Case::new("lock-ran-out");
+        let held = case.run_lock_held_here();
+        let marker = case.base.join("ran");
+        let script = format!(": > '{}'", marker.display());
+        let ended = lock_ran(&case, &script, (&json!({}), &["--test-box-lock-wait-ms", "300"]), Reading::All);
+        drop(held);
+
+        assert_eq!(ended.status, Some(75), "{:?}", ended.err);
+        let tag = refused_line(NONCE, Refusal::Lock);
+        let texts = ended.err_texts();
+        assert!(
+            texts
+                .windows(2)
+                .any(|pair| pair[0] == tag && pair[1] == "gate: remote lock signing stayed held past 0 s; nothing ran"),
+            "the lock tag, then the line: {:?}",
+            ended.err
+        );
+        assert!(
+            texts.contains(&"gate: remote waiting for lock signing: held by another run"),
+            "{:?}",
+            ended.err
+        );
+        assert!(!ended.err_has(&started_line(NONCE)), "no start marker: {:?}", ended.err);
+        assert!(!marker.exists(), "the command never ran");
+        assert!(!case.holder_record().exists(), "no holder record is written");
+        assert!(case.lock_free(), "the work lock is free");
+    }
+
+    #[test]
+    fn a_run_waiting_for_a_lock_keeps_beating() {
+        let case = Case::new("lock-beats");
+        let commit = case.snapshot();
+        let held = case.run_lock_held_here();
+        let (waiting, beaten) = (case.base.join("waiting"), case.base.join("beaten-waiting"));
+        let marks = vec![(WAITING_FOR_LOCK, waiting), ("gate-remote-heartbeat:", beaten.clone())];
+        let run = lock_run(&[], &case.request(&commit, &lock_keys("true")), marks, false);
+        until(|| beaten.exists(), "a heartbeat after the waiting line");
+        drop(held);
+        let ended = run.ended();
+
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        let texts = ended.err_texts();
+        let waited = texts
+            .iter()
+            .position(|line| line.starts_with(WAITING_FOR_LOCK))
+            .expect("the waiting line");
+        let took = texts
+            .iter()
+            .position(|line| line.starts_with("gate: remote took lock signing after "))
+            .expect("the took line");
+        assert!(
+            texts[waited..took].iter().any(|line| line.starts_with("gate-remote-heartbeat:")),
+            "a beat while it waits: {:?}",
+            ended.err
+        );
+        case.run_lock_let_go();
+    }
+
+    #[test]
+    fn a_client_gone_during_the_lock_wait_starts_nothing() {
+        let case = Case::new("lock-wait-gone");
+        let commit = case.snapshot();
+        let held = case.run_lock_held_here();
+        let marker = case.base.join("ran");
+        let request = case.request(&commit, &lock_keys(&format!(": > '{}'", marker.display())));
+        let run = lock_run(&[], &request, vec![(WAITING_FOR_LOCK, case.base.join("waiting"))], true);
+        let ended = run.ended();
+        drop(held);
+
+        assert_eq!(ended.status, Some(255), "{:?}", ended.err);
+        assert!(!marker.exists(), "the command never ran");
+        assert!(!case.holder_record().exists(), "no holder record is written");
+        assert!(case.lock_free(), "the work lock is free");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_run_waiting_for_a_lock_counts_as_going_for_a_drain() {
+        let case = Case::new("lock-drain");
+        let root = case.root();
+        let commit = case.snapshot();
+        let held = case.run_lock_held_here();
+        let waiting = case.base.join("waiting");
+        let now = DRAIN_NOW.to_string();
+        let request = case.request(&commit, &merged(lock_keys("true"), &session_keys("s1")));
+        let run = lock_run(&["--test-box-now", &now], &request, vec![(WAITING_FOR_LOCK, waiting.clone())], false);
+        until(|| waiting.exists(), "the run waits for the lock");
+        raised(&root);
+        // Past the session's lease, so only the run's held session keeps it live.
+        let going = drained_at(&root, "status", DRAIN_NOW + 600);
+        drop(held);
+        let ended = run.ended();
+        let after = drained_at(&root, "status", DRAIN_NOW + 600);
+
+        assert_eq!(going.status, Some(0), "{:?}", going.err);
+        assert_eq!(going.out.last().map(String::as_str), Some("gate: drain state waiting"), "{:?}", going.out);
+        assert_eq!(ended.status, Some(0), "the admitted run runs under the barrier: {:?}", ended.err);
+        assert_eq!(after.out.last().map(String::as_str), Some("gate: drain state drained"), "{:?}", after.out);
+    }
+
+    #[test]
+    fn prune_leaves_the_locks_folder_and_no_lock_file_is_removed() {
+        let case = Case::new("lock-prune");
+        let ended = lock_ran(&case, "true", (&json!({}), &[]), Reading::All);
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+
+        let keyed = pruned(&["--root", &case.root(), "--keys", KEY], &[]);
+        let aged = pruned(&["--root", &case.root()], &[]);
+
+        assert_eq!(keyed.status, Some(0), "{:?}", keyed.err);
+        assert_eq!(aged.status, Some(0), "{:?}", aged.err);
+        assert!(Path::new(&format!("{}/locks", case.root())).is_dir(), "the locks folder stays");
+        case.run_lock_let_go();
+    }
 }

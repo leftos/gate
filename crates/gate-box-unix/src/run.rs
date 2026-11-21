@@ -49,6 +49,7 @@ use crate::packages;
 use crate::preflight::{checked_root, layout_record};
 use crate::probe;
 use crate::process::{self, GroupRecord, Ran};
+use crate::run_lock;
 use crate::slots::{self, Untaken};
 use crate::stop::{Record, own_group, record_current, records_folder, unusable_refusal};
 use crate::tools;
@@ -56,9 +57,6 @@ use crate::tools;
 /// The status of a run refused: another run holds the work folder, it could not be laid out, or it asks for what this
 /// builder does not build. Said with a refusal tag and before any start marker, so the PC runs the command itself.
 pub const REFUSED_STATUS: u8 = 75;
-
-/// The line this builder says after its `lock` refusal tag: it holds no `--lock` locks.
-const LOCK_REFUSED_LINE: &str = "gate: this builder holds no --lock locks";
 
 /// What a run asks for that this builder does not build, refused with the tag of its refusal.
 #[derive(Clone, Copy, Debug)]
@@ -70,13 +68,11 @@ pub(crate) struct Unbuilt {
 
 impl Unbuilt {
     /// The line said after the refusal's tag: the layout line naming the repo of the bare repository `bare` for a
-    /// `layout` refusal ([`layout_line`]), [`LOCK_REFUSED_LINE`] for a `lock` one, else
-    /// `gate: remote <key> is not built on this builder`.
+    /// `layout` refusal ([`layout_line`]), else `gate: remote <key> is not built on this builder`.
     pub(crate) fn line(self, bare: &str) -> String {
         let why = format!("{} is not built on this builder", self.key);
         match self.refusal {
             Refusal::Layout => layout_line(repo_name(bare), &escaped(&why)),
-            Refusal::Lock => LOCK_REFUSED_LINE.to_owned(),
             _ => format!("gate: remote {why}"),
         }
     }
@@ -199,6 +195,33 @@ pub(crate) fn layout_repos<'p>(
     (main, siblings)
 }
 
+/// The builder-wide lock a run asks for, `RunLock`, and what its holder record names.
+#[derive(Clone, Copy, Debug)]
+pub struct RunLockAsked<'p> {
+    /// The lock's name.
+    pub name: &'p str,
+    /// How long the run may wait for it, in whole seconds, `RunLockWait`.
+    pub wait: u64,
+    /// The run's repo, `Repo`, empty when the payload gives none.
+    pub repo: &'p str,
+    /// The run's PC, `Pc`, empty when the payload gives none.
+    pub pc: &'p str,
+}
+
+/// The lock `payload` asks for ([`Payload::run_lock`], which refuses a lock without its `RunLockWait`), with the run's
+/// `Repo` and `Pc` read as `drain::session_of` reads them; `None` for none. Else the usage line.
+fn run_lock_asked(payload: &Payload) -> Result<Option<RunLockAsked<'_>>, String> {
+    let (Some(name), Some(wait)) = (payload.run_lock()?, payload.run_lock_wait()?) else {
+        return Ok(None);
+    };
+    Ok(Some(RunLockAsked {
+        name,
+        wait,
+        repo: payload.repo()?.unwrap_or(""),
+        pc: payload.pc()?.unwrap_or(""),
+    }))
+}
+
 /// What a run reads of its payload.
 pub struct Request<'p> {
     /// The main repo, checked out in the work folder, or in `<work>/<leaf>` on a pair run.
@@ -249,6 +272,8 @@ pub struct Request<'p> {
     pub outputs: Option<Asked<'p>>,
     /// The cross build run after a passing command, before its outputs are brought back, `CrossBuild`; `None` for none.
     pub cross: Option<CrossBuild>,
+    /// The builder-wide lock the run holds from just before its command to the end of its pack; `None` for none.
+    pub run_lock: Option<RunLockAsked<'p>>,
     /// The first thing the payload asks for that this builder does not build, in the order the payload is read.
     unbuilt: Option<Unbuilt>,
 }
@@ -256,7 +281,7 @@ pub struct Request<'p> {
 impl<'p> Request<'p> {
     /// Reads `payload` in the order the Windows box reads it, each key checked as it does, the outputs asked for
     /// ([`Asked::new`]) read once the output folder is; then notes the first thing asking for what this builder does not
-    /// build: `RunLock`, `Desktop`, `CommitStage`, a warm-up's `WarmCommands`, an unreal `EngineEnv` name, `UnrealVersion` or
+    /// build: `Desktop`, `CommitStage`, a warm-up's `WarmCommands`, an unreal `EngineEnv` name, `UnrealVersion` or
     /// `SentDigest`; then, last, the repos ([`repos`]), a sibling pair and its `SiblingLfsDigests` as `gate-wire` checks
     /// them. A work root holding a `:` is refused just after the work folder is read ([`work_layout`]).
     ///
@@ -278,7 +303,7 @@ impl<'p> Request<'p> {
         if desktop && payload.desktop_wait()?.is_none() {
             return Err("gate: box payload lacks DesktopWait".to_owned());
         }
-        let run_lock = payload.run_lock()?.is_some();
+        let run_lock = run_lock_asked(payload)?;
         let bare = payload.path("Bare")?;
         let lock = payload.beside_work("Lock", work, "lock")?;
         let index = payload.beside_work("Index", work, "index")?;
@@ -309,9 +334,7 @@ impl<'p> Request<'p> {
         let commit_stage = payload.commit_stage_head()?.is_some();
         // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
         let (main, siblings) = repos(payload, work, bare, (snapshot, lfs_digest))?;
-        // A `--lock` run first: this builder holds no lock, so it never runs one without it.
         let unbuilt = [
-            (run_lock, Refusal::Lock, "RunLock"),
             (desktop, Refusal::Desktop, "Desktop"),
             (commit_stage, Refusal::Layout, "CommitStage"),
             (warm, Refusal::Layout, "WarmCommands"),
@@ -344,6 +367,7 @@ impl<'p> Request<'p> {
             inputs_digest,
             outputs,
             cross,
+            run_lock,
             unbuilt,
         })
     }
@@ -801,6 +825,11 @@ pub struct Watches {
     /// `--test-box-park-outputs`: the path a run parks on right after its command ends, before its back commit and
     /// every pack decision ([`parked`]).
     pub park_outputs: Option<PathBuf>,
+    /// `--test-box-park-pack`: the path a passing run parks on just before its pack, after its cross build
+    /// ([`parked`]).
+    pub park_pack: Option<PathBuf>,
+    /// `--test-box-lock-wait-ms`: how long a run waits for its `--lock`, in place of its `RunLockWait`.
+    pub lock_wait: Option<Duration>,
     /// The path a run's own pack parks on once its archive is written, before its trim ([`brought_back`], [`parked`]):
     /// a unit test's, set by no flag; `None` from [`Watches::of`]. Only in a build with the test seams.
     #[cfg(feature = "test-seams")]
@@ -884,6 +913,8 @@ impl Watches {
             started: started_at(seams),
             pack_delay: seams.pack_delay_ms.map(Duration::from_millis),
             park_outputs: seams.park_outputs.clone(),
+            park_pack: seams.park_pack.clone(),
+            lock_wait: seams.lock_wait_ms.map(Duration::from_millis),
             #[cfg(feature = "test-seams")]
             park_trim: None,
         }
@@ -906,7 +937,9 @@ fn run_along<S: LineSink + 'static>(payload: &Payload, output: &Arc<Output<S>>, 
 /// [`run`], the login shell's `PATH` read from `login` and the PC's outputs manifest from `input`, in the Windows box's
 /// order: the run readied ([`prepared`]), the heartbeat beating from the subfolder's check; the command run
 /// ([`run_command`]); the back commit made and pushed when the command reached an end of its own, then, after a
-/// passing command, its outputs brought back ([`synced_back`]); then the run's temp folder removed
+/// passing command, its outputs brought back ([`synced_back`]), all of it under the run's `--lock` when it asks for
+/// one, taken just before the command and let go once [`commanded`] returns ([`run_lock_held`]); then the run's temp
+/// folder removed
 /// ([`temp_removed`]) and the heartbeat stopped ([`heartbeat::stop`]), the pack kept to the run's end
 /// ([`Packs::kept`]) still held; then the client probed ([`Output::client_gone_probe`]) and a client found gone by
 /// then ruled once more ([`cut_ended`]), so a full pack whose client went after the command's own ruling, a write
@@ -929,7 +962,14 @@ fn run_reading<S: LineSink + 'static>(
         Ok(ready) => ready,
         Err(status) => return status,
     };
+    // Held from just before the command to the end of its back commit, cross build and pack; on every way out of
+    // `commanded` it is let go here, before the temp folder, the heartbeat and the work lock.
+    let run_lock = match run_lock_held(&ready, output, watches) {
+        Ok(run_lock) => run_lock,
+        Err(status) => return unstarted(ready, output, status),
+    };
     let (end, status) = commanded(&ready, output, watches);
+    drop(run_lock);
     if let Some(temp) = ready.temp.take() {
         temp_removed(temp, output);
     }
@@ -947,6 +987,68 @@ fn run_reading<S: LineSink + 'static>(
     // The kept pack goes first, its shared lock with it, once nothing more can replace it. The slot goes while the
     // work lock is still held, as the Windows box lets it go: a second call of the session that takes the lock next
     // keeps a claim no end of this run removes. The rest of the run goes with `ready`, after the lock.
+    drop(packs);
+    drop(slot);
+    drop(lock);
+    status
+}
+
+/// The run lock of the run `ready` when it asks for one ([`run_lock::held`]): waited for within its
+/// `RunLockWait`, or `watches`' seam in its place, beating itself every heartbeat period when its pump did not start,
+/// its holder record naming its job, work folder, repo and PC. `Ok(None)` for a run with no lock. Else the status the
+/// run ends on before its command, nothing started: a client gone closed, as a client gone before its command; a lock
+/// still held past the wait refused `lock` ([`run_lock::ran_out_line`]); a lock folder or file that could not be used
+/// failed as a slots folder that could not be ([`run_lock::failed_line`]), its back commits never made.
+fn run_lock_held<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, watches: &Watches) -> Result<Option<run_lock::RunLock>, u8> {
+    let request = &ready.request;
+    let Some(RunLockAsked { name, wait, repo, pc }) = request.run_lock else {
+        return Ok(None);
+    };
+    let total = watches.lock_wait.unwrap_or(Duration::from_secs(wait));
+    let asked = run_lock::Asked {
+        name,
+        root: Path::new(&request.root),
+        own: run_lock::HolderRecord {
+            job: request.job.to_owned(),
+            work: request.work.to_owned(),
+            repo: repo.to_owned(),
+            pc: pc.to_owned(),
+            pid: std::process::id(),
+            started_ms: 0,
+        },
+        live: run_lock::group_live,
+    };
+    match run_lock::held(&asked, output.as_ref(), lock_bound(ready.pump.is_some(), ready.periods, total)) {
+        run_lock::Waited::Took(held) => Ok(Some(held)),
+        run_lock::Waited::Gone => Err(back_commits_failed(output, request, CLOSED_STATUS)),
+        run_lock::Waited::RanOut => Err(refused(output, request, Refusal::Lock, &run_lock::ran_out_line(name, total))),
+        run_lock::Waited::Failed(why) => {
+            let status = said(output, &[&run_lock::failed_line(name, &why)], FAILED_STATUS);
+            Err(back_commits_failed(output, request, status))
+        }
+    }
+}
+
+/// The bound of a run's lock wait of `total`: beating itself every heartbeat period of `periods` when its heartbeat
+/// pump did not start (`pumped` false), and leaving the beats to the pump when it did.
+fn lock_bound(pumped: bool, periods: Periods, total: Duration) -> run_lock::Bound {
+    run_lock::Bound {
+        total,
+        beat: (!pumped).then_some(periods.heartbeat),
+    }
+}
+
+/// Ends the run `ready` whose command never started with `status`, letting go what [`run_reading`] lets go at a
+/// run's end, in the same order: its temp folder, its heartbeat, its LFS state, then its slot and its work lock.
+fn unstarted<S: LineSink>(mut ready: Ready<'_>, output: &Output<S>, status: u8) -> u8 {
+    if let Some(temp) = ready.temp.take() {
+        temp_removed(temp, output);
+    }
+    if let Some(pump) = ready.pump.take() {
+        heartbeat::stop(pump);
+    }
+    ready.lfs.close(&mut |line| noted(output, GAT, line));
+    let Ready { packs, slot, lock, .. } = ready;
     drop(packs);
     drop(slot);
     drop(lock);
@@ -1089,7 +1191,8 @@ const PARK_STEP: Duration = Duration::from_millis(20);
 const PARK_LIMIT: Duration = Duration::from_secs(600);
 
 /// Parks the run on `path`: with `--test-box-park-outputs`, right after its command ends, before its back commit and
-/// every pack decision; with [`Watches::park_trim`], once its own pack is written, before its trim. Makes
+/// every pack decision; with `--test-box-park-pack`, just before a passing run's pack, after its cross build; with
+/// [`Watches::park_trim`], once its own pack is written, before its trim. Makes
 /// `<path>.parked`, its failure said, then waits until `path` exists, at most [`PARK_LIMIT`].
 fn parked<S: LineSink>(path: &Path, output: &Output<S>) {
     let mut parked = path.as_os_str().to_owned();
@@ -1248,7 +1351,12 @@ fn outputs_brought<S: LineSink + 'static>(
         return status;
     }
     match request.cross.as_ref().map(|cross| cross_built(launch, cross, output)) {
-        None | Some(Crossed::Passed) => brought_back(ready, (asked, read), main, output, watches, Packing::Passed),
+        None | Some(Crossed::Passed) => {
+            if let Some(park) = watches.park_pack.as_deref() {
+                parked(park, output);
+            }
+            brought_back(ready, (asked, read), main, output, watches, Packing::Passed)
+        }
         Some(Crossed::Ended(ended)) => ended,
         Some(Crossed::Gone) => CLOSED_STATUS,
     }
@@ -3072,6 +3180,8 @@ mod tests {
             started: Instant::now(),
             pack_delay: None,
             park_outputs: None,
+            park_pack: None,
+            lock_wait: None,
             #[cfg(feature = "test-seams")]
             park_trim: None,
         }
@@ -4865,12 +4975,8 @@ mod tests {
     }
 
     #[test]
-    fn a_unix_box_refuses_run_lock_with_the_lock_tag() {
-        let case = Case::new("run-lock");
-        let lock = json!({ "RunLock": "mac-signing", "RunLockWait": 60 });
-        assert_refused(&case, &lock, Refusal::Lock, "gate: this builder holds no --lock locks");
-        let with_desktop = json!({ "RunLock": "mac-signing", "RunLockWait": 60, "Desktop": true, "DesktopWait": 60 });
-        assert_refused(&case, &with_desktop, Refusal::Lock, "gate: this builder holds no --lock locks");
+    fn a_bad_run_lock_name_or_a_run_lock_without_its_wait_is_a_usage_line_and_takes_no_work_lock() {
+        let case = Case::new("run-lock-usage");
         let commit = "a".repeat(40);
         for (extra, line) in [
             (
@@ -4884,6 +4990,39 @@ mod tests {
             assert_eq!(said, [line]);
             assert!(!Path::new(&case.lock()).exists(), "the lock is not taken");
         }
+    }
+
+    #[test]
+    fn a_lock_run_whose_repo_or_pc_is_not_a_text_is_a_usage_line() {
+        let case = Case::new("run-lock-repo-pc");
+        let commit = "a".repeat(40);
+        for key in ["Repo", "Pc"] {
+            let mut extra = json!({ "RunLock": "mac-signing", "RunLockWait": 60 });
+            extra[key] = json!(5);
+            let json = case.json(&commit, &extra);
+            let payload = decoded(&json);
+            let line = match key {
+                "Repo" => payload.repo().map(drop).expect_err("a number is no Repo"),
+                _ => payload.pc().map(drop).expect_err("a number is no Pc"),
+            };
+            let (status, said) = ran(&json);
+            assert_eq!(status, 2, "{key}: {said:?}");
+            assert_eq!(said, [line]);
+            assert!(!Path::new(&case.lock()).exists(), "the lock is not taken");
+        }
+    }
+
+    #[test]
+    fn a_lock_wait_with_no_pump_beats_at_the_heartbeat_period() {
+        let periods = Periods {
+            heartbeat: Duration::from_millis(1234),
+            ..Periods::default()
+        };
+        let total = Duration::from_secs(60);
+        let unpumped = super::lock_bound(false, periods, total);
+        assert_eq!(unpumped.beat, Some(periods.heartbeat), "no pump: the wait beats itself");
+        assert_eq!(unpumped.total, total);
+        assert_eq!(super::lock_bound(true, periods, total).beat, None, "a pump beats instead");
     }
 
     #[test]

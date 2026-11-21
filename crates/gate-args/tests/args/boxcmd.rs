@@ -257,6 +257,38 @@ fn a_box_seam_sets_the_drain_lock_retry() {
     assert!(refused[0].contains("--test-box-drain-lock-ms"), "{refused:?}");
 }
 
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_box_lock_wait_seam_parses_above_zero() {
+    let mut words = vec!["box", "--test-box-lock-wait-ms", "50"];
+    words.extend_from_slice(&hold_words(&["--root", r"C:\x", "--holder", "ci 7", "--ceiling", "60"], &["a"])[1..]);
+    let seams = BoxSeams {
+        lock_wait_ms: Some(50),
+        ..BoxSeams::default()
+    };
+    assert_eq!(invocation(&words), held_with(seams, 0, vec![OsString::from("a")]));
+    words[2] = "0";
+    let refused = problems(&words);
+    assert_eq!(refused.len(), 1, "a wait of 0 is refused: {refused:?}");
+    assert!(refused[0].contains("--test-box-lock-wait-ms"), "{refused:?}");
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_box_park_pack_seam_takes_a_path() {
+    let mut words = vec!["box", "--test-box-park-pack", "/tmp/park"];
+    words.extend_from_slice(&hold_words(&["--root", r"C:\x", "--holder", "ci 7", "--ceiling", "60"], &["a"])[1..]);
+    let seams = BoxSeams {
+        park_pack: Some(std::path::PathBuf::from("/tmp/park")),
+        ..BoxSeams::default()
+    };
+    assert_eq!(invocation(&words), held_with(seams, 0, vec![OsString::from("a")]));
+    words[2] = "";
+    let refused = problems(&words);
+    assert_eq!(refused.len(), 1, "an empty path is refused: {refused:?}");
+    assert!(refused[0].contains("--test-box-park-pack"), "{refused:?}");
+}
+
 #[test]
 fn each_verb_parses_with_stdin() {
     for (word, verb) in [
