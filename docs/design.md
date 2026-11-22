@@ -2744,6 +2744,12 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   `--no-restore` is dropped from the builder's words of a dotnet `build`, `test`, `run`, `publish`, `pack` or `format` command, saying nothing, so the builder restores the work folder for itself: `NuGet`'s no-op check in a warm folder, and the restore a cold one lacks, whose `obj` holds no assets for the command to read.
 
+  The one exception is a routed direct command whose own words set `TargetFramework` by a property (`-p:TargetFramework=`, in any spelling the router reads) and name a project or solution file, or a `--project` folder: dotnet's implicit restore does not restore a framework a property sets (NETSDK1005), so the builder's words keep `--no-restore` and the payload gains `PreRestore`, the words after `dotnet` of a restore the box runs first.
+
+  They are `restore <target>`, then the command's property words (prefixed), `-c` rewritten as `-p:Configuration=`, `-r` or `--runtime`, `--source`, and `--use-current-runtime` or `--ucr`, taken before the revision stamp, so the restore never sees the stamped revision or the path map.
+
+  Never `-f`, `-s`, a bare word (an option's value) or a word after `--`. A carried word that is empty means no pre-restore and the drop above. A wrapped pwsh command, `TargetFrameworks`, a warm-up, a positional folder and a command with no target keep the drop (`pre_restore_words` in `gate-router`'s `decide.rs`).
+
   The PC's own words and a run that falls back keep it, and so do a sent build's kept `--no-build` words, which restore nothing. A commit stage's hooks run inside `git commit`, out of the router's reach, so they need `.gate/stage.toml` instead.
 
   A fallback here decides `--no-build` again for the run here, as a Local route does (below), whatever the refusal: the word stays when the built-here record says the last build of what the command builds ran here, or the worktree has no nothing-back record and every project the command builds has `obj\project.assets.json`, so the run tests the PC's own build, else it drops.
@@ -4401,7 +4407,15 @@ A routed run therefore moves to one long-lived connection carrying every verb, `
 
 The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`.
 
-A `run` payload also holds `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, the optional `FailureOutputs` (a list of globs read like `Outputs`; an older box ignores it), `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, `SentDigest`, `LfsDigest`, `GodotVersion`, `EngineEnv`, `CrossBuild` (a macOS builder's key: an object of `Rid` and `Words`, with `Outputs`; [The Unix box](#the-unix-box)) and the commit stage's `CommitStage` and `Head` (below).
+A `run` payload also holds `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, the optional `FailureOutputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, `SentDigest`, `LfsDigest`, `GodotVersion`, `EngineEnv` and `CrossBuild` (a macOS builder's key: an object of `Rid` and `Words`, with `Outputs`; [The Unix box](#the-unix-box)).
+
+`FailureOutputs` is a list of globs read like `Outputs`; an older box ignores it.
+
+It may also hold the optional `PreRestore` (a non-empty list of non-empty texts: the words after `dotnet` of the restore a routed command's framework override needs before it, [Routing](#routing); never in a warm-up's payload) and the commit stage's `CommitStage` and `Head` (below).
+
+A `PreRestore` that is not such a list is a usage error, `gate: box payload PreRestore must be a non-empty list of non-empty texts`, and a warm-up payload that sets one is refused, `gate: box payload asks a warm-up for PreRestore`, both exit 2 (`gate_wire::Payload::pre_restore`).
+
+A key the box reads that an older box would ignore needs no negotiation: the preflight refuses a builder whose gate version differs, so a new payload key (`PreRestore` among them) only ever reaches a box that reads it.
 
 An `outputs` payload also holds `Name`.
 
@@ -4888,7 +4902,9 @@ Built verbs:
 
   Otherwise the line is git's own `gate: remote checkout failed (status <n>)`.
 
-  The steps are the layout, fetch, the commit probe, checkout, clean and the back ref reset (each of the three git steps once per repo on a pair run, the main repo first), the broken `.venv` clear (below), the dotnet tool restore, the sent project restore of a run with a `SentDigest`, the package restore (pnpm, bun or npm), a commit stage's preparation (below), then the command, then the sync-back. A failing step prints `gate: remote <fetch|checkout|clean|back ref reset|reset|head ref delete> failed (status <n>)` and exits `n`.
+  The steps are the layout, fetch, the commit probe, checkout, clean and the back ref reset (each of the three git steps once per repo on a pair run, the main repo first), the broken `.venv` clear (below), the dotnet tool restore, the sent project restore of a run with a `SentDigest`, the framework override's restore of a run with a `PreRestore`, the package restore (pnpm, bun or npm), a commit stage's preparation (below), then the command, then the sync-back.
+
+  A failing step prints `gate: remote <fetch|checkout|clean|back ref reset|reset|head ref delete> failed (status <n>)` and exits `n`.
 
   The clean is `git clean -fdq`, with no `-x`, so a work folder keeps its ignored files between runs; a Godot project's `.godot` folder is one, so it persists from one routed run to the next.
 
@@ -5366,6 +5382,12 @@ Built verbs:
   It runs on every such run, warm folders included, NuGet's own no-op check deciding whether there is work. It runs after the dotnet tool restore and before any package install and the start marker, in a job of its own named `{job}-sent-restore`, with the command's restricted token (the box's own is never the fallback) and the command's base environment: the caller's `Env`, the build-server settings, `safe.directory`, Event Log off, and the box run's job and exe names.
 
   It prints `gate: restoring {project} on the builder for the sent build` before and `gate: dotnet restore of {project} took {n} s` after. A restore that fails prints `gate: remote restore of {project} failed (status {status})`, one that cannot start `gate: remote could not start the dotnet restore of {project}: {message}`, and either then the `sent` refusal tag and `gate: remote build sent to work folder {key} cannot run: the builder could not restore {project}`. A record that cannot be read prints `gate: remote could not read the sent-build record: {why}`, then the tag and `gate: remote build sent to work folder {key} cannot run: its sent-build record cannot be read`. The client says the dropped line and runs the dropped words on the builder; it never falls back to a run here.
+
+  The framework override's restore (`update_pre` in `boxside/tools.rs`) runs after the tool restore and the sent restore and before the package restore and the stage preparation, when the payload holds a `PreRestore`: the box's `dotnet` with those words, in the folder the command runs in, in the same `{job}-sent-restore` job (the two never run at once), with the command's restricted token and base environment. The command then keeps its `--no-restore`.
+
+  It prints `gate: restore for the framework override took <n.n> s` after it. A restore that fails prints `gate: remote restore for the framework override failed (status <n>)`, one that cannot start `gate: remote could not start the restore for the framework override: <why>`, and either then the `tools` refusal tag and `gate: remote work folder <key> could not restore its framework override` (`gate_wire::pre_restore_line`), status 75, so the PC tries the next builder or runs the command itself.
+
+  A stop, or a client that closes the connection, ends it as it ends the sent restore.
 
   Once a sent build's put has every file of its manifest, it deletes each plain file of one name below `<project>/bin/<configuration>/` that neither record holds, reached through handles as above; folders, links and junctions stay, and a file that cannot be deleted says `gate: remote could not remove the leftover build file <path>: <error>`. Both records' paths go into the one exclude file, whichever record an install or a run's check writes it from.
 
@@ -6222,6 +6244,12 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
   It says `gate: dotnet tool restore took <s> s`. A nonzero exit says `gate: remote tool restore failed (status <n>)`, then the `tools` refusal tag and `gate: remote work folder <key> could not restore its dotnet tools`, and the run ends 75, so the PC runs the command itself. A restore that never started (no `dotnet`, its group record not readied, or the lock lost first) says `gate: remote could not start the dotnet tool restore: <error>`, then the same three lines, status 75.
 
   A restore ended by a signal, a `box stop` among them, says `gate: remote tool restore failed (signal <n>)` and ends 1 with no tag.
+
+  The framework override's restore (`PreRestore`, [Routing](#routing)) runs after the tool restore and before the package restore: `dotnet <PreRestore>` in the place folder, as the leader of a process group of its own recorded in `<Work>.tools.pgid` (job `<Job>-tools`), with the login `PATH`, `TMPDIR`, the caller's `Env` pairs and the gate's build-server settings (run id `gate-box-<nonce>`), its streams forwarded like the tool restore's.
+
+  It says `gate: restore for the framework override took <n.n> s`. A nonzero exit says `gate: remote restore for the framework override failed (status <n>)`, a start that failed `gate: remote could not start the restore for the framework override: <why>`, and either then the `tools` refusal tag and `gate: remote work folder <key> could not restore its framework override`, status 75.
+
+  A signal says `... failed (signal <n>)` and ends 1 with no tag. A `box stop` during it ends its group and runs no command.
 
   Status 1 also follows `gate: remote could not read the tool manifest <path>: <error>`, `gate: remote could not place the tool manifest <path> under the work folder <work>`, `gate: remote could not write <Work>.tools: <why>`, `gate: remote could not resolve the work folder <work> or the folder <place>: <error>`, and `gate: remote could not see the dotnet tool restore to its end: <why>`; an unreadable record only notes `gate: remote could not read <Work>.tools: <error>; restoring the tools` and restores.
 

@@ -634,8 +634,9 @@ pub struct Along<'a> {
     pub godot: Godot<'a>,
     /// The program of the run's chosen Blender install, which each of [`Along::blender_names`] is set to over the
     /// payload's `Env`; `None` for a run that chose none, which removes each of those names from the box's own
-    /// environment, a caller's pair for it kept, and for a tool or package restore, which removes each of them from the
-    /// environment it inherits and takes no caller's pairs.
+    /// environment, a caller's pair for it kept, and for a tool, framework-override or package restore, which removes
+    /// each of them from the environment it inherits; of those, only the framework override's pre-restore takes the
+    /// caller's pairs, a pair for a blender name kept.
     pub blender: Option<&'a str>,
     /// The names `EngineEnv` sets to the chosen Blender install's program.
     pub blender_names: &'a [String],

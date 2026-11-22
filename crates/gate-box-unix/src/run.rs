@@ -263,8 +263,12 @@ pub struct Request<'p> {
     pub blender: Option<&'p str>,
     /// The names `EngineEnv` sets to the chosen Blender install's program, in order; with no [`Request::blender`],
     /// each is removed from what the box hands the command, a caller's pair for it kept. The tool and package restores
-    /// never see one: each is removed from the environment they inherit, and they take no caller's pairs.
+    /// never see one: each is removed from the environment they inherit, and they take no caller's pairs; the restore for
+    /// the framework override takes the caller's pairs, a pair for a blender name kept.
     pub blender_names: Vec<String>,
+    /// The words after `dotnet` of the restore run before the command for a framework override, `PreRestore`; `None`
+    /// for none.
+    pub pre_restore: Option<Vec<String>>,
     /// The digest of the inputs manifest the PC sent before the run, `InputsDigest`; `None` for none.
     pub inputs_digest: Option<&'p str>,
     /// The outputs the run brings back after a passing command, and the test reports among them after a failed one,
@@ -329,6 +333,7 @@ impl<'p> Request<'p> {
         let blender = payload.blender_version()?;
         let inputs_digest = payload.inputs_digest()?;
         let sent = payload.sent_digest()?.is_some();
+        let pre_restore = payload.pre_restore()?;
         let lfs_digest = payload.lfs_digest()?;
         // Just before the repos, where the Windows box reads it beside the repos' default branch.
         let commit_stage = payload.commit_stage_head()?.is_some();
@@ -364,6 +369,7 @@ impl<'p> Request<'p> {
             godot,
             blender,
             blender_names,
+            pre_restore,
             inputs_digest,
             outputs,
             cross,
@@ -1790,21 +1796,15 @@ fn locked<S: LineSink + 'static>(
         return Err(Unready::Ended(said(output, &[&not_inside(request.subfolder)], USAGE_STATUS)));
     }
     let temp = temp_for(request, output).inspect_err(|_| lfs_let_go(&mut lfs, output))?;
-    // No Blender for a restore: each restore removes every blender name from what it inherits.
-    let along = Along {
-        path: login_path.as_deref(),
-        tmp: temp.as_ref().map(RunTemp::tmpdir),
-        godot: Godot::Unchosen,
-        blender: None,
-        blender_names: &request.blender_names,
-        ceiling: None,
-    };
+    let along = restore_along(request, login_path.as_deref(), temp.as_ref());
     venvs_cleared(request, &git, output);
     // A Blender that did not resolve skips the restores: the command then says why and ends 127 before it starts.
     let restored = if blender.is_err() {
         Ok(())
     } else {
-        tools::update(request, &place, lock, along, output).and_then(|()| packages::update(request, &place, lock, along, &git, output))
+        tools::update(request, &place, lock, along, output)
+            .and_then(|()| tools::update_pre(request, &place, lock, along, output))
+            .and_then(|()| packages::update(request, &place, lock, along, &git, output))
     };
     if let Err(unready) = restored {
         if let Some(temp) = temp {
@@ -1826,6 +1826,20 @@ fn locked<S: LineSink + 'static>(
         outputs,
         lfs,
     })
+}
+
+/// What the restores of `request` ([`locked`]) are found along: the login shell's `PATH` `login_path` and the run's
+/// temp folder `temp` as their `TMPDIR`, when there are, with no Godot, no ceiling and no Blender, as each restore
+/// removes every blender name from what it inherits.
+fn restore_along<'a>(request: &'a Request<'_>, login_path: Option<&'a str>, temp: Option<&'a RunTemp>) -> Along<'a> {
+    Along {
+        path: login_path,
+        tmp: temp.map(RunTemp::tmpdir),
+        godot: Godot::Unchosen,
+        blender: None,
+        blender_names: &request.blender_names,
+        ceiling: None,
+    }
 }
 
 /// The run's LFS state `lfs` closed ([`RunLfs::close`]) on a way out of [`locked`] after its checkout, as
@@ -2681,7 +2695,8 @@ mod tests {
     use gate_inputs::hash::sha256_of;
     use gate_inputs::manifest::Manifest;
     use gate_wire::{
-        PathForm, Payload, Refusal, busy_line, checkout_prefix, checkout_start_line, escaped, layout_line, refused_line, started_line, tools_line,
+        PathForm, Payload, Refusal, busy_line, checkout_prefix, checkout_start_line, escaped, layout_line, pre_restore_line, refused_line,
+        started_line, tools_line,
     };
     use serde_json::{Value, json};
 
@@ -4378,6 +4393,19 @@ mod tests {
 
             assert_eq!(status, 2, "{line}");
             assert_eq!(said, [line]);
+        }
+    }
+
+    #[test]
+    fn a_malformed_pre_restore_is_a_usage_error() {
+        let case = Case::new("pre-restore");
+        let line = "gate: box payload PreRestore must be a non-empty list of non-empty texts";
+        for pre_restore in [json!("restore p.csproj"), json!([]), json!(["restore", ""]), json!(["restore", 1])] {
+            let (status, said) = ran(&case.json(&"a".repeat(40), &json!({ "PreRestore": pre_restore })));
+
+            assert_eq!(status, 2, "{pre_restore}");
+            assert_eq!(said, [line], "{pre_restore}");
+            assert!(!Path::new(&case.lock()).exists(), "the lock is not taken: {pre_restore}");
         }
     }
 
@@ -6831,13 +6859,57 @@ mod tests {
         );
     }
 
-    /// Readies a run of `case` whose restore waits, stops it with `box stop` once the restore has started, and checks
-    /// that its group record is removed, no tools record written and the restore ran once; the run's status and lines.
+    /// Readies a run of `case` whose tool restore waits, stops it with `box stop` once the restore has started, and
+    /// checks it as [`stopped_restore_of`] does; the run's status and lines.
     fn stopped_restore(case: &Case) -> (u8, Vec<String>) {
+        stopped_restore_of(case, &[(MANIFEST_PATH, MANIFEST)], &json!({}))
+    }
+
+    /// The words after `dotnet` of the pre-restore the framework override cases send as `PreRestore`.
+    const PRE_RESTORE: [&str; 3] = ["restore", "p.csproj", "-p:TargetFramework=net8.0"];
+
+    #[test]
+    fn a_stop_during_the_pre_restore_ends_its_group_and_runs_no_command() {
+        let case = Case::new("pre-restore-stop");
+        let (status, said) = stopped_restore_of(&case, &[("p.csproj", "<Project />\n")], &json!({ "PreRestore": PRE_RESTORE }));
+        assert_eq!(status, 1, "a stop during the pre-restore ends the run before its command: {said:?}");
+        assert!(
+            said.iter()
+                .any(|line| line == "gate: remote restore for the framework override failed (signal 15)"),
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn a_pre_restore_without_dotnet_refuses_the_run_75_with_the_tools_tag_and_the_framework_override_line() {
+        let case = Case::new("pre-restore-missing");
+        let empty = case.base.with_file_name("no-dotnet");
+        fs::create_dir_all(&empty).expect("the empty folder is made");
+        // The git steps run the real git by its path; the login PATH holds no dotnet.
+        test_program::set(&real_git());
+        SHIM_PATH.with(|cell| *cell.borrow_mut() = empty.display().to_string());
+        let commit = case.snapshot(&[("p.csproj", "<Project />\n")]);
+        let (status, said) = ran_along_shim(&case.json(&commit, &json!({ "PreRestore": PRE_RESTORE })));
+        // Refused before it is ready, so its command never runs.
+        assert_eq!(status, REFUSED_STATUS, "{said:?}");
+        let start = said
+            .iter()
+            .position(|line| line.starts_with("gate: remote could not start the restore for the framework override: "));
+        let after = [refused_line(NONCE, Refusal::Tools), pre_restore_line(KEY)];
+        assert!(
+            start.is_some_and(|at| said[at + 1..] == after),
+            "the could-not-start line, then the tools tag and the framework override line, last: {said:?}"
+        );
+    }
+
+    /// Readies a run of `case` with `extra` keys, its snapshot holding `files`, whose restore waits, stops it with
+    /// `box stop` once the restore has started, and checks that its group record is removed, no tools record written
+    /// and the restore ran once; the run's status and lines.
+    fn stopped_restore_of(case: &Case, files: &[(&str, &str)], extra: &Value) -> (u8, Vec<String>) {
         let started = case.base.with_file_name("restore-started");
         let log = case.dotnet_shim(&format!(": > '{}'\nsleep 600", started.display()));
-        let commit = case.snapshot(&[(MANIFEST_PATH, MANIFEST)]);
-        let json = case.json(&commit, &json!({}));
+        let commit = case.snapshot(files);
+        let json = case.json(&commit, extra);
         let (path, run_json) = (shim_login().expect("the shim's PATH is set").path, json.clone());
         let (sent, got) = mpsc::channel();
         thread::spawn(move || {

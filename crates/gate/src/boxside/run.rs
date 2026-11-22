@@ -208,6 +208,9 @@ pub(super) struct Request<'a> {
     /// The digest of the manifest of the PC's build the client sent the work folder, `SentDigest`, `None` when it sent
     /// none.
     pub(super) sent_digest: Option<&'a str>,
+    /// The words after `dotnet` of the restore run before the command for a framework override, `PreRestore`
+    /// ([`tools::update_pre`]); `None` when the payload gives none.
+    pub(super) pre_restore: Option<Vec<String>>,
     /// The folders below the main repo's tree whose files the clear after an interrupted command leaves alone,
     /// `SpareFolders`; none when the payload gives none.
     spare: Vec<String>,
@@ -288,6 +291,7 @@ impl Request<'_> {
         let blender = resolved_blender(blender_version, blender_root.as_deref(), variables, &refused);
         let inputs_digest = payload.inputs_digest()?;
         let sent_digest = payload.sent_digest()?;
+        let pre_restore = payload.pre_restore()?;
         let spare = payload.spare_folders()?;
         let lfs_digest = payload.lfs_digest()?;
         // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
@@ -319,6 +323,7 @@ impl Request<'_> {
             host,
             inputs_digest,
             sent_digest,
+            pre_restore,
             spare,
             run_lock,
         })
@@ -1884,8 +1889,9 @@ pub(super) enum Of {
 }
 
 /// The run up to its command: the snapshot laid out and checked out, the subfolder found, the repo's dotnet tools
-/// restored and, for a pnpm, bun or npm command, its packages installed ([`packages::update`]); else `Err` with the status the
-/// run ends on, its lines said. A refusal is said as such; any other end is followed, on a pair run, by the box's
+/// restored, a sent build's projects and a framework override restored ([`tools::update_pre`]) and, for a pnpm, bun
+/// or npm command, its packages installed ([`packages::update`]); else `Err` with the status the run ends on, its lines
+/// said. A refusal is said as such; any other end is followed, on a pair run, by the box's
 /// `gate: remote back commits: failed` line ([`ended_before`]). The run's LFS state, held: the LFS content of each repo
 /// that carries an LFS digest, its scratch folder alone, or nothing, otherwise ([`WorkGit::checkout`]); a refusal of it is said as such
 /// ([`lfs_refused`]).
@@ -1949,8 +1955,9 @@ fn no_head(repo: &Repo<'_>, head: &str) -> String {
 }
 
 /// The run after its checkout and up to its command: the subfolder found, the repo's dotnet tools restored, a sent build's
-/// projects restored ([`tools::update_sent`]), for a pnpm or bun command its packages installed and, on a commit stage,
-/// the repo's stage preparation run; else `Err` with the status the run ends on, its lines said, as [`ready`] gives it.
+/// projects restored ([`tools::update_sent`]), a framework override restored ([`tools::update_pre`]), for a pnpm or bun
+/// command its packages installed and, on a commit stage, the repo's stage preparation run; else `Err` with the status
+/// the run ends on, its lines said, as [`ready`] gives it.
 fn restored(
     request: &Request<'_>,
     (git, lfs): (&WorkGit, &RunLfs),
@@ -1968,6 +1975,7 @@ fn restored(
     venvs_cleared(request, git, console);
     let restored = tools::update(request, folders.work, folders.place, beat, console)
         .and_then(|()| tools::update_sent(request, folders.place, beat, console))
+        .and_then(|()| tools::update_pre(request, folders.place, beat, console))
         .and_then(|()| packages::update(request, git, folders, beat, console))
         .and_then(|()| stage_prep::update(request, (git, lfs), folders.place, beat, console));
     match restored {

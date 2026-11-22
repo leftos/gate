@@ -28,7 +28,8 @@ pub const DROPPED_UNSENT_LINE: &str = "gate: dropped --no-build: the PC's build 
 pub const NO_OUTPUTS_LINE: &str = "gate: outputs: bins not brought back for a --no-build command";
 
 const NO_BUILD: &str = "--no-build";
-/// The word a routed dotnet command loses, so the builder restores its work folder for itself ([`without_no_restore`]).
+/// The word a routed dotnet command loses, so the builder restores its work folder for itself ([`without_no_restore`]),
+/// or keeps beside the restore the builder runs before it ([`pre_restore_words`]).
 const NO_RESTORE: &str = "--no-restore";
 
 /// The word that ends a dotnet command's own arguments: what follows it goes to the program the command runs. After a
@@ -134,6 +135,14 @@ const VALUE_OPTIONS: [&str; 18] = [
 const VALUE_SPELLINGS: [&[&str]; 4] = [&CONFIGURATION_OPTIONS, &FRAMEWORK_OPTIONS, &RUNTIME_OPTIONS, &VALUE_OPTIONS];
 /// The spellings of the package source option, which a cross build carries with the framework.
 const SOURCE_OPTIONS: [&str; 2] = ["-s", "--source"];
+/// The source option a pre-restore carries with its value ([`pre_restore_carried`]).
+const SOURCE_OPTION: &str = "--source";
+/// The spellings of the switch a pre-restore carries alone ([`pre_restore_carried`]).
+const USE_CURRENT_RUNTIME: [&str; 2] = ["--use-current-runtime", "--ucr"];
+/// The property whose override a routed dotnet command's builder restores before it ([`pre_restore_words`]).
+const TARGET_FRAMEWORK: &str = "TargetFramework";
+/// The dotnet verb a pre-restore runs ([`pre_restore_words`]).
+const RESTORE_VERB: &str = "restore";
 /// The dotnet build and test options beyond [`VALUE_OPTIONS`] that take the next word as their value when written
 /// without `=` or `:`, which only the cross build reads ([`cross_plan`]); an option in none of [`CROSS_VALUE_SPELLINGS`]
 /// and [`NO_VALUE_OPTIONS`] keeps a build from its cross build ([`unknown_option`]).
@@ -973,11 +982,11 @@ pub struct RemoteRun {
     /// The pattern that matched.
     pub pattern: String,
     /// The words the builder runs: paths rewritten, `--no-build` and `--no-restore` dropped from a dotnet command
-    /// ([`without_no_build`], [`without_no_restore`]), the worktree's `HEAD`
-    /// sha pinned onto a dotnet command that builds as `SourceRevisionId`, a bare first word naming a file of the
-    /// gate's folder written `./name`, and a first word naming a program by a path outside the worktree sent as the
-    /// program's name ([`RemoteRun::program_named`]), which is never the file of the folder; a property value naming a
-    /// carried file holds [`GATE_FOLDER_MARK`].
+    /// ([`without_no_build`], [`without_no_restore`]), `--no-restore` kept for one with a pre-restore
+    /// ([`RemoteRun::pre_restore`]), the worktree's `HEAD` sha pinned onto a dotnet command that builds as
+    /// `SourceRevisionId`, a bare first word naming a file of the gate's folder written `./name`, and a first word
+    /// naming a program by a path outside the worktree sent as the program's name ([`RemoteRun::program_named`]), which
+    /// is never the file of the folder; a property value naming a carried file holds [`GATE_FOLDER_MARK`].
     pub words: Vec<String>,
     /// The command as given, each exact `--no-build` word of a dotnet command dropped from it: read only to say the
     /// first word the caller gave, for a run whose first word was sent as a program's name
@@ -1040,6 +1049,11 @@ pub struct RemoteRun {
     /// ([`names_bin_folder`]) as a best effort, since any other glob may still match a Mac-built bin file, and the run
     /// counts as not having brought its outputs back, whatever its globs.
     pub bins_withheld: bool,
+    /// The words after `dotnet` of the restore the builder runs before the command, whose `--no-restore` is then kept
+    /// ([`pre_restore_words`]): set only for a direct dotnet command that keeps `--no-restore`, sets `TargetFramework`
+    /// by a property and names a project or solution file, or a folder as its `--project` value; `None` for every other
+    /// run, one naming a positional folder or no target among them.
+    pub pre_restore: Option<Vec<String>>,
 }
 
 /// What a routed dotnet build or test builds, as [`Facts::cross_target`] reads it from disk.
@@ -1408,6 +1422,7 @@ fn stage_run(config: &Config, place: Place, builder: Builder, facts: &dyn Facts)
         cross_build: None,
         cross_build_blocked: None,
         bins_withheld: false,
+        pre_restore: None,
     })
 }
 
@@ -4543,20 +4558,7 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         }
     });
     let fallback = without_no_build(given.to_vec());
-    let own_outputs = config.own_outputs_on(&target.builder, &target.repo);
-    let derives = target.builder.os == BuilderOs::Windows && own_outputs.as_ref().is_some_and(|globs| !globs.is_empty());
-    let derived = derives.then(|| derived_outputs(&sent, &subfolder).into_iter().chain(switch_outputs(&sent, &subfolder)));
-    let mut outputs = match own_outputs {
-        Some(globs) => globs,
-        None if target.builder.os == BuilderOs::Macos => Vec::new(),
-        None if cargo => CARGO_OUTPUTS.iter().map(|glob| (*glob).to_owned()).collect(),
-        None => DEFAULT_OUTPUTS.iter().map(|glob| (*glob).to_owned()).collect(),
-    };
-    for glob in derived.into_iter().flatten() {
-        if !outputs.contains(&glob) {
-            outputs.push(glob);
-        }
-    }
+    let mut outputs = run_outputs(config, &target, &sent, &subfolder, cargo);
     // The builder builds a dropped `--no-build` run, so its bins must not come back over the PC's build; its other
     // globs (data the command writes, switch files, test reports) still do.
     let outputs_withheld = fallback.len() != given.len() && !outputs.is_empty();
@@ -4574,7 +4576,8 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
     let crosses = rid.is_some() && cross_verb(&sent);
     let no_build_dropped = without_no_build(sent);
     let dropped_no_build = no_build_dropped.len() != sent_count;
-    let mut words = without_no_restore(no_build_dropped);
+    // Taken before the stamp, so the builder's own SourceRevisionId and PathMap are never restored with.
+    let (mut words, pre_restore) = with_pre_restore(no_build_dropped);
     mark_bare_first_word(&mut words, facts, program_named);
     let source_revision = head_of(&target.place, facts);
     stamp(&mut words, || source_revision.clone(), &target, facts);
@@ -4619,7 +4622,30 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         cross_build,
         cross_build_blocked,
         bins_withheld,
+        pre_restore,
     })
+}
+
+/// The output globs of the routed run of `sent` (its rewritten words, `cargo` whether it is a cargo command) from the
+/// gate's folder `subfolder` on `target` ([`remote_run`]): the repo's own globs on that builder, else none on a macOS
+/// builder, else the cargo or the default globs; on a Windows builder with own globs that are not empty, each glob the
+/// command's words derive ([`derived_outputs`], [`switch_outputs`]) added after them, once.
+fn run_outputs(config: &Config, target: &Target, sent: &[String], subfolder: &str, cargo: bool) -> Vec<String> {
+    let own_outputs = config.own_outputs_on(&target.builder, &target.repo);
+    let derives = target.builder.os == BuilderOs::Windows && own_outputs.as_ref().is_some_and(|globs| !globs.is_empty());
+    let derived = derives.then(|| derived_outputs(sent, subfolder).into_iter().chain(switch_outputs(sent, subfolder)));
+    let mut outputs = match own_outputs {
+        Some(globs) => globs,
+        None if target.builder.os == BuilderOs::Macos => Vec::new(),
+        None if cargo => CARGO_OUTPUTS.iter().map(|glob| (*glob).to_owned()).collect(),
+        None => DEFAULT_OUTPUTS.iter().map(|glob| (*glob).to_owned()).collect(),
+    };
+    for glob in derived.into_iter().flatten() {
+        if !outputs.contains(&glob) {
+            outputs.push(glob);
+        }
+    }
+    outputs
 }
 
 /// The bin folder whose files the run of the command as `given` on `target` sends ([`send_bin`]), and whether the send
@@ -4827,6 +4853,81 @@ pub fn without_no_restore(words: Vec<String>) -> Vec<String> {
         .filter(|(index, word)| !(own.contains(index) && word == NO_RESTORE))
         .map(|(_, word)| word)
         .collect()
+}
+
+/// The words after `dotnet` of the restore the builder runs before a routed dotnet command that keeps its `--no-restore`,
+/// as the builder's implicit restore does not restore a target framework a property sets: `restore <target>`, then each
+/// of the command's own words after its verb that a restore reads ([`pre_restore_carried`]), in their order.
+///
+/// `Some` only for a direct dotnet command (its first non-empty word's file name without extension is `dotnet`, not a
+/// wrapping script's) whose own words name no response file, whose verb is one of [`NO_RESTORE_DROP_VERBS`], whose own
+/// words hold `--no-restore` and set `TargetFramework` ([`sets_property`]), which names a project or solution file, or
+/// a folder as its `--project` value ([`dotnet_target`]), and of whose carried words none is empty. `None` for every
+/// other command, one naming a positional folder or no target among them, whose `--no-restore` [`without_no_restore`]
+/// drops.
+#[must_use]
+pub fn pre_restore_words(words: &[String]) -> Option<Vec<String>> {
+    let direct = first_word(words).is_some_and(|(_, word)| names_program(word, DOTNET));
+    let own = &words[dotnet_own(words).filter(|_| direct)?];
+    let wanted = verb_in(own, &NO_RESTORE_DROP_VERBS) && own.iter().any(|word| word == NO_RESTORE) && sets_property(own, TARGET_FRAMEWORK);
+    let (DotnetTarget::Project(target) | DotnetTarget::Solution(target)) = dotnet_target(words).filter(|_| wanted)?;
+    if target.is_empty() {
+        return None;
+    }
+    let mut restore = vec![RESTORE_VERB.to_owned(), target];
+    let mut at = verb_at(own)? + 1;
+    while at < own.len() {
+        let (carried, taken) = pre_restore_carried(own, at);
+        restore.extend(carried);
+        at += taken;
+    }
+    restore.iter().all(|word| !word.is_empty()).then_some(restore)
+}
+
+/// A routed command's builder words after their `--no-build` drop, and its pre-restore: `--no-restore` kept beside the
+/// pre-restore when there is one ([`pre_restore_words`]), else dropped as ever ([`without_no_restore`]).
+fn with_pre_restore(words: Vec<String>) -> (Vec<String>, Option<Vec<String>>) {
+    match pre_restore_words(&words) {
+        Some(pre_restore) => (words, Some(pre_restore)),
+        None => (without_no_restore(words), None),
+    }
+}
+
+/// What the pre-restore ([`pre_restore_words`]) carries of the dotnet command's own word at `at` (`own`, its dotnet word
+/// first), and how many words that reads: a property word starting with `-` or `/` in each form [`property_list`]
+/// reads, as written, a two-word one with its next word; a configuration in each spelling [`build_settings`] reads as
+/// `-p:Configuration=<c>`; a runtime or `--source` with its value, as written; `--use-current-runtime` or `--ucr`.
+/// Nothing of any other word, a bare one such as an option's value among them, one word read.
+fn pre_restore_carried(own: &[String], at: usize) -> (Vec<String>, usize) {
+    let word = &own[at];
+    let next = own.get(at + 1);
+    let switch = word.starts_with(['-', '/']);
+    if (switch && property_list(word, None).is_some()) || USE_CURRENT_RUNTIME.contains(&word.as_str()) {
+        return (vec![word.clone()], 1);
+    }
+    if switch && property_list(word, next).is_some() {
+        return (own[at..at + 2].to_vec(), 2);
+    }
+    if let Some((configuration, taken)) = spelled_value(word, next, &CONFIGURATION_OPTIONS) {
+        return (vec![format!("-p:Configuration={configuration}")], taken);
+    }
+    match spelled_value(word, next, &RUNTIME_OPTIONS).or_else(|| spelled_value(word, next, &[SOURCE_OPTION])) {
+        Some((_, taken)) => (own[at..at + taken].to_vec(), taken),
+        None => (Vec::new(), 1),
+    }
+}
+
+/// The value `word` gives an option spelled as one of `spellings`, as [`option_value`] reads it, and how many words
+/// that reads: `next` for the spelling alone (two), the text after `=` or `:` for `-c=X` or `-c:X` (one).
+fn spelled_value(word: &str, next: Option<&String>, spellings: &[&str]) -> Option<(String, usize)> {
+    spellings.iter().find_map(|spelling| {
+        if word == *spelling {
+            return next.map(|next| (next.clone(), 2));
+        }
+        word.strip_prefix(spelling)
+            .and_then(|after| after.strip_prefix(['=', ':']))
+            .map(|value| (value.to_owned(), 1))
+    })
 }
 
 /// Writes the first non-empty word `./name` when it is a bare name (no separator, drive or `.`/`..`) of a file in the

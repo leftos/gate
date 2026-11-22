@@ -12,6 +12,9 @@
 //! the restore files a send leaves in a cold folder name the PC's package folder, so `dotnet test` would find no test
 //! project ([`update_sent`]). It runs on every such run, `NuGet`'s own no-op check being the test of whether it has work
 //! to do. One that fails refuses the run `sent` instead, so the PC runs it again without its `--no-build`.
+//!
+//! A run whose `PreRestore` restores a framework override runs those words the same way, in the sent restore's job
+//! ([`update_pre`]); one that fails refuses the run `tools`, so the PC runs the command itself.
 
 use std::convert::Infallible;
 use std::ffi::OsString;
@@ -57,6 +60,7 @@ pub(super) const TOOLS_SUFFIX: &str = ".tools";
 /// What the box does instead when it cannot read the stop signal just before it starts the restore.
 const STARTING_RESTORE: &str = "starting the restore";
 
+use gate_wire::pre_restore_line;
 pub(crate) use gate_wire::tools_line;
 
 /// The manifests `dotnet` would read for `place`: from `place` up to the work folder's root, never above it, each
@@ -353,13 +357,48 @@ pub(crate) fn update(request: &Request<'_>, work: &Path, place: &Path, beat: &Be
         return write_record(&record, &digest, console);
     }
     stamping::err(console, &format!("gate: remote tool restore failed (status {status})"));
-    {
-        // Held across both lines, so no heartbeat lands between the tag and the line it tags.
-        let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
-        stamping::protocol(console, &refused_line(request.nonce, Refusal::Tools));
-        stamping::err(console, &tools_line(request.key));
+    Err(refused_tools(request, &tools_line(request.key), beat, console))
+}
+
+/// Refuses the run with the `tools` tag, so the PC runs the command itself: the tag, then `line`, the line saying what
+/// the work folder could not restore ([`tools_line`], [`pre_restore_line`]), under the beat lock; 75.
+fn refused_tools(request: &Request<'_>, line: &str, beat: &Beat<'_>, console: &mut Console) -> u32 {
+    // Held across both lines, so no heartbeat lands between the tag and the line it tags.
+    let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
+    stamping::protocol(console, &refused_line(request.nonce, Refusal::Tools));
+    stamping::err(console, line);
+    REFUSED_STATUS
+}
+
+/// What the line after the restore for a framework override calls it ([`update_pre`]).
+const PRE_RESTORE: &str = "restore for the framework override";
+
+/// Restores the run's framework override before its command, when it has a `PreRestore`: the box's own `dotnet` run with
+/// those words in `place`, in the job of the sent restore ([`sent_restore_job_name`], as the two never run at once) and
+/// with the command's token and environment, as it evaluates the repo's `MSBuild`. The command then keeps its
+/// `--no-restore`, as the builder's implicit restore would not restore a framework a property sets. `Ok` when there is
+/// none or it passed; else `Err` with the status the run ends on, its lines already said: 75 with the `tools` tag and
+/// [`pre_restore_line`] when it failed or could not start, so the PC runs the command itself, whose own restore already
+/// ran there; 1 when a stop came before or during it or the box could not wait for it; 255 when the client closed the
+/// connection during it.
+pub(crate) fn update_pre(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
+    let Some(words) = &request.pre_restore else {
+        return Ok(());
+    };
+    let words: Vec<OsString> = words.iter().map(OsString::from).collect();
+    let one = OneRestore {
+        words: &words,
+        called: PRE_RESTORE,
+        job: sent_restore_job_name(request.job),
+        context: RestoreContext::OfTheCommand,
+    };
+    match restore(request, place, &one, beat, console) {
+        Ok(Restored::Status(0)) => return Ok(()),
+        Ok(Restored::Status(status)) => stamping::err(console, &format!("gate: remote {PRE_RESTORE} failed (status {status})")),
+        Ok(Restored::Ended(status)) => return Err(status),
+        Err(message) => stamping::err(console, &format!("gate: remote could not start the {PRE_RESTORE}: {message}")),
     }
-    Err(REFUSED_STATUS)
+    Err(refused_tools(request, &pre_restore_line(request.key), beat, console))
 }
 
 /// Restores the projects of the run's sent build before its command, when it has a `SentDigest`: each project the
@@ -401,7 +440,8 @@ pub(crate) fn update_sent(request: &Request<'_>, place: &Path, beat: &Beat<'_>, 
 /// `command`: quiet, as a real restore's chatter would reach a caller's captured output on every sent run, and with the
 /// command's configuration and runtime, as a bare restore evaluates as Debug and would lose a Release-conditional
 /// package, and rewriting a warm folder's assets without the runtime target can break a later `--no-build -r <rid>`.
-/// The framework is not passed, as a restore covers every target framework.
+/// The framework is not passed, as a restore covers every target framework the project itself names; a framework
+/// override a property sets is restored by the run's pre-restore instead ([`update_pre`]).
 fn project_restore_words(file: &Path, command: &[String]) -> Vec<OsString> {
     let settings = build_settings(command);
     let mut words = vec![

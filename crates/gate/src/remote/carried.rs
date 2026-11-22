@@ -129,6 +129,7 @@ mod tests {
             cross_build: None,
             cross_build_blocked: None,
             bins_withheld: false,
+            pre_restore: None,
         }
     }
 

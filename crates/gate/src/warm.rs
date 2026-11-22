@@ -740,6 +740,7 @@ fn call_of<'a>(
         outputs: &[],
         outputs_withheld: false,
         bins_withheld: false,
+        pre_restore: None,
         failure_outputs: &[],
         dropped_no_build: false,
         send: None,

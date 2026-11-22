@@ -4,8 +4,13 @@
 //! runs along the login shell's `PATH` as the leader of a process group of its own, recorded in `<work>.tools.pgid` so
 //! `box stop` ends it, both its streams forwarded like the command's, with no deadline; a client gone ends it. A restore
 //! that fails or cannot start refuses the run with status 75 and the `tools` tag, so the PC runs the command itself.
+//!
+//! A run whose `PreRestore` restores a framework override then runs `dotnet` with those words in the place folder the
+//! same way, under the same group record and job, with the caller's `Env` pairs and the run's build-server settings as
+//! the command gets them; it refuses the same way when it fails or cannot start, with its own line after the tag.
 
 use std::cell::Cell;
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
@@ -16,7 +21,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gate_wire::{Refusal, refused_line, tools_line};
+use gate_wire::{Refusal, build_server_settings, pre_restore_line, refused_line, tools_line};
 use sha2::{Digest, Sha256};
 
 use crate::command::signals_reset;
@@ -151,7 +156,7 @@ pub(crate) fn update<S: LineSink + 'static>(
             );
         }
     }
-    let status = match restored(request, place, lock, along, output) {
+    let status = match restored(request, place, lock, &tool_restore(along), output) {
         Restored::Exited(0) => return record_written(&record, &digest, lock, output).map_err(Unready::Ended),
         Restored::Exited(status) => status,
         Restored::Signalled(signal) => {
@@ -166,10 +171,67 @@ pub(crate) fn update<S: LineSink + 'static>(
         Restored::Ended(status) => return Err(Unready::Ended(status)),
     };
     let _ = output.say(Stream::Err, GAT, &format!("gate: remote tool restore failed (status {status})"));
-    // Said together, so no heartbeat lands between the tag and the line it tags.
+    Err(refused_tools(request, &tools_line(request.key), output))
+}
+
+/// Refuses the run with the `tools` tag, so the PC runs the command itself: the tag and `line`, the line saying what
+/// the work folder could not restore ([`tools_line`], [`pre_restore_line`]), said together so no heartbeat lands
+/// between the tag and the line it tags; [`Unready::Refused`].
+fn refused_tools<S: LineSink>(request: &Request<'_>, line: &str, output: &Output<S>) -> Unready {
     let tag = refused_line(request.nonce, Refusal::Tools);
-    said_as(output, &[(Stamp::Bare, &tag), (GAT, &tools_line(request.key))], REFUSED_STATUS);
-    Err(Unready::Refused)
+    said_as(output, &[(Stamp::Bare, &tag), (GAT, line)], REFUSED_STATUS);
+    Unready::Refused
+}
+
+/// What the lines about the restore for a framework override call it ([`update_pre`]).
+const PRE_RESTORE: &str = "restore for the framework override";
+
+/// Restores the run's framework override before its command, when it has a `PreRestore`: the box's own `dotnet` run
+/// with those words in `place`, along `along` and with the caller's `Env` pairs and the build-server settings of the
+/// command's run `gate-box-<nonce>` ([`restored`]), after the tool restore and under its group record and job, as the
+/// two run one after the other. The command then keeps its `--no-restore`, as `dotnet`'s implicit restore would not
+/// restore a framework a property sets. `Ok` when there is none or it exited 0.
+///
+/// # Errors
+///
+/// How the run ends, its lines said: refused when the restore exited nonzero or could not start, after the failed or
+/// could-not-start line, the `tools` tag and [`pre_restore_line`], said together, so the PC runs the command itself,
+/// whose own restore ran there; status 1 when a signal ended the restore or the box could not see it to its end; 255
+/// when the client closed the connection during it.
+pub(crate) fn update_pre<S: LineSink + 'static>(
+    request: &Request<'_>,
+    place: &Path,
+    lock: &HeldLock,
+    along: Along<'_>,
+    output: &Arc<Output<S>>,
+) -> Result<(), Unready> {
+    let Some(words) = &request.pre_restore else {
+        return Ok(());
+    };
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let run = format!("gate-box-{}", request.nonce);
+    let restoring = Restoring {
+        words: &words,
+        called: PRE_RESTORE,
+        env: &request.env,
+        run: Some(&run),
+        along,
+    };
+    match restored(request, place, lock, &restoring, output) {
+        Restored::Exited(0) => return Ok(()),
+        Restored::Exited(status) => {
+            let _ = output.say(Stream::Err, GAT, &format!("gate: remote {PRE_RESTORE} failed (status {status})"));
+        }
+        Restored::Signalled(signal) => {
+            let line = format!("gate: remote {PRE_RESTORE} failed (signal {signal})");
+            return Err(Unready::Ended(said(output, &[&line], FAILED_STATUS)));
+        }
+        Restored::NotStarted(why) => {
+            let _ = output.say(Stream::Err, GAT, &format!("gate: remote could not start the {PRE_RESTORE}: {why}"));
+        }
+        Restored::Ended(status) => return Err(Unready::Ended(status)),
+    }
+    Err(refused_tools(request, &pre_restore_line(request.key), output))
 }
 
 /// Writes `digest` as the whole of the record `record` while the work lock `lock` is held; a failure is said and
@@ -183,15 +245,40 @@ fn record_written<S: LineSink>(record: &str, digest: &str, lock: &HeldLock, outp
     written.map_err(|why| said(output, &[&format!("gate: remote could not write {record}: {why}")], FAILED_STATUS))
 }
 
-/// Runs `dotnet tool restore` in `place`, found along `along.path` and its `TMPDIR` `along.tmp` when given, each of
-/// `along.blender_names` removed from the environment it inherits, as the
-/// leader of a process group of its own recorded in `<work>.tools.pgid` under the job `<job>-tools`, which `box stop`
-/// reads; both its streams forwarded through `output`, no deadline, and a client gone ending its group. A restore that
-/// exited or was ended by a signal is followed by a line saying how long it ran.
-fn restored<S: LineSink + 'static>(request: &Request<'_>, place: &Path, lock: &HeldLock, along: Along<'_>, output: &Arc<Output<S>>) -> Restored {
-    let record = GroupRecord::new(PathBuf::from(tools_group_record(request.work)), &format!("{}-tools", request.job), lock);
+/// One restore [`restored`] runs.
+struct Restoring<'r> {
+    /// The words after `dotnet`.
+    words: &'r [&'r str],
+    /// What its lines call it: `<called> took`, `could not see the <called> to its end`.
+    called: &'r str,
+    /// The caller's pairs it is given, set last as the command's are; none for the tool restore.
+    env: &'r [(String, String)],
+    /// The run whose build-server settings it is given after the caller's pairs, as the command is
+    /// ([`build_server_settings`]); `None` for the tool restore, which is given none.
+    run: Option<&'r str>,
+    /// What it is found along: the login shell's `PATH`, the run's `TMPDIR` and the blender names it never inherits.
+    along: Along<'r>,
+}
+
+/// The tool restore along `along`: `dotnet tool restore`, given no caller's pairs and no build-server settings.
+fn tool_restore(along: Along<'_>) -> Restoring<'_> {
+    Restoring {
+        words: &["tool", "restore"],
+        called: "dotnet tool restore",
+        env: &[],
+        run: None,
+        along,
+    }
+}
+
+/// The `dotnet` of `restoring` run in `place`: its words, found along `along.path` and its `TMPDIR` `along.tmp` when
+/// given, each of `along.blender_names` removed from the environment it inherits, then `restoring.env` set, then the
+/// build-server settings of `restoring.run` when there is one, each first removing every inherited or given name that
+/// differs from it only in ASCII case, as the command's environment does.
+fn restore_command(place: &Path, restoring: &Restoring<'_>) -> Command {
+    let along = restoring.along;
     let mut command = Command::new("dotnet");
-    command.args(["tool", "restore"]).current_dir(place);
+    command.args(restoring.words).current_dir(place);
     process::with_path(&mut command, along.path);
     if let Some(tmp) = along.tmp {
         command.env("TMPDIR", tmp);
@@ -200,6 +287,36 @@ fn restored<S: LineSink + 'static>(request: &Request<'_>, place: &Path, lock: &H
     for name in along.blender_names {
         command.env_remove(name);
     }
+    // The caller's pairs last, as the command gets them, so a caller's pair for a blender name is kept.
+    for (name, value) in restoring.env {
+        command.env(name, value);
+    }
+    for (name, value) in restoring.run.map(build_server_settings).into_iter().flatten() {
+        let given = restoring.env.iter().map(|(set, _)| OsString::from(set));
+        for set in std::env::vars_os().map(|(set, _)| set).chain(given) {
+            if set.to_str().is_some_and(|set| set.eq_ignore_ascii_case(name)) {
+                command.env_remove(&set);
+            }
+        }
+        command.env(name, value);
+    }
+    command
+}
+
+/// Runs `dotnet` as [`restore_command`] gives it for `restoring` in `place`, as the leader of a process group of its
+/// own recorded in `<work>.tools.pgid` under the job `<job>-tools`, which `box stop` reads; both its streams forwarded
+/// through `output`, no deadline, and a client gone ending its group. A restore that exited or was ended by a signal is
+/// followed by a line saying how long it ran.
+fn restored<S: LineSink + 'static>(
+    request: &Request<'_>,
+    place: &Path,
+    lock: &HeldLock,
+    restoring: &Restoring<'_>,
+    output: &Arc<Output<S>>,
+) -> Restored {
+    let record = GroupRecord::new(PathBuf::from(tools_group_record(request.work)), &format!("{}-tools", request.job), lock);
+    let called = restoring.called;
+    let mut command = restore_command(place, restoring);
     // SAFETY: the closure runs in the child between fork and exec and only resets the umask, signal dispositions and the
     // mask with async-signal-safe calls ([`signals_reset`]), as the command's does.
     unsafe {
@@ -232,7 +349,7 @@ fn restored<S: LineSink + 'static>(request: &Request<'_>, place: &Path, lock: &H
             return Restored::Ended(CLOSED_STATUS);
         }
         Err(not) => {
-            let line = format!("gate: remote could not see the dotnet tool restore to its end: {}", unran(not));
+            let line = format!("gate: remote could not see the {called} to its end: {}", unran(not));
             return Restored::Ended(said(output, &[&line], FAILED_STATUS));
         }
     };
@@ -240,14 +357,14 @@ fn restored<S: LineSink + 'static>(request: &Request<'_>, place: &Path, lock: &H
         return Restored::Ended(CLOSED_STATUS);
     }
     // Said after the restore's own output and before any line saying it failed.
-    let took = format!("gate: dotnet tool restore took {:.1} s", started.elapsed().as_secs_f64());
+    let took = format!("gate: {called} took {:.1} s", started.elapsed().as_secs_f64());
     let _ = output.say(Stream::Err, GAT, &took);
     match (ran.status.code(), ran.status.signal()) {
         (Some(code), _) => Restored::Exited(code),
         (None, Some(signal)) => Restored::Signalled(signal),
         (None, None) => Restored::Ended(said(
             output,
-            &["gate: remote could not see the dotnet tool restore to its end: it gave no status"],
+            &[&format!("gate: remote could not see the {called} to its end: it gave no status")],
             FAILED_STATUS,
         )),
     }

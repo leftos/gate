@@ -1183,6 +1183,49 @@ fn a_routed_run_gives_the_builder_s_command_shared_compilation_off() {
     assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
 }
 
+/// A routed dotnet command that sets its framework by a property and says `--no-restore` reaches the builder with the
+/// `PreRestore` words, which the box runs with its own `dotnet` before the command, and the command keeps its
+/// `--no-restore` (GATE-1256).
+#[test]
+fn a_routed_framework_override_reaches_the_builder_with_its_pre_restore_and_keeps_no_restore() {
+    let case = outputs_case("client-pre-restore", &[]);
+    copy_tool(&case, "dotnet.exe");
+    git(&case, &["commit", "--quiet", "--allow-empty", "-m", "a"]);
+    let stub = case.folder().join("stub-dotnet");
+    fs::create_dir_all(&stub).expect("the stub folder can be made");
+    let log = case.folder().join("dotnet-words.txt");
+    let script = format!("@echo off\r\necho %*>>\"{}\"\r\nexit /b 0\r\n", log.display());
+    fs::write(stub.join("dotnet.cmd"), script).expect("the dotnet stub can be written");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let command = [r".\dotnet.exe", "test", "argv", "p.csproj", "-p:TargetFramework=net8.0", "--no-restore"];
+    let mut gate = client_gate(&case, "out.log", &steps, &command);
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![stub.clone()];
+    paths.extend(std::env::split_paths(&path));
+    gate.env("PATH", std::env::join_paths(paths).expect("the PATH can be joined"));
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "the run went to the builder: {outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
+    let restored = fs::read_to_string(&log).expect("the box ran its dotnet for the pre-restore");
+    // The stub is a batch file, so the box quotes a word holding `=` for cmd; the preflight's `--list-sdks` is no restore.
+    assert_eq!(
+        restored
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| line.starts_with("restore"))
+            .collect::<Vec<_>>(),
+        [r#"restore p.csproj "-p:TargetFramework=net8.0""#],
+        "the PreRestore words: {outcome:?}"
+    );
+    assert!(
+        outcome.stdout.lines().any(|line| line == "--no-restore"),
+        "the builder's command keeps its --no-restore: {outcome:?}"
+    );
+}
+
 /// The most git processes the simple pass below starts, on the PC and the box together, children of git counted. Among
 /// them are the PC's `rev-parse --verify -q HEAD` that every routed run asks for its `SourceRevisionId`, and the box's
 /// `git grep` of the snapshot's `.gitattributes` files for the LFS filter, before the checkout.

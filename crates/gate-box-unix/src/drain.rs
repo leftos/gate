@@ -618,8 +618,8 @@ fn capped(text: &str, most: usize) -> String {
 const WORK: &str = "work";
 
 /// The extensions of a run's group records, longest first, since `.tools.pgid` also ends in `.pgid`, each with what
-/// its record's job adds to the run's job: its git step's `{key}.pgid` the job itself, its tool restore's
-/// `{key}.tools.pgid` `{job}-tools`, and its package restore's `{key}.packages.pgid` `{job}-packages`.
+/// its record's job adds to the run's job: its git step's `{key}.pgid` the job itself, its tool restore's and its
+/// pre-restore's `{key}.tools.pgid` `{job}-tools`, and its package restore's `{key}.packages.pgid` `{job}-packages`.
 const GROUP_JOBS: [(&str, &str); 3] = [(".packages.pgid", "-packages"), (".tools.pgid", "-tools"), (".pgid", "")];
 
 /// What the drained test reads of one group record in the work folder.

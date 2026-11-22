@@ -2565,6 +2565,7 @@ mod tests {
                 outputs: &[],
                 outputs_withheld: false,
                 bins_withheld: false,
+                pre_restore: None,
                 failure_outputs: &[],
                 dropped_no_build: false,
                 send: None,
@@ -2827,6 +2828,7 @@ mod tests {
                 commit_stage: false,
                 outputs_withheld: true,
                 bins_withheld: false,
+                pre_restore: None,
                 ..on(&crate::test_support::HOST, &root, &globs, &state, &log)
             };
             let mut attempt = attempt_of(&held, &transport);
@@ -2896,6 +2898,7 @@ mod tests {
                 commit_stage: false,
                 outputs_withheld: true,
                 bins_withheld: false,
+                pre_restore: None,
                 ..on(&crate::test_support::HOST, &root, &globs, &state, &log)
             };
             let mut attempt = attempt_of(&held, &transport);

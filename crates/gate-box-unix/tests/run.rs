@@ -1529,6 +1529,135 @@ mod unix {
         case.ended_clean();
     }
 
+    /// The `PreRestore` the framework override cases send: the words after `dotnet`.
+    const PRE_RESTORE: [&str; 3] = ["restore", "p.csproj", "-p:TargetFramework=net8.0"];
+
+    #[test]
+    fn a_run_with_a_pre_restore_runs_it_before_the_command() {
+        let case = Case::new("pre-restore");
+        let log = case.base.join("dotnet.log");
+        let shell = shell_with_shim(&case, "dotnet", &format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()));
+        let commit = case.snapshot_holding(&[("p.csproj", "<Project />\n")]);
+        // The command fails unless the restore ran before it.
+        let command = json!(["/bin/sh", "-c", format!("test -s '{}'", log.display())]);
+        let request = case.request(&commit, &json!({ "Command": command, "PreRestore": PRE_RESTORE }));
+        let ended = ran_in(&[], &request, Reading::All, &case.base.join("beaten"), Some(&shell));
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(
+            logged(&log),
+            ["restore p.csproj -p:TargetFramework=net8.0"],
+            "one restore, its words as sent"
+        );
+        assert!(
+            ended
+                .err_texts()
+                .iter()
+                .any(|line| line.starts_with("gate: restore for the framework override took ")),
+            "{:?}",
+            ended.err
+        );
+        case.ended_clean();
+    }
+
+    #[test]
+    fn a_pre_restore_runs_after_the_tool_restore() {
+        let case = Case::new("pre-restore-tools");
+        let log = case.base.join("dotnet.log");
+        let shell = shell_with_shim(&case, "dotnet", &format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()));
+        let commit = case.snapshot_holding(&[(".config/dotnet-tools.json", "{\n  \"version\": 1\n}\n"), ("p.csproj", "<Project />\n")]);
+        let request = case.request(&commit, &json!({ "Command": ["/bin/sh", "-c", "true"], "PreRestore": PRE_RESTORE }));
+        let ended = ran_in(&[], &request, Reading::All, &case.base.join("beaten"), Some(&shell));
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(
+            logged(&log),
+            ["tool restore", "restore p.csproj -p:TargetFramework=net8.0"],
+            "the tool restore first, the framework override second"
+        );
+        case.ended_clean();
+    }
+
+    #[test]
+    fn a_failing_pre_restore_refuses_the_run_75_with_the_tools_tag_and_never_runs_the_command() {
+        let case = Case::new("pre-restore-fails");
+        let log = case.base.join("dotnet.log");
+        let shim = format!(
+            "#!/bin/sh\nif [ \"$1\" = restore ]; then exit 3; fi\necho \"$*\" >> '{}'\n",
+            log.display()
+        );
+        let shell = shell_with_shim(&case, "dotnet", &shim);
+        let commit = case.snapshot_holding(&[("p.csproj", "<Project />\n")]);
+        let request = case.request(&commit, &json!({ "Command": ["dotnet", "build"], "PreRestore": PRE_RESTORE }));
+        let ended = ran_in(&[], &request, Reading::All, &case.base.join("beaten"), Some(&shell));
+        assert_eq!(ended.status, Some(75), "{:?}", ended.err);
+        let texts = ended.err_texts();
+        let failed = texts
+            .iter()
+            .position(|line| *line == "gate: remote restore for the framework override failed (status 3)");
+        let tag = ended.err.iter().position(|line| *line == refused_line(NONCE, Refusal::Tools));
+        let refused = gate_wire::pre_restore_line(KEY);
+        assert!(
+            failed.is_some_and(|failed| tag.is_some_and(|tag| failed < tag)),
+            "the failed line, then the tools tag: {:?}",
+            ended.err
+        );
+        assert!(
+            tag.is_some_and(|tag| texts.get(tag + 1) == Some(&refused.as_str())),
+            "the tools tag, then the framework override line: {:?}",
+            ended.err
+        );
+        assert!(logged(&log).is_empty(), "the command never ran: {:?}", logged(&log));
+        case.ended_clean();
+    }
+
+    #[test]
+    fn a_run_without_a_pre_restore_runs_no_restore() {
+        let case = Case::new("no-pre-restore");
+        let log = case.base.join("dotnet.log");
+        let shell = shell_with_shim(&case, "dotnet", &format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()));
+        let commit = case.snapshot_holding(&[("p.csproj", "<Project />\n")]);
+        let request = case.request(&commit, &json!({ "Command": ["dotnet", "build", "p.csproj", "--no-restore"] }));
+        let ended = ran_in(&[], &request, Reading::All, &case.base.join("beaten"), Some(&shell));
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(logged(&log), ["build p.csproj --no-restore"], "only the command ran");
+        assert!(
+            !ended.err_texts().iter().any(|line| line.contains("framework override")),
+            "{:?}",
+            ended.err
+        );
+        case.ended_clean();
+    }
+
+    #[test]
+    fn a_pre_restore_gets_the_caller_s_env_and_the_build_server_settings() {
+        let case = Case::new("pre-restore-env");
+        let log = case.base.join("dotnet.log");
+        let shim = format!(
+            "#!/bin/sh\necho \"$1 ZZ_PRE_RESTORE=${{ZZ_PRE_RESTORE-unset}} SharedCompilationId=${{SharedCompilationId-unset}}\" >> '{}'\n",
+            log.display()
+        );
+        // The run's own id, which no environment the box inherits holds: the gate running these cases names its own.
+        let servers = format!("SharedCompilationId=gate-box-{NONCE}");
+        let shell = shell_with_shim(&case, "dotnet", &shim);
+        let commit = case.snapshot_holding(&[("p.csproj", "<Project />\n")]);
+        let keys = json!({
+            "Command": ["dotnet", "build"],
+            "PreRestore": PRE_RESTORE,
+            "Env": { "ZZ_PRE_RESTORE": "theirs" },
+        });
+        let request = case.request(&commit, &keys);
+        let ended = ran_in(&[], &request, Reading::All, &case.base.join("beaten"), Some(&shell));
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(
+            logged(&log),
+            [
+                format!("restore ZZ_PRE_RESTORE=theirs {servers}"),
+                format!("build ZZ_PRE_RESTORE=theirs {servers}")
+            ],
+            "the restore sees the caller's pair and the build-server settings, as the command does"
+        );
+        case.ended_clean();
+    }
+
     /// A login shell for `case` whose `PATH` starts with a folder holding only the runnable `program`, `script` its
     /// text; the shell's path.
     fn shell_with_shim(case: &Case, program: &str, script: &str) -> PathBuf {

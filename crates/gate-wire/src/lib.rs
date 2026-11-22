@@ -515,6 +515,25 @@ impl Payload {
         Ok(Some(CrossBuild { rid: rid.clone(), words }))
     }
 
+    /// The words after `dotnet` of the restore the box runs before the command, `PreRestore`: a non-empty list of
+    /// non-empty texts, `restore` and its target first, which the box hands its own `dotnet`; `None` when the key is
+    /// absent or null.
+    ///
+    /// # Errors
+    ///
+    /// The usage line, for a value that is no list, an empty list, or a list holding a non-text or an empty text.
+    pub fn pre_restore(&self) -> Result<Option<Vec<String>>, String> {
+        let usage = || "gate: box payload PreRestore must be a non-empty list of non-empty texts".to_owned();
+        let list = match self.object.get("PreRestore") {
+            None | Some(Value::Null) => return Ok(None),
+            Some(value) => value.as_array().filter(|list| !list.is_empty()).ok_or_else(usage)?,
+        };
+        list.iter()
+            .map(|word| word.as_str().filter(|word| !word.is_empty()).map(str::to_owned).ok_or_else(usage))
+            .collect::<Result<Vec<String>, String>>()
+            .map(Some)
+    }
+
     /// The run's outputs `Nonce`: 32 lower-case hex digits, as the client draws it; else the usage line, the value
     /// shown with its control characters escaped.
     pub fn nonce(&self) -> Result<&str, String> {
@@ -819,7 +838,8 @@ impl Payload {
 
     /// What the run runs ([`Commands`]): the one `Command` of a payload that sets no `WarmCommands`, else the warm-up's
     /// `WarmCommands` and its `WarmHash`, in a payload that sets no `Command`, asks for no outputs (no `Outputs` or
-    /// `FailureOutputs` glob, `OutputsFull` not true) and gives a `Timeout`. Else the usage line.
+    /// `FailureOutputs` glob, `OutputsFull` not true), sets no `Env` or `PreRestore` and gives a `Timeout`. Else the
+    /// usage line.
     pub fn commands(&self) -> Result<Commands<'_>, String> {
         if !self.sets("WarmCommands") {
             return Ok(Commands {
@@ -837,6 +857,9 @@ impl Payload {
         }
         if self.sets("Env") {
             return Err("gate: box payload asks a warm-up for Env".to_owned());
+        }
+        if self.sets("PreRestore") {
+            return Err("gate: box payload asks a warm-up for PreRestore".to_owned());
         }
         // The budget bounds the warm-up's commands, their wall time included, though not the layout, checkout and
         // restores before them; a warm-up never goes without one.
@@ -1944,6 +1967,13 @@ pub fn tools_line(key: &str) -> String {
     format!("gate: remote work folder {key} could not restore its dotnet tools")
 }
 
+/// The line the box says when the work folder `key` could not run the restore a routed dotnet command's framework
+/// override needs before it (its `PreRestore`), just after its refusal tag.
+#[must_use]
+pub fn pre_restore_line(key: &str) -> String {
+    format!("gate: remote work folder {key} could not restore its framework override")
+}
+
 /// The start marker the box says on stderr just before it starts the command of the run whose payload carries `nonce`:
 /// `gate-remote-started: <nonce>`. A call that said it is past the banner, so the client never makes it again.
 ///
@@ -2604,8 +2634,8 @@ mod tests {
         use crate::{
             BoxKill, DrainAction, IDENTITY_NAMES, LAYOUT_CHANGING, LAYOUT_SINGLE, PathForm, Payload, Refusal, WARM_READ_LIMIT, adjusted_line,
             adjusted_prefix, busy_line, checkout_done_line, checkout_prefix, checkout_start_line, killed_line, layout_line, layout_text,
-            layout_text_for, names_another_layout, readies_single, refused_line, started_line, status_line, status_prefix, tools_line,
-            warm_record_hash,
+            layout_text_for, names_another_layout, pre_restore_line, readies_single, refused_line, started_line, status_line, status_prefix,
+            tools_line, warm_record_hash,
         };
 
         const NONCE: &str = "0123456789abcdef0123456789abcdef";
@@ -2769,6 +2799,14 @@ mod tests {
             assert_eq!(
                 layout_line("app", "the folder is held"),
                 "gate: not routed: the builder could not clear app's work folder: the folder is held"
+            );
+        }
+
+        #[test]
+        fn the_pre_restore_line_after_a_tag_names_the_work_folder_and_the_framework_override() {
+            assert_eq!(
+                pre_restore_line("repo-0123abcd"),
+                "gate: remote work folder repo-0123abcd could not restore its framework override"
             );
         }
 
@@ -3441,6 +3479,16 @@ mod tests {
     }
 
     #[test]
+    fn a_warm_payload_that_asks_for_a_pre_restore_is_refused() {
+        let warmed = |words: serde_json::Value| json!({"WarmCommands": [["x"]], "WarmHash": WARM_HASH, "Timeout": 1, "PreRestore": words});
+        assert_eq!(
+            commands(&warmed(json!(["restore", "p.csproj"]))),
+            Err("gate: box payload asks a warm-up for PreRestore".to_owned())
+        );
+        assert!(commands(&warmed(json!(null))).is_ok(), "a null PreRestore is not set");
+    }
+
+    #[test]
     fn a_warm_payload_that_asks_for_env_is_refused() {
         let warmed = |env: serde_json::Value| json!({"WarmCommands": [["x"]], "WarmHash": WARM_HASH, "Timeout": 1, "Env": env});
         for env in [json!({"NuGetAudit": "false"}), json!({})] {
@@ -3714,6 +3762,39 @@ mod tests {
             Ok(Some("osx.13-arm64".to_owned())),
             "letters, digits, '-' and '.'"
         );
+    }
+
+    /// The pre-restore of the payload `json`, or the line refusing it.
+    fn pre_restore(json: &serde_json::Value) -> Result<Option<Vec<String>>, String> {
+        decoded(&json.to_string()).and_then(|payload| payload.pre_restore())
+    }
+
+    #[test]
+    fn a_pre_restore_is_none_when_absent_and_its_words_when_given() {
+        assert_eq!(pre_restore(&json!({})), Ok(None), "absent");
+        assert_eq!(pre_restore(&json!({ "PreRestore": null })), Ok(None), "null");
+        assert_eq!(
+            pre_restore(&json!({ "PreRestore": ["restore", "p.csproj", "-p:TargetFramework=net8.0"] })),
+            Ok(Some(["restore", "p.csproj", "-p:TargetFramework=net8.0"].map(str::to_owned).to_vec()))
+        );
+    }
+
+    #[test]
+    fn a_malformed_pre_restore_is_refused_with_its_usage_line() {
+        let usage = Err("gate: box payload PreRestore must be a non-empty list of non-empty texts".to_owned());
+        for value in [
+            json!("restore p.csproj"),
+            json!(1),
+            json!(true),
+            json!({ "Words": ["restore"] }),
+            json!([]),
+            json!([""]),
+            json!(["restore", ""]),
+            json!(["restore", 1]),
+            json!(["restore", null]),
+        ] {
+            assert_eq!(pre_restore(&json!({ "PreRestore": value })), usage, "{value}");
+        }
     }
 
     #[test]

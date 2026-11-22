@@ -1519,6 +1519,14 @@ fn channel_why(called: &Called) -> String {
     }
 }
 
+/// The words `call`'s run call sends: its send's, which keep `--no-build`, once that send landed (`landed`); else its own.
+fn run_words<'a>(call: &RemoteCall<'a>, landed: bool) -> &'a [String] {
+    match call.send {
+        Some(plan) if landed => &plan.words,
+        _ => call.words,
+    }
+}
+
 /// One run of the client: the call, the way to the builder, the limits, every line the attempt wrote to the log, and
 /// the first line that could not be written.
 #[expect(
@@ -1809,10 +1817,7 @@ impl Attempt<'_, '_> {
         // After the preflight, whose installs the Godot and Unreal Engine versions are chosen from, and after the send,
         // whose landing keeps `--no-build`.
         let run = RunCall {
-            words: match self.call.send {
-                Some(plan) if sent_digest.is_some() => &plan.words,
-                _ => self.call.words,
-            },
+            words: run_words(self.call, sent_digest.is_some()),
             subfolder: self.call.subfolder,
             nonce: &nonce,
             snapshot: &snapshot.commit,
@@ -1834,6 +1839,7 @@ impl Attempt<'_, '_> {
             lock: self.call.lock,
             desktop: self.call.desktop,
             cross_build: self.call.cross_build,
+            pre_restore: self.call.pre_restore,
             base: snapshot.base.as_ref().map(|base| base.name.as_str()),
             sibling_bases: &sibling_bases,
             commit_stage_head: stage_head,
@@ -6850,6 +6856,7 @@ mod tests {
             outputs: &[],
             outputs_withheld: false,
             bins_withheld: false,
+            pre_restore: None,
             failure_outputs: &[],
             dropped_no_build: false,
             send: None,
@@ -10608,6 +10615,7 @@ mod tests {
             outputs: &[],
             outputs_withheld: false,
             bins_withheld: false,
+            pre_restore: None,
             failure_outputs: &[],
             dropped_no_build: false,
             send: None,
@@ -10677,6 +10685,7 @@ mod tests {
             outputs: &globs,
             outputs_withheld: true,
             bins_withheld: false,
+            pre_restore: None,
             failure_outputs: &[],
             dropped_no_build: false,
             send: None,

@@ -1,9 +1,9 @@
 //! `gate box stop`: ends every process of the run whose job the payload names, as the PowerShell wrapper's
 //! `Invoke-Stop` does. It sets the run's stop signal first, so a run whose job does not exist yet never starts its
 //! command, then ends the run's job, the job its dotnet tool restore runs in ([`restore_job_name`]), the job its sent
-//! build's project restore runs in ([`sent_restore_job_name`]) and the job its package install runs in
-//! ([`packages_job_name`]). The job name carries the run's nonce, so a stop that arrives late finds no job, and never
-//! another run's. It takes no lock.
+//! build's project restore and its framework override's pre-restore run in ([`sent_restore_job_name`]) and the job its
+//! package install runs in ([`packages_job_name`]). The job name carries the run's nonce, so a stop that arrives late
+//! finds no job, and never another run's. It takes no lock.
 
 use std::io;
 use std::thread;
@@ -130,8 +130,8 @@ pub(crate) fn restore_job_name(job: &str) -> String {
     format!("{job}-tools")
 }
 
-/// The name of the job the restore of a sent build's project in the run whose job is `job` runs in, which a stop ends
-/// beside the run's own.
+/// The name of the job the restore of a sent build's project in the run whose job is `job` runs in, and its framework
+/// override's pre-restore after it, which a stop ends beside the run's own.
 pub(crate) fn sent_restore_job_name(job: &str) -> String {
     format!("{job}-sent-restore")
 }

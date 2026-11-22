@@ -208,6 +208,9 @@ pub(crate) struct RunCall<'a> {
     /// The cross build a macOS builder runs after the passing command (`CrossBuild`, its `Rid` and `Words`, sent only
     /// when there is one and the run asks for outputs, as the box takes it only then); a warm-up never sends it.
     pub cross_build: Option<&'a CrossBuild>,
+    /// The words after `dotnet` of the restore the builder runs before the command (`PreRestore`, sent only when there
+    /// is one, [`gate_router::RemoteRun::pre_restore`]); a warm-up never sends it.
+    pub pre_restore: Option<&'a [String]>,
     /// The main repo's default branch name (`Base`, sent only when it has one); a warm-up never sends it.
     pub base: Option<&'a str>,
     /// Each sibling's name and its default branch name, for the siblings that have one (`SiblingBases`, sent only when
@@ -372,8 +375,9 @@ fn desktop_wait(timeout: u64) -> u64 {
 /// which takes no desktop lock (a box that does not know the key takes the lock), and `DesktopHidden: true` beside
 /// those for a hidden run, a session run on a desktop of its own that no one sees, `RunLock` with `RunLockWait`
 /// ([`desktop_wait`], the run's `Timeout`) for a run that holds a `--lock`, `CrossBuild` (`Rid` and `Words`) for
-/// a run with a cross build and output globs, and the repos' default branches as `Base` and `SiblingBases` when any has
-/// one, and `CommitStage: true` with the PC's `Head` for a commit's pre-commit stage.
+/// a run with a cross build and output globs, `PreRestore` for a run with a pre-restore, and the repos' default branches
+/// as `Base` and `SiblingBases` when any has one, and `CommitStage: true` with the PC's `Head` for a commit's pre-commit
+/// stage.
 pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
     let mut object = location.object();
     for (name, value) in [
@@ -412,6 +416,9 @@ pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
     }
     if let Some(cross) = run.cross_build.filter(|_| !run.outputs.is_empty()) {
         object.insert("CrossBuild".to_owned(), json!({"Rid": cross.rid, "Words": cross.words}));
+    }
+    if let Some(words) = run.pre_restore {
+        object.insert("PreRestore".to_owned(), json!(words));
     }
     if let Some(base) = run.base {
         object.insert("Base".to_owned(), json!(base));
@@ -721,6 +728,7 @@ mod tests {
         let words = ["./tool.exe".to_owned()];
         let run = RunCall {
             cross_build: None,
+            pre_restore: None,
             words: &words,
             subfolder: "",
             nonce: "0123456789abcdef0123456789abcdef",
@@ -1083,6 +1091,7 @@ mod tests {
         let sha = "0123456789abcdef0123456789abcdef01234567";
         let run = RunCall {
             cross_build: None,
+            pre_restore: None,
             words: &words,
             subfolder: "sub",
             nonce: "n1",
@@ -1137,6 +1146,7 @@ mod tests {
         let globs = ["**/bin/**".to_owned(), "out/*.dll".to_owned()];
         let run = RunCall {
             cross_build: None,
+            pre_restore: None,
             words: &words,
             subfolder: "",
             nonce: "n2",
@@ -1252,6 +1262,7 @@ mod tests {
         let env = [("NuGetAudit".to_owned(), "false".to_owned()), ("EMPTY".to_owned(), String::new())];
         let run = RunCall {
             cross_build: None,
+            pre_restore: None,
             words: &words,
             subfolder: "",
             nonce: "n3",
@@ -1299,6 +1310,7 @@ mod tests {
         let words = ["Godot_console.exe".to_owned()];
         let mut run = RunCall {
             cross_build: None,
+            pre_restore: None,
             words: &words,
             subfolder: "",
             nonce: "0123456789abcdef0123456789abcdef",
@@ -1352,6 +1364,7 @@ mod tests {
         let words = ["build.cmd".to_owned()];
         let mut run = RunCall {
             cross_build: None,
+            pre_restore: None,
             words: &words,
             subfolder: "",
             nonce: "0123456789abcdef0123456789abcdef",
@@ -1405,6 +1418,7 @@ mod tests {
         let words = ["build.cmd".to_owned()];
         let mut run = RunCall {
             cross_build: None,
+            pre_restore: None,
             words: &words,
             subfolder: "",
             nonce: "0123456789abcdef0123456789abcdef",
@@ -1462,6 +1476,7 @@ mod tests {
         ];
         let mut run = RunCall {
             cross_build: None,
+            pre_restore: None,
             words: &words,
             subfolder: "",
             nonce: "0123456789abcdef0123456789abcdef",
@@ -1520,6 +1535,7 @@ mod tests {
         let words = ["./tool.exe".to_owned()];
         let mut run = RunCall {
             cross_build: None,
+            pre_restore: None,
             words: &words,
             subfolder: "",
             nonce: "0123456789abcdef0123456789abcdef",
@@ -1610,6 +1626,7 @@ mod tests {
         let words = ["./tool.exe".to_owned()];
         let run = RunCall {
             cross_build: None,
+            pre_restore: None,
             words: &words,
             subfolder: "",
             nonce: "0123456789abcdef0123456789abcdef",
@@ -1660,6 +1677,7 @@ mod tests {
     fn lock_run<'a>(words: &'a [String], timeout: u64, lock: Option<&'a str>) -> RunCall<'a> {
         RunCall {
             cross_build: None,
+            pre_restore: None,
             words,
             subfolder: "",
             nonce: "0123456789abcdef0123456789abcdef",
@@ -1750,6 +1768,7 @@ mod tests {
         };
         let mut run = RunCall {
             cross_build: Some(&cross),
+            pre_restore: None,
             failure_outputs: &[],
             words: &words,
             subfolder: "",
@@ -1808,6 +1827,33 @@ mod tests {
         assert_eq!(on_the_box(&word).cross_build(), Ok(None));
     }
 
+    #[test]
+    fn a_run_with_a_pre_restore_sends_it_and_a_warm_up_never_does() {
+        let words = ["dotnet", "build", "p.csproj", "-p:TargetFramework=net8.0", "--no-restore"].map(str::to_owned);
+        let restore = ["restore", "p.csproj", "-p:TargetFramework=net8.0"].map(str::to_owned);
+        let mut run = lock_run(&words, 300, None);
+        run.pre_restore = Some(&restore);
+        let word = run_word(&location(), &run);
+        assert_eq!(decoded(&word)["PreRestore"], json!(["restore", "p.csproj", "-p:TargetFramework=net8.0"]));
+        assert_eq!(
+            on_the_box(&word).pre_restore(),
+            Ok(Some(restore.to_vec())),
+            "the box reads PreRestore back"
+        );
+        let commands = warm_commands();
+        let warm = WarmCall {
+            commands: &commands,
+            hash: WARM_HASH,
+        };
+        let warm_sent = decoded(&warm_word(&location(), &run, &warm));
+        assert!(warm_sent.get("PreRestore").is_none(), "a warm-up never carries it: {warm_sent}");
+
+        run.pre_restore = None;
+        let word = run_word(&location(), &run);
+        assert!(decoded(&word).get("PreRestore").is_none(), "a run without one sends none");
+        assert_eq!(on_the_box(&word).pre_restore(), Ok(None));
+    }
+
     const WARM_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const WARM_NONCE: &str = "fedcba9876543210fedcba9876543210";
 
@@ -1823,6 +1869,7 @@ mod tests {
     fn warm_run<'a>(sibling_snapshots: &'a [(String, String)], inputs_digest: Option<&'a str>) -> RunCall<'a> {
         RunCall {
             cross_build: None,
+            pre_restore: None,
             words: &[],
             subfolder: "sub",
             nonce: WARM_NONCE,

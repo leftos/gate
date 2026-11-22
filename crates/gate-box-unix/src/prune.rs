@@ -3,8 +3,8 @@
 //! each tree's `.git/FETCH_HEAD` (every run fetches into each tree it checks out) and the key's records. A key's work
 //! folder `<root>/work/<key>` goes only with its lock `<root>/work/<key>.lock` held, so no run is using it and none can
 //! start in it meanwhile (one that tries is refused busy, status 75, and its PC runs the command itself); a key whose
-//! lock is held is kept, and so is one whose recorded process group, a git step's `<key>.pgid`, a tool restore's
-//! `<key>.tools.pgid` or a package restore's `<key>.packages.pgid`, is still the one its run made, as a run refuses
+//! lock is held is kept, and so is one whose recorded process group, a git step's `<key>.pgid`, a tool restore's or
+//! a pre-restore's `<key>.tools.pgid` or a package restore's `<key>.packages.pgid`, is still the one its run made, as a run refuses
 //! `busy` for it.
 //! The folder's layout record is marked changing and its other records removed first, then the folder is renamed into
 //! `<root>/pruned` under the lock, so no run ever sees it half removed, and its layout and index records go once it is

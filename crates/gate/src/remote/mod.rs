@@ -248,6 +248,9 @@ pub(crate) struct RemoteCall<'a> {
     /// The route's cross build, which a macOS builder runs after the passing command so its outputs come back built for
     /// Windows ([`gate_router::RemoteRun::cross_build`]); `None` for every other run, a warm-up among them.
     pub cross_build: Option<&'a CrossBuild>,
+    /// The words after `dotnet` of the restore the builder runs before the command, whose `--no-restore` is kept
+    /// ([`gate_router::RemoteRun::pre_restore`]); `None` for every other run, a warm-up among them.
+    pub pre_restore: Option<&'a [String]>,
     /// The input globs the run sends: the repo's `inputs` list, none when it has no entry.
     pub inputs: &'a [String],
     /// The user tools the route matched for the command, each its path and kind ([`gate_router::RemoteRun::user_tools`]).
@@ -637,6 +640,7 @@ mod snapshot_only {
                 outputs: &[],
                 outputs_withheld: false,
                 bins_withheld: false,
+                pre_restore: None,
                 failure_outputs: &[],
                 dropped_no_build: false,
                 send: None,

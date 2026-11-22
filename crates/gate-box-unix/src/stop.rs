@@ -1,10 +1,10 @@
-//! `gate-box box stop`: ends the process group of the run whose job the payload names, the group of its tool restore,
-//! `<job>-tools`, and the group of its package restore, `<job>-packages`. A run records each group beside its work
-//! folder, `<Work>.pgid`, `<Work>.tools.pgid` and `<Work>.packages.pgid`: the job's name, the group, the group's
-//! session in decimal, then its leader's start, one per line. A group is signalled only while its record names it for
-//! the payload's own job and the process whose pid is the group's id has the recorded start, so a stop that arrives
-//! late finds another run's record, or none, or a group id another's took, and signals nothing; once a group ends, the
-//! stop follows the record to a later group of the same job.
+//! `gate-box box stop`: ends the process group of the run whose job the payload names, the group of its tool restore
+//! and of its framework override's pre-restore, `<job>-tools`, and the group of its package restore, `<job>-packages`.
+//! A run records each group beside its work folder, `<Work>.pgid`, `<Work>.tools.pgid` and `<Work>.packages.pgid`:
+//! the job's name, the group, the group's session in decimal, then its leader's start, one per line. A group is
+//! signalled only while its record names it for the payload's own job and the process whose pid is the group's id has
+//! the recorded start, so a stop that arrives late finds another run's record, or none, or a group id another's took,
+//! and signals nothing; once a group ends, the stop follows the record to a later group of the same job.
 
 use std::io;
 use std::path::Path;
@@ -30,9 +30,9 @@ const POLL: Duration = Duration::from_millis(100);
 /// The most bytes of a job record read.
 const RECORD_LIMIT: u64 = 4096;
 
-/// Stops the payload's job, its tool restore's job and its package restore's job; the status: 0 when each is gone or there was none, 1 when one
-/// is left or could not be stopped or the work root is refused, 2 for a payload whose `Key`, `Work` or `Job` does not
-/// fit its work folder or whose `Work` is not `<root>/work/<key>`.
+/// Stops the payload's job, the job of its tool restore and its pre-restore, and its package restore's job; the status:
+/// 0 when each is gone or there was none, 1 when one is left or could not be stopped or the work root is refused, 2 for
+/// a payload whose `Key`, `Work` or `Job` does not fit its work folder or whose `Work` is not `<root>/work/<key>`.
 pub fn stop(payload: &Payload, console: &mut Console) -> u8 {
     let named = payload
         .work_folder()

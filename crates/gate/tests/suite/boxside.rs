@@ -9310,6 +9310,224 @@ fn a_sent_project_restore_runs_with_the_restricted_token() {
     assert!(lines.contains(&restricted_dacl_line().as_str()), "the restricted token's DACL: {lines:?}");
 }
 
+/// The words of the restore the framework override cases send as `PreRestore`.
+const PRE_RESTORE: [&str; 3] = ["restore", "p.csproj", "-p:TargetFramework=net8.0"];
+
+/// The run payload of `command` in the work folder `k`, its snapshot tracking the project `p.csproj`, with the
+/// `PreRestore` of [`PRE_RESTORE`].
+fn pre_restore_payload(case: &Case, command: &[&str]) -> Value {
+    let mut payload = box_payload(case, "k", command);
+    snapshot(case, &mut payload, &[("p.csproj", "<Project />\n")]);
+    payload["PreRestore"] = json!(PRE_RESTORE);
+    payload
+}
+
+/// The lines of the case's words file, one per call of a [`stub_dotnet_words`], none when no stub ran.
+fn dotnet_word_lines(case: &Case) -> Vec<String> {
+    fs::read_to_string(dotnet_words(case))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn a_run_with_a_pre_restore_restores_the_framework_override_before_its_command() {
+    let case = Case::new("box_pre_restore_order");
+    let payload = pre_restore_payload(&case, &["dotnet", "build", "p.csproj", "-p:TargetFramework=net8.0", "--no-restore"]);
+    let stub = stub_dotnet_words(&case, 0, false);
+
+    let run = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(run.code, Some(0), "{run:?}");
+    let called = dotnet_word_lines(&case);
+    assert_eq!(
+        called.iter().map(|line| line.trim_end()).collect::<Vec<_>>(),
+        // The stub is a batch file, so the box quotes a word holding `=` for cmd in both calls alike.
+        [
+            r#"restore p.csproj "-p:TargetFramework=net8.0""#,
+            r#"build p.csproj "-p:TargetFramework=net8.0" --no-restore"#
+        ],
+        "the restore first, then the command with its --no-restore: {run:?}"
+    );
+    assert!(
+        lines(&run.stderr)
+            .iter()
+            .any(|line| line.starts_with("gate: restore for the framework override took ") && line.ends_with(" s")),
+        "the took line: {run:?}"
+    );
+}
+
+#[test]
+fn a_failing_framework_override_restore_refuses_the_run_tools_and_runs_no_command() {
+    let case = Case::new("box_pre_restore_fails");
+    let marker = case.folder().join("marker");
+    let payload = pre_restore_payload(&case, &[FAKE_TOOL, "mark", &shown(&marker)]);
+    let stub = stub_dotnet_words(&case, 1, false);
+
+    let run = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(run.code, Some(75), "{run:?}");
+    let said = lines(&run.stderr);
+    let failed = said
+        .iter()
+        .position(|line| *line == "gate: remote restore for the framework override failed (status 1)");
+    let tagged = said.iter().position(|line| *line == refused_line(&payload, "tools"));
+    assert!(
+        matches!((failed, tagged), (Some(failed), Some(tagged)) if failed < tagged),
+        "the failure line, then the tools tag: {run:?}"
+    );
+    let refused = said
+        .iter()
+        .position(|line| *line == "gate: remote work folder k could not restore its framework override");
+    assert!(
+        matches!((tagged, refused), (Some(tagged), Some(refused)) if tagged + 1 == refused),
+        "the tag comes just before the framework override line: {run:?}"
+    );
+    assert!(!marker.exists(), "the command never ran: {run:?}");
+}
+
+#[test]
+fn a_framework_override_restore_that_cannot_start_refuses_the_run_tools_and_runs_no_command() {
+    let case = Case::new("box_pre_restore_no_dotnet");
+    let marker = case.folder().join("marker");
+    let payload = pre_restore_payload(&case, &[FAKE_TOOL, "mark", &shown(&marker)]);
+
+    let run = run_box_with_path(&case, &payload, Some(&path_for_run(&[])));
+
+    assert_eq!(run.code, Some(75), "{run:?}");
+    // The win32 error `ERROR_FILE_NOT_FOUND`, as `locate` reports a word it does not find.
+    let cannot_start = format!(
+        "gate: remote could not start the restore for the framework override: {}",
+        gate_win32::win32_message(2)
+    );
+    assert_eq!(
+        lines(after_checkout(&payload, &run.stderr)),
+        [
+            cannot_start.as_str(),
+            refused_line(&payload, "tools").as_str(),
+            "gate: remote work folder k could not restore its framework override",
+        ],
+        "{run:?}"
+    );
+    assert!(!marker.exists(), "the command never ran: {run:?}");
+}
+
+#[test]
+fn a_framework_override_restore_runs_after_the_tool_restore_and_before_the_command() {
+    let case = Case::new("box_pre_restore_after_tools");
+    let mut payload = box_payload(&case, "k", &["dotnet", "build", "p.csproj", "--no-restore"]);
+    snapshot(
+        &case,
+        &mut payload,
+        &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST), ("p.csproj", "<Project />\n")],
+    );
+    payload["PreRestore"] = json!(PRE_RESTORE);
+    let stub = stub_dotnet_words(&case, 0, false);
+
+    let run = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert_eq!(
+        dotnet_word_lines(&case).iter().map(|line| line.trim_end()).collect::<Vec<_>>(),
+        [
+            "tool restore",
+            r#"restore p.csproj "-p:TargetFramework=net8.0""#,
+            "build p.csproj --no-restore"
+        ],
+        "the tool restore, then the framework override, then the command: {run:?}"
+    );
+}
+
+#[test]
+fn a_malformed_pre_restore_is_a_usage_error() {
+    let case = Case::new("box_pre_restore_malformed");
+    let line = "gate: box payload PreRestore must be a non-empty list of non-empty texts";
+    // One preflight lays the work folder out, so each refusal is shown to leave it as it was.
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let laid = work_entries(&payload);
+
+    for pre_restore in [json!("restore p.csproj"), json!([]), json!(["restore", ""]), json!(["restore", 1])] {
+        let mut refused = payload.clone();
+        refused["PreRestore"] = pre_restore.clone();
+
+        let outcome = run_box(&case, &refused);
+
+        assert_eq!(outcome.code, Some(2), "{pre_restore}: {outcome:?}");
+        assert_eq!(outcome.stdout, "", "{pre_restore}");
+        assert_eq!(outcome.stderr, format!("{line}\n"), "{pre_restore}: {outcome:?}");
+        assert_eq!(work_entries(&payload), laid, "nothing is checked out or run: {pre_restore}");
+    }
+}
+
+#[test]
+fn a_run_without_a_pre_restore_runs_no_framework_override_restore() {
+    let case = Case::new("box_pre_restore_none");
+    let mut payload = pre_restore_payload(&case, &[FAKE_TOOL, "out", "ran"]);
+    payload.as_object_mut().expect("an object").remove("PreRestore");
+    let stub = stub_dotnet_words(&case, 0, false);
+
+    let run = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert_eq!(restore_lines(&case), Vec::<String>::new(), "{run:?}");
+    assert!(!run.stderr.contains("framework override"), "{run:?}");
+}
+
+#[test]
+fn a_stop_during_the_framework_override_restore_ends_it_and_runs_no_command() {
+    let case = Case::new("box_pre_restore_stop");
+    let marker = case.folder().join("marker");
+    let payload = pre_restore_payload(&case, &[FAKE_TOOL, "mark", &shown(&marker)]);
+    let stub = stub_dotnet_running(&case, 0, &held_restore(&case.folder().join("never")));
+    let running = start_box_with_path(&case, &payload, Some(&path_for_run(std::slice::from_ref(&stub))));
+    let helper = spawned_pid(&running.wait_for_stdout("\n"));
+
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+    let outcome = running.finish_read();
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_eq!(
+        stopped.stdout,
+        format!("gate: remote stopped job {}-sent-restore\n", field(&payload, "Job")),
+        "{stopped:?}"
+    );
+    assert_eq!(stopped.stderr, "", "{stopped:?}");
+    assert_eq!(outcome.code, Some(1), "a stop during the restore fails the run: {outcome:?}");
+    let said = stopped_line_for(&format!("{}-sent-restore", field(&payload, "Job")));
+    assert!(outcome.stderr.lines().any(|line| line == said), "{said:?} in {outcome:?}");
+    assert!(!marker.exists(), "the command never ran: {outcome:?}");
+    wait_until_gone(helper);
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn a_framework_override_restore_runs_with_the_restricted_token_and_the_caller_s_env() {
+    let case = Case::new("box_pre_restore_context");
+    let mut payload = pre_restore_payload(&case, &[FAKE_TOOL, "out", "ran"]);
+    payload["Env"] = json!({"GATE1256_PROBE": "from the caller"});
+    let token = case.folder().join("token.txt");
+    let told = case.folder().join("told.txt");
+    let before = format!(
+        "\"{FAKE_TOOL}\" token >\"{}\"\r\necho %GATE1256_PROBE%>\"{}\"\r\n",
+        shown(&token),
+        shown(&told)
+    );
+    let stub = stub_dotnet_running(&case, 0, &before);
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said = fs::read_to_string(&token).expect("the restore wrote its token's facts");
+    let lines: Vec<&str> = said.lines().collect();
+    assert!(lines.contains(&"not-elevated"), "{lines:?}");
+    assert!(lines.contains(&"owner user"), "{lines:?}");
+    assert!(lines.contains(&restricted_dacl_line().as_str()), "the restricted token's DACL: {lines:?}");
+    let env = fs::read_to_string(&told).expect("the restore wrote what it was told");
+    assert_eq!(env.trim_end(), "from the caller", "{outcome:?}");
+}
+
 #[test]
 fn a_tool_restore_keeps_the_box_s_token() {
     let case = Case::new("box_run_tools_restore_token");

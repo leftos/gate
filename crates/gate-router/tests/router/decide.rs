@@ -12,7 +12,7 @@ use gate_router::{
     DotnetTarget, ElsewhereRead, Facts, FolderSends, GitignoredInput, Inputs, InstalledLayout, LocalReason, NO_OUTPUTS_LINE, Nested,
     PROJECT_EXTENSIONS, Pattern, PinRefusal, Place, RemoteRun, Route, SiblingFolder, Slot, Target, UsedTool, UserToolKind, build_settings,
     builder_words, decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet, is_usable_host, later_run, named_tree_paths, pattern_for,
-    sdk_build_target, target, without_no_build, without_no_restore, work_folder_key,
+    pre_restore_words, sdk_build_target, target, without_no_build, without_no_restore, work_folder_key,
 };
 
 use crate::support::{FakeFacts, HEAD, ROOT, carried, fake_id, heavy, light, place_at, sibling_root, words};
@@ -182,6 +182,7 @@ fn the_control_command_routes_from_the_root() {
             cross_build: None,
             cross_build_blocked: None,
             bins_withheld: false,
+            pre_restore: None,
         }
     );
     assert_eq!(run.lines(), Vec::<&str>::new());
@@ -2150,6 +2151,205 @@ fn a_routed_run_drops_no_restore_beside_no_build_and_says_only_the_no_build_line
         ["dotnet", "test", "-c", "Release", "--no-restore"],
         "the PC's words keep it"
     );
+}
+
+/// The routed run of `given` from the worktree root.
+fn routed_at_root(given: &[&str]) -> RemoteRun {
+    routed(decide(&heavy(&words(given)), &FakeFacts::at_root()))
+}
+
+/// Whether `run`'s builder words keep `--no-restore`.
+fn keeps_no_restore(run: &RemoteRun) -> bool {
+    run.words.iter().any(|word| word == "--no-restore")
+}
+
+#[test]
+fn a_routed_build_that_sets_its_framework_keeps_no_restore_and_pre_restores_first() {
+    let run = routed_at_root(&["dotnet", "build", "p.csproj", "-c", "Debug", "-p:TargetFramework=net8.0", "--no-restore"]);
+    assert!(keeps_no_restore(&run), "{:?}", run.words);
+    assert_eq!(
+        run.pre_restore,
+        Some(words(&["restore", "p.csproj", "-p:Configuration=Debug", "-p:TargetFramework=net8.0"])),
+        "the restore's words in the command's order"
+    );
+}
+
+#[test]
+fn a_pre_restore_reads_every_property_spelling_and_carries_it_as_written() {
+    let spellings: [&[&str]; 6] = [
+        &["/p:TargetFramework=net8.0"],
+        &["-property:TargetFramework=net8.0"],
+        &["--property:TargetFramework=net8.0"],
+        &["-p", "TargetFramework=net8.0"],
+        &["-p:A=1;TargetFramework=net8.0"],
+        &["-P:targetframework=net8.0"],
+    ];
+    for spelled in spellings {
+        let given = [&["dotnet", "build", "p.csproj"][..], spelled, &["--no-restore"]].concat();
+        let expected = words(&[&["restore", "p.csproj"][..], spelled].concat());
+        assert_eq!(pre_restore_words(&words(&given)), Some(expected.clone()), "{spelled:?}");
+        let run = routed_at_root(&given);
+        assert!(keeps_no_restore(&run), "{spelled:?}: {:?}", run.words);
+        assert_eq!(run.pre_restore, Some(expected), "{spelled:?}");
+    }
+}
+
+#[test]
+fn a_pre_restore_carries_runtime_source_and_current_runtime_but_not_framework_verbosity_or_program_words() {
+    let given = [
+        "dotnet",
+        "run",
+        "--project",
+        "p.csproj",
+        "-p:TargetFramework=net8.0",
+        "-r",
+        "linux-x64",
+        "--source",
+        "s",
+        "--use-current-runtime",
+        "-f",
+        "net8.0",
+        "-v",
+        "q",
+        "--configuration:Release",
+        "--no-restore",
+        "--",
+        "-p:X=1",
+        "--source",
+        "t",
+    ];
+    assert_eq!(
+        pre_restore_words(&words(&given)),
+        Some(words(&[
+            "restore",
+            "p.csproj",
+            "-p:TargetFramework=net8.0",
+            "-r",
+            "linux-x64",
+            "--source",
+            "s",
+            "--use-current-runtime",
+            "-p:Configuration=Release",
+        ]))
+    );
+}
+
+#[test]
+fn a_pre_restore_carries_each_spelling_of_configuration_runtime_and_source_but_not_s() {
+    let cases: [(&[&str], &[&str]); 8] = [
+        (&["-c=Release"], &["-p:Configuration=Release"]),
+        (&["-c:Release"], &["-p:Configuration=Release"]),
+        (&["--configuration", "Release"], &["-p:Configuration=Release"]),
+        (&["-r:linux-x64"], &["-r:linux-x64"]),
+        (&["--runtime=linux-x64"], &["--runtime=linux-x64"]),
+        (&["--source=s"], &["--source=s"]),
+        (&["--ucr"], &["--ucr"]),
+        (&["-s", "s"], &[]),
+    ];
+    for (spelled, carried) in cases {
+        let given = [
+            &["dotnet", "build", "p.csproj", "-p:TargetFramework=net8.0"][..],
+            spelled,
+            &["--no-restore"],
+        ]
+        .concat();
+        let expected = words(&[&["restore", "p.csproj", "-p:TargetFramework=net8.0"][..], carried].concat());
+        assert_eq!(pre_restore_words(&words(&given)), Some(expected), "{spelled:?}");
+    }
+}
+
+#[test]
+fn a_pre_restore_carries_no_bare_word_such_as_an_option_s_value() {
+    let given = [
+        "dotnet",
+        "build",
+        "p.csproj",
+        "-p:TargetFramework=net8.0",
+        "-o",
+        r"P:\out",
+        "--no-restore",
+    ];
+    assert_eq!(
+        pre_restore_words(&words(&given)),
+        Some(words(&["restore", "p.csproj", "-p:TargetFramework=net8.0"]))
+    );
+}
+
+#[test]
+fn a_pre_restore_with_an_empty_carried_word_is_none_and_keeps_the_no_restore_drop() {
+    let given = ["dotnet", "build", "p.csproj", "-p:TargetFramework=net8.0", "-r", "", "--no-restore"];
+    assert_eq!(pre_restore_words(&words(&given)), None);
+    let run = routed_at_root(&given);
+    assert_eq!(run.pre_restore, None);
+    assert!(!keeps_no_restore(&run), "{:?}", run.words);
+}
+
+#[test]
+fn a_run_naming_its_project_folder_pre_restores_that_folder_and_keeps_no_restore() {
+    let run = routed_at_root(&["dotnet", "run", "--project", "src/App", "-p:TargetFramework=net8.0", "--no-restore"]);
+    assert!(keeps_no_restore(&run), "{:?}", run.words);
+    assert_eq!(run.pre_restore, Some(words(&["restore", "src/App", "-p:TargetFramework=net8.0"])));
+}
+
+#[test]
+fn a_pre_restore_never_restores_with_the_stamped_revision_or_path_map() {
+    let given = words(&["dotnet", "build", "p.csproj", "-p:TargetFramework=net8.0", "--no-restore"]);
+    let run = routed(decide(&heavy(&given), &mapped(FakeFacts::at_root())));
+    assert!(run.words.iter().any(|word| word.contains("SourceRevisionId")), "stamped: {:?}", run.words);
+    assert!(run.words.contains(&path_map()), "stamped: {:?}", run.words);
+    let pre_restore = run.pre_restore.expect("a pre-restore");
+    assert!(
+        !pre_restore
+            .iter()
+            .any(|word| word.contains("SourceRevisionId") || word.contains("PathMap")),
+        "{pre_restore:?}"
+    );
+}
+
+#[test]
+fn a_routed_command_with_no_pre_restore_keeps_today_s_no_restore_drop() {
+    let dropped: [&[&str]; 9] = [
+        &["dotnet", "build", "p.csproj", "--no-restore"],
+        &["dotnet", "build", "p.csproj", "-f", "net8.0", "--no-restore"],
+        &["dotnet", "build", "p.csproj", "-p:TargetFrameworks=net8.0", "--no-restore"],
+        &["dotnet", "build", "src", "-p:TargetFramework=net8.0", "--no-restore"],
+        &["dotnet", "build", "-p:TargetFramework=net8.0", "--no-restore"],
+        &[
+            "pwsh",
+            "-File",
+            "x.ps1",
+            "--",
+            "dotnet",
+            "build",
+            "p.csproj",
+            "-p:TargetFramework=net8.0",
+            "--no-restore",
+        ],
+        &["dotnet", "build", "p.csproj", "@x.rsp", "-p:TargetFramework=net8.0", "--no-restore"],
+        &["dotnet", "msbuild", "p.csproj", "-p:TargetFramework=net8.0", "--no-restore"],
+        &["dotnet", "build", "p.csproj", "-p:TargetFramework=net8.0"],
+    ];
+    for given in dropped {
+        assert_eq!(pre_restore_words(&words(given)), None, "{given:?}");
+        // A command the fixture's patterns do not route has no builder words to look at.
+        let Route::Routed(run) = decide(&heavy(&words(given)), &FakeFacts::at_root()) else {
+            assert!(!given[0].starts_with("dotnet"), "{given:?} routes");
+            continue;
+        };
+        assert_eq!(run.pre_restore, None, "{given:?}");
+        let today = without_no_restore(words(given)).iter().any(|word| word == "--no-restore");
+        assert_eq!(keeps_no_restore(&run), today, "{given:?}: {:?}", run.words);
+    }
+}
+
+#[test]
+fn a_routed_test_with_a_framework_drops_no_build_with_its_line_and_keeps_no_restore_with_a_pre_restore() {
+    let run = routed_at_root(&["dotnet", "test", "p.csproj", "--no-build", "--no-restore", "-p:TargetFramework=net8.0"]);
+    assert!(run.dropped_no_build);
+    assert_eq!(run.lines()[0], DROPPED_NO_BUILD_LINE);
+    assert!(!run.words.iter().any(|word| word == "--no-build"), "{:?}", run.words);
+    assert!(keeps_no_restore(&run), "{:?}", run.words);
+    assert_eq!(run.pre_restore, Some(words(&["restore", "p.csproj", "-p:TargetFramework=net8.0"])));
 }
 
 #[test]
