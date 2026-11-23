@@ -14,8 +14,8 @@ use serde_json::{Value, json};
 use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
 use crate::support::{
-    Case, FAKE_SSH, GATE, GATE_VARIABLE, GIT_REDIRECTS, Outcome, ROOT_WALK_STOP_VARIABLE, STEPS_VARIABLE, calls, finish, git, git_home_for, shown,
-    ssh_steps, write_remote_json,
+    Case, FAKE_SSH, GATE, GATE_VARIABLE, GIT_REDIRECTS, Outcome, ROOT_WALK_STOP_VARIABLE, STEPS_VARIABLE, calls, finish, git, git_home_for,
+    hold_folder_mutex, shown, ssh_steps, write_remote_json,
 };
 
 /// The routing file of a prune case: two builders.
@@ -328,6 +328,68 @@ fn a_key_whose_mutex_is_held_is_kept_in_use() {
     assert!(all_there(&files.shared), "the shared files stay");
     assert!(record.exists(), "the record stays");
     assert_eq!(refs_in(&case, "repo"), key_refs(), "every ref stays");
+}
+
+/// Writes the worktree record of `key` for the worktree `root` of the common folder `common`, long gone, its work folder
+/// on each builder, and the files of `key` every builder shares, each written: the record's path and those files.
+fn keyed(case: &Case, key: &str, (root, common): (&str, &str)) -> (PathBuf, Vec<PathBuf>) {
+    let record = json!({ "v": 1, "root": root, "commonDir": common, "repo": "app", "lastRouted": "2026-10-27T00:00:00Z", "goneSince": LONG_GONE });
+    let path = case.root().join("remote").join(format!("{key}.worktree"));
+    fs::create_dir_all(path.parent().expect("a record has a folder")).expect("the records' folder can be made");
+    fs::write(&path, record.to_string()).expect("the record can be written");
+    for alias in ["builder-1", "builder-2"] {
+        let folder = builder_root(case, alias).join("work").join(key);
+        fs::create_dir_all(&folder).expect("the work folder can be made");
+        fs::write(folder.join("file"), "x").expect("a file can be written in the work folder");
+    }
+    let state = case.root();
+    let shared = vec![
+        v1::outputs_pending_path(&state, key),
+        v1::nothing_back_path(&state, key),
+        v1::outputs_from_path(&state, key),
+        v1::built_here_path(&state, key),
+    ];
+    for file in &shared {
+        fs::write(file, "x").expect("the file can be written");
+    }
+    (path, shared)
+}
+
+#[test]
+fn a_worktree_s_key_is_kept_while_a_later_work_folder_of_it_is_held_and_a_later_one_s_prune_keeps_its_records() {
+    let case = prune_case("prune_pc_lane_held");
+    let (root, common) = gone_worktree(&case);
+    let key = gate_router::work_folder_key(&root);
+    let (record, shared) = keyed(&case, &key, (&root, &common));
+    let held = hold_folder_mutex(&case, &format!("{key}-2"));
+    let steps = ssh_steps(&case, "ssh", &ANSWERS);
+
+    let outcome = pruned(&case, &steps, &[]);
+
+    drop(held);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.ends_with(&format!("gate: prune: kept {key}: in use\n")), "{outcome:?}");
+    assert!(all_there(&shared), "the worktree's shared files stay");
+    assert!(record.exists(), "the record stays");
+
+    let case = prune_case("prune_pc_lane_pruned");
+    let (root, common) = gone_worktree(&case);
+    let key = gate_router::work_folder_key(&root);
+    let lane = format!("{key}-2");
+    let (record, shared) = keyed(&case, &key, (&root, &common));
+    let (lane_record, _) = keyed(&case, &lane, (&root, &common));
+    let held = hold_folder_mutex(&case, &key);
+    let steps = ssh_steps(&case, "ssh", &ANSWERS);
+
+    let outcome = pruned(&case, &steps, &[]);
+
+    drop(held);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(&format!("gate: prune: kept {key}: in use\n")), "{outcome:?}");
+    assert!(outcome.stderr.contains(&format!("gate: prune: removed {lane} (")), "{outcome:?}");
+    assert!(!lane_record.exists(), "the later work folder's record is gone");
+    assert!(all_there(&shared), "the worktree's shared files stay");
+    assert!(record.exists(), "the worktree's record stays");
 }
 
 #[test]

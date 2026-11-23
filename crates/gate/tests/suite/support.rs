@@ -1645,6 +1645,19 @@ impl Drop for Go {
     }
 }
 
+/// The mutex of the work folder `key` in the case's state root, the one a routed run in that folder holds, held as
+/// such a run holds it until the returned guard is dropped.
+pub fn hold_folder_mutex(case: &Case, key: &str) -> gate_win32::OwnedMutexGuard {
+    let state = gate_state::StateRoot::new(&shown(&case.root()), None);
+    let name = state.object_name(gate_state::KernelObject::Routed {
+        hash: gate_state::key_hash(key),
+    });
+    gate_win32::NamedMutex::open(&name)
+        .expect("the work folder's mutex opens")
+        .acquire_owned(Duration::from_secs(5))
+        .expect("the work folder's mutex is free")
+}
+
 /// Returns once every handle on `path` is closed: an open that shares nothing succeeds only then. A command a killed
 /// gate left running holds its log open until it ends, so this waits until no process of that command has the log
 /// open.

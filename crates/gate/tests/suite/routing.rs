@@ -21,8 +21,8 @@ use crate::nesting::{LOOK_OFTEN, commit_with_hook_gate, end_parent, first_event,
 use crate::remote_client::{PREK_SHIM, STAGE_COMMIT, Tuned, client_case, client_gate, client_gate_tuned, fallbacks};
 use crate::support::{
     Case, DenyEntry, FAKE_TOOL, GATE, Go, Junction, LOCAL_REASON, Outcome, Running, UNTIL_KILLED, assert_in_order, beside, calls, copy_tool,
-    critical_words, events, finish, git, git_init, heavy_words, latest_run_of, log_texts, none_words, nothing_back, powershell_folder, record_path,
-    release, run_words, shown, ssh_steps, start, wait_for_journal_line, wait_until, write_counts, write_remote_json,
+    critical_words, events, finish, git, git_init, heavy_words, hold_folder_mutex, latest_run_of, log_texts, none_words, nothing_back,
+    powershell_folder, record_path, release, run_words, shown, ssh_steps, start, wait_for_journal_line, wait_until, write_counts, write_remote_json,
 };
 
 pub(crate) const HOST: &str = "builder";
@@ -3586,7 +3586,15 @@ fn a_project_build_adds_nothing_while_another_run_holds_the_work_folder_key() {
 
     let build = finish(case.gate(&run_words(
         "build.log",
-        &["--local", LOCAL_REASON[0], LOCAL_REASON[1], "--test-key-wait-ms", "200"],
+        &[
+            "--local",
+            LOCAL_REASON[0],
+            LOCAL_REASON[1],
+            "--test-key-wait-ms",
+            "200",
+            "--test-lanes",
+            "1",
+        ],
         &[r".\dotnet.cmd", "build", "One", "-c", "Release"],
     )));
     drop(held);
@@ -3797,7 +3805,8 @@ fn a_local_build_while_the_work_folder_key_is_held_records_nothing_and_removes_o
     let held = mutex.acquire(Duration::from_secs(5)).expect("the key's mutex is free");
     let line = format!("gate: built-here record not written: work folder {key} is held");
 
-    let build = case.start(&run_words("build.log", &KEPT_HERE, &[r".\dotnet.cmd", "build", "App.sln"]));
+    let words = [&KEPT_HERE[..], &["--test-lanes", "1"]].concat();
+    let build = case.start(&run_words("build.log", &words, &[r".\dotnet.cmd", "build", "App.sln"]));
     build.wait_until("the skipped write's line", || {
         fs::read_to_string(case.folder().join("build.log")).is_ok_and(|text| text.contains(&line))
     });
@@ -3812,6 +3821,23 @@ fn a_local_build_while_the_work_folder_key_is_held_records_nothing_and_removes_o
     assert!(!build.stderr.contains(&line), "said in the log only: {build:?}");
     assert!(left_while_held, "removed only under the key: {build:?}");
     assert!(!outputs_from.exists(), "removed once the key was let go: {build:?}");
+}
+
+/// A later work folder of the worktree held while its own is free, as a routed run in it holds it: the build records
+/// nothing, as it records nothing while its own work folder is held.
+#[test]
+fn a_local_build_while_a_later_work_folder_of_the_worktree_is_held_records_nothing() {
+    let case = built_here_case("routing-built-here-lane-held");
+    let (key, _) = key_lock(&case);
+    let held = hold_folder_mutex(&case, &format!("{key}-2"));
+
+    let build = finish(case.gate(&run_words("build.log", &KEPT_HERE, &[r".\dotnet.cmd", "build", r"One\One.csproj"])));
+
+    drop(held);
+    assert_eq!(build.code, Some(0), "{build:?}");
+    assert_eq!(built_here(&case), None, "{build:?}");
+    let line = format!("gate: built-here record not written: work folder {key}-2 is held");
+    assert!(log_text(&case, "build.log").lines().any(|said| said.ends_with(&line)), "{build:?}");
 }
 
 /// A holder that lets the key go while the build retries its take, as a local write does after milliseconds: the
@@ -5654,7 +5680,7 @@ fn a_pinned_run_whose_work_folder_is_busy_exits_1_and_runs_nothing_here() {
     first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
     let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
     let tuned = Tuned {
-        extra: &["--test-key-wait-ms", "100", "--builder", HOST],
+        extra: &["--test-key-wait-ms", "100", "--builder", HOST, "--test-lanes", "1"],
         ..Tuned::default()
     };
     let second = start(client_gate_tuned(
@@ -5900,7 +5926,7 @@ fn a_held_work_folder_key_runs_here_without_trying_the_next_builder() {
     first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
     let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
     let tuned = Tuned {
-        extra: &["--test-key-wait-ms", "100"],
+        extra: &["--test-key-wait-ms", "100", "--test-lanes", "1"],
         ..Tuned::default()
     };
     let second = start(client_gate_tuned(
@@ -5923,6 +5949,58 @@ fn a_held_work_folder_key_runs_here_without_trying_the_next_builder() {
     assert_eq!(own[1]["host"], "win-2", "{own:#?}");
     fs::write(go.path(), "").expect("the go file can be made");
     assert_eq!(first.finish().code, Some(0));
+}
+
+/// A run in a later work folder of its worktree, refused by its first builder, whose run there brings nothing back:
+/// the next builder's run brings outputs back, which only the worktree's own work folder may, so the run never goes
+/// there and runs here.
+#[test]
+fn a_run_in_a_later_work_folder_never_tries_a_builder_whose_run_brings_outputs_back() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let case = client_case("routing-lane-outputs-builder");
+    let routing = json!({
+        "host": HOST,
+        "repos": { repo(&case): ["*tool*"] },
+        "outputs": { repo(&case): ["**/bin/**"] },
+        "builders": [{ "host": "win-2", "os": "windows", "repos": { repo(&case): ["*tool*"] }, "outputs": { repo(&case): [] } }],
+    });
+    write_remote_json(&case, &routing.to_string());
+    let key = work_folder_key(&git(&case, &["rev-parse", "--show-toplevel"]));
+    let (first, next) = (case.folder().join("builder").join("a"), case.folder().join("builder").join("b"));
+    fs::create_dir_all(first.join("work")).expect("the first builder's work root can be made");
+    fs::create_dir_all(&next).expect("the next builder's folder can be made");
+    // The first builder's later work folder is busy there, as another PC's run holds it: the run is refused busy.
+    let box_lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(first.join("work").join(format!("{key}-2.lock")))
+        .expect("the box's work lock can be held");
+    let held = hold_folder_mutex(&case, &key);
+    let steps = ssh_steps(&case, "ssh", &["ok"; 8]);
+    let folders = format!("win-2={}|{HOST}={}", shown(&first), shown(&next));
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "600000"],
+        folders: Some(&folders),
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran here"]));
+
+    drop(held);
+    drop(box_lock);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(has_line(&outcome.stderr, "gate: remote win-2 busy; running here"), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert!(
+        !next.join("work").join(format!("{key}-2")).exists(),
+        "the next builder was never tried: {outcome:?}"
+    );
+    let note = "gate: builder not tried: its run there keeps the worktree's one work folder, and this run holds a later work folder of the worktree";
+    assert!(log_text(&case, "out.log").lines().any(|line| line.ends_with(note)), "{outcome:?}");
 }
 
 #[test]
@@ -6488,7 +6566,7 @@ fn a_second_run_of_the_worktree_waiting_for_the_key_does_not_fall_back_busy_whil
     let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
     // The heartbeat comes after the key wait's bound.
     let tuned = Tuned {
-        extra: &["--test-key-wait-ms", "100", "--test-heartbeat-ms", "300"],
+        extra: &["--test-key-wait-ms", "100", "--test-heartbeat-ms", "300", "--test-lanes", "1"],
         ..Tuned::default()
     };
     let second = start(client_gate_tuned(
@@ -6613,7 +6691,7 @@ fn a_key_wait_is_held_off_by_a_marker_of_another_builder() {
     let marker = hold_marker(&case, Some("1f0efc62"));
     let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
     let tuned = Tuned {
-        extra: &["--test-key-wait-ms", "100", "--test-heartbeat-ms", "300"],
+        extra: &["--test-key-wait-ms", "100", "--test-heartbeat-ms", "300", "--test-lanes", "1"],
         ..Tuned::default()
     };
     let mut second = start(client_gate_tuned(

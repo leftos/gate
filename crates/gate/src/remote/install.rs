@@ -2377,6 +2377,7 @@ mod tests {
                 commit_stage: false,
                 builder: &crate::test_support::HOST,
                 key: "app-1a2b3c4d",
+                lane: None,
                 session: "0123456789abcdef0123456789abcdef",
                 root,
                 root_id: gate_router::FolderId { volume: 0, file: [0; 16] },

@@ -41,7 +41,7 @@ pub(crate) mod channel;
 mod client;
 pub(crate) mod drain;
 
-pub(crate) use client::{KEY_WAIT_SLICE, KeyHold, hold_mutex_waiting};
+pub(crate) use client::{KEY_WAIT_SLICE, KeyHold, hold_mutex_waiting, hold_records};
 pub(crate) mod git;
 mod held;
 pub(crate) mod inputs;
@@ -208,11 +208,15 @@ pub(crate) enum KeyWait {
     clippy::struct_excessive_bools,
     reason = "each flag is an independent fact of the route or the request that the client reads by name"
 )]
+#[derive(Clone)]
 pub(crate) struct RemoteCall<'a> {
     /// The builder the route picked, whose alias is [`RemoteCall::host`]: its profile ([`transport::Transport::profile`]) lays
     /// out the run's paths and words on it, and its id names the PC folder of its per-worktree caches.
     pub builder: &'a Builder,
     pub key: &'a str,
+    /// What a run that may use its worktree's later work folders ([`gate_router::lane_key`]) carries beside its own key;
+    /// `None` for a run that keeps to the worktree's own work folder, a warm-up among them.
+    pub lane: Option<LaneCall<'a>>,
     /// The run's drain session (`Session`), 32 lower-case hex digits made once per run and kept across its attempts
     /// and polls.
     pub session: &'a str,
@@ -293,7 +297,23 @@ pub(crate) struct RemoteCall<'a> {
     pub commit_stage: bool,
 }
 
+/// What a routed run that may use its worktree's later work folders carries beside the key of the folder it runs in.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LaneCall<'a> {
+    /// The worktree's own work-folder key, which names the worktree's records: built-here, nothing-back, outputs
+    /// pending and outputs-from.
+    pub base: &'a str,
+    /// How long the run waits for a worktree lock another run holds: its own key-wait bound, as runs in the worktree's
+    /// other work folders hold it for their pre-run phases.
+    pub worktree_wait: Duration,
+}
+
 impl<'a> RemoteCall<'a> {
+    /// The worktree's own work-folder key, which names its records whatever work folder the call runs in.
+    pub(crate) fn base_key(&self) -> &'a str {
+        self.lane.map_or(self.key, |lane| lane.base)
+    }
+
     /// The alias the call reaches its builder by, the picked builder's own, so the box line and the paths and caches
     /// the call lays out by never name two builders.
     pub(crate) fn host(&self) -> &'a str {
@@ -629,6 +649,7 @@ mod snapshot_only {
                 cross_build: None,
                 builder: &crate::test_support::HOST,
                 key: "app-1a2b3c4d",
+                lane: None,
                 session: "0123456789abcdef0123456789abcdef",
                 root,
                 root_id: gate_router::FolderId { volume: 0, file: [0; 16] },
@@ -908,8 +929,9 @@ mod scripted {
             // the line kept among the outcome's so a fallback does not say it again. The builder then builds, so the
             // built-here record goes first, as the client's goes.
             if let Some(plan) = call.send {
-                let record = gate_state::v1::built_here_path(call.state_dir, call.key);
-                if let Err(line) = crate::no_build::clear_built_here(&record) {
+                let record = gate_state::v1::built_here_path(call.state_dir, call.base_key());
+                let cleared = super::hold_records(call.state, call.base_key()).and_then(|_records| crate::no_build::clear_built_here(&record));
+                if let Err(line) = cleared {
                     return RemoteOutcome::not_started(line);
                 }
                 if let Err(why) = super::say(call.log, &[plan.dropped_line()], io::stderr().lock()) {

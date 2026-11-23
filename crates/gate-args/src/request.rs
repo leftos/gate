@@ -463,6 +463,9 @@ pub struct TestSeams {
     /// back with reason `busy`; also the bounds a passing build here takes the key with to write its built-here record:
     /// its brief retry and its wait to remove the outputs-from record.
     pub key_wait_ms: Option<u64>,
+    /// How many work folders a worktree's routed runs use on a builder at once, in place of three: a whole number from 1
+    /// to 3, 1 keeping every routed run in the worktree's own.
+    pub lanes: Option<u32>,
     /// How long each git call of the routing decision may take before git is killed and the run goes ahead here, and
     /// each git call the remote client's bounds give before that call fails, in place of their defaults.
     pub git_limit_ms: Option<u64>,

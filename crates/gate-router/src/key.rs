@@ -34,6 +34,16 @@ pub fn work_folder_key(root: &str) -> String {
     key
 }
 
+/// The most work folders the routed runs of one worktree use on a builder at once: its own and two later ones.
+pub const MOST_LANES: u32 = 3;
+
+/// The key of work folder `lane` of the worktree whose own key is `base`: `base` itself for the first, else `base`, `-`
+/// and the lane's number (`yaat-1a2b3c4d-2`), which can never read as a key's 8 hex digits.
+#[must_use]
+pub fn lane_key(base: &str, lane: u32) -> String {
+    if lane <= 1 { base.to_owned() } else { format!("{base}-{lane}") }
+}
+
 /// The device names Windows reserves in every folder, in upper case.
 const DEVICE_NAMES: [&str; 22] = [
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",

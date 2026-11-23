@@ -120,6 +120,10 @@ pub enum KernelObject {
     /// The mutex a routed run holds from before its preflight to its end, by its work-folder key's [`key_hash`], so a
     /// second routed run of one worktree finds it taken and runs here.
     Routed { hash: u64 },
+    /// The mutex a gate holds for the milliseconds it reads and rewrites a worktree's built-here or nothing-back record, by
+    /// the worktree's own work-folder key's [`key_hash`], so two routed runs in two of its work folders and a run here
+    /// never interleave their writes. No other lock is taken while it is held.
+    Records { hash: u64 },
     /// The mutex a routed run holds around what its sync-back writes in a worktree, the main one's or a sibling's, by
     /// the worktree folder's id: its volume's serial number and its file id, so two spellings of one folder share it.
     Worktree { volume: u64, file: [u8; 16] },
@@ -143,6 +147,7 @@ impl KernelObject {
             KernelObject::Job { gate_pid } => format!("job-{gate_pid}"),
             KernelObject::Log { hash } => format!("log-{hash:016x}"),
             KernelObject::Routed { hash } => format!("routed-{hash:016x}"),
+            KernelObject::Records { hash } => format!("records-{hash:016x}"),
             KernelObject::Worktree { volume, file } => format!("worktree-{volume:016x}-{:032x}", u128::from_be_bytes(file)),
             KernelObject::DesktopQueue => "desktop-queue".to_owned(),
         }
@@ -165,6 +170,7 @@ impl KernelObject {
             | KernelObject::Job { .. }
             | KernelObject::Log { .. }
             | KernelObject::Routed { .. }
+            | KernelObject::Records { .. }
             | KernelObject::Worktree { .. }
             | KernelObject::DesktopQueue => None,
         }

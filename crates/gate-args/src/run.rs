@@ -71,6 +71,8 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     KeyWaitMs,
     #[cfg(feature = "test-seams")]
+    Lanes,
+    #[cfg(feature = "test-seams")]
     GitLimitMs,
     #[cfg(feature = "test-seams")]
     GitDrainMs,
@@ -404,6 +406,7 @@ impl RunBuilder {
             | ValueOption::RemoteClient
             | ValueOption::RemoteWaitMs
             | ValueOption::KeyWaitMs
+            | ValueOption::Lanes
             | ValueOption::GitLimitMs
             | ValueOption::GitDrainMs
             | ValueOption::RestoreLimitMs
@@ -471,6 +474,7 @@ impl RunBuilder {
             ValueOption::RemoteClient => seams.remote_client = Some(PathBuf::from(value)),
             ValueOption::RemoteWaitMs => seams.remote_wait_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::KeyWaitMs => seams.key_wait_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::Lanes => seams.lanes = Some(values::in_range(spelled, value, 1, 3)?),
             ValueOption::GitLimitMs => seams.git_limit_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::GitDrainMs => seams.git_drain_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::RestoreLimitMs => seams.restore_limit_ms = Some(values::above_zero(spelled, value)?),

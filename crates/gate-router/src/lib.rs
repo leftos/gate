@@ -47,7 +47,7 @@ pub use decide::{
 };
 pub use edit::{BUILDER_SECTIONS, EDIT_SECTIONS, Edit, EditRefusal, EditVerb, Edited, edit_remote_json};
 pub use escape::{escaped, is_reordering_mark};
-pub use key::{is_layout_char, is_layout_name, repo_name, work_folder_key};
+pub use key::{MOST_LANES, is_layout_char, is_layout_name, lane_key, repo_name, work_folder_key};
 pub use like::{InvalidPattern, Pattern};
 pub use rewrite::{RewritePlace, Rewritten, SiblingRoot, rewrite_words};
 pub use warm::{parse_failure, spelled};

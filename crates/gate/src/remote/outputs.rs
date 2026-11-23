@@ -310,14 +310,14 @@ pub(super) fn sent<'a>(attempt: &mut Attempt<'_, 'a>) -> Result<Sent<'a>, End> {
     let call: &RemoteCall<'a> = attempt.call;
     let mut sent = Sent::nothing();
     if call.outputs_withheld {
-        sent.withheld = Some(v1::outputs_pending_path(call.state_dir, call.key));
+        sent.withheld = Some(v1::outputs_pending_path(call.state_dir, call.base_key()));
     }
     if call.outputs.is_empty() && call.failure_outputs.is_empty() {
         return Ok(sent);
     }
-    let marker = v1::outputs_pending_path(call.state_dir, call.key);
+    let marker = v1::outputs_pending_path(call.state_dir, call.base_key());
     let marker_full = pending(&marker);
-    let from = v1::outputs_from_path(call.state_dir, call.key);
+    let from = v1::outputs_from_path(call.state_dir, call.base_key());
     // Only a run with output globs records its builder, so only one is held to the switch: a failure-only run brings
     // nothing back and would otherwise send full for good.
     let full = marker_full || (!call.outputs.is_empty() && !pulled_by(&from, &call.builder.alias));
@@ -1378,7 +1378,7 @@ fn pulled_by(path: &Path, alias: &str) -> bool {
 /// whole, so a later run on another builder asks for every output that differs from the PC's ([`Sent::full`]). Else
 /// why it could not be written, which the run says and leaves its marker for: the next run is then full.
 pub(super) fn recorded(attempt: &mut Attempt<'_, '_>) -> Result<(), String> {
-    let path = v1::outputs_from_path(attempt.call.state_dir, attempt.call.key);
+    let path = v1::outputs_from_path(attempt.call.state_dir, attempt.call.base_key());
     v1::write_outputs_from(&path, &attempt.call.builder.alias).map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
@@ -2554,6 +2554,7 @@ mod tests {
                 commit_stage: false,
                 builder: &crate::test_support::HOST,
                 key: KEY,
+                lane: None,
                 session: "0123456789abcdef0123456789abcdef",
                 root,
                 root_id: gate_router::FolderId { volume: 0, file: [0; 16] },

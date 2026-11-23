@@ -3451,6 +3451,29 @@ fn the_box_side_ends_in_one_separator_and_the_pc_side_in_none() {
 }
 
 #[test]
+fn a_run_in_a_later_work_folder_maps_that_folder_and_keeps_its_source_revision() {
+    let key = work_folder_key(ROOT);
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &mapped(FakeFacts::at_root())));
+    let lane = run.for_lane(2);
+    assert_eq!(lane.key, format!("{key}-2"));
+    let mapped_word = format!(r"-p:PathMap={BUILDER}\work\{key}-2\=X:\dev\yaat.wt\a");
+    assert_eq!(lane.words, ["dotnet".to_owned(), "build".to_owned(), stamp(), mapped_word]);
+    assert_eq!(run.for_lane(1), run, "the first is the worktree's own work folder");
+
+    let mac_tree = format!("/Users/b/gate-remote/work/{key}/");
+    let facts = FakeFacts {
+        given_trees: Some(vec![(mac_tree, r"X:\dev\yaat.wt\a\".to_owned())]),
+        ..FakeFacts::with_config(with_builders(r#"{"yaat": ["dotnet *"]}"#, MAC_BUILD))
+    };
+    let mac = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    let mac_lane = mac.for_lane(3);
+    let (last, before) = mac_lane.words.split_last().expect("the run has words");
+    assert_eq!(last, &format!(r"-p:PathMap=/Users/b/gate-remote/work/{key}-3/=X:\dev\yaat.wt\a"));
+    assert_eq!(before, &mac.words[..mac.words.len() - 1], "the source revision word is unchanged");
+    assert!(before.iter().any(|word| word.starts_with("-p:SourceRevisionId=")), "{before:?}");
+}
+
+#[test]
 fn a_build_whose_head_cannot_be_read_still_maps_its_work_folder() {
     let heads: [Result<Option<String>, String>; 2] = [Ok(None), Err("git could not be started".to_owned())];
     for head in heads {
@@ -7917,6 +7940,30 @@ fn a_dotnet_build_to_an_opted_in_mac_gets_a_cross_build_of_its_target_configurat
     assert_eq!(cross.words, expected);
     assert_eq!(run.cross_build_blocked, None);
     assert_eq!(run.lines(), Vec::<String>::new());
+}
+
+#[test]
+fn a_run_in_a_later_work_folder_maps_that_folder_in_its_cross_build_too() {
+    let command = words(&["dotnet", "build", "src/App/App.csproj", "-c", "Release"]);
+    // The Mac's tree laid out in the fixture worktree's own work folder, as the builder's profile lays it out.
+    let facts = FakeFacts {
+        given_trees: Some(vec![(format!("/m/work/{}/", work_folder_key(ROOT)), r"X:\dev\yaat.wt\a\".to_owned())]),
+        ..cross_facts(cross_routing(r#"{"yaat": "win-x64"}"#))
+    };
+    let run = routed(decide(&heavy(&command), &facts));
+    let lane = run.for_lane(2);
+
+    let path_map = |words: &[String]| {
+        words
+            .iter()
+            .find(|word| word.starts_with("-p:PathMap="))
+            .cloned()
+            .expect("a path-map word")
+    };
+    let cross = lane.cross_build.as_ref().expect("a cross build");
+    assert_ne!(path_map(&lane.words), path_map(&run.words), "the lane maps its own folder");
+    assert!(path_map(&lane.words).contains(&format!("{}-2", run.key)), "{:?}", lane.words);
+    assert_eq!(path_map(&cross.words), path_map(&lane.words), "the cross build maps the same folder");
 }
 
 #[test]

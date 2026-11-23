@@ -6,7 +6,7 @@ use gate_router::{CarriedSibling, FolderId, is_layout_name, sibling_root};
 
 /// A sibling a routed run carries: its folder name, its root and its folder's id, borrowed from the route's decision,
 /// never a fresh read of the siblings file or the routing file.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Sibling<'a> {
     name: &'a str,
     root: &'a str,

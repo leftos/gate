@@ -32,8 +32,8 @@ use crate::remote_inputs::inputs_case;
 use crate::support::{
     ANSWERING, Case, FAKE_GATE, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, GIT_REDIRECTS, Go, Junction, LOCAL_REASON, NetfxKey, Outcome,
     PREFLIGHT_SEAMS_VARIABLE, Running, STEPS_VARIABLE, allow_breakaway, assert_in_order, beside, build_version, calls, copy_tool, events, finish,
-    git, git_init, heavy_words, latest_run_of, log_texts, nothing_back, refuse_breakaway, release, run_words, shown, ssh_steps, start,
-    wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
+    git, git_init, heavy_words, hold_folder_mutex, latest_run_of, log_texts, nothing_back, refuse_breakaway, release, run_words, shown, ssh_steps,
+    start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
 };
 
 pub(super) const HOST: &str = "builder";
@@ -1925,7 +1925,7 @@ fn a_second_routed_run_of_one_worktree_falls_back_busy_past_the_bound() {
     first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
     let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
     let tuned = Tuned {
-        extra: &["--test-key-wait-ms", "100"],
+        extra: &["--test-key-wait-ms", "100", "--test-lanes", "1"],
         ..Tuned::default()
     };
 
@@ -1963,7 +1963,7 @@ fn a_second_routed_run_of_one_worktree_waits_for_its_holder_and_routes() {
     first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
     let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
     let tuned = Tuned {
-        extra: &["--test-key-wait-ms", "600000", "--test-remote-wait-ms", "3600000"],
+        extra: &["--test-key-wait-ms", "600000", "--test-remote-wait-ms", "3600000", "--test-lanes", "1"],
         ..Tuned::default()
     };
     let second = start(client_gate_tuned(
@@ -2010,7 +2010,7 @@ fn a_second_routed_run_of_one_worktree_says_the_holders_time_left() {
     first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
     let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
     let tuned = Tuned {
-        extra: &["--test-key-wait-ms", "600000", "--test-remote-wait-ms", "3600000"],
+        extra: &["--test-key-wait-ms", "600000", "--test-remote-wait-ms", "3600000", "--test-lanes", "1"],
         ..Tuned::default()
     };
     let second = start(client_gate_tuned(&case, "second.log", &second_steps, &tuned, &command));
@@ -2049,6 +2049,8 @@ fn a_second_routed_run_of_one_worktree_says_it_still_waits() {
             "50",
             "--test-remote-wait-ms",
             "3600000",
+            "--test-lanes",
+            "1",
         ],
         ..Tuned::default()
     };
@@ -2073,6 +2075,207 @@ fn a_second_routed_run_of_one_worktree_says_it_still_waits() {
     assert_eq!(fallbacks(&own(&case, pid)), Vec::<&str>::new());
 }
 
+/// The words of a routed run that waits for a work folder and a remote slot as long as any holder runs.
+const PATIENT: [&str; 4] = ["--test-key-wait-ms", "600000", "--test-remote-wait-ms", "3600000"];
+
+/// The case worktree's own work-folder key.
+fn base_key(case: &Case) -> String {
+    work_folder_key(&git(case, &["rev-parse", "--show-toplevel"]))
+}
+
+/// A routed run of the case logging to `name.log` whose run call holds until the case writes `go`, started and seen at
+/// its run call: the run and its steps file.
+fn held_run(case: &Case, name: &str, go: &Go) -> (Running, PathBuf) {
+    let steps = ssh_steps(case, name, &["ok", &format!("hold {}", shown(go.path()))]);
+    let tuned = Tuned {
+        extra: &PATIENT,
+        ..Tuned::default()
+    };
+    let run = start(client_gate_tuned(
+        case,
+        &format!("{name}.log"),
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "out", name],
+    ));
+    run.wait_until("the held run's run call", || calls(&steps).len() == 2);
+    (run, steps)
+}
+
+#[test]
+fn three_routed_runs_of_one_worktree_that_bring_no_outputs_each_run_in_a_work_folder_of_their_own() {
+    let case = client_case_of("client-lanes", 3);
+    let gos = [1, 2].map(|lane| Go(case.folder().join("ssh").join(format!("go-{lane}"))));
+    let (first, first_steps) = held_run(&case, "first", &gos[0]);
+    let (second, second_steps) = held_run(&case, "second", &gos[1]);
+    let third_steps = ssh_steps(&case, "third", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &PATIENT,
+        ..Tuned::default()
+    };
+
+    let (third_pid, third) = finish_with_pid(client_gate_tuned(
+        &case,
+        "third.log",
+        &third_steps,
+        &tuned,
+        &[r".\tool.exe", "out", "third"],
+    ));
+    for go in &gos {
+        fs::write(go.path(), "").expect("the go file can be made");
+    }
+    let (first_pid, second_pid) = (first.id(), second.id());
+    let (first, second) = (first.finish(), second.finish());
+
+    let runs = [
+        (&first, &first_steps, first_pid),
+        (&second, &second_steps, second_pid),
+        (&third, &third_steps, third_pid),
+    ];
+    for (outcome, steps, pid) in runs {
+        assert_eq!(outcome.code, Some(0), "{outcome:?}");
+        assert!(!outcome.stderr.contains(BUSY_LINE), "{outcome:?}");
+        assert!(!outcome.stderr.contains(KEY_WAITING), "a free work folder is no wait: {outcome:?}");
+        assert_eq!(calls(steps), ["preflight", "run"], "{outcome:?}");
+        assert_eq!(fallbacks(&own(&case, pid)), Vec::<&str>::new(), "{outcome:?}");
+    }
+    let key = base_key(&case);
+    let work = case.folder().join("builder").join("work");
+    for folder in [key.clone(), format!("{key}-2"), format!("{key}-3")] {
+        assert!(work.join(&folder).is_dir(), "the builder holds the work folder {folder}");
+    }
+    for lane in [2, 3] {
+        assert!(
+            !builder_ref(&case, &format!("refs/gate/{key}-{lane}")).is_empty(),
+            "lane {lane} has its snapshot ref"
+        );
+    }
+}
+
+#[test]
+fn a_fourth_routed_run_of_one_worktree_takes_the_first_work_folder_let_go() {
+    let case = client_case_of("client-lanes-fourth", 3);
+    let gos = [1, 2, 3].map(|lane| Go(case.folder().join("ssh").join(format!("go-{lane}"))));
+    let (first, _) = held_run(&case, "first", &gos[0]);
+    let (second, _) = held_run(&case, "second", &gos[1]);
+    let (third, _) = held_run(&case, "third", &gos[2]);
+    let fourth_steps = ssh_steps(&case, "fourth", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &PATIENT,
+        ..Tuned::default()
+    };
+    let fourth = start(client_gate_tuned(
+        &case,
+        "fourth.log",
+        &fourth_steps,
+        &tuned,
+        &[r".\tool.exe", "out", "fourth"],
+    ));
+    let pid = fourth.id();
+    fourth.wait_for_stderr(KEY_WAITING);
+
+    fs::write(gos[1].path(), "").expect("the go file can be made");
+    let second = second.finish();
+    let fourth = fourth.finish();
+    for go in [&gos[0], &gos[2]] {
+        fs::write(go.path(), "").expect("the go file can be made");
+    }
+    let (first, third) = (first.finish(), third.finish());
+
+    assert_eq!(
+        (first.code, second.code, third.code),
+        (Some(0), Some(0), Some(0)),
+        "{first:?}\n{second:?}\n{third:?}"
+    );
+    assert_eq!(fourth.code, Some(0), "{fourth:?}");
+    assert!(!fourth.stderr.contains(BUSY_LINE), "{fourth:?}");
+    assert_eq!(calls(&fourth_steps), ["preflight", "run"]);
+    let own = own(&case, pid);
+    assert_eq!(fallbacks(&own), Vec::<&str>::new(), "{own:#?}");
+    let take = own.iter().find(|event| event["event"] == "take").expect("the run took a remote slot");
+    assert_eq!(
+        take["key"],
+        format!("{}-2", base_key(&case)).as_str(),
+        "the second work folder was let go first: {own:#?}"
+    );
+}
+
+#[test]
+fn a_routed_run_that_brings_outputs_back_keeps_its_one_work_folder_and_falls_back_busy() {
+    let case = outputs_case("client-lanes-outputs", &BIN);
+    let held = hold_folder_mutex(&case, &base_key(&case));
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "100"],
+        ..Tuned::default()
+    };
+
+    let (pid, outcome) = finish_with_pid(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran here"]));
+
+    drop(held);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_in_order(&outcome.stderr, &[KEY_WAITING, BUSY_LINE]);
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(calls(&steps), Vec::<String>::new(), "the run made no ssh call");
+    assert_eq!(fallbacks(&own(&case, pid)), ["busy"]);
+}
+
+/// A warm-up holds the worktree's own work folder: a run that waits its ceiling waits for that folder as it did, and
+/// never goes to a later, cold one.
+#[test]
+fn a_patient_run_behind_a_warm_up_keeps_to_the_worktree_s_own_work_folder() {
+    let case = client_case("client-warm-lane");
+    let key = base_key(&case);
+    let held = hold_folder_mutex(&case, &key);
+    let lock = gate_state::v1::warm_lock_path(&case.root(), &key);
+    fs::create_dir_all(lock.parent().expect("the lock has a folder")).expect("the warm-up folder can be made");
+    let warm = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(&lock)
+        .expect("the warm-up lock can be held");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "100"],
+        ..Tuned::default()
+    };
+
+    let (pid, outcome) = finish_with_pid(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran here"]));
+
+    drop(warm);
+    drop(held);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_in_order(&outcome.stderr, &[KEY_WAITING, BUSY_LINE]);
+    assert_eq!(calls(&steps), Vec::<String>::new(), "the run made no ssh call");
+    assert_eq!(fallbacks(&own(&case, pid)), ["busy"]);
+    let later = case.folder().join("builder").join("work").join(format!("{key}-2"));
+    assert!(!later.exists(), "the run never took a later work folder: {outcome:?}");
+}
+
+#[test]
+fn a_routed_run_in_a_later_work_folder_journals_that_folder_s_key() {
+    let case = client_case("client-lane-journal");
+    let key = base_key(&case);
+    let held = hold_folder_mutex(&case, &key);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let (pid, outcome) = finish_with_pid(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there"]));
+
+    drop(held);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "{outcome:?}");
+    let own = own(&case, pid);
+    assert_eq!(own[0]["key"], key.as_str(), "the queue line comes before the pick: {own:#?}");
+    let lane = format!("{key}-2");
+    for name in ["take", "release"] {
+        let event = own.iter().find(|event| event["event"] == name).expect("the run journalled the event");
+        assert_eq!(event["key"], lane.as_str(), "{own:#?}");
+    }
+}
+
 #[test]
 fn a_ctrl_c_while_waiting_for_the_work_folder_abandons_the_wait() {
     let case = client_case_of("client-key-ctrl-c", 1);
@@ -2083,7 +2286,7 @@ fn a_ctrl_c_while_waiting_for_the_work_folder_abandons_the_wait() {
     let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
     // The seam raises the console interrupt once the gate has said it waits, the key wait's line included.
     let tuned = Tuned {
-        extra: &["--test-key-wait-ms", "3600000", "--test-interrupt-queued"],
+        extra: &["--test-key-wait-ms", "3600000", "--test-interrupt-queued", "--test-lanes", "1"],
         ..Tuned::default()
     };
     let second = start(client_gate_tuned(
@@ -2119,7 +2322,7 @@ fn a_ctrl_c_already_raised_at_the_key_take_abandons_before_busy() {
     // The seam raises the console interrupt before the zero-wait take, which reads the taken lock as busy: the run must
     // end as an interrupted key wait, not fall back `busy`, and without a waiting line it never said.
     let tuned = Tuned {
-        extra: &["--test-key-wait-ms", "3600000", "--test-interrupt-before-key"],
+        extra: &["--test-key-wait-ms", "3600000", "--test-interrupt-before-key", "--test-lanes", "1"],
         ..Tuned::default()
     };
     let second = start(client_gate_tuned(
@@ -12242,7 +12445,7 @@ fn a_built_here_send_whose_entry_is_gone_under_the_key_is_stopped_by_a_standing_
     first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
     let second_steps = ssh_steps(&case, "second", &["ok"; 4]);
     let tuned = Tuned {
-        extra: &["--test-key-wait-ms", "600000", "--test-remote-wait-ms", "3600000"],
+        extra: &["--test-key-wait-ms", "600000", "--test-remote-wait-ms", "3600000", "--test-lanes", "1"],
         ..Tuned::default()
     };
     let second = start(client_gate_tuned(&case, "second.log", &second_steps, &tuned, &SENT_TEST));
@@ -12272,7 +12475,7 @@ fn a_built_here_send_the_nothing_back_record_stops_removes_the_built_here_record
     first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
     let second_steps = ssh_steps(&case, "second", &["ok"; 4]);
     let tuned = Tuned {
-        extra: &["--test-key-wait-ms", "600000", "--test-remote-wait-ms", "3600000"],
+        extra: &["--test-key-wait-ms", "600000", "--test-remote-wait-ms", "3600000", "--test-lanes", "1"],
         ..Tuned::default()
     };
     let second = start(client_gate_tuned(&case, "second.log", &second_steps, &tuned, &SENT_TEST));
@@ -12491,7 +12694,7 @@ fn a_busy_fallback_of_a_send_keeps_no_build_and_says_no_dropped_line() {
     first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
     let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
     let tuned = Tuned {
-        extra: &["--test-key-wait-ms", "100", "--test-dotnet-limit-ms", "3600000"],
+        extra: &["--test-key-wait-ms", "100", "--test-dotnet-limit-ms", "3600000", "--test-lanes", "1"],
         ..Tuned::default()
     };
 
@@ -12522,7 +12725,7 @@ fn a_busy_fallback_of_a_send_with_a_record_drops_no_build_and_says_the_local_lin
     first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
     let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
     let tuned = Tuned {
-        extra: &["--test-key-wait-ms", "100", "--test-dotnet-limit-ms", "3600000"],
+        extra: &["--test-key-wait-ms", "100", "--test-dotnet-limit-ms", "3600000", "--test-lanes", "1"],
         ..Tuned::default()
     };
 

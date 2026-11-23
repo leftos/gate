@@ -729,6 +729,7 @@ fn call_of<'a>(
         cross_build: None,
         builder: &target.builder,
         key: &target.key,
+        lane: None,
         session: &prepared.session,
         root: &target.place.root,
         root_id: target.root_id,

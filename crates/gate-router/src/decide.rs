@@ -13,7 +13,7 @@ use crate::balance::{self, Balanced, BalancedEntry, BuilderFigures};
 use crate::config::{Builder, BuilderOs, CARGO_OUTPUTS, Config, ConfigProblem, DEFAULT_OUTPUTS, FolderGlob, UserToolKind, ignored_line};
 use crate::desktop::{DesktopDeclaration, DesktopMode};
 use crate::escape::escaped;
-use crate::key::{is_layout_name, repo_name, work_folder_key};
+use crate::key::{is_layout_name, lane_key, repo_name, work_folder_key};
 use crate::like::{Pattern, eq_ignoring_case};
 use crate::rewrite::{RewritePlace, Rewritten, Separators, SiblingRoot, drive_letters, is_script_text, rewrite_named, root_letter, split_root};
 use crate::windows::{WINDOWS_NAME, WindowsChange};
@@ -1162,6 +1162,26 @@ impl SendPlan {
 }
 
 impl RemoteRun {
+    /// This run in the worktree's work folder `lane` ([`lane_key`]): its key that folder's, and the path-map word of its
+    /// words and its cross build's, which [`stamp`] wrote from the worktree's own key, mapping that folder's trees in its
+    /// place ([`lane_path_map`]). Lane 1 is the run as it is.
+    #[must_use]
+    pub fn for_lane(&self, lane: u32) -> RemoteRun {
+        let key = lane_key(&self.key, lane);
+        let mapped = |words: &[String]| -> Vec<String> { words.iter().map(|word| lane_path_map(word, &self.key, &key, self.builder.os)).collect() };
+        let words = mapped(&self.words);
+        let cross_build = self.cross_build.as_ref().map(|cross| CrossBuild {
+            words: mapped(&cross.words),
+            ..cross.clone()
+        });
+        RemoteRun {
+            key,
+            words,
+            cross_build,
+            ..self.clone()
+        }
+    }
+
     /// The lines the gate says for this route, in order: [`RemoteRun::program_line`], [`DROPPED_NO_BUILD_LINE`] unless
     /// the run has a send, whose client says it only when the send does not land, [`NO_OUTPUTS_LINE`], then, for a run
     /// carrying siblings, `gate: routed with siblings: {name} ({root}), ...` naming each in declared order, then, for a
@@ -4992,6 +5012,32 @@ fn path_map_word(trees: &[(String, String)], os: BuilderOs) -> Option<String> {
         .map(|(tree, root)| format!("{}{separator}={}", tree.trim_end_matches(separator), root.trim_end_matches('\\')))
         .collect();
     Some(format!("-p:{PATH_MAP}={}", pairs.join(PATH_MAP_PAIR_SEPARATOR)))
+}
+
+/// `word` with each box tree of its pairs naming the work folder `lane` in place of `base`, when it is a path-map word
+/// ([`path_map_word`]) of a builder running `os`: every folder of a tree named `base` exactly is renamed, so the box side
+/// still ends in its one separator and the PC side is left as it is. Any other word is returned as it is.
+fn lane_path_map(word: &str, base: &str, lane: &str, os: BuilderOs) -> String {
+    let prefix = format!("-p:{PATH_MAP}=");
+    let Some(pairs) = word.strip_prefix(&prefix) else {
+        return word.to_owned();
+    };
+    let separator = match os {
+        BuilderOs::Windows => '\\',
+        BuilderOs::Macos => '/',
+    };
+    let middle = format!("{separator}=");
+    let renamed: Vec<String> = pairs
+        .split(PATH_MAP_PAIR_SEPARATOR)
+        .map(|pair| match pair.split_once(&middle) {
+            Some((tree, root)) => {
+                let folders: Vec<&str> = tree.split(separator).map(|folder| if folder == base { lane } else { folder }).collect();
+                format!("{}{middle}{root}", folders.join(&separator.to_string()))
+            }
+            None => pair.to_owned(),
+        })
+        .collect();
+    format!("{prefix}{}", renamed.join(PATH_MAP_PAIR_SEPARATOR))
 }
 
 /// The worktree's `HEAD` sha at `place`, or `None` when the branch is unborn or git cannot read it: a run without

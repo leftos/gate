@@ -37,7 +37,7 @@ use gate_args::TestSeams;
 use gate_args::is_godot_console;
 use gate_inputs::lfs::{Blob, Listed, Small, is_attributes, is_small_blob};
 use gate_state::v1::{self, WarmFailure};
-use gate_state::{FallbackReason, KernelObject, LowDiskFacts, LowDiskPrune, key_hash};
+use gate_state::{FallbackReason, KernelObject, LowDiskFacts, LowDiskPrune, StateRoot, key_hash};
 use gate_win32::{AcquireError, Interrupt, Job, NamedMutex, OwnedMutexGuard, PipedConsole, Running, Share};
 use gate_wire::floor::{PruneStart, free_of_line};
 use gate_wire::slots::{BOX_SLOTS_LINE, BoxSlots};
@@ -399,6 +399,29 @@ pub(crate) fn hold_key_waiting(call: &RemoteCall<'_>, wait: Duration) -> Result<
     hold_mutex_waiting(&name, call.interrupt, wait)
 }
 
+/// How long a take of a worktree's records lock ([`hold_records`]) waits for another holder, which holds it for the
+/// milliseconds of one record's read and write.
+const RECORDS_WAIT: Duration = Duration::from_secs(10);
+
+/// The records lock of the worktree whose own work-folder key is `base`, under the state root `state`: the mutex every
+/// read and rewrite of its built-here and nothing-back records holds ([`KernelObject::Records`]), waited for up to
+/// [`RECORDS_WAIT`], a Ctrl+C never ending the wait, so a record is never left half rewritten. Nothing else is taken
+/// while it is held.
+///
+/// # Errors
+///
+/// The line saying the lock cannot be opened or taken, or was held past its wait.
+pub(crate) fn hold_records(state: &StateRoot, base: &str) -> Result<OwnedMutexGuard, String> {
+    let name = state.object_name(KernelObject::Records { hash: key_hash(base) });
+    match hold_mutex_waiting(&name, None, RECORDS_WAIT)? {
+        KeyHold::Held(held) => Ok(held),
+        KeyHold::Busy | KeyHold::Interrupted => Err(format!(
+            "gate: another run held the worktree's records lock {name} for more than {} s",
+            RECORDS_WAIT.as_secs()
+        )),
+    }
+}
+
 /// The named mutex `name`, waited for up to `wait` in slices of [`KEY_WAIT_SLICE`], `interrupt` looked at between
 /// them, as [`hold_key_waiting`] waits for the key: a mutex its last holder left without releasing is taken. `Err`
 /// with the line saying why it could not be opened or taken.
@@ -497,7 +520,7 @@ impl RustClient {
             call,
             transport: &*transport,
             git: self.git,
-            lock_wait: self.git.limit,
+            lock_wait: call.lane.map_or(self.git.limit, |lane| lane.worktree_wait),
             pause: self.pause,
             transfer_pauses: self.transfer_pauses,
             transfer_failed: false,
@@ -2028,7 +2051,7 @@ impl Attempt<'_, '_> {
         if plan.built_here && self.built_here_stands(plan) {
             return None;
         }
-        let path = v1::nothing_back_path(self.call.state_dir, self.call.key);
+        let path = v1::nothing_back_path(self.call.state_dir, self.call.base_key());
         let configuration = plan.bin.rsplit('/').next().unwrap_or_default().to_lowercase();
         let standing = || format!("the last build's outputs are not back: {} stands", path.display());
         match no_build::read_record(&path) {
@@ -2046,7 +2069,7 @@ impl Attempt<'_, '_> {
     /// the record's entry the route matched ([`SendPlan::project_key`]) under the settings [`SendPlan::words`] set
     /// ([`no_build::entry_stands`]). A routed build removes the record under that lock between the route and here.
     fn built_here_stands(&self, plan: &SendPlan) -> bool {
-        let record = no_build::read_built_here(&v1::built_here_path(self.call.state_dir, self.call.key));
+        let record = no_build::read_built_here(&v1::built_here_path(self.call.state_dir, self.call.base_key()));
         no_build::entry_stands(&record, &plan.project_key, &build_settings(&plan.words))
     }
 
@@ -2059,7 +2082,9 @@ impl Attempt<'_, '_> {
     /// A record that cannot be removed refuses the route `inputs`, as its entries would outlast the build there: the
     /// run goes on here, the line saying why kept for its log.
     fn takes_the_drop(&mut self, line: &'static str) -> Result<(), End> {
-        if let Err(cannot) = no_build::clear_built_here(&v1::built_here_path(self.call.state_dir, self.call.key)) {
+        let (state, base) = (self.call.state, self.call.base_key());
+        let cleared = hold_records(state, base).and_then(|_records| no_build::clear_built_here(&v1::built_here_path(self.call.state_dir, base)));
+        if let Err(cannot) = cleared {
             self.logged_kept(cannot);
             return Err(End::Refused(FallbackReason::Inputs));
         }
@@ -6845,6 +6870,7 @@ mod tests {
             cross_build: None,
             builder: &crate::test_support::HOST,
             key: "app-1a2b3c4d",
+            lane: None,
             session: "0123456789abcdef0123456789abcdef",
             root: r"C:\no-such-worktree",
             root_id: gate_router::FolderId { volume: 0, file: [0; 16] },
@@ -10604,6 +10630,7 @@ mod tests {
             cross_build: None,
             builder: &crate::test_support::HOST,
             key: "app-1a2b3c4d",
+            lane: None,
             session: "0123456789abcdef0123456789abcdef",
             root: r"C:\no-such-worktree",
             root_id: gate_router::FolderId { volume: 0, file: [0; 16] },

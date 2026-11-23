@@ -183,6 +183,31 @@ fn the_key_wait_seams_parse() {
     );
 }
 
+/// The lanes seam caps the work folders a worktree's routed runs use at once: a whole number from 1 to 3, unset unless
+/// given.
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_lanes_seam_takes_a_whole_number_from_one_to_three() {
+    use crate::support::run_request;
+
+    for lanes in [1, 2, 3] {
+        let given = lanes.to_string();
+        let words = with(&RUN, &["--test-lanes", &given, "--", "cmd"]);
+        assert_eq!(run_request(&refs(&words)).test_seams.lanes, Some(lanes));
+    }
+    assert_eq!(
+        run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams.lanes,
+        None,
+        "unset unless given"
+    );
+    for refused in ["0", "4"] {
+        assert_eq!(
+            problems(&refs(&with(&RUN, &["--test-lanes", refused, "--", "cmd"]))),
+            [format!("gate: --test-lanes must be a whole number from 1 to 3, got '{refused}'")]
+        );
+    }
+}
+
 #[cfg(feature = "test-seams")]
 #[test]
 fn the_diagnostics_budget_seam_is_read_once_and_refuses_zero() {

@@ -9,8 +9,9 @@ use std::io::ErrorKind;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use gate_router::{Config, escaped, sibling_root};
+use gate_router::{Config, MOST_LANES, escaped, lane_key, sibling_root, work_folder_key};
 use gate_state::v1;
+use gate_win32::OwnedMutexGuard;
 use jiff::Timestamp;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
@@ -70,7 +71,7 @@ fn key_removed(removal: &Removal<'_>, scanned: &Scanned, builders: &[(Option<Str
     if !builders.iter().any(|(_, outcome)| *outcome == Outcome::Removed) {
         return Removed::Kept;
     }
-    let _key = match worktree_record::try_hold_key(&removal.state.root, key) {
+    let _keys = match held_folders(removal, scanned) {
         Ok(Some(held)) => held,
         Ok(None) => {
             console.err(&format!("gate: prune: kept {key}: in use"));
@@ -99,6 +100,27 @@ fn key_removed(removal: &Removal<'_>, scanned: &Scanned, builders: &[(Option<Str
         };
     }
     shared_removed(removal, scanned, console)
+}
+
+/// The mutexes of the work folders the removal of the key of `scanned` holds, each taken without waiting: the key's
+/// own, and, for the worktree's own key (the one its root makes, [`work_folder_key`]), every later work folder's of the
+/// worktree too ([`lane_key`]), so the files its routed runs share go only while none runs. A later work folder's
+/// record holds its own alone. `None` when another gate holds any of them.
+///
+/// # Errors
+///
+/// The line, after `gate: `, saying a mutex cannot be opened or taken.
+fn held_folders(removal: &Removal<'_>, scanned: &Scanned) -> Result<Option<Vec<OwnedMutexGuard>>, String> {
+    let key = &scanned.key;
+    let lanes = if work_folder_key(&scanned.record.root) == *key { MOST_LANES } else { 1 };
+    let mut held = Vec::new();
+    for lane in 1..=lanes {
+        match worktree_record::try_hold_key(&removal.state.root, &lane_key(key, lane))? {
+            Some(guard) => held.push(guard),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(held))
 }
 
 /// The aliases among the `builders` of `record` whose builder, as `config` names it ([`Config::named_builder`]), pruned

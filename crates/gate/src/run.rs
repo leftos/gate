@@ -29,8 +29,8 @@ use gate_args::{
 use gate_inputs::glob::names_tmp;
 use gate_router::warm::{RecordRead, RecordState};
 use gate_router::{
-    BuildSettings, BuildTarget, CARRIED_INPUT, DEFAULT_OUTPUTS, LaterCandidate, Nested, PinRefusal, Place, RemoteRun, Route, build_settings,
-    builds_in_place, dotnet_builds, dotnet_target, named_tree_paths, sdk_build_target, without_no_build, work_folder_key,
+    BuildSettings, BuildTarget, CARRIED_INPUT, DEFAULT_OUTPUTS, LaterCandidate, MOST_LANES, Nested, PinRefusal, Place, RemoteRun, Route,
+    build_settings, builds_in_place, dotnet_builds, dotnet_target, lane_key, named_tree_paths, sdk_build_target, without_no_build, work_folder_key,
 };
 use gate_state::{
     Estimate, FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RoutingFacts, RunFacts, RunTrace, StageFacts, StageOutcome,
@@ -73,7 +73,7 @@ use crate::outputs::glob::Globs;
 use crate::outputs::{stale, walk::walk_outputs};
 use crate::remote::drain::{self, Drain, utc_clock};
 use crate::remote::syncback::Staged;
-use crate::remote::{self, KEY_WAIT_SLICE, KeyHold, KeyWait, RemoteCall, RemoteClient, RemoteOutcome, Split, git};
+use crate::remote::{self, KEY_WAIT_SLICE, KeyHold, KeyWait, LaneCall, RemoteCall, RemoteClient, RemoteOutcome, Split, git, hold_records};
 use crate::resolve::{Environment, HANDED_OVER_VARIABLE, ResolvedRoot};
 use crate::restore::{self, NotRestoring, RestorePlan};
 use crate::route::{self, Placed};
@@ -185,14 +185,13 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, started
             return exit_status(GATE_FAILED);
         }
     };
-    let log_path = log;
-    let log = Log::new(log);
     let at = Where {
         root,
         gate: &gate,
         nesting: &nesting,
-        log: log_path,
+        log,
     };
+    let log = Log::new(log);
     let (plan, client) = match ready(request, &at, console) {
         Ok(ready) => ready,
         Err(NotRun { status, line }) => {
@@ -250,6 +249,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, started
         writer: None,
         streams: None,
         rerouted_for: None,
+        lane: None,
         may_reroute: false,
         restore_after: None,
         hint_after: None,
@@ -1021,6 +1021,9 @@ struct Run<'a> {
     /// The critical request whose barrier sent this light run to a builder, from its route on; `None` for every other
     /// run.
     rerouted_for: Option<u32>,
+    /// The work folder of its worktree a routed run that may use the later ones took ([`Run::take_key`]), until its next
+    /// take; `None` for a run that keeps to the worktree's own work folder ([`Run::keeps_one_folder`]) and every other run.
+    lane: Option<Lane>,
     /// Whether a critical request holding the light run back may still send it to a builder: set by the start decision
     /// ([`Run::route`]) when it kept the run here, never when it routed it, as a run that routed and fell back here
     /// already had its turn on a builder; cleared once the run has asked, so it asks at most once.
@@ -1253,6 +1256,59 @@ struct CallParts<'r> {
     session: &'r str,
     /// Whether the call is a commit's pre-commit stage ([`RemoteCall::commit_stage`]).
     commit_stage: bool,
+    /// What a run that may use its worktree's later work folders carries beside its key, whichever folder it took
+    /// ([`RemoteCall::lane`]).
+    lane: Option<LaneCall<'r>>,
+}
+
+/// The work folder of its worktree a routed run that may use the later ones took ([`Run::take_key`]).
+struct Lane {
+    /// Its number, 1 for the worktree's own ([`lane_key`]).
+    number: u32,
+    /// The worktree's own work-folder key, which names its records.
+    base: String,
+    /// The run's key-wait bound, which its waits for a worktree lock take too ([`LaneCall::worktree_wait`]).
+    worktree_wait: Duration,
+}
+
+impl Lane {
+    /// What the run's client calls carry of it.
+    fn call(&self) -> LaneCall<'_> {
+        LaneCall {
+            base: &self.base,
+            worktree_wait: self.worktree_wait,
+        }
+    }
+}
+
+/// The work folder's key a routed run took ([`Run::take_key`]).
+struct KeyTaken {
+    /// The key's lock; `None` for a client that takes none.
+    held: Option<OwnedMutexGuard>,
+    /// How long the run waited for it.
+    waited: Duration,
+}
+
+/// How a take of a routed run's work folder ended, before the run acts on it ([`Run::take_key`]).
+enum KeyEnd {
+    /// The lock of work folder `lane` is held ([`lane_key`]).
+    Held { held: Option<OwnedMutexGuard>, lane: u32 },
+    /// Every work folder the run may take stayed held, or a warm-up holds the worktree's own.
+    Busy,
+    /// A lock could not be opened or taken: the line saying why, said before the run falls back busy.
+    Said(String),
+    /// A Ctrl+C ended the take.
+    Interrupted,
+}
+
+/// What a routed run's take of its work folder goes by ([`Run::take_key`]).
+struct KeyPlan<'l> {
+    /// The keys of the later work folders the run may take, lane 2 first; none for a run that keeps the worktree's own.
+    lanes: &'l [String],
+    /// Whether the run waits its ceiling out for a holder ([`waits_its_ceiling`]).
+    patient: bool,
+    /// Whether a warm-up lock that cannot be probed was said ([`warm_up_holds`]).
+    probe_said: bool,
 }
 
 /// The outcome a routed run of `request` goes on with once `first`, the outcome of its `call`, ended: `first` itself,
@@ -1989,11 +2045,13 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         env,
         session,
         commit_stage,
+        lane,
     } = parts;
     Ok(RemoteCall {
         commit_stage,
         builder: &remote.builder,
         key: &remote.key,
+        lane,
         session,
         root: &remote.root,
         root_id: remote.root_id,
@@ -3110,16 +3168,22 @@ impl<'r> Run<'r> {
     /// ([`Run::take_key`]). The walk's remote budget is already spent by the queue and key waits of a run that never
     /// runs here, a desktop or `--lock` run ([`key_walk`]). Else how
     /// the run goes on, as the take that failed ended it; a queue it could not take holds nothing.
-    fn take_locks(&mut self, remote: &RemoteRun, console: &mut Console) -> Result<(Locks, Walk), Remotely> {
+    ///
+    /// A run that took a later work folder of its worktree goes on as the run in that folder ([`RemoteRun::for_lane`]),
+    /// returned with the locks; `None` for one in the worktree's own.
+    fn take_locks(&mut self, remote: &RemoteRun, console: &mut Console) -> Result<(Locks, Walk, Option<RemoteRun>), Remotely> {
+        self.lane = None;
         let (queue, queued) = self.take_desktop_queue(remote, console)?;
         // The key lock reads neither figure of the call; no take has resolved them yet. A sibling that fails its check
         // again sends nothing: the run falls back here before it takes the lock or a slot.
-        let (key, key_waited) = self.take_key(remote, queued, console)?;
+        let KeyTaken { held, waited } = self.take_key(remote, queued, console)?;
+        let in_lane = self.lane.as_ref().filter(|lane| lane.number > 1).map(|lane| remote.for_lane(lane.number));
+        let folder = in_lane.as_ref().unwrap_or(remote);
         // Under the key lock, once a run: the key is the same for every builder the run tries.
-        worktree_record::leave(&self.root.path, &remote.root, &remote.repo, &remote.key, console);
+        worktree_record::leave(&self.root.path, &folder.root, &folder.repo, &folder.key, console);
         // One drain session for every attempt and poll of the run.
-        let walk = key_walk(self.request, self.is_desktop(remote), queued, key_waited);
-        Ok((Locks { _key: key, _queue: queue }, walk))
+        let walk = key_walk(self.request, self.is_desktop(remote), queued, waited);
+        Ok((Locks { _key: held, _queue: queue }, walk, in_lane))
     }
 
     /// The attempts of [`Run::routed`], and the reason of the last builder's fallback when a builder's attempt fell back,
@@ -3138,10 +3202,11 @@ impl<'r> Run<'r> {
             );
         }
         // The locks are held until the whole remote attempt, every builder it hops to included, has ended.
-        let (_locks, mut walk) = match self.take_locks(remote, console) {
+        let (_locks, mut walk, in_lane) = match self.take_locks(remote, console) {
             Ok(taken) => taken,
             Err(remotely) => return (remotely, None),
         };
+        let remote = in_lane.as_ref().unwrap_or(remote);
         loop {
             // Before each attempt, whose builder may plan another drop, so a run killed on the builder leaves its
             // entries cleared. A record that cannot be removed would outlast the build there: the run falls back here.
@@ -3355,7 +3420,7 @@ impl<'r> Run<'r> {
             interrupt.raise();
         }
         match built {
-            Ok(run) => Some(run),
+            Ok(run) => self.in_later_folder(run, console),
             Err(why) => {
                 if let Some(why) = why {
                     console.note(&format!("gate: not trying {}: {why}", candidate.alias));
@@ -3363,6 +3428,23 @@ impl<'r> Run<'r> {
                 None
             }
         }
+    }
+
+    /// The later builder's run `run` in the work folder the run took: a run in a later work folder tries every builder
+    /// in that folder ([`RemoteRun::for_lane`]), but never one whose run there keeps to the worktree's own
+    /// ([`Run::keeps_one_folder`]), such as one that brings outputs back: that builder is skipped, noted in the log.
+    fn in_later_folder(&self, run: RemoteRun, console: &mut Console) -> Option<RemoteRun> {
+        let Some(lane) = self.lane.as_ref().filter(|lane| lane.number > 1) else {
+            return Some(run);
+        };
+        if self.keeps_one_folder(&run) {
+            console.note(&format!(
+                "gate: {} not tried: its run there keeps the worktree's one work folder, and this run holds a later work folder of the worktree",
+                run.builder.alias
+            ));
+            return None;
+        }
+        Some(run.for_lane(lane.number))
     }
 
     /// One builder's attempt of the routed run `first`, on the builder the `walk` goes to now: takes a remote slot into
@@ -3557,6 +3639,12 @@ impl<'r> Run<'r> {
             env: &env,
             session,
             commit_stage: self.staging.is_some(),
+            // A run that keeps one folder on this builder waits the git limit for a worktree lock, as any such run.
+            lane: self
+                .lane
+                .as_ref()
+                .filter(|lane| lane.number > 1 || !self.keeps_one_folder(remote))
+                .map(Lane::call),
         };
         let call = match call_of(parts, remote) {
             Ok(call) => call,
@@ -3697,49 +3785,23 @@ impl<'r> Run<'r> {
         let Some(words) = words else {
             return;
         };
-        let path = v1::nothing_back_path(&self.root.path, &remote.key);
-        if outcome.dropped_no_build {
-            match path.try_exists() {
-                Ok(false) => {}
-                Ok(true) => return,
-                Err(error) => {
-                    console.err(&format!("gate: cannot read {}: {error}", path.display()));
-                    return;
-                }
-            }
-        } else if !dotnet_builds(words) {
-            return;
-        } else if brought_everything_back(outcome) {
-            self.clear_nothing_back(HereWords::routed(remote, words.to_vec()), console);
+        let step = nothing_back_step(outcome, words);
+        match step {
+            NothingBackStep::Leave => return,
+            NothingBackStep::Clear => return self.clear_nothing_back(HereWords::routed(remote, words.to_vec()), console),
+            NothingBackStep::Write | NothingBackStep::WriteUnlessStanding => {}
+        }
+        // The worktree's record, whichever of its work folders the run ran in, read and written under its records lock.
+        let base = self.base_key(remote);
+        let _records = match hold_records(&self.root.root, base) {
+            Ok(held) => held,
+            Err(line) => return console.err(&line),
+        };
+        let path = v1::nothing_back_path(&self.root.path, base);
+        if step == NothingBackStep::WriteUnlessStanding && record_stands(&path, console) {
             return;
         }
-        let settings = build_settings(words);
-        let standing = match no_build::read_record(&path) {
-            Ok(standing) => standing,
-            Err(error) => {
-                console.err(&format!("gate: cannot read {}: {error}", path.display()));
-                None
-            }
-        };
-        let differs = |old: &Option<String>| match (old, &settings.configuration) {
-            (Some(old), Some(new)) => old.to_lowercase() != new.to_lowercase(),
-            (None, None) => false,
-            _ => true,
-        };
-        let configuration = match standing.as_ref() {
-            Some(record) if differs(&record.settings.configuration) => None,
-            _ => settings.configuration.clone(),
-        };
-        let record = v1::NothingBackRecord {
-            host: remote.builder.alias.clone(),
-            configuration,
-            framework: settings.framework,
-            runtime: settings.runtime,
-            built: Vec::new(),
-        };
-        if let Err(error) = v1::write_nothing_back(&path, &record) {
-            console.err(&format!("gate: cannot write {}: {error}", path.display()));
-        }
+        write_nothing_back(&path, &remote.builder.alias, words, console);
     }
 
     /// Ends a run that has let its slots and its work folder's key go: after a routed dotnet build that passed and
@@ -3873,7 +3935,13 @@ impl<'r> Run<'r> {
     /// and journals the abandon.
     ///
     /// A desktop run's bound is what is left of its ceiling after `queued`, its wait in the desktop queue ([`key_bound`]).
-    fn take_key(&mut self, remote: &RemoteRun, queued: Duration, console: &mut Console) -> Result<(Option<OwnedMutexGuard>, Duration), Remotely> {
+    ///
+    /// A run that may use the worktree's later work folders ([`Run::lanes_for`]) and finds its own held, by no warm-up,
+    /// waits one slice for it and then takes the first later one free without waiting; past them all, each slice of its
+    /// wait for its own is followed by a try of each later one, so it takes whichever is let go first. It never waits
+    /// for one while holding another. A later folder taken is the run's from then on ([`Run::lane`]), and its key the
+    /// run's tag's; a run that took none keeps the worktree's own key on every line it journals.
+    fn take_key(&mut self, remote: &RemoteRun, queued: Duration, console: &mut Console) -> Result<KeyTaken, Remotely> {
         // The key lock reads neither figure of the call; no take has resolved them yet. A sibling that fails its check
         // again sends nothing: the run falls back here before it takes the lock or a slot.
         let env = routed_env(&self.request.env, remote.source_revision.as_deref());
@@ -3889,77 +3957,157 @@ impl<'r> Run<'r> {
             // The key lock sends nothing, so it names no session.
             session: "",
             commit_stage: self.staging.is_some(),
+            lane: None,
+        };
+        let lanes = lane_keys(&remote.key, self.lanes_for(remote));
+        let desktop = self.is_desktop(remote);
+        let patient = waits_its_ceiling(self.request, desktop, self.staged());
+        let bound = key_bound(self.request, desktop, patient, queued);
+        let mut plan = KeyPlan {
+            lanes: &lanes,
+            patient,
+            probe_said: false,
         };
         let call = match call_of(parts, remote) {
             Ok(call) => call,
             Err(why) => return Err(self.fell_back(remote, FallbackReason::Client, &RemoteOutcome::not_started(why), console)),
         };
-        // The key is the worktree's on every builder: a key held elsewhere is busy on all of them, so the run runs here,
-        // or a pinned or desktop run ends.
-        let busy = |run: &mut Run<'_>, console: &mut Console| run.fell_back(remote, FallbackReason::Busy, &RemoteOutcome::default(), console);
         // The seam raises the console interrupt before the take, so the zero wait meets it as the lock's busy.
         if self.request.test_seams.interrupt_before_key
             && let Some(interrupt) = self.host.interrupt
         {
             interrupt.raise();
         }
-        match self.client.hold_key(&call) {
-            Ok(held) => return Ok((held, Duration::ZERO)),
+        let (end, waited) = if let Some(end) = self.key_at_once(&call, remote, &mut plan, console) {
+            (end, Duration::ZERO)
+        } else {
+            let left = holder_time_left(&mut self.survey, &self.root.path, call.key, console);
+            console.err(&key_wait_line(&remote.builder.alias, left));
+            // The seam raises the console interrupt once the gate has said it waits, the key wait's line among them.
+            if self.request.test_seams.interrupt_queued
+                && let Some(interrupt) = self.host.interrupt
+            {
+                interrupt.raise();
+            }
+            self.waited_key(&call, remote, &mut plan, Bound::new(bound, KEY_HELD_OFF_LINE), console)
+        };
+        self.key_ended(end, (waited, bound, !lanes.is_empty()), remote, console)
+    }
+
+    /// How the routed run `remote` goes on once its take of a work folder ended as `end`, after `waited`, its key-wait
+    /// bound `bound`: a work folder held is the run's, kept as [`Run::lane`] for every run that may use the later ones
+    /// (`eligible`), whichever it took, and a later one named by the run's tag; else the run falls back busy, a line
+    /// saying why first when one does, or ends as an interrupted wait.
+    fn key_ended(
+        &mut self,
+        end: KeyEnd,
+        (waited, bound, eligible): (Duration, Duration, bool),
+        remote: &RemoteRun,
+        console: &mut Console,
+    ) -> Result<KeyTaken, Remotely> {
+        // The key is the worktree's on every builder: a key held elsewhere is busy on all of them, so the run runs here,
+        // or a pinned or desktop run ends.
+        let busy = |run: &mut Run<'_>, console: &mut Console| run.fell_back(remote, FallbackReason::Busy, &RemoteOutcome::default(), console);
+        match end {
+            KeyEnd::Held { held, lane } => {
+                if lane > 1
+                    && let Some(tag) = self.tag.as_mut()
+                {
+                    tag.key = lane_key(&remote.key, lane);
+                }
+                // Every run that may use the later work folders, whichever it took, is kept as one.
+                self.lane = eligible.then(|| Lane {
+                    number: lane,
+                    base: remote.key.clone(),
+                    worktree_wait: bound,
+                });
+                Ok(KeyTaken { held, waited })
+            }
+            KeyEnd::Busy => Err(busy(self, console)),
+            KeyEnd::Said(line) => {
+                console.err(&line);
+                Err(busy(self, console))
+            }
+            KeyEnd::Interrupted => Err(self.interrupted_key_wait(remote, waited, console)),
+        }
+    }
+
+    /// The take of the call's work folder before any wait is said: the worktree's own when it is free, or how the take
+    /// ended, a Ctrl+C raised before it, a light run a critical request sent here and a warm-up a run that keeps the
+    /// short wait meets ending it; then, for a run with later work folders that no warm-up of its own keeps, one slice
+    /// of wait for its own and a try of each later one ([`Run::key_slice`]). `None` when the run goes on to wait.
+    fn key_at_once<'k>(&self, call: &RemoteCall<'k>, remote: &RemoteRun, plan: &mut KeyPlan<'k>, console: &mut Console) -> Option<KeyEnd> {
+        match self.client.hold_key(call) {
+            Ok(held) => return Some(KeyEnd::Held { held, lane: 1 }),
             // Another run of the worktree holds the key, or the lock could not be taken without a line; the zero wait
             // never reads the interrupt, which the check after it sees.
             Err(None) => {}
-            Err(Some(line)) => {
-                console.err(&line);
-                return Err(busy(self, console));
-            }
+            Err(Some(line)) => return Some(KeyEnd::Said(line)),
         }
         // A Ctrl+C raised before the take reads as the lock's busy; it ends the run as an interrupted wait does.
         if self.host.interrupt.is_some_and(Interrupt::is_raised) {
-            return Err(self.interrupted_key_wait(remote, Duration::ZERO, console));
+            return Some(KeyEnd::Interrupted);
         }
         // A light run a critical request sent here never waits for the key.
         if self.rerouted_for.is_some() {
-            return Err(busy(self, console));
+            return Some(KeyEnd::Busy);
         }
-        let mut probe_said = false;
-        let desktop = self.is_desktop(remote);
-        let patient = waits_its_ceiling(self.request, desktop, self.staging.is_some() || self.nesting.hook_of_commit());
-        if warm_up_sends_busy(patient, || warm_up_holds(&self.root.path, &remote.key, console, &mut probe_said)) {
-            return Err(busy(self, console));
+        if self.warm_up_busy_or_one_folder(remote, plan, console) {
+            return Some(KeyEnd::Busy);
         }
-        let mut bound = Bound::new(key_bound(self.request, desktop, patient, queued), KEY_HELD_OFF_LINE);
-        let left = holder_time_left(&mut self.survey, &self.root.path, call.key, console);
-        console.err(&key_wait_line(&remote.builder.alias, left));
-        // The seam raises the console interrupt once the gate has said it waits, the key wait's line among them.
-        if self.request.test_seams.interrupt_queued
-            && let Some(interrupt) = self.host.interrupt
-        {
-            interrupt.raise();
+        if plan.lanes.is_empty() {
+            return None;
         }
+        self.key_slice(call, plan.lanes)
+    }
+
+    /// Whether a warm-up holding the worktree's own work folder sends the routed run `remote` busy at once
+    /// ([`warm_up_sends_busy`]); a warm-up that does not keeps the run to that folder, its later ones taken out of
+    /// `plan`, so a run that waits its ceiling waits for the warm-up as it did. The warm-up lock is probed only by a run
+    /// it would send busy or keep from the later folders.
+    fn warm_up_busy_or_one_folder(&self, remote: &RemoteRun, plan: &mut KeyPlan<'_>, console: &mut Console) -> bool {
+        if plan.patient && plan.lanes.is_empty() {
+            return false;
+        }
+        let warming = warm_up_holds(&self.root.path, &remote.key, console, &mut plan.probe_said);
+        if warming {
+            plan.lanes = &[];
+        }
+        warm_up_sends_busy(plan.patient, || warming)
+    }
+
+    /// The wait of the routed run `remote` for a work folder once it said it waits: slice by slice ([`Run::key_slice`])
+    /// until one is held, a Ctrl+C, or `bound` is spent, which a live drain marker holds off, saying the still-waiting
+    /// line each heartbeat; a warm-up that took the worktree's own folder meanwhile ends it for a run that keeps the short
+    /// wait. How it ended, and how long it waited.
+    fn waited_key<'k>(
+        &self,
+        call: &RemoteCall<'k>,
+        remote: &RemoteRun,
+        plan: &mut KeyPlan<'k>,
+        mut bound: Bound,
+        console: &mut Console,
+    ) -> (KeyEnd, Duration) {
         let mut beat = Beat::new(self.request.test_seams.heartbeat_ms.map_or(wait::HEARTBEAT, Duration::from_millis));
         loop {
-            match self.client.hold_key_waiting(&call, KEY_WAIT_SLICE) {
-                Ok(KeyWait::Held(held)) => return Ok((held, beat.waited())),
-                Ok(KeyWait::Interrupted) => return Err(self.interrupted_key_wait(remote, beat.waited(), console)),
-                Ok(KeyWait::Busy) => {}
-                Err(line) => {
-                    console.err(&line);
-                    return Err(busy(self, console));
-                }
+            if let Some(end) = self.key_slice(call, plan.lanes) {
+                return (end, beat.waited());
             }
             // Each slice's wait is the slice itself, whose `Busy` comes before the client reads the interrupt.
             if self.host.interrupt.is_some_and(Interrupt::is_raised) {
-                return Err(self.interrupted_key_wait(remote, beat.waited(), console));
+                return (KeyEnd::Interrupted, beat.waited());
             }
             // A run of the worktree waiting behind a builder's drain may hold the key, which is the worktree's on every
             // builder: a live marker of any of them holds the bound off.
             if bound.spent(beat.waited(), &self.root.path, console) {
-                return Err(busy(self, console));
+                return (KeyEnd::Busy, beat.waited());
             }
             if let Some(waited) = beat.due() {
                 // A warm-up that took the key during the wait is not waited for either, but by a run that waits its ceiling.
-                if warm_up_sends_busy(patient, || warm_up_holds(&self.root.path, &remote.key, console, &mut probe_said)) {
-                    return Err(busy(self, console));
+                if warm_up_sends_busy(plan.patient, || {
+                    warm_up_holds(&self.root.path, &remote.key, console, &mut plan.probe_said)
+                }) {
+                    return (KeyEnd::Busy, beat.waited());
                 }
                 console.err(&format!(
                     "gate: still waiting for this worktree's work folder on {} ({} s)",
@@ -3968,6 +4116,48 @@ impl<'r> Run<'r> {
                 ));
             }
         }
+    }
+
+    /// One slice of a wait for a work folder: up to [`KEY_WAIT_SLICE`] for the call's own, then a try of each of `lanes`
+    /// without waiting ([`free_lane`]), so no run waits for one while it holds another. How the take ended, `None` while
+    /// every one stays held.
+    fn key_slice<'k>(&self, call: &RemoteCall<'k>, lanes: &'k [String]) -> Option<KeyEnd> {
+        match self.client.hold_key_waiting(call, KEY_WAIT_SLICE) {
+            Ok(KeyWait::Held(held)) => return Some(KeyEnd::Held { held, lane: 1 }),
+            Ok(KeyWait::Interrupted) => return Some(KeyEnd::Interrupted),
+            Ok(KeyWait::Busy) => {}
+            Err(line) => return Some(KeyEnd::Said(line)),
+        }
+        match free_lane(self.client.as_ref(), call, lanes) {
+            Ok(found) => found.map(|(held, lane)| KeyEnd::Held { held, lane }),
+            Err(line) => Some(KeyEnd::Said(line)),
+        }
+    }
+
+    /// How many work folders of its worktree the routed run `remote` may use: one for a run that keeps the worktree's own
+    /// ([`Run::keeps_one_folder`]), else `--test-lanes`, else [`MOST_LANES`].
+    fn lanes_for(&self, remote: &RemoteRun) -> u32 {
+        if self.keeps_one_folder(remote) {
+            return 1;
+        }
+        self.request.test_seams.lanes.unwrap_or(MOST_LANES)
+    }
+
+    /// Whether the routed run `remote` keeps to the worktree's own work folder: one that pulls its outputs back whole
+    /// ([`pulls_outputs`]), carries siblings, uses the builder's desktop, holds a `--lock`, is a commit's stage, or is a
+    /// light run a critical request sent here.
+    fn keeps_one_folder(&self, remote: &RemoteRun) -> bool {
+        pulls_outputs(remote)
+            || !remote.siblings.is_empty()
+            || self.is_desktop(remote)
+            || self.request.lock.is_some()
+            || self.staged()
+            || self.rerouted_for.is_some()
+    }
+
+    /// Whether the run is a commit's stage, or runs in a hook a commit's stage started.
+    fn staged(&self) -> bool {
+        self.staging.is_some() || self.nesting.hook_of_commit()
     }
 
     /// Takes this PC's desktop queue for the routed run `remote` when it is a locked desktop run
@@ -4441,7 +4631,11 @@ impl<'r> Run<'r> {
             taken = Some((self.record_built_here(&folder, &projects, &settings, console), folder));
         }
         match self.record_change(here, console) {
-            Some(RecordChange::Clear(path)) => remove_record(&path, console),
+            Some(RecordChange::Clear {
+                path,
+                folder,
+                settings: cleared,
+            }) => remove_nothing_back(&self.root.root, (&path, &folder), &cleared, console),
             Some(RecordChange::Add { path, folder, project }) => {
                 // The key lock a routed run writes the record under, so a fresh record it writes meanwhile is kept.
                 let held = match taken {
@@ -4450,7 +4644,7 @@ impl<'r> Run<'r> {
                 };
                 let added = held
                     .map_err(|reason| format!("gate: cannot add to {}: {reason}", path.display()))
-                    .and_then(|_held| no_build::add_built(&path, &project, &settings));
+                    .and_then(|_held| hold_records(&self.root.root, &folder).and_then(|_records| no_build::add_built(&path, &project, &settings)));
                 if let Err(line) = added {
                     console.err(&line);
                 }
@@ -4499,21 +4693,27 @@ impl<'r> Run<'r> {
     ) -> Result<OwnedMutexGuard, String> {
         let path = v1::built_here_path(&self.root.path, folder);
         let outputs_from = v1::outputs_from_path(&self.root.path, folder);
-        let taken = match self.try_folder_key(folder, KeyTake::Brief, console) {
-            Ok(held) => {
-                match no_build::record_built_here(&path, projects, settings) {
+        // A routed run in a later work folder of the worktree is as much in flight as one in its own.
+        let free = self
+            .try_folder_key(folder, KeyTake::Brief, console)
+            .map_err(|untaken| (untaken, folder.to_owned()))
+            .and_then(|held| self.later_lanes_free(folder).map(|lanes| (held, lanes)));
+        let taken = match free {
+            Ok((held, _lanes)) => {
+                let written = hold_records(&self.root.root, folder).and_then(|_records| no_build::record_built_here(&path, projects, settings));
+                match written {
                     Ok(Some(left)) => console.note(&format!("gate: built-here record trimmed to {left} entries")),
                     Ok(None) => {}
                     Err(line) => console.err(&line),
                 }
                 Ok(held)
             }
-            Err(Untaken::Held(_)) => {
-                console.note(&format!("gate: built-here record not written: work folder {folder} is held"));
+            Err((Untaken::Held(_), held_folder)) => {
+                console.note(&format!("gate: built-here record not written: work folder {held_folder} is held"));
                 console.note(&format!("gate: waiting for the work folder's key to remove {}", outputs_from.display()));
                 self.try_folder_key(folder, KeyTake::Bounded, console).map_err(Untaken::why)
             }
-            Err(untaken) => {
+            Err((untaken, _)) => {
                 let why = untaken.why();
                 console.err(&format!("gate: cannot write {}: {why}", path.display()));
                 Err(why)
@@ -4540,7 +4740,34 @@ impl<'r> Run<'r> {
         if !dropped && !unicode_words(&self.request.command).is_some_and(|words| dotnet_builds(&words)) {
             return Ok(());
         }
-        no_build::clear_built_here(&v1::built_here_path(&self.root.path, &remote.key))
+        let base = self.base_key(remote);
+        let _records = hold_records(&self.root.root, base)?;
+        no_build::clear_built_here(&v1::built_here_path(&self.root.path, base))
+    }
+
+    /// The own work-folder key of the worktree of the routed run `remote`, which names its records: the run's key, or
+    /// the worktree's own for a run in a later work folder ([`Run::lane`]).
+    fn base_key<'k>(&'k self, remote: &'k RemoteRun) -> &'k str {
+        self.lane.as_ref().map_or(&remote.key, |lane| &lane.base)
+    }
+
+    /// The locks of the later work folders of the worktree whose own key is `folder`, each taken without waiting, so a
+    /// build here writes its built-here entry only while no routed run of the worktree is in any of them: `--test-lanes`
+    /// of them, else [`MOST_LANES`].
+    ///
+    /// # Errors
+    ///
+    /// A folder another run holds, as [`Untaken::Held`], or a lock that cannot be opened or taken, with that folder's key.
+    fn later_lanes_free(&self, folder: &str) -> Result<Vec<OwnedMutexGuard>, (Untaken, String)> {
+        let lanes = self.request.test_seams.lanes.unwrap_or(MOST_LANES);
+        lane_keys(folder, lanes)
+            .iter()
+            .map(|key| match worktree_record::try_hold_key(&self.root.root, key) {
+                Ok(Some(held)) => Ok(held),
+                Ok(None) => Err((Untaken::Held(Duration::ZERO), key.clone())),
+                Err(why) => Err((Untaken::Failed(why), key.clone())),
+            })
+            .collect()
     }
 
     /// Holds the lock of the work-folder key `folder`, the one a routed run of the worktree holds while it writes the
@@ -4642,8 +4869,8 @@ impl<'r> Run<'r> {
     /// record stands for ([`Run::record_change`]); a build of one project there adds nothing. A record that cannot be
     /// removed is said.
     fn clear_nothing_back(&self, here: HereWords, console: &mut Console) {
-        if let Some(RecordChange::Clear(path)) = self.record_change(here, console) {
-            remove_record(&path, console);
+        if let Some(RecordChange::Clear { path, folder, settings }) = self.record_change(here, console) {
+            remove_nothing_back(&self.root.root, (&path, &folder), &settings, console);
         }
     }
 
@@ -4682,7 +4909,11 @@ impl<'r> Run<'r> {
                 return None;
             }
         };
-        record.settings.same_as(&build_settings(&here.words)).then_some(RecordChange::Clear(path))
+        let settings = build_settings(&here.words);
+        record
+            .settings
+            .same_as(&settings)
+            .then_some(RecordChange::Clear { path, folder, settings })
     }
 
     /// A plan of `words`, which a run here runs in place of the command as given; else how the run ended when they
@@ -6291,6 +6522,36 @@ fn key_wait_line(host: &str, left: Option<String>) -> String {
     }
 }
 
+/// The keys of the later work folders of the worktree whose own key is `base` a run that may use `lanes` of them takes:
+/// lane 2's first ([`lane_key`]); none for one.
+fn lane_keys(base: &str, lanes: u32) -> Vec<String> {
+    (2..=lanes).map(|lane| lane_key(base, lane)).collect()
+}
+
+/// The first of `lanes`, the keys of later work folders from lane 2 on, whose lock `client` takes without waiting, and
+/// its number, each tried through a copy of `call` naming it. `None` when every one is held.
+///
+/// # Errors
+///
+/// The line saying a lock could not be opened or taken.
+fn free_lane<'k>(client: &dyn RemoteClient, call: &RemoteCall<'k>, lanes: &'k [String]) -> Result<Option<(Option<OwnedMutexGuard>, u32)>, String> {
+    for (lane, key) in (2..).zip(lanes) {
+        let named = RemoteCall { key, ..call.clone() };
+        match client.hold_key(&named) {
+            Ok(held) => return Ok(Some((held, lane))),
+            Err(None) => {}
+            Err(Some(line)) => return Err(line),
+        }
+    }
+    Ok(None)
+}
+
+/// Whether the routed run `remote` pulls outputs back whole, which keeps it to its worktree's own work folder: it has
+/// output or failure output globs, and the route did not withhold its outputs.
+fn pulls_outputs(remote: &RemoteRun) -> bool {
+    (!remote.outputs.is_empty() || !remote.failure_outputs.is_empty()) && !remote.outputs_withheld
+}
+
 /// How long the holder of the work folder of `key` under `state` has left by its remote claim, by the gate's figure
 /// rule, for the key wait's first line: `None` when no live claim names `key`, when its claim carries no usual run time,
 /// or once that time is at or past.
@@ -6519,10 +6780,113 @@ impl HereWords {
 
 /// What a passing run does to its worktree's nothing-back record at the path each holds ([`Run::record_change`]).
 enum RecordChange {
-    /// Removes it.
-    Clear(PathBuf),
+    /// Removes it when it still stands for the build's `settings` ([`remove_if_still_same`]).
+    Clear {
+        path: PathBuf,
+        folder: String,
+        settings: BuildSettings,
+    },
     /// Adds the key of the project built to its `built` list, under the lock of the worktree's work-folder key.
     Add { path: PathBuf, folder: String, project: String },
+}
+
+/// What a routed run on the builder does to the worktree's nothing-back record ([`Run::leave_nothing_back`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NothingBackStep {
+    /// Nothing: a command that is no dotnet build and whose `--no-build` was kept.
+    Leave,
+    /// Clears it, as a passing build here of the words would: a dotnet build that brought its outputs back.
+    Clear,
+    /// Writes it: any other dotnet build.
+    Write,
+    /// Writes it when none stands: a dotnet command whose `--no-build` the builder dropped, which built there.
+    WriteUnlessStanding,
+}
+
+/// What a routed run whose client ended as `outcome`, its command's words `words`, does to the nothing-back record.
+fn nothing_back_step(outcome: &RemoteOutcome, words: &[String]) -> NothingBackStep {
+    if outcome.dropped_no_build {
+        NothingBackStep::WriteUnlessStanding
+    } else if !dotnet_builds(words) {
+        NothingBackStep::Leave
+    } else if brought_everything_back(outcome) {
+        NothingBackStep::Clear
+    } else {
+        NothingBackStep::Write
+    }
+}
+
+/// Removes the nothing-back record at `path` of the worktree whose own work-folder key is `folder`, under the state
+/// root `state`, when it still stands for a build under `settings`, read again under the worktree's records lock
+/// ([`hold_records`], [`remove_if_still_same`]): both nothing-back clears of a run here go through it. A lock that cannot
+/// be taken is said and removes nothing.
+fn remove_nothing_back(state: &StateRoot, (path, folder): (&Path, &str), settings: &BuildSettings, console: &mut Console) {
+    match hold_records(state, folder) {
+        Ok(_records) => remove_if_still_same(path, settings, console),
+        Err(line) => console.err(&line),
+    }
+}
+
+/// Removes the nothing-back record at `path` when it still stands for a build under `settings`, read again under the
+/// worktree's records lock the caller holds: a record another run rewrote since the clear was decided is kept. One that
+/// cannot be read is said and kept.
+fn remove_if_still_same(path: &Path, settings: &BuildSettings, console: &mut Console) {
+    match no_build::read_record(path) {
+        Ok(Some(record)) if record.settings.same_as(settings) => remove_record(path, console),
+        Ok(_) => {}
+        Err(error) => console.err(&format!("gate: cannot read {}: {error}", path.display())),
+    }
+}
+
+/// Whether the nothing-back record at `path` stands, a presence that cannot be read said and counted as standing, so
+/// a dropped `--no-build` run never rewrites it.
+fn record_stands(path: &Path, console: &mut Console) -> bool {
+    match path.try_exists() {
+        Ok(stands) => stands,
+        Err(error) => {
+            console.err(&format!("gate: cannot read {}: {error}", path.display()));
+            true
+        }
+    }
+}
+
+/// Writes the nothing-back record at `path` of a routed run on the builder `host` whose dotnet command's `words` built
+/// there and brought nothing back ([`Run::leave_nothing_back`]), naming the configuration only when the record it
+/// replaces names the same one ([`kept_configuration`]). A record that cannot be read or written is said.
+fn write_nothing_back(path: &Path, host: &str, words: &[String], console: &mut Console) {
+    let settings = build_settings(words);
+    let standing = match no_build::read_record(path) {
+        Ok(standing) => standing,
+        Err(error) => {
+            console.err(&format!("gate: cannot read {}: {error}", path.display()));
+            None
+        }
+    };
+    let record = v1::NothingBackRecord {
+        host: host.to_owned(),
+        configuration: kept_configuration(standing.as_ref(), &settings),
+        framework: settings.framework,
+        runtime: settings.runtime,
+        built: Vec::new(),
+    };
+    if let Err(error) = v1::write_nothing_back(path, &record) {
+        console.err(&format!("gate: cannot write {}: {error}", path.display()));
+    }
+}
+
+/// The configuration a nothing-back record of a build under `settings` names over `standing`, the record it replaces:
+/// the build's, unless the standing one names another, compared ignoring letter case, one naming none differing from
+/// one naming a value; then none.
+fn kept_configuration(standing: Option<&NothingBack>, settings: &BuildSettings) -> Option<String> {
+    let differs = |old: &Option<String>| match (old, &settings.configuration) {
+        (Some(old), Some(new)) => old.to_lowercase() != new.to_lowercase(),
+        (None, None) => false,
+        _ => true,
+    };
+    match standing {
+        Some(record) if differs(&record.settings.configuration) => None,
+        _ => settings.configuration.clone(),
+    }
 }
 
 /// Removes the nothing-back record at `path`; one that cannot be removed is said, one already gone is not.
@@ -7153,6 +7517,7 @@ mod tests {
                 cross_build: None,
                 builder: &crate::test_support::HOST,
                 key: "app-1a2b3c4d",
+                lane: None,
                 session: "0123456789abcdef0123456789abcdef",
                 root: r"C:\no-such-worktree",
                 root_id: gate_router::FolderId { volume: 0, file: [0; 16] },
@@ -8882,5 +9247,69 @@ mod end_tests {
             "an exited member is nothing to end: {:?}",
             opened.map(|process| process.is_some())
         );
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "a test that cannot write its record must fail loudly")]
+mod nothing_back_tests {
+    use std::fs;
+
+    use gate_router::build_settings;
+    use gate_state::v1;
+
+    use gate_state::StateRoot;
+
+    use super::{remove_if_still_same, remove_nothing_back};
+    use crate::console::Console;
+
+    /// A record a build of another configuration rewrote after the clear was decided is kept; one that still stands
+    /// for the clearing build's settings is removed.
+    #[test]
+    fn a_nothing_back_record_rewritten_since_the_clear_was_decided_is_kept() {
+        let folder = crate::test_support::temp_dir().join(format!("gate-nothing-back-recheck-{}", std::process::id()));
+        fs::create_dir_all(&folder).expect("the folder can be made");
+        let path = folder.join("k.nothing-back");
+        let record = v1::NothingBackRecord {
+            host: "builder".to_owned(),
+            configuration: Some("Debug".to_owned()),
+            framework: None,
+            runtime: None,
+            built: Vec::new(),
+        };
+        v1::write_nothing_back(&path, &record).expect("the record can be written");
+        let settings = |configuration: &str| build_settings(&["dotnet", "build", "-c", configuration].map(str::to_owned));
+
+        remove_if_still_same(&path, &settings("Release"), &mut Console::new());
+        let kept = path.exists();
+        remove_if_still_same(&path, &settings("Debug"), &mut Console::new());
+
+        assert!(kept, "a record of another configuration is kept");
+        assert!(!path.exists(), "a record of the same settings is removed");
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    /// The clear both nothing-back sites make under the records lock: decided against a Release record, it keeps the
+    /// Debug record another run wrote since.
+    #[test]
+    fn a_nothing_back_clear_decided_before_a_rewrite_keeps_the_rewritten_record() {
+        let folder = crate::test_support::temp_dir().join(format!("gate-nothing-back-clear-{}", std::process::id()));
+        fs::create_dir_all(&folder).expect("the folder can be made");
+        let state = StateRoot::new(&folder.to_string_lossy(), None);
+        let path = folder.join("k.nothing-back");
+        let record = v1::NothingBackRecord {
+            host: "builder".to_owned(),
+            configuration: Some("Debug".to_owned()),
+            framework: None,
+            runtime: None,
+            built: Vec::new(),
+        };
+        v1::write_nothing_back(&path, &record).expect("the record can be written");
+        let release = build_settings(&["dotnet", "build", "-c", "Release"].map(str::to_owned));
+
+        remove_nothing_back(&state, (&path, "k"), &release, &mut Console::new());
+
+        assert!(path.exists(), "the record rewritten since the clear was decided is kept");
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
     }
 }
