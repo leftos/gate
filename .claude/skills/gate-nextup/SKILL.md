@@ -47,7 +47,7 @@ Functional work comes before edge cases and hardening. The owner is the gate's o
 
 Such an item, and such a finding from a review or an invariant pass, is **add**ed with no priority (in its project, else `Backlog`) and never raised to Urgent or High. A defect that breaks or blocks a caller's routed run is not an edge case, and a flaky or timing-out test stays Urgent.
 
-Merging is the agents' call too. Once every item under a feature marker has landed and its gates are green, the session runs `ship` on the branch and merges the feature PR without asking.
+Merging is the agents' call too. Once every item under a feature marker has landed and its gates are green, the session runs `ship-to-main` on the branch and merges the feature PR without asking.
 
 ## Agents
 
